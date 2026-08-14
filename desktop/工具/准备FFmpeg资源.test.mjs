@@ -51,3 +51,12 @@ test('按目标三元组复制当前包所需的标准资源名', () => {
   assert.equal(readFileSync(join(output, 'ffmpeg'), 'utf8'), 'ffmpeg-test');
   assert.equal(readFileSync(join(output, 'ffprobe'), 'utf8'), 'ffprobe-test');
 });
+
+test('Tauri scripts use the package binary lookup that works on Windows', () => {
+  const packageJsonPath = fileURLToPath(new URL('../ui/package.json', import.meta.url));
+  const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+  const tauriScripts = `${packageJson.scripts['tauri:dev']}\n${packageJson.scripts['tauri:build']}`;
+
+  assert.match(tauriScripts, /\btauri (?:dev|build)\b/);
+  assert.doesNotMatch(tauriScripts, /\.\/ui\/node_modules\/\.bin\/tauri/);
+});
