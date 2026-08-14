@@ -2319,7 +2319,7 @@ function DesktopApp() {
               </Space>
             </Card>
             <Card
-              title="音频研究参数"
+              title="研究参数校验"
               extra={
                 <Space>
                   <Button onClick={() => void resetResearchParams()}>恢复默认</Button>
@@ -2328,8 +2328,8 @@ function DesktopApp() {
                   </Button>
                 </Space>
               }
-            >
-              <Alert
+              >
+                <Alert
                 type={researchValidationStatus === 'invalid' ? 'error' : researchValidationStatus === 'valid' ? 'success' : 'info'}
                 showIcon
                 message={
@@ -2339,9 +2339,12 @@ function DesktopApp() {
                       ? '参数契约校验通过（当前仅校验，未执行媒体算法）'
                       : '参数先由 Rust 校验；点击“应用当前处理参数”后在后台生成当前源视频的预览缓存'
                 }
-                description={researchValidation.slice(0, 3).map((item) => `${item.field}：${item.message}`).join('；') || undefined}
-              />
-              {researchParams ? (
+                  description={researchValidation.slice(0, 3).map((item) => `${item.field}：${item.message}`).join('；') || undefined}
+                />
+                <Typography.Title level={5} style={{ marginTop: 24 }}>
+                  音频研究参数
+                </Typography.Title>
+                {researchParams ? (
                 <Space wrap style={{ marginTop: 16 }}>
                   <InputNumber addonBefore="动态周期" addonAfter="ms" value={researchParams.audio.random_change_period_ms} min={500} max={60_000} step={500} onChange={(value) => updateResearchParam('audio', 'random_change_period_ms', value)} />
                   <InputNumber addonBefore="音高微移" addonAfter="半音" value={researchParams.audio.pitch_shift_semitones} min={-2} max={2} step={0.1} onChange={(value) => updateResearchParam('audio', 'pitch_shift_semitones', value)} />
