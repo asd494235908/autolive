@@ -30,9 +30,8 @@ use autolive_desktop_core::speech_to_speech_worker::configured_speech_to_speech_
 use autolive_desktop_core::speech_to_speech_worker::run_configured_speech_to_speech_context_worker;
 use autolive_desktop_core::speech_to_speech_worker::SpeechToSpeechWorkerError;
 use autolive_desktop_core::voice_clone::{
-    validate_replacement_result, VoiceClonePrepareRequest, VoiceClonePrepareResult,
-    VoiceCloneReplacementRequest, VoiceCloneReplacementResult, VoiceCloneSegment,
-    VoiceCloneSourceIndex,
+    validate_replacement_result, VoiceClonePrepareRequest, VoiceCloneReplacementRequest,
+    VoiceCloneReplacementResult, VoiceCloneSegment, VoiceCloneSourceIndex,
 };
 use autolive_desktop_core::window_sizing::{calculate_window_size, WindowSizingError};
 use autolive_desktop_core::{
@@ -1313,16 +1312,16 @@ pub fn start_voice_clone_replacement(
         .map_err(|error| CommandErrorDto::new("voice_clone_cache_dir_failed", error.to_string()))?;
     let request_json = replacement_root.join(format!("{}.replace.json", plan.operation_id));
     let output_json = replacement_root.join(format!("{}.replace-result.json", plan.operation_id));
-    let request_payload = serde_json::json!({
-        "source_generation": plan.source_generation,
-        "source_path": plan.source_path,
-        "source_sha256": plan.source_sha256,
-        "operation_id": plan.operation_id,
-        "reference_audio_path": plan.reference_audio_path,
-        "text": plan.input_text,
-        "replace_at_ms": plan.replace_at_ms,
-        "resume_at_ms": plan.resume_at_ms,
-    });
+    let request_payload = VoiceCloneReplacementRequest {
+        source_generation: plan.source_generation,
+        source_path: plan.source_path.clone(),
+        source_sha256: plan.source_sha256.clone(),
+        operation_id: plan.operation_id.clone(),
+        reference_audio_path: plan.reference_audio_path.clone(),
+        text: plan.input_text.clone(),
+        replace_at_ms: plan.replace_at_ms,
+        resume_at_ms: plan.resume_at_ms,
+    };
     write_json_file(&request_json, &request_payload)?;
 
     let playback = Arc::clone(&state.playback);
@@ -1425,6 +1424,7 @@ pub fn cancel_voice_clone_operation(
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
     state.ensure_main_window(&window)?;
+    let _ = state.reap_finished_voice_clone_worker()?;
     let had_worker = state.voice_clone_worker_is_running()?;
     state.stop_voice_clone_worker()?;
     state.with_playback(&window, |playback| {
@@ -2784,6 +2784,12 @@ fn validate_voice_clone_prepare_result(
     let reference_audio_path = worker_result.reference_audio_path.ok_or_else(|| {
         CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少参考音频")
     })?;
+    if !Path::new(&reference_audio_path).is_absolute() {
+        return Err(CommandErrorDto::new(
+            "voice_clone_prepare_failed",
+            "参考音频路径必须是绝对路径",
+        ));
+    }
     let reference_audio_sha256 = worker_result.reference_audio_sha256.ok_or_else(|| {
         CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少参考音频哈希")
     })?;
@@ -2804,27 +2810,30 @@ fn validate_voice_clone_prepare_result(
         source_path: canonical_source_path.display().to_string(),
         segments: worker_result.segments,
     };
-    let _contract_result = VoiceClonePrepareResult {
-        source_generation,
-        source_path: canonical_source_path.display().to_string(),
-        operation_id: operation_id.to_owned(),
-        source_index: source_index.clone(),
-    };
+    let sample_rate_hz = worker_result.sample_rate_hz.ok_or_else(|| {
+        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少采样率")
+    })?;
+    let channel_count = worker_result.channel_count.ok_or_else(|| {
+        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少声道数")
+    })?;
+    let total_duration_ms = worker_result.duration_ms.ok_or_else(|| {
+        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少总时长")
+    })?;
+    if total_duration_ms == 0 {
+        return Err(CommandErrorDto::new(
+            "voice_clone_prepare_failed",
+            "固定话术准备总时长必须大于 0",
+        ));
+    }
     Ok(VoiceClonePreparedSource {
         operation_id: operation_id.to_owned(),
         source_index,
         source_sha256: source_sha256.to_owned(),
         reference_audio_path: canonical_reference_path.display().to_string(),
         reference_audio_sha256: actual_reference_sha256,
-        sample_rate_hz: worker_result.sample_rate_hz.ok_or_else(|| {
-            CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少采样率")
-        })?,
-        channel_count: worker_result.channel_count.ok_or_else(|| {
-            CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少声道数")
-        })?,
-        total_duration_ms: worker_result.duration_ms.ok_or_else(|| {
-            CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少总时长")
-        })?,
+        sample_rate_hz,
+        channel_count,
+        total_duration_ms,
         model: worker_result.model.or(worker_result.provider),
     })
 }
@@ -2879,9 +2888,12 @@ fn validate_voice_clone_replace_result(
     let replacement_request = VoiceCloneReplacementRequest {
         source_generation: plan.source_generation,
         source_path: plan.source_path.clone(),
+        source_sha256: plan.source_sha256.clone(),
         operation_id: plan.operation_id.clone(),
+        reference_audio_path: plan.reference_audio_path.clone(),
         text: plan.input_text.clone(),
-        position_ms: plan.replace_at_ms,
+        replace_at_ms: plan.replace_at_ms,
+        resume_at_ms: plan.resume_at_ms,
     };
     validate_replacement_result(&replacement_result, &replacement_request)
         .map_err(|error| CommandErrorDto::new("voice_clone_replace_failed", error.to_string()))?;

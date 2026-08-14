@@ -64,9 +64,12 @@ pub struct VoiceClonePrepareResult {
 pub struct VoiceCloneReplacementRequest {
     pub source_generation: u64,
     pub source_path: String,
+    pub source_sha256: String,
     pub operation_id: String,
+    pub reference_audio_path: String,
     pub text: String,
-    pub position_ms: u64,
+    pub replace_at_ms: u64,
+    pub resume_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

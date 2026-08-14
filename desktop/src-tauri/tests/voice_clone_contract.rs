@@ -12,9 +12,13 @@ fn sample_request() -> VoiceCloneReplacementRequest {
     VoiceCloneReplacementRequest {
         source_generation: 7,
         source_path: "/Users/mac/work/gepin/autoLive/media/source.mp4".to_owned(),
+        source_sha256: "b".repeat(64),
         operation_id: "operation-001".to_owned(),
+        reference_audio_path: "/Users/mac/work/gepin/autoLive/cache/voice-clone/reference.wav"
+            .to_owned(),
         text: "替换当前话术".to_owned(),
-        position_ms: 1_500,
+        replace_at_ms: 1_500,
+        resume_at_ms: 2_000,
     }
 }
 
