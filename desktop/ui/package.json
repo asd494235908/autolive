@@ -11,7 +11,7 @@
     "tauri:dev": "cd .. && tauri dev --config src-tauri/tauri.conf.json",
     "ffmpeg:prepare": "node ../工具/准备FFmpeg资源.mjs",
     "ffmpeg:test": "node --test ../工具/准备FFmpeg资源.test.mjs",
-    "tauri:build": "node ../工具/准备FFmpeg资源.mjs && cd .. && tauri build --config src-tauri/tauri.conf.json"
+    "tauri:build": "node ../工具/准备FFmpeg资源.mjs && cd .. && tauri build --config src-tauri/tauri.conf.json && node 工具/归档桌面产物.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

@@ -37,6 +37,7 @@ backend/*.sqlite3
 deploy/data/
 
 # Tauri bundles and installers
+desktop/package/
 desktop/src-tauri/bundle/
 desktop/src-tauri/*.dmg
 desktop/src-tauri/*.msi

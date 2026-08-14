@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 const script = fileURLToPath(new URL('./准备FFmpeg资源.mjs', import.meta.url));
+const archiveScript = fileURLToPath(new URL('./归档桌面产物.mjs', import.meta.url));
 
 test('缺少当前目标的 FFmpeg 文件时失败且不创建输出', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-ffmpeg-'));
@@ -59,4 +60,47 @@ test('Tauri scripts use the package binary lookup that works on Windows', () => 
 
   assert.match(tauriScripts, /\btauri (?:dev|build)\b/);
   assert.doesNotMatch(tauriScripts, /\.\/ui\/node_modules\/\.bin\/tauri/);
+});
+
+test('归档脚本按版本和目标平台目录保存 bundle', () => {
+  const root = mkdtempSync(join(tmpdir(), 'autolive-package-'));
+  const source = join(root, 'bundle');
+  const output = join(root, 'package');
+  const configPath = fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url));
+  const version = JSON.parse(readFileSync(configPath, 'utf8')).version;
+  mkdirSync(join(source, 'dmg'), { recursive: true });
+  writeFileSync(join(source, 'dmg', 'bundle.txt'), 'bundle-test');
+
+  const result = spawnSync(process.execPath, [archiveScript], {
+    env: {
+      ...process.env,
+      AUTOLIVE_BUNDLE_SOURCE_DIR: source,
+      AUTOLIVE_PACKAGE_ROOT: output,
+      AUTOLIVE_TARGET_TRIPLE: 'aarch64-apple-darwin',
+    },
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+  assert.equal(
+    readFileSync(join(output, `v${version}`, 'aarch64-apple-darwin', 'dmg', 'bundle.txt'), 'utf8'),
+    'bundle-test',
+  );
+});
+
+test('GitHub workflow uploads the versioned package directory', () => {
+  const workflowPath = fileURLToPath(
+    new URL('../../.github/workflows/desktop-package.yml', import.meta.url),
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+
+  assert.match(workflow, /id: desktop-version/);
+  assert.match(
+    workflow,
+    /path: desktop\/package\/\*\*/,
+  );
+  assert.match(
+    workflow,
+    /name: desktop-bundle-\$\{\{ steps\.desktop-version\.outputs\.version \}\}-\$\{\{ matrix\.target_triple \}\}/,
+  );
 });
