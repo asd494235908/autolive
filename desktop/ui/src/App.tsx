@@ -11,6 +11,7 @@ import { clampMediaTime, clampVolume, formatMediaTime, isPlaybackMediaControlMes
 import type { PlaybackMediaControlMessage, PlaybackMediaStateMessage } from './播放控制消息';
 import { addVoiceClonePreset, loadVoiceClonePresets, removeVoiceClonePreset, updateVoiceClonePreset } from './voiceClonePresets';
 import type { VoiceClonePreset } from './voiceClonePresets';
+import './desktop-layout.css';
 
 const PLAYBACK_CHANNEL_NAME = 'autolive-playback-ui-v1';
 
@@ -1316,7 +1317,7 @@ function DesktopApp() {
       video.removeEventListener('enterpictureinpicture', handleEnter);
       video.removeEventListener('leavepictureinpicture', handleLeave);
     };
-  }, []);
+  }, [pictureInPictureSourceUrl]);
 
   useEffect(() => {
     const video = pictureInPictureVideoRef.current;
@@ -1335,8 +1336,18 @@ function DesktopApp() {
   }, [pictureInPictureSourceUrl, mediaState?.current_time, mediaState?.duration, mediaState?.volume]);
 
   useEffect(() => {
-    drawDiagnosticCanvas(waveformCanvasRef.current, diagnosticMessage?.waveform ?? [], '#22d3ee', 'rgba(34, 211, 238, 0.12)');
-    drawDiagnosticCanvas(spectrumCanvasRef.current, diagnosticMessage?.spectrum ?? [], '#a78bfa', 'rgba(167, 139, 250, 0.12)');
+    const video = pictureInPictureVideoRef.current;
+    if (!video || !pictureInPictureSourceUrl || !mediaState) return;
+    if (mediaState.paused) {
+      video.pause();
+      return;
+    }
+    void video.play().catch(() => undefined);
+  }, [mediaState?.paused, pictureInPictureSourceUrl]);
+
+  useEffect(() => {
+    drawDiagnosticCanvas(waveformCanvasRef.current, diagnosticMessage?.waveform ?? [], '#1677ff', 'rgba(22, 119, 255, 0.12)');
+    drawDiagnosticCanvas(spectrumCanvasRef.current, diagnosticMessage?.spectrum ?? [], '#1677ff', 'rgba(22, 119, 255, 0.12)');
   }, [diagnosticMessage]);
 
   useEffect(() => {
@@ -1999,663 +2010,544 @@ function DesktopApp() {
     typeof (pictureInPictureVideoRef.current as PictureInPictureVideo | null)?.requestPictureInPicture === 'function';
 
     return (
-    <Layout style={{ minHeight: '100vh' }}>
-      <Layout.Content style={{ maxWidth: 1120, width: '100%', margin: '0 auto', padding: 32 }}>
-        <video
-          ref={pictureInPictureVideoRef}
-          src={pictureInPictureSourceUrl ?? undefined}
-          muted
-          playsInline
-          preload="auto"
-          aria-hidden="true"
-          onLoadedMetadata={syncPictureInPictureVideo}
-          style={{ position: 'fixed', width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
-        />
-        <Space direction="vertical" size="large" style={{ width: '100%' }}>
-          <Typography.Title>autoLive 桌面端</Typography.Title>
-          <Alert
-            type="info"
-            showIcon
-            message="单源循环播放"
-            description="导入一个 MP4 后，在同一个最终效果窗口内持续循环；不生成 N 个离线视频，不创建版本队列。"
-          />
-          <Space wrap>
-            <Button type="primary" size="large" onClick={() => void importVideo()}>
-              导入视频并播放
-            </Button>
-            <Button size="large" onClick={() => void openFinalEffectWindowFromHome()} loading={playerWindowBusy}>
-              打开/聚焦播放器
-            </Button>
-          </Space>
-          {error ? <Alert type="error" showIcon message={error} /> : null}
-          <Card title="播放状态与控制">
-            <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-              <Space wrap>
-                <Tag color={getPlaybackDisplayColor(playbackDisplayState)}>{getPlaybackDisplayLabel(playbackDisplayState)}</Tag>
-                <Tag color={snapshot?.playback_state === 'playing' ? 'green' : 'default'}>
-                  循环次数：{snapshot?.loop_index ?? 0}
-                </Tag>
-                <Tag>{currentSource ? currentSource.file_name : '尚未导入源素材'}</Tag>
-              </Space>
-              <Alert type={playbackNoticeType as 'info' | 'success' | 'warning' | 'error'} showIcon message={playbackNotice} />
-              <Descriptions column={2} size="small">
-                <Descriptions.Item label="播放状态">{snapshot?.playback_state ?? '未获取'}</Descriptions.Item>
-                <Descriptions.Item label="循环次数">{snapshot?.loop_index ?? 0}</Descriptions.Item>
-                <Descriptions.Item label="当前视频">{snapshot?.current_video_reference ?? '—'}</Descriptions.Item>
-                <Descriptions.Item label="当前音轨">{snapshot?.current_audio_source ?? '—'}</Descriptions.Item>
-                <Descriptions.Item label="视频处理">{snapshot?.video_processing_enabled ? '开启' : '关闭'}</Descriptions.Item>
-                <Descriptions.Item label="声音处理">{snapshot?.audio_processing_enabled ? '开启' : '关闭'}</Descriptions.Item>
-              </Descriptions>
-              <Space wrap>
-                <Button
-                  onClick={() => void runPlaybackAction('pause', 'pause_playback')}
-                  disabled={!canPause}
-                  loading={playbackActionBusy === 'pause'}
-                >
-                  暂停
-                </Button>
-                <Button
-                  onClick={() => void runPlaybackAction('resume', 'resume_playback')}
-                  disabled={!canResume}
-                  loading={playbackActionBusy === 'resume'}
-                >
-                  继续
-                </Button>
-                <Button
-                  danger
-                  onClick={() => void runPlaybackAction('stop', 'stop_playback')}
-                  disabled={!canStop}
-                  loading={playbackActionBusy === 'stop'}
-                >
-                  停止
-                </Button>
-              </Space>
-              <Space direction="vertical" size="small" style={{ width: '100%' }}>
-                <Typography.Text>
-                  播放进度：{formatMediaTime(mediaCurrentTime)} / {formatMediaTime(mediaDuration)}
-                </Typography.Text>
-                <Slider
-                  aria-label="播放进度"
-                  min={0}
-                  max={Math.max(mediaDuration, 1)}
-                  value={mediaCurrentTime}
-                  onChange={(value) => {
-                    if (typeof value !== 'number') return;
-                    postPlaybackMediaControl({
-                      version: 1,
-                      type: 'playback-media-control',
-                      action: 'seek',
-                      current_time: value,
-                    });
-                  }}
-                  disabled={!mediaState || mediaDuration <= 0}
-                />
+    <Layout className="desktop-page">
+      <Layout.Content className="desktop-page-content">
+        <div className="desktop-workspace">
+          <section className="desktop-column desktop-column-source" aria-label="视频素材与状态">
+            <Typography.Title level={2}>autoLive 桌面端</Typography.Title>
+            <Alert
+              type="info"
+              showIcon
+              message="单源循环播放"
+              description="导入一个 MP4 后，在同一个最终效果窗口内持续循环；不生成 N 个离线视频，不创建版本队列。"
+            />
+            <Space wrap>
+              <Button type="primary" size="large" onClick={() => void importVideo()}>
+                导入视频并播放
+              </Button>
+              <Button size="large" onClick={() => void openFinalEffectWindowFromHome()} loading={playerWindowBusy}>
+                打开/聚焦播放器
+              </Button>
+            </Space>
+            {error ? <Alert type="error" showIcon message={error} /> : null}
+            <Card title="播放状态与控制">
+              <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                <Space wrap>
+                  <Tag color={getPlaybackDisplayColor(playbackDisplayState)}>{getPlaybackDisplayLabel(playbackDisplayState)}</Tag>
+                  <Tag color={snapshot?.playback_state === 'playing' ? 'green' : 'default'}>
+                    循环次数：{snapshot?.loop_index ?? 0}
+                  </Tag>
+                  <Tag>{currentSource ? currentSource.file_name : '尚未导入源素材'}</Tag>
+                </Space>
+                <Alert type={playbackNoticeType as 'info' | 'success' | 'warning' | 'error'} showIcon message={playbackNotice} />
+                <Descriptions column={2} size="small">
+                  <Descriptions.Item label="播放状态">{snapshot?.playback_state ?? '未获取'}</Descriptions.Item>
+                  <Descriptions.Item label="循环次数">{snapshot?.loop_index ?? 0}</Descriptions.Item>
+                  <Descriptions.Item label="当前视频">{snapshot?.current_video_reference ?? '—'}</Descriptions.Item>
+                  <Descriptions.Item label="当前音轨">{snapshot?.current_audio_source ?? '—'}</Descriptions.Item>
+                  <Descriptions.Item label="视频处理">{snapshot?.video_processing_enabled ? '开启' : '关闭'}</Descriptions.Item>
+                  <Descriptions.Item label="声音处理">{snapshot?.audio_processing_enabled ? '开启' : '关闭'}</Descriptions.Item>
+                </Descriptions>
                 <Space wrap>
                   <Button
-                    onClick={() => postPlaybackMediaControl({ version: 1, type: 'playback-media-control', action: 'toggle-muted' })}
-                    disabled={!mediaState}
+                    onClick={() => void runPlaybackAction('pause', 'pause_playback')}
+                    disabled={!canPause}
+                    loading={playbackActionBusy === 'pause'}
                   >
-                    {mediaState?.muted ? '取消静音' : '静音'}
+                    暂停
                   </Button>
-                  <Typography.Text>音量</Typography.Text>
+                  <Button
+                    onClick={() => void runPlaybackAction('resume', 'resume_playback')}
+                    disabled={!canResume}
+                    loading={playbackActionBusy === 'resume'}
+                  >
+                    继续
+                  </Button>
+                  <Button
+                    danger
+                    onClick={() => void runPlaybackAction('stop', 'stop_playback')}
+                    disabled={!canStop}
+                    loading={playbackActionBusy === 'stop'}
+                  >
+                    停止
+                  </Button>
+                </Space>
+                <Space direction="vertical" size="small" style={{ width: '100%' }}>
+                  <Typography.Text>
+                    播放进度：{formatMediaTime(mediaCurrentTime)} / {formatMediaTime(mediaDuration)}
+                  </Typography.Text>
                   <Slider
-                    aria-label="音量"
+                    aria-label="播放进度"
                     min={0}
-                    max={1}
-                    step={0.01}
-                    value={mediaState?.volume ?? 1}
+                    max={Math.max(mediaDuration, 1)}
+                    value={mediaCurrentTime}
                     onChange={(value) => {
                       if (typeof value !== 'number') return;
                       postPlaybackMediaControl({
                         version: 1,
                         type: 'playback-media-control',
-                        action: 'set-volume',
-                        volume: value,
+                        action: 'seek',
+                        current_time: value,
                       });
                     }}
-                    disabled={!mediaState}
-                    style={{ width: 180 }}
+                    disabled={!mediaState || mediaDuration <= 0}
                   />
-                  <Button
-                    onClick={() => void togglePictureInPicture()}
-                    disabled={!mediaState || !pictureInPictureSupported}
-                  >
-                    {pictureInPictureActive ? '退出画中画' : '画中画'}
-                  </Button>
+                  <Space wrap>
+                    <Button
+                      onClick={() => postPlaybackMediaControl({ version: 1, type: 'playback-media-control', action: 'toggle-muted' })}
+                      disabled={!mediaState}
+                    >
+                      {mediaState?.muted ? '取消静音' : '静音'}
+                    </Button>
+                    <Typography.Text>音量</Typography.Text>
+                    <Slider
+                      aria-label="音量"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={mediaState?.volume ?? 1}
+                      onChange={(value) => {
+                        if (typeof value !== 'number') return;
+                        postPlaybackMediaControl({
+                          version: 1,
+                          type: 'playback-media-control',
+                          action: 'set-volume',
+                          volume: value,
+                        });
+                      }}
+                      disabled={!mediaState}
+                      style={{ width: 180 }}
+                    />
+                    <Button
+                      onClick={() => void togglePictureInPicture()}
+                      disabled={!mediaState || !pictureInPictureSupported}
+                    >
+                      {pictureInPictureActive ? '退出画中画' : '画中画'}
+                    </Button>
+                  </Space>
                 </Space>
               </Space>
-            </Space>
-          </Card>
-          {probe || snapshot?.source_media ? (
-            <Card title="当前源素材">
-              <Descriptions column={1} size="small">
-                <Descriptions.Item label="文件">
-                  {snapshot?.source_media?.file_name ?? probe?.source.file_name}
-                </Descriptions.Item>
-                <Descriptions.Item label="时长">
-                  {snapshot?.source_media?.duration_ms ?? probe?.source.duration_ms ?? '-'} ms
-                </Descriptions.Item>
-                <Descriptions.Item label="SHA-256">
-                  {snapshot?.source_media?.mp4_sha256 ??
-                    `计算中（${snapshot?.source_media?.mp4_hash_status ?? probe?.source.mp4_hash_status}）`}
-                </Descriptions.Item>
-              </Descriptions>
             </Card>
-          ) : null}
-          <Card title="处理开关">
-            <Space direction="vertical" size="middle">
-              <Switch
-                checked={videoProcessingEnabled}
-                onChange={(checked) =>
-                  void updateProcessingSwitches({
-                    video_processing_enabled: checked,
-                    audio_processing_enabled: audioProcessingEnabled,
-                    realtime_audio_variant_enabled: realtimeAudioVariantEnabled,
-                  })
-                }
-              />{' '}
-              视频处理
-              <Switch
-                checked={audioProcessingEnabled}
-                onChange={(checked) =>
-                  void updateProcessingSwitches({
-                    video_processing_enabled: videoProcessingEnabled,
-                    audio_processing_enabled: checked,
-                    realtime_audio_variant_enabled: realtimeAudioVariantEnabled,
-                  })
-                }
-              />{' '}
-              声音处理
-              <Switch
-                checked={realtimeAudioVariantEnabled}
-                onChange={(checked) =>
-                  void updateProcessingSwitches({
-                    video_processing_enabled: videoProcessingEnabled,
-                    audio_processing_enabled: audioProcessingEnabled,
-                    realtime_audio_variant_enabled: checked,
-                  })
-                }
-              />{' '}
-              实时话术幻化
-            </Space>
-            <Space wrap style={{ marginTop: 16 }}>
-              <Button
-                type="primary"
-                onClick={() => void applyMediaProcessing()}
-                loading={mediaProcessingBusy}
-                disabled={
-                  !snapshot?.source_media ||
-                  !researchParams ||
-                  (!videoProcessingEnabled && !audioProcessingEnabled) ||
-                  snapshot.video_processing_status === 'processing' ||
-                  snapshot.audio_processing_status === 'processing'
-                  || mediaProcessingBusy
-                }
-              >
-                应用当前处理参数
-              </Button>
-              <Tag color={mediaEngineCapabilities?.available ? 'green' : 'orange'}>
-                媒体引擎：{mediaEngineCapabilities?.available ? '可用' : '不可用'}
-              </Tag>
-            </Space>
-            <Alert
-              style={{ marginTop: 16 }}
-              type={mediaEngineCapabilities?.available ? 'success' : 'warning'}
-              showIcon
-              message={
-                mediaEngineCapabilities?.available
-                  ? 'FFmpeg/FFprobe 已就绪，处理结果将在当前视频下一轮开始时切换'
-                  : `本地媒体引擎不可用：${mediaEngineCapabilities?.reason ?? '未完成能力探测'}`
-              }
-            />
-            <Alert
-              style={{ marginTop: 16 }}
-              type={workerCapabilities?.available ? 'success' : 'warning'}
-              showIcon
-              message={
-                workerCapabilities?.available
-                  ? `本地话术 Worker：${workerCapabilities.provider}/${workerCapabilities.model}`
-                  : `本地话术 Worker 不可用：${workerCapabilities?.reason ?? '未完成能力探测'}`
-              }
-            />
-          </Card>
-          <Card title="声音克隆替换">
-            <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-              <Space wrap>
-                <Tag color={voiceCloneWorkerCapabilities?.available ? 'green' : 'orange'}>
-                  Worker：{voiceCloneWorkerCapabilities?.available ? '可用' : '不可用'}
-                </Tag>
-                <Tag color={voiceCloneStatus === 'ready' || voiceCloneStatus === 'playing' ? 'green' : 'blue'}>
-                  状态：{getVoiceCloneStatusLabel(voiceCloneStatus)}
-                </Tag>
-                <Tag>预制：{voiceClonePresets.length} / 10</Tag>
-                {voiceCloneState?.model ? <Tag>{voiceCloneState.model}</Tag> : null}
-              </Space>
-              <Alert type={voiceCloneNotice.type} showIcon message={voiceCloneNotice.message} />
-              <Progress
-                percent={getVoiceCloneProgress(voiceCloneStatus)}
-                status={voiceCloneProgressStatus}
-                showInfo={false}
-              />
-              {realtimeAudioBusy ? <Alert type="warning" showIcon message="当前实时音频正在占用" /> : null}
-              {voiceCloneFormError ? <Alert type="error" showIcon message={voiceCloneFormError} /> : null}
-              <Select
-                allowClear
-                placeholder="选择一条本地预制文本"
-                value={selectedVoiceClonePresetId ?? undefined}
-                options={voiceClonePresets.map((preset) => ({
-                  label: preset.title,
-                  value: preset.id,
-                }))}
-                onChange={(value) => applyVoiceClonePresetSelection(typeof value === 'string' ? value : null)}
-              />
-              <Input
-                placeholder="预制标题"
-                value={voiceClonePresetTitle}
-                maxLength={80}
-                onChange={(event) => {
-                  setVoiceClonePresetTitle(event.target.value);
-                  setVoiceCloneFormError(null);
-                }}
-              />
-              <Input.TextArea
-                value={voiceCloneText}
-                rows={5}
-                maxLength={500}
-                placeholder="输入或编辑要替换当前话术的文本"
-                onChange={(event) => {
-                  setVoiceCloneText(event.target.value);
-                  setVoiceCloneFormError(null);
-                }}
-              />
-              <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
-                <Typography.Text type={voiceCloneTextCount > 500 ? 'danger' : undefined}>
-                  文本字数：{voiceCloneTextCount} / 500
-                </Typography.Text>
-                {voiceCloneState?.replace_at_ms !== null && voiceCloneState?.replace_at_ms !== undefined ? (
-                  <Typography.Text type="secondary">
-                    最近替换位置：{formatMediaTime((voiceCloneState.replace_at_ms ?? 0) / 1000)}
-                  </Typography.Text>
-                ) : null}
-              </Space>
-              <Space wrap>
-                <Button
-                  onClick={() => void prepareVoiceCloneSource()}
-                  loading={voiceCloneActionBusy === 'prepare'}
-                  disabled={voiceClonePrepareDisabledReason !== null}
-                >
-                  准备人声
-                </Button>
-                <Button
-                  type="primary"
-                  onClick={() => void startVoiceCloneReplacement()}
-                  loading={voiceCloneActionBusy === 'replace'}
-                  disabled={voiceCloneReplaceDisabledReason !== null}
-                >
-                  替换当前话
-                </Button>
-                <Button
-                  onClick={saveVoiceClonePresetFromForm}
-                  disabled={voiceCloneSaveDisabledReason !== null}
-                >
-                  {selectedVoiceClonePreset ? '更新预制文本' : '保存预制文本'}
-                </Button>
-                <Button
-                  danger
-                  onClick={deleteSelectedVoiceClonePreset}
-                  disabled={!selectedVoiceClonePreset}
-                >
-                  删除预制文本
-                </Button>
-                <Button
-                  onClick={() => void cancelVoiceCloneOperation()}
-                  loading={voiceCloneActionBusy === 'cancel'}
-                  disabled={!voiceCloneCanCancel}
-                >
-                  取消
-                </Button>
-                <Button
-                  onClick={() => void clearVoiceCloneReplacement()}
-                  loading={voiceCloneActionBusy === 'clear'}
-                  disabled={!voiceCloneCanClear}
-                >
-                  清空当前替换
-                </Button>
-              </Space>
-              <Typography.Text type="secondary">
-                替换时会取当前播放器位置，只替换点击瞬间所在话术片段的后半段，并在下一轮循环恢复原音频。
-              </Typography.Text>
-            </Space>
-          </Card>
-          <Card title="运行时参数预览">
-            <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-              <Space wrap>
-                <Tag color={videoProcessingEnabled ? 'green' : 'default'}>
-                  视频动态：{videoProcessingEnabled ? '开启' : '关闭'}
-                </Tag>
-                <Tag color={audioProcessingEnabled ? 'green' : 'default'}>
-                  声音动态：{audioProcessingEnabled ? '开启' : '关闭'}
-                </Tag>
-                <Tag>周期：{runtimePeriodMs} ms</Tag>
-                <Tag>第 {runtimeCycle} 次变化</Tag>
-                <Tag>下一次：{runtimeRemainingMs === null ? '未启动' : `${runtimeRemainingMs} ms`}</Tag>
-              </Space>
-              {runtimeActive && runtimeBaseParameters && runtimePreview ? (
-                <Descriptions column={2} size="small">
-                  <Descriptions.Item label="音频增益（配置 / 当前）">
-                    {runtimeBaseParameters.audio_gain_db.toFixed(1)} / {runtimePreview.audio_gain_db.toFixed(1)} dB
+            {probe || snapshot?.source_media ? (
+              <Card title="当前源素材">
+                <Descriptions column={1} size="small">
+                  <Descriptions.Item label="文件">
+                    {snapshot?.source_media?.file_name ?? probe?.source.file_name}
                   </Descriptions.Item>
-                  <Descriptions.Item label="亮度（配置 / 当前）">
-                    {runtimeBaseParameters.video_brightness_percent.toFixed(1)} / {runtimePreview.video_brightness_percent.toFixed(1)}%
+                  <Descriptions.Item label="时长">
+                    {snapshot?.source_media?.duration_ms ?? probe?.source.duration_ms ?? '-'} ms
                   </Descriptions.Item>
-                  <Descriptions.Item label="对比度（配置 / 当前）">
-                    {runtimeBaseParameters.video_contrast_percent.toFixed(1)} / {runtimePreview.video_contrast_percent.toFixed(1)}%
-                  </Descriptions.Item>
-                  <Descriptions.Item label="饱和度（配置 / 当前）">
-                    {runtimeBaseParameters.video_saturation_percent.toFixed(1)} / {runtimePreview.video_saturation_percent.toFixed(1)}%
-                  </Descriptions.Item>
-                  <Descriptions.Item label="色相 / 模糊">
-                    {runtimePreview.video_hue_rotation_degrees.toFixed(1)}° / {runtimePreview.video_blur_radius_px.toFixed(1)} px
-                  </Descriptions.Item>
-                  <Descriptions.Item label="画面缩放 / 位移">
-                    {runtimePreview.video_pixel_scale_percent.toFixed(1)}% / {runtimePreview.video_space_x_offset_px.toFixed(1)}, {runtimePreview.video_space_y_offset_px.toFixed(1)} px
+                  <Descriptions.Item label="SHA-256">
+                    {snapshot?.source_media?.mp4_sha256 ??
+                      `计算中（${snapshot?.source_media?.mp4_hash_status ?? probe?.source.mp4_hash_status}）`}
                   </Descriptions.Item>
                 </Descriptions>
-              ) : (
-                <Alert type="info" showIcon message="打开视频处理或声音处理开关后，运行时预览会按周期变化；关闭后恢复配置基线。" />
-              )}
-              {runtimeChannelError ? <Alert type="warning" showIcon message={runtimeChannelError} /> : null}
-            </Space>
-          </Card>
-          <Card title="实时诊断">
-            <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-              <Tag color={diagnosticFresh ? 'green' : 'orange'}>
-                {diagnosticFresh ? '已收到独立播放器采样' : '等待独立播放器采样'}
-              </Tag>
-              {diagnosticMessage?.error ? <Alert type="warning" showIcon message={diagnosticMessage.error} /> : null}
-              <canvas ref={waveformCanvasRef} width={640} height={96} aria-label="实时波形" style={{ display: 'block', width: '100%', height: 96 }} />
-              <canvas ref={spectrumCanvasRef} width={640} height={96} aria-label="实时频谱" style={{ display: 'block', width: '100%', height: 96 }} />
-            </Space>
-          </Card>
-          <Card
-            title="本地研究参数"
-            extra={
-              <Space>
-                <Button onClick={() => void resetResearchParams()}>恢复默认</Button>
-                <Button type="primary" onClick={() => void validateResearchParams()} disabled={!researchParams}>
-                  校验参数
-                </Button>
-              </Space>
-            }
-          >
-            <Alert
-              type={researchValidationStatus === 'invalid' ? 'error' : researchValidationStatus === 'valid' ? 'success' : 'info'}
-              showIcon
-              message={
-                researchValidationStatus === 'invalid'
-                  ? `参数有 ${researchValidation.length} 项错误`
-                  : researchValidationStatus === 'valid'
-                    ? '参数契约校验通过（当前仅校验，未执行媒体算法）'
-                    : '参数先由 Rust 校验；点击“应用当前处理参数”后在后台生成当前源视频的预览缓存'
-              }
-              description={researchValidation.slice(0, 3).map((item) => `${item.field}：${item.message}`).join('；') || undefined}
-            />
-            {researchParams ? (
-              <Space wrap style={{ marginTop: 16 }}>
-                <InputNumber
-                  addonBefore="动态周期"
-                  addonAfter="ms"
-                  value={researchParams.audio.random_change_period_ms}
-                  min={500}
-                  max={60_000}
-                  step={500}
-                  onChange={(value) => updateResearchParam('audio', 'random_change_period_ms', value)}
-                />
-                <InputNumber
-                  addonBefore="音高微移"
-                  addonAfter="半音"
-                  value={researchParams.audio.pitch_shift_semitones}
-                  min={-2}
-                  max={2}
-                  step={0.1}
-                  onChange={(value) => updateResearchParam('audio', 'pitch_shift_semitones', value)}
-                />
-                <InputNumber
-                  addonBefore="MFCC"
-                  addonAfter="%"
-                  value={researchParams.audio.mfcc_shift_percent}
-                  min={-20}
-                  max={20}
-                  onChange={(value) => updateResearchParam('audio', 'mfcc_shift_percent', value)}
-                />
-                <InputNumber
-                  addonBefore="SNR 浮动"
-                  addonAfter="dB"
-                  value={researchParams.audio.snr_variation_db}
-                  min={-6}
-                  max={6}
-                  onChange={(value) => updateResearchParam('audio', 'snr_variation_db', value)}
-                />
-                <InputNumber
-                  addonBefore="输入增益"
-                  addonAfter="dB"
-                  value={researchParams.audio.input_gain_db}
-                  min={-6}
-                  max={6}
-                  step={0.1}
-                  onChange={(value) => updateResearchParam('audio', 'input_gain_db', value)}
-                />
-                <InputNumber
-                  addonBefore="输出增益"
-                  addonAfter="dB"
-                  value={researchParams.audio.output_gain_db}
-                  min={-6}
-                  max={6}
-                  step={0.1}
-                  onChange={(value) => updateResearchParam('audio', 'output_gain_db', value)}
-                />
-                <InputNumber
-                  addonBefore="响度"
-                  addonAfter="dB"
-                  value={researchParams.audio.loudness_adjustment_db}
-                  min={-6}
-                  max={6}
-                  step={0.1}
-                  onChange={(value) => updateResearchParam('audio', 'loudness_adjustment_db', value)}
-                />
-                <Select
-                  aria-label="音频采样率"
-                  value={researchParams.audio.sample_rate_hz ?? 'source'}
-                  options={[
-                    { label: '采样率：跟随源素材', value: 'source' },
-                    { label: '采样率：44100 Hz', value: 44100 },
-                    { label: '采样率：48000 Hz', value: 48000 },
-                  ]}
-                  onChange={updateAudioSampleRate}
-                />
-                <InputNumber
-                  addonBefore="亮度"
-                  addonAfter="%"
-                  value={researchParams.video.brightness_percent}
-                  min={-100}
-                  max={100}
-                  onChange={(value) => updateResearchParam('video', 'brightness_percent', value)}
-                />
-                <InputNumber
-                  addonBefore="对比度"
-                  addonAfter="%"
-                  value={researchParams.video.contrast_percent}
-                  min={0}
-                  max={200}
-                  onChange={(value) => updateResearchParam('video', 'contrast_percent', value)}
-                />
-                <InputNumber
-                  addonBefore="饱和度"
-                  addonAfter="%"
-                  value={researchParams.video.saturation_percent}
-                  min={0}
-                  max={200}
-                  onChange={(value) => updateResearchParam('video', 'saturation_percent', value)}
-                />
-                <InputNumber
-                  addonBefore="色相"
-                  addonAfter="°"
-                  value={researchParams.video.hue_rotation_degrees}
-                  min={-180}
-                  max={180}
-                  onChange={(value) => updateResearchParam('video', 'hue_rotation_degrees', value)}
-                />
-                <InputNumber
-                  addonBefore="像素缩放"
-                  addonAfter="%"
-                  value={researchParams.video.pixel_scale_percent}
-                  min={95}
-                  max={105}
-                  step={0.1}
-                  onChange={(value) => updateResearchParam('video', 'pixel_scale_percent', value)}
-                />
-                <InputNumber
-                  addonBefore="模糊"
-                  addonAfter="px"
-                  value={researchParams.video.blur_radius_px}
-                  min={0}
-                  max={8}
-                  step={0.1}
-                  onChange={(value) => updateResearchParam('video', 'blur_radius_px', value)}
-                />
-                <InputNumber
-                  addonBefore="锐化"
-                  addonAfter="%"
-                  value={researchParams.video.sharpen_percent}
-                  min={0}
-                  max={100}
-                  onChange={(value) => updateResearchParam('video', 'sharpen_percent', value)}
-                />
-                <InputNumber
-                  addonBefore="噪点"
-                  addonAfter="%"
-                  value={researchParams.video.noise_percent}
-                  min={0}
-                  max={8}
-                  step={0.1}
-                  onChange={(value) => updateResearchParam('video', 'noise_percent', value)}
-                />
-                <InputNumber
-                  addonBefore="细节增强"
-                  addonAfter="%"
-                  value={researchParams.video.detail_enhancement_percent}
-                  min={0}
-                  max={50}
-                  step={0.1}
-                  onChange={(value) => updateResearchParam('video', 'detail_enhancement_percent', value)}
-                />
-                <InputNumber
-                  addonBefore="动态裁剪"
-                  addonAfter="%/边"
-                  value={researchParams.video.dynamic_crop_percent}
-                  min={0}
-                  max={4}
-                  step={0.1}
-                  onChange={(value) => updateResearchParam('video', 'dynamic_crop_percent', value)}
-                />
-                <InputNumber
-                  addonBefore="像素扰动"
-                  addonAfter="px"
-                  value={researchParams.video.pixel_jitter_px}
-                  min={0}
-                  max={2}
-                  step={0.1}
-                  onChange={(value) => updateResearchParam('video', 'pixel_jitter_px', value)}
-                />
-                <InputNumber
-                  addonBefore="X 偏移"
-                  addonAfter="px"
-                  value={researchParams.video.space_x_offset_px}
-                  min={-4}
-                  max={4}
-                  step={0.1}
-                  onChange={(value) => updateResearchParam('video', 'space_x_offset_px', value)}
-                />
-                <InputNumber
-                  addonBefore="Y 偏移"
-                  addonAfter="px"
-                  value={researchParams.video.space_y_offset_px}
-                  min={-4}
-                  max={4}
-                  step={0.1}
-                  onChange={(value) => updateResearchParam('video', 'space_y_offset_px', value)}
-                />
-                <InputNumber
-                  addonBefore="切片间隔"
-                  addonAfter="ms"
-                  value={researchParams.research.slice_trigger_interval_ms}
-                  min={5_000}
-                  max={120_000}
-                  onChange={(value) => updateResearchParam('research', 'slice_trigger_interval_ms', value)}
-                />
-              </Space>
+              </Card>
             ) : null}
-          </Card>
-          <Card title="本地研究分析 Worker">
-            <Space direction="vertical" style={{ width: '100%' }}>
+          </section>
+
+          <section className="desktop-column desktop-column-audio" aria-label="音频设置">
+            <Card title="声音设置">
+              <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                <Space align="center">
+                  <Switch
+                    checked={audioProcessingEnabled}
+                    onChange={(checked) =>
+                      void updateProcessingSwitches({
+                        video_processing_enabled: videoProcessingEnabled,
+                        audio_processing_enabled: checked,
+                        realtime_audio_variant_enabled: realtimeAudioVariantEnabled,
+                      })
+                    }
+                  />
+                  <Typography.Text>声音处理</Typography.Text>
+                </Space>
+                <Space align="center">
+                  <Switch
+                    checked={realtimeAudioVariantEnabled}
+                    onChange={(checked) =>
+                      void updateProcessingSwitches({
+                        video_processing_enabled: videoProcessingEnabled,
+                        audio_processing_enabled: audioProcessingEnabled,
+                        realtime_audio_variant_enabled: checked,
+                      })
+                    }
+                  />
+                  <Typography.Text>实时话术幻化</Typography.Text>
+                </Space>
+                <Alert
+                  type={workerCapabilities?.available ? 'success' : 'warning'}
+                  showIcon
+                  message={
+                    workerCapabilities?.available
+                      ? `本地话术 Worker：${workerCapabilities.provider}/${workerCapabilities.model}`
+                      : `本地话术 Worker 不可用：${workerCapabilities?.reason ?? '未完成能力探测'}`
+                  }
+                />
+              </Space>
+            </Card>
+            <Card title="声音克隆替换">
+              <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                <Space wrap>
+                  <Tag color={voiceCloneWorkerCapabilities?.available ? 'green' : 'orange'}>
+                    Worker：{voiceCloneWorkerCapabilities?.available ? '可用' : '不可用'}
+                  </Tag>
+                  <Tag color={voiceCloneStatus === 'ready' || voiceCloneStatus === 'playing' ? 'green' : 'blue'}>
+                    状态：{getVoiceCloneStatusLabel(voiceCloneStatus)}
+                  </Tag>
+                  <Tag>预制：{voiceClonePresets.length} / 10</Tag>
+                  {voiceCloneState?.model ? <Tag>{voiceCloneState.model}</Tag> : null}
+                </Space>
+                <Alert type={voiceCloneNotice.type} showIcon message={voiceCloneNotice.message} />
+                <Progress
+                  percent={getVoiceCloneProgress(voiceCloneStatus)}
+                  status={voiceCloneProgressStatus}
+                  showInfo={false}
+                />
+                {realtimeAudioBusy ? <Alert type="warning" showIcon message="当前实时音频正在占用" /> : null}
+                {voiceCloneFormError ? <Alert type="error" showIcon message={voiceCloneFormError} /> : null}
+                <Select
+                  allowClear
+                  placeholder="选择一条本地预制文本"
+                  value={selectedVoiceClonePresetId ?? undefined}
+                  options={voiceClonePresets.map((preset) => ({
+                    label: preset.title,
+                    value: preset.id,
+                  }))}
+                  onChange={(value) => applyVoiceClonePresetSelection(typeof value === 'string' ? value : null)}
+                />
+                <Input
+                  placeholder="预制标题"
+                  value={voiceClonePresetTitle}
+                  maxLength={80}
+                  onChange={(event) => {
+                    setVoiceClonePresetTitle(event.target.value);
+                    setVoiceCloneFormError(null);
+                  }}
+                />
+                <Input.TextArea
+                  value={voiceCloneText}
+                  rows={5}
+                  maxLength={500}
+                  placeholder="输入或编辑要替换当前话术的文本"
+                  onChange={(event) => {
+                    setVoiceCloneText(event.target.value);
+                    setVoiceCloneFormError(null);
+                  }}
+                />
+                <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
+                  <Typography.Text type={voiceCloneTextCount > 500 ? 'danger' : undefined}>
+                    文本字数：{voiceCloneTextCount} / 500
+                  </Typography.Text>
+                  {voiceCloneState?.replace_at_ms !== null && voiceCloneState?.replace_at_ms !== undefined ? (
+                    <Typography.Text type="secondary">
+                      最近替换位置：{formatMediaTime((voiceCloneState.replace_at_ms ?? 0) / 1000)}
+                    </Typography.Text>
+                  ) : null}
+                </Space>
+                <Space wrap>
+                  <Button
+                    onClick={() => void prepareVoiceCloneSource()}
+                    loading={voiceCloneActionBusy === 'prepare'}
+                    disabled={voiceClonePrepareDisabledReason !== null}
+                  >
+                    准备人声
+                  </Button>
+                  <Button
+                    type="primary"
+                    onClick={() => void startVoiceCloneReplacement()}
+                    loading={voiceCloneActionBusy === 'replace'}
+                    disabled={voiceCloneReplaceDisabledReason !== null}
+                  >
+                    替换当前话
+                  </Button>
+                  <Button onClick={saveVoiceClonePresetFromForm} disabled={voiceCloneSaveDisabledReason !== null}>
+                    {selectedVoiceClonePreset ? '更新预制文本' : '保存预制文本'}
+                  </Button>
+                  <Button danger onClick={deleteSelectedVoiceClonePreset} disabled={!selectedVoiceClonePreset}>
+                    删除预制文本
+                  </Button>
+                  <Button
+                    onClick={() => void cancelVoiceCloneOperation()}
+                    loading={voiceCloneActionBusy === 'cancel'}
+                    disabled={!voiceCloneCanCancel}
+                  >
+                    取消
+                  </Button>
+                  <Button
+                    onClick={() => void clearVoiceCloneReplacement()}
+                    loading={voiceCloneActionBusy === 'clear'}
+                    disabled={!voiceCloneCanClear}
+                  >
+                    清空当前替换
+                  </Button>
+                </Space>
+                <Typography.Text type="secondary">
+                  替换时会取当前播放器位置，只替换点击瞬间所在话术片段的后半段，并在下一轮循环恢复原音频。
+                </Typography.Text>
+              </Space>
+            </Card>
+            <Card title="音频实时参数预览">
+              <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                <Space wrap>
+                  <Tag color={audioProcessingEnabled ? 'green' : 'default'}>
+                    声音动态：{audioProcessingEnabled ? '开启' : '关闭'}
+                  </Tag>
+                  <Tag>周期：{runtimePeriodMs} ms</Tag>
+                  <Tag>第 {runtimeCycle} 次变化</Tag>
+                  <Tag>下一次：{runtimeRemainingMs === null ? '未启动' : `${runtimeRemainingMs} ms`}</Tag>
+                </Space>
+                {runtimeActive && runtimeBaseParameters && runtimePreview ? (
+                  <Descriptions column={1} size="small">
+                    <Descriptions.Item label="音频增益（配置 / 当前）">
+                      {runtimeBaseParameters.audio_gain_db.toFixed(1)} / {runtimePreview.audio_gain_db.toFixed(1)} dB
+                    </Descriptions.Item>
+                  </Descriptions>
+                ) : (
+                  <Alert type="info" showIcon message="打开声音处理或视频处理开关后，运行时预览会按周期变化；关闭后恢复配置基线。" />
+                )}
+              </Space>
+            </Card>
+            <Card title="实时诊断">
+              <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                <Tag color={diagnosticFresh ? 'green' : 'orange'}>
+                  {diagnosticFresh ? '已收到独立播放器采样' : '等待独立播放器采样'}
+                </Tag>
+                {diagnosticMessage?.error ? <Alert type="warning" showIcon message={diagnosticMessage.error} /> : null}
+                <canvas ref={waveformCanvasRef} width={640} height={96} aria-label="实时波形" style={{ display: 'block', width: '100%', height: 96 }} />
+                <canvas ref={spectrumCanvasRef} width={640} height={96} aria-label="实时频谱" style={{ display: 'block', width: '100%', height: 96 }} />
+              </Space>
+            </Card>
+            <Card
+              title="音频研究参数"
+              extra={
+                <Space>
+                  <Button onClick={() => void resetResearchParams()}>恢复默认</Button>
+                  <Button type="primary" onClick={() => void validateResearchParams()} disabled={!researchParams}>
+                    校验参数
+                  </Button>
+                </Space>
+              }
+            >
               <Alert
-                type={researchWorkerCapabilities?.available ? 'success' : 'warning'}
+                type={researchValidationStatus === 'invalid' ? 'error' : researchValidationStatus === 'valid' ? 'success' : 'info'}
                 showIcon
                 message={
-                  researchWorkerCapabilities?.available
-                    ? `研究 Worker 已配置：${researchWorkerCapabilities.executable}`
-                    : `研究 Worker 不可用：${researchWorkerCapabilities?.reason ?? '未完成能力探测'}`
+                  researchValidationStatus === 'invalid'
+                    ? `参数有 ${researchValidation.length} 项错误`
+                    : researchValidationStatus === 'valid'
+                      ? '参数契约校验通过（当前仅校验，未执行媒体算法）'
+                      : '参数先由 Rust 校验；点击“应用当前处理参数”后在后台生成当前源视频的预览缓存'
                 }
+                description={researchValidation.slice(0, 3).map((item) => `${item.field}：${item.message}`).join('；') || undefined}
               />
-              <Space wrap>
-                <Button
-                  type="primary"
-                  onClick={() => void startResearchAnalysis(false)}
-                  loading={researchActionBusy}
-                  disabled={!researchParams || !snapshot?.source_media || !researchWorkerCapabilities?.available || researchStatus?.state === 'running'}
-                >
-                  开始分析
-                </Button>
-                <Button
-                  onClick={() => void startResearchAnalysis(true)}
-                  loading={researchActionBusy}
-                  disabled={!researchParams || !snapshot?.source_media || !researchWorkerCapabilities?.available || researchStatus?.state === 'running'}
-                >
-                  分析并生成研究 MP4
-                </Button>
-                <Button danger loading={researchCancelBusy} onClick={() => void cancelResearchAnalysis()} disabled={researchStatus?.state !== 'running' || researchCancelBusy}>
-                  取消
-                </Button>
-                <Tag color={researchStatus?.state === 'ready' ? 'green' : researchStatus?.state === 'failed' ? 'red' : 'blue'}>
-                  状态：{researchStatus?.state ?? 'idle'}
-                </Tag>
-              </Space>
-              <Checkbox disabled>研究结果仅用于本地授权分析，不参与播放决策</Checkbox>
-              {researchStatus?.error ? <Alert type="error" showIcon message={researchStatus.error} /> : null}
-              {researchStatus?.state === 'ready' ? (
-                <Descriptions column={2} size="small">
-                  <Descriptions.Item label="内容相似度">{researchStatus.content_similarity_percent ?? '-'}%</Descriptions.Item>
-                  <Descriptions.Item label="媒体鲁棒性">{researchStatus.media_robustness_score ?? '-'}</Descriptions.Item>
-                  <Descriptions.Item label="隐形标记状态">{researchStatus.invisible_mark_status ?? '-'}</Descriptions.Item>
-                  <Descriptions.Item label="随机种子">{researchStatus.random_seed ?? '-'}</Descriptions.Item>
-                  <Descriptions.Item label="算法版本">{researchStatus.algorithm_version ?? '-'}</Descriptions.Item>
-                  <Descriptions.Item label="报告 SHA-256">{researchStatus.report_sha256 ?? '-'}</Descriptions.Item>
-                  <Descriptions.Item label="原始 MP4 SHA-256">{researchStatus.source_mp4_sha256 ?? '-'}</Descriptions.Item>
-                  <Descriptions.Item label="阶段输入 MP4 SHA-256">{researchStatus.input_mp4_sha256 ?? '-'}</Descriptions.Item>
-                  <Descriptions.Item label="当前 MP4 SHA-256">{researchStatus.current_mp4_sha256 ?? '-'}</Descriptions.Item>
-                </Descriptions>
+              {researchParams ? (
+                <Space wrap style={{ marginTop: 16 }}>
+                  <InputNumber addonBefore="动态周期" addonAfter="ms" value={researchParams.audio.random_change_period_ms} min={500} max={60_000} step={500} onChange={(value) => updateResearchParam('audio', 'random_change_period_ms', value)} />
+                  <InputNumber addonBefore="音高微移" addonAfter="半音" value={researchParams.audio.pitch_shift_semitones} min={-2} max={2} step={0.1} onChange={(value) => updateResearchParam('audio', 'pitch_shift_semitones', value)} />
+                  <InputNumber addonBefore="MFCC" addonAfter="%" value={researchParams.audio.mfcc_shift_percent} min={-20} max={20} onChange={(value) => updateResearchParam('audio', 'mfcc_shift_percent', value)} />
+                  <InputNumber addonBefore="SNR 浮动" addonAfter="dB" value={researchParams.audio.snr_variation_db} min={-6} max={6} onChange={(value) => updateResearchParam('audio', 'snr_variation_db', value)} />
+                  <InputNumber addonBefore="输入增益" addonAfter="dB" value={researchParams.audio.input_gain_db} min={-6} max={6} step={0.1} onChange={(value) => updateResearchParam('audio', 'input_gain_db', value)} />
+                  <InputNumber addonBefore="输出增益" addonAfter="dB" value={researchParams.audio.output_gain_db} min={-6} max={6} step={0.1} onChange={(value) => updateResearchParam('audio', 'output_gain_db', value)} />
+                  <InputNumber addonBefore="响度" addonAfter="dB" value={researchParams.audio.loudness_adjustment_db} min={-6} max={6} step={0.1} onChange={(value) => updateResearchParam('audio', 'loudness_adjustment_db', value)} />
+                  <Select
+                    aria-label="音频采样率"
+                    value={researchParams.audio.sample_rate_hz ?? 'source'}
+                    options={[
+                      { label: '采样率：跟随源素材', value: 'source' },
+                      { label: '采样率：44100 Hz', value: 44100 },
+                      { label: '采样率：48000 Hz', value: 48000 },
+                    ]}
+                    onChange={updateAudioSampleRate}
+                  />
+                </Space>
               ) : null}
-              <Space wrap>
-                <Button loading={cacheCleanupBusy} onClick={() => void cleanupLocalCaches()} disabled={cacheCleanupBusy}>清理本地缓存</Button>
-                {cacheCleanup ? (
-                  <Tag>
-                    已清理 {cacheCleanup.removed_files} 个文件 / {(cacheCleanup.removed_bytes / 1024 / 1024).toFixed(1)} MB
+            </Card>
+          </section>
+
+          <section className="desktop-column desktop-column-video" aria-label="视频实时预览与参数">
+            <Card title="视频实时预览" extra={<Tag color={pictureInPictureSourceUrl ? 'green' : 'default'}>{pictureInPictureSourceUrl ? '已加载源视频' : '等待导入'}</Tag>}>
+              {pictureInPictureSourceUrl ? (
+                <video
+                  ref={pictureInPictureVideoRef}
+                  src={pictureInPictureSourceUrl}
+                  muted
+                  playsInline
+                  preload="auto"
+                  aria-label="视频实时预览"
+                  onLoadedMetadata={syncPictureInPictureVideo}
+                  className="desktop-preview-video"
+                />
+              ) : (
+                <Alert type="info" showIcon message="导入视频后显示实时预览。" />
+              )}
+              <Typography.Text type="secondary">
+                预览与最终效果窗口共享播放位置，保持静音，不创建额外播放窗口。
+              </Typography.Text>
+            </Card>
+            <Card title="视频处理">
+              <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                <Space align="center">
+                  <Switch
+                    checked={videoProcessingEnabled}
+                    onChange={(checked) =>
+                      void updateProcessingSwitches({
+                        video_processing_enabled: checked,
+                        audio_processing_enabled: audioProcessingEnabled,
+                        realtime_audio_variant_enabled: realtimeAudioVariantEnabled,
+                      })
+                    }
+                  />
+                  <Typography.Text>视频处理</Typography.Text>
+                </Space>
+                <Space wrap>
+                  <Button
+                    type="primary"
+                    onClick={() => void applyMediaProcessing()}
+                    loading={mediaProcessingBusy}
+                    disabled={
+                      !snapshot?.source_media ||
+                      !researchParams ||
+                      (!videoProcessingEnabled && !audioProcessingEnabled) ||
+                      snapshot.video_processing_status === 'processing' ||
+                      snapshot.audio_processing_status === 'processing' ||
+                      mediaProcessingBusy
+                    }
+                  >
+                    应用当前处理参数
+                  </Button>
+                  <Tag color={mediaEngineCapabilities?.available ? 'green' : 'orange'}>
+                    媒体引擎：{mediaEngineCapabilities?.available ? '可用' : '不可用'}
                   </Tag>
-                ) : null}
+                </Space>
+                <Alert
+                  type={mediaEngineCapabilities?.available ? 'success' : 'warning'}
+                  showIcon
+                  message={
+                    mediaEngineCapabilities?.available
+                      ? 'FFmpeg/FFprobe 已就绪，处理结果将在当前视频下一轮开始时切换'
+                      : `本地媒体引擎不可用：${mediaEngineCapabilities?.reason ?? '未完成能力探测'}`
+                  }
+                />
               </Space>
-            </Space>
-          </Card>
-        </Space>
+            </Card>
+            <Card title="视频实时参数预览">
+              <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                <Space wrap>
+                  <Tag color={videoProcessingEnabled ? 'green' : 'default'}>
+                    视频动态：{videoProcessingEnabled ? '开启' : '关闭'}
+                  </Tag>
+                  <Tag>周期：{runtimePeriodMs} ms</Tag>
+                  <Tag>第 {runtimeCycle} 次变化</Tag>
+                  <Tag>下一次：{runtimeRemainingMs === null ? '未启动' : `${runtimeRemainingMs} ms`}</Tag>
+                </Space>
+                {runtimeActive && runtimeBaseParameters && runtimePreview ? (
+                  <Descriptions column={1} size="small">
+                    <Descriptions.Item label="亮度（配置 / 当前）">
+                      {runtimeBaseParameters.video_brightness_percent.toFixed(1)} / {runtimePreview.video_brightness_percent.toFixed(1)}%
+                    </Descriptions.Item>
+                    <Descriptions.Item label="对比度（配置 / 当前）">
+                      {runtimeBaseParameters.video_contrast_percent.toFixed(1)} / {runtimePreview.video_contrast_percent.toFixed(1)}%
+                    </Descriptions.Item>
+                    <Descriptions.Item label="饱和度（配置 / 当前）">
+                      {runtimeBaseParameters.video_saturation_percent.toFixed(1)} / {runtimePreview.video_saturation_percent.toFixed(1)}%
+                    </Descriptions.Item>
+                    <Descriptions.Item label="色相 / 模糊">
+                      {runtimePreview.video_hue_rotation_degrees.toFixed(1)}° / {runtimePreview.video_blur_radius_px.toFixed(1)} px
+                    </Descriptions.Item>
+                    <Descriptions.Item label="画面缩放 / 位移">
+                      {runtimePreview.video_pixel_scale_percent.toFixed(1)}% / {runtimePreview.video_space_x_offset_px.toFixed(1)}, {runtimePreview.video_space_y_offset_px.toFixed(1)} px
+                    </Descriptions.Item>
+                  </Descriptions>
+                ) : (
+                  <Alert type="info" showIcon message="打开视频处理或声音处理开关后，运行时预览会按周期变化；关闭后恢复配置基线。" />
+                )}
+                {runtimeChannelError ? <Alert type="warning" showIcon message={runtimeChannelError} /> : null}
+              </Space>
+            </Card>
+            <Card title="视频研究参数">
+              {researchParams ? (
+                <Space wrap>
+                  <InputNumber addonBefore="亮度" addonAfter="%" value={researchParams.video.brightness_percent} min={-100} max={100} onChange={(value) => updateResearchParam('video', 'brightness_percent', value)} />
+                  <InputNumber addonBefore="对比度" addonAfter="%" value={researchParams.video.contrast_percent} min={0} max={200} onChange={(value) => updateResearchParam('video', 'contrast_percent', value)} />
+                  <InputNumber addonBefore="饱和度" addonAfter="%" value={researchParams.video.saturation_percent} min={0} max={200} onChange={(value) => updateResearchParam('video', 'saturation_percent', value)} />
+                  <InputNumber addonBefore="色相" addonAfter="°" value={researchParams.video.hue_rotation_degrees} min={-180} max={180} onChange={(value) => updateResearchParam('video', 'hue_rotation_degrees', value)} />
+                  <InputNumber addonBefore="像素缩放" addonAfter="%" value={researchParams.video.pixel_scale_percent} min={95} max={105} step={0.1} onChange={(value) => updateResearchParam('video', 'pixel_scale_percent', value)} />
+                  <InputNumber addonBefore="模糊" addonAfter="px" value={researchParams.video.blur_radius_px} min={0} max={8} step={0.1} onChange={(value) => updateResearchParam('video', 'blur_radius_px', value)} />
+                  <InputNumber addonBefore="锐化" addonAfter="%" value={researchParams.video.sharpen_percent} min={0} max={100} onChange={(value) => updateResearchParam('video', 'sharpen_percent', value)} />
+                  <InputNumber addonBefore="噪点" addonAfter="%" value={researchParams.video.noise_percent} min={0} max={8} step={0.1} onChange={(value) => updateResearchParam('video', 'noise_percent', value)} />
+                  <InputNumber addonBefore="细节增强" addonAfter="%" value={researchParams.video.detail_enhancement_percent} min={0} max={50} step={0.1} onChange={(value) => updateResearchParam('video', 'detail_enhancement_percent', value)} />
+                  <InputNumber addonBefore="动态裁剪" addonAfter="%/边" value={researchParams.video.dynamic_crop_percent} min={0} max={4} step={0.1} onChange={(value) => updateResearchParam('video', 'dynamic_crop_percent', value)} />
+                  <InputNumber addonBefore="像素扰动" addonAfter="px" value={researchParams.video.pixel_jitter_px} min={0} max={2} step={0.1} onChange={(value) => updateResearchParam('video', 'pixel_jitter_px', value)} />
+                  <InputNumber addonBefore="X 偏移" addonAfter="px" value={researchParams.video.space_x_offset_px} min={-4} max={4} step={0.1} onChange={(value) => updateResearchParam('video', 'space_x_offset_px', value)} />
+                  <InputNumber addonBefore="Y 偏移" addonAfter="px" value={researchParams.video.space_y_offset_px} min={-4} max={4} step={0.1} onChange={(value) => updateResearchParam('video', 'space_y_offset_px', value)} />
+                  <InputNumber addonBefore="切片间隔" addonAfter="ms" value={researchParams.research.slice_trigger_interval_ms} min={5_000} max={120_000} onChange={(value) => updateResearchParam('research', 'slice_trigger_interval_ms', value)} />
+                </Space>
+              ) : (
+                <Alert type="info" showIcon message="正在读取视频研究参数…" />
+              )}
+            </Card>
+            <Card title="本地研究分析 Worker">
+              <Space direction="vertical" style={{ width: '100%' }}>
+                <Alert
+                  type={researchWorkerCapabilities?.available ? 'success' : 'warning'}
+                  showIcon
+                  message={
+                    researchWorkerCapabilities?.available
+                      ? `研究 Worker 已配置：${researchWorkerCapabilities.executable}`
+                      : `研究 Worker 不可用：${researchWorkerCapabilities?.reason ?? '未完成能力探测'}`
+                  }
+                />
+                <Space wrap>
+                  <Button
+                    type="primary"
+                    onClick={() => void startResearchAnalysis(false)}
+                    loading={researchActionBusy}
+                    disabled={!researchParams || !snapshot?.source_media || !researchWorkerCapabilities?.available || researchStatus?.state === 'running'}
+                  >
+                    开始分析
+                  </Button>
+                  <Button
+                    onClick={() => void startResearchAnalysis(true)}
+                    loading={researchActionBusy}
+                    disabled={!researchParams || !snapshot?.source_media || !researchWorkerCapabilities?.available || researchStatus?.state === 'running'}
+                  >
+                    分析并生成研究 MP4
+                  </Button>
+                  <Button danger loading={researchCancelBusy} onClick={() => void cancelResearchAnalysis()} disabled={researchStatus?.state !== 'running' || researchCancelBusy}>
+                    取消
+                  </Button>
+                  <Tag color={researchStatus?.state === 'ready' ? 'green' : researchStatus?.state === 'failed' ? 'red' : 'blue'}>
+                    状态：{researchStatus?.state ?? 'idle'}
+                  </Tag>
+                </Space>
+                <Checkbox disabled>研究结果仅用于本地授权分析，不参与播放决策</Checkbox>
+                {researchStatus?.error ? <Alert type="error" showIcon message={researchStatus.error} /> : null}
+                {researchStatus?.state === 'ready' ? (
+                  <Descriptions column={2} size="small">
+                    <Descriptions.Item label="内容相似度">{researchStatus.content_similarity_percent ?? '-'}%</Descriptions.Item>
+                    <Descriptions.Item label="媒体鲁棒性">{researchStatus.media_robustness_score ?? '-'}</Descriptions.Item>
+                    <Descriptions.Item label="隐形标记状态">{researchStatus.invisible_mark_status ?? '-'}</Descriptions.Item>
+                    <Descriptions.Item label="随机种子">{researchStatus.random_seed ?? '-'}</Descriptions.Item>
+                    <Descriptions.Item label="算法版本">{researchStatus.algorithm_version ?? '-'}</Descriptions.Item>
+                    <Descriptions.Item label="报告 SHA-256">{researchStatus.report_sha256 ?? '-'}</Descriptions.Item>
+                    <Descriptions.Item label="原始 MP4 SHA-256">{researchStatus.source_mp4_sha256 ?? '-'}</Descriptions.Item>
+                    <Descriptions.Item label="阶段输入 MP4 SHA-256">{researchStatus.input_mp4_sha256 ?? '-'}</Descriptions.Item>
+                    <Descriptions.Item label="当前 MP4 SHA-256">{researchStatus.current_mp4_sha256 ?? '-'}</Descriptions.Item>
+                  </Descriptions>
+                ) : null}
+                <Space wrap>
+                  <Button loading={cacheCleanupBusy} onClick={() => void cleanupLocalCaches()} disabled={cacheCleanupBusy}>清理本地缓存</Button>
+                  {cacheCleanup ? (
+                    <Tag>
+                      已清理 {cacheCleanup.removed_files} 个文件 / {(cacheCleanup.removed_bytes / 1024 / 1024).toFixed(1)} MB
+                    </Tag>
+                  ) : null}
+                </Space>
+              </Space>
+            </Card>
+          </section>
+        </div>
       </Layout.Content>
     </Layout>
   );

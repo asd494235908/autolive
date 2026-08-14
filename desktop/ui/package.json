@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "test": "node --test src/heartbeatOutbox.test.mjs src/运行时参数自动调度.test.mjs src/播放循环.test.mjs src/播放控制消息.test.mjs src/voiceClonePresets.test.mjs",
+    "test": "node --test src/heartbeatOutbox.test.mjs src/运行时参数自动调度.test.mjs src/播放循环.test.mjs src/播放控制消息.test.mjs src/voiceClonePresets.test.mjs src/桌面三列布局.test.mjs",
     "preview": "vite preview",
     "tauri:dev": "cd .. && tauri dev --config src-tauri/tauri.conf.json",
     "ffmpeg:prepare": "node ../工具/准备FFmpeg资源.mjs",
