@@ -13,7 +13,7 @@ class VoiceCloneAdapterTest(unittest.TestCase):
         real_import_module = adapter.importlib.import_module
 
         def fake_import_module(name: str, package: str | None = None):
-            if name in {"demucs", "faster_whisper", "TTS"}:
+            if name in {"demucs.separate", "faster_whisper", "TTS.api"}:
                 raise ImportError(name)
             return real_import_module(name, package)
 
@@ -56,6 +56,27 @@ class VoiceCloneAdapterTest(unittest.TestCase):
 
             self.assertFalse(output_path.exists())
             self.assertFalse(output_path.with_name("result.json.partial").exists())
+
+    def test_malformed_request_writes_structured_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            request_path = Path(temp_dir) / "request.json"
+            output_path = Path(temp_dir) / "result.json"
+            request_path.write_text("{broken", encoding="utf-8")
+
+            self.assertEqual(
+                adapter.main(
+                    [
+                        "--replace-json",
+                        str(request_path),
+                        "--output-json",
+                        str(output_path),
+                    ]
+                ),
+                0,
+            )
+            payload = adapter._read_json(output_path)
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["operation_id"], "invalid-request")
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ MAX_VOICE_CLONE_TEXT_CHARS = 500
 
 FFMPEG_PATH_ENV = "AUTOLIVE_FFMPEG_PATH"
 FFPROBE_PATH_ENV = "AUTOLIVE_FFPROBE_PATH"
+DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 30 * 60
 
 
 JsonDict = dict[str, Any]
@@ -66,7 +67,8 @@ def write_atomic_json(path: Path, value: JsonDict) -> None:
 def _resolve_executable(env_name: str, default_name: str) -> Path | None:
     configured = os.environ.get(env_name, "").strip()
     if configured:
-        return Path(configured).expanduser()
+        candidate = Path(configured).expanduser()
+        return candidate if candidate.is_file() and os.access(candidate, os.X_OK) else None
     found = shutil.which(default_name)
     if not found:
         return None
@@ -79,7 +81,7 @@ def _import_optional_module(module_name: str) -> Any:
 
 def _dependency_reason() -> str | None:
     missing: list[str] = []
-    for module_name in ("demucs", "faster_whisper", "TTS"):
+    for module_name in ("demucs.separate", "faster_whisper", "TTS.api"):
         try:
             _import_optional_module(module_name)
         except ImportError:
@@ -228,7 +230,7 @@ def _probe_audio_stream(ffprobe_path: Path, source_path: Path) -> dict[str, int]
     }
 
 
-def _run_checked(command: list[str], *, timeout_seconds: int | None = None) -> None:
+def _run_checked(command: list[str], *, timeout_seconds: int = DEFAULT_SUBPROCESS_TIMEOUT_SECONDS) -> None:
     completed = subprocess.run(
         command,
         check=False,
@@ -396,11 +398,11 @@ def prepare_source(request: JsonDict, output_json: Path) -> JsonDict:
 
         _extract_source_audio(ffmpeg_path, source_path, source_audio_path)
 
-        demucs_module = _import_optional_module("demucs")
+        _import_optional_module("demucs.separate")
         demucs_executable = [
             str(sys.executable),
             "-m",
-            getattr(demucs_module, "__name__", "demucs"),
+            "demucs.separate",
             "--device",
             "cpu",
             "--two-stems=vocals",
@@ -556,7 +558,7 @@ def replace_current(request: JsonDict, output_json: Path) -> JsonDict:
         cloned_adjusted_path = operation_dir / "clone-adjusted.wav"
         final_audio_path = operation_dir / "replacement.wav"
 
-        tts_module = _import_optional_module("TTS")
+        tts_module = _import_optional_module("TTS.api")
         tts = tts_module.TTS(model_name=DEFAULT_XTTS_MODEL, gpu=False)
         tts.tts_to_file(
             text=text,
@@ -628,13 +630,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.output_json is None:
         parser.error("准备或替换模式必须提供 --output-json")
 
+    operation_mode = "prepare" if args.prepare_json is not None else "replace"
+    request_path = args.prepare_json or args.replace_json
+    try:
+        request = _read_json(request_path)
+    except Exception as error:  # noqa: BLE001 - 输入 JSON 也必须结构化失败
+        write_atomic_json(
+            args.output_json,
+            _failure_result(
+                "invalid-request",
+                f"{operation_mode} 请求 JSON 无效：{error}",
+                model=DEFAULT_XTTS_MODEL,
+            ),
+        )
+        return 0
+
     if args.prepare_json is not None:
-        request = _read_json(args.prepare_json)
         result = prepare_source(request, args.output_json)
         write_atomic_json(args.output_json, result)
         return 0
 
-    request = _read_json(args.replace_json)
     result = replace_current(request, args.output_json)
     write_atomic_json(args.output_json, result)
     return 0
