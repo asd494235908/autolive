@@ -3,6 +3,7 @@ pub mod cancellation;
 pub mod direct_model;
 pub mod errors;
 pub mod hashing;
+pub mod interlude_player;
 pub mod media_engine;
 pub mod media_library;
 pub mod research_params;
@@ -14,6 +15,7 @@ pub mod window_sizing;
 
 use crate::audio_processing::AudioProcessingProfile;
 use crate::errors::PlaybackError;
+use crate::interlude_player::{resolve_effective_audio_source, InterludeSnapshot};
 use crate::media_library::SourceMediaDto;
 use crate::speech_to_speech::{
     AudioTrackInput, AudioVariantCandidate, CandidateValidationError, SpeechToSpeechContext,
@@ -34,6 +36,9 @@ pub enum PlaybackState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoiceCloneReplacementState {
     pub status: String,
+    pub phase: Option<String>,
+    pub progress_percent: Option<u8>,
+    pub progress_message: Option<String>,
     pub source_generation: Option<u64>,
     pub source_path: Option<String>,
     pub operation_id: Option<String>,
@@ -51,6 +56,9 @@ impl Default for VoiceCloneReplacementState {
     fn default() -> Self {
         Self {
             status: "idle".to_owned(),
+            phase: None,
+            progress_percent: None,
+            progress_message: None,
             source_generation: None,
             source_path: None,
             operation_id: None,
@@ -66,7 +74,7 @@ impl Default for VoiceCloneReplacementState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoiceClonePreparedSource {
     pub operation_id: String,
     pub source_index: VoiceCloneSourceIndex,
@@ -131,6 +139,7 @@ pub struct PlaybackSnapshot {
     pub playback_state: PlaybackState,
     pub source_media: Option<SourceMediaDto>,
     pub loop_index: u64,
+    pub current_position_ms: u64,
     pub current_video_source: Option<String>,
     pub current_video_reference: Option<String>,
     pub current_video_sha256: Option<String>,
@@ -156,7 +165,9 @@ pub struct PlaybackSnapshot {
     pub audio_processing_status: String,
     pub audio_processing_runtime: bool,
     pub audio_processing_gain_db: f64,
+    pub effective_audio_source: String,
     pub voice_clone_replacement: VoiceCloneReplacementState,
+    pub interlude: InterludeSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,6 +196,7 @@ pub struct PlaybackCore {
     pending_audio_candidate: Option<AudioVariantCandidate>,
     audio_processing_profile: AudioProcessingProfile,
     audio_processing_status: String,
+    interlude_snapshot: InterludeSnapshot,
     voice_clone_prepared_source: Option<VoiceClonePreparedSource>,
     voice_clone_replacement: VoiceCloneReplacementState,
     current_position_ms: u64,
@@ -217,6 +229,7 @@ impl Default for PlaybackCore {
             pending_audio_candidate: None,
             audio_processing_profile: AudioProcessingProfile::default(),
             audio_processing_status: "disabled".to_owned(),
+            interlude_snapshot: InterludeSnapshot::default(),
             voice_clone_prepared_source: None,
             voice_clone_replacement: VoiceCloneReplacementState::default(),
             current_position_ms: 0,
@@ -284,6 +297,9 @@ impl PlaybackCore {
         self.voice_clone_prepared_source = None;
         self.voice_clone_replacement = VoiceCloneReplacementState {
             status: "preparing".to_owned(),
+            phase: Some("checking-models".to_owned()),
+            progress_percent: Some(0),
+            progress_message: Some("正在检查模型缓存。".to_owned()),
             source_generation: Some(self.playback_generation),
             source_path: Some(source.source_path.clone()),
             operation_id: Some(operation_id.to_owned()),
@@ -335,6 +351,9 @@ impl PlaybackCore {
         self.voice_clone_prepared_source = Some(prepared.clone());
         self.voice_clone_replacement = VoiceCloneReplacementState {
             status: "ready".to_owned(),
+            phase: Some("ready".to_owned()),
+            progress_percent: Some(100),
+            progress_message: Some("人声准备完成。".to_owned()),
             source_generation: Some(prepared.source_index.source_generation),
             source_path: Some(prepared.source_index.source_path.clone()),
             operation_id: Some(prepared.operation_id),
@@ -395,6 +414,9 @@ impl PlaybackCore {
         }
         self.voice_clone_replacement = VoiceCloneReplacementState {
             status: "generating".to_owned(),
+            phase: Some("checking-models".to_owned()),
+            progress_percent: Some(0),
+            progress_message: Some("正在检查模型缓存。".to_owned()),
             source_generation: Some(self.playback_generation),
             source_path: Some(source.source_path.clone()),
             operation_id: Some(operation_id.to_owned()),
@@ -448,6 +470,9 @@ impl PlaybackCore {
         }
         self.voice_clone_replacement = VoiceCloneReplacementState {
             status: "playing".to_owned(),
+            phase: Some("ready".to_owned()),
+            progress_percent: Some(100),
+            progress_message: Some("固定话术音轨已生成。".to_owned()),
             source_generation: Some(replacement.source_generation),
             source_path: Some(replacement.source_path),
             operation_id: Some(replacement.operation_id),
@@ -464,8 +489,12 @@ impl PlaybackCore {
     }
 
     pub fn mark_voice_clone_failed(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
         self.voice_clone_replacement.status = "failed".to_owned();
-        self.voice_clone_replacement.error = Some(reason.into());
+        self.voice_clone_replacement.phase = Some("failed".to_owned());
+        self.voice_clone_replacement.progress_percent = Some(100);
+        self.voice_clone_replacement.progress_message = Some(reason.clone());
+        self.voice_clone_replacement.error = Some(reason);
         self.voice_clone_replacement.replacement_audio_reference = None;
         self.voice_clone_replacement.replacement_audio_sha256 = None;
         self.voice_clone_replacement.replacement_duration_ms = None;
@@ -475,13 +504,17 @@ impl PlaybackCore {
     }
 
     pub fn mark_voice_clone_cancelled(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
         let next_status = if self.voice_clone_prepared_source.is_some() {
             "ready"
         } else {
             "cancelled"
         };
         self.voice_clone_replacement.status = next_status.to_owned();
-        self.voice_clone_replacement.error = Some(reason.into());
+        self.voice_clone_replacement.phase = Some("cancelled".to_owned());
+        self.voice_clone_replacement.progress_percent = None;
+        self.voice_clone_replacement.progress_message = Some(reason.clone());
+        self.voice_clone_replacement.error = Some(reason);
         self.voice_clone_replacement.replacement_audio_reference = None;
         self.voice_clone_replacement.replacement_audio_sha256 = None;
         self.voice_clone_replacement.replacement_duration_ms = None;
@@ -492,6 +525,22 @@ impl PlaybackCore {
 
     pub fn clear_voice_clone_replacement(&mut self) {
         self.reset_voice_clone_for_current_source();
+    }
+
+    pub fn update_voice_clone_progress(
+        &mut self,
+        operation_id: &str,
+        phase: &str,
+        progress_percent: u8,
+        message: &str,
+    ) -> bool {
+        if self.voice_clone_replacement.operation_id.as_deref() != Some(operation_id) {
+            return false;
+        }
+        self.voice_clone_replacement.phase = Some(phase.to_owned());
+        self.voice_clone_replacement.progress_percent = Some(progress_percent);
+        self.voice_clone_replacement.progress_message = Some(message.to_owned());
+        true
     }
 
     pub fn set_playback_position(&mut self, position_ms: u64) {
@@ -647,6 +696,10 @@ impl PlaybackCore {
         self.audio_processing_profile = profile;
         self.audio_processing_status = self.audio_processing_status_for("unavailable");
         Ok(())
+    }
+
+    pub fn set_interlude_snapshot(&mut self, snapshot: InterludeSnapshot) {
+        self.interlude_snapshot = snapshot;
     }
 
     pub fn set_mp4_sha256_for_generation(&mut self, generation: u64, mp4_sha256: String) {
@@ -848,12 +901,19 @@ impl PlaybackCore {
 
     #[must_use]
     pub fn snapshot(&self) -> PlaybackSnapshot {
+        let effective_audio_source = resolve_effective_audio_source(
+            self.voice_clone_replacement.status.as_str(),
+            self.current_audio_source.as_deref(),
+            self.current_video_source.as_deref(),
+        )
+        .to_owned();
         PlaybackSnapshot {
             window_id: self.window_id.clone(),
             playback_generation: self.playback_generation,
             playback_state: self.playback_state,
             source_media: self.source_media.clone(),
             loop_index: self.loop_index,
+            current_position_ms: self.current_position_ms,
             current_video_source: self.current_video_source.clone(),
             current_video_reference: self.current_video_reference.clone(),
             current_video_sha256: self.current_video_sha256.clone(),
@@ -897,7 +957,9 @@ impl PlaybackCore {
             audio_processing_gain_db: self.audio_processing_profile.params.input_gain_db
                 + self.audio_processing_profile.params.output_gain_db
                 + self.audio_processing_profile.params.loudness_adjustment_db,
+            effective_audio_source,
             voice_clone_replacement: self.voice_clone_replacement.clone(),
+            interlude: self.interlude_snapshot.clone(),
         }
     }
 
@@ -1049,6 +1111,40 @@ mod tests {
             snapshot.source_media.expect("source").file_name,
             "source.mp4"
         );
+    }
+
+    #[test]
+    fn snapshot_exposes_current_playback_position_for_control_fallback() {
+        let mut core = PlaybackCore::default();
+        core.set_source(source());
+        core.set_playback_position(1_234);
+
+        assert_eq!(core.snapshot().current_position_ms, 1_000);
+    }
+
+    #[test]
+    fn voice_clone_progress_updates_only_the_current_operation() {
+        let mut core = PlaybackCore::default();
+        core.set_source(source());
+        core.mark_voice_clone_preparing("prepare-1")
+            .expect("voice clone preparation should start");
+
+        assert!(!core.update_voice_clone_progress(
+            "stale-operation",
+            "downloading-models",
+            25,
+            "正在下载模型。"
+        ));
+        assert!(core.update_voice_clone_progress(
+            "prepare-1",
+            "downloading-models",
+            25,
+            "正在下载模型。"
+        ));
+        let progress = &core.snapshot().voice_clone_replacement;
+        assert_eq!(progress.phase.as_deref(), Some("downloading-models"));
+        assert_eq!(progress.progress_percent, Some(25));
+        assert_eq!(progress.progress_message.as_deref(), Some("正在下载模型。"));
     }
 
     #[test]

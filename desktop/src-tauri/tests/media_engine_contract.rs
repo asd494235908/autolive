@@ -5,7 +5,6 @@ use autolive_desktop_core::media_engine::{
 };
 use autolive_desktop_core::research_params::{AudioResearchParams, VideoResearchParams};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -40,9 +39,11 @@ impl Drop for TestDir {
 }
 
 fn request(directory: &TestDir) -> MediaRenderRequest {
+    let ffmpeg_path = fixture_file(directory, "ffmpeg");
+    let ffprobe_path = fixture_file(directory, "ffprobe");
     MediaRenderRequest {
-        ffmpeg_path: directory.path().join("ffmpeg"),
-        ffprobe_path: directory.path().join("ffprobe"),
+        ffmpeg_path,
+        ffprobe_path,
         input_mp4_path: directory.path().join("source.mp4"),
         staging_output_path: directory.path().join("staging.partial.mp4"),
         output_mp4_path: directory.path().join("processed.mp4"),
@@ -56,7 +57,16 @@ fn request(directory: &TestDir) -> MediaRenderRequest {
     }
 }
 
+fn fixture_file(directory: &TestDir, name: &str) -> PathBuf {
+    let path = directory.path().join(name);
+    fs::write(&path, b"engine fixture").expect("fixture file should be written");
+    path
+}
+
+#[cfg(unix)]
 fn executable_script(directory: &TestDir, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
     let path = directory.path().join(name);
     fs::write(&path, body).expect("script should be written");
     let mut permissions = fs::metadata(&path)
@@ -70,10 +80,8 @@ fn executable_script(directory: &TestDir, name: &str, body: &str) -> PathBuf {
 #[test]
 fn render_plan_reencodes_video_when_video_processing_is_enabled() {
     let directory = TestDir::new();
-    let mut input = request(&directory);
+    let input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    input.ffmpeg_path = executable_script(&directory, "ffmpeg", "#!/bin/sh\n");
-    input.ffprobe_path = executable_script(&directory, "ffprobe", "#!/bin/sh\n");
     let args = build_media_render_args(&input).expect("render args should be valid");
     let values: Vec<String> = args
         .iter()
@@ -92,8 +100,6 @@ fn render_rejects_pitch_shift_without_source_sample_rate() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    input.ffmpeg_path = executable_script(&directory, "ffmpeg", "#!/bin/sh\n");
-    input.ffprobe_path = executable_script(&directory, "ffprobe", "#!/bin/sh\n");
     input.audio.pitch_shift_semitones = 0.5;
     input.source_audio_sample_rate_hz = None;
 
@@ -110,8 +116,6 @@ fn render_maps_native_video_noise_and_detail_filters() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    input.ffmpeg_path = executable_script(&directory, "ffmpeg", "#!/bin/sh\n");
-    input.ffprobe_path = executable_script(&directory, "ffprobe", "#!/bin/sh\n");
     input.video.noise_percent = 2.0;
     input.video.detail_enhancement_percent = 5.0;
 
@@ -135,8 +139,6 @@ fn render_maps_explicit_audio_sample_rate() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    input.ffmpeg_path = executable_script(&directory, "ffmpeg", "#!/bin/sh\n");
-    input.ffprobe_path = executable_script(&directory, "ffprobe", "#!/bin/sh\n");
     input.audio.sample_rate_hz = Some(44_100);
 
     let args = build_media_render_args(&input).expect("native audio sample rate should be mapped");
@@ -158,8 +160,6 @@ fn render_maps_static_and_dynamic_video_motion_filters() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    input.ffmpeg_path = executable_script(&directory, "ffmpeg", "#!/bin/sh\n");
-    input.ffprobe_path = executable_script(&directory, "ffprobe", "#!/bin/sh\n");
     input.video.space_x_offset_px = 2.0;
     input.video.space_y_offset_px = -1.0;
     input.video.dynamic_crop_percent = 1.0;
@@ -188,8 +188,6 @@ fn render_maps_pitch_shift_when_source_sample_rate_is_known() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    input.ffmpeg_path = executable_script(&directory, "ffmpeg", "#!/bin/sh\n");
-    input.ffprobe_path = executable_script(&directory, "ffprobe", "#!/bin/sh\n");
     input.audio.pitch_shift_semitones = 1.0;
 
     let args = build_media_render_args(&input).expect("pitch shift should be mapped");
@@ -208,6 +206,7 @@ fn render_maps_pitch_shift_when_source_sample_rate_is_known() {
     assert!(filter.contains("atempo="));
 }
 
+#[cfg(unix)]
 #[test]
 fn render_commits_verified_output_after_probe_and_hash() {
     let directory = TestDir::new();
@@ -239,12 +238,9 @@ fn render_commits_verified_output_after_probe_and_hash() {
 #[test]
 fn render_rejects_existing_output_without_touching_source() {
     let directory = TestDir::new();
-    let mut input = request(&directory);
+    let input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
     fs::write(&input.output_mp4_path, b"existing").expect("output should be written");
-    input.ffmpeg_path = executable_script(&directory, "ffmpeg", "#!/bin/sh\n");
-    input.ffprobe_path = executable_script(&directory, "ffprobe", "#!/bin/sh\n");
-
     let result = render_media(&input, &CancellationToken::new());
 
     assert!(
@@ -261,6 +257,7 @@ fn render_rejects_existing_output_without_touching_source() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn render_unavailable_engine_does_not_write_output() {
     let directory = TestDir::new();
@@ -279,6 +276,7 @@ fn render_unavailable_engine_does_not_write_output() {
     assert!(!input.output_mp4_path.exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn capability_probe_uses_argument_array_without_shell() {
     let directory = TestDir::new();

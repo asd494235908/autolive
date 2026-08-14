@@ -12,10 +12,10 @@ use commands::{
     get_snapshot, get_speech_to_speech_worker_capabilities, get_voice_clone_worker_capabilities,
     hash_local_mp4_sha256, open_final_effect_window, pause_playback, prepare_voice_clone_source,
     probe_local_mp4, resize_final_effect_window, restore_original_audio, resume_playback,
-    set_audio_processing_profile, set_processing_switches, stage_audio_variant_candidate,
-    start_media_processing, start_playback, start_research_analysis, start_speech_to_speech_worker,
-    start_voice_clone_replacement, stop_playback, update_playback_position,
-    validate_local_research_params, AppState,
+    set_audio_processing_profile, set_interlude_config, set_processing_switches,
+    stage_audio_variant_candidate, start_media_processing, start_playback, start_research_analysis,
+    start_speech_to_speech_worker, start_voice_clone_replacement, stop_playback,
+    update_playback_position, validate_local_research_params, AppState,
 };
 
 fn main() {
@@ -47,6 +47,7 @@ fn main() {
             commit_media_processing_if_ready,
             set_processing_switches,
             set_audio_processing_profile,
+            set_interlude_config,
             start_media_processing,
             start_research_analysis,
             cancel_research_analysis,

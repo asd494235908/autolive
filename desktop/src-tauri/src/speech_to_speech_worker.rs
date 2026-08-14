@@ -1,4 +1,5 @@
 use crate::cancellation::CancellationToken;
+use crate::media_engine::{packaged_media_engine_paths, FFMPEG_PATH_ENV, FFPROBE_PATH_ENV};
 use crate::speech_to_speech::{
     SpeechToSpeechContext, SpeechToSpeechResult, SpeechToSpeechWorkerCapabilities,
 };
@@ -9,6 +10,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 pub const SPEECH_TO_SPEECH_WORKER_ENV: &str = "AUTOLIVE_SPEECH_TO_SPEECH_WORKER";
 pub const SPEECH_TO_SPEECH_WORKER_TIMEOUT_MS: u64 = 2_000;
@@ -90,13 +94,29 @@ impl fmt::Display for SpeechToSpeechWorkerError {
 impl std::error::Error for SpeechToSpeechWorkerError {}
 
 pub fn configured_speech_to_speech_worker_capabilities() -> SpeechToSpeechWorkerCapabilities {
+    configured_speech_to_speech_worker_capabilities_for_resource_dir(None)
+}
+
+pub fn configured_speech_to_speech_worker_capabilities_with_resource_dir(
+    resource_dir: &Path,
+) -> SpeechToSpeechWorkerCapabilities {
+    configured_speech_to_speech_worker_capabilities_for_resource_dir(Some(resource_dir))
+}
+
+fn configured_speech_to_speech_worker_capabilities_for_resource_dir(
+    resource_dir: Option<&Path>,
+) -> SpeechToSpeechWorkerCapabilities {
     let executable = match configured_worker_executable() {
         Ok(executable) => executable,
         Err(error) => {
             return SpeechToSpeechWorkerCapabilities::unavailable_with_reason(error.to_string())
         }
     };
-    match probe_speech_to_speech_worker(&executable, SPEECH_TO_SPEECH_WORKER_TIMEOUT_MS) {
+    match probe_speech_to_speech_worker_for_resource_dir(
+        &executable,
+        SPEECH_TO_SPEECH_WORKER_TIMEOUT_MS,
+        resource_dir,
+    ) {
         Ok(capabilities) => capabilities,
         Err(error) => SpeechToSpeechWorkerCapabilities::unavailable_with_reason(format!(
             "本地 Worker 能力探测失败：{error}"
@@ -118,6 +138,22 @@ pub fn probe_speech_to_speech_worker(
     executable: &Path,
     timeout_ms: u64,
 ) -> Result<SpeechToSpeechWorkerCapabilities, SpeechToSpeechWorkerError> {
+    probe_speech_to_speech_worker_for_resource_dir(executable, timeout_ms, None)
+}
+
+pub fn probe_speech_to_speech_worker_with_resource_dir(
+    executable: &Path,
+    timeout_ms: u64,
+    resource_dir: &Path,
+) -> Result<SpeechToSpeechWorkerCapabilities, SpeechToSpeechWorkerError> {
+    probe_speech_to_speech_worker_for_resource_dir(executable, timeout_ms, Some(resource_dir))
+}
+
+fn probe_speech_to_speech_worker_for_resource_dir(
+    executable: &Path,
+    timeout_ms: u64,
+    resource_dir: Option<&Path>,
+) -> Result<SpeechToSpeechWorkerCapabilities, SpeechToSpeechWorkerError> {
     if !executable.is_file() {
         return Err(SpeechToSpeechWorkerError::InvalidExecutable);
     }
@@ -126,12 +162,17 @@ pub fn probe_speech_to_speech_worker(
     }
     let capability_output = capability_output_path();
     cleanup(&capability_output);
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("--capabilities-json")
         .arg(&capability_output)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    inject_packaged_media_engine_paths(&mut command, resource_dir);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|_| SpeechToSpeechWorkerError::SpawnFailed)?;
 
@@ -174,6 +215,22 @@ pub fn run_speech_to_speech_worker(
     request: &SpeechToSpeechWorkerRequest,
     cancellation: &CancellationToken,
 ) -> Result<SpeechToSpeechResult, SpeechToSpeechWorkerError> {
+    run_speech_to_speech_worker_for_resource_dir(request, cancellation, None)
+}
+
+pub fn run_speech_to_speech_worker_with_resource_dir(
+    request: &SpeechToSpeechWorkerRequest,
+    cancellation: &CancellationToken,
+    resource_dir: &Path,
+) -> Result<SpeechToSpeechResult, SpeechToSpeechWorkerError> {
+    run_speech_to_speech_worker_for_resource_dir(request, cancellation, Some(resource_dir))
+}
+
+fn run_speech_to_speech_worker_for_resource_dir(
+    request: &SpeechToSpeechWorkerRequest,
+    cancellation: &CancellationToken,
+    resource_dir: Option<&Path>,
+) -> Result<SpeechToSpeechResult, SpeechToSpeechWorkerError> {
     validate_request(request)?;
     if cancellation.is_cancelled() {
         return Err(SpeechToSpeechWorkerError::Cancelled);
@@ -181,14 +238,19 @@ pub fn run_speech_to_speech_worker(
 
     let output_partial = partial_path(&request.output_json_path);
     let _ = fs::remove_file(&output_partial);
-    let mut child = Command::new(&request.executable)
+    let mut command = Command::new(&request.executable);
+    command
         .arg("--input-json")
         .arg(&request.input_json_path)
         .arg("--output-json")
         .arg(&output_partial)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    inject_packaged_media_engine_paths(&mut command, resource_dir);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|_| SpeechToSpeechWorkerError::SpawnFailed)?;
 
@@ -242,6 +304,15 @@ pub fn run_speech_to_speech_context_worker(
     context: &SpeechToSpeechContext,
     cancellation: &CancellationToken,
 ) -> Result<SpeechToSpeechResult, SpeechToSpeechWorkerError> {
+    run_speech_to_speech_context_worker_for_resource_dir(request, context, cancellation, None)
+}
+
+fn run_speech_to_speech_context_worker_for_resource_dir(
+    request: &SpeechToSpeechContextWorkerRequest,
+    context: &SpeechToSpeechContext,
+    cancellation: &CancellationToken,
+    resource_dir: Option<&Path>,
+) -> Result<SpeechToSpeechResult, SpeechToSpeechWorkerError> {
     context
         .validate_for_worker()
         .map_err(|_| SpeechToSpeechWorkerError::InvalidContext)?;
@@ -260,7 +331,7 @@ pub fn run_speech_to_speech_context_worker(
     }
     fs::write(&request.context_json_path, content)
         .map_err(|_| SpeechToSpeechWorkerError::InvalidInput)?;
-    let result = run_speech_to_speech_worker(
+    let result = run_speech_to_speech_worker_for_resource_dir(
         &SpeechToSpeechWorkerRequest {
             executable: request.executable.clone(),
             input_json_path: request.context_json_path.clone(),
@@ -268,6 +339,7 @@ pub fn run_speech_to_speech_context_worker(
             timeout_ms: request.timeout_ms,
         },
         cancellation,
+        resource_dir,
     );
     cleanup(&request.context_json_path);
     result
@@ -276,6 +348,26 @@ pub fn run_speech_to_speech_context_worker(
 pub fn run_configured_speech_to_speech_context_worker(
     context: &SpeechToSpeechContext,
     cancellation: &CancellationToken,
+) -> Result<SpeechToSpeechResult, SpeechToSpeechWorkerError> {
+    run_configured_speech_to_speech_context_worker_for_resource_dir(context, cancellation, None)
+}
+
+pub fn run_configured_speech_to_speech_context_worker_with_resource_dir(
+    context: &SpeechToSpeechContext,
+    cancellation: &CancellationToken,
+    resource_dir: &Path,
+) -> Result<SpeechToSpeechResult, SpeechToSpeechWorkerError> {
+    run_configured_speech_to_speech_context_worker_for_resource_dir(
+        context,
+        cancellation,
+        Some(resource_dir),
+    )
+}
+
+fn run_configured_speech_to_speech_context_worker_for_resource_dir(
+    context: &SpeechToSpeechContext,
+    cancellation: &CancellationToken,
+    resource_dir: Option<&Path>,
 ) -> Result<SpeechToSpeechResult, SpeechToSpeechWorkerError> {
     if context.timeout_ms > MAX_SPEECH_TO_SPEECH_WORKER_TIMEOUT_MS {
         return Err(SpeechToSpeechWorkerError::Timeout {
@@ -291,7 +383,12 @@ pub fn run_configured_speech_to_speech_context_worker(
         output_json_path: job_directory.join("result.json"),
         timeout_ms: context.timeout_ms,
     };
-    let result = run_speech_to_speech_context_worker(&request, context, cancellation);
+    let result = run_speech_to_speech_context_worker_for_resource_dir(
+        &request,
+        context,
+        cancellation,
+        resource_dir,
+    );
     // 候选音频必须由 Worker 写入 job 目录之外的受控持久化位置。
     // 这样任务结束、取消或超时时，临时上下文和结果不会泄漏；候选文件的生命周期
     // 由后续候选提交/媒体播放层管理。
@@ -357,7 +454,35 @@ fn cleanup(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
+fn inject_packaged_media_engine_paths(command: &mut Command, resource_dir: Option<&Path>) {
+    let Some(resource_dir) = resource_dir else {
+        return;
+    };
+    let Ok((ffmpeg_path, ffprobe_path)) = packaged_media_engine_paths(resource_dir) else {
+        return;
+    };
+    if std::env::var_os(FFMPEG_PATH_ENV).is_none() && ffmpeg_path.is_file() {
+        command.env(FFMPEG_PATH_ENV, ffmpeg_path);
+    }
+    if std::env::var_os(FFPROBE_PATH_ENV).is_none() && ffprobe_path.is_file() {
+        command.env(FFPROBE_PATH_ENV, ffprobe_path);
+    }
+}
+
 fn terminate_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{}", child.id());
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", process_group.as_str()])
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .status();
+    }
     let _ = child.kill();
     let _ = child.wait();
 }

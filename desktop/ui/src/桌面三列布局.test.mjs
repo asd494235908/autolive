@@ -20,6 +20,8 @@ test('desktop page exposes the approved three-column layout contract', async () 
   assert.match(app, /desktop-column-source/);
   assert.match(app, /desktop-column-audio/);
   assert.match(app, /desktop-column-video/);
+  assert.doesNotMatch(app, /单源循环播放/);
+  assert.doesNotMatch(app, /不生成 N 个离线视频，不创建版本队列/);
   const sourceIndex = app.indexOf('desktop-column-source');
   const audioIndex = app.indexOf('desktop-column-audio');
   const videoIndex = app.indexOf('desktop-column-video');

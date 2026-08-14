@@ -50,6 +50,15 @@ export function clampMediaTime(value: number, duration: number): number {
   return Math.min(safeValue, duration);
 }
 
+export function resolvePlaybackPositionMs(
+  mediaCurrentTime: number | null | undefined,
+  snapshotPositionMs: number | null | undefined,
+): number | null {
+  if (isFiniteNonNegative(mediaCurrentTime)) return Math.round(mediaCurrentTime * 1000);
+  if (isFiniteNonNegative(snapshotPositionMs)) return Math.round(snapshotPositionMs);
+  return null;
+}
+
 export function clampVolume(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.min(1, Math.max(0, value));

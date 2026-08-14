@@ -3,16 +3,17 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { Alert, Button, Card, Checkbox, Descriptions, Input, InputNumber, Layout, Progress, Select, Slider, Space, Switch, Tag, Typography } from 'antd';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { SyntheticEvent } from 'react';
-import { chooseInterludeIndex, randomIntervalMs, resolveBaseAudioSource, shouldPauseInterlude } from './插话播放器';
+import { buildInterludeScheduleKey, chooseInterludeIndex, INTERLUDE_LIMITS, nextInterludeAtMs, resolvePlaybackAudioSource, shouldPauseInterlude } from './插话播放器';
 import type { BaseAudioSource } from './插话播放器';
 import { buildRuntimePreviewParameters, isRuntimeVariationDue, normalizeRuntimeVariationPeriod } from './运行时参数自动调度';
 import type { RuntimeBaseParameters, RuntimePreviewParameters } from './运行时参数自动调度';
 import { shouldRestartPlayback } from './播放循环';
 import { buildFinalEffectWindowResizeKey } from './最终效果窗口尺寸';
-import { clampMediaTime, clampVolume, formatMediaTime, isPlaybackMediaControlMessage, isPlaybackMediaStateMessage } from './播放控制消息';
+import { clampMediaTime, clampVolume, formatMediaTime, isPlaybackMediaControlMessage, isPlaybackMediaStateMessage, resolvePlaybackPositionMs } from './播放控制消息';
 import type { PlaybackMediaControlMessage, PlaybackMediaStateMessage } from './播放控制消息';
 import { addVoiceClonePreset, loadVoiceClonePresets, removeVoiceClonePreset, updateVoiceClonePreset } from './voiceClonePresets';
 import type { VoiceClonePreset } from './voiceClonePresets';
+import { getVoiceCloneIdleNotice, getVoiceClonePrepareDisabledReason } from './voiceCloneStatus';
 import './desktop-layout.css';
 
 const PLAYBACK_CHANNEL_NAME = 'autolive-playback-ui-v1';
@@ -72,6 +73,7 @@ type PlaybackSnapshot = {
   playback_generation: number;
   playback_state: string;
   loop_index: number;
+  current_position_ms: number;
   source_media: MediaProbeResult['source'] | null;
   current_video_source: string | null;
   current_video_reference: string | null;
@@ -141,6 +143,9 @@ type VoiceCloneWorkerCapabilities = SpeechToSpeechWorkerCapabilities;
 
 type VoiceCloneReplacementState = {
   status: string;
+  phase: string | null;
+  progress_percent: number | null;
+  progress_message: string | null;
   source_generation: number | null;
   source_path: string | null;
   operation_id: string | null;
@@ -404,11 +409,11 @@ function toGainValue(db: number) {
 }
 
 function getEffectiveAudioSource(snapshot: PlaybackSnapshot | null): BaseAudioSource {
-  if (snapshot?.effective_audio_source) return snapshot.effective_audio_source;
-  return resolveBaseAudioSource({
-    voiceCloneActive: snapshot?.voice_clone_replacement?.status === 'playing',
-    realtimeVariantActive: snapshot?.current_audio_source === 'realtime_variant',
-    processedOriginalActive: snapshot?.current_audio_source === 'processed_original',
+  return resolvePlaybackAudioSource({
+    effectiveAudioSource: snapshot?.effective_audio_source,
+    voiceCloneStatus: snapshot?.voice_clone_replacement?.status,
+    currentAudioSource: snapshot?.current_audio_source,
+    currentVideoSource: snapshot?.current_video_source,
   });
 }
 
@@ -416,9 +421,9 @@ function buildInterludeDraft(interlude?: InterludeSnapshot | null): InterludeCon
   return {
     enabled: interlude?.enabled ?? false,
     directory: interlude?.directory ?? null,
-    intervalMinMs: interlude?.interval_min_ms ?? 30_000,
-    intervalMaxMs: interlude?.interval_max_ms ?? 60_000,
-    volumeDb: interlude?.volume_db ?? -6,
+    intervalMinMs: interlude?.interval_min_ms ?? 8_000,
+    intervalMaxMs: interlude?.interval_max_ms ?? 13_000,
+    volumeDb: interlude?.volume_db ?? 0,
     duckingDepthDb: interlude?.ducking_depth_db ?? -12,
     duckingAttackMs: interlude?.ducking_attack_ms ?? 120,
     duckingReleaseMs: interlude?.ducking_release_ms ?? 240,
@@ -468,14 +473,13 @@ function FinalEffectWindow() {
   const voiceCloneAudioRef = useRef<HTMLAudioElement | null>(null);
   const interludeAudioRef = useRef<HTMLAudioElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const audioContextCleanupTimerRef = useRef<number | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const videoGainNodeRef = useRef<GainNode | null>(null);
   const audioGainNodeRef = useRef<GainNode | null>(null);
   const voiceCloneGainNodeRef = useRef<GainNode | null>(null);
-  const baseBusGainNodeRef = useRef<GainNode | null>(null);
   const duckGainNodeRef = useRef<GainNode | null>(null);
   const interludeGainNodeRef = useRef<GainNode | null>(null);
-  const interludeBusGainNodeRef = useRef<GainNode | null>(null);
   const suppressMediaEventRef = useRef(false);
   const playbackChannelRef = useRef<BroadcastChannel | null>(null);
   const userMutedRef = useRef(false);
@@ -562,9 +566,10 @@ function FinalEffectWindow() {
     const interludeAudio = interludeAudioRef.current;
     const volume = userVolumeRef.current;
     const muted = userMutedRef.current;
+    const effectiveAudioSource = getEffectiveAudioSource(snapshotRef.current);
     const replacementAudioActive =
-      (Boolean(audioUrlRef.current) || Boolean(voiceCloneAudioUrlRef.current)) &&
-      audioDiagnosticsReadyRef.current;
+      audioDiagnosticsReadyRef.current &&
+      (effectiveAudioSource === 'realtime_variant' || effectiveAudioSource === 'voice_clone');
     if (video) {
       video.volume = volume;
       video.muted = replacementAudioActive || muted;
@@ -662,6 +667,13 @@ function FinalEffectWindow() {
     rampGain(interludeGainNodeRef.current, 0, interlude?.ducking_release_ms ?? 0);
     rampGain(duckGainNodeRef.current, 1, interlude?.ducking_release_ms ?? 0);
     nextInterludeAtMsRef.current = null;
+  }
+
+  function handleInterludeError(event: SyntheticEvent<HTMLAudioElement>) {
+    if (!interludeActiveRef.current) return;
+    const detail = event.currentTarget.error?.message;
+    setPlaybackError(detail ? `插话音频播放失败：${detail}` : '插话音频播放失败，请检查文件格式和文件权限。');
+    handleInterludeEnded();
   }
 
   function startInterludePlayback(interlude: InterludeSnapshot) {
@@ -769,9 +781,10 @@ function FinalEffectWindow() {
           voiceCloneAudio?.pause();
         } else if (video) {
           void video.play().catch(() => setPlaybackError('播放已恢复，但系统阻止了自动播放，请点击视频播放。'));
-          if (voiceCloneAudioUrlRef.current && audioDiagnosticsReadyRef.current && voiceCloneAudio) {
+          const effectiveAudioSource = getEffectiveAudioSource(snapshotRef.current);
+          if (effectiveAudioSource === 'voice_clone' && voiceCloneAudioUrlRef.current && audioDiagnosticsReadyRef.current && voiceCloneAudio) {
             void voiceCloneAudio.play().catch(() => undefined);
-          } else if (audioUrlRef.current && audioDiagnosticsReadyRef.current && audio) {
+          } else if (effectiveAudioSource === 'realtime_variant' && audioUrlRef.current && audioDiagnosticsReadyRef.current && audio) {
             void audio.play().catch(() => undefined);
           }
         }
@@ -858,9 +871,38 @@ function FinalEffectWindow() {
   }, []);
 
   useEffect(() => {
-    if (!sourceUrl || !videoRef.current || !audioRef.current || !voiceCloneAudioRef.current || !interludeAudioRef.current || audioContextRef.current) return;
+    if (audioContextCleanupTimerRef.current !== null) {
+      window.clearTimeout(audioContextCleanupTimerRef.current);
+      audioContextCleanupTimerRef.current = null;
+    }
+
+    const scheduleAudioContextCleanup = () => {
+      if (audioContextCleanupTimerRef.current !== null) return;
+      audioContextCleanupTimerRef.current = window.setTimeout(() => {
+        const context = audioContextRef.current;
+        audioContextRef.current = null;
+        analyserRef.current = null;
+        videoGainNodeRef.current = null;
+        audioGainNodeRef.current = null;
+        voiceCloneGainNodeRef.current = null;
+        duckGainNodeRef.current = null;
+        interludeGainNodeRef.current = null;
+        audioDiagnosticsReadyRef.current = false;
+        setAudioDiagnosticsReady(false);
+        void context?.close().catch(() => undefined);
+        audioContextCleanupTimerRef.current = null;
+      }, 0);
+    };
+
+    if (!sourceUrl || !videoRef.current || !audioRef.current || !voiceCloneAudioRef.current || !interludeAudioRef.current) {
+      if (audioContextRef.current) return scheduleAudioContextCleanup;
+      return;
+    }
+    if (audioContextRef.current) return scheduleAudioContextCleanup;
+
+    let context: AudioContext | null = null;
     try {
-      const context = new AudioContext();
+      context = new AudioContext();
       const analyser = context.createAnalyser();
       analyser.fftSize = 2_048;
       analyser.smoothingTimeConstant = 0.75;
@@ -889,30 +931,17 @@ function FinalEffectWindow() {
       videoGainNodeRef.current = videoGain;
       audioGainNodeRef.current = audioGain;
       voiceCloneGainNodeRef.current = voiceCloneGain;
-      baseBusGainNodeRef.current = baseBus;
       duckGainNodeRef.current = duckGain;
       interludeGainNodeRef.current = interludeGain;
-      interludeBusGainNodeRef.current = interludeBus;
       audioDiagnosticsReadyRef.current = true;
       setAudioDiagnosticsReady(true);
-    } catch {
+    } catch (cause) {
+      void context?.close().catch(() => undefined);
       setAudioDiagnosticsReady(false);
+      setPlaybackError(cause instanceof Error ? `音频混音初始化失败：${cause.message}` : '音频混音初始化失败');
     }
 
-    return () => {
-      clearInterludeStopTimer();
-      audioContextRef.current?.close().catch(() => undefined);
-      audioContextRef.current = null;
-      analyserRef.current = null;
-      videoGainNodeRef.current = null;
-      audioGainNodeRef.current = null;
-      voiceCloneGainNodeRef.current = null;
-      baseBusGainNodeRef.current = null;
-      duckGainNodeRef.current = null;
-      interludeGainNodeRef.current = null;
-      interludeBusGainNodeRef.current = null;
-      audioDiagnosticsReadyRef.current = false;
-    };
+    return scheduleAudioContextCleanup;
   }, [sourceUrl]);
 
   useEffect(() => {
@@ -1039,14 +1068,15 @@ function FinalEffectWindow() {
     }
     if (snapshot?.playback_state === 'playing' && video.paused) {
       void video.play().catch(() => setPlaybackError('播放已恢复，但系统阻止了自动播放，请点击视频播放。'));
-      if (voiceCloneAudioUrl && audioDiagnosticsReady && voiceCloneAudio) {
+      const effectiveAudioSource = getEffectiveAudioSource(snapshotRef.current);
+      if (effectiveAudioSource === 'voice_clone' && voiceCloneAudioUrl && audioDiagnosticsReady && voiceCloneAudio) {
         void voiceCloneAudio.play().catch(() => undefined);
-      } else if (audioUrl && audioDiagnosticsReady && audio) {
+      } else if (effectiveAudioSource === 'realtime_variant' && audioUrl && audioDiagnosticsReady && audio) {
         void audio.play().catch(() => undefined);
       }
       resumeInterludePlayback();
     }
-  }, [audioDiagnosticsReady, audioUrl, snapshot?.interlude, snapshot?.playback_state, sourceUrl, voiceCloneAudioUrl]);
+  }, [audioDiagnosticsReady, audioUrl, snapshot?.interlude, snapshot?.playback_state, snapshot?.effective_audio_source, snapshot?.current_audio_source, snapshot?.voice_clone_replacement?.status, sourceUrl, voiceCloneAudioUrl]);
 
   useEffect(() => {
     if (!snapshot || !sourceUrl) return;
@@ -1082,11 +1112,14 @@ function FinalEffectWindow() {
     if (!video) return;
     audioUrlRef.current = audioUrl;
     audioDiagnosticsReadyRef.current = audioDiagnosticsReady;
-    if (!audioUrl || !audio) {
+    const effectiveAudioSource = getEffectiveAudioSource(snapshotRef.current);
+    if (!audioUrl || !audio || effectiveAudioSource !== 'realtime_variant') {
       if (audio) {
         audio.pause();
-        audio.removeAttribute('src');
-        audio.load();
+        if (!audioUrl) {
+          audio.removeAttribute('src');
+          audio.load();
+        }
       }
       syncUserAudioSettings();
       return;
@@ -1100,7 +1133,7 @@ function FinalEffectWindow() {
     audio.currentTime = Math.max(0, video.currentTime - (snapshot?.current_audio_start_at_ms ?? 0) / 1000);
     syncUserAudioSettings();
     if (!video.paused) void audio.play().catch(() => undefined);
-  }, [audioDiagnosticsReady, audioUrl, snapshot?.current_audio_start_at_ms]);
+  }, [audioDiagnosticsReady, audioUrl, snapshot?.current_audio_start_at_ms, snapshot?.current_audio_source, snapshot?.effective_audio_source, snapshot?.voice_clone_replacement?.status]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -1204,7 +1237,7 @@ function FinalEffectWindow() {
         null;
       const scheduleKey = sourceKey === null
         ? null
-        : `${currentSnapshot.playback_generation}:${currentSnapshot.loop_index}:${sourceKey}`;
+        : buildInterludeScheduleKey(currentSnapshot.playback_generation, sourceKey);
 
       if (scheduleKey !== interludeScheduleKeyRef.current) {
         interludeScheduleKeyRef.current = scheduleKey;
@@ -1244,13 +1277,16 @@ function FinalEffectWindow() {
 
       if (interludeActiveRef.current) return;
 
-      const currentTimeMs = Math.max(0, Math.round(video.currentTime * 1000));
+      const currentClockMs = performance.now();
       if (nextInterludeAtMsRef.current === null) {
-        nextInterludeAtMsRef.current =
-          currentTimeMs + randomIntervalMs(interlude.interval_min_ms, interlude.interval_max_ms);
-        return;
+        nextInterludeAtMsRef.current = nextInterludeAtMs(
+          currentClockMs,
+          lastInterludeIndexRef.current !== null,
+          interlude.interval_min_ms,
+          interlude.interval_max_ms,
+        );
       }
-      if (currentTimeMs < nextInterludeAtMsRef.current) return;
+      if (currentClockMs < nextInterludeAtMsRef.current) return;
       startInterludePlayback(interlude);
     }, 250);
     return () => window.clearInterval(timer);
@@ -1358,7 +1394,6 @@ function FinalEffectWindow() {
 
   function restartToNextLoop(video: HTMLVideoElement, restartToken: string) {
     const previousVideoReference = snapshotRef.current?.current_video_reference;
-    const interlude = snapshotRef.current?.interlude ?? null;
     lastRestartTokenRef.current = restartToken;
     loopSequenceRef.current += 1;
     video.currentTime = 0;
@@ -1367,14 +1402,13 @@ function FinalEffectWindow() {
       voiceCloneAudioRef.current.pause();
       voiceCloneAudioRef.current.currentTime = 0;
     }
-    clearInterludePlayback({ releaseMs: interlude?.ducking_release_ms ?? 0, resetSchedule: true, resetIndex: true });
-
     suppressMediaEventRef.current = true;
     void video.play().catch(() => {
       suppressMediaEventRef.current = false;
       setPlaybackError('视频已回到开头，但自动播放失败，请点击视频播放。');
     });
-    if (audioRef.current && audioUrl && audioDiagnosticsReady) {
+    const effectiveAudioSource = getEffectiveAudioSource(snapshotRef.current);
+    if (effectiveAudioSource === 'realtime_variant' && audioRef.current && audioUrl && audioDiagnosticsReady) {
       audioRef.current.currentTime = 0;
       void audioRef.current.play().catch(() => undefined);
     }
@@ -1448,7 +1482,12 @@ function FinalEffectWindow() {
                 src={sourceUrl}
                 autoPlay
                 playsInline
-                muted={(Boolean(audioUrl) || Boolean(voiceCloneAudioUrl)) && audioDiagnosticsReady ? true : userMuted}
+                muted={
+                  audioDiagnosticsReady &&
+                  ['realtime_variant', 'voice_clone'].includes(getEffectiveAudioSource(snapshot))
+                    ? true
+                    : userMuted
+                }
                 onClick={resumeAudioDiagnostics}
                 onPlay={() => {
                   resumeAudioDiagnostics();
@@ -1504,9 +1543,10 @@ function FinalEffectWindow() {
               <audio
                 ref={interludeAudioRef}
                 src={interludeAudioUrl ?? undefined}
+                preload="auto"
                 muted={userMuted}
                 onEnded={handleInterludeEnded}
-                onError={() => handleInterludeEnded()}
+                onError={handleInterludeError}
                 hidden
               />
             </>
@@ -1933,19 +1973,24 @@ function DesktopApp() {
     ['running', 'pending', 'active'].includes(snapshot?.worker_status ?? '') ||
     snapshot?.pending_audio_candidate === true ||
     snapshot?.current_audio_source === 'realtime_variant';
-  const voiceClonePrepareDisabledReason =
-    !currentSource
-      ? '请先导入一个 MP4'
-      : !voiceCloneWorkerCapabilities?.available
-        ? voiceCloneWorkerCapabilities?.reason ?? '固定话术 Worker 不可用'
-        : voiceCloneStatus === 'preparing' || voiceCloneStatus === 'generating'
-          ? '固定话术 Worker 正在执行'
-          : null;
+  const voiceClonePositionMs = resolvePlaybackPositionMs(
+    mediaState?.current_time,
+    snapshot?.current_position_ms,
+  );
+  const voiceClonePrepareDisabledReason = getVoiceClonePrepareDisabledReason({
+    hasSource: Boolean(currentSource),
+    sourceHashStatus: currentSource?.mp4_hash_status,
+    workerAvailable: Boolean(voiceCloneWorkerCapabilities?.available),
+    workerReason: voiceCloneWorkerCapabilities?.reason,
+    status: voiceCloneStatus,
+  });
   const voiceCloneReplaceDisabledReason =
     !currentSource
       ? '请先导入一个 MP4'
-      : playbackDisplayState !== 'playing' || mediaState?.paused || !mediaState
+      : playbackDisplayState !== 'playing'
         ? '请先让最终效果窗口保持播放'
+        : voiceClonePositionMs === null
+          ? '播放器位置尚未同步，请打开最终效果窗口'
         : !voiceCloneWorkerCapabilities?.available
           ? voiceCloneWorkerCapabilities?.reason ?? '固定话术 Worker 不可用'
           : voiceCloneStatus !== 'ready'
@@ -1976,6 +2021,9 @@ function DesktopApp() {
       : voiceCloneStatus === 'ready' || voiceCloneStatus === 'playing'
         ? 'success'
         : 'active';
+  const voiceCloneProgressPercent =
+    voiceCloneState?.progress_percent ?? getVoiceCloneProgress(voiceCloneStatus);
+  const voiceCloneProgressMessage = voiceCloneState?.progress_message?.trim() || null;
   const voiceCloneNotice =
     !voiceCloneWorkerCapabilities?.available
       ? {
@@ -1983,11 +2031,20 @@ function DesktopApp() {
           message: `固定话术 Worker 不可用：${voiceCloneWorkerCapabilities?.reason ?? '未完成能力探测'}`,
         }
       : voiceCloneStatus === 'preparing'
-        ? { type: 'info' as const, message: '正在准备当前 MP4 的参考人声与话术索引。' }
+        ? {
+            type: 'info' as const,
+            message: voiceCloneProgressMessage ?? '正在准备当前 MP4 的参考人声与话术索引。',
+          }
         : voiceCloneStatus === 'ready'
-          ? { type: 'success' as const, message: '参考人声已准备完成，可以在播放中替换当前话术。' }
-          : voiceCloneStatus === 'generating'
-            ? { type: 'info' as const, message: '固定话术正在生成完整替换音轨。' }
+          ? {
+              type: 'success' as const,
+              message: '参考人声与 XTTS-v2 模型已准备完成，可以在播放中替换当前话术。',
+            }
+      : voiceCloneStatus === 'generating'
+            ? {
+                type: 'info' as const,
+                message: voiceCloneProgressMessage ?? '固定话术正在生成完整替换音轨。',
+              }
             : voiceCloneStatus === 'playing'
               ? { type: 'success' as const, message: '固定话术替换音轨正在当前轮次生效。' }
               : voiceCloneStatus === 'failed'
@@ -2000,10 +2057,10 @@ function DesktopApp() {
                       type: 'warning' as const,
                       message: voiceCloneState?.error ?? '固定话术操作已取消',
                     }
-                  : {
-                      type: 'info' as const,
-                      message: '点击“准备人声”后，再选择预制文本或输入新文本替换当前话术。',
-                    };
+                : {
+                    type: 'info' as const,
+                    message: getVoiceCloneIdleNotice(currentSource?.mp4_hash_status),
+                  };
 
   function applyVoiceClonePresetSelection(presetId: string | null) {
     setSelectedVoiceClonePresetId(presetId);
@@ -2035,7 +2092,7 @@ function DesktopApp() {
       setVoiceCloneFormError(validationError);
       return;
     }
-    if (!mediaState) {
+    if (voiceClonePositionMs === null) {
       setVoiceCloneFormError('播放器位置尚未同步，请稍后再试');
       return;
     }
@@ -2046,7 +2103,7 @@ function DesktopApp() {
       const nextSnapshot = await invoke<PlaybackSnapshot>('start_voice_clone_replacement', {
         request: {
           text: trimmedVoiceCloneText,
-          position_ms: Math.max(0, Math.round(mediaState.current_time * 1000)),
+          position_ms: voiceClonePositionMs,
         },
       });
       setSnapshot(nextSnapshot);
@@ -2353,6 +2410,13 @@ function DesktopApp() {
     ? null
     : Math.max(0, runtimePeriodMs - (runtimeNowMs - runtimeLastChangeMs));
   const diagnosticFresh = diagnosticMessage !== null && Date.now() - diagnosticMessage.sent_at_ms < 1_500;
+  const interludePlaybackNotice = interludeDraft.enabled
+    ? playbackDisplayState !== 'playing'
+      ? '当前视频已暂停或未开始，插话不会播放，请点击“继续”后再试听。'
+      : !diagnosticFresh
+        ? '最终效果播放器尚未连接，插话不会播放，请点击“打开/聚焦播放器”。'
+        : null
+    : null;
   const mediaDuration = mediaState?.duration ?? 0;
   const mediaCurrentTime = clampMediaTime(mediaState?.current_time ?? 0, mediaDuration);
   const pictureInPictureDocument = document as PictureInPictureDocument;
@@ -2377,12 +2441,6 @@ function DesktopApp() {
         <div className="desktop-workspace">
           <section className="desktop-column desktop-column-source" aria-label="视频素材与状态">
             <Typography.Title level={2}>autoLive 桌面端</Typography.Title>
-            <Alert
-              type="info"
-              showIcon
-              message="单源循环播放"
-              description="导入一个 MP4 后，在同一个最终效果窗口内持续循环；不生成 N 个离线视频，不创建版本队列。"
-            />
             <Space wrap>
               <Button type="primary" size="large" onClick={() => void importVideo()}>
                 导入视频并播放
@@ -2406,7 +2464,7 @@ function DesktopApp() {
                   <Descriptions.Item label="播放状态">{snapshot?.playback_state ?? '未获取'}</Descriptions.Item>
                   <Descriptions.Item label="循环次数">{snapshot?.loop_index ?? 0}</Descriptions.Item>
                   <Descriptions.Item label="当前视频">{snapshot?.current_video_reference ?? '—'}</Descriptions.Item>
-                  <Descriptions.Item label="当前音轨">{snapshot?.current_audio_source ?? '—'}</Descriptions.Item>
+                  <Descriptions.Item label="当前音轨">{snapshot ? getEffectiveAudioSource(snapshot) : '—'}</Descriptions.Item>
                   <Descriptions.Item label="视频处理">{snapshot?.video_processing_enabled ? '开启' : '关闭'}</Descriptions.Item>
                   <Descriptions.Item label="声音处理">{snapshot?.audio_processing_enabled ? '开启' : '关闭'}</Descriptions.Item>
                 </Descriptions>
@@ -2496,6 +2554,12 @@ function DesktopApp() {
                   <Descriptions.Item label="文件">
                     {snapshot?.source_media?.file_name ?? probe?.source.file_name}
                   </Descriptions.Item>
+                  <Descriptions.Item label="格式">
+                    {currentSource?.file_name.split('.').pop()?.toUpperCase() ?? 'MP4'}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="大小">
+                    {((currentSource?.file_size_bytes ?? 0) / 1024 / 1024).toFixed(1)} MB
+                  </Descriptions.Item>
                   <Descriptions.Item label="时长">
                     {snapshot?.source_media?.duration_ms ?? probe?.source.duration_ms ?? '-'} ms
                   </Descriptions.Item>
@@ -2513,6 +2577,7 @@ function DesktopApp() {
               <Space direction="vertical" size="middle" style={{ width: '100%' }}>
                 <Space align="center">
                   <Switch
+                    aria-label="声音处理"
                     checked={audioProcessingEnabled}
                     onChange={(checked) =>
                       void updateProcessingSwitches({
@@ -2526,6 +2591,7 @@ function DesktopApp() {
                 </Space>
                 <Space align="center">
                   <Switch
+                    aria-label="实时话术幻化"
                     checked={realtimeAudioVariantEnabled}
                     onChange={(checked) =>
                       void updateProcessingSwitches({
@@ -2548,6 +2614,103 @@ function DesktopApp() {
                 />
               </Space>
             </Card>
+            <Card title="随机插话播放器">
+              <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                <Space align="center">
+                  <Switch
+                    aria-label="启用随机插话"
+                    checked={interludeDraft.enabled}
+                    onChange={(checked) => updateInterludeDraft({ enabled: checked })}
+                  />
+                  <Typography.Text>启用随机插话</Typography.Text>
+                </Space>
+                <Typography.Text type="secondary">
+                  首段立即随机播放；每段结束后等待设置的随机间隔，再播放下一段。
+                </Typography.Text>
+                {interludePlaybackNotice ? <Alert type="warning" showIcon message={interludePlaybackNotice} /> : null}
+                <Space.Compact style={{ width: '100%' }}>
+                  <Input
+                    readOnly
+                    value={interludeDraft.directory ?? ''}
+                    placeholder="请选择音频文件夹"
+                  />
+                  <Button onClick={() => void chooseInterludeDirectory()}>选择音频文件夹</Button>
+                </Space.Compact>
+                <Space wrap>
+                  <InputNumber
+                    aria-label="插话最小间隔"
+                    addonBefore="最小间隔"
+                    addonAfter="ms"
+                    min={INTERLUDE_LIMITS.intervalMinMs.min}
+                    max={INTERLUDE_LIMITS.intervalMinMs.max}
+                    step={500}
+                    value={interludeDraft.intervalMinMs}
+                    onChange={(value) => typeof value === 'number' && updateInterludeDraft({ intervalMinMs: value })}
+                  />
+                  <InputNumber
+                    aria-label="插话最大间隔"
+                    addonBefore="最大间隔"
+                    addonAfter="ms"
+                    min={INTERLUDE_LIMITS.intervalMinMs.min}
+                    max={INTERLUDE_LIMITS.intervalMinMs.max}
+                    step={500}
+                    value={interludeDraft.intervalMaxMs}
+                    onChange={(value) => typeof value === 'number' && updateInterludeDraft({ intervalMaxMs: value })}
+                  />
+                  <InputNumber
+                    aria-label="插话音量"
+                    addonBefore="插话音量"
+                    addonAfter="dB"
+                    min={INTERLUDE_LIMITS.volumeDb.min}
+                    max={INTERLUDE_LIMITS.volumeDb.max}
+                    step={0.5}
+                    value={interludeDraft.volumeDb}
+                    onChange={(value) => typeof value === 'number' && updateInterludeDraft({ volumeDb: value })}
+                  />
+                  <InputNumber
+                    aria-label="原声压低"
+                    addonBefore="原声压低"
+                    addonAfter="dB"
+                    min={INTERLUDE_LIMITS.duckingDepthDb.min}
+                    max={INTERLUDE_LIMITS.duckingDepthDb.max}
+                    step={0.5}
+                    value={interludeDraft.duckingDepthDb}
+                    onChange={(value) => typeof value === 'number' && updateInterludeDraft({ duckingDepthDb: value })}
+                  />
+                  <InputNumber
+                    aria-label="插话淡入时长"
+                    addonBefore="Attack"
+                    addonAfter="ms"
+                    min={INTERLUDE_LIMITS.duckingAttackMs.min}
+                    max={INTERLUDE_LIMITS.duckingAttackMs.max}
+                    step={5}
+                    value={interludeDraft.duckingAttackMs}
+                    onChange={(value) => typeof value === 'number' && updateInterludeDraft({ duckingAttackMs: value })}
+                  />
+                  <InputNumber
+                    aria-label="插话淡出时长"
+                    addonBefore="Release"
+                    addonAfter="ms"
+                    min={INTERLUDE_LIMITS.duckingReleaseMs.min}
+                    max={INTERLUDE_LIMITS.duckingReleaseMs.max}
+                    step={10}
+                    value={interludeDraft.duckingReleaseMs}
+                    onChange={(value) => typeof value === 'number' && updateInterludeDraft({ duckingReleaseMs: value })}
+                  />
+                </Space>
+                <Space wrap>
+                  <Tag color={snapshot?.interlude?.enabled ? 'green' : 'default'}>
+                    开关：{snapshot?.interlude?.enabled ? '开启' : '关闭'}
+                  </Tag>
+                  <Tag>文件数：{snapshot?.interlude?.audio_count ?? 0}</Tag>
+                  <Tag>状态：{snapshot?.interlude?.status ?? 'idle'}</Tag>
+                </Space>
+                {snapshot?.interlude?.error ? <Alert type="error" showIcon message={snapshot.interlude.error} /> : null}
+                <Button type="primary" onClick={() => void saveInterludeConfig()} loading={interludeSaving}>
+                  保存插话配置
+                </Button>
+              </Space>
+            </Card>
             <Card title="声音克隆替换">
               <Space direction="vertical" size="middle" style={{ width: '100%' }}>
                 <Space wrap>
@@ -2562,7 +2725,7 @@ function DesktopApp() {
                 </Space>
                 <Alert type={voiceCloneNotice.type} showIcon message={voiceCloneNotice.message} />
                 <Progress
-                  percent={getVoiceCloneProgress(voiceCloneStatus)}
+                  percent={voiceCloneProgressPercent}
                   status={voiceCloneProgressStatus}
                   showInfo={false}
                 />
@@ -2620,6 +2783,7 @@ function DesktopApp() {
                     onClick={() => void startVoiceCloneReplacement()}
                     loading={voiceCloneActionBusy === 'replace'}
                     disabled={voiceCloneReplaceDisabledReason !== null}
+                    title={voiceCloneReplaceDisabledReason ?? undefined}
                   >
                     替换当前话
                   </Button>
@@ -2644,6 +2808,9 @@ function DesktopApp() {
                     清空当前替换
                   </Button>
                 </Space>
+                {voiceCloneReplaceDisabledReason ? (
+                  <Typography.Text type="secondary">{voiceCloneReplaceDisabledReason}</Typography.Text>
+                ) : null}
                 <Typography.Text type="secondary">
                   替换时会取当前播放器位置，只替换点击瞬间所在话术片段的后半段，并在下一轮循环恢复原音频。
                 </Typography.Text>
@@ -2708,13 +2875,13 @@ function DesktopApp() {
                 </Typography.Title>
                 {researchParams ? (
                 <Space wrap style={{ marginTop: 16 }}>
-                  <InputNumber addonBefore="动态周期" addonAfter="ms" value={researchParams.audio.random_change_period_ms} min={500} max={60_000} step={500} onChange={(value) => updateResearchParam('audio', 'random_change_period_ms', value)} />
-                  <InputNumber addonBefore="音高微移" addonAfter="半音" value={researchParams.audio.pitch_shift_semitones} min={-2} max={2} step={0.1} onChange={(value) => updateResearchParam('audio', 'pitch_shift_semitones', value)} />
-                  <InputNumber addonBefore="MFCC" addonAfter="%" value={researchParams.audio.mfcc_shift_percent} min={-20} max={20} onChange={(value) => updateResearchParam('audio', 'mfcc_shift_percent', value)} />
-                  <InputNumber addonBefore="SNR 浮动" addonAfter="dB" value={researchParams.audio.snr_variation_db} min={-6} max={6} onChange={(value) => updateResearchParam('audio', 'snr_variation_db', value)} />
-                  <InputNumber addonBefore="输入增益" addonAfter="dB" value={researchParams.audio.input_gain_db} min={-6} max={6} step={0.1} onChange={(value) => updateResearchParam('audio', 'input_gain_db', value)} />
-                  <InputNumber addonBefore="输出增益" addonAfter="dB" value={researchParams.audio.output_gain_db} min={-6} max={6} step={0.1} onChange={(value) => updateResearchParam('audio', 'output_gain_db', value)} />
-                  <InputNumber addonBefore="响度" addonAfter="dB" value={researchParams.audio.loudness_adjustment_db} min={-6} max={6} step={0.1} onChange={(value) => updateResearchParam('audio', 'loudness_adjustment_db', value)} />
+                  <InputNumber aria-label="音频动态周期" addonBefore="动态周期" addonAfter="ms" value={researchParams.audio.random_change_period_ms} min={500} max={60_000} step={500} onChange={(value) => updateResearchParam('audio', 'random_change_period_ms', value)} />
+                  <InputNumber aria-label="音频音高微移" addonBefore="音高微移" addonAfter="半音" value={researchParams.audio.pitch_shift_semitones} min={-2} max={2} step={0.1} onChange={(value) => updateResearchParam('audio', 'pitch_shift_semitones', value)} />
+                  <InputNumber aria-label="音频 MFCC 偏移" addonBefore="MFCC" addonAfter="%" value={researchParams.audio.mfcc_shift_percent} min={-20} max={20} onChange={(value) => updateResearchParam('audio', 'mfcc_shift_percent', value)} />
+                  <InputNumber aria-label="音频 SNR 浮动" addonBefore="SNR 浮动" addonAfter="dB" value={researchParams.audio.snr_variation_db} min={-6} max={6} onChange={(value) => updateResearchParam('audio', 'snr_variation_db', value)} />
+                  <InputNumber aria-label="音频输入增益" addonBefore="输入增益" addonAfter="dB" value={researchParams.audio.input_gain_db} min={-6} max={6} step={0.1} onChange={(value) => updateResearchParam('audio', 'input_gain_db', value)} />
+                  <InputNumber aria-label="音频输出增益" addonBefore="输出增益" addonAfter="dB" value={researchParams.audio.output_gain_db} min={-6} max={6} step={0.1} onChange={(value) => updateResearchParam('audio', 'output_gain_db', value)} />
+                  <InputNumber aria-label="音频响度调整" addonBefore="响度" addonAfter="dB" value={researchParams.audio.loudness_adjustment_db} min={-6} max={6} step={0.1} onChange={(value) => updateResearchParam('audio', 'loudness_adjustment_db', value)} />
                   <Select
                     aria-label="音频采样率"
                     value={researchParams.audio.sample_rate_hz ?? 'source'}
@@ -2735,6 +2902,7 @@ function DesktopApp() {
               <Space direction="vertical" size="middle" style={{ width: '100%' }}>
                 <Space align="center">
                   <Switch
+                    aria-label="视频处理"
                     checked={videoProcessingEnabled}
                     onChange={(checked) =>
                       void updateProcessingSwitches({
@@ -2814,20 +2982,20 @@ function DesktopApp() {
             <Card title="视频研究参数">
               {researchParams ? (
                 <Space wrap>
-                  <InputNumber addonBefore="亮度" addonAfter="%" value={researchParams.video.brightness_percent} min={-100} max={100} onChange={(value) => updateResearchParam('video', 'brightness_percent', value)} />
-                  <InputNumber addonBefore="对比度" addonAfter="%" value={researchParams.video.contrast_percent} min={0} max={200} onChange={(value) => updateResearchParam('video', 'contrast_percent', value)} />
-                  <InputNumber addonBefore="饱和度" addonAfter="%" value={researchParams.video.saturation_percent} min={0} max={200} onChange={(value) => updateResearchParam('video', 'saturation_percent', value)} />
-                  <InputNumber addonBefore="色相" addonAfter="°" value={researchParams.video.hue_rotation_degrees} min={-180} max={180} onChange={(value) => updateResearchParam('video', 'hue_rotation_degrees', value)} />
-                  <InputNumber addonBefore="像素缩放" addonAfter="%" value={researchParams.video.pixel_scale_percent} min={95} max={105} step={0.1} onChange={(value) => updateResearchParam('video', 'pixel_scale_percent', value)} />
-                  <InputNumber addonBefore="模糊" addonAfter="px" value={researchParams.video.blur_radius_px} min={0} max={8} step={0.1} onChange={(value) => updateResearchParam('video', 'blur_radius_px', value)} />
-                  <InputNumber addonBefore="锐化" addonAfter="%" value={researchParams.video.sharpen_percent} min={0} max={100} onChange={(value) => updateResearchParam('video', 'sharpen_percent', value)} />
-                  <InputNumber addonBefore="噪点" addonAfter="%" value={researchParams.video.noise_percent} min={0} max={8} step={0.1} onChange={(value) => updateResearchParam('video', 'noise_percent', value)} />
-                  <InputNumber addonBefore="细节增强" addonAfter="%" value={researchParams.video.detail_enhancement_percent} min={0} max={50} step={0.1} onChange={(value) => updateResearchParam('video', 'detail_enhancement_percent', value)} />
-                  <InputNumber addonBefore="动态裁剪" addonAfter="%/边" value={researchParams.video.dynamic_crop_percent} min={0} max={4} step={0.1} onChange={(value) => updateResearchParam('video', 'dynamic_crop_percent', value)} />
-                  <InputNumber addonBefore="像素扰动" addonAfter="px" value={researchParams.video.pixel_jitter_px} min={0} max={2} step={0.1} onChange={(value) => updateResearchParam('video', 'pixel_jitter_px', value)} />
-                  <InputNumber addonBefore="X 偏移" addonAfter="px" value={researchParams.video.space_x_offset_px} min={-4} max={4} step={0.1} onChange={(value) => updateResearchParam('video', 'space_x_offset_px', value)} />
-                  <InputNumber addonBefore="Y 偏移" addonAfter="px" value={researchParams.video.space_y_offset_px} min={-4} max={4} step={0.1} onChange={(value) => updateResearchParam('video', 'space_y_offset_px', value)} />
-                  <InputNumber addonBefore="切片间隔" addonAfter="ms" value={researchParams.research.slice_trigger_interval_ms} min={5_000} max={120_000} onChange={(value) => updateResearchParam('research', 'slice_trigger_interval_ms', value)} />
+                  <InputNumber aria-label="视频亮度" addonBefore="亮度" addonAfter="%" value={researchParams.video.brightness_percent} min={-100} max={100} onChange={(value) => updateResearchParam('video', 'brightness_percent', value)} />
+                  <InputNumber aria-label="视频对比度" addonBefore="对比度" addonAfter="%" value={researchParams.video.contrast_percent} min={0} max={200} onChange={(value) => updateResearchParam('video', 'contrast_percent', value)} />
+                  <InputNumber aria-label="视频饱和度" addonBefore="饱和度" addonAfter="%" value={researchParams.video.saturation_percent} min={0} max={200} onChange={(value) => updateResearchParam('video', 'saturation_percent', value)} />
+                  <InputNumber aria-label="视频色相" addonBefore="色相" addonAfter="°" value={researchParams.video.hue_rotation_degrees} min={-180} max={180} onChange={(value) => updateResearchParam('video', 'hue_rotation_degrees', value)} />
+                  <InputNumber aria-label="视频像素缩放" addonBefore="像素缩放" addonAfter="%" value={researchParams.video.pixel_scale_percent} min={95} max={105} step={0.1} onChange={(value) => updateResearchParam('video', 'pixel_scale_percent', value)} />
+                  <InputNumber aria-label="视频模糊半径" addonBefore="模糊" addonAfter="px" value={researchParams.video.blur_radius_px} min={0} max={8} step={0.1} onChange={(value) => updateResearchParam('video', 'blur_radius_px', value)} />
+                  <InputNumber aria-label="视频锐化" addonBefore="锐化" addonAfter="%" value={researchParams.video.sharpen_percent} min={0} max={100} onChange={(value) => updateResearchParam('video', 'sharpen_percent', value)} />
+                  <InputNumber aria-label="视频噪点" addonBefore="噪点" addonAfter="%" value={researchParams.video.noise_percent} min={0} max={8} step={0.1} onChange={(value) => updateResearchParam('video', 'noise_percent', value)} />
+                  <InputNumber aria-label="视频细节增强" addonBefore="细节增强" addonAfter="%" value={researchParams.video.detail_enhancement_percent} min={0} max={50} step={0.1} onChange={(value) => updateResearchParam('video', 'detail_enhancement_percent', value)} />
+                  <InputNumber aria-label="视频动态裁剪" addonBefore="动态裁剪" addonAfter="%/边" value={researchParams.video.dynamic_crop_percent} min={0} max={4} step={0.1} onChange={(value) => updateResearchParam('video', 'dynamic_crop_percent', value)} />
+                  <InputNumber aria-label="视频像素扰动" addonBefore="像素扰动" addonAfter="px" value={researchParams.video.pixel_jitter_px} min={0} max={2} step={0.1} onChange={(value) => updateResearchParam('video', 'pixel_jitter_px', value)} />
+                  <InputNumber aria-label="视频 X 轴偏移" addonBefore="X 偏移" addonAfter="px" value={researchParams.video.space_x_offset_px} min={-4} max={4} step={0.1} onChange={(value) => updateResearchParam('video', 'space_x_offset_px', value)} />
+                  <InputNumber aria-label="视频 Y 轴偏移" addonBefore="Y 偏移" addonAfter="px" value={researchParams.video.space_y_offset_px} min={-4} max={4} step={0.1} onChange={(value) => updateResearchParam('video', 'space_y_offset_px', value)} />
+                  <InputNumber aria-label="研究切片间隔" addonBefore="切片间隔" addonAfter="ms" value={researchParams.research.slice_trigger_interval_ms} min={5_000} max={120_000} onChange={(value) => updateResearchParam('research', 'slice_trigger_interval_ms', value)} />
                 </Space>
               ) : (
                 <Alert type="info" showIcon message="正在读取视频研究参数…" />

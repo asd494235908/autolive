@@ -27,6 +27,10 @@ desktop/third_party/ffmpeg/*/ffmpeg
 desktop/third_party/ffmpeg/*/ffprobe
 desktop/third_party/ffmpeg/*/ffmpeg.exe
 desktop/third_party/ffmpeg/*/ffprobe.exe
+desktop/src-tauri/voice-models/*
+!desktop/src-tauri/voice-models/.gitkeep
+desktop/src-tauri/voice-worker/*
+!desktop/src-tauri/voice-worker/.gitkeep
 
 # Local backend binaries and runtime data
 backend/bin/

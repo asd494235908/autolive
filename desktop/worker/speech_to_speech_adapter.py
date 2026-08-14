@@ -36,6 +36,7 @@ DEFAULT_OUTPUT_SAMPLE_RATE_HZ = 24_000
 INPUT_SAMPLE_RATE_HZ = 16_000
 INPUT_CHANNEL_COUNT = 1
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
+FFMPEG_PATH_ENV = "AUTOLIVE_FFMPEG_PATH"
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
@@ -45,6 +46,17 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
         raise FileExistsError(path)
     partial.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
     partial.replace(path)
+
+
+def _resolve_ffmpeg() -> Path | None:
+    configured = os.environ.get(FFMPEG_PATH_ENV, "").strip()
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate.resolve()
+        return None
+    found = shutil.which("ffmpeg")
+    return Path(found).resolve() if found else None
 
 
 def capabilities() -> dict[str, Any]:
@@ -67,13 +79,13 @@ def capabilities() -> dict[str, Any]:
             "model": None,
             "reason": "未配置 AUTOLIVE_SPEECH_TO_SPEECH_ENDPOINT",
         }
-    if shutil.which("ffmpeg") is None:
+    if _resolve_ffmpeg() is None:
         return {
             "available": False,
             "status": "unavailable",
             "provider": None,
             "model": None,
-            "reason": "未安装 ffmpeg，无法提取和归一化本地音频",
+            "reason": f"未找到 FFmpeg，可通过 {FFMPEG_PATH_ENV} 指定绝对路径",
         }
     return {
         "available": True,
@@ -129,11 +141,14 @@ def local_path(reference: str) -> Path:
 
 
 def extract_pcm(context: dict[str, Any]) -> bytes:
+    ffmpeg_path = _resolve_ffmpeg()
+    if ffmpeg_path is None:
+        raise RuntimeError(f"未找到 FFmpeg，可通过 {FFMPEG_PATH_ENV} 指定绝对路径")
     source = local_path(str(context["audio_path_or_stream_ref"]))
     start_seconds = max(0.0, int(context.get("start_at_ms", 0)) / 1000)
     duration_seconds = int(context["target_duration_ms"]) / 1000
     command = [
-        "ffmpeg",
+        str(ffmpeg_path),
         "-hide_banner",
         "-loglevel",
         "error",
@@ -244,6 +259,9 @@ def normalize_audio(
     target_channel_count: int,
     target_duration_ms: int,
 ) -> bytes:
+    ffmpeg_path = _resolve_ffmpeg()
+    if ffmpeg_path is None:
+        raise RuntimeError(f"未找到 FFmpeg，可通过 {FFMPEG_PATH_ENV} 指定绝对路径")
     if not audio or source_sample_rate_hz <= 0 or target_sample_rate_hz <= 0:
         raise ValueError("音频采样率或内容无效")
     if target_channel_count <= 0 or target_duration_ms <= 0:
@@ -262,7 +280,7 @@ def normalize_audio(
         ]
     )
     command = [
-        "ffmpeg",
+        str(ffmpeg_path),
         "-hide_banner",
         "-loglevel",
         "error",

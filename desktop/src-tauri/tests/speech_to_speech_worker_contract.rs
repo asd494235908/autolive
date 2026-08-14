@@ -1,14 +1,17 @@
 use autolive_desktop_core::cancellation::CancellationToken;
 use autolive_desktop_core::speech_to_speech::SpeechToSpeechContext;
 use autolive_desktop_core::speech_to_speech_worker::{
-    probe_speech_to_speech_worker, run_speech_to_speech_context_worker,
-    run_speech_to_speech_worker, SpeechToSpeechContextWorkerRequest, SpeechToSpeechWorkerError,
-    SpeechToSpeechWorkerRequest,
+    probe_speech_to_speech_worker, probe_speech_to_speech_worker_with_resource_dir,
+    run_speech_to_speech_context_worker, run_speech_to_speech_worker,
+    run_speech_to_speech_worker_with_resource_dir, SpeechToSpeechContextWorkerRequest,
+    SpeechToSpeechWorkerError, SpeechToSpeechWorkerRequest,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
 struct TestDir(PathBuf);
 
@@ -204,4 +207,98 @@ fn timed_out_worker_is_terminated_and_staging_output_is_removed() {
     );
     assert!(!output.exists());
     assert!(!directory.0.join("result.json.partial").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn packaged_media_paths_are_injected_for_capability_probe_and_actual_task() {
+    let _environment_guard = ENVIRONMENT_LOCK
+        .lock()
+        .expect("speech worker environment lock should work");
+    let directory = TestDir::new();
+    let resource_dir = directory.0.join("resources");
+    let executable = directory.0.join("worker.sh");
+    let input = directory.0.join("input.json");
+    let output = directory.0.join("result.json");
+    let captured_environment = directory.0.join("media-environment.txt");
+    std::fs::create_dir_all(resource_dir.join("binaries")).expect("resource directory");
+    std::fs::write(resource_dir.join("binaries/ffmpeg"), b"ffmpeg").expect("ffmpeg fixture");
+    std::fs::write(resource_dir.join("binaries/ffprobe"), b"ffprobe").expect("ffprobe fixture");
+    std::fs::write(&input, b"{}").expect("input should be written");
+    make_executable(
+        &executable,
+        &format!(
+            "#!/bin/sh\n\nif [ \"$1\" = \"--capabilities-json\" ]; then\n  printf '%s\\n%s' \"$AUTOLIVE_FFMPEG_PATH\" \"$AUTOLIVE_FFPROBE_PATH\" > '{}'\n  printf '%s' '{{\"available\":true,\"status\":\"available\",\"provider\":\"hf-speech-to-speech\",\"model\":\"local\",\"reason\":null}}' > \"$2\"\n  exit 0\nfi\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --output-json) output=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nprintf '%s\\n%s' \"$AUTOLIVE_FFMPEG_PATH\" \"$AUTOLIVE_FFPROBE_PATH\" > '{}'\nprintf '%s' '{{\"decision\":\"keep_original\",\"text\":\"原始话术\",\"audio_path_or_stream_ref\":null,\"audio_sha256\":null,\"duration_ms\":null,\"sync_offset_ms\":null,\"sample_rate_hz\":null,\"channel_count\":null,\"latency_ms\":20,\"model\":\"worker-test\",\"fallback_reason\":null}}' > \"$output\"\n",
+            captured_environment.display(),
+            captured_environment.display(),
+        ),
+    );
+
+    let previous_ffmpeg = std::env::var_os("AUTOLIVE_FFMPEG_PATH");
+    let previous_ffprobe = std::env::var_os("AUTOLIVE_FFPROBE_PATH");
+    std::env::remove_var("AUTOLIVE_FFMPEG_PATH");
+    std::env::remove_var("AUTOLIVE_FFPROBE_PATH");
+
+    let capabilities =
+        probe_speech_to_speech_worker_with_resource_dir(&executable, 5_000, &resource_dir)
+            .expect("capability probe should succeed");
+    assert!(capabilities.available);
+    let result = run_speech_to_speech_worker_with_resource_dir(
+        &SpeechToSpeechWorkerRequest {
+            executable,
+            input_json_path: input,
+            output_json_path: output,
+            timeout_ms: 2_000,
+        },
+        &CancellationToken::new(),
+        &resource_dir,
+    )
+    .expect("worker task should succeed");
+    assert_eq!(result.model, "worker-test");
+
+    let expected = format!(
+        "{}\n{}",
+        resource_dir.join("binaries/ffmpeg").display(),
+        resource_dir.join("binaries/ffprobe").display(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&captured_environment)
+            .expect("worker environment should be captured"),
+        expected
+    );
+
+    let explicit_ffmpeg = directory.0.join("dev-ffmpeg");
+    let explicit_ffprobe = directory.0.join("dev-ffprobe");
+    let explicit_output = directory.0.join("explicit-result.json");
+    std::env::set_var("AUTOLIVE_FFMPEG_PATH", &explicit_ffmpeg);
+    std::env::set_var("AUTOLIVE_FFPROBE_PATH", &explicit_ffprobe);
+    run_speech_to_speech_worker_with_resource_dir(
+        &SpeechToSpeechWorkerRequest {
+            executable: directory.0.join("worker.sh"),
+            input_json_path: directory.0.join("input.json"),
+            output_json_path: explicit_output,
+            timeout_ms: 2_000,
+        },
+        &CancellationToken::new(),
+        &resource_dir,
+    )
+    .expect("explicit media paths should not block the worker");
+    assert_eq!(
+        std::fs::read_to_string(&captured_environment)
+            .expect("explicit worker environment should be captured"),
+        format!(
+            "{}\n{}",
+            explicit_ffmpeg.display(),
+            explicit_ffprobe.display()
+        )
+    );
+
+    match previous_ffmpeg {
+        Some(value) => std::env::set_var("AUTOLIVE_FFMPEG_PATH", value),
+        None => std::env::remove_var("AUTOLIVE_FFMPEG_PATH"),
+    }
+    match previous_ffprobe {
+        Some(value) => std::env::set_var("AUTOLIVE_FFPROBE_PATH", value),
+        None => std::env::remove_var("AUTOLIVE_FFPROBE_PATH"),
+    }
 }

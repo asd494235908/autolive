@@ -574,7 +574,25 @@ fn cleanup(report_path: &Path, output_path: Option<&Path>) {
     }
 }
 
+#[cfg(any(windows, test))]
+fn windows_taskkill_args(pid: u32) -> Vec<String> {
+    vec![
+        String::from("/PID"),
+        pid.to_string(),
+        String::from("/T"),
+        String::from("/F"),
+    ]
+}
+
 fn terminate_child(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ignored = Command::new("taskkill")
+            .args(windows_taskkill_args(child.id()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     let _ignored = child.kill();
     let _ignored = child.wait();
 }
@@ -617,4 +635,15 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<(), ResearchE
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|item| item.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn windows_taskkill_contract_targets_the_process_tree() {
+        assert_eq!(
+            super::windows_taskkill_args(4242),
+            vec!["/PID", "4242", "/T", "/F"]
+        );
+    }
 }

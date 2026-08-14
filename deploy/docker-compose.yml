@@ -1,3 +1,5 @@
+name: autolive
+
 x-app-environment: &app-environment
   APP_ADDR: ${APP_ADDR}
   APP_VERSION: ${APP_VERSION}

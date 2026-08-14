@@ -38,6 +38,8 @@ jobs:
 
     env:
       AUTOLIVE_TARGET_TRIPLE: ${{ matrix.target_triple }}
+      AUTOLIVE_VOICE_PYTHON: python
+      AUTOLIVE_COQUI_TOS_AGREE: ${{ vars.AUTOLIVE_COQUI_TOS_AGREE }}
 
     steps:
       - name: Checkout
@@ -60,6 +62,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target_triple }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: desktop/worker/requirements-voice-clone-build.txt
+
+      - name: Install voice clone packaging dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r desktop/worker/requirements-voice-clone-build.txt
 
       - name: Install desktop/ui dependencies
         run: pnpm --dir desktop/ui install --frozen-lockfile

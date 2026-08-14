@@ -62,6 +62,15 @@ test('validates control actions and clamps media values', async () => {
   assert.equal(formatMediaTime(72.4), '01:12');
 });
 
+test('uses the Rust playback position when the player window state is unavailable', async () => {
+  const { resolvePlaybackPositionMs } = await loadTypeScriptModule('播放控制消息.ts', [
+    'resolvePlaybackPositionMs',
+  ]);
+  assert.equal(resolvePlaybackPositionMs(2.4, 1_000), 2_400);
+  assert.equal(resolvePlaybackPositionMs(null, 1_000), 1_000);
+  assert.equal(resolvePlaybackPositionMs(undefined, undefined), null);
+});
+
 test('the final-effect video does not enable browser-native controls', async () => {
   const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /<video[\s\S]*?\bcontrols\b[\s\S]*?\/>/);

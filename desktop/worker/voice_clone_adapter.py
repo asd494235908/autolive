@@ -37,10 +37,90 @@ MIN_VOICE_SEGMENT_DURATION_MS = 200
 
 FFMPEG_PATH_ENV = "AUTOLIVE_FFMPEG_PATH"
 FFPROBE_PATH_ENV = "AUTOLIVE_FFPROBE_PATH"
+MODEL_ROOT_ENV = "AUTOLIVE_VOICE_CLONE_MODEL_ROOT"
+FROZEN_DEMUCS_DISPATCH_ARG = "--autolive-run-demucs"
 DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 30 * 60
 
 
 JsonDict = dict[str, Any]
+
+
+def progress_payload(*, status: str, phase: str, message: str, percent: int) -> JsonDict:
+    if status not in {"running", "success", "failed"}:
+        raise ValueError("进度状态无效")
+    if not phase.strip() or not message.strip():
+        raise ValueError("进度阶段和提示不能为空")
+    if percent < 0 or percent > 100:
+        raise ValueError("进度百分比必须在 0 到 100 之间")
+    return {
+        "status": status,
+        "phase": phase,
+        "message": message,
+        "percent": percent,
+    }
+
+
+def emit_progress(path: Path, payload: JsonDict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(f"{path.name}.partial")
+    try:
+        partial.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        partial.replace(path)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+
+
+def model_root_environment(root: Path) -> dict[str, str]:
+    root = root.expanduser()
+    huggingface_root = root / "huggingface"
+    return {
+        MODEL_ROOT_ENV: str(root),
+        "TORCH_HOME": str(root / "torch"),
+        "HF_HOME": str(huggingface_root),
+        "HF_HUB_CACHE": str(huggingface_root / "hub"),
+        "TTS_HOME": str(root / "tts"),
+    }
+
+
+def _configured_model_root() -> Path | None:
+    configured = os.environ.get(MODEL_ROOT_ENV, "").strip()
+    if not configured:
+        return None
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{MODEL_ROOT_ENV} 必须是绝对路径")
+    os.environ.update(model_root_environment(path))
+    return path
+
+
+def _optional_absolute_path(path_value: Any, field_name: str) -> Path | None:
+    if path_value is None or not str(path_value).strip():
+        return None
+    path = Path(str(path_value)).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{field_name} 必须是绝对路径")
+    return path
+
+
+def _safe_emit_progress(
+    path: Path | None,
+    *,
+    status: str,
+    phase: str,
+    message: str,
+    percent: int,
+) -> None:
+    if path is None:
+        return
+    try:
+        emit_progress(
+            path,
+            progress_payload(status=status, phase=phase, message=message, percent=percent),
+        )
+    except OSError:
+        # 进度文件是可选的观测通道，不能让它的磁盘错误中断媒体处理。
+        return
 
 
 def _safe_token(value: str) -> str:
@@ -94,6 +174,7 @@ def _dependency_reason() -> str | None:
 
 def capabilities() -> JsonDict:
     try:
+        _configured_model_root()
         dependency_reason = _dependency_reason()
         if dependency_reason is not None:
             return {
@@ -377,13 +458,56 @@ def _prepare_segments(
     return prepared
 
 
+def build_demucs_command(
+    demucs_args: list[str],
+    *,
+    executable: str | None = None,
+    frozen: bool | None = None,
+) -> list[str]:
+    worker_executable = sys.executable if executable is None else executable
+    frozen_mode = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    entrypoint = (
+        [FROZEN_DEMUCS_DISPATCH_ARG]
+        if frozen_mode
+        else ["-m", "demucs.separate"]
+    )
+    return [worker_executable, *entrypoint, *demucs_args]
+
+
+def _dispatch_frozen_demucs(demucs_args: list[str]) -> int:
+    demucs_module = _import_optional_module("demucs.separate")
+    try:
+        result = demucs_module.main(demucs_args)
+    except SystemExit as error:
+        return error.code if isinstance(error.code, int) else 0 if error.code is None else 1
+    return result if isinstance(result, int) else 0
+
+
 def prepare_source(request: JsonDict, output_json: Path) -> JsonDict:
     operation_id = str(request.get("operation_id") or uuid.uuid4().hex)
-    capability = capabilities()
-    if not capability["available"]:
-        return _failure_result(operation_id, capability["reason"] or "本地 voice clone 能力不可用", model=DEFAULT_XTTS_MODEL)
-
+    progress_path: Path | None = None
     try:
+        progress_path = _optional_absolute_path(request.get("progress_path"), "progress_path")
+        _configured_model_root()
+        _safe_emit_progress(
+            progress_path,
+            status="running",
+            phase="checking-models",
+            message="正在检查模型缓存。",
+            percent=0,
+        )
+        capability = capabilities()
+        if not capability["available"]:
+            reason = capability["reason"] or "本地 voice clone 能力不可用"
+            _safe_emit_progress(
+                progress_path,
+                status="failed",
+                phase="failed",
+                message=reason,
+                percent=100,
+            )
+            return _failure_result(operation_id, reason, model=DEFAULT_XTTS_MODEL)
+
         source_path = _read_existing_file(request.get("source_path"), "source_path")
         ffmpeg_path = _resolve_executable(FFMPEG_PATH_ENV, "ffmpeg")
         ffprobe_path = _resolve_executable(FFPROBE_PATH_ENV, "ffprobe")
@@ -399,13 +523,17 @@ def prepare_source(request: JsonDict, output_json: Path) -> JsonDict:
         model_size = str(request.get("model_size") or DEFAULT_WHISPER_MODEL_SIZE)
         language = str(request.get("language") or "zh")
 
+        _safe_emit_progress(
+            progress_path,
+            status="running",
+            phase="downloading-models",
+            message="正在下载或加载 Demucs 模型。",
+            percent=10,
+        )
         _extract_source_audio(ffmpeg_path, source_path, source_audio_path)
 
         _import_optional_module("demucs.separate")
-        demucs_executable = [
-            str(sys.executable),
-            "-m",
-            "demucs.separate",
+        demucs_args = [
             "--device",
             "cpu",
             "--two-stems=vocals",
@@ -413,9 +541,16 @@ def prepare_source(request: JsonDict, output_json: Path) -> JsonDict:
             str(demucs_output_dir),
             str(source_audio_path),
         ]
-        demucs_model_name = str(request.get("demucs_model") or "").strip()
-        if demucs_model_name:
-            demucs_executable[demucs_executable.index("-o"):demucs_executable.index("-o")] = ["-n", demucs_model_name]
+        demucs_model_name = str(request.get("demucs_model") or "htdemucs").strip() or "htdemucs"
+        demucs_args[demucs_args.index("-o"):demucs_args.index("-o")] = ["-n", demucs_model_name]
+        demucs_executable = build_demucs_command(demucs_args)
+        _safe_emit_progress(
+            progress_path,
+            status="running",
+            phase="separating-voice",
+            message="正在分离人声。",
+            percent=35,
+        )
         _run_checked(demucs_executable)
 
         vocals_path = _find_vocals_path(demucs_output_dir)
@@ -429,15 +564,38 @@ def prepare_source(request: JsonDict, output_json: Path) -> JsonDict:
         )
         reference_sha256 = _sha256(reference_audio_path)
 
+        _safe_emit_progress(
+            progress_path,
+            status="running",
+            phase="downloading-models",
+            message="正在下载或加载 Whisper 模型。",
+            percent=55,
+        )
         faster_whisper_module = _import_optional_module("faster_whisper")
         whisper_model = faster_whisper_module.WhisperModel(
             model_size,
             device="cpu",
             compute_type="int8",
         )
+        _safe_emit_progress(
+            progress_path,
+            status="running",
+            phase="transcribing",
+            message="正在识别人声话术。",
+            percent=75,
+        )
         segments = _prepare_segments(whisper_model, index_audio_path, language=language)
         if not segments:
             raise RuntimeError("未检测到有效人声片段")
+
+        _safe_emit_progress(
+            progress_path,
+            status="running",
+            phase="downloading-models",
+            message="正在下载或加载 XTTS-v2 模型。",
+            percent=90,
+        )
+        ensure_xtts_model_ready()
 
         result = _result_base(operation_id, "success", model=f"demucs+{model_size}+xtts_v2")
         result.update(
@@ -452,9 +610,24 @@ def prepare_source(request: JsonDict, output_json: Path) -> JsonDict:
                 "segments": segments,
             }
         )
+        _safe_emit_progress(
+            progress_path,
+            status="success",
+            phase="ready",
+            message="人声准备完成。",
+            percent=100,
+        )
         return result
     except Exception as error:  # noqa: BLE001 - Worker 必须返回结构化失败
-        return _failure_result(operation_id, str(error), model=DEFAULT_XTTS_MODEL)
+        reason = str(error)
+        _safe_emit_progress(
+            progress_path,
+            status="failed",
+            phase="failed",
+            message=reason,
+            percent=100,
+        )
+        return _failure_result(operation_id, reason, model=DEFAULT_XTTS_MODEL)
 
 
 def _adjust_cloned_audio(
@@ -543,13 +716,49 @@ def validate_replacement_bounds(replace_at_ms: int, resume_at_ms: int, total_dur
         raise ValueError("替换时间范围必须满足 0 <= replace_at_ms < resume_at_ms <= 源音频时长")
 
 
+def load_xtts_model(tts_module: Any) -> Any:
+    try:
+        return tts_module.TTS(model_name=DEFAULT_XTTS_MODEL, gpu=False)
+    except EOFError as error:
+        if os.environ.get(MODEL_ROOT_ENV, "").strip():
+            message = "XTTS-v2 模型资源不可用，请重新安装包含完整人声模型的安装包。"
+        else:
+            message = "XTTS-v2 模型资源不可用：当前开发环境尚未准备模型资源。"
+        raise RuntimeError(
+            message
+        ) from error
+
+
+def ensure_xtts_model_ready(tts_module: Any | None = None) -> Any:
+    module = tts_module or _import_optional_module("TTS.api")
+    return load_xtts_model(module)
+
+
 def replace_current(request: JsonDict, output_json: Path) -> JsonDict:
     operation_id = str(request.get("operation_id") or uuid.uuid4().hex)
-    capability = capabilities()
-    if not capability["available"]:
-        return _failure_result(operation_id, capability["reason"] or "本地 voice clone 能力不可用")
-
+    progress_path: Path | None = None
     try:
+        progress_path = _optional_absolute_path(request.get("progress_path"), "progress_path")
+        _configured_model_root()
+        _safe_emit_progress(
+            progress_path,
+            status="running",
+            phase="checking-models",
+            message="正在检查模型缓存。",
+            percent=0,
+        )
+        capability = capabilities()
+        if not capability["available"]:
+            reason = capability["reason"] or "本地 voice clone 能力不可用"
+            _safe_emit_progress(
+                progress_path,
+                status="failed",
+                phase="failed",
+                message=reason,
+                percent=100,
+            )
+            return _failure_result(operation_id, reason)
+
         source_path = _read_existing_file(request.get("source_path"), "source_path")
         audio_base_path = _read_existing_file(
             request.get("audio_base_path") or source_path,
@@ -585,8 +794,21 @@ def replace_current(request: JsonDict, output_json: Path) -> JsonDict:
         cloned_adjusted_path = operation_dir / "clone-adjusted.wav"
         final_audio_path = operation_dir / "replacement.wav"
 
-        tts_module = _import_optional_module("TTS.api")
-        tts = tts_module.TTS(model_name=DEFAULT_XTTS_MODEL, gpu=False)
+        _safe_emit_progress(
+            progress_path,
+            status="running",
+            phase="downloading-models",
+            message="正在下载或加载 XTTS-v2 模型。",
+            percent=25,
+        )
+        tts = ensure_xtts_model_ready()
+        _safe_emit_progress(
+            progress_path,
+            status="running",
+            phase="generating",
+            message="正在生成固定话术音轨。",
+            percent=60,
+        )
         tts.tts_to_file(
             text=text,
             speaker_wav=str(reference_audio_path),
@@ -633,18 +855,39 @@ def replace_current(request: JsonDict, output_json: Path) -> JsonDict:
                 "remaining_ms": remaining_ms,
             }
         )
+        _safe_emit_progress(
+            progress_path,
+            status="success",
+            phase="ready",
+            message="固定话术音轨已生成。",
+            percent=100,
+        )
         return result
     except Exception as error:  # noqa: BLE001 - Worker 必须返回结构化失败
-        return _failure_result(operation_id, str(error), model=DEFAULT_XTTS_MODEL)
+        reason = str(error)
+        _safe_emit_progress(
+            progress_path,
+            status="failed",
+            phase="failed",
+            message=reason,
+            percent=100,
+        )
+        return _failure_result(operation_id, reason, model=DEFAULT_XTTS_MODEL)
 
 
 def main(argv: list[str] | None = None) -> int:
+    worker_argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser()
     parser.add_argument("--capabilities-json", type=Path)
     parser.add_argument("--prepare-json", type=Path)
     parser.add_argument("--replace-json", type=Path)
     parser.add_argument("--output-json", type=Path)
-    args = parser.parse_args(argv)
+    parser.add_argument("--progress-json", type=Path)
+    if worker_argv and worker_argv[0] == FROZEN_DEMUCS_DISPATCH_ARG:
+        if not getattr(sys, "frozen", False):
+            parser.error(f"{FROZEN_DEMUCS_DISPATCH_ARG} 仅可由冻结 Worker 使用")
+        return _dispatch_frozen_demucs(worker_argv[1:])
+    args = parser.parse_args(worker_argv)
 
     if args.capabilities_json is not None:
         write_atomic_json(args.capabilities_json, capabilities())
@@ -671,6 +914,9 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         return 0
+
+    if args.progress_json is not None:
+        request["progress_path"] = str(args.progress_json)
 
     if args.prepare_json is not None:
         result = prepare_source(request, args.output_json)

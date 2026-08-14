@@ -2,6 +2,7 @@ use autolive_desktop_core::research_worker::{
     build_research_args, run_research, validate_research_report, ResearchAnalysisRequest,
     ResearchError, ResearchReport,
 };
+#[cfg(unix)]
 use sha2::Digest;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,17 +37,17 @@ fn request() -> ResearchAnalysisRequest {
     ResearchAnalysisRequest {
         analysis_id: String::from("analysis_abcd1234"),
         run_id: String::from("run_0001"),
-        input_mp4_path: PathBuf::from("/tmp/source.mp4"),
+        input_mp4_path: PathBuf::from("source.mp4"),
         expected_input_mp4_sha256: String::from(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ),
         source_mp4_sha256: String::from(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ),
-        params_path: PathBuf::from("/tmp/params.json"),
-        research_executable: PathBuf::from("/tmp/research-worker"),
-        output_report_path: PathBuf::from("/tmp/report.json"),
-        output_mp4_path: Some(PathBuf::from("/tmp/research.mp4")),
+        params_path: PathBuf::from("params.json"),
+        research_executable: PathBuf::from("research-worker"),
+        output_report_path: PathBuf::from("report.json"),
+        output_mp4_path: Some(PathBuf::from("research.mp4")),
         timeout_seconds: 60,
     }
 }
@@ -79,11 +80,13 @@ fn research_command_uses_argument_array_and_optional_output_mp4() {
     let mut input = request();
     input.input_mp4_path = directory.0.join("source.mp4");
     input.params_path = directory.0.join("params.json");
-    input.research_executable = PathBuf::from("/bin/sh");
+    input.research_executable = directory.0.join("research-worker");
     input.output_report_path = directory.0.join("report.json");
     input.output_mp4_path = Some(directory.0.join("research.mp4"));
     std::fs::write(&input.input_mp4_path, b"mp4 fixture").expect("input should be written");
     std::fs::write(&input.params_path, b"{}").expect("params should be written");
+    std::fs::write(&input.research_executable, b"worker fixture")
+        .expect("worker should be written");
 
     let args = build_research_args(&input).expect("valid research request should build args");
     let rendered: Vec<String> = args
@@ -154,17 +157,8 @@ fn research_request_identifiers_reject_path_separators() {
     input.research_executable = directory.0.join("worker");
     std::fs::write(&input.input_mp4_path, b"mp4 fixture").expect("input should be written");
     std::fs::write(&input.params_path, b"{}").expect("params should be written");
-    std::fs::write(&input.research_executable, b"#!/bin/sh\n").expect("worker should be written");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&input.research_executable)
-            .expect("worker metadata should be readable")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&input.research_executable, permissions)
-            .expect("worker should be executable");
-    }
+    std::fs::write(&input.research_executable, b"worker fixture")
+        .expect("worker should be written");
     input.analysis_id = "../escape".to_owned();
     input.expected_input_mp4_sha256 = autolive_desktop_core::hashing::hash_file_at_path(
         &input.input_mp4_path,
