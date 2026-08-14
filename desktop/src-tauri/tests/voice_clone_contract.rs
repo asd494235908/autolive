@@ -120,6 +120,64 @@ fn replacement_result_rejects_stale_operation_source_or_invalid_hash() {
 }
 
 #[test]
+fn replacement_result_rejects_relative_audio_or_zero_duration() {
+    let request = sample_request();
+
+    let mut relative_audio = sample_result();
+    relative_audio.audio_reference = "output.wav".to_owned();
+    assert_eq!(
+        validate_replacement_result(&relative_audio, &request),
+        Err(VoiceCloneError::NonAbsoluteAudioReference {
+            reference: "output.wav".to_owned(),
+        })
+    );
+
+    let mut zero_duration = sample_result();
+    zero_duration.replacement_duration_ms = 0;
+    assert_eq!(
+        validate_replacement_result(&zero_duration, &request),
+        Err(VoiceCloneError::ReplacementDurationZero)
+    );
+}
+
+#[test]
+fn segment_validation_rejects_invalid_bounds_short_duration_and_blank_text() {
+    assert_eq!(
+        VoiceCloneSegment {
+            start_ms: 1_000,
+            end_ms: 1_000,
+            text: "有效文本".to_owned(),
+        }
+        .validate(),
+        Err(VoiceCloneError::InvalidSegmentBounds {
+            start_ms: 1_000,
+            end_ms: 1_000,
+        })
+    );
+    assert_eq!(
+        VoiceCloneSegment {
+            start_ms: 1_000,
+            end_ms: 1_199,
+            text: "有效文本".to_owned(),
+        }
+        .validate(),
+        Err(VoiceCloneError::SegmentTooShort {
+            min_duration_ms: 200,
+            actual_duration_ms: 199,
+        })
+    );
+    assert_eq!(
+        VoiceCloneSegment {
+            start_ms: 1_000,
+            end_ms: 1_500,
+            text: "  ".to_owned(),
+        }
+        .validate(),
+        Err(VoiceCloneError::BlankSegmentText)
+    );
+}
+
+#[test]
 fn replacement_result_accepts_current_source_and_absolute_audio_output() {
     let request = sample_request();
     let source_index = VoiceCloneSourceIndex {

@@ -188,12 +188,18 @@ pub fn validate_replacement_result(
         });
     }
     if result.source_path != request.source_path {
+        if result.source_path.trim().is_empty() {
+            return Err(VoiceCloneError::EmptySourcePath);
+        }
         return Err(VoiceCloneError::SourcePathMismatch {
             expected: request.source_path.clone(),
             actual: result.source_path.clone(),
         });
     }
     if result.operation_id != request.operation_id {
+        if result.operation_id.trim().is_empty() {
+            return Err(VoiceCloneError::EmptyOperationId);
+        }
         return Err(VoiceCloneError::OperationIdMismatch {
             expected: request.operation_id.clone(),
             actual: result.operation_id.clone(),
