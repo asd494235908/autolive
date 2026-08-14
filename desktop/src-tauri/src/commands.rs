@@ -59,7 +59,7 @@ const MEDIA_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const RESEARCH_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const MACOS_NATIVE_TITLEBAR_HEIGHT: f64 = 32.0;
 const VOICE_CLONE_WORKER_ENV: &str = "AUTOLIVE_VOICE_CLONE_WORKER";
-const VOICE_CLONE_CAPABILITY_TIMEOUT_MS: u64 = 5_000;
+const VOICE_CLONE_CAPABILITY_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_VOICE_CLONE_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
 const VOICE_CLONE_AUDIO_PROBE_TIMEOUT_MS: u64 = 5_000;
 
@@ -3404,7 +3404,7 @@ fn build_audio_variant_candidate(
 
 #[cfg(test)]
 mod tests {
-    use super::AppState;
+    use super::{AppState, VOICE_CLONE_CAPABILITY_TIMEOUT_MS};
 
     #[test]
     fn state_starts_without_a_source_or_queue() {
@@ -3413,5 +3413,10 @@ mod tests {
         let snapshot = playback.snapshot();
         assert!(snapshot.source_media.is_none());
         assert_eq!(snapshot.loop_index, 0);
+    }
+
+    #[test]
+    fn voice_clone_capability_probe_allows_cpu_dependency_startup() {
+        assert_eq!(VOICE_CLONE_CAPABILITY_TIMEOUT_MS, 30_000);
     }
 }
