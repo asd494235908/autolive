@@ -90,6 +90,10 @@ mod tests {
     #[test]
     fn tauri_bundle_has_a_windows_icon() {
         assert!(std::path::Path::new("icons/icon.ico").is_file());
+
+        let config =
+            std::fs::read_to_string("tauri.conf.json").expect("tauri.conf.json should exist");
+        assert!(config.contains("\"icons/icon.ico\""));
     }
 
     #[test]
