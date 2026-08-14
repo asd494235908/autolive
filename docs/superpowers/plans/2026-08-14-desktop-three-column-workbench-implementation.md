@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 宽屏列比例固定为 28% / 38% / 34%，左列素材与视频状态，中列声音设置，右列视频预览与实时参数。
+- 宽屏列比例固定为 28% / 38% / 34%，左列素材与视频状态，中列声音设置，右列视频处理与实时参数；主页不展示实际视频画面。
 - 使用 Ant Design 默认亮色主题，移除当前自定义深色 Token 和自定义青色主色。
 - 不修改 Rust/Tauri 命令、播放状态机、媒体处理流程、API、数据库或媒体任务模型。
 - 不新增组件库、状态管理库或测试框架；继续复用现有 Ant Design 组件。
@@ -127,15 +127,6 @@ Create `desktop/ui/src/desktop-layout.css` with only page-owned selectors:
   gap: 16px;
 }
 
-.desktop-preview-video {
-  display: block;
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  object-fit: contain;
-  border-radius: 8px;
-  background: transparent;
-}
-
 @media (max-width: 1100px) {
   .desktop-page-content {
     padding: 16px;
@@ -180,7 +171,7 @@ In `DesktopApp` replace the current `Layout`/`Layout.Content` sizing and outer v
 ```tsx
 <Layout className="desktop-page">
   <Layout.Content className="desktop-page-content">
-    {/* existing hidden/media preview element */}
+    {/* existing hidden media element for Picture-in-Picture synchronization */}
     <div className="desktop-workspace">
       <section className="desktop-column desktop-column-source" aria-label="视频素材与状态">
         {/* title, single-source alert, import/open buttons, error, playback status, source media */}
@@ -188,8 +179,8 @@ In `DesktopApp` replace the current `Layout`/`Layout.Content` sizing and outer v
       <section className="desktop-column desktop-column-audio" aria-label="音频设置">
         {/* audio/realtime switches, voice clone, runtime audio values, diagnostics, audio research fields */}
       </section>
-      <section className="desktop-column desktop-column-video" aria-label="视频实时预览与参数">
-        {/* visible preview, video switch/engine/apply state, runtime video values, video research fields */}
+      <section className="desktop-column desktop-column-video" aria-label="视频处理与实时参数">
+        {/* video switch/engine/apply state, runtime video values, video research fields */}
       </section>
     </div>
   </Layout.Content>
@@ -204,42 +195,13 @@ Move existing JSX blocks without changing their handlers or labels:
 
 1. Source column: page title, single-source alert, import/open actions, page error, “播放状态与控制”, and “当前源素材”.
 2. Audio column: audio switch and realtime-audio switch from “处理开关”; audio-side worker alerts; “声音克隆替换”; audio-only runtime values; “实时诊断”; audio fields from “本地研究参数”.
-3. Video column: visible source preview, video switch and media-engine/apply controls from “处理开关”; video-only runtime values; video fields from “本地研究参数”; “本地研究分析 Worker” card.
+3. Video column: video switch and media-engine/apply controls from “处理开关”; video-only runtime values; video fields from “本地研究参数”; “本地研究分析 Worker” card. The homepage does not show a video frame.
 
 The combined `applyMediaProcessing()` action remains in the video column but keeps its existing guard, request order, loading state, and error handling. The research Worker card remains one card and keeps its existing commands; only its position changes.
 
-- [ ] **Step 4: Make the right-column video preview visible while keeping it muted and synchronized**
+- [ ] **Step 4: Keep the homepage media element hidden and preserve Picture-in-Picture synchronization**
 
-Change the existing `pictureInPictureVideoRef` element from a 1px transparent element to:
-
-```tsx
-<video
-  ref={pictureInPictureVideoRef}
-  src={pictureInPictureSourceUrl ?? undefined}
-  muted
-  playsInline
-  preload="auto"
-  aria-label="视频实时预览"
-  onLoadedMetadata={syncPictureInPictureVideo}
-  className="desktop-preview-video"
-/>
-```
-
-Keep the existing `syncPictureInPictureVideo()` behavior and Picture-in-Picture capability checks. Add one effect beside the existing media-state synchronization so the visible preview follows the shared playback state:
-
-```ts
-useEffect(() => {
-  const video = pictureInPictureVideoRef.current;
-  if (!video || !pictureInPictureSourceUrl || !mediaState) return;
-  if (mediaState.paused) {
-    video.pause();
-    return;
-  }
-  void video.play().catch(() => undefined);
-}, [mediaState?.paused, pictureInPictureSourceUrl]);
-```
-
-The preview stays muted and local; it does not create a Tauri window or alter the final-effect window lifecycle.
+Keep the existing `pictureInPictureVideoRef` as an invisible, muted media element with `preload="auto"`, `aria-hidden="true"`, and `onLoadedMetadata={syncPictureInPictureVideo}`. Do not add a visible video surface or an autoplay effect. The element only supplies the existing Picture-in-Picture button with a media source and synchronized playback position; it must not create a Tauri window or alter the final-effect window lifecycle.
 
 - [ ] **Step 5: Verify the layout contract and build**
 

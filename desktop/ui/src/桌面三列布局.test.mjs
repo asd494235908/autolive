@@ -18,11 +18,10 @@ test('desktop page exposes the approved three-column layout contract', async () 
   assert.match(app, /desktop-column-source/);
   assert.match(app, /desktop-column-audio/);
   assert.match(app, /desktop-column-video/);
-  assert.match(app, /className="desktop-preview-video"/);
-  assert.match(app, /aria-label="视频实时预览"/);
-  assert.match(app, /mediaState\?\.paused/);
-  assert.match(app, /video\.play\(\)\.catch\(\(\) => undefined\)/);
-  assert.match(app, /muted/);
+  assert.match(app, /aria-hidden="true"/);
+  assert.match(app, /视频实时参数预览/);
+  assert.doesNotMatch(app, /title="视频实时预览"/);
+  assert.doesNotMatch(app, /className="desktop-preview-video"/);
   assert.match(css, /grid-template-columns:\s*minmax\(0,\s*28fr\)\s+minmax\(0,\s*38fr\)\s+minmax\(0,\s*34fr\)/);
   assert.match(css, /@media\s*\(max-width:\s*800px\)/);
   assert.match(css, /grid-template-columns:\s*1fr/);

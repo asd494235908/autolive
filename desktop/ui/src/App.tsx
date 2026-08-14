@@ -3,6 +3,8 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { Alert, Button, Card, Checkbox, Descriptions, Input, InputNumber, Layout, Progress, Select, Slider, Space, Switch, Tag, Typography } from 'antd';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { SyntheticEvent } from 'react';
+import { chooseInterludeIndex, randomIntervalMs, resolveBaseAudioSource, shouldPauseInterlude } from './插话播放器';
+import type { BaseAudioSource } from './插话播放器';
 import { buildRuntimePreviewParameters, isRuntimeVariationDue, normalizeRuntimeVariationPeriod } from './运行时参数自动调度';
 import type { RuntimeBaseParameters, RuntimePreviewParameters } from './运行时参数自动调度';
 import { shouldRestartPlayback } from './播放循环';
@@ -83,6 +85,7 @@ type PlaybackSnapshot = {
   current_audio_source: string | null;
   current_audio_reference: string | null;
   current_audio_start_at_ms: number;
+  effective_audio_source?: BaseAudioSource | null;
   current_mp4_sha256: string | null;
   current_audio_sha256: string | null;
   audio_decision: string;
@@ -97,6 +100,33 @@ type PlaybackSnapshot = {
   audio_processing_runtime: boolean;
   audio_processing_gain_db: number;
   voice_clone_replacement: VoiceCloneReplacementState;
+  interlude?: InterludeSnapshot | null;
+};
+
+type InterludeSnapshot = {
+  enabled: boolean;
+  directory: string | null;
+  audio_files: string[];
+  audio_count: number;
+  status: string;
+  error: string | null;
+  interval_min_ms: number;
+  interval_max_ms: number;
+  volume_db: number;
+  ducking_depth_db: number;
+  ducking_attack_ms: number;
+  ducking_release_ms: number;
+};
+
+type InterludeConfigDraft = {
+  enabled: boolean;
+  directory: string | null;
+  intervalMinMs: number;
+  intervalMaxMs: number;
+  volumeDb: number;
+  duckingDepthDb: number;
+  duckingAttackMs: number;
+  duckingReleaseMs: number;
 };
 
 type SpeechToSpeechWorkerCapabilities = {
@@ -369,6 +399,32 @@ function getDisplayErrorMessage(cause: unknown, fallback: string) {
   return message || fallback;
 }
 
+function toGainValue(db: number) {
+  return Math.pow(10, db / 20);
+}
+
+function getEffectiveAudioSource(snapshot: PlaybackSnapshot | null): BaseAudioSource {
+  if (snapshot?.effective_audio_source) return snapshot.effective_audio_source;
+  return resolveBaseAudioSource({
+    voiceCloneActive: snapshot?.voice_clone_replacement?.status === 'playing',
+    realtimeVariantActive: snapshot?.current_audio_source === 'realtime_variant',
+    processedOriginalActive: snapshot?.current_audio_source === 'processed_original',
+  });
+}
+
+function buildInterludeDraft(interlude?: InterludeSnapshot | null): InterludeConfigDraft {
+  return {
+    enabled: interlude?.enabled ?? false,
+    directory: interlude?.directory ?? null,
+    intervalMinMs: interlude?.interval_min_ms ?? 30_000,
+    intervalMaxMs: interlude?.interval_max_ms ?? 60_000,
+    volumeDb: interlude?.volume_db ?? -6,
+    duckingDepthDb: interlude?.ducking_depth_db ?? -12,
+    duckingAttackMs: interlude?.ducking_attack_ms ?? 120,
+    duckingReleaseMs: interlude?.ducking_release_ms ?? 240,
+  };
+}
+
 function getVoiceCloneStatusLabel(status: string) {
   switch (status) {
     case 'preparing':
@@ -410,22 +466,34 @@ function FinalEffectWindow() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const voiceCloneAudioRef = useRef<HTMLAudioElement | null>(null);
+  const interludeAudioRef = useRef<HTMLAudioElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const videoGainNodeRef = useRef<GainNode | null>(null);
   const audioGainNodeRef = useRef<GainNode | null>(null);
   const voiceCloneGainNodeRef = useRef<GainNode | null>(null);
+  const baseBusGainNodeRef = useRef<GainNode | null>(null);
+  const duckGainNodeRef = useRef<GainNode | null>(null);
+  const interludeGainNodeRef = useRef<GainNode | null>(null);
+  const interludeBusGainNodeRef = useRef<GainNode | null>(null);
   const suppressMediaEventRef = useRef(false);
   const playbackChannelRef = useRef<BroadcastChannel | null>(null);
   const userMutedRef = useRef(false);
   const userVolumeRef = useRef(1);
   const audioUrlRef = useRef<string | null>(null);
   const voiceCloneAudioUrlRef = useRef<string | null>(null);
+  const interludeAudioUrlRef = useRef<string | null>(null);
   const audioDiagnosticsReadyRef = useRef(false);
   const loopSourceKeyRef = useRef<string | null>(null);
   const loopGenerationRef = useRef<number | null>(null);
   const loopSequenceRef = useRef(0);
   const lastRestartTokenRef = useRef<string | number | null>(null);
+  const interludeScheduleKeyRef = useRef<string | null>(null);
+  const nextInterludeAtMsRef = useRef<number | null>(null);
+  const lastInterludeIndexRef = useRef<number | null>(null);
+  const interludeActiveRef = useRef(false);
+  const interludePausedRef = useRef(false);
+  const interludeStopTimerRef = useRef<number | null>(null);
   const [sourceUrl, setSourceUrl] = useState<string | null>(() => {
     const path = window.localStorage.getItem('autolive.source.path');
     return toAssetUrl(path);
@@ -434,6 +502,7 @@ function FinalEffectWindow() {
   const [workerCapabilities, setWorkerCapabilities] = useState<SpeechToSpeechWorkerCapabilities | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [voiceCloneAudioUrl, setVoiceCloneAudioUrl] = useState<string | null>(null);
+  const [interludeAudioUrl, setInterludeAudioUrl] = useState<string | null>(null);
   const [runtimeParameters, setRuntimeParameters] = useState<RuntimePreviewParameters | null>(null);
   const [runtimeAudioProcessingEnabled, setRuntimeAudioProcessingEnabled] = useState(false);
   const [runtimeVideoProcessingEnabled, setRuntimeVideoProcessingEnabled] = useState(false);
@@ -490,6 +559,7 @@ function FinalEffectWindow() {
     const video = videoRef.current;
     const audio = audioRef.current;
     const voiceCloneAudio = voiceCloneAudioRef.current;
+    const interludeAudio = interludeAudioRef.current;
     const volume = userVolumeRef.current;
     const muted = userMutedRef.current;
     const replacementAudioActive =
@@ -507,6 +577,108 @@ function FinalEffectWindow() {
       voiceCloneAudio.volume = volume;
       voiceCloneAudio.muted = muted;
     }
+    if (interludeAudio) {
+      interludeAudio.volume = volume;
+      interludeAudio.muted = muted;
+    }
+  }
+
+  function clearInterludeStopTimer() {
+    if (interludeStopTimerRef.current !== null) {
+      window.clearTimeout(interludeStopTimerRef.current);
+      interludeStopTimerRef.current = null;
+    }
+  }
+
+  function rampGain(node: GainNode | null, target: number, durationMs: number) {
+    const context = audioContextRef.current;
+    if (!context || !node) return;
+    const now = context.currentTime;
+    const durationSeconds = Math.max(0, durationMs) / 1000;
+    node.gain.cancelScheduledValues(now);
+    node.gain.setValueAtTime(node.gain.value, now);
+    node.gain.linearRampToValueAtTime(target, now + durationSeconds);
+  }
+
+  function clearInterludePlayback(options?: {
+    releaseMs?: number;
+    resetSchedule?: boolean;
+    resetIndex?: boolean;
+    clearSource?: boolean;
+  }) {
+    const releaseMs = options?.releaseMs ?? 0;
+    const resetSchedule = options?.resetSchedule ?? true;
+    const resetIndex = options?.resetIndex ?? false;
+    const clearSource = options?.clearSource ?? true;
+    clearInterludeStopTimer();
+    interludeActiveRef.current = false;
+    interludePausedRef.current = false;
+    if (resetSchedule) nextInterludeAtMsRef.current = null;
+    if (resetIndex) lastInterludeIndexRef.current = null;
+    rampGain(interludeGainNodeRef.current, 0, releaseMs);
+    rampGain(duckGainNodeRef.current, 1, releaseMs);
+    const finalize = () => {
+      const interludeAudio = interludeAudioRef.current;
+      if (interludeAudio) {
+        interludeAudio.pause();
+        interludeAudio.currentTime = 0;
+        if (clearSource) {
+          interludeAudio.removeAttribute('src');
+          interludeAudio.load();
+        }
+      }
+      if (clearSource) {
+        interludeAudioUrlRef.current = null;
+        setInterludeAudioUrl(null);
+      }
+      interludeStopTimerRef.current = null;
+    };
+    if (releaseMs <= 0) {
+      finalize();
+      return;
+    }
+    interludeStopTimerRef.current = window.setTimeout(finalize, releaseMs + 40);
+  }
+
+  function pauseInterludePlayback() {
+    if (!interludeActiveRef.current) return;
+    interludePausedRef.current = true;
+    interludeAudioRef.current?.pause();
+  }
+
+  function resumeInterludePlayback() {
+    if (!interludeActiveRef.current || !interludePausedRef.current || !interludeAudioUrlRef.current) return;
+    interludePausedRef.current = false;
+    void interludeAudioRef.current?.play().catch(() => undefined);
+  }
+
+  function handleInterludeEnded() {
+    const interlude = snapshotRef.current?.interlude ?? null;
+    clearInterludeStopTimer();
+    interludeActiveRef.current = false;
+    interludePausedRef.current = false;
+    interludeAudioUrlRef.current = null;
+    setInterludeAudioUrl(null);
+    rampGain(interludeGainNodeRef.current, 0, interlude?.ducking_release_ms ?? 0);
+    rampGain(duckGainNodeRef.current, 1, interlude?.ducking_release_ms ?? 0);
+    nextInterludeAtMsRef.current = null;
+  }
+
+  function startInterludePlayback(interlude: InterludeSnapshot) {
+    const count = interlude.audio_files.length;
+    const nextIndex = chooseInterludeIndex(count, lastInterludeIndexRef.current);
+    if (nextIndex === null) return;
+    const selectedUrl = toAssetUrl(interlude.audio_files[nextIndex]);
+    if (!selectedUrl) return;
+    clearInterludeStopTimer();
+    lastInterludeIndexRef.current = nextIndex;
+    nextInterludeAtMsRef.current = null;
+    interludeActiveRef.current = true;
+    interludePausedRef.current = false;
+    interludeAudioUrlRef.current = selectedUrl;
+    setInterludeAudioUrl(selectedUrl);
+    rampGain(interludeGainNodeRef.current, toGainValue(interlude.volume_db), interlude.ducking_attack_ms);
+    rampGain(duckGainNodeRef.current, toGainValue(interlude.ducking_depth_db), interlude.ducking_attack_ms);
   }
 
   function publishMediaState() {
@@ -686,7 +858,7 @@ function FinalEffectWindow() {
   }, []);
 
   useEffect(() => {
-    if (!sourceUrl || !videoRef.current || !audioRef.current || !voiceCloneAudioRef.current || audioContextRef.current) return;
+    if (!sourceUrl || !videoRef.current || !audioRef.current || !voiceCloneAudioRef.current || !interludeAudioRef.current || audioContextRef.current) return;
     try {
       const context = new AudioContext();
       const analyser = context.createAnalyser();
@@ -695,18 +867,32 @@ function FinalEffectWindow() {
       const videoSource = context.createMediaElementSource(videoRef.current);
       const audioSource = context.createMediaElementSource(audioRef.current);
       const voiceCloneAudioSource = context.createMediaElementSource(voiceCloneAudioRef.current);
+      const interludeAudioSource = context.createMediaElementSource(interludeAudioRef.current);
       const videoGain = context.createGain();
       const audioGain = context.createGain();
       const voiceCloneGain = context.createGain();
-      videoSource.connect(videoGain).connect(analyser);
-      audioSource.connect(audioGain).connect(analyser);
-      voiceCloneAudioSource.connect(voiceCloneGain).connect(analyser);
+      const baseBus = context.createGain();
+      const duckGain = context.createGain();
+      const interludeGain = context.createGain();
+      const interludeBus = context.createGain();
+      duckGain.gain.value = 1;
+      interludeGain.gain.value = 0;
+      videoSource.connect(videoGain).connect(baseBus);
+      audioSource.connect(audioGain).connect(baseBus);
+      voiceCloneAudioSource.connect(voiceCloneGain).connect(baseBus);
+      interludeAudioSource.connect(interludeGain).connect(interludeBus);
+      baseBus.connect(duckGain).connect(analyser);
+      interludeBus.connect(analyser);
       analyser.connect(context.destination);
       audioContextRef.current = context;
       analyserRef.current = analyser;
       videoGainNodeRef.current = videoGain;
       audioGainNodeRef.current = audioGain;
       voiceCloneGainNodeRef.current = voiceCloneGain;
+      baseBusGainNodeRef.current = baseBus;
+      duckGainNodeRef.current = duckGain;
+      interludeGainNodeRef.current = interludeGain;
+      interludeBusGainNodeRef.current = interludeBus;
       audioDiagnosticsReadyRef.current = true;
       setAudioDiagnosticsReady(true);
     } catch {
@@ -714,12 +900,17 @@ function FinalEffectWindow() {
     }
 
     return () => {
+      clearInterludeStopTimer();
       audioContextRef.current?.close().catch(() => undefined);
       audioContextRef.current = null;
       analyserRef.current = null;
       videoGainNodeRef.current = null;
       audioGainNodeRef.current = null;
       voiceCloneGainNodeRef.current = null;
+      baseBusGainNodeRef.current = null;
+      duckGainNodeRef.current = null;
+      interludeGainNodeRef.current = null;
+      interludeBusGainNodeRef.current = null;
       audioDiagnosticsReadyRef.current = false;
     };
   }, [sourceUrl]);
@@ -730,26 +921,29 @@ function FinalEffectWindow() {
       : snapshot?.audio_processing_runtime
         ? snapshot.audio_processing_gain_db ?? 0
         : 0;
-    const gain = Math.pow(10, gainDb / 20);
-    const hasVoiceCloneReplacement = Boolean(voiceCloneAudioUrl) && audioDiagnosticsReady;
-    const hasVariant = !hasVoiceCloneReplacement && Boolean(audioUrl);
+    const gain = toGainValue(gainDb);
+    const effectiveAudioSource = getEffectiveAudioSource(snapshot);
     if (videoGainNodeRef.current) {
-      videoGainNodeRef.current.gain.value = hasVariant || hasVoiceCloneReplacement ? 0 : gain;
+      videoGainNodeRef.current.gain.value =
+        audioDiagnosticsReady && (effectiveAudioSource === 'original' || effectiveAudioSource === 'processed_original') ? gain : 0;
     }
     if (audioGainNodeRef.current) {
-      audioGainNodeRef.current.gain.value = hasVariant ? gain : 0;
+      audioGainNodeRef.current.gain.value =
+        audioDiagnosticsReady && effectiveAudioSource === 'realtime_variant' ? gain : 0;
     }
     if (voiceCloneGainNodeRef.current) {
-      voiceCloneGainNodeRef.current.gain.value = hasVoiceCloneReplacement ? gain : 0;
+      voiceCloneGainNodeRef.current.gain.value =
+        audioDiagnosticsReady && effectiveAudioSource === 'voice_clone' ? gain : 0;
     }
   }, [
     audioDiagnosticsReady,
-    audioUrl,
     runtimeAudioProcessingEnabled,
     runtimeParameters?.audio_gain_db,
     snapshot?.audio_processing_gain_db,
     snapshot?.audio_processing_runtime,
-    voiceCloneAudioUrl,
+    snapshot?.current_audio_source,
+    snapshot?.effective_audio_source,
+    snapshot?.voice_clone_replacement?.status,
   ]);
 
   useEffect(() => {
@@ -824,6 +1018,7 @@ function FinalEffectWindow() {
     const video = videoRef.current;
     const audio = audioRef.current;
     const voiceCloneAudio = voiceCloneAudioRef.current;
+    const interlude = snapshot?.interlude ?? null;
     if (!video || !sourceUrl) return;
     if (snapshot?.playback_state === 'stopped') {
       video.pause();
@@ -832,12 +1027,14 @@ function FinalEffectWindow() {
       if (audio) audio.currentTime = 0;
       voiceCloneAudio?.pause();
       if (voiceCloneAudio) voiceCloneAudio.currentTime = 0;
+      clearInterludePlayback({ releaseMs: interlude?.ducking_release_ms ?? 0, resetSchedule: true, resetIndex: true });
       return;
     }
     if (snapshot?.playback_state === 'paused') {
       video.pause();
       audio?.pause();
       voiceCloneAudio?.pause();
+      pauseInterludePlayback();
       return;
     }
     if (snapshot?.playback_state === 'playing' && video.paused) {
@@ -847,16 +1044,17 @@ function FinalEffectWindow() {
       } else if (audioUrl && audioDiagnosticsReady && audio) {
         void audio.play().catch(() => undefined);
       }
+      resumeInterludePlayback();
     }
-  }, [audioDiagnosticsReady, audioUrl, snapshot?.playback_state, sourceUrl, voiceCloneAudioUrl]);
+  }, [audioDiagnosticsReady, audioUrl, snapshot?.interlude, snapshot?.playback_state, sourceUrl, voiceCloneAudioUrl]);
 
   useEffect(() => {
     if (!snapshot || !sourceUrl) return;
-    const reference = snapshot.current_audio_source === 'realtime_variant'
+    const reference = getEffectiveAudioSource(snapshot) === 'realtime_variant'
       ? snapshot.current_audio_reference
       : null;
     setAudioUrl(reference ? convertFileSrc(reference.replace(/^file:\/\//, '')) : null);
-  }, [snapshot?.current_audio_source, snapshot?.current_audio_reference, sourceUrl]);
+  }, [snapshot?.current_audio_reference, snapshot?.current_audio_source, snapshot?.effective_audio_source, snapshot?.voice_clone_replacement?.status, sourceUrl]);
 
   useEffect(() => {
     if (!snapshot || !sourceUrl) {
@@ -929,6 +1127,38 @@ function FinalEffectWindow() {
   }, [audioDiagnosticsReady, voiceCloneAudioUrl]);
 
   useEffect(() => {
+    const interludeAudio = interludeAudioRef.current;
+    const currentSnapshot = snapshotRef.current;
+    if (!interludeAudio) return;
+    interludeAudioUrlRef.current = interludeAudioUrl;
+    if (!interludeAudioUrl) {
+      interludeAudio.pause();
+      interludeAudio.currentTime = 0;
+      interludeAudio.removeAttribute('src');
+      interludeAudio.load();
+      syncUserAudioSettings();
+      return;
+    }
+    if (!audioDiagnosticsReady) {
+      interludeAudio.pause();
+      syncUserAudioSettings();
+      return;
+    }
+    interludeAudio.src = interludeAudioUrl;
+    interludeAudio.currentTime = 0;
+    syncUserAudioSettings();
+    if (
+      currentSnapshot?.playback_state === 'playing' &&
+      !shouldPauseInterlude({
+        playbackState: currentSnapshot.playback_state,
+        voiceCloneStatus: currentSnapshot.voice_clone_replacement.status,
+      })
+    ) {
+      void interludeAudio.play().catch(() => undefined);
+    }
+  }, [audioDiagnosticsReady, interludeAudioUrl]);
+
+  useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     const mediaEvents = [
@@ -959,6 +1189,72 @@ function FinalEffectWindow() {
     const timer = window.setInterval(commitIfDue, 100);
     return () => window.clearInterval(timer);
   }, [snapshot?.pending_audio_candidate]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const video = videoRef.current;
+      const currentSnapshot = snapshotRef.current;
+      const interlude = currentSnapshot?.interlude ?? null;
+      if (!video || !currentSnapshot || !audioDiagnosticsReadyRef.current) return;
+
+      const sourceKey =
+        currentSnapshot.current_video_reference ??
+        currentSnapshot.source_media?.source_path ??
+        sourceUrl ??
+        null;
+      const scheduleKey = sourceKey === null
+        ? null
+        : `${currentSnapshot.playback_generation}:${currentSnapshot.loop_index}:${sourceKey}`;
+
+      if (scheduleKey !== interludeScheduleKeyRef.current) {
+        interludeScheduleKeyRef.current = scheduleKey;
+        nextInterludeAtMsRef.current = null;
+        lastInterludeIndexRef.current = null;
+        clearInterludePlayback({ resetSchedule: true, resetIndex: true });
+      }
+
+      if (
+        !interlude ||
+        !interlude.enabled ||
+        interlude.audio_files.length === 0 ||
+        currentSnapshot.playback_state === 'stopped'
+      ) {
+        clearInterludePlayback({ resetSchedule: true });
+        return;
+      }
+
+      if (shouldPauseInterlude({
+        playbackState: currentSnapshot.playback_state,
+        voiceCloneStatus: currentSnapshot.voice_clone_replacement.status,
+      })) {
+        if (currentSnapshot.playback_state === 'paused') {
+          pauseInterludePlayback();
+          return;
+        }
+        clearInterludePlayback({
+          releaseMs: interlude.ducking_release_ms,
+          resetSchedule: true,
+        });
+        return;
+      }
+
+      if (interludeActiveRef.current && interludePausedRef.current) {
+        resumeInterludePlayback();
+      }
+
+      if (interludeActiveRef.current) return;
+
+      const currentTimeMs = Math.max(0, Math.round(video.currentTime * 1000));
+      if (nextInterludeAtMsRef.current === null) {
+        nextInterludeAtMsRef.current =
+          currentTimeMs + randomIntervalMs(interlude.interval_min_ms, interlude.interval_max_ms);
+        return;
+      }
+      if (currentTimeMs < nextInterludeAtMsRef.current) return;
+      startInterludePlayback(interlude);
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [sourceUrl]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1062,6 +1358,7 @@ function FinalEffectWindow() {
 
   function restartToNextLoop(video: HTMLVideoElement, restartToken: string) {
     const previousVideoReference = snapshotRef.current?.current_video_reference;
+    const interlude = snapshotRef.current?.interlude ?? null;
     lastRestartTokenRef.current = restartToken;
     loopSequenceRef.current += 1;
     video.currentTime = 0;
@@ -1070,6 +1367,7 @@ function FinalEffectWindow() {
       voiceCloneAudioRef.current.pause();
       voiceCloneAudioRef.current.currentTime = 0;
     }
+    clearInterludePlayback({ releaseMs: interlude?.ducking_release_ms ?? 0, resetSchedule: true, resetIndex: true });
 
     suppressMediaEventRef.current = true;
     void video.play().catch(() => {
@@ -1203,6 +1501,14 @@ function FinalEffectWindow() {
                 hidden
               />
               <audio ref={voiceCloneAudioRef} src={voiceCloneAudioUrl ?? undefined} muted={userMuted} hidden />
+              <audio
+                ref={interludeAudioRef}
+                src={interludeAudioUrl ?? undefined}
+                muted={userMuted}
+                onEnded={handleInterludeEnded}
+                onError={() => handleInterludeEnded()}
+                hidden
+              />
             </>
           ) : (
             <div style={{ display: 'grid', placeItems: 'center', width: '100%', height: '100%', padding: 24, boxSizing: 'border-box' }}>
@@ -1234,6 +1540,9 @@ function DesktopApp() {
   const [voiceCloneText, setVoiceCloneText] = useState('');
   const [voiceCloneFormError, setVoiceCloneFormError] = useState<string | null>(null);
   const [voiceCloneActionBusy, setVoiceCloneActionBusy] = useState<'prepare' | 'replace' | 'cancel' | 'clear' | null>(null);
+  const [interludeDraft, setInterludeDraft] = useState<InterludeConfigDraft>(() => buildInterludeDraft());
+  const [interludeDirty, setInterludeDirty] = useState(false);
+  const [interludeSaving, setInterludeSaving] = useState(false);
   const [mediaEngineCapabilities, setMediaEngineCapabilities] = useState<MediaEngineCapabilities | null>(null);
   const [researchWorkerCapabilities, setResearchWorkerCapabilities] = useState<ResearchWorkerCapabilities | null>(null);
   const [researchStatus, setResearchStatus] = useState<ResearchStatus | null>(null);
@@ -1336,16 +1645,6 @@ function DesktopApp() {
   }, [pictureInPictureSourceUrl, mediaState?.current_time, mediaState?.duration, mediaState?.volume]);
 
   useEffect(() => {
-    const video = pictureInPictureVideoRef.current;
-    if (!video || !pictureInPictureSourceUrl || !mediaState) return;
-    if (mediaState.paused) {
-      video.pause();
-      return;
-    }
-    void video.play().catch(() => undefined);
-  }, [mediaState?.paused, pictureInPictureSourceUrl]);
-
-  useEffect(() => {
     drawDiagnosticCanvas(waveformCanvasRef.current, diagnosticMessage?.waveform ?? [], '#1677ff', 'rgba(22, 119, 255, 0.12)');
     drawDiagnosticCanvas(spectrumCanvasRef.current, diagnosticMessage?.spectrum ?? [], '#1677ff', 'rgba(22, 119, 255, 0.12)');
   }, [diagnosticMessage]);
@@ -1390,6 +1689,22 @@ function DesktopApp() {
     setAudioProcessingEnabled(snapshot.audio_processing_enabled);
     setRealtimeAudioVariantEnabled(snapshot.realtime_audio_variant_enabled);
   }, [snapshot?.audio_processing_enabled, snapshot?.realtime_audio_variant_enabled, snapshot?.video_processing_enabled]);
+
+  useEffect(() => {
+    if (!interludeDirty) {
+      setInterludeDraft(buildInterludeDraft(snapshot?.interlude));
+    }
+  }, [
+    interludeDirty,
+    snapshot?.interlude?.directory,
+    snapshot?.interlude?.ducking_attack_ms,
+    snapshot?.interlude?.ducking_depth_db,
+    snapshot?.interlude?.ducking_release_ms,
+    snapshot?.interlude?.enabled,
+    snapshot?.interlude?.interval_max_ms,
+    snapshot?.interlude?.interval_min_ms,
+    snapshot?.interlude?.volume_db,
+  ]);
 
   useEffect(() => {
     void invoke<MediaEngineCapabilities>('get_media_engine_capabilities')
@@ -1997,6 +2312,43 @@ function DesktopApp() {
     }
   }
 
+  function updateInterludeDraft(patch: Partial<InterludeConfigDraft>) {
+    setInterludeDirty(true);
+    setInterludeDraft((current) => ({ ...current, ...patch }));
+  }
+
+  async function chooseInterludeDirectory() {
+    const selected = await open({ directory: true, multiple: false });
+    if (typeof selected !== 'string') return;
+    updateInterludeDraft({ directory: selected });
+  }
+
+  async function saveInterludeConfig() {
+    setInterludeSaving(true);
+    setError(null);
+    try {
+      const nextSnapshot = await invoke<PlaybackSnapshot>('set_interlude_config', {
+        request: {
+          enabled: interludeDraft.enabled,
+          directory: interludeDraft.directory,
+          interval_min_ms: interludeDraft.intervalMinMs,
+          interval_max_ms: interludeDraft.intervalMaxMs,
+          volume_db: interludeDraft.volumeDb,
+          ducking_depth_db: interludeDraft.duckingDepthDb,
+          ducking_attack_ms: interludeDraft.duckingAttackMs,
+          ducking_release_ms: interludeDraft.duckingReleaseMs,
+        },
+      });
+      setSnapshot(nextSnapshot);
+      setInterludeDraft(buildInterludeDraft(nextSnapshot.interlude));
+      setInterludeDirty(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '保存插话配置失败');
+    } finally {
+      setInterludeSaving(false);
+    }
+  }
+
   const runtimeRemainingMs = runtimeLastChangeMs === null
     ? null
     : Math.max(0, runtimePeriodMs - (runtimeNowMs - runtimeLastChangeMs));
@@ -2012,6 +2364,16 @@ function DesktopApp() {
     return (
     <Layout className="desktop-page">
       <Layout.Content className="desktop-page-content">
+        <video
+          ref={pictureInPictureVideoRef}
+          src={pictureInPictureSourceUrl ?? undefined}
+          muted
+          playsInline
+          preload="auto"
+          aria-hidden="true"
+          onLoadedMetadata={syncPictureInPictureVideo}
+          style={{ position: 'fixed', width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
+        />
         <div className="desktop-workspace">
           <section className="desktop-column desktop-column-source" aria-label="视频素材与状态">
             <Typography.Title level={2}>autoLive 桌面端</Typography.Title>
@@ -2368,26 +2730,7 @@ function DesktopApp() {
             </Card>
           </section>
 
-          <section className="desktop-column desktop-column-video" aria-label="视频实时预览与参数">
-            <Card title="视频实时预览" extra={<Tag color={pictureInPictureSourceUrl ? 'green' : 'default'}>{pictureInPictureSourceUrl ? '已加载源视频' : '等待导入'}</Tag>}>
-              {pictureInPictureSourceUrl ? (
-                <video
-                  ref={pictureInPictureVideoRef}
-                  src={pictureInPictureSourceUrl}
-                  muted
-                  playsInline
-                  preload="auto"
-                  aria-label="视频实时预览"
-                  onLoadedMetadata={syncPictureInPictureVideo}
-                  className="desktop-preview-video"
-                />
-              ) : (
-                <Alert type="info" showIcon message="导入视频后显示实时预览。" />
-              )}
-              <Typography.Text type="secondary">
-                预览与最终效果窗口共享播放位置，保持静音，不创建额外播放窗口。
-              </Typography.Text>
-            </Card>
+          <section className="desktop-column desktop-column-video" aria-label="视频处理与实时参数">
             <Card title="视频处理">
               <Space direction="vertical" size="middle" style={{ width: '100%' }}>
                 <Space align="center">
