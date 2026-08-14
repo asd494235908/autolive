@@ -1,0 +1,220 @@
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Alert, App, Button, Card, Empty, Space, Table, Typography } from 'antd';
+import { useMemo, useState } from 'react';
+import { apiClient, ApiClientError, createRequestId } from '../../api/client';
+import { StatusTag } from '../../components/StatusTag';
+import type { DeviceEnvelope, DeviceListResponse, DeviceSummary } from '../../types/api';
+
+function formatDiskSize(bytes?: number) {
+  if (bytes === undefined) {
+    return '未上报';
+  }
+
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function formatMemory(bytes?: number) {
+  if (bytes === undefined) {
+    return '未上报';
+  }
+
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+export function DeviceManagementPage() {
+  const { message, modal } = App.useApp();
+  const queryClient = useQueryClient();
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
+  const [unbindingDeviceId, setUnbindingDeviceId] = useState<string | null>(null);
+
+  const devicesQuery = useQuery({
+    queryKey: ['admin-devices', page, pageSize],
+    queryFn: () =>
+      apiClient.get<DeviceListResponse>('/api/v1/admin/devices', {
+        query: { page, page_size: pageSize }
+      })
+  });
+
+  const disableDeviceMutation = useMutation({
+    mutationFn: (deviceId: string) =>
+      apiClient.post<DeviceEnvelope>(`/api/v1/admin/devices/${deviceId}/disable`, {
+        headers: { 'Idempotency-Key': createRequestId() }
+      }),
+    onSuccess: async (response) => {
+      void message.success(`设备已禁用：${response.device.device_name}`);
+      await queryClient.invalidateQueries({ queryKey: ['admin-devices'] });
+    },
+    onError: (error) => {
+      void message.error(
+        error instanceof ApiClientError
+          ? `${error.message}${error.requestId ? `（request_id：${error.requestId}）` : ''}`
+          : '禁用设备失败'
+      );
+    }
+  });
+
+  const unbindDeviceMutation = useMutation({
+    mutationFn: (deviceId: string) =>
+      apiClient.post<DeviceEnvelope>(`/api/v1/admin/devices/${deviceId}/unbind`, {
+        headers: { 'Idempotency-Key': createRequestId() }
+      }),
+    onSuccess: async (response) => {
+      void message.success(`设备已解除绑定：${response.device.device_name}`);
+      await queryClient.invalidateQueries({ queryKey: ['admin-devices'] });
+    },
+    onError: (error) => {
+      void message.error(
+        error instanceof ApiClientError
+          ? `${error.message}${error.requestId ? `（request_id：${error.requestId}）` : ''}`
+          : '解除设备绑定失败'
+      );
+    },
+    onSettled: () => {
+      setUnbindingDeviceId(null);
+    }
+  });
+
+  const columns = useMemo(
+    () => [
+      { title: '设备名', dataIndex: 'device_name', key: 'device_name' },
+      { title: '用户 ID', dataIndex: 'user_id', key: 'user_id' },
+      { title: '平台', dataIndex: 'platform', key: 'platform' },
+      { title: '客户端版本', dataIndex: 'app_version', key: 'app_version' },
+      {
+        title: '状态',
+        dataIndex: 'status',
+        key: 'status',
+        render: (status: DeviceSummary['status']) => <StatusTag status={status} />
+      },
+      {
+        title: '磁盘剩余',
+        dataIndex: 'disk_free_bytes',
+        key: 'disk_free_bytes',
+        render: (value?: number) => formatDiskSize(value)
+      },
+      {
+        title: '运行时信息',
+        key: 'runtime_metrics',
+        render: (_: unknown, record: DeviceSummary) => {
+          const os = [record.runtime_os_name, record.runtime_os_version]
+            .filter(Boolean)
+            .join(' ');
+          const memory =
+            record.memory_total_bytes === undefined
+              ? '内存未上报'
+              : `内存 ${formatMemory(record.memory_available_bytes)} / ${formatMemory(record.memory_total_bytes)}`;
+          const cpu = record.cpu_logical_cores
+            ? `CPU ${record.cpu_logical_cores} 线程`
+            : 'CPU 未上报';
+          return `${os || '系统未上报'}；${memory}；${cpu}`;
+        }
+      },
+      {
+        title: '最后心跳',
+        dataIndex: 'last_seen_at',
+        key: 'last_seen_at',
+        render: (value: string) => new Date(value).toLocaleString('zh-CN')
+      },
+      {
+        title: '操作',
+        key: 'actions',
+        render: (_: unknown, record: DeviceSummary) => (
+          <Space>
+            <Button
+              danger
+              disabled={record.status === 'disabled' || record.status === 'revoked'}
+              loading={disableDeviceMutation.isPending}
+              onClick={() => {
+                modal.confirm({
+                  title: '确认禁用设备',
+                  content: `将禁用设备“${record.device_name}”，客户端下次鉴权时会停止受保护能力。`,
+                  okText: '确认禁用',
+                  cancelText: '返回',
+                  onOk: () => disableDeviceMutation.mutateAsync(record.id)
+                });
+              }}
+            >
+              禁用
+            </Button>
+            <Button
+              disabled={record.status === 'pending_activation' || unbindDeviceMutation.isPending}
+              loading={unbindingDeviceId === record.id}
+              onClick={() => {
+                modal.confirm({
+                  title: '确认解除设备绑定',
+                  content: `解除“${record.device_name}”后，原用户将失去该设备的受保护访问；重新使用必须输入新的激活码。`,
+                  okText: '确认解绑',
+                  cancelText: '返回',
+                  onOk: () => {
+                    setUnbindingDeviceId(record.id);
+                    return unbindDeviceMutation.mutateAsync(record.id);
+                  }
+                });
+              }}
+            >
+              解绑
+            </Button>
+          </Space>
+        )
+      }
+    ],
+    [disableDeviceMutation, modal, unbindDeviceMutation, unbindingDeviceId]
+  );
+
+  return (
+    <Space direction="vertical" size="large" style={{ width: '100%' }}>
+      <div>
+        <Typography.Title level={2} style={{ margin: 0 }}>
+          设备管理
+        </Typography.Title>
+        <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
+          对齐 `/api/v1/admin/devices` 列表、禁用和解绑接口；解绑后设备进入待激活状态。
+        </Typography.Paragraph>
+      </div>
+
+      {devicesQuery.isError ? (
+        <Alert
+          type="error"
+          showIcon
+          message="设备列表加载失败"
+          description={
+            <Space direction="vertical" size="small">
+              <Typography.Text>
+                {devicesQuery.error instanceof ApiClientError
+                  ? `${devicesQuery.error.message}${devicesQuery.error.requestId ? `（request_id：${devicesQuery.error.requestId}）` : ''}`
+                  : '发生未知错误'}
+              </Typography.Text>
+              <Button onClick={() => void devicesQuery.refetch()}>重试</Button>
+            </Space>
+          }
+        />
+      ) : null}
+
+      <Card>
+        <Table<DeviceSummary>
+          rowKey="id"
+          columns={columns}
+          dataSource={devicesQuery.data?.items ?? []}
+          loading={devicesQuery.isLoading}
+          pagination={{
+            current: page,
+            pageSize,
+            total: devicesQuery.data?.pagination.total ?? 0,
+            showSizeChanger: true
+          }}
+          locale={{
+            emptyText: devicesQuery.isLoading ? '加载中...' : <Empty description="暂无设备数据" />
+          }}
+          onChange={(pagination) => {
+            setPage(pagination.current ?? 1);
+            setPageSize(pagination.pageSize ?? 20);
+          }}
+        />
+        <Typography.Text type="secondary">
+          最近请求 ID：{devicesQuery.data?.request_id ?? '暂无'}
+        </Typography.Text>
+      </Card>
+    </Space>
+  );
+}

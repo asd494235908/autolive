@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Main and final-effect window capability for local playback, MP4 probing and SHA-256 hashing.","local":true,"windows":["main","final-effect"],"permissions":["core:default","core:window:default","dialog:default",{"identifier":"http:default","allow":[{"url":"http://192.168.100.213:18090/**"}]}]}}

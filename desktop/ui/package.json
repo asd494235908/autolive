@@ -1,0 +1,33 @@
+{
+  "name": "autolive-desktop-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "node --test src/heartbeatOutbox.test.mjs",
+    "preview": "vite preview",
+    "tauri:dev": "cd .. && ./ui/node_modules/.bin/tauri dev --config src-tauri/tauri.conf.json",
+    "ffmpeg:prepare": "node ../工具/准备FFmpeg资源.mjs",
+    "ffmpeg:test": "node --test ../工具/准备FFmpeg资源.test.mjs",
+    "tauri:build": "node ../工具/准备FFmpeg资源.mjs && cd .. && ./ui/node_modules/.bin/tauri build --config src-tauri/tauri.conf.json"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.4.0",
+    "@tauri-apps/plugin-http": "^2.5.9",
+    "antd": "^5.27.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  },
+  "packageManager": "pnpm@10.33.0+sha512.10568bb4a6afb58c9eb3630da90cc9516417abebd3fabbe6739f0ae795728da1491e9db5a544c76ad8eb7570f5c4bb3d6c637b2cb41bfdcdb47fa823c8649319"
+}

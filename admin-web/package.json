@@ -1,0 +1,29 @@
+{
+  "name": "admin-web",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "node --test src/features/model-pool/modelPoolIdempotency.test.mjs src/features/auth/session.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@ant-design/icons": "^6.3.2",
+    "@tanstack/react-query": "^5.0.0",
+    "antd": "^5.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "^5.0.0",
+    "vite": "^7.0.0"
+  }
+}

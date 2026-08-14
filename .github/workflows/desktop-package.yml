@@ -1,0 +1,173 @@
+name: desktop-package
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package ${{ matrix.target_triple }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target_triple: x86_64-apple-darwin
+            ffmpeg_url: https://ffmpeg.martin-riedl.de/download/macos/amd64/1785871427_9.0/ffmpeg.zip
+            ffmpeg_sha256: 79d14663d8b078dbbc38de18d63a30f8a5bfc860af5dfee7f8cf3e387cf1c02c
+            ffprobe_url: https://ffmpeg.martin-riedl.de/download/macos/amd64/1785871427_9.0/ffprobe.zip
+            ffprobe_sha256: a2dd3f2e7eb35a10fa6ac43b1a8c21890f27bee0dc4a86ddee16a57d72d3898d
+          - runner: macos-15
+            target_triple: aarch64-apple-darwin
+            ffmpeg_url: https://ffmpeg.martin-riedl.de/download/macos/arm64/1785863997_9.0/ffmpeg.zip
+            ffmpeg_sha256: 5267ef149ee0d208057a1b316aac079b661b0476574dee5da7d225769773c603
+            ffprobe_url: https://ffmpeg.martin-riedl.de/download/macos/arm64/1785863997_9.0/ffprobe.zip
+            ffprobe_sha256: 7778fbb533fb60d3336cbd9a9e51eced71658f020b570c7203590c1c41d42f50
+          - runner: windows-2022
+            target_triple: x86_64-pc-windows-msvc
+            archive_url: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-8.1.zip
+            archive_sha256: d86ff1f4941d72b2942472f3d0a3c8a0b1b3ac951932f47cfdcd7212f9ae7413
+
+    env:
+      AUTOLIVE_TARGET_TRIPLE: ${{ matrix.target_triple }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: desktop/ui/pnpm-lock.yaml
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target_triple }}
+
+      - name: Install desktop/ui dependencies
+        run: pnpm --dir desktop/ui install --frozen-lockfile
+
+      - name: Prepare FFmpeg resources (macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          FFMPEG_URL: ${{ matrix.ffmpeg_url }}
+          FFMPEG_SHA256: ${{ matrix.ffmpeg_sha256 }}
+          FFPROBE_URL: ${{ matrix.ffprobe_url }}
+          FFPROBE_SHA256: ${{ matrix.ffprobe_sha256 }}
+        run: |
+          set -euo pipefail
+
+          target_dir="desktop/third_party/ffmpeg/${AUTOLIVE_TARGET_TRIPLE}"
+          work_dir="$(mktemp -d)"
+          trap 'rm -rf "$work_dir"' EXIT
+
+          fetch_and_extract() {
+            local label="$1"
+            local url="$2"
+            local expected_sha="$3"
+            local expected_name="$4"
+
+            local archive="$work_dir/${label}.zip"
+            local extract_dir="$work_dir/${label}"
+            mkdir -p "$extract_dir"
+
+            curl --fail --location --silent --show-error --retry 3 --proto '=https' --tlsv1.2 \
+              --output "$archive" "$url"
+            printf '%s  %s\n' "$expected_sha" "$archive" | shasum -a 256 -c -
+            unzip -q "$archive" -d "$extract_dir"
+
+            matches=()
+            while IFS= read -r match; do
+              matches+=("$match")
+            done < <(find "$extract_dir" -type f -name "$expected_name" -print)
+
+            if [[ "${#matches[@]}" -ne 1 ]]; then
+              printf 'expected exactly one %s in %s, found %s\n' \
+                "$expected_name" "$url" "${#matches[@]}" >&2
+              exit 1
+            fi
+
+            mkdir -p "$target_dir"
+            cp "${matches[0]}" "$target_dir/$expected_name"
+            chmod 755 "$target_dir/$expected_name"
+          }
+
+          fetch_and_extract "ffmpeg" "$FFMPEG_URL" "$FFMPEG_SHA256" "ffmpeg"
+          fetch_and_extract "ffprobe" "$FFPROBE_URL" "$FFPROBE_SHA256" "ffprobe"
+
+      - name: Prepare FFmpeg resources (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ARCHIVE_URL: ${{ matrix.archive_url }}
+          ARCHIVE_SHA256: ${{ matrix.archive_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $targetDir = Join-Path 'desktop/third_party/ffmpeg' $env:AUTOLIVE_TARGET_TRIPLE
+          $workDir = Join-Path $env:RUNNER_TEMP ("ffmpeg-" + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+
+          try {
+            $archive = Join-Path $workDir 'ffmpeg.zip'
+            $extractDir = Join-Path $workDir 'extract'
+            New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+
+            & curl.exe --fail --location --silent --show-error --retry 3 --output $archive $env:ARCHIVE_URL
+            if ($LASTEXITCODE -ne 0) {
+              throw "下载失败：$($env:ARCHIVE_URL)"
+            }
+
+            $actualHash = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLowerInvariant()
+            if ($actualHash -ne $env:ARCHIVE_SHA256) {
+              throw "SHA-256 校验失败：$($env:ARCHIVE_URL)"
+            }
+
+            Expand-Archive -Path $archive -DestinationPath $extractDir -Force
+
+            $ffmpegMatches = @(Get-ChildItem -Path $extractDir -Recurse -File -Filter 'ffmpeg.exe')
+            if ($ffmpegMatches.Count -ne 1) {
+              throw "期望在 $($env:ARCHIVE_URL) 中找到且仅找到一个 ffmpeg.exe，实际为 $($ffmpegMatches.Count)"
+            }
+
+            $ffprobeMatches = @(Get-ChildItem -Path $extractDir -Recurse -File -Filter 'ffprobe.exe')
+            if ($ffprobeMatches.Count -ne 1) {
+              throw "期望在 $($env:ARCHIVE_URL) 中找到且仅找到一个 ffprobe.exe，实际为 $($ffprobeMatches.Count)"
+            }
+
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+            Copy-Item -Force $ffmpegMatches[0].FullName (Join-Path $targetDir 'ffmpeg.exe')
+            Copy-Item -Force $ffprobeMatches[0].FullName (Join-Path $targetDir 'ffprobe.exe')
+          } finally {
+            Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue
+          }
+
+      - name: Build desktop package
+        run: pnpm --dir desktop/ui run tauri:build
+
+      - name: Upload desktop bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-bundle-${{ matrix.target_triple }}
+          path: desktop/src-tauri/target/${{ matrix.target_triple }}/release/bundle/**
+          if-no-files-found: error
+          retention-days: 7

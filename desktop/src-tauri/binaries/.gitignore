@@ -1,0 +1,3 @@
+# Populated by desktop/工具/准备FFmpeg资源.mjs during local or CI packaging.
+*
+!.gitignore

@@ -1,0 +1,1748 @@
+openapi: 3.1.0
+info:
+  title: AutoLive Phase 0 接口契约
+  version: 0.1.0
+  summary: Go 控制面、React 管理端、Rust/Tauri 客户端共享的 `/api/v1` OpenAPI 契约
+  description: |
+    本契约只覆盖控制面元数据、授权、设备、模型账号测试、直连模型租约和调用摘要。
+    不上传大视频文件，不返回完整模型密钥；媒体处理、ASR/TTS、实时音频候选和播放均在桌面端本地完成，Rust 使用单账号短期租约直接调用 OpenAI-compatible 供应商。
+    当前首版导入单个视频后只在桌面端单窗口循环播放；视频处理、声音处理和实时音频幻化不创建媒体任务。
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+servers:
+  - url: https://api.example.com
+    description: 示例服务地址
+tags:
+  - name: Auth
+  - name: Client
+  - name: Model Leases
+  - name: Model Accounts
+  - name: Admin
+paths:
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: 用户登录
+      operationId: authLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: 登录成功
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: 刷新会话
+      operationId: authRefresh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+      responses:
+        '200':
+          description: 刷新成功
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshTokenResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: 退出登录
+      operationId: authLogout
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogoutRequest'
+      responses:
+        '200':
+          description: 已退出
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogoutResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/client/activate:
+    post:
+      tags: [Client]
+      summary: 激活当前设备
+      operationId: clientActivate
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActivateDeviceRequest'
+      responses:
+        '200':
+          description: 激活成功
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivateDeviceResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/client/heartbeat:
+    post:
+      tags: [Client]
+      summary: 上报设备心跳
+      operationId: clientHeartbeat
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HeartbeatRequest'
+      responses:
+        '200':
+          description: 心跳已接收
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HeartbeatResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/client/profile:
+    get:
+      tags: [Client]
+      summary: 获取客户端当前用户、设备和权限摘要
+      operationId: clientProfile
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 当前身份摘要
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientProfileResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/client/model-leases:
+    post:
+      tags: [Model Leases]
+      summary: 申请模型租约
+      operationId: createModelLease
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateModelLeaseRequest'
+      responses:
+        '200':
+          description: 已返回可用租约
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelLeaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /api/v1/client/model-leases/{lease_id}/renew:
+    post:
+      tags: [Model Leases]
+      summary: 续租模型租约
+      operationId: renewModelLease
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/LeaseId'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenewModelLeaseRequest'
+      responses:
+        '200':
+          description: 续租成功或幂等返回当前租约
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelLeaseResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/client/model-leases/{lease_id}/release:
+    post:
+      tags: [Model Leases]
+      summary: 释放模型租约
+      operationId: releaseModelLease
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/LeaseId'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseModelLeaseRequest'
+      responses:
+        '200':
+          description: 已释放或重复释放
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReleaseModelLeaseResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/client/llm/call-records:
+    post:
+      tags: [Model Accounts]
+      summary: 记录 Rust 直连模型调用摘要
+      description: |
+        Rust 使用当前 `direct_lease` 直接调用租约指定的 OpenAI-compatible 供应商；Go 不接收话术正文、视频或完整音频文件。
+        本接口只记录 client_call_id、lease_id、provider/model、usage、延迟、状态和错误摘要；Go 生成服务端 request_id，客户端上报的 usage 必须标记为 `client_reported`。
+      operationId: recordDirectLLMCall
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DirectLLMCallRecordRequest'
+      responses:
+        '200':
+          description: 调用摘要已记录；模型正文不经 Go 返回
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DirectLLMCallRecordResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+  /api/v1/admin/users:
+    get:
+      tags: [Admin]
+      summary: 查询用户列表
+      operationId: listAdminUsers
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 用户分页列表
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Admin]
+      summary: 创建用户
+      operationId: createAdminUser
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+      responses:
+        '201':
+          description: 创建成功
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/admin/users/{user_id}/disable:
+    post:
+      tags: [Admin]
+      summary: 禁用用户
+      operationId: disableAdminUser
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      responses:
+        '200':
+          description: 用户已禁用或已处于禁用状态
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/admin/devices:
+    get:
+      tags: [Admin]
+      summary: 查询设备列表
+      operationId: listAdminDevices
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 设备分页列表
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/admin/devices/{device_id}/disable:
+    post:
+      tags: [Admin]
+      summary: 禁用设备
+      operationId: disableAdminDevice
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      responses:
+        '200':
+          description: 设备已禁用或已处于禁用状态
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/admin/devices/{device_id}/unbind:
+    post:
+      tags: [Admin]
+      summary: 解除设备绑定
+      operationId: unbindAdminDevice
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      responses:
+        '200':
+          description: 设备进入待激活状态；重新绑定需要新的激活码
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/admin/activation-codes:
+    get:
+      tags: [Admin]
+      summary: 查询激活码列表
+      operationId: listActivationCodes
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 激活码分页列表
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivationCodeListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Admin]
+      summary: 创建激活码
+      operationId: createActivationCode
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateActivationCodeRequest'
+      responses:
+        '201':
+          description: 创建成功；仅此响应可返回一次性明文激活码
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivationCodeEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/admin/activation-codes/{code_id}/revoke:
+    post:
+      tags: [Admin]
+      summary: 作废激活码
+      operationId: revokeActivationCode
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: code_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      responses:
+        '200':
+          description: 激活码已作废；已核销或已过期激活码不能作废
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivationCodeEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/admin/model-pool:
+    get:
+      tags: [Admin]
+      summary: 查询模型池摘要
+      operationId: getModelPool
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 模型池摘要列表
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelPoolResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Admin]
+      summary: 新增模型账号
+      operationId: createModelPoolAccount
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateModelPoolAccountRequest'
+      responses:
+        '201':
+          description: 创建成功，仅返回脱敏账号摘要
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelPoolAccountEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/admin/model-pool/{account_id}/disable:
+    post:
+      tags: [Admin]
+      summary: 禁用模型号池账号
+      operationId: disableModelPoolAccount
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: account_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      responses:
+        '200':
+          description: 禁用成功；不会再分配新租约
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelPoolAccountEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/admin/model-pool/{account_id}/test:
+    post:
+      tags: [Admin]
+      summary: 测试 OpenAI-compatible 模型账号连通性
+      description: |
+        Go 使用服务端 Secret Store 中的账号密钥调用供应商测试接口；测试正文、API Key 和完整响应正文不返回客户端。
+        服务端只返回测试状态、HTTP 状态、延迟、模型摘要和稳定错误码，并记录审计与健康状态。
+      operationId: testModelPoolAccount
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: account_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TestModelPoolAccountRequest'
+      responses:
+        '200':
+          description: 测试完成，结果已记录
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelPoolConnectivityTestResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/admin/model-pool/{account_id}:
+    patch:
+      tags: [Admin]
+      summary: 编辑模型号池账号非密钥配置
+      operationId: updateModelPoolAccount
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: account_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateModelPoolAccountRequest'
+      responses:
+        '200':
+          description: 编辑成功；API Key 不在此接口修改或返回
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelPoolAccountEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/admin/model-usage:
+    get:
+      tags: [Admin]
+      summary: 查询模型调用用量记录
+      operationId: listModelUsage
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 服务端生成的模型用量记录
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelUsageListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/admin/audit-logs:
+    get:
+      tags: [Admin]
+      summary: 查询审计日志
+      operationId: listAuditLogs
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 审计日志分页列表
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditLogListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/health:
+    get:
+      tags: [Admin]
+      summary: 健康检查
+      operationId: health
+      responses:
+        '200':
+          description: 服务健康状态
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Opaque
+  headers:
+    X-Request-Id:
+      description: 服务端生成或透传的请求追踪 ID
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+  parameters:
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        写接口必填。相同认证主体、相同资源语义和相同幂等键的重复请求必须返回同一结果，不能重复产生副作用。
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+    LeaseId:
+      name: lease_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    Page:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSize:
+      name: page_size
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 20
+  responses:
+    BadRequest:
+      description: 请求参数不合法
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: 未登录或会话失效
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: 已登录但无权限或资源不可用
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: 资源不存在
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: 状态冲突或重复请求语义不一致
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    TooManyRequests:
+      description: 达到限流或并发上限
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    BadGateway:
+      description: 上游模型供应商返回失败或无效响应
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServiceUnavailable:
+      description: 模型账号、直连租约或供应商暂时不可用
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    GatewayTimeout:
+      description: 上游模型请求超时
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    Id:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$'
+    Timestamp:
+      type: string
+      format: date-time
+    Sha256Hex:
+      type: string
+      pattern: '^[a-f0-9]{64}$'
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [code, message, request_id]
+      properties:
+        code:
+          type: string
+          description: 稳定错误码，供三端分支处理
+        message:
+          type: string
+          description: 面向操作者的可读消息
+        request_id:
+          type: string
+        details:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorDetail'
+    ErrorDetail:
+      type: object
+      additionalProperties: false
+      required: [field, reason]
+      properties:
+        field:
+          type: string
+        reason:
+          type: string
+    ActorRole:
+      type: string
+      enum: [admin, user]
+    UserStatus:
+      type: string
+      enum: [active, disabled]
+    DeviceStatus:
+      type: string
+      enum: [pending_activation, active, disabled, revoked]
+    ActivationCodeStatus:
+      type: string
+      enum: [active, used, expired, revoked]
+    ModelAccountStatus:
+      type: string
+      enum: [active, cooldown, exhausted, disabled]
+    ModelLeaseStatus:
+      type: string
+      enum: [active, released, expired]
+    SessionTokens:
+      type: object
+      additionalProperties: false
+      required: [access_token, refresh_token, expires_at]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+    UserSummary:
+      type: object
+      additionalProperties: false
+      required: [id, username, role, status, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        username:
+          type: string
+          minLength: 3
+          maxLength: 64
+        role:
+          $ref: '#/components/schemas/ActorRole'
+        status:
+          $ref: '#/components/schemas/UserStatus'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    DeviceSummary:
+      type: object
+      additionalProperties: false
+      required: [id, user_id, device_name, platform, app_version, status, last_seen_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        user_id:
+          $ref: '#/components/schemas/Id'
+        device_name:
+          type: string
+          maxLength: 128
+        platform:
+          type: string
+          maxLength: 64
+        app_version:
+          type: string
+          maxLength: 64
+        status:
+          $ref: '#/components/schemas/DeviceStatus'
+        disk_free_bytes:
+          type: integer
+          minimum: 0
+        memory_total_bytes:
+          type: integer
+          minimum: 0
+        memory_available_bytes:
+          type: integer
+          minimum: 0
+        cpu_logical_cores:
+          type: integer
+          minimum: 0
+          maximum: 4096
+        runtime_os_name:
+          type: string
+          maxLength: 128
+        runtime_os_version:
+          type: string
+          maxLength: 128
+        kernel_version:
+          type: string
+          maxLength: 128
+        last_seen_at:
+          $ref: '#/components/schemas/Timestamp'
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 64
+        password:
+          type: string
+          minLength: 8
+          maxLength: 256
+    LoginResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, tokens, user]
+      properties:
+        request_id:
+          type: string
+        tokens:
+          $ref: '#/components/schemas/SessionTokens'
+        user:
+          $ref: '#/components/schemas/UserSummary'
+    RefreshTokenRequest:
+      type: object
+      additionalProperties: false
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+    RefreshTokenResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, tokens]
+      properties:
+        request_id:
+          type: string
+        tokens:
+          $ref: '#/components/schemas/SessionTokens'
+    LogoutRequest:
+      type: object
+      additionalProperties: false
+      description: 可选 refresh_token 仅为兼容客户端请求体；服务端只撤销当前 Bearer Token 对应会话，不会撤销其他会话。
+      properties:
+        refresh_token:
+          type: string
+    LogoutResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, success]
+      properties:
+        request_id:
+          type: string
+        success:
+          type: boolean
+          const: true
+    ActivateDeviceRequest:
+      type: object
+      additionalProperties: false
+      required: [activation_code, device]
+      properties:
+        activation_code:
+          type: string
+          minLength: 8
+          maxLength: 128
+        device:
+          $ref: '#/components/schemas/DeviceRegistration'
+    DeviceRegistration:
+      type: object
+      additionalProperties: false
+      required: [device_id, device_name, platform, app_version]
+      properties:
+        device_id:
+          $ref: '#/components/schemas/Id'
+        device_name:
+          type: string
+          maxLength: 128
+        platform:
+          type: string
+          maxLength: 64
+        app_version:
+          type: string
+          maxLength: 64
+        os_version:
+          type: string
+          maxLength: 128
+    ActivateDeviceResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, device]
+      properties:
+        request_id:
+          type: string
+        device:
+          $ref: '#/components/schemas/DeviceSummary'
+    HeartbeatRequest:
+      type: object
+      additionalProperties: false
+      required: [device_id, sent_at, status]
+      properties:
+        device_id:
+          $ref: '#/components/schemas/Id'
+        sent_at:
+          $ref: '#/components/schemas/Timestamp'
+        status:
+          type: object
+          additionalProperties: false
+          required: [disk_free_bytes]
+          properties:
+            disk_free_bytes:
+              type: integer
+              minimum: 0
+            memory_total_bytes:
+              type: integer
+              minimum: 0
+            memory_available_bytes:
+              type: integer
+              minimum: 0
+            cpu_logical_cores:
+              type: integer
+              minimum: 0
+              maximum: 4096
+            os_name:
+              type: string
+              maxLength: 128
+            os_version:
+              type: string
+              maxLength: 128
+            kernel_version:
+              type: string
+              maxLength: 128
+            current_media_name:
+              type: string
+              maxLength: 255
+            playback_state:
+              type: string
+              enum: [idle, playing, paused, error]
+    HeartbeatResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, accepted_at, device_status]
+      properties:
+        request_id:
+          type: string
+        accepted_at:
+          $ref: '#/components/schemas/Timestamp'
+        device_status:
+          $ref: '#/components/schemas/DeviceStatus'
+    ClientProfileResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, user, device, permissions]
+      properties:
+        request_id:
+          type: string
+        user:
+          $ref: '#/components/schemas/UserSummary'
+        device:
+          $ref: '#/components/schemas/DeviceSummary'
+        permissions:
+          type: array
+          items:
+            type: string
+    CreateModelPoolAccountRequest:
+      type: object
+      additionalProperties: false
+      required: [provider, model, api_key, priority, daily_limit, concurrency_limit]
+      properties:
+        provider:
+          type: string
+          maxLength: 64
+        model:
+          type: string
+          maxLength: 128
+        base_url:
+          type: string
+          format: uri
+          description: OpenAI-compatible API 根地址，仅允许 http/https；不得包含密钥
+        api_key:
+          type: string
+          minLength: 8
+          maxLength: 4096
+          writeOnly: true
+        priority:
+          type: integer
+        daily_limit:
+          type: integer
+          minimum: 0
+        concurrency_limit:
+          type: integer
+          minimum: 1
+    UpdateModelPoolAccountRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        base_url:
+          type: string
+          format: uri
+          description: OpenAI-compatible API 根地址；不得包含密钥
+        priority:
+          type: integer
+          minimum: 0
+        daily_limit:
+          type: integer
+          minimum: 0
+        concurrency_limit:
+          type: integer
+          minimum: 1
+        status:
+          $ref: '#/components/schemas/ModelAccountStatus'
+    TestModelPoolAccountRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        timeout_seconds:
+          type: integer
+          minimum: 1
+          maximum: 60
+          default: 15
+    ModelPoolConnectivityTestResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, account_id, provider, model, status, tested_at, latency_ms]
+      properties:
+        request_id:
+          type: string
+        account_id:
+          $ref: '#/components/schemas/Id'
+        status:
+          type: string
+          enum: [succeeded, failed, timeout]
+        tested_at:
+          $ref: '#/components/schemas/Timestamp'
+        latency_ms:
+          type: integer
+          minimum: 0
+        http_status:
+          type: integer
+          minimum: 100
+          maximum: 599
+        provider:
+          type: string
+        model:
+          type: string
+        response_summary:
+          type: string
+          maxLength: 512
+        error_code:
+          type: string
+          maxLength: 128
+    CreateModelLeaseRequest:
+      type: object
+      additionalProperties: false
+      required: [provider, model, purpose]
+      properties:
+        provider:
+          type: string
+          maxLength: 64
+        model:
+          type: string
+          maxLength: 128
+        purpose:
+          type: string
+          enum: [realtime_script, chat, validation]
+        max_duration_seconds:
+          type: integer
+          minimum: 30
+          maximum: 3600
+          default: 300
+    RenewModelLeaseRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        extend_seconds:
+          type: integer
+          minimum: 30
+          maximum: 3600
+          default: 300
+    ReleaseModelLeaseRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          maxLength: 255
+    ModelLeaseResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, lease]
+      properties:
+        request_id:
+          type: string
+        lease:
+          $ref: '#/components/schemas/ModelLease'
+    ModelLease:
+      type: object
+      additionalProperties: false
+      required:
+        [id, provider, model, status, expires_at, proxy_mode, concurrency_limit]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        provider:
+          type: string
+        model:
+          type: string
+        status:
+          $ref: '#/components/schemas/ModelLeaseStatus'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        proxy_mode:
+          type: string
+          enum: [direct_lease]
+        concurrency_limit:
+          type: integer
+          minimum: 1
+        direct_base_url:
+          type: string
+          format: uri
+          readOnly: true
+          description: 当前租约允许访问的 OpenAI-compatible API 根地址；不得由客户端修改
+    ReleaseModelLeaseResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, lease_id, released]
+      properties:
+        request_id:
+          type: string
+        lease_id:
+          $ref: '#/components/schemas/Id'
+        released:
+          type: boolean
+    DirectLLMCallRecordRequest:
+      type: object
+      additionalProperties: false
+      required: [lease_id, provider, model, client_call_id, status, usage_source]
+      properties:
+        lease_id:
+          $ref: '#/components/schemas/Id'
+        client_call_id:
+          $ref: '#/components/schemas/Id'
+        provider:
+          type: string
+          maxLength: 64
+        model:
+          type: string
+          maxLength: 128
+        status:
+          type: string
+          enum: [succeeded, failed, timeout, cancelled, unknown]
+        usage_source:
+          type: string
+          enum: [client_reported]
+        input_tokens:
+          type: integer
+          minimum: 0
+        output_tokens:
+          type: integer
+          minimum: 0
+        total_tokens:
+          type: integer
+          minimum: 0
+        latency_ms:
+          type: integer
+          minimum: 0
+        error_code:
+          type: string
+          maxLength: 128
+        finish_reason:
+          type: string
+          maxLength: 64
+    DirectLLMCallRecordResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, recorded]
+      properties:
+        request_id:
+          type: string
+        recorded:
+          type: boolean
+    Pagination:
+      type: object
+      additionalProperties: false
+      required: [page, page_size, total]
+      properties:
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+    UserEnvelope:
+      type: object
+      additionalProperties: false
+      required: [request_id, user]
+      properties:
+        request_id:
+          type: string
+        user:
+          $ref: '#/components/schemas/UserSummary'
+    DeviceEnvelope:
+      type: object
+      additionalProperties: false
+      required: [request_id, device]
+      properties:
+        request_id:
+          type: string
+        device:
+          $ref: '#/components/schemas/DeviceSummary'
+    UserListResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, items, pagination]
+      properties:
+        request_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserSummary'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    CreateUserRequest:
+      type: object
+      additionalProperties: false
+      required: [username, password, role]
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 64
+        password:
+          type: string
+          minLength: 8
+          maxLength: 256
+        role:
+          $ref: '#/components/schemas/ActorRole'
+    DeviceListResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, items, pagination]
+      properties:
+        request_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceSummary'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    CreateActivationCodeRequest:
+      type: object
+      additionalProperties: false
+      required: [expires_at]
+      properties:
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        max_devices:
+          type: integer
+          minimum: 1
+          maximum: 1
+          default: 1
+    ActivationCode:
+      type: object
+      additionalProperties: false
+      required: [id, status, expires_at, max_devices]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        status:
+          $ref: '#/components/schemas/ActivationCodeStatus'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        max_devices:
+          type: integer
+        plain_code:
+          type:
+            - string
+            - 'null'
+          description: 仅创建响应中出现一次，列表与查询接口必须为 null
+    ActivationCodeEnvelope:
+      type: object
+      additionalProperties: false
+      required: [request_id, activation_code]
+      properties:
+        request_id:
+          type: string
+        activation_code:
+          $ref: '#/components/schemas/ActivationCode'
+    ActivationCodeListResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, items, pagination]
+      properties:
+        request_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActivationCode'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    ModelPoolAccountEnvelope:
+      type: object
+      additionalProperties: false
+      required: [request_id, account]
+      properties:
+        request_id:
+          type: string
+        account:
+          $ref: '#/components/schemas/ModelPoolAccountSummary'
+    ModelPoolAccountSummary:
+      type: object
+      additionalProperties: false
+      required: [id, provider, model, status, priority, daily_limit, concurrency_limit, secret_configured, active_leases, daily_used_tokens]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        provider:
+          type: string
+        model:
+          type: string
+        base_url:
+          type: string
+          format: uri
+        status:
+          $ref: '#/components/schemas/ModelAccountStatus'
+        priority:
+          type: integer
+        daily_limit:
+          type: integer
+        concurrency_limit:
+          type: integer
+        secret_configured:
+          type: boolean
+        active_leases:
+          type: integer
+          minimum: 0
+        daily_used_tokens:
+          type: integer
+          minimum: 0
+        last_test_status:
+          type: string
+          enum: [succeeded, failed, timeout]
+        last_tested_at:
+          $ref: '#/components/schemas/Timestamp'
+    ModelPoolResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, accounts]
+      properties:
+        request_id:
+          type: string
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelPoolAccountSummary'
+    ModelUsageRecord:
+      type: object
+      additionalProperties: false
+      required: [id, lease_id, request_id, client_call_id, provider, model, input_tokens, output_tokens, total_tokens, latency_ms, status, usage_source, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        lease_id:
+          $ref: '#/components/schemas/Id'
+        request_id:
+          $ref: '#/components/schemas/Id'
+        client_call_id:
+          $ref: '#/components/schemas/Id'
+        provider:
+          type: string
+        model:
+          type: string
+        input_tokens:
+          type: integer
+          minimum: 0
+        output_tokens:
+          type: integer
+          minimum: 0
+        total_tokens:
+          type: integer
+          minimum: 0
+        latency_ms:
+          type: integer
+          minimum: 0
+        status:
+          type: string
+          enum: [succeeded, failed, timeout, cancelled, unknown]
+        usage_source:
+          type: string
+          enum: [client_reported]
+        error_code:
+          type: string
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    ModelUsageListResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, items, pagination]
+      properties:
+        request_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelUsageRecord'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    AuditLog:
+      type: object
+      additionalProperties: false
+      required: [id, action, target_type, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        actor_user_id:
+          type:
+            - string
+            - 'null'
+        device_id:
+          type:
+            - string
+            - 'null'
+        action:
+          type: string
+        target_type:
+          type: string
+        target_id:
+          type:
+            - string
+            - 'null'
+        request_id:
+          type:
+            - string
+            - 'null'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    AuditLogListResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, items, pagination]
+      properties:
+        request_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditLog'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, status, service, version, now]
+      properties:
+        request_id:
+          type: string
+        status:
+          type: string
+          enum: [ok, degraded]
+        service:
+          type: string
+        version:
+          type: string
+        now:
+          $ref: '#/components/schemas/Timestamp'

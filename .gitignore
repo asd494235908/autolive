@@ -1,0 +1,44 @@
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+
+# JavaScript dependencies and package-manager state
+node_modules/
+.pnpm-store/
+
+# Frontend build output and test coverage
+**/dist/
+**/coverage/
+
+# Rust/Tauri build output
+**/target/
+desktop/src-tauri/binaries/*
+!desktop/src-tauri/binaries/.gitignore
+
+# Locally prepared third-party FFmpeg binaries; sources and license notes stay tracked.
+desktop/third_party/ffmpeg/*/ffmpeg
+desktop/third_party/ffmpeg/*/ffprobe
+desktop/third_party/ffmpeg/*/ffmpeg.exe
+desktop/third_party/ffmpeg/*/ffprobe.exe
+
+# Local backend binaries and runtime data
+backend/bin/
+backend/migrate
+backend/*.db
+backend/*.sqlite
+backend/*.sqlite3
+deploy/data/
+
+# Tauri bundles and installers
+desktop/src-tauri/bundle/
+desktop/src-tauri/*.dmg
+desktop/src-tauri/*.msi
+desktop/src-tauri/*.exe
+desktop/src-tauri/*.AppImage

@@ -1,0 +1,27 @@
+[package]
+name = "autolive-desktop-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "autolive_desktop_core"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }
+
+[dependencies]
+mp4 = "0.14.0"
+keyring = "4.1.5"
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+sysinfo = { version = "0.39.6", default-features = false, features = ["disk", "system"] }
+tauri = { version = "2.0.0", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2.0.0"
+tauri-plugin-http = "2.5.9"
+
+[lints.rust]
+unsafe_code = "forbid"

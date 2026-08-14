@@ -1,0 +1,56 @@
+x-app-environment: &app-environment
+  APP_ADDR: ${APP_ADDR}
+  APP_VERSION: ${APP_VERSION}
+  APP_STORAGE_MODE: ${APP_STORAGE_MODE}
+  APP_MODEL_READ_SOURCE: ${APP_MODEL_READ_SOURCE}
+  APP_DATABASE_URL: ${APP_DATABASE_URL}
+  APP_SECRET_ENCRYPTION_KEY: ${APP_SECRET_ENCRYPTION_KEY}
+  APP_ADMIN_USERNAME: ${APP_ADMIN_USERNAME}
+  APP_ADMIN_PASSWORD: ${APP_ADMIN_PASSWORD}
+
+x-migrate-environment: &migrate-environment
+  APP_STORAGE_MODE: ${APP_STORAGE_MODE}
+  APP_DATABASE_URL: ${APP_DATABASE_URL}
+
+services:
+  autolive-migrate:
+    image: ${AUTOLIVE_API_IMAGE}
+    environment: *migrate-environment
+    command: ["/usr/local/bin/autolive-migrate"]
+    restart: "on-failure:5"
+    networks:
+      - shared-net
+
+  autolive-api:
+    image: ${AUTOLIVE_API_IMAGE}
+    environment: *app-environment
+    depends_on:
+      autolive-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/api/v1/health >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - shared-net
+
+  autolive-admin:
+    image: ${AUTOLIVE_ADMIN_IMAGE}
+    depends_on:
+      autolive-api:
+        condition: service_healthy
+    ports:
+      - "18090:80"
+    restart: unless-stopped
+    networks:
+      - shared-net
+
+networks:
+  shared-net:
+    external: true
+    name: shared-net
