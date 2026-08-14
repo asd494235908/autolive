@@ -47,6 +47,13 @@ class VoiceCloneAdapterTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter.plan_replacement_duration(0, 10_000)
 
+    def test_replacement_bounds_stay_inside_source_duration(self) -> None:
+        adapter.validate_replacement_bounds(0, 10_000, 10_000)
+        with self.assertRaises(ValueError):
+            adapter.validate_replacement_bounds(-1, 1_000, 10_000)
+        with self.assertRaises(ValueError):
+            adapter.validate_replacement_bounds(1_000, 10_001, 10_000)
+
     def test_atomic_json_output_does_not_leave_partial_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "result.json"

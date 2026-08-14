@@ -33,6 +33,7 @@ DEFAULT_REFERENCE_LANGUAGE = "zh-cn"
 DEFAULT_REFERENCE_SAMPLE_RATE_HZ = 22_050
 DEFAULT_REFERENCE_MAX_SECONDS = 30
 MAX_VOICE_CLONE_TEXT_CHARS = 500
+MIN_VOICE_SEGMENT_DURATION_MS = 200
 
 FFMPEG_PATH_ENV = "AUTOLIVE_FFMPEG_PATH"
 FFPROBE_PATH_ENV = "AUTOLIVE_FFPROBE_PATH"
@@ -368,7 +369,7 @@ def _prepare_segments(
         text = str(getattr(segment, "text", "")).strip()
         start_ms = max(0, round(float(getattr(segment, "start", 0.0)) * 1000))
         end_ms = max(0, round(float(getattr(segment, "end", 0.0)) * 1000))
-        if not text or end_ms <= start_ms:
+        if not text or end_ms - start_ms < MIN_VOICE_SEGMENT_DURATION_MS:
             continue
         prepared.append({"start_ms": start_ms, "end_ms": end_ms, "text": text})
     return prepared
@@ -426,6 +427,8 @@ def prepare_source(request: JsonDict, output_json: Path) -> JsonDict:
             compute_type="int8",
         )
         segments = _prepare_segments(whisper_model, reference_audio_path, language=language)
+        if not segments:
+            raise RuntimeError("未检测到有效人声片段")
 
         result = _result_base(operation_id, "success", model=f"demucs+{model_size}+xtts_v2")
         result.update(
@@ -526,6 +529,11 @@ def _concat_source_with_clone(
     _run_checked(command)
 
 
+def validate_replacement_bounds(replace_at_ms: int, resume_at_ms: int, total_duration_ms: int) -> None:
+    if replace_at_ms < 0 or resume_at_ms <= replace_at_ms or resume_at_ms > total_duration_ms:
+        raise ValueError("替换时间范围必须满足 0 <= replace_at_ms < resume_at_ms <= 源音频时长")
+
+
 def replace_current(request: JsonDict, output_json: Path) -> JsonDict:
     operation_id = str(request.get("operation_id") or uuid.uuid4().hex)
     capability = capabilities()
@@ -538,8 +546,6 @@ def replace_current(request: JsonDict, output_json: Path) -> JsonDict:
         text = _validate_text(request.get("text"))
         replace_at_ms = int(request.get("replace_at_ms"))
         resume_at_ms = int(request.get("resume_at_ms"))
-        if resume_at_ms <= replace_at_ms:
-            raise ValueError("resume_at_ms 必须大于 replace_at_ms")
 
         expected_source_sha256 = str(request.get("source_sha256") or "").strip()
         actual_source_sha256 = _sha256(source_path)
@@ -552,6 +558,7 @@ def replace_current(request: JsonDict, output_json: Path) -> JsonDict:
             raise RuntimeError("FFmpeg/FFprobe 不可用")
 
         source_info = _probe_audio_stream(ffprobe_path, source_path)
+        validate_replacement_bounds(replace_at_ms, resume_at_ms, source_info["duration_ms"])
         remaining_ms = resume_at_ms - replace_at_ms
         operation_dir = _output_path(output_json, operation_id, "replacement.wav").parent
         cloned_raw_path = operation_dir / "clone-raw.wav"
