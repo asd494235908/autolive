@@ -44,6 +44,7 @@ use tauri_runtime::dpi::{LogicalSize, PhysicalSize};
 
 const MEDIA_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const RESEARCH_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const MACOS_NATIVE_TITLEBAR_HEIGHT: f64 = 32.0;
 
 #[derive(Debug)]
 pub struct AppState {
@@ -1364,7 +1365,7 @@ pub fn open_final_effect_window(app: AppHandle) -> Result<FinalEffectWindowDto, 
     )
     .title("autoLive 最终效果")
     .inner_size(1280.0, 760.0)
-    .min_inner_size(640.0, 360.0)
+    .min_inner_size(320.0, 180.0)
     .resizable(true)
     .center()
     .build()
@@ -1420,11 +1421,27 @@ pub fn resize_final_effect_window(
     }
 
     let work_area = monitor.work_area().size;
+    let previous_size = window.inner_size().map_err(|error| {
+        CommandErrorDto::new("final_effect_window_resize_failed", error.to_string())
+    })?;
+    let outer_size = window.outer_size().map_err(|error| {
+        CommandErrorDto::new("final_effect_window_resize_failed", error.to_string())
+    })?;
+    let measured_titlebar_height =
+        f64::from(outer_size.height.saturating_sub(previous_size.height)) / scale_factor;
+    let native_titlebar_height = if measured_titlebar_height > 0.0 {
+        measured_titlebar_height
+    } else if cfg!(target_os = "macos") {
+        MACOS_NATIVE_TITLEBAR_HEIGHT
+    } else {
+        0.0
+    };
     let target = calculate_window_size(
         request.width,
         request.height,
         f64::from(work_area.width) / scale_factor,
         f64::from(work_area.height) / scale_factor,
+        native_titlebar_height,
     )
     .map_err(|error| match error {
         WindowSizingError::InvalidVideoDimensions => CommandErrorDto::new(
@@ -1437,7 +1454,6 @@ pub fn resize_final_effect_window(
         ),
     })?;
 
-    let previous_size = window.inner_size().ok();
     window
         .set_size(LogicalSize::new(
             f64::from(target.width),
@@ -1447,9 +1463,7 @@ pub fn resize_final_effect_window(
             CommandErrorDto::new("final_effect_window_resize_failed", error.to_string())
         })?;
     if let Err(error) = window.center() {
-        if let Some(previous_size) = previous_size {
-            let _ = window.set_size(PhysicalSize::new(previous_size.width, previous_size.height));
-        }
+        let _ = window.set_size(PhysicalSize::new(previous_size.width, previous_size.height));
         return Err(CommandErrorDto::new(
             "final_effect_window_resize_failed",
             error.to_string(),

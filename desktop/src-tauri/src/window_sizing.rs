@@ -1,7 +1,6 @@
 const MAX_VIDEO_DIMENSION: u32 = 16_384;
-const PLAYER_CHROME_HEIGHT: f64 = 180.0;
-const MIN_WINDOW_WIDTH: f64 = 640.0;
-const MIN_WINDOW_HEIGHT: f64 = 360.0;
+const MIN_WINDOW_WIDTH: f64 = 320.0;
+const MIN_WINDOW_HEIGHT: f64 = 180.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowSize {
@@ -20,6 +19,7 @@ pub fn calculate_window_size(
     video_height: u32,
     work_area_width: f64,
     work_area_height: f64,
+    native_titlebar_height: f64,
 ) -> Result<WindowSize, WindowSizingError> {
     if video_width == 0
         || video_height == 0
@@ -30,13 +30,15 @@ pub fn calculate_window_size(
     }
     if !work_area_width.is_finite()
         || !work_area_height.is_finite()
+        || !native_titlebar_height.is_finite()
         || work_area_width <= 0.0
         || work_area_height <= 0.0
+        || native_titlebar_height < 0.0
     {
         return Err(WindowSizingError::InvalidWorkArea);
     }
 
-    let available_video_height = (work_area_height - PLAYER_CHROME_HEIGHT).max(1.0);
+    let available_video_height = (work_area_height - native_titlebar_height).max(1.0);
     let scale = (work_area_width / f64::from(video_width))
         .min(available_video_height / f64::from(video_height))
         .min(1.0);
@@ -45,7 +47,7 @@ pub fn calculate_window_size(
     }
 
     let mut width = round_to_dimension(f64::from(video_width) * scale);
-    let mut height = round_to_dimension(f64::from(video_height) * scale + PLAYER_CHROME_HEIGHT);
+    let mut height = round_to_dimension(f64::from(video_height) * scale + native_titlebar_height);
     let max_width = round_to_dimension(work_area_width);
     let max_height = round_to_dimension(work_area_height);
 
@@ -64,12 +66,12 @@ mod tests {
     use super::{calculate_window_size, WindowSize, WindowSizingError};
 
     #[test]
-    fn keeps_in_bounds_video_size_and_reserves_player_chrome() {
+    fn does_not_reserve_hidden_player_chrome_for_video_only_layout() {
         assert_eq!(
-            calculate_window_size(1280, 720, 1920.0, 1200.0),
+            calculate_window_size(1280, 720, 1920.0, 1200.0, 0.0),
             Ok(WindowSize {
                 width: 1280,
-                height: 900,
+                height: 720,
             })
         );
     }
@@ -77,20 +79,31 @@ mod tests {
     #[test]
     fn scales_large_video_without_changing_video_ratio() {
         assert_eq!(
-            calculate_window_size(3840, 2160, 1440.0, 900.0),
+            calculate_window_size(3840, 2160, 1440.0, 900.0, 32.0),
             Ok(WindowSize {
-                width: 1280,
-                height: 900,
+                width: 1440,
+                height: 842,
             })
         );
     }
 
     #[test]
-    fn keeps_portrait_video_complete_and_operable() {
+    fn accounts_for_native_titlebar_before_sizing_video() {
         assert_eq!(
-            calculate_window_size(720, 1280, 1440.0, 900.0),
+            calculate_window_size(720, 1280, 1440.0, 1021.0, 32.0),
             Ok(WindowSize {
-                width: 640,
+                width: 556,
+                height: 1021,
+            })
+        );
+    }
+
+    #[test]
+    fn portrait_video_window_matches_scaled_video_without_side_bars() {
+        assert_eq!(
+            calculate_window_size(720, 1280, 1440.0, 900.0, 32.0),
+            Ok(WindowSize {
+                width: 488,
                 height: 900,
             })
         );
@@ -99,10 +112,10 @@ mod tests {
     #[test]
     fn applies_minimum_window_size_for_small_video() {
         assert_eq!(
-            calculate_window_size(320, 180, 1440.0, 900.0),
+            calculate_window_size(320, 180, 1440.0, 900.0, 32.0),
             Ok(WindowSize {
-                width: 640,
-                height: 360,
+                width: 320,
+                height: 212,
             })
         );
     }
@@ -110,9 +123,9 @@ mod tests {
     #[test]
     fn stays_inside_tiny_work_area_when_minimum_does_not_fit() {
         assert_eq!(
-            calculate_window_size(1280, 720, 500.0, 300.0),
+            calculate_window_size(1280, 720, 500.0, 300.0, 32.0),
             Ok(WindowSize {
-                width: 500,
+                width: 476,
                 height: 300,
             })
         );
@@ -121,11 +134,11 @@ mod tests {
     #[test]
     fn rejects_missing_or_unsafe_video_dimensions() {
         assert_eq!(
-            calculate_window_size(0, 720, 1920.0, 1200.0),
+            calculate_window_size(0, 720, 1920.0, 1200.0, 0.0),
             Err(WindowSizingError::InvalidVideoDimensions)
         );
         assert_eq!(
-            calculate_window_size(16_385, 720, 1920.0, 1200.0),
+            calculate_window_size(16_385, 720, 1920.0, 1200.0, 0.0),
             Err(WindowSizingError::InvalidVideoDimensions)
         );
     }
