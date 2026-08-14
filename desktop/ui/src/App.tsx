@@ -358,6 +358,7 @@ function getVoiceCloneTextError(text: string) {
 function getVoiceClonePresetError(title: string, text: string) {
   const trimmedTitle = title.trim();
   if (!trimmedTitle) return '标题不能为空';
+  if (countUnicodeCharacters(trimmedTitle) > 80) return '标题最多 80 个字符';
   return getVoiceCloneTextError(text);
 }
 
@@ -513,6 +514,9 @@ function FinalEffectWindow() {
     if (!channel || !video) return;
     const duration = Number.isFinite(video.duration) && video.duration >= 0 ? video.duration : 0;
     const currentTime = clampMediaTime(video.currentTime, duration);
+    void invoke<PlaybackSnapshot>('update_playback_position', {
+      request: { position_ms: Math.max(0, Math.round(currentTime * 1000)) },
+    }).catch(() => undefined);
     try {
       channel.postMessage({
         version: 1,
@@ -1620,6 +1624,10 @@ function DesktopApp() {
           ? voiceCloneWorkerCapabilities?.reason ?? '固定话术 Worker 不可用'
           : voiceCloneStatus !== 'ready'
             ? '请先准备人声'
+            : snapshot?.audio_processing_enabled &&
+                !snapshot.realtime_audio_variant_enabled &&
+                snapshot.current_video_source !== 'processed'
+              ? '请先应用当前普通声音处理参数'
             : realtimeAudioBusy
               ? '当前实时音频正在占用'
               : getVoiceCloneTextError(voiceCloneText);

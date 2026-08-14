@@ -84,6 +84,8 @@ pub struct VoiceCloneReplacementPlan {
     pub source_generation: u64,
     pub source_path: String,
     pub source_sha256: String,
+    pub audio_base_path: String,
+    pub source_duration_ms: u64,
     pub operation_id: String,
     pub input_text: String,
     pub replace_at_ms: u64,
@@ -117,6 +119,7 @@ pub enum VoiceCloneRuntimeError {
     VoiceCloneSourceNotPrepared,
     VoiceClonePreparedSourceStale,
     CurrentVoiceSegmentNotFound,
+    VoiceCloneAudioProcessingNotReady,
     RealtimeAudioWorkerBusy,
     VoiceCloneReplacementStale,
 }
@@ -184,6 +187,7 @@ pub struct PlaybackCore {
     audio_processing_status: String,
     voice_clone_prepared_source: Option<VoiceClonePreparedSource>,
     voice_clone_replacement: VoiceCloneReplacementState,
+    current_position_ms: u64,
 }
 
 impl Default for PlaybackCore {
@@ -215,6 +219,7 @@ impl Default for PlaybackCore {
             audio_processing_status: "disabled".to_owned(),
             voice_clone_prepared_source: None,
             voice_clone_replacement: VoiceCloneReplacementState::default(),
+            current_position_ms: 0,
         }
     }
 }
@@ -245,6 +250,7 @@ impl PlaybackCore {
         self.loop_index = 0;
         self.playback_generation = self.playback_generation.wrapping_add(1);
         self.playback_state = PlaybackState::Ready;
+        self.current_position_ms = 0;
         self.reset_audio_to_original();
         self.reset_video_to_original();
         self.pending_video_reference = None;
@@ -357,6 +363,12 @@ impl PlaybackCore {
         if self.playback_state != PlaybackState::Playing {
             return Err(VoiceCloneRuntimeError::PlaybackNotPlaying);
         }
+        if self.audio_processing_enabled
+            && !self.realtime_audio_variant_enabled
+            && self.current_video_source.as_deref() != Some("processed")
+        {
+            return Err(VoiceCloneRuntimeError::VoiceCloneAudioProcessingNotReady);
+        }
         let source = self
             .source_media
             .as_ref()
@@ -395,10 +407,17 @@ impl PlaybackCore {
             model: prepared.model.clone(),
             error: None,
         };
+        self.current_position_ms = position_ms;
+        let audio_base_path = self
+            .current_video_reference
+            .clone()
+            .unwrap_or_else(|| source.source_path.clone());
         Ok(VoiceCloneReplacementPlan {
             source_generation: self.playback_generation,
             source_path: source.source_path.clone(),
             source_sha256: prepared.source_sha256,
+            audio_base_path,
+            source_duration_ms: prepared.total_duration_ms,
             operation_id: operation_id.to_owned(),
             input_text,
             replace_at_ms: position_ms,
@@ -423,6 +442,7 @@ impl PlaybackCore {
             || replacement.source_path != source.source_path
             || self.voice_clone_replacement.operation_id.as_deref()
                 != Some(replacement.operation_id.as_str())
+            || self.current_position_ms >= replacement.resume_at_ms
         {
             return Err(VoiceCloneRuntimeError::VoiceCloneReplacementStale);
         }
@@ -449,6 +469,9 @@ impl PlaybackCore {
         self.voice_clone_replacement.replacement_audio_reference = None;
         self.voice_clone_replacement.replacement_audio_sha256 = None;
         self.voice_clone_replacement.replacement_duration_ms = None;
+        self.voice_clone_replacement.replace_at_ms = None;
+        self.voice_clone_replacement.resume_at_ms = None;
+        self.voice_clone_replacement.input_text = None;
     }
 
     pub fn mark_voice_clone_cancelled(&mut self, reason: impl Into<String>) {
@@ -462,10 +485,21 @@ impl PlaybackCore {
         self.voice_clone_replacement.replacement_audio_reference = None;
         self.voice_clone_replacement.replacement_audio_sha256 = None;
         self.voice_clone_replacement.replacement_duration_ms = None;
+        self.voice_clone_replacement.replace_at_ms = None;
+        self.voice_clone_replacement.resume_at_ms = None;
+        self.voice_clone_replacement.input_text = None;
     }
 
     pub fn clear_voice_clone_replacement(&mut self) {
         self.reset_voice_clone_for_current_source();
+    }
+
+    pub fn set_playback_position(&mut self, position_ms: u64) {
+        self.current_position_ms = self
+            .source_media
+            .as_ref()
+            .and_then(|source| source.duration_ms)
+            .map_or(position_ms, |duration_ms| position_ms.min(duration_ms));
     }
 
     pub fn voice_clone_prepared_source(&self) -> Option<VoiceClonePreparedSource> {
@@ -792,6 +826,7 @@ impl PlaybackCore {
         self.playback_state = PlaybackState::Stopped;
         self.playback_generation = self.playback_generation.wrapping_add(1);
         self.pending_audio_candidate = None;
+        self.current_position_ms = 0;
         self.reset_audio_to_original();
         self.reset_video_to_original();
         self.pending_video_reference = None;
@@ -804,6 +839,7 @@ impl PlaybackCore {
         self.loop_index = self.loop_index.saturating_add(1);
         self.playback_state = PlaybackState::Playing;
         self.pending_audio_candidate = None;
+        self.current_position_ms = 0;
         self.reset_audio_to_original();
         self.commit_pending_video();
         self.reset_voice_clone_for_current_source();

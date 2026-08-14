@@ -14,7 +14,8 @@ use commands::{
     probe_local_mp4, resize_final_effect_window, restore_original_audio, resume_playback,
     set_audio_processing_profile, set_processing_switches, stage_audio_variant_candidate,
     start_media_processing, start_playback, start_research_analysis, start_speech_to_speech_worker,
-    start_voice_clone_replacement, stop_playback, validate_local_research_params, AppState,
+    start_voice_clone_replacement, stop_playback, update_playback_position,
+    validate_local_research_params, AppState,
 };
 
 fn main() {
@@ -36,6 +37,7 @@ fn main() {
             start_playback,
             pause_playback,
             resume_playback,
+            update_playback_position,
             stop_playback,
             complete_playback_loop,
             prepare_voice_clone_source,

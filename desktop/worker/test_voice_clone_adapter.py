@@ -54,6 +54,21 @@ class VoiceCloneAdapterTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter.validate_replacement_bounds(1_000, 10_001, 10_000)
 
+    def test_full_transcription_audio_is_not_limited_to_reference_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target_path = Path(temp_dir) / "transcription.wav"
+            with patch.object(adapter, "_run_checked") as run_checked:
+                adapter._normalize_reference_audio(
+                    Path("/usr/bin/ffmpeg"),
+                    Path(temp_dir) / "vocals.wav",
+                    target_path,
+                    max_seconds=None,
+                )
+
+            command = run_checked.call_args.args[0]
+            self.assertNotIn("-t", command)
+            self.assertEqual(command[-1], str(target_path))
+
     def test_atomic_json_output_does_not_leave_partial_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "result.json"

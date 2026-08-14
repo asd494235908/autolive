@@ -1,5 +1,6 @@
 export const VOICE_CLONE_PRESETS_STORAGE_KEY = 'autolive.voice-clone-presets.v1';
 const MAX_PRESET_COUNT = 10;
+const MAX_TITLE_LENGTH = 80;
 const MAX_TEXT_LENGTH = 500;
 
 export type VoiceClonePreset = {
@@ -39,6 +40,9 @@ function normalizePresetFields(input: VoiceClonePresetDraft) {
   const title = input.title.trim();
   const text = input.text.trim();
   if (!title) throw new Error('标题不能为空');
+  if (countUnicodeCharacters(title) > MAX_TITLE_LENGTH) {
+    throw new Error('标题最多 80 个字符');
+  }
   if (!text) throw new Error('文本不能为空');
   if (countUnicodeCharacters(text) > MAX_TEXT_LENGTH) {
     throw new Error('文本最多 500 个字符');

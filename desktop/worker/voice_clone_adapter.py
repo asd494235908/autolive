@@ -281,7 +281,7 @@ def _normalize_reference_audio(
     target_path: Path,
     *,
     sample_rate_hz: int = DEFAULT_REFERENCE_SAMPLE_RATE_HZ,
-    max_seconds: int = DEFAULT_REFERENCE_MAX_SECONDS,
+    max_seconds: int | None = DEFAULT_REFERENCE_MAX_SECONDS,
 ) -> None:
     command = [
         str(ffmpeg_path),
@@ -295,12 +295,14 @@ def _normalize_reference_audio(
         "1",
         "-ar",
         str(sample_rate_hz),
-        "-t",
-        str(max_seconds),
+    ]
+    if max_seconds is not None:
+        command.extend(["-t", str(max_seconds)])
+    command.extend([
         "-f",
         "wav",
         str(target_path),
-    ]
+    ])
     _run_checked(command)
 
 
@@ -418,6 +420,13 @@ def prepare_source(request: JsonDict, output_json: Path) -> JsonDict:
 
         vocals_path = _find_vocals_path(demucs_output_dir)
         _normalize_reference_audio(ffmpeg_path, vocals_path, reference_audio_path)
+        index_audio_path = operation_dir / "transcription.wav"
+        _normalize_reference_audio(
+            ffmpeg_path,
+            vocals_path,
+            index_audio_path,
+            max_seconds=None,
+        )
         reference_sha256 = _sha256(reference_audio_path)
 
         faster_whisper_module = _import_optional_module("faster_whisper")
@@ -426,7 +435,7 @@ def prepare_source(request: JsonDict, output_json: Path) -> JsonDict:
             device="cpu",
             compute_type="int8",
         )
-        segments = _prepare_segments(whisper_model, reference_audio_path, language=language)
+        segments = _prepare_segments(whisper_model, index_audio_path, language=language)
         if not segments:
             raise RuntimeError("未检测到有效人声片段")
 
@@ -542,6 +551,10 @@ def replace_current(request: JsonDict, output_json: Path) -> JsonDict:
 
     try:
         source_path = _read_existing_file(request.get("source_path"), "source_path")
+        audio_base_path = _read_existing_file(
+            request.get("audio_base_path") or source_path,
+            "audio_base_path",
+        )
         reference_audio_path = _read_existing_file(request.get("reference_audio_path"), "reference_audio_path")
         text = _validate_text(request.get("text"))
         replace_at_ms = int(request.get("replace_at_ms"))
@@ -557,9 +570,16 @@ def replace_current(request: JsonDict, output_json: Path) -> JsonDict:
         if ffmpeg_path is None or ffprobe_path is None:
             raise RuntimeError("FFmpeg/FFprobe 不可用")
 
-        source_info = _probe_audio_stream(ffprobe_path, source_path)
+        source_info = _probe_audio_stream(ffprobe_path, audio_base_path)
+        expected_source_duration_ms = int(request.get("source_duration_ms") or 0)
+        if expected_source_duration_ms > 0 and abs(source_info["duration_ms"] - expected_source_duration_ms) > 1_000:
+            raise ValueError("当前处理后音频与源视频时长差异过大")
         validate_replacement_bounds(replace_at_ms, resume_at_ms, source_info["duration_ms"])
         remaining_ms = resume_at_ms - replace_at_ms
+        sample_rate_hz = int(request.get("sample_rate_hz") or source_info["sample_rate_hz"])
+        channel_count = int(request.get("channel_count") or source_info["channel_count"])
+        if sample_rate_hz <= 0 or channel_count <= 0:
+            raise ValueError("替换输出音频参数无效")
         operation_dir = _output_path(output_json, operation_id, "replacement.wav").parent
         cloned_raw_path = operation_dir / "clone-raw.wav"
         cloned_adjusted_path = operation_dir / "clone-adjusted.wav"
@@ -580,19 +600,19 @@ def replace_current(request: JsonDict, output_json: Path) -> JsonDict:
             ffmpeg_path,
             cloned_raw_path,
             cloned_adjusted_path,
-            sample_rate_hz=source_info["sample_rate_hz"],
-            channel_count=source_info["channel_count"],
+            sample_rate_hz=sample_rate_hz,
+            channel_count=channel_count,
             plan=duration_plan,
         )
         _concat_source_with_clone(
             ffmpeg_path,
-            source_path,
+            audio_base_path,
             cloned_adjusted_path,
             final_audio_path,
             replace_at_ms=replace_at_ms,
             resume_at_ms=resume_at_ms,
-            sample_rate_hz=source_info["sample_rate_hz"],
-            channel_count=source_info["channel_count"],
+            sample_rate_hz=sample_rate_hz,
+            channel_count=channel_count,
         )
 
         replacement_sha256 = _sha256(final_audio_path)
@@ -606,8 +626,8 @@ def replace_current(request: JsonDict, output_json: Path) -> JsonDict:
                 "replace_at_ms": replace_at_ms,
                 "resume_at_ms": resume_at_ms,
                 "total_duration_ms": source_info["duration_ms"],
-                "sample_rate_hz": source_info["sample_rate_hz"],
-                "channel_count": source_info["channel_count"],
+                "sample_rate_hz": sample_rate_hz,
+                "channel_count": channel_count,
                 "input_text": text,
                 "source_generation": request.get("source_generation"),
                 "remaining_ms": remaining_ms,

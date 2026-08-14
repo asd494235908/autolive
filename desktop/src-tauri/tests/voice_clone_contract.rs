@@ -13,6 +13,10 @@ fn sample_request() -> VoiceCloneReplacementRequest {
         source_generation: 7,
         source_path: "/Users/mac/work/gepin/autoLive/media/source.mp4".to_owned(),
         source_sha256: "b".repeat(64),
+        audio_base_path: "/Users/mac/work/gepin/autoLive/media/source.mp4".to_owned(),
+        source_duration_ms: 10_000,
+        sample_rate_hz: 48_000,
+        channel_count: 2,
         operation_id: "operation-001".to_owned(),
         reference_audio_path: "/Users/mac/work/gepin/autoLive/cache/voice-clone/reference.wav"
             .to_owned(),

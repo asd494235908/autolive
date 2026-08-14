@@ -132,6 +132,10 @@ test('rejects blank titles and text over 500 unicode characters', async () => {
     () => addVoiceClonePreset(storage, [], { title: '有效标题', text: tooLongText }),
     /文本最多 500 个字符/i,
   );
+  assert.throws(
+    () => addVoiceClonePreset(storage, [], { title: '标'.repeat(81), text: '有效文本' }),
+    /标题最多 80 个字符/i,
+  );
 });
 
 test('removes a preset without mutating the original list', async () => {

@@ -9,7 +9,8 @@ use autolive_desktop_core::hashing::{
     hash_file_at_path, hash_mp4_sha256_dto, FileHashRequestDto, Mp4Sha256Dto,
 };
 use autolive_desktop_core::media_engine::{
-    build_media_render_args, configured_media_engine_paths_with_resource_dir,
+    build_media_render_args, configured_media_engine_paths,
+    configured_media_engine_paths_with_resource_dir,
     configured_media_engine_status_with_resource_dir, render_media, MediaEngineStatus,
     MediaRenderRequest,
 };
@@ -51,12 +52,16 @@ use sysinfo::{Disks, System};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, Window};
 use tauri_runtime::dpi::{LogicalSize, PhysicalSize};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 const MEDIA_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const RESEARCH_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const MACOS_NATIVE_TITLEBAR_HEIGHT: f64 = 32.0;
 const VOICE_CLONE_WORKER_ENV: &str = "AUTOLIVE_VOICE_CLONE_WORKER";
 const VOICE_CLONE_CAPABILITY_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_VOICE_CLONE_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
+const VOICE_CLONE_AUDIO_PROBE_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug)]
 pub struct AppState {
@@ -163,6 +168,11 @@ pub struct StartVoiceCloneReplacementRequestDto {
     pub text: String,
     pub position_ms: u64,
     pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdatePlaybackPositionRequestDto {
+    pub position_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -807,6 +817,69 @@ fn prune_cache_dir(
     })
 }
 
+fn prune_cache_tree(
+    directory: &Path,
+    max_bytes: u64,
+    protected_paths: &[PathBuf],
+) -> std::io::Result<CacheCleanupResultDto> {
+    if !directory.is_dir() {
+        return Ok(CacheCleanupResultDto {
+            removed_files: 0,
+            removed_bytes: 0,
+            remaining_bytes: 0,
+        });
+    }
+    let mut entries = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in std::fs::read_dir(current)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() {
+                entries.push((
+                    path,
+                    metadata.len(),
+                    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                ));
+            }
+        }
+    }
+    let mut remaining_bytes = entries.iter().map(|(_, size, _)| *size).sum::<u64>();
+    let mut removed_files: u32 = 0;
+    let mut removed_bytes: u64 = 0;
+    let partial_expiry = SystemTime::now()
+        .checked_sub(Duration::from_secs(10 * 60))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    entries.sort_by_key(|(_, _, modified)| *modified);
+    for (path, size, modified) in entries {
+        let is_partial = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(".partial"));
+        let over_budget = remaining_bytes > max_bytes;
+        let stale_partial = is_partial && modified <= partial_expiry;
+        let protected = protected_paths
+            .iter()
+            .any(|protected_path| path == *protected_path || path.starts_with(protected_path));
+        if protected || (!over_budget && !stale_partial) {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            remaining_bytes = remaining_bytes.saturating_sub(size);
+            removed_files += 1;
+            removed_bytes = removed_bytes.saturating_add(size);
+        }
+    }
+    Ok(CacheCleanupResultDto {
+        removed_files,
+        removed_bytes,
+        remaining_bytes,
+    })
+}
+
 #[cfg(test)]
 mod cache_tests {
     use super::prune_cache_dir;
@@ -845,7 +918,7 @@ fn cleanup_local_caches(
         .path()
         .app_cache_dir()
         .map_err(|error| CommandErrorDto::new("cache_dir_failed", error.to_string()))?;
-    let (current_video, pending_video, research_paths) = {
+    let (current_video, pending_video, research_paths, voice_clone_protected_paths) = {
         let playback = state
             .playback
             .lock()
@@ -857,10 +930,15 @@ fn cleanup_local_caches(
             .map_err(|_| CommandErrorDto::new("research_status_lock_failed", "研究状态锁已损坏"))?
             .cache_paths
             .clone();
+        let voice_clone_protected_paths = voice_clone_artifact_dirs(&playback, true)
+            .into_iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .collect::<Vec<_>>();
         (
             snapshot.current_video_reference.map(PathBuf::from),
             snapshot.pending_video_reference.map(PathBuf::from),
             research_paths,
+            voice_clone_protected_paths,
         )
     };
     let media_result = prune_cache_dir(
@@ -878,10 +956,22 @@ fn cleanup_local_caches(
         &research_paths,
     )
     .map_err(|error| CommandErrorDto::new("research_cache_cleanup_failed", error.to_string()))?;
+    let voice_clone_result = prune_cache_tree(
+        &cache_root.join("voice-clone"),
+        1_024 * 1024 * 1024,
+        &voice_clone_protected_paths,
+    )
+    .map_err(|error| CommandErrorDto::new("voice_clone_cache_cleanup_failed", error.to_string()))?;
     Ok(CacheCleanupResultDto {
-        removed_files: media_result.removed_files + research_result.removed_files,
-        removed_bytes: media_result.removed_bytes + research_result.removed_bytes,
-        remaining_bytes: media_result.remaining_bytes + research_result.remaining_bytes,
+        removed_files: media_result.removed_files
+            + research_result.removed_files
+            + voice_clone_result.removed_files,
+        removed_bytes: media_result.removed_bytes
+            + research_result.removed_bytes
+            + voice_clone_result.removed_bytes,
+        remaining_bytes: media_result.remaining_bytes
+            + research_result.remaining_bytes
+            + voice_clone_result.remaining_bytes,
     })
 }
 
@@ -1283,6 +1373,9 @@ pub fn start_voice_clone_replacement(
     let executable = configured_voice_clone_worker_executable()
         .map_err(|reason| CommandErrorDto::new("voice_clone_worker_unavailable", reason))?;
     let cache_root = voice_clone_cache_root(&app)?;
+    let (_, ffprobe_path) = configured_media_engine_paths().map_err(|error| {
+        CommandErrorDto::new("voice_clone_media_engine_unavailable", error.to_string())
+    })?;
     let _ = state.reap_finished_speech_worker()?;
     let speech_worker_running = state.speech_worker_is_running()?;
     let (plan, stale_replacement_paths, snapshot) = {
@@ -1317,6 +1410,10 @@ pub fn start_voice_clone_replacement(
         source_generation: plan.source_generation,
         source_path: plan.source_path.clone(),
         source_sha256: plan.source_sha256.clone(),
+        audio_base_path: plan.audio_base_path.clone(),
+        source_duration_ms: plan.source_duration_ms,
+        sample_rate_hz: plan.sample_rate_hz,
+        channel_count: plan.channel_count,
         operation_id: plan.operation_id.clone(),
         reference_audio_path: plan.reference_audio_path.clone(),
         text: plan.input_text.clone(),
@@ -1335,6 +1432,7 @@ pub fn start_voice_clone_replacement(
     let thread_output_json = output_json.clone();
     let thread_replacement_root = replacement_root.clone();
     let thread_plan = plan.clone();
+    let thread_ffprobe_path = ffprobe_path.clone();
     let handle = thread::spawn(move || {
         let args = vec![
             "--replace-json".to_owned(),
@@ -1355,7 +1453,12 @@ pub fn start_voice_clone_replacement(
                 "固定话术替换结果 JSON 无法解析",
             )
             .and_then(|result| {
-                validate_voice_clone_replace_result(&thread_replacement_root, &thread_plan, result)
+                validate_voice_clone_replace_result(
+                    &thread_replacement_root,
+                    &thread_plan,
+                    &thread_ffprobe_path,
+                    result,
+                )
             }),
             Err(VoiceCloneWorkerRunError::Cancelled) => {
                 if let Ok(mut playback) = playback.lock() {
@@ -2103,6 +2206,18 @@ pub fn resume_playback(
 }
 
 #[tauri::command]
+pub fn update_playback_position(
+    window: Window,
+    state: State<'_, AppState>,
+    request: UpdatePlaybackPositionRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.with_playback_window(&window, |playback| {
+        playback.set_playback_position(request.position_ms);
+        Ok(state.snapshot(playback))
+    })
+}
+
+#[tauri::command]
 pub fn stop_playback(
     window: Window,
     state: State<'_, AppState>,
@@ -2536,6 +2651,18 @@ fn configured_voice_clone_worker_executable() -> Result<PathBuf, String> {
     if !path.is_file() {
         return Err("固定话术 Worker 文件不存在".to_owned());
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = path
+            .metadata()
+            .map_err(|error| format!("无法读取固定话术 Worker 权限：{error}"))?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            return Err("固定话术 Worker 文件不可执行，请先赋予执行权限".to_owned());
+        }
+    }
     Ok(path)
 }
 
@@ -2596,6 +2723,19 @@ fn read_json_file<T: DeserializeOwned>(
 }
 
 fn kill_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{}", child.id());
+        let _kill_group_result = Command::new("/bin/kill")
+            .args(["-KILL", process_group.as_str()])
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _kill_tree_result = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .status();
+    }
     let _kill_result = child.kill();
     let _wait_result = child.wait();
 }
@@ -2612,6 +2752,8 @@ fn run_voice_clone_worker_process(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command
         .spawn()
         .map_err(|error| VoiceCloneWorkerRunError::Failed(error.to_string()))?;
@@ -2739,6 +2881,118 @@ fn voice_clone_hash_matches(
     Ok(actual_sha256)
 }
 
+fn probe_voice_clone_audio(
+    ffprobe_path: &Path,
+    audio_path: &Path,
+) -> Result<(u32, u16, u64), CommandErrorDto> {
+    let mut child = Command::new(ffprobe_path);
+    child
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=sample_rate,channels,duration",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(audio_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = child.spawn().map_err(|error| {
+        CommandErrorDto::new(
+            "voice_clone_replace_failed",
+            format!("无法探测替换音频：{error}"),
+        )
+    })?;
+    let started_at = Instant::now();
+    let status = loop {
+        if started_at.elapsed() >= Duration::from_millis(VOICE_CLONE_AUDIO_PROBE_TIMEOUT_MS) {
+            kill_child(&mut child);
+            return Err(CommandErrorDto::new(
+                "voice_clone_replace_failed",
+                "替换音频可读性探测超时",
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                kill_child(&mut child);
+                return Err(CommandErrorDto::new(
+                    "voice_clone_replace_failed",
+                    format!("替换音频探测失败：{error}"),
+                ));
+            }
+        }
+    };
+    let mut output = Vec::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        use std::io::Read;
+        stdout.read_to_end(&mut output).map_err(|error| {
+            CommandErrorDto::new(
+                "voice_clone_replace_failed",
+                format!("替换音频探测结果读取失败：{error}"),
+            )
+        })?;
+    }
+    if !status.success() {
+        return Err(CommandErrorDto::new(
+            "voice_clone_replace_failed",
+            "替换音频文件不可读",
+        ));
+    }
+    let payload: serde_json::Value = serde_json::from_slice(&output).map_err(|error| {
+        CommandErrorDto::new(
+            "voice_clone_replace_failed",
+            format!("替换音频探测结果无效：{error}"),
+        )
+    })?;
+    let stream = payload
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|streams| streams.first())
+        .ok_or_else(|| CommandErrorDto::new("voice_clone_replace_failed", "替换音频缺少音频流"))?;
+    let sample_rate_hz = stream
+        .get("sample_rate")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or_default();
+    let channel_count = stream
+        .get("channels")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or_default();
+    let duration_seconds = stream
+        .get("duration")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<f64>().ok())
+        .or_else(|| {
+            payload
+                .get("format")
+                .and_then(|format| format.get("duration"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+        .unwrap_or_default();
+    let duration_ms = if duration_seconds.is_finite() && duration_seconds > 0.0 {
+        (duration_seconds * 1_000.0).round() as u64
+    } else {
+        0
+    };
+    if sample_rate_hz == 0 || channel_count == 0 || duration_ms == 0 {
+        return Err(CommandErrorDto::new(
+            "voice_clone_replace_failed",
+            "替换音频采样率、声道或时长无效",
+        ));
+    }
+    Ok((sample_rate_hz, channel_count, duration_ms))
+}
+
 fn validate_voice_clone_prepare_result(
     prepared_root: &Path,
     source_generation: u64,
@@ -2842,6 +3096,7 @@ fn validate_voice_clone_prepare_result(
 fn validate_voice_clone_replace_result(
     replacement_root: &Path,
     plan: &autolive_desktop_core::VoiceCloneReplacementPlan,
+    ffprobe_path: &Path,
     worker_result: VoiceCloneReplaceWorkerResult,
 ) -> Result<VoiceCloneCommittedReplacement, CommandErrorDto> {
     if worker_result.status != "success" {
@@ -2870,11 +3125,25 @@ fn validate_voice_clone_replace_result(
         "voice_clone_replace_failed",
         "固定话术输出哈希与当前文件不一致",
     )?;
+    let file_size = std::fs::metadata(&canonical_replacement_path)
+        .map_err(|error| CommandErrorDto::new("voice_clone_replace_failed", error.to_string()))?
+        .len();
+    if file_size < 44 {
+        return Err(CommandErrorDto::new(
+            "voice_clone_replace_failed",
+            "固定话术输出文件过小或不完整",
+        ));
+    }
+    let (actual_sample_rate_hz, actual_channel_count, actual_duration_ms) =
+        probe_voice_clone_audio(ffprobe_path, &canonical_replacement_path)?;
     let source_generation = worker_result.source_generation.ok_or_else(|| {
         CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少源代际")
     })?;
     let source_path = worker_result.source_path.ok_or_else(|| {
         CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少源路径")
+    })?;
+    let reported_duration_ms = worker_result.total_duration_ms.ok_or_else(|| {
+        CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少总时长")
     })?;
     let replacement_result = VoiceCloneReplacementResult {
         source_generation,
@@ -2882,14 +3151,16 @@ fn validate_voice_clone_replace_result(
         operation_id: worker_result.operation_id.clone(),
         audio_reference: canonical_replacement_path.display().to_string(),
         audio_sha256: actual_sha256.clone(),
-        replacement_duration_ms: worker_result.total_duration_ms.ok_or_else(|| {
-            CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少总时长")
-        })?,
+        replacement_duration_ms: reported_duration_ms,
     };
     let replacement_request = VoiceCloneReplacementRequest {
         source_generation: plan.source_generation,
         source_path: plan.source_path.clone(),
         source_sha256: plan.source_sha256.clone(),
+        audio_base_path: plan.audio_base_path.clone(),
+        source_duration_ms: plan.source_duration_ms,
+        sample_rate_hz: plan.sample_rate_hz,
+        channel_count: plan.channel_count,
         operation_id: plan.operation_id.clone(),
         reference_audio_path: plan.reference_audio_path.clone(),
         text: plan.input_text.clone(),
@@ -2908,6 +3179,16 @@ fn validate_voice_clone_replace_result(
         return Err(CommandErrorDto::new(
             "voice_clone_replace_failed",
             "固定话术替换结果与当前请求上下文不一致",
+        ));
+    }
+    if actual_sample_rate_hz != plan.sample_rate_hz
+        || actual_channel_count != plan.channel_count
+        || actual_duration_ms.abs_diff(reported_duration_ms) > 100
+        || actual_duration_ms.abs_diff(plan.source_duration_ms) > 1_000
+    {
+        return Err(CommandErrorDto::new(
+            "voice_clone_replace_failed",
+            "固定话术输出的实际音频参数与请求不一致",
         ));
     }
     Ok(VoiceCloneCommittedReplacement {
@@ -2959,6 +3240,10 @@ fn command_error_from_voice_clone_runtime(error: VoiceCloneRuntimeError) -> Comm
         VoiceCloneRuntimeError::CurrentVoiceSegmentNotFound => (
             "voice_clone_segment_not_found",
             "当前位置没有可替换的话术片段".to_owned(),
+        ),
+        VoiceCloneRuntimeError::VoiceCloneAudioProcessingNotReady => (
+            "voice_clone_audio_processing_not_ready",
+            "请先应用当前普通声音处理参数，再替换固定话术".to_owned(),
         ),
         VoiceCloneRuntimeError::RealtimeAudioWorkerBusy => (
             "voice_clone_realtime_audio_busy",

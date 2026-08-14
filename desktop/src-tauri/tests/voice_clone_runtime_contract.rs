@@ -185,3 +185,66 @@ fn realtime_audio_worker_occupancy_rejects_fixed_text_replacement() {
         .replacement_audio_reference
         .is_none());
 }
+
+#[test]
+fn ordinary_audio_processing_must_be_committed_before_fixed_replacement() {
+    let mut core = PlaybackCore::default();
+    core.set_source(source("/tmp/source.mp4", "source.mp4"));
+    core.set_processing_switches(false, true, false);
+    core.set_voice_clone_prepared_source(prepared_source(
+        core.snapshot().playback_generation,
+        "/tmp/source.mp4",
+    ))
+    .expect("prepared source should be accepted");
+    core.start().expect("playback should start");
+
+    assert_eq!(
+        core.start_voice_clone_replacement("替换后的固定话术", 1_500, "replace-operation", false),
+        Err(VoiceCloneRuntimeError::VoiceCloneAudioProcessingNotReady)
+    );
+}
+
+#[test]
+fn fixed_replacement_uses_the_committed_processed_video_as_audio_base() {
+    let mut core = PlaybackCore::default();
+    core.set_source(source("/tmp/source.mp4", "source.mp4"));
+    core.set_processing_switches(false, true, false);
+    let generation = core.snapshot().playback_generation;
+    core.mark_media_processing_ready(generation, "/tmp/processed.mp4".to_owned(), "c".repeat(64))
+        .expect("processed media should be accepted");
+    assert!(core.commit_media_processing_if_ready());
+    core.set_voice_clone_prepared_source(prepared_source(generation, "/tmp/source.mp4"))
+        .expect("prepared source should be accepted");
+    core.start().expect("playback should start");
+
+    let plan = core
+        .start_voice_clone_replacement("替换后的固定话术", 1_500, "replace-operation", false)
+        .expect("replacement should start");
+
+    assert_eq!(plan.audio_base_path, "/tmp/processed.mp4");
+}
+
+#[test]
+fn late_replacement_result_is_rejected_after_current_phrase_ends() {
+    let mut core = PlaybackCore::default();
+    core.set_source(source("/tmp/source.mp4", "source.mp4"));
+    core.set_voice_clone_prepared_source(prepared_source(
+        core.snapshot().playback_generation,
+        "/tmp/source.mp4",
+    ))
+    .expect("prepared source should be accepted");
+    core.start().expect("playback should start");
+    let operation = core
+        .start_voice_clone_replacement("替换后的固定话术", 1_500, "replace-operation", false)
+        .expect("replacement should start");
+    core.set_playback_position(3_000);
+
+    assert_eq!(
+        core.apply_voice_clone_replacement(committed_replacement(
+            operation.source_generation,
+            &operation.source_path,
+            &operation.operation_id,
+        )),
+        Err(VoiceCloneRuntimeError::VoiceCloneReplacementStale)
+    );
+}
