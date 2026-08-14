@@ -29,6 +29,7 @@ use autolive_desktop_core::speech_to_speech::{
 use autolive_desktop_core::speech_to_speech_worker::configured_speech_to_speech_worker_capabilities;
 use autolive_desktop_core::speech_to_speech_worker::run_configured_speech_to_speech_context_worker;
 use autolive_desktop_core::speech_to_speech_worker::SpeechToSpeechWorkerError;
+use autolive_desktop_core::window_sizing::{calculate_window_size, WindowSizingError};
 use autolive_desktop_core::{PlaybackCore, PlaybackSnapshot};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -39,6 +40,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use sysinfo::{Disks, System};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, Window};
+use tauri_runtime::dpi::{LogicalSize, PhysicalSize};
 
 const MEDIA_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const RESEARCH_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -78,6 +80,18 @@ struct ResearchWorkerTask {
 pub struct FinalEffectWindowDto {
     pub label: String,
     pub created: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResizeFinalEffectWindowRequestDto {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FinalEffectWindowSizeDto {
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1372,6 +1386,80 @@ pub fn close_final_effect_window(app: AppHandle) -> Result<bool, CommandErrorDto
         CommandErrorDto::new("final_effect_window_close_failed", error.to_string())
     })?;
     Ok(true)
+}
+
+#[tauri::command]
+pub fn resize_final_effect_window(
+    window: Window,
+    request: ResizeFinalEffectWindowRequestDto,
+) -> Result<FinalEffectWindowSizeDto, CommandErrorDto> {
+    if !matches!(window.label(), "main" | "final-effect") {
+        return Err(CommandErrorDto::new(
+            "playback_window_not_allowed",
+            "当前窗口不允许调整播放窗口尺寸",
+        ));
+    }
+
+    let monitor = window
+        .current_monitor()
+        .map_err(|error| {
+            CommandErrorDto::new("final_effect_monitor_unavailable", error.to_string())
+        })?
+        .ok_or_else(|| {
+            CommandErrorDto::new(
+                "final_effect_monitor_unavailable",
+                "无法读取当前播放窗口所在显示器",
+            )
+        })?;
+    let scale_factor = monitor.scale_factor();
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return Err(CommandErrorDto::new(
+            "final_effect_monitor_unavailable",
+            "当前显示器缩放比例无效",
+        ));
+    }
+
+    let work_area = monitor.work_area().size;
+    let target = calculate_window_size(
+        request.width,
+        request.height,
+        f64::from(work_area.width) / scale_factor,
+        f64::from(work_area.height) / scale_factor,
+    )
+    .map_err(|error| match error {
+        WindowSizingError::InvalidVideoDimensions => CommandErrorDto::new(
+            "invalid_video_dimensions",
+            "视频宽高必须为正数且不超过安全上限",
+        ),
+        WindowSizingError::InvalidWorkArea => CommandErrorDto::new(
+            "final_effect_monitor_unavailable",
+            "当前显示器工作区尺寸无效",
+        ),
+    })?;
+
+    let previous_size = window.inner_size().ok();
+    window
+        .set_size(LogicalSize::new(
+            f64::from(target.width),
+            f64::from(target.height),
+        ))
+        .map_err(|error| {
+            CommandErrorDto::new("final_effect_window_resize_failed", error.to_string())
+        })?;
+    if let Err(error) = window.center() {
+        if let Some(previous_size) = previous_size {
+            let _ = window.set_size(PhysicalSize::new(previous_size.width, previous_size.height));
+        }
+        return Err(CommandErrorDto::new(
+            "final_effect_window_resize_failed",
+            error.to_string(),
+        ));
+    }
+
+    Ok(FinalEffectWindowSizeDto {
+        width: target.width,
+        height: target.height,
+    })
 }
 
 #[tauri::command]

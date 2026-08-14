@@ -250,6 +250,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-http",
+ "tauri-runtime",
 ]
 
 [[package]]

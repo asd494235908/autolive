@@ -9,6 +9,7 @@ pub mod research_params;
 pub mod research_worker;
 pub mod speech_to_speech;
 pub mod speech_to_speech_worker;
+pub mod window_sizing;
 
 use crate::audio_processing::AudioProcessingProfile;
 use crate::errors::PlaybackError;

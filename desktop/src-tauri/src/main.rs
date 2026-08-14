@@ -10,10 +10,10 @@ use commands::{
     get_default_local_research_params, get_device_runtime_info, get_media_engine_capabilities,
     get_research_status, get_research_worker_capabilities, get_snapshot,
     get_speech_to_speech_worker_capabilities, hash_local_mp4_sha256, open_final_effect_window,
-    pause_playback, probe_local_mp4, restore_original_audio, resume_playback,
-    set_audio_processing_profile, set_processing_switches, stage_audio_variant_candidate,
-    start_media_processing, start_playback, start_research_analysis, start_speech_to_speech_worker,
-    stop_playback, validate_local_research_params, AppState,
+    pause_playback, probe_local_mp4, resize_final_effect_window, restore_original_audio,
+    resume_playback, set_audio_processing_profile, set_processing_switches,
+    stage_audio_variant_candidate, start_media_processing, start_playback, start_research_analysis,
+    start_speech_to_speech_worker, stop_playback, validate_local_research_params, AppState,
 };
 
 fn main() {
@@ -56,6 +56,7 @@ fn main() {
             delete_refresh_token,
             open_final_effect_window,
             close_final_effect_window,
+            resize_final_effect_window,
             direct_model_chat
         ]);
 
