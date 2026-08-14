@@ -88,6 +88,11 @@ mod tests {
     }
 
     #[test]
+    fn tauri_bundle_has_a_windows_icon() {
+        assert!(std::path::Path::new("icons/icon.ico").is_file());
+    }
+
+    #[test]
     fn capabilities_allow_remote_control_plane_only() {
         let config = std::fs::read_to_string("capabilities/default.json")
             .expect("capabilities/default.json should exist");
