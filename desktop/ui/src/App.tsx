@@ -1,6 +1,6 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import { Alert, Button, Card, Checkbox, Descriptions, InputNumber, Layout, Select, Slider, Space, Switch, Tag, Typography } from 'antd';
+import { Alert, Button, Card, Checkbox, Descriptions, Input, InputNumber, Layout, Progress, Select, Slider, Space, Switch, Tag, Typography } from 'antd';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { SyntheticEvent } from 'react';
 import { buildRuntimePreviewParameters, isRuntimeVariationDue, normalizeRuntimeVariationPeriod } from './运行时参数自动调度';
@@ -9,6 +9,8 @@ import { shouldRestartPlayback } from './播放循环';
 import { buildFinalEffectWindowResizeKey } from './最终效果窗口尺寸';
 import { clampMediaTime, clampVolume, formatMediaTime, isPlaybackMediaControlMessage, isPlaybackMediaStateMessage } from './播放控制消息';
 import type { PlaybackMediaControlMessage, PlaybackMediaStateMessage } from './播放控制消息';
+import { addVoiceClonePreset, loadVoiceClonePresets, removeVoiceClonePreset, updateVoiceClonePreset } from './voiceClonePresets';
+import type { VoiceClonePreset } from './voiceClonePresets';
 
 const PLAYBACK_CHANNEL_NAME = 'autolive-playback-ui-v1';
 
@@ -93,6 +95,7 @@ type PlaybackSnapshot = {
   audio_processing_status: string;
   audio_processing_runtime: boolean;
   audio_processing_gain_db: number;
+  voice_clone_replacement: VoiceCloneReplacementState;
 };
 
 type SpeechToSpeechWorkerCapabilities = {
@@ -101,6 +104,23 @@ type SpeechToSpeechWorkerCapabilities = {
   provider: string | null;
   model: string | null;
   reason: string | null;
+};
+
+type VoiceCloneWorkerCapabilities = SpeechToSpeechWorkerCapabilities;
+
+type VoiceCloneReplacementState = {
+  status: string;
+  source_generation: number | null;
+  source_path: string | null;
+  operation_id: string | null;
+  replacement_audio_reference: string | null;
+  replacement_audio_sha256: string | null;
+  replacement_duration_ms: number | null;
+  replace_at_ms: number | null;
+  resume_at_ms: number | null;
+  input_text: string | null;
+  model: string | null;
+  error: string | null;
 };
 
 type SpeechToSpeechStartResult = {
@@ -324,18 +344,81 @@ function getPlaybackDisplayColor(state: PlaybackDisplayState) {
   }
 }
 
+function countUnicodeCharacters(value: string) {
+  return Array.from(value).length;
+}
+
+function getVoiceCloneTextError(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) return '文本不能为空';
+  if (countUnicodeCharacters(trimmed) > 500) return '文本最多 500 个字符';
+  return null;
+}
+
+function getVoiceClonePresetError(title: string, text: string) {
+  const trimmedTitle = title.trim();
+  if (!trimmedTitle) return '标题不能为空';
+  return getVoiceCloneTextError(text);
+}
+
+function getDisplayErrorMessage(cause: unknown, fallback: string) {
+  if (!(cause instanceof Error)) return fallback;
+  const message = cause.message.trim();
+  return message || fallback;
+}
+
+function getVoiceCloneStatusLabel(status: string) {
+  switch (status) {
+    case 'preparing':
+      return '准备中';
+    case 'ready':
+      return '已准备';
+    case 'generating':
+      return '替换生成中';
+    case 'playing':
+      return '替换播放中';
+    case 'failed':
+      return '失败';
+    case 'cancelled':
+      return '已取消';
+    default:
+      return '未准备';
+  }
+}
+
+function getVoiceCloneProgress(status: string) {
+  switch (status) {
+    case 'preparing':
+      return 35;
+    case 'ready':
+      return 100;
+    case 'generating':
+      return 75;
+    case 'playing':
+      return 100;
+    case 'failed':
+    case 'cancelled':
+      return 100;
+    default:
+      return 0;
+  }
+}
+
 function FinalEffectWindow() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const voiceCloneAudioRef = useRef<HTMLAudioElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const videoGainNodeRef = useRef<GainNode | null>(null);
   const audioGainNodeRef = useRef<GainNode | null>(null);
+  const voiceCloneGainNodeRef = useRef<GainNode | null>(null);
   const suppressMediaEventRef = useRef(false);
   const playbackChannelRef = useRef<BroadcastChannel | null>(null);
   const userMutedRef = useRef(false);
   const userVolumeRef = useRef(1);
   const audioUrlRef = useRef<string | null>(null);
+  const voiceCloneAudioUrlRef = useRef<string | null>(null);
   const audioDiagnosticsReadyRef = useRef(false);
   const loopSourceKeyRef = useRef<string | null>(null);
   const loopGenerationRef = useRef<number | null>(null);
@@ -348,6 +431,7 @@ function FinalEffectWindow() {
   const [snapshot, setSnapshot] = useState<PlaybackSnapshot | null>(null);
   const [workerCapabilities, setWorkerCapabilities] = useState<SpeechToSpeechWorkerCapabilities | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [voiceCloneAudioUrl, setVoiceCloneAudioUrl] = useState<string | null>(null);
   const [runtimeParameters, setRuntimeParameters] = useState<RuntimePreviewParameters | null>(null);
   const [runtimeAudioProcessingEnabled, setRuntimeAudioProcessingEnabled] = useState(false);
   const [runtimeVideoProcessingEnabled, setRuntimeVideoProcessingEnabled] = useState(false);
@@ -403,16 +487,23 @@ function FinalEffectWindow() {
   function syncUserAudioSettings() {
     const video = videoRef.current;
     const audio = audioRef.current;
+    const voiceCloneAudio = voiceCloneAudioRef.current;
     const volume = userVolumeRef.current;
     const muted = userMutedRef.current;
-    const candidateAudioActive = Boolean(audioUrlRef.current) && audioDiagnosticsReadyRef.current;
+    const replacementAudioActive =
+      (Boolean(audioUrlRef.current) || Boolean(voiceCloneAudioUrlRef.current)) &&
+      audioDiagnosticsReadyRef.current;
     if (video) {
       video.volume = volume;
-      video.muted = candidateAudioActive || muted;
+      video.muted = replacementAudioActive || muted;
     }
     if (audio) {
       audio.volume = volume;
       audio.muted = muted;
+    }
+    if (voiceCloneAudio) {
+      voiceCloneAudio.volume = volume;
+      voiceCloneAudio.muted = muted;
     }
   }
 
@@ -443,8 +534,12 @@ function FinalEffectWindow() {
     if (message.action === 'seek') {
       video.currentTime = clampMediaTime(message.current_time, video.duration);
       const audio = audioRef.current;
+      const voiceCloneAudio = voiceCloneAudioRef.current;
       if (audio) {
         audio.currentTime = Math.max(0, video.currentTime - (snapshotRef.current?.current_audio_start_at_ms ?? 0) / 1000);
+      }
+      if (voiceCloneAudio) {
+        voiceCloneAudio.currentTime = clampMediaTime(video.currentTime, voiceCloneAudio.duration);
       }
       publishMediaState();
       return;
@@ -483,16 +578,25 @@ function FinalEffectWindow() {
       if (isPlaybackControlMessage(event.data)) {
         const video = videoRef.current;
         const audio = audioRef.current;
+        const voiceCloneAudio = voiceCloneAudioRef.current;
         if (event.data.action === 'stop') {
           video?.pause();
           if (video) video.currentTime = 0;
           audio?.pause();
           if (audio) audio.currentTime = 0;
+          voiceCloneAudio?.pause();
+          if (voiceCloneAudio) voiceCloneAudio.currentTime = 0;
         } else if (event.data.action === 'pause') {
           video?.pause();
           audio?.pause();
+          voiceCloneAudio?.pause();
         } else if (video) {
           void video.play().catch(() => setPlaybackError('播放已恢复，但系统阻止了自动播放，请点击视频播放。'));
+          if (voiceCloneAudioUrlRef.current && audioDiagnosticsReadyRef.current && voiceCloneAudio) {
+            void voiceCloneAudio.play().catch(() => undefined);
+          } else if (audioUrlRef.current && audioDiagnosticsReadyRef.current && audio) {
+            void audio.play().catch(() => undefined);
+          }
         }
         return;
       }
@@ -577,7 +681,7 @@ function FinalEffectWindow() {
   }, []);
 
   useEffect(() => {
-    if (!sourceUrl || !videoRef.current || !audioRef.current || audioContextRef.current) return;
+    if (!sourceUrl || !videoRef.current || !audioRef.current || !voiceCloneAudioRef.current || audioContextRef.current) return;
     try {
       const context = new AudioContext();
       const analyser = context.createAnalyser();
@@ -585,15 +689,19 @@ function FinalEffectWindow() {
       analyser.smoothingTimeConstant = 0.75;
       const videoSource = context.createMediaElementSource(videoRef.current);
       const audioSource = context.createMediaElementSource(audioRef.current);
+      const voiceCloneAudioSource = context.createMediaElementSource(voiceCloneAudioRef.current);
       const videoGain = context.createGain();
       const audioGain = context.createGain();
+      const voiceCloneGain = context.createGain();
       videoSource.connect(videoGain).connect(analyser);
       audioSource.connect(audioGain).connect(analyser);
+      voiceCloneAudioSource.connect(voiceCloneGain).connect(analyser);
       analyser.connect(context.destination);
       audioContextRef.current = context;
       analyserRef.current = analyser;
       videoGainNodeRef.current = videoGain;
       audioGainNodeRef.current = audioGain;
+      voiceCloneGainNodeRef.current = voiceCloneGain;
       audioDiagnosticsReadyRef.current = true;
       setAudioDiagnosticsReady(true);
     } catch {
@@ -606,6 +714,7 @@ function FinalEffectWindow() {
       analyserRef.current = null;
       videoGainNodeRef.current = null;
       audioGainNodeRef.current = null;
+      voiceCloneGainNodeRef.current = null;
       audioDiagnosticsReadyRef.current = false;
     };
   }, [sourceUrl]);
@@ -616,16 +725,27 @@ function FinalEffectWindow() {
       : snapshot?.audio_processing_runtime
         ? snapshot.audio_processing_gain_db ?? 0
         : 0;
-    const gain =
-      Math.pow(10, gainDb / 20);
-    const hasVariant = Boolean(audioUrl);
+    const gain = Math.pow(10, gainDb / 20);
+    const hasVoiceCloneReplacement = Boolean(voiceCloneAudioUrl) && audioDiagnosticsReady;
+    const hasVariant = !hasVoiceCloneReplacement && Boolean(audioUrl);
     if (videoGainNodeRef.current) {
-      videoGainNodeRef.current.gain.value = hasVariant ? 0 : gain;
+      videoGainNodeRef.current.gain.value = hasVariant || hasVoiceCloneReplacement ? 0 : gain;
     }
     if (audioGainNodeRef.current) {
       audioGainNodeRef.current.gain.value = hasVariant ? gain : 0;
     }
-  }, [audioUrl, runtimeAudioProcessingEnabled, runtimeParameters?.audio_gain_db, snapshot?.audio_processing_gain_db, snapshot?.audio_processing_runtime]);
+    if (voiceCloneGainNodeRef.current) {
+      voiceCloneGainNodeRef.current.gain.value = hasVoiceCloneReplacement ? gain : 0;
+    }
+  }, [
+    audioDiagnosticsReady,
+    audioUrl,
+    runtimeAudioProcessingEnabled,
+    runtimeParameters?.audio_gain_db,
+    snapshot?.audio_processing_gain_db,
+    snapshot?.audio_processing_runtime,
+    voiceCloneAudioUrl,
+  ]);
 
   useEffect(() => {
     void invoke<SpeechToSpeechWorkerCapabilities>('get_speech_to_speech_worker_capabilities')
@@ -698,24 +818,32 @@ function FinalEffectWindow() {
   useEffect(() => {
     const video = videoRef.current;
     const audio = audioRef.current;
+    const voiceCloneAudio = voiceCloneAudioRef.current;
     if (!video || !sourceUrl) return;
     if (snapshot?.playback_state === 'stopped') {
       video.pause();
       video.currentTime = 0;
       audio?.pause();
       if (audio) audio.currentTime = 0;
+      voiceCloneAudio?.pause();
+      if (voiceCloneAudio) voiceCloneAudio.currentTime = 0;
       return;
     }
     if (snapshot?.playback_state === 'paused') {
       video.pause();
       audio?.pause();
+      voiceCloneAudio?.pause();
       return;
     }
     if (snapshot?.playback_state === 'playing' && video.paused) {
       void video.play().catch(() => setPlaybackError('播放已恢复，但系统阻止了自动播放，请点击视频播放。'));
-      if (audioUrl && audioDiagnosticsReady && audio) void audio.play().catch(() => undefined);
+      if (voiceCloneAudioUrl && audioDiagnosticsReady && voiceCloneAudio) {
+        void voiceCloneAudio.play().catch(() => undefined);
+      } else if (audioUrl && audioDiagnosticsReady && audio) {
+        void audio.play().catch(() => undefined);
+      }
     }
-  }, [audioDiagnosticsReady, audioUrl, snapshot?.playback_state, sourceUrl]);
+  }, [audioDiagnosticsReady, audioUrl, snapshot?.playback_state, sourceUrl, voiceCloneAudioUrl]);
 
   useEffect(() => {
     if (!snapshot || !sourceUrl) return;
@@ -724,6 +852,26 @@ function FinalEffectWindow() {
       : null;
     setAudioUrl(reference ? convertFileSrc(reference.replace(/^file:\/\//, '')) : null);
   }, [snapshot?.current_audio_source, snapshot?.current_audio_reference, sourceUrl]);
+
+  useEffect(() => {
+    if (!snapshot || !sourceUrl) {
+      setVoiceCloneAudioUrl(null);
+      return;
+    }
+    const replacement = snapshot.voice_clone_replacement;
+    const activeReference =
+      replacement.status === 'playing' &&
+      replacement.source_generation === snapshot.playback_generation &&
+      replacement.source_path === snapshot.source_media?.source_path
+        ? replacement.replacement_audio_reference
+        : null;
+    setVoiceCloneAudioUrl(activeReference ? convertFileSrc(activeReference.replace(/^file:\/\//, '')) : null);
+  }, [
+    snapshot?.playback_generation,
+    snapshot?.source_media?.source_path,
+    snapshot?.voice_clone_replacement,
+    sourceUrl,
+  ]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -750,6 +898,30 @@ function FinalEffectWindow() {
     syncUserAudioSettings();
     if (!video.paused) void audio.play().catch(() => undefined);
   }, [audioDiagnosticsReady, audioUrl, snapshot?.current_audio_start_at_ms]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    const voiceCloneAudio = voiceCloneAudioRef.current;
+    if (!video || !voiceCloneAudio) return;
+    voiceCloneAudioUrlRef.current = voiceCloneAudioUrl;
+    if (!voiceCloneAudioUrl) {
+      voiceCloneAudio.pause();
+      voiceCloneAudio.currentTime = 0;
+      voiceCloneAudio.removeAttribute('src');
+      voiceCloneAudio.load();
+      syncUserAudioSettings();
+      return;
+    }
+    if (!audioDiagnosticsReady) {
+      voiceCloneAudio.pause();
+      syncUserAudioSettings();
+      return;
+    }
+    voiceCloneAudio.src = voiceCloneAudioUrl;
+    voiceCloneAudio.currentTime = clampMediaTime(video.currentTime, voiceCloneAudio.duration);
+    syncUserAudioSettings();
+    if (!video.paused) void voiceCloneAudio.play().catch(() => undefined);
+  }, [audioDiagnosticsReady, voiceCloneAudioUrl]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -889,6 +1061,10 @@ function FinalEffectWindow() {
     loopSequenceRef.current += 1;
     video.currentTime = 0;
     if (audioRef.current) audioRef.current.currentTime = 0;
+    if (voiceCloneAudioRef.current) {
+      voiceCloneAudioRef.current.pause();
+      voiceCloneAudioRef.current.currentTime = 0;
+    }
 
     suppressMediaEventRef.current = true;
     void video.play().catch(() => {
@@ -969,7 +1145,7 @@ function FinalEffectWindow() {
                 src={sourceUrl}
                 autoPlay
                 playsInline
-                muted={Boolean(audioUrl) && audioDiagnosticsReady ? true : userMuted}
+                muted={(Boolean(audioUrl) || Boolean(voiceCloneAudioUrl)) && audioDiagnosticsReady ? true : userMuted}
                 onClick={resumeAudioDiagnostics}
                 onPlay={() => {
                   resumeAudioDiagnostics();
@@ -1021,6 +1197,7 @@ function FinalEffectWindow() {
                 }}
                 hidden
               />
+              <audio ref={voiceCloneAudioRef} src={voiceCloneAudioUrl ?? undefined} muted={userMuted} hidden />
             </>
           ) : (
             <div style={{ display: 'grid', placeItems: 'center', width: '100%', height: '100%', padding: 24, boxSizing: 'border-box' }}>
@@ -1045,6 +1222,13 @@ function DesktopApp() {
   const [audioProcessingEnabled, setAudioProcessingEnabled] = useState(false);
   const [realtimeAudioVariantEnabled, setRealtimeAudioVariantEnabled] = useState(false);
   const [workerCapabilities, setWorkerCapabilities] = useState<SpeechToSpeechWorkerCapabilities | null>(null);
+  const [voiceCloneWorkerCapabilities, setVoiceCloneWorkerCapabilities] = useState<VoiceCloneWorkerCapabilities | null>(null);
+  const [voiceClonePresets, setVoiceClonePresets] = useState<VoiceClonePreset[]>(() => loadVoiceClonePresets());
+  const [selectedVoiceClonePresetId, setSelectedVoiceClonePresetId] = useState<string | null>(null);
+  const [voiceClonePresetTitle, setVoiceClonePresetTitle] = useState('');
+  const [voiceCloneText, setVoiceCloneText] = useState('');
+  const [voiceCloneFormError, setVoiceCloneFormError] = useState<string | null>(null);
+  const [voiceCloneActionBusy, setVoiceCloneActionBusy] = useState<'prepare' | 'replace' | 'cancel' | 'clear' | null>(null);
   const [mediaEngineCapabilities, setMediaEngineCapabilities] = useState<MediaEngineCapabilities | null>(null);
   const [researchWorkerCapabilities, setResearchWorkerCapabilities] = useState<ResearchWorkerCapabilities | null>(null);
   const [researchStatus, setResearchStatus] = useState<ResearchStatus | null>(null);
@@ -1218,6 +1402,18 @@ function DesktopApp() {
       .then(setResearchParams)
       .catch(() => setResearchParams(null));
   }, []);
+
+  useEffect(() => {
+    void invoke<VoiceCloneWorkerCapabilities>('get_voice_clone_worker_capabilities')
+      .then(setVoiceCloneWorkerCapabilities)
+      .catch(() => setVoiceCloneWorkerCapabilities(null));
+  }, []);
+
+  useEffect(() => {
+    if (selectedVoiceClonePresetId && !voiceClonePresets.some((preset) => preset.id === selectedVoiceClonePresetId)) {
+      setSelectedVoiceClonePresetId(null);
+    }
+  }, [selectedVoiceClonePresetId, voiceClonePresets]);
 
   const runtimeBaseParameters = useMemo<RuntimeBaseParameters | null>(() => {
     if (!researchParams) return null;
@@ -1394,6 +1590,206 @@ function DesktopApp() {
   const canPause = playbackDisplayState === 'playing';
   const canResume = playbackDisplayState === 'paused' || playbackDisplayState === 'ready';
   const canStop = ['ready', 'playing', 'paused'].includes(playbackDisplayState);
+  const voiceCloneState = snapshot?.voice_clone_replacement ?? null;
+  const voiceCloneStatus = voiceCloneState?.status ?? 'idle';
+  const voiceCloneTextCount = countUnicodeCharacters(voiceCloneText);
+  const trimmedVoiceCloneText = voiceCloneText.trim();
+  const trimmedVoiceClonePresetTitle = voiceClonePresetTitle.trim();
+  const selectedVoiceClonePreset =
+    selectedVoiceClonePresetId === null
+      ? null
+      : voiceClonePresets.find((preset) => preset.id === selectedVoiceClonePresetId) ?? null;
+  const realtimeAudioBusy =
+    ['running', 'pending', 'active'].includes(snapshot?.worker_status ?? '') ||
+    snapshot?.pending_audio_candidate === true ||
+    snapshot?.current_audio_source === 'realtime_variant';
+  const voiceClonePrepareDisabledReason =
+    !currentSource
+      ? '请先导入一个 MP4'
+      : !voiceCloneWorkerCapabilities?.available
+        ? voiceCloneWorkerCapabilities?.reason ?? '固定话术 Worker 不可用'
+        : voiceCloneStatus === 'preparing' || voiceCloneStatus === 'generating'
+          ? '固定话术 Worker 正在执行'
+          : null;
+  const voiceCloneReplaceDisabledReason =
+    !currentSource
+      ? '请先导入一个 MP4'
+      : playbackDisplayState !== 'playing' || mediaState?.paused || !mediaState
+        ? '请先让最终效果窗口保持播放'
+        : !voiceCloneWorkerCapabilities?.available
+          ? voiceCloneWorkerCapabilities?.reason ?? '固定话术 Worker 不可用'
+          : voiceCloneStatus !== 'ready'
+            ? '请先准备人声'
+            : realtimeAudioBusy
+              ? '当前实时音频正在占用'
+              : getVoiceCloneTextError(voiceCloneText);
+  const voiceCloneSaveDisabledReason =
+    selectedVoiceClonePreset
+      ? getVoiceClonePresetError(voiceClonePresetTitle, voiceCloneText)
+      : voiceClonePresets.length >= 10
+        ? '最多保存 10 条预制文本'
+        : getVoiceClonePresetError(voiceClonePresetTitle, voiceCloneText);
+  const voiceCloneCanCancel = voiceCloneStatus === 'preparing' || voiceCloneStatus === 'generating';
+  const voiceCloneCanClear =
+    voiceCloneStatus === 'playing' ||
+    voiceCloneStatus === 'failed' ||
+    voiceCloneStatus === 'cancelled' ||
+    (voiceCloneStatus === 'ready' && Boolean(voiceCloneState?.error));
+  const voiceCloneProgressStatus =
+    voiceCloneStatus === 'failed'
+      ? 'exception'
+      : voiceCloneStatus === 'ready' || voiceCloneStatus === 'playing'
+        ? 'success'
+        : 'active';
+  const voiceCloneNotice =
+    !voiceCloneWorkerCapabilities?.available
+      ? {
+          type: 'warning' as const,
+          message: `固定话术 Worker 不可用：${voiceCloneWorkerCapabilities?.reason ?? '未完成能力探测'}`,
+        }
+      : voiceCloneStatus === 'preparing'
+        ? { type: 'info' as const, message: '正在准备当前 MP4 的参考人声与话术索引。' }
+        : voiceCloneStatus === 'ready'
+          ? { type: 'success' as const, message: '参考人声已准备完成，可以在播放中替换当前话术。' }
+          : voiceCloneStatus === 'generating'
+            ? { type: 'info' as const, message: '固定话术正在生成完整替换音轨。' }
+            : voiceCloneStatus === 'playing'
+              ? { type: 'success' as const, message: '固定话术替换音轨正在当前轮次生效。' }
+              : voiceCloneStatus === 'failed'
+                ? {
+                    type: 'error' as const,
+                    message: voiceCloneState?.error ?? '固定话术替换失败',
+                  }
+                : voiceCloneStatus === 'cancelled'
+                  ? {
+                      type: 'warning' as const,
+                      message: voiceCloneState?.error ?? '固定话术操作已取消',
+                    }
+                  : {
+                      type: 'info' as const,
+                      message: '点击“准备人声”后，再选择预制文本或输入新文本替换当前话术。',
+                    };
+
+  function applyVoiceClonePresetSelection(presetId: string | null) {
+    setSelectedVoiceClonePresetId(presetId);
+    if (!presetId) return;
+    const preset = voiceClonePresets.find((item) => item.id === presetId);
+    if (!preset) return;
+    setVoiceClonePresetTitle(preset.title);
+    setVoiceCloneText(preset.text);
+    setVoiceCloneFormError(null);
+  }
+
+  async function prepareVoiceCloneSource() {
+    setVoiceCloneActionBusy('prepare');
+    setVoiceCloneFormError(null);
+    setError(null);
+    try {
+      const nextSnapshot = await invoke<PlaybackSnapshot>('prepare_voice_clone_source', { request: {} });
+      setSnapshot(nextSnapshot);
+    } catch (cause) {
+      setError(getDisplayErrorMessage(cause, '固定话术准备失败'));
+    } finally {
+      setVoiceCloneActionBusy(null);
+    }
+  }
+
+  async function startVoiceCloneReplacement() {
+    const validationError = getVoiceCloneTextError(voiceCloneText);
+    if (validationError) {
+      setVoiceCloneFormError(validationError);
+      return;
+    }
+    if (!mediaState) {
+      setVoiceCloneFormError('播放器位置尚未同步，请稍后再试');
+      return;
+    }
+    setVoiceCloneActionBusy('replace');
+    setVoiceCloneFormError(null);
+    setError(null);
+    try {
+      const nextSnapshot = await invoke<PlaybackSnapshot>('start_voice_clone_replacement', {
+        request: {
+          text: trimmedVoiceCloneText,
+          position_ms: Math.max(0, Math.round(mediaState.current_time * 1000)),
+        },
+      });
+      setSnapshot(nextSnapshot);
+    } catch (cause) {
+      setError(getDisplayErrorMessage(cause, '固定话术替换失败'));
+    } finally {
+      setVoiceCloneActionBusy(null);
+    }
+  }
+
+  async function cancelVoiceCloneOperation() {
+    setVoiceCloneActionBusy('cancel');
+    setError(null);
+    try {
+      setSnapshot(await invoke<PlaybackSnapshot>('cancel_voice_clone_operation'));
+    } catch (cause) {
+      setError(getDisplayErrorMessage(cause, '取消固定话术操作失败'));
+    } finally {
+      setVoiceCloneActionBusy(null);
+    }
+  }
+
+  async function clearVoiceCloneReplacement() {
+    setVoiceCloneActionBusy('clear');
+    setError(null);
+    try {
+      setSnapshot(await invoke<PlaybackSnapshot>('clear_voice_clone_replacement'));
+    } catch (cause) {
+      setError(getDisplayErrorMessage(cause, '清空固定话术替换失败'));
+    } finally {
+      setVoiceCloneActionBusy(null);
+    }
+  }
+
+  function saveVoiceClonePresetFromForm() {
+    const validationError = getVoiceClonePresetError(voiceClonePresetTitle, voiceCloneText);
+    if (validationError) {
+      setVoiceCloneFormError(validationError);
+      return;
+    }
+    try {
+      const nextPresets = selectedVoiceClonePreset
+        ? updateVoiceClonePreset(window.localStorage, voiceClonePresets, {
+            id: selectedVoiceClonePreset.id,
+            title: trimmedVoiceClonePresetTitle,
+            text: trimmedVoiceCloneText,
+          })
+        : addVoiceClonePreset(window.localStorage, voiceClonePresets, {
+            title: trimmedVoiceClonePresetTitle,
+            text: trimmedVoiceCloneText,
+          });
+      setVoiceClonePresets(nextPresets);
+      const activePreset =
+        selectedVoiceClonePreset
+          ? nextPresets.find((preset) => preset.id === selectedVoiceClonePreset.id) ?? null
+          : nextPresets[nextPresets.length - 1] ?? null;
+      setSelectedVoiceClonePresetId(activePreset?.id ?? null);
+      setVoiceClonePresetTitle(activePreset?.title ?? trimmedVoiceClonePresetTitle);
+      setVoiceCloneText(activePreset?.text ?? trimmedVoiceCloneText);
+      setVoiceCloneFormError(null);
+    } catch (cause) {
+      setVoiceCloneFormError(getDisplayErrorMessage(cause, '保存预制文本失败'));
+    }
+  }
+
+  function deleteSelectedVoiceClonePreset() {
+    if (!selectedVoiceClonePreset) return;
+    try {
+      const nextPresets = removeVoiceClonePreset(window.localStorage, voiceClonePresets, selectedVoiceClonePreset.id);
+      setVoiceClonePresets(nextPresets);
+      setSelectedVoiceClonePresetId(null);
+      setVoiceClonePresetTitle('');
+      setVoiceCloneText('');
+      setVoiceCloneFormError(null);
+    } catch (cause) {
+      setVoiceCloneFormError(getDisplayErrorMessage(cause, '删除预制文本失败'));
+    }
+  }
 
   async function openFinalEffectWindowFromHome() {
     setPlayerWindowBusy(true);
@@ -1813,6 +2209,114 @@ function DesktopApp() {
                   : `本地话术 Worker 不可用：${workerCapabilities?.reason ?? '未完成能力探测'}`
               }
             />
+          </Card>
+          <Card title="声音克隆替换">
+            <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+              <Space wrap>
+                <Tag color={voiceCloneWorkerCapabilities?.available ? 'green' : 'orange'}>
+                  Worker：{voiceCloneWorkerCapabilities?.available ? '可用' : '不可用'}
+                </Tag>
+                <Tag color={voiceCloneStatus === 'ready' || voiceCloneStatus === 'playing' ? 'green' : 'blue'}>
+                  状态：{getVoiceCloneStatusLabel(voiceCloneStatus)}
+                </Tag>
+                <Tag>预制：{voiceClonePresets.length} / 10</Tag>
+                {voiceCloneState?.model ? <Tag>{voiceCloneState.model}</Tag> : null}
+              </Space>
+              <Alert type={voiceCloneNotice.type} showIcon message={voiceCloneNotice.message} />
+              <Progress
+                percent={getVoiceCloneProgress(voiceCloneStatus)}
+                status={voiceCloneProgressStatus}
+                showInfo={false}
+              />
+              {realtimeAudioBusy ? <Alert type="warning" showIcon message="当前实时音频正在占用" /> : null}
+              {voiceCloneFormError ? <Alert type="error" showIcon message={voiceCloneFormError} /> : null}
+              <Select
+                allowClear
+                placeholder="选择一条本地预制文本"
+                value={selectedVoiceClonePresetId ?? undefined}
+                options={voiceClonePresets.map((preset) => ({
+                  label: preset.title,
+                  value: preset.id,
+                }))}
+                onChange={(value) => applyVoiceClonePresetSelection(typeof value === 'string' ? value : null)}
+              />
+              <Input
+                placeholder="预制标题"
+                value={voiceClonePresetTitle}
+                maxLength={80}
+                onChange={(event) => {
+                  setVoiceClonePresetTitle(event.target.value);
+                  setVoiceCloneFormError(null);
+                }}
+              />
+              <Input.TextArea
+                value={voiceCloneText}
+                rows={5}
+                maxLength={500}
+                placeholder="输入或编辑要替换当前话术的文本"
+                onChange={(event) => {
+                  setVoiceCloneText(event.target.value);
+                  setVoiceCloneFormError(null);
+                }}
+              />
+              <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
+                <Typography.Text type={voiceCloneTextCount > 500 ? 'danger' : undefined}>
+                  文本字数：{voiceCloneTextCount} / 500
+                </Typography.Text>
+                {voiceCloneState?.replace_at_ms !== null && voiceCloneState?.replace_at_ms !== undefined ? (
+                  <Typography.Text type="secondary">
+                    最近替换位置：{formatMediaTime((voiceCloneState.replace_at_ms ?? 0) / 1000)}
+                  </Typography.Text>
+                ) : null}
+              </Space>
+              <Space wrap>
+                <Button
+                  onClick={() => void prepareVoiceCloneSource()}
+                  loading={voiceCloneActionBusy === 'prepare'}
+                  disabled={voiceClonePrepareDisabledReason !== null}
+                >
+                  准备人声
+                </Button>
+                <Button
+                  type="primary"
+                  onClick={() => void startVoiceCloneReplacement()}
+                  loading={voiceCloneActionBusy === 'replace'}
+                  disabled={voiceCloneReplaceDisabledReason !== null}
+                >
+                  替换当前话
+                </Button>
+                <Button
+                  onClick={saveVoiceClonePresetFromForm}
+                  disabled={voiceCloneSaveDisabledReason !== null}
+                >
+                  {selectedVoiceClonePreset ? '更新预制文本' : '保存预制文本'}
+                </Button>
+                <Button
+                  danger
+                  onClick={deleteSelectedVoiceClonePreset}
+                  disabled={!selectedVoiceClonePreset}
+                >
+                  删除预制文本
+                </Button>
+                <Button
+                  onClick={() => void cancelVoiceCloneOperation()}
+                  loading={voiceCloneActionBusy === 'cancel'}
+                  disabled={!voiceCloneCanCancel}
+                >
+                  取消
+                </Button>
+                <Button
+                  onClick={() => void clearVoiceCloneReplacement()}
+                  loading={voiceCloneActionBusy === 'clear'}
+                  disabled={!voiceCloneCanClear}
+                >
+                  清空当前替换
+                </Button>
+              </Space>
+              <Typography.Text type="secondary">
+                替换时会取当前播放器位置，只替换点击瞬间所在话术片段的后半段，并在下一轮循环恢复原音频。
+              </Typography.Text>
+            </Space>
           </Card>
           <Card title="运行时参数预览">
             <Space direction="vertical" size="middle" style={{ width: '100%' }}>
