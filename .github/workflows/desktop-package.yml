@@ -168,6 +168,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: desktop-bundle-${{ matrix.target_triple }}
-          path: desktop/src-tauri/target/${{ matrix.target_triple }}/release/bundle/**
+          path: desktop/src-tauri/target/release/bundle/**
           if-no-files-found: error
           retention-days: 7
