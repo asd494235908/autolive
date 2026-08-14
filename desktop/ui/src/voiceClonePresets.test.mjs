@@ -50,6 +50,25 @@ test('loads invalid storage as an empty preset list', async () => {
   assert.deepEqual(loadVoiceClonePresets(storage), []);
 });
 
+test('loads duplicate or blank preset ids as an empty preset list', async () => {
+  const storage = new MemoryStorage();
+  const preset = {
+    id: 'same-id',
+    title: '标题',
+    text: '有效文本',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  storage.setItem('autolive.voice-clone-presets.v1', JSON.stringify([preset, preset]));
+  const { loadVoiceClonePresets } = await loadTypeScriptModule('voiceClonePresets.ts', [
+    'loadVoiceClonePresets',
+  ]);
+  assert.deepEqual(loadVoiceClonePresets(storage), []);
+
+  storage.setItem('autolive.voice-clone-presets.v1', JSON.stringify([{ ...preset, id: '   ' }]));
+  assert.deepEqual(loadVoiceClonePresets(storage), []);
+});
+
 test('adds and updates at most ten presets', async () => {
   const storage = new MemoryStorage();
   const { addVoiceClonePreset, loadVoiceClonePresets, updateVoiceClonePreset } = await loadTypeScriptModule(

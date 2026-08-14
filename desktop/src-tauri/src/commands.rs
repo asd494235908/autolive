@@ -1283,6 +1283,7 @@ pub fn start_voice_clone_replacement(
     let executable = configured_voice_clone_worker_executable()
         .map_err(|reason| CommandErrorDto::new("voice_clone_worker_unavailable", reason))?;
     let cache_root = voice_clone_cache_root(&app)?;
+    let _ = state.reap_finished_speech_worker()?;
     let speech_worker_running = state.speech_worker_is_running()?;
     let (plan, stale_replacement_paths, snapshot) = {
         let mut playback = state

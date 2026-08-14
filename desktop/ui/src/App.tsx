@@ -1631,10 +1631,11 @@ function DesktopApp() {
         : getVoiceClonePresetError(voiceClonePresetTitle, voiceCloneText);
   const voiceCloneCanCancel = voiceCloneStatus === 'preparing' || voiceCloneStatus === 'generating';
   const voiceCloneCanClear =
+    voiceCloneStatus === 'ready' ||
     voiceCloneStatus === 'playing' ||
     voiceCloneStatus === 'failed' ||
     voiceCloneStatus === 'cancelled' ||
-    (voiceCloneStatus === 'ready' && Boolean(voiceCloneState?.error));
+    Boolean(voiceCloneState?.error);
   const voiceCloneProgressStatus =
     voiceCloneStatus === 'failed'
       ? 'exception'

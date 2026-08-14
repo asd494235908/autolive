@@ -102,7 +102,7 @@ export function loadVoiceClonePresets(storage?: StorageLike) {
     if (!Array.isArray(parsed)) return [] as VoiceClonePreset[];
     const normalized = parsed.map(normalizePresetRecord).filter((item): item is VoiceClonePreset => item !== null);
     if (normalized.length !== parsed.length || normalized.length > MAX_PRESET_COUNT) return [] as VoiceClonePreset[];
-    return normalized;
+    return normalizePresetList(normalized);
   } catch {
     return [] as VoiceClonePreset[];
   }
