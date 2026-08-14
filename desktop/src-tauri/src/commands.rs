@@ -29,11 +29,21 @@ use autolive_desktop_core::speech_to_speech::{
 use autolive_desktop_core::speech_to_speech_worker::configured_speech_to_speech_worker_capabilities;
 use autolive_desktop_core::speech_to_speech_worker::run_configured_speech_to_speech_context_worker;
 use autolive_desktop_core::speech_to_speech_worker::SpeechToSpeechWorkerError;
+use autolive_desktop_core::voice_clone::{
+    validate_replacement_result, VoiceClonePrepareRequest, VoiceClonePrepareResult,
+    VoiceCloneReplacementRequest, VoiceCloneReplacementResult, VoiceCloneSegment,
+    VoiceCloneSourceIndex,
+};
 use autolive_desktop_core::window_sizing::{calculate_window_size, WindowSizingError};
-use autolive_desktop_core::{PlaybackCore, PlaybackSnapshot};
+use autolive_desktop_core::{
+    PlaybackCore, PlaybackSnapshot, VoiceCloneCommittedReplacement, VoiceClonePreparedSource,
+    VoiceCloneRuntimeError,
+};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -45,12 +55,16 @@ use tauri_runtime::dpi::{LogicalSize, PhysicalSize};
 const MEDIA_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const RESEARCH_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const MACOS_NATIVE_TITLEBAR_HEIGHT: f64 = 32.0;
+const VOICE_CLONE_WORKER_ENV: &str = "AUTOLIVE_VOICE_CLONE_WORKER";
+const VOICE_CLONE_CAPABILITY_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_VOICE_CLONE_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
 
 #[derive(Debug)]
 pub struct AppState {
     main_window_label: &'static str,
     playback: Arc<Mutex<PlaybackCore>>,
     speech_worker: Arc<Mutex<Option<SpeechWorkerTask>>>,
+    voice_clone_worker: Arc<Mutex<Option<VoiceCloneWorkerTask>>>,
     media_worker: Arc<Mutex<Option<MediaWorkerTask>>>,
     research_worker: Arc<Mutex<Option<ResearchWorkerTask>>>,
     research_status: Arc<Mutex<ResearchStatusDto>>,
@@ -58,6 +72,13 @@ pub struct AppState {
 
 #[derive(Debug)]
 struct SpeechWorkerTask {
+    cancellation: CancellationToken,
+    completed: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct VoiceCloneWorkerTask {
     cancellation: CancellationToken,
     completed: Arc<AtomicBool>,
     handle: thread::JoinHandle<()>,
@@ -122,6 +143,65 @@ pub struct CacheCleanupResultDto {
     pub removed_files: u32,
     pub removed_bytes: u64,
     pub remaining_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceCloneWorkerCapabilitiesDto {
+    pub available: bool,
+    pub status: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrepareVoiceCloneSourceRequestDto {
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartVoiceCloneReplacementRequestDto {
+    pub text: String,
+    pub position_ms: u64,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct VoiceClonePrepareWorkerResult {
+    status: String,
+    provider: Option<String>,
+    model: Option<String>,
+    reason: Option<String>,
+    operation_id: String,
+    source_path: Option<String>,
+    source_sha256: Option<String>,
+    reference_audio_path: Option<String>,
+    reference_audio_sha256: Option<String>,
+    sample_rate_hz: Option<u32>,
+    channel_count: Option<u16>,
+    duration_ms: Option<u64>,
+    #[serde(default)]
+    segments: Vec<VoiceCloneSegment>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct VoiceCloneReplaceWorkerResult {
+    status: String,
+    provider: Option<String>,
+    model: Option<String>,
+    reason: Option<String>,
+    operation_id: String,
+    source_path: Option<String>,
+    source_sha256: Option<String>,
+    replacement_audio_path: Option<String>,
+    replacement_sha256: Option<String>,
+    replace_at_ms: Option<u64>,
+    resume_at_ms: Option<u64>,
+    total_duration_ms: Option<u64>,
+    sample_rate_hz: Option<u32>,
+    channel_count: Option<u16>,
+    input_text: Option<String>,
+    source_generation: Option<u64>,
 }
 
 fn apply_research_result(
@@ -192,6 +272,7 @@ impl Default for AppState {
             main_window_label: "main",
             playback: Arc::new(Mutex::new(PlaybackCore::default())),
             speech_worker: Arc::new(Mutex::new(None)),
+            voice_clone_worker: Arc::new(Mutex::new(None)),
             media_worker: Arc::new(Mutex::new(None)),
             research_worker: Arc::new(Mutex::new(None)),
             research_status: Arc::new(Mutex::new(ResearchStatusDto::default())),
@@ -221,11 +302,70 @@ impl AppState {
         Ok(false)
     }
 
+    fn speech_worker_is_running(&self) -> Result<bool, CommandErrorDto> {
+        let worker = self.speech_worker.lock().map_err(|_| {
+            CommandErrorDto::new("speech_worker_lock_failed", "Worker 状态锁已损坏")
+        })?;
+        Ok(worker.is_some())
+    }
+
     fn stop_speech_worker(&self) -> Result<(), CommandErrorDto> {
         let task = self
             .speech_worker
             .lock()
             .map_err(|_| CommandErrorDto::new("speech_worker_lock_failed", "Worker 状态锁已损坏"))?
+            .take();
+        if let Some(task) = task {
+            task.cancellation.cancel();
+            let _join_result = task.handle.join();
+        }
+        Ok(())
+    }
+
+    fn reap_finished_voice_clone_worker(&self) -> Result<bool, CommandErrorDto> {
+        let task = {
+            let mut worker = self.voice_clone_worker.lock().map_err(|_| {
+                CommandErrorDto::new(
+                    "voice_clone_worker_lock_failed",
+                    "固定话术 Worker 状态锁已损坏",
+                )
+            })?;
+            if worker
+                .as_ref()
+                .is_some_and(|task| task.completed.load(Ordering::Acquire))
+            {
+                worker.take()
+            } else {
+                None
+            }
+        };
+        if let Some(task) = task {
+            let _join_result = task.handle.join();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn voice_clone_worker_is_running(&self) -> Result<bool, CommandErrorDto> {
+        let worker = self.voice_clone_worker.lock().map_err(|_| {
+            CommandErrorDto::new(
+                "voice_clone_worker_lock_failed",
+                "固定话术 Worker 状态锁已损坏",
+            )
+        })?;
+        Ok(worker.is_some())
+    }
+
+    fn stop_voice_clone_worker(&self) -> Result<(), CommandErrorDto> {
+        let task = self
+            .voice_clone_worker
+            .lock()
+            .map_err(|_| {
+                CommandErrorDto::new(
+                    "voice_clone_worker_lock_failed",
+                    "固定话术 Worker 状态锁已损坏",
+                )
+            })?
             .take();
         if let Some(task) = task {
             task.cancellation.cancel();
@@ -369,6 +509,21 @@ impl AppState {
         Ok(())
     }
 
+    fn install_voice_clone_worker(
+        &self,
+        task: VoiceCloneWorkerTask,
+    ) -> Result<(), VoiceCloneWorkerTask> {
+        let mut worker = match self.voice_clone_worker.lock() {
+            Ok(worker) => worker,
+            Err(_) => return Err(task),
+        };
+        if worker.is_some() {
+            return Err(task);
+        }
+        worker.replace(task);
+        Ok(())
+    }
+
     fn install_media_worker(&self, task: MediaWorkerTask) -> Result<(), MediaWorkerTask> {
         let mut worker = match self.media_worker.lock() {
             Ok(worker) => worker,
@@ -474,6 +629,7 @@ pub struct PlaybackSnapshotDto {
     pub audio_processing_status: String,
     pub audio_processing_runtime: bool,
     pub audio_processing_gain_db: f64,
+    pub voice_clone_replacement: autolive_desktop_core::VoiceCloneReplacementState,
 }
 
 impl From<PlaybackSnapshot> for PlaybackSnapshotDto {
@@ -509,6 +665,7 @@ impl From<PlaybackSnapshot> for PlaybackSnapshotDto {
             audio_processing_status: value.audio_processing_status,
             audio_processing_runtime: value.audio_processing_runtime,
             audio_processing_gain_db: value.audio_processing_gain_db,
+            voice_clone_replacement: value.voice_clone_replacement,
         }
     }
 }
@@ -769,8 +926,17 @@ pub fn probe_local_mp4(
 ) -> Result<MediaProbeResultDto, CommandErrorDto> {
     state.ensure_main_window(&window)?;
     state.stop_speech_worker()?;
+    state.stop_voice_clone_worker()?;
     state.stop_media_worker()?;
     state.stop_research_worker()?;
+    let cleanup_paths = {
+        let playback = state
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+        voice_clone_artifact_dirs(&playback, true)
+    };
+    cleanup_voice_clone_paths(cleanup_paths);
 
     let cancellation = CancellationToken::new();
     let result = probe_user_selected_mp4(&request, &cancellation)
@@ -846,6 +1012,62 @@ pub fn get_speech_to_speech_worker_capabilities(
 }
 
 #[tauri::command]
+pub fn get_voice_clone_worker_capabilities(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<VoiceCloneWorkerCapabilitiesDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    let executable = match configured_voice_clone_worker_executable() {
+        Ok(executable) => executable,
+        Err(reason) => return Ok(unavailable_voice_clone_capabilities(reason)),
+    };
+    let temp_root = std::env::temp_dir().join(format!(
+        "autolive-voice-clone-capabilities-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|error| {
+                CommandErrorDto::new("voice_clone_capability_probe_failed", error.to_string())
+            })?
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_root).map_err(|error| {
+        CommandErrorDto::new("voice_clone_capability_probe_failed", error.to_string())
+    })?;
+    let output_json = temp_root.join("capabilities.json");
+    let args = vec![
+        "--capabilities-json".to_owned(),
+        output_json.display().to_string(),
+    ];
+    let result = match run_voice_clone_worker_process(
+        &executable,
+        &args,
+        VOICE_CLONE_CAPABILITY_TIMEOUT_MS,
+        &CancellationToken::new(),
+    ) {
+        Ok(()) => read_json_file::<VoiceCloneWorkerCapabilitiesDto>(
+            &output_json,
+            "voice_clone_capability_probe_failed",
+            "固定话术能力 JSON 无法解析",
+        )
+        .unwrap_or_else(|error| unavailable_voice_clone_capabilities(error.message)),
+        Err(VoiceCloneWorkerRunError::Timeout { timeout_ms }) => {
+            unavailable_voice_clone_capabilities(format!(
+                "固定话术 Worker 能力探测超时（{timeout_ms}ms）"
+            ))
+        }
+        Err(VoiceCloneWorkerRunError::Cancelled) => {
+            unavailable_voice_clone_capabilities("固定话术 Worker 能力探测被取消")
+        }
+        Err(VoiceCloneWorkerRunError::Failed(reason)) => {
+            unavailable_voice_clone_capabilities(reason)
+        }
+    };
+    cleanup_voice_clone_paths([temp_root]);
+    Ok(result)
+}
+
+#[tauri::command]
 pub fn get_media_engine_capabilities(
     window: Window,
     app: AppHandle,
@@ -859,6 +1081,385 @@ pub fn get_media_engine_capabilities(
     Ok(configured_media_engine_status_with_resource_dir(
         &resource_dir,
     ))
+}
+
+#[tauri::command]
+pub fn prepare_voice_clone_source(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: PrepareVoiceCloneSourceRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    let _ = state.reap_finished_voice_clone_worker()?;
+    if state.voice_clone_worker_is_running()? {
+        return Err(CommandErrorDto::new(
+            "voice_clone_worker_already_running",
+            "当前已有固定话术 Worker 在执行",
+        ));
+    }
+    let timeout_ms = request.timeout_ms.unwrap_or(DEFAULT_VOICE_CLONE_TIMEOUT_MS);
+    let executable = configured_voice_clone_worker_executable()
+        .map_err(|reason| CommandErrorDto::new("voice_clone_worker_unavailable", reason))?;
+    let cache_root = voice_clone_cache_root(&app)?;
+    let (
+        source_generation,
+        canonical_source_path,
+        source_sha256,
+        operation_id,
+        stale_paths,
+        snapshot,
+    ) = {
+        let mut playback = state
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+        playback
+            .bind_window(window.label())
+            .map_err(command_error_from_playback)?;
+        let snapshot = playback.snapshot();
+        let source = snapshot
+            .source_media
+            .as_ref()
+            .ok_or_else(|| CommandErrorDto::new("source_media_required", "请先导入一个源视频"))?;
+        let source_sha256 = source.mp4_sha256.clone().ok_or_else(|| {
+            CommandErrorDto::new("source_hash_required", "源视频完整 SHA-256 尚未完成")
+        })?;
+        let canonical_source_path = std::fs::canonicalize(&source.source_path).map_err(|_| {
+            CommandErrorDto::new("source_media_invalid", "当前源视频路径无法规范化")
+        })?;
+        let operation_id = voice_clone_operation_id("prepare", snapshot.playback_generation)?;
+        let stale_paths = voice_clone_artifact_dirs(&playback, true);
+        playback
+            .mark_voice_clone_preparing(&operation_id)
+            .map_err(command_error_from_voice_clone_runtime)?;
+        (
+            snapshot.playback_generation,
+            canonical_source_path,
+            source_sha256,
+            operation_id,
+            stale_paths,
+            state.snapshot(&playback),
+        )
+    };
+    cleanup_voice_clone_paths(stale_paths);
+    let prepared_root = cache_root.join(&source_sha256);
+    std::fs::create_dir_all(&prepared_root)
+        .map_err(|error| CommandErrorDto::new("voice_clone_cache_dir_failed", error.to_string()))?;
+    let request_json = prepared_root.join(format!("{operation_id}.prepare.json"));
+    let output_json = prepared_root.join(format!("{operation_id}.prepare-result.json"));
+    let request_payload = VoiceClonePrepareRequest {
+        source_generation,
+        source_path: canonical_source_path.display().to_string(),
+        operation_id: operation_id.clone(),
+    };
+    write_json_file(&request_json, &request_payload)?;
+
+    let playback = Arc::clone(&state.playback);
+    let completed = Arc::new(AtomicBool::new(false));
+    let completed_for_thread = Arc::clone(&completed);
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let thread_executable = executable.clone();
+    let thread_request_json = request_json.clone();
+    let thread_output_json = output_json.clone();
+    let thread_prepared_root = prepared_root.clone();
+    let thread_canonical_source_path = canonical_source_path.clone();
+    let thread_source_sha256 = source_sha256.clone();
+    let thread_operation_id = operation_id.clone();
+    let handle = thread::spawn(move || {
+        let args = vec![
+            "--prepare-json".to_owned(),
+            thread_request_json.display().to_string(),
+            "--output-json".to_owned(),
+            thread_output_json.display().to_string(),
+        ];
+        let worker_result = run_voice_clone_worker_process(
+            &thread_executable,
+            &args,
+            timeout_ms,
+            &worker_cancellation,
+        );
+        let prepared = match worker_result {
+            Ok(()) => read_json_file::<VoiceClonePrepareWorkerResult>(
+                &thread_output_json,
+                "voice_clone_prepare_failed",
+                "固定话术准备结果 JSON 无法解析",
+            )
+            .and_then(|result| {
+                validate_voice_clone_prepare_result(
+                    &thread_prepared_root,
+                    source_generation,
+                    &thread_canonical_source_path,
+                    &thread_source_sha256,
+                    &thread_operation_id,
+                    result,
+                )
+            }),
+            Err(VoiceCloneWorkerRunError::Cancelled) => {
+                if let Ok(mut playback) = playback.lock() {
+                    let current = playback.snapshot();
+                    if current.playback_generation == source_generation
+                        && current
+                            .source_media
+                            .as_ref()
+                            .map(|source| source.source_path.as_str())
+                            == Some(thread_canonical_source_path.to_string_lossy().as_ref())
+                    {
+                        playback.mark_voice_clone_cancelled("用户取消固定话术准备");
+                    }
+                }
+                cleanup_voice_clone_paths([
+                    thread_request_json.clone(),
+                    thread_output_json.clone(),
+                    thread_prepared_root.join(&thread_operation_id),
+                ]);
+                completed_for_thread.store(true, Ordering::Release);
+                return;
+            }
+            Err(VoiceCloneWorkerRunError::Timeout { timeout_ms }) => Err(CommandErrorDto::new(
+                "voice_clone_prepare_failed",
+                format!("固定话术准备超时（{timeout_ms}ms）"),
+            )),
+            Err(VoiceCloneWorkerRunError::Failed(reason)) => {
+                Err(CommandErrorDto::new("voice_clone_prepare_failed", reason))
+            }
+        };
+
+        if let Ok(mut playback) = playback.lock() {
+            match prepared {
+                Ok(prepared_source) => {
+                    if playback
+                        .set_voice_clone_prepared_source(prepared_source)
+                        .is_err()
+                    {
+                        cleanup_voice_clone_paths(
+                            [thread_prepared_root.join(&thread_operation_id)],
+                        );
+                    }
+                }
+                Err(error) => {
+                    cleanup_voice_clone_paths([thread_prepared_root.join(&thread_operation_id)]);
+                    playback.mark_voice_clone_failed(error.message);
+                }
+            }
+        } else {
+            cleanup_voice_clone_paths([thread_prepared_root.join(&thread_operation_id)]);
+        }
+        cleanup_voice_clone_paths([thread_request_json, thread_output_json]);
+        completed_for_thread.store(true, Ordering::Release);
+    });
+    if let Err(task) = state.install_voice_clone_worker(VoiceCloneWorkerTask {
+        cancellation,
+        completed,
+        handle,
+    }) {
+        task.cancellation.cancel();
+        let _join_result = task.handle.join();
+        cleanup_voice_clone_paths([request_json, output_json, prepared_root.join(&operation_id)]);
+        return Err(CommandErrorDto::new(
+            "voice_clone_worker_already_running",
+            "当前已有固定话术 Worker 在执行",
+        ));
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn start_voice_clone_replacement(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: StartVoiceCloneReplacementRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    let _ = state.reap_finished_voice_clone_worker()?;
+    if state.voice_clone_worker_is_running()? {
+        return Err(CommandErrorDto::new(
+            "voice_clone_worker_already_running",
+            "当前已有固定话术 Worker 在执行",
+        ));
+    }
+    let timeout_ms = request.timeout_ms.unwrap_or(DEFAULT_VOICE_CLONE_TIMEOUT_MS);
+    let executable = configured_voice_clone_worker_executable()
+        .map_err(|reason| CommandErrorDto::new("voice_clone_worker_unavailable", reason))?;
+    let cache_root = voice_clone_cache_root(&app)?;
+    let speech_worker_running = state.speech_worker_is_running()?;
+    let (plan, stale_replacement_paths, snapshot) = {
+        let mut playback = state
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+        playback
+            .bind_window(window.label())
+            .map_err(command_error_from_playback)?;
+        let occupancy = speech_worker_running || realtime_audio_is_occupying(&playback.snapshot());
+        let operation_id =
+            voice_clone_operation_id("replace", playback.snapshot().playback_generation)?;
+        let stale_replacement_paths = voice_clone_artifact_dirs(&playback, false);
+        let plan = playback
+            .start_voice_clone_replacement(
+                &request.text,
+                request.position_ms,
+                &operation_id,
+                occupancy,
+            )
+            .map_err(command_error_from_voice_clone_runtime)?;
+        (plan, stale_replacement_paths, state.snapshot(&playback))
+    };
+    cleanup_voice_clone_paths(stale_replacement_paths);
+    let replacement_root = cache_root.join(&plan.source_sha256);
+    std::fs::create_dir_all(&replacement_root)
+        .map_err(|error| CommandErrorDto::new("voice_clone_cache_dir_failed", error.to_string()))?;
+    let request_json = replacement_root.join(format!("{}.replace.json", plan.operation_id));
+    let output_json = replacement_root.join(format!("{}.replace-result.json", plan.operation_id));
+    let request_payload = serde_json::json!({
+        "source_generation": plan.source_generation,
+        "source_path": plan.source_path,
+        "source_sha256": plan.source_sha256,
+        "operation_id": plan.operation_id,
+        "reference_audio_path": plan.reference_audio_path,
+        "text": plan.input_text,
+        "replace_at_ms": plan.replace_at_ms,
+        "resume_at_ms": plan.resume_at_ms,
+    });
+    write_json_file(&request_json, &request_payload)?;
+
+    let playback = Arc::clone(&state.playback);
+    let completed = Arc::new(AtomicBool::new(false));
+    let completed_for_thread = Arc::clone(&completed);
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let thread_executable = executable.clone();
+    let thread_request_json = request_json.clone();
+    let thread_output_json = output_json.clone();
+    let thread_replacement_root = replacement_root.clone();
+    let thread_plan = plan.clone();
+    let handle = thread::spawn(move || {
+        let args = vec![
+            "--replace-json".to_owned(),
+            thread_request_json.display().to_string(),
+            "--output-json".to_owned(),
+            thread_output_json.display().to_string(),
+        ];
+        let worker_result = run_voice_clone_worker_process(
+            &thread_executable,
+            &args,
+            timeout_ms,
+            &worker_cancellation,
+        );
+        let replacement = match worker_result {
+            Ok(()) => read_json_file::<VoiceCloneReplaceWorkerResult>(
+                &thread_output_json,
+                "voice_clone_replace_failed",
+                "固定话术替换结果 JSON 无法解析",
+            )
+            .and_then(|result| {
+                validate_voice_clone_replace_result(&thread_replacement_root, &thread_plan, result)
+            }),
+            Err(VoiceCloneWorkerRunError::Cancelled) => {
+                if let Ok(mut playback) = playback.lock() {
+                    playback.mark_voice_clone_cancelled("用户取消固定话术替换");
+                }
+                cleanup_voice_clone_paths([
+                    thread_request_json.clone(),
+                    thread_output_json.clone(),
+                    thread_replacement_root.join(&thread_plan.operation_id),
+                ]);
+                completed_for_thread.store(true, Ordering::Release);
+                return;
+            }
+            Err(VoiceCloneWorkerRunError::Timeout { timeout_ms }) => Err(CommandErrorDto::new(
+                "voice_clone_replace_failed",
+                format!("固定话术替换超时（{timeout_ms}ms）"),
+            )),
+            Err(VoiceCloneWorkerRunError::Failed(reason)) => {
+                Err(CommandErrorDto::new("voice_clone_replace_failed", reason))
+            }
+        };
+        if let Ok(mut playback) = playback.lock() {
+            match replacement {
+                Ok(replacement) => {
+                    if playback.apply_voice_clone_replacement(replacement).is_err() {
+                        cleanup_voice_clone_paths([
+                            thread_replacement_root.join(&thread_plan.operation_id)
+                        ]);
+                    }
+                }
+                Err(error) => {
+                    cleanup_voice_clone_paths([
+                        thread_replacement_root.join(&thread_plan.operation_id)
+                    ]);
+                    playback.mark_voice_clone_failed(error.message);
+                }
+            }
+        } else {
+            cleanup_voice_clone_paths([thread_replacement_root.join(&thread_plan.operation_id)]);
+        }
+        cleanup_voice_clone_paths([thread_request_json, thread_output_json]);
+        completed_for_thread.store(true, Ordering::Release);
+    });
+    if let Err(task) = state.install_voice_clone_worker(VoiceCloneWorkerTask {
+        cancellation,
+        completed,
+        handle,
+    }) {
+        task.cancellation.cancel();
+        let _join_result = task.handle.join();
+        cleanup_voice_clone_paths([
+            request_json,
+            output_json,
+            replacement_root.join(&plan.operation_id),
+        ]);
+        return Err(CommandErrorDto::new(
+            "voice_clone_worker_already_running",
+            "当前已有固定话术 Worker 在执行",
+        ));
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn cancel_voice_clone_operation(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    let had_worker = state.voice_clone_worker_is_running()?;
+    state.stop_voice_clone_worker()?;
+    state.with_playback(&window, |playback| {
+        if had_worker
+            || matches!(
+                playback.snapshot().voice_clone_replacement.status.as_str(),
+                "preparing" | "generating"
+            )
+        {
+            playback.mark_voice_clone_cancelled("用户取消固定话术 Worker");
+        }
+        Ok(state.snapshot(playback))
+    })
+}
+
+#[tauri::command]
+pub fn clear_voice_clone_replacement(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    state.stop_voice_clone_worker()?;
+    let cleanup_paths = {
+        let playback = state
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+        voice_clone_artifact_dirs(&playback, false)
+    };
+    let snapshot = state.with_playback(&window, |playback| {
+        playback.clear_voice_clone_replacement();
+        Ok(state.snapshot(playback))
+    })?;
+    cleanup_voice_clone_paths(cleanup_paths);
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -1506,12 +2107,22 @@ pub fn stop_playback(
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
     state.stop_speech_worker()?;
+    state.stop_voice_clone_worker()?;
     state.stop_media_worker()?;
     state.stop_research_worker()?;
-    state.playback_action(&window, |playback| {
+    let cleanup_paths = {
+        let playback = state
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+        voice_clone_artifact_dirs(&playback, true)
+    };
+    let snapshot = state.playback_action(&window, |playback| {
         playback.stop();
         Ok(())
-    })
+    })?;
+    cleanup_voice_clone_paths(cleanup_paths);
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -1520,7 +2131,17 @@ pub fn complete_playback_loop(
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
     state.stop_speech_worker()?;
-    state.playback_action(&window, PlaybackCore::complete_loop)
+    state.stop_voice_clone_worker()?;
+    let cleanup_paths = {
+        let playback = state
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+        voice_clone_artifact_dirs(&playback, false)
+    };
+    let snapshot = state.playback_action(&window, PlaybackCore::complete_loop)?;
+    cleanup_voice_clone_paths(cleanup_paths);
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -1881,6 +2502,415 @@ pub fn get_default_local_research_params(
     Ok(LocalResearchParams::default())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VoiceCloneWorkerRunError {
+    Cancelled,
+    Timeout { timeout_ms: u64 },
+    Failed(String),
+}
+
+fn unavailable_voice_clone_capabilities(
+    reason: impl Into<String>,
+) -> VoiceCloneWorkerCapabilitiesDto {
+    VoiceCloneWorkerCapabilitiesDto {
+        available: false,
+        status: "unavailable".to_owned(),
+        provider: None,
+        model: None,
+        reason: Some(reason.into()),
+    }
+}
+
+fn configured_voice_clone_worker_executable() -> Result<PathBuf, String> {
+    let configured = std::env::var(VOICE_CLONE_WORKER_ENV)
+        .map_err(|_| format!("未设置 {VOICE_CLONE_WORKER_ENV}"))?;
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{VOICE_CLONE_WORKER_ENV} 不能为空"));
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(format!("{VOICE_CLONE_WORKER_ENV} 必须是绝对路径"));
+    }
+    if !path.is_file() {
+        return Err("固定话术 Worker 文件不存在".to_owned());
+    }
+    Ok(path)
+}
+
+fn voice_clone_cache_root(app: &AppHandle) -> Result<PathBuf, CommandErrorDto> {
+    let cache_root = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| CommandErrorDto::new("voice_clone_cache_dir_failed", error.to_string()))?
+        .join("voice-clone");
+    std::fs::create_dir_all(&cache_root)
+        .map_err(|error| CommandErrorDto::new("voice_clone_cache_dir_failed", error.to_string()))?;
+    Ok(cache_root)
+}
+
+fn voice_clone_operation_id(prefix: &str, generation: u64) -> Result<String, CommandErrorDto> {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|error| {
+            CommandErrorDto::new("voice_clone_operation_id_failed", error.to_string())
+        })?
+        .as_nanos();
+    Ok(format!("{prefix}-g{generation}-{nonce}"))
+}
+
+fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), CommandErrorDto> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            CommandErrorDto::new("voice_clone_json_dir_failed", error.to_string())
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        CommandErrorDto::new("voice_clone_json_serialize_failed", error.to_string())
+    })?;
+    let partial = path.with_extension("json.partial");
+    let mut file = std::fs::File::create(&partial).map_err(|error| {
+        CommandErrorDto::new("voice_clone_json_write_failed", error.to_string())
+    })?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| {
+            CommandErrorDto::new("voice_clone_json_write_failed", error.to_string())
+        })?;
+    std::fs::rename(&partial, path).map_err(|error| {
+        CommandErrorDto::new("voice_clone_json_commit_failed", error.to_string())
+    })?;
+    Ok(())
+}
+
+fn read_json_file<T: DeserializeOwned>(
+    path: &Path,
+    code: &'static str,
+    message: &'static str,
+) -> Result<T, CommandErrorDto> {
+    let bytes =
+        std::fs::read(path).map_err(|error| CommandErrorDto::new(code, error.to_string()))?;
+    serde_json::from_slice::<T>(&bytes)
+        .map_err(|error| CommandErrorDto::new(code, format!("{message}：{error}")))
+}
+
+fn kill_child(child: &mut std::process::Child) {
+    let _kill_result = child.kill();
+    let _wait_result = child.wait();
+}
+
+fn run_voice_clone_worker_process(
+    executable: &Path,
+    args: &[String],
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> Result<(), VoiceCloneWorkerRunError> {
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| VoiceCloneWorkerRunError::Failed(error.to_string()))?;
+    let started_at = Instant::now();
+    loop {
+        if cancellation.is_cancelled() {
+            kill_child(&mut child);
+            return Err(VoiceCloneWorkerRunError::Cancelled);
+        }
+        if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
+            kill_child(&mut child);
+            return Err(VoiceCloneWorkerRunError::Timeout { timeout_ms });
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(());
+                }
+                let stderr = child
+                    .stderr
+                    .take()
+                    .and_then(|mut stream| {
+                        use std::io::Read;
+                        let mut content = String::new();
+                        match stream.read_to_string(&mut content) {
+                            Ok(_) => Some(content),
+                            Err(_) => None,
+                        }
+                    })
+                    .unwrap_or_default();
+                let message = if stderr.trim().is_empty() {
+                    format!("固定话术 Worker 退出码异常：{status}")
+                } else {
+                    stderr.trim().to_owned()
+                };
+                return Err(VoiceCloneWorkerRunError::Failed(message));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                kill_child(&mut child);
+                return Err(VoiceCloneWorkerRunError::Failed(error.to_string()));
+            }
+        }
+    }
+}
+
+fn cleanup_path(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if path.is_dir() {
+        let _ignored = std::fs::remove_dir_all(path);
+    } else {
+        let _ignored = std::fs::remove_file(path);
+    }
+}
+
+fn cleanup_voice_clone_paths(paths: impl IntoIterator<Item = PathBuf>) {
+    let mut unique = Vec::<PathBuf>::new();
+    for path in paths {
+        if !unique.iter().any(|existing| existing == &path) {
+            unique.push(path);
+        }
+    }
+    for path in unique {
+        cleanup_path(&path);
+    }
+}
+
+fn voice_clone_artifact_dirs(playback: &PlaybackCore, include_prepared: bool) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if include_prepared {
+        if let Some(prepared) = playback.voice_clone_prepared_source() {
+            if let Some(parent) = Path::new(&prepared.reference_audio_path).parent() {
+                paths.push(parent.to_path_buf());
+            }
+        }
+    }
+    let snapshot = playback.snapshot();
+    if let Some(reference) = snapshot
+        .voice_clone_replacement
+        .replacement_audio_reference
+        .as_deref()
+    {
+        if let Some(parent) = Path::new(reference).parent() {
+            paths.push(parent.to_path_buf());
+        }
+    }
+    paths
+}
+
+fn realtime_audio_is_occupying(snapshot: &PlaybackSnapshot) -> bool {
+    snapshot.worker_status == "running"
+        || snapshot.current_audio_source.as_deref() == Some("realtime_variant")
+        || snapshot.pending_audio_candidate
+}
+
+fn canonicalize_file_within_root(
+    root: &Path,
+    path: &str,
+    code: &'static str,
+    message: &'static str,
+) -> Result<PathBuf, CommandErrorDto> {
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|error| CommandErrorDto::new(code, error.to_string()))?;
+    let canonical_path = std::fs::canonicalize(path)
+        .map_err(|error| CommandErrorDto::new(code, format!("{message}：{error}")))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(CommandErrorDto::new(code, message));
+    }
+    Ok(canonical_path)
+}
+
+fn voice_clone_hash_matches(
+    path: &Path,
+    expected_sha256: &str,
+    code: &'static str,
+    mismatch_message: &'static str,
+) -> Result<String, CommandErrorDto> {
+    let actual_sha256 = hash_file_at_path(path, &CancellationToken::new())
+        .map_err(|error| CommandErrorDto::new(code, error.to_string()))?;
+    if actual_sha256 != expected_sha256 {
+        return Err(CommandErrorDto::new(code, mismatch_message));
+    }
+    Ok(actual_sha256)
+}
+
+fn validate_voice_clone_prepare_result(
+    prepared_root: &Path,
+    source_generation: u64,
+    canonical_source_path: &Path,
+    source_sha256: &str,
+    operation_id: &str,
+    worker_result: VoiceClonePrepareWorkerResult,
+) -> Result<VoiceClonePreparedSource, CommandErrorDto> {
+    if worker_result.status != "success" {
+        return Err(CommandErrorDto::new(
+            "voice_clone_prepare_failed",
+            worker_result
+                .reason
+                .unwrap_or_else(|| "固定话术准备失败".to_owned()),
+        ));
+    }
+    if worker_result.operation_id != operation_id {
+        return Err(CommandErrorDto::new(
+            "voice_clone_prepare_failed",
+            "固定话术准备返回了过期的操作 ID",
+        ));
+    }
+    let worker_source_path = worker_result.source_path.ok_or_else(|| {
+        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少源路径")
+    })?;
+    let canonical_worker_source = std::fs::canonicalize(&worker_source_path).map_err(|_| {
+        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备源路径无法规范化")
+    })?;
+    if canonical_worker_source != canonical_source_path {
+        return Err(CommandErrorDto::new(
+            "voice_clone_prepare_failed",
+            "固定话术准备结果不属于当前源视频",
+        ));
+    }
+    let worker_source_sha256 = worker_result.source_sha256.ok_or_else(|| {
+        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少源哈希")
+    })?;
+    if worker_source_sha256 != source_sha256 {
+        return Err(CommandErrorDto::new(
+            "voice_clone_prepare_failed",
+            "固定话术准备结果的源哈希与当前源视频不一致",
+        ));
+    }
+    let reference_audio_path = worker_result.reference_audio_path.ok_or_else(|| {
+        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少参考音频")
+    })?;
+    let reference_audio_sha256 = worker_result.reference_audio_sha256.ok_or_else(|| {
+        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少参考音频哈希")
+    })?;
+    let canonical_reference_path = canonicalize_file_within_root(
+        prepared_root,
+        &reference_audio_path,
+        "voice_clone_prepare_failed",
+        "参考音频必须位于固定话术缓存目录内",
+    )?;
+    let actual_reference_sha256 = voice_clone_hash_matches(
+        &canonical_reference_path,
+        &reference_audio_sha256,
+        "voice_clone_prepare_failed",
+        "参考音频哈希与当前文件不一致",
+    )?;
+    let source_index = VoiceCloneSourceIndex {
+        source_generation,
+        source_path: canonical_source_path.display().to_string(),
+        segments: worker_result.segments,
+    };
+    let _contract_result = VoiceClonePrepareResult {
+        source_generation,
+        source_path: canonical_source_path.display().to_string(),
+        operation_id: operation_id.to_owned(),
+        source_index: source_index.clone(),
+    };
+    Ok(VoiceClonePreparedSource {
+        operation_id: operation_id.to_owned(),
+        source_index,
+        source_sha256: source_sha256.to_owned(),
+        reference_audio_path: canonical_reference_path.display().to_string(),
+        reference_audio_sha256: actual_reference_sha256,
+        sample_rate_hz: worker_result.sample_rate_hz.ok_or_else(|| {
+            CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少采样率")
+        })?,
+        channel_count: worker_result.channel_count.ok_or_else(|| {
+            CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少声道数")
+        })?,
+        total_duration_ms: worker_result.duration_ms.ok_or_else(|| {
+            CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少总时长")
+        })?,
+        model: worker_result.model.or(worker_result.provider),
+    })
+}
+
+fn validate_voice_clone_replace_result(
+    replacement_root: &Path,
+    plan: &autolive_desktop_core::VoiceCloneReplacementPlan,
+    worker_result: VoiceCloneReplaceWorkerResult,
+) -> Result<VoiceCloneCommittedReplacement, CommandErrorDto> {
+    if worker_result.status != "success" {
+        return Err(CommandErrorDto::new(
+            "voice_clone_replace_failed",
+            worker_result
+                .reason
+                .unwrap_or_else(|| "固定话术替换失败".to_owned()),
+        ));
+    }
+    let replacement_audio_path = worker_result.replacement_audio_path.ok_or_else(|| {
+        CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少输出音频")
+    })?;
+    let replacement_sha256 = worker_result.replacement_sha256.ok_or_else(|| {
+        CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少输出音频哈希")
+    })?;
+    let canonical_replacement_path = canonicalize_file_within_root(
+        replacement_root,
+        &replacement_audio_path,
+        "voice_clone_replace_failed",
+        "固定话术输出必须位于固定话术缓存目录内",
+    )?;
+    let actual_sha256 = voice_clone_hash_matches(
+        &canonical_replacement_path,
+        &replacement_sha256,
+        "voice_clone_replace_failed",
+        "固定话术输出哈希与当前文件不一致",
+    )?;
+    let source_generation = worker_result.source_generation.ok_or_else(|| {
+        CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少源代际")
+    })?;
+    let source_path = worker_result.source_path.ok_or_else(|| {
+        CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少源路径")
+    })?;
+    let replacement_result = VoiceCloneReplacementResult {
+        source_generation,
+        source_path: source_path.clone(),
+        operation_id: worker_result.operation_id.clone(),
+        audio_reference: canonical_replacement_path.display().to_string(),
+        audio_sha256: actual_sha256.clone(),
+        replacement_duration_ms: worker_result.total_duration_ms.ok_or_else(|| {
+            CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少总时长")
+        })?,
+    };
+    let replacement_request = VoiceCloneReplacementRequest {
+        source_generation: plan.source_generation,
+        source_path: plan.source_path.clone(),
+        operation_id: plan.operation_id.clone(),
+        text: plan.input_text.clone(),
+        position_ms: plan.replace_at_ms,
+    };
+    validate_replacement_result(&replacement_result, &replacement_request)
+        .map_err(|error| CommandErrorDto::new("voice_clone_replace_failed", error.to_string()))?;
+    if worker_result.source_sha256.as_deref() != Some(plan.source_sha256.as_str())
+        || worker_result.replace_at_ms != Some(plan.replace_at_ms)
+        || worker_result.resume_at_ms != Some(plan.resume_at_ms)
+        || worker_result.sample_rate_hz != Some(plan.sample_rate_hz)
+        || worker_result.channel_count != Some(plan.channel_count)
+        || worker_result.input_text.as_deref() != Some(plan.input_text.as_str())
+    {
+        return Err(CommandErrorDto::new(
+            "voice_clone_replace_failed",
+            "固定话术替换结果与当前请求上下文不一致",
+        ));
+    }
+    Ok(VoiceCloneCommittedReplacement {
+        source_generation,
+        source_path,
+        operation_id: worker_result.operation_id,
+        input_text: plan.input_text.clone(),
+        replacement_audio_reference: canonical_replacement_path.display().to_string(),
+        replacement_audio_sha256: actual_sha256,
+        replacement_duration_ms: replacement_result.replacement_duration_ms,
+        replace_at_ms: plan.replace_at_ms,
+        resume_at_ms: plan.resume_at_ms,
+        model: worker_result.model.or(worker_result.provider),
+    })
+}
+
 fn command_error_from_playback(error: PlaybackError) -> CommandErrorDto {
     let code = match error {
         PlaybackError::EmptyWindowId => "empty_window_id",
@@ -1891,6 +2921,42 @@ fn command_error_from_playback(error: PlaybackError) -> CommandErrorDto {
         PlaybackError::InvalidTransition { .. } => "invalid_playback_transition",
     };
     CommandErrorDto::new(code, error.to_string())
+}
+
+fn command_error_from_voice_clone_runtime(error: VoiceCloneRuntimeError) -> CommandErrorDto {
+    let (code, message) = match error {
+        VoiceCloneRuntimeError::SourceMediaRequired => {
+            ("source_media_required", "请先导入一个源视频".to_owned())
+        }
+        VoiceCloneRuntimeError::VoiceCloneTextInvalid(error) => {
+            ("voice_clone_text_invalid", error.to_string())
+        }
+        VoiceCloneRuntimeError::PlaybackNotPlaying => (
+            "voice_clone_playback_not_playing",
+            "固定话术替换只允许在播放中启动".to_owned(),
+        ),
+        VoiceCloneRuntimeError::VoiceCloneSourceNotPrepared => (
+            "voice_clone_source_not_prepared",
+            "请先准备当前源视频的人声参考".to_owned(),
+        ),
+        VoiceCloneRuntimeError::VoiceClonePreparedSourceStale => (
+            "voice_clone_source_stale",
+            "当前固定话术参考已经过期，请重新准备".to_owned(),
+        ),
+        VoiceCloneRuntimeError::CurrentVoiceSegmentNotFound => (
+            "voice_clone_segment_not_found",
+            "当前位置没有可替换的话术片段".to_owned(),
+        ),
+        VoiceCloneRuntimeError::RealtimeAudioWorkerBusy => (
+            "voice_clone_realtime_audio_busy",
+            "实时音频候选正在占用音频，当前不能启动固定话术替换".to_owned(),
+        ),
+        VoiceCloneRuntimeError::VoiceCloneReplacementStale => (
+            "voice_clone_replacement_stale",
+            "固定话术结果已经过期，未应用到当前播放".to_owned(),
+        ),
+    };
+    CommandErrorDto::new(code, message)
 }
 
 fn command_error_from_media_library(error: MediaLibraryError) -> CommandErrorDto {

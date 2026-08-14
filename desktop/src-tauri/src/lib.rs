@@ -9,6 +9,7 @@ pub mod research_params;
 pub mod research_worker;
 pub mod speech_to_speech;
 pub mod speech_to_speech_worker;
+pub mod voice_clone;
 pub mod window_sizing;
 
 use crate::audio_processing::AudioProcessingProfile;
@@ -16,6 +17,9 @@ use crate::errors::PlaybackError;
 use crate::media_library::SourceMediaDto;
 use crate::speech_to_speech::{
     AudioTrackInput, AudioVariantCandidate, CandidateValidationError, SpeechToSpeechContext,
+};
+use crate::voice_clone::{
+    locate_current_voice_segment, validate_voice_clone_text, VoiceCloneError, VoiceCloneSourceIndex,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +29,96 @@ pub enum PlaybackState {
     Playing,
     Paused,
     Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceCloneReplacementState {
+    pub status: String,
+    pub source_generation: Option<u64>,
+    pub source_path: Option<String>,
+    pub operation_id: Option<String>,
+    pub replacement_audio_reference: Option<String>,
+    pub replacement_audio_sha256: Option<String>,
+    pub replacement_duration_ms: Option<u64>,
+    pub replace_at_ms: Option<u64>,
+    pub resume_at_ms: Option<u64>,
+    pub input_text: Option<String>,
+    pub model: Option<String>,
+    pub error: Option<String>,
+}
+
+impl Default for VoiceCloneReplacementState {
+    fn default() -> Self {
+        Self {
+            status: "idle".to_owned(),
+            source_generation: None,
+            source_path: None,
+            operation_id: None,
+            replacement_audio_reference: None,
+            replacement_audio_sha256: None,
+            replacement_duration_ms: None,
+            replace_at_ms: None,
+            resume_at_ms: None,
+            input_text: None,
+            model: None,
+            error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceClonePreparedSource {
+    pub operation_id: String,
+    pub source_index: VoiceCloneSourceIndex,
+    pub source_sha256: String,
+    pub reference_audio_path: String,
+    pub reference_audio_sha256: String,
+    pub sample_rate_hz: u32,
+    pub channel_count: u16,
+    pub total_duration_ms: u64,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceCloneReplacementPlan {
+    pub source_generation: u64,
+    pub source_path: String,
+    pub source_sha256: String,
+    pub operation_id: String,
+    pub input_text: String,
+    pub replace_at_ms: u64,
+    pub resume_at_ms: u64,
+    pub reference_audio_path: String,
+    pub reference_audio_sha256: String,
+    pub sample_rate_hz: u32,
+    pub channel_count: u16,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceCloneCommittedReplacement {
+    pub source_generation: u64,
+    pub source_path: String,
+    pub operation_id: String,
+    pub input_text: String,
+    pub replacement_audio_reference: String,
+    pub replacement_audio_sha256: String,
+    pub replacement_duration_ms: u64,
+    pub replace_at_ms: u64,
+    pub resume_at_ms: u64,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoiceCloneRuntimeError {
+    SourceMediaRequired,
+    VoiceCloneTextInvalid(VoiceCloneError),
+    PlaybackNotPlaying,
+    VoiceCloneSourceNotPrepared,
+    VoiceClonePreparedSourceStale,
+    CurrentVoiceSegmentNotFound,
+    RealtimeAudioWorkerBusy,
+    VoiceCloneReplacementStale,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,6 +153,7 @@ pub struct PlaybackSnapshot {
     pub audio_processing_status: String,
     pub audio_processing_runtime: bool,
     pub audio_processing_gain_db: f64,
+    pub voice_clone_replacement: VoiceCloneReplacementState,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +182,8 @@ pub struct PlaybackCore {
     pending_audio_candidate: Option<AudioVariantCandidate>,
     audio_processing_profile: AudioProcessingProfile,
     audio_processing_status: String,
+    voice_clone_prepared_source: Option<VoiceClonePreparedSource>,
+    voice_clone_replacement: VoiceCloneReplacementState,
 }
 
 impl Default for PlaybackCore {
@@ -116,6 +213,8 @@ impl Default for PlaybackCore {
             pending_audio_candidate: None,
             audio_processing_profile: AudioProcessingProfile::default(),
             audio_processing_status: "disabled".to_owned(),
+            voice_clone_prepared_source: None,
+            voice_clone_replacement: VoiceCloneReplacementState::default(),
         }
     }
 }
@@ -159,6 +258,218 @@ impl PlaybackCore {
         } else {
             "disabled".to_owned()
         };
+        self.clear_voice_clone_for_new_generation();
+    }
+
+    pub fn mark_voice_clone_preparing(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<(), VoiceCloneRuntimeError> {
+        let source = self
+            .source_media
+            .as_ref()
+            .ok_or(VoiceCloneRuntimeError::SourceMediaRequired)?;
+        let operation_id = operation_id.trim();
+        if operation_id.is_empty() {
+            return Err(VoiceCloneRuntimeError::VoiceCloneTextInvalid(
+                VoiceCloneError::EmptyOperationId,
+            ));
+        }
+        self.voice_clone_prepared_source = None;
+        self.voice_clone_replacement = VoiceCloneReplacementState {
+            status: "preparing".to_owned(),
+            source_generation: Some(self.playback_generation),
+            source_path: Some(source.source_path.clone()),
+            operation_id: Some(operation_id.to_owned()),
+            replacement_audio_reference: None,
+            replacement_audio_sha256: None,
+            replacement_duration_ms: None,
+            replace_at_ms: None,
+            resume_at_ms: None,
+            input_text: None,
+            model: None,
+            error: None,
+        };
+        Ok(())
+    }
+
+    pub fn set_voice_clone_prepared_source(
+        &mut self,
+        prepared: VoiceClonePreparedSource,
+    ) -> Result<(), VoiceCloneRuntimeError> {
+        let source = self
+            .source_media
+            .as_ref()
+            .ok_or(VoiceCloneRuntimeError::SourceMediaRequired)?;
+        if prepared.source_index.source_generation != self.playback_generation
+            || prepared.source_index.source_path != source.source_path
+        {
+            return Err(VoiceCloneRuntimeError::VoiceClonePreparedSourceStale);
+        }
+        if prepared.operation_id.trim().is_empty()
+            || prepared.source_sha256.len() != 64
+            || !prepared
+                .source_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || prepared.reference_audio_sha256.len() != 64
+            || !prepared
+                .reference_audio_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(VoiceCloneRuntimeError::VoiceClonePreparedSourceStale);
+        }
+        for segment in &prepared.source_index.segments {
+            segment
+                .validate()
+                .map_err(VoiceCloneRuntimeError::VoiceCloneTextInvalid)?;
+        }
+
+        self.voice_clone_prepared_source = Some(prepared.clone());
+        self.voice_clone_replacement = VoiceCloneReplacementState {
+            status: "ready".to_owned(),
+            source_generation: Some(prepared.source_index.source_generation),
+            source_path: Some(prepared.source_index.source_path.clone()),
+            operation_id: Some(prepared.operation_id),
+            replacement_audio_reference: None,
+            replacement_audio_sha256: None,
+            replacement_duration_ms: None,
+            replace_at_ms: None,
+            resume_at_ms: None,
+            input_text: None,
+            model: prepared.model,
+            error: None,
+        };
+        Ok(())
+    }
+
+    pub fn start_voice_clone_replacement(
+        &mut self,
+        text: &str,
+        position_ms: u64,
+        operation_id: &str,
+        realtime_worker_occupied: bool,
+    ) -> Result<VoiceCloneReplacementPlan, VoiceCloneRuntimeError> {
+        if realtime_worker_occupied {
+            return Err(VoiceCloneRuntimeError::RealtimeAudioWorkerBusy);
+        }
+        if self.playback_state != PlaybackState::Playing {
+            return Err(VoiceCloneRuntimeError::PlaybackNotPlaying);
+        }
+        let source = self
+            .source_media
+            .as_ref()
+            .ok_or(VoiceCloneRuntimeError::SourceMediaRequired)?;
+        let prepared = self
+            .voice_clone_prepared_source
+            .clone()
+            .ok_or(VoiceCloneRuntimeError::VoiceCloneSourceNotPrepared)?;
+        if prepared.source_index.source_generation != self.playback_generation
+            || prepared.source_index.source_path != source.source_path
+        {
+            return Err(VoiceCloneRuntimeError::VoiceClonePreparedSourceStale);
+        }
+        let input_text = validate_voice_clone_text(text)
+            .map_err(VoiceCloneRuntimeError::VoiceCloneTextInvalid)?;
+        let current_segment =
+            locate_current_voice_segment(&prepared.source_index.segments, position_ms)
+                .ok_or(VoiceCloneRuntimeError::CurrentVoiceSegmentNotFound)?;
+        let operation_id = operation_id.trim();
+        if operation_id.is_empty() {
+            return Err(VoiceCloneRuntimeError::VoiceCloneTextInvalid(
+                VoiceCloneError::EmptyOperationId,
+            ));
+        }
+        self.voice_clone_replacement = VoiceCloneReplacementState {
+            status: "generating".to_owned(),
+            source_generation: Some(self.playback_generation),
+            source_path: Some(source.source_path.clone()),
+            operation_id: Some(operation_id.to_owned()),
+            replacement_audio_reference: None,
+            replacement_audio_sha256: None,
+            replacement_duration_ms: None,
+            replace_at_ms: Some(position_ms),
+            resume_at_ms: Some(current_segment.end_ms),
+            input_text: Some(input_text.clone()),
+            model: prepared.model.clone(),
+            error: None,
+        };
+        Ok(VoiceCloneReplacementPlan {
+            source_generation: self.playback_generation,
+            source_path: source.source_path.clone(),
+            source_sha256: prepared.source_sha256,
+            operation_id: operation_id.to_owned(),
+            input_text,
+            replace_at_ms: position_ms,
+            resume_at_ms: current_segment.end_ms,
+            reference_audio_path: prepared.reference_audio_path,
+            reference_audio_sha256: prepared.reference_audio_sha256,
+            sample_rate_hz: prepared.sample_rate_hz,
+            channel_count: prepared.channel_count,
+            model: prepared.model,
+        })
+    }
+
+    pub fn apply_voice_clone_replacement(
+        &mut self,
+        replacement: VoiceCloneCommittedReplacement,
+    ) -> Result<(), VoiceCloneRuntimeError> {
+        let source = self
+            .source_media
+            .as_ref()
+            .ok_or(VoiceCloneRuntimeError::SourceMediaRequired)?;
+        if replacement.source_generation != self.playback_generation
+            || replacement.source_path != source.source_path
+            || self.voice_clone_replacement.operation_id.as_deref()
+                != Some(replacement.operation_id.as_str())
+        {
+            return Err(VoiceCloneRuntimeError::VoiceCloneReplacementStale);
+        }
+        self.voice_clone_replacement = VoiceCloneReplacementState {
+            status: "playing".to_owned(),
+            source_generation: Some(replacement.source_generation),
+            source_path: Some(replacement.source_path),
+            operation_id: Some(replacement.operation_id),
+            replacement_audio_reference: Some(replacement.replacement_audio_reference),
+            replacement_audio_sha256: Some(replacement.replacement_audio_sha256),
+            replacement_duration_ms: Some(replacement.replacement_duration_ms),
+            replace_at_ms: Some(replacement.replace_at_ms),
+            resume_at_ms: Some(replacement.resume_at_ms),
+            input_text: Some(replacement.input_text),
+            model: replacement.model,
+            error: None,
+        };
+        Ok(())
+    }
+
+    pub fn mark_voice_clone_failed(&mut self, reason: impl Into<String>) {
+        self.voice_clone_replacement.status = "failed".to_owned();
+        self.voice_clone_replacement.error = Some(reason.into());
+        self.voice_clone_replacement.replacement_audio_reference = None;
+        self.voice_clone_replacement.replacement_audio_sha256 = None;
+        self.voice_clone_replacement.replacement_duration_ms = None;
+    }
+
+    pub fn mark_voice_clone_cancelled(&mut self, reason: impl Into<String>) {
+        let next_status = if self.voice_clone_prepared_source.is_some() {
+            "ready"
+        } else {
+            "cancelled"
+        };
+        self.voice_clone_replacement.status = next_status.to_owned();
+        self.voice_clone_replacement.error = Some(reason.into());
+        self.voice_clone_replacement.replacement_audio_reference = None;
+        self.voice_clone_replacement.replacement_audio_sha256 = None;
+        self.voice_clone_replacement.replacement_duration_ms = None;
+    }
+
+    pub fn clear_voice_clone_replacement(&mut self) {
+        self.reset_voice_clone_for_current_source();
+    }
+
+    pub fn voice_clone_prepared_source(&self) -> Option<VoiceClonePreparedSource> {
+        self.voice_clone_prepared_source.clone()
     }
 
     pub fn mark_media_processing_running(&mut self) -> Result<(), PlaybackError> {
@@ -485,6 +796,7 @@ impl PlaybackCore {
         self.reset_video_to_original();
         self.pending_video_reference = None;
         self.pending_video_sha256 = None;
+        self.clear_voice_clone_for_new_generation();
     }
 
     pub fn complete_loop(&mut self) -> Result<(), PlaybackError> {
@@ -494,6 +806,7 @@ impl PlaybackCore {
         self.pending_audio_candidate = None;
         self.reset_audio_to_original();
         self.commit_pending_video();
+        self.reset_voice_clone_for_current_source();
         Ok(())
     }
 
@@ -548,6 +861,7 @@ impl PlaybackCore {
             audio_processing_gain_db: self.audio_processing_profile.params.input_gain_db
                 + self.audio_processing_profile.params.output_gain_db
                 + self.audio_processing_profile.params.loudness_adjustment_db,
+            voice_clone_replacement: self.voice_clone_replacement.clone(),
         }
     }
 
@@ -639,6 +953,25 @@ impl PlaybackCore {
         self.current_video_source = Some("processed".to_owned());
         self.current_video_reference = Some(reference);
         self.current_video_sha256 = Some(sha256);
+    }
+
+    fn reset_voice_clone_for_current_source(&mut self) {
+        let mut state = VoiceCloneReplacementState::default();
+        if let Some(source) = self.source_media.as_ref() {
+            state.source_generation = Some(self.playback_generation);
+            state.source_path = Some(source.source_path.clone());
+        }
+        if let Some(prepared) = self.voice_clone_prepared_source.as_ref() {
+            state.status = "ready".to_owned();
+            state.operation_id = Some(prepared.operation_id.clone());
+            state.model = prepared.model.clone();
+        }
+        self.voice_clone_replacement = state;
+    }
+
+    fn clear_voice_clone_for_new_generation(&mut self) {
+        self.voice_clone_prepared_source = None;
+        self.voice_clone_replacement = VoiceCloneReplacementState::default();
     }
 }
 
