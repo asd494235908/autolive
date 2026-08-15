@@ -2,6 +2,9 @@ mod auth_session;
 mod commands;
 
 use auth_session::{delete_refresh_token, load_refresh_token, store_refresh_token};
+use autolive_desktop_core::runtime_resource_task::{
+    handle_runtime_resource_exit, RuntimeResourceTaskShutdown,
+};
 use commands::{
     cancel_research_analysis, cancel_runtime_resource_install, cancel_speech_to_speech_worker,
     cancel_voice_clone_operation, cleanup_local_caches_command, clear_runtime_resources,
@@ -91,49 +94,20 @@ fn main() -> ExitCode {
         }
     };
     app.run(|app_handle, event| {
-        if let RunEvent::ExitRequested { api, code, .. } = event {
+        if let RunEvent::ExitRequested { code, .. } = event {
             let state = app_handle.state::<AppState>();
-            if state.runtime_resource_exit_coordination_finished() {
-                return;
-            }
-            if state.runtime_resource_exit_coordination_started() {
-                api.prevent_exit();
-                return;
-            }
-            match state.shutdown_runtime_resources(Duration::from_secs(3)) {
-                Ok(autolive_desktop_core::runtime_resource_task::RuntimeResourceTaskShutdown::TimedOut) => {
-                    api.prevent_exit();
+            let shutdown = state.shutdown_runtime_resources(Duration::from_secs(3));
+            match &shutdown {
+                Ok(RuntimeResourceTaskShutdown::TimedOut) => {
                     eprintln!("runtime resource task did not stop within the 3 second exit budget");
-                    if state.begin_runtime_resource_exit_coordination() {
-                        let coordinator_state = state.inner().clone();
-                        let app_handle = app_handle.clone();
-                        let exit_code = code.unwrap_or(0);
-                        let spawn_result = std::thread::Builder::new()
-                            .name("runtime-resource-exit-coordinator".to_owned())
-                            .spawn(move || {
-                                loop {
-                                    match coordinator_state.shutdown_runtime_resources(Duration::from_secs(1)) {
-                                        Ok(autolive_desktop_core::runtime_resource_task::RuntimeResourceTaskShutdown::TimedOut) => continue,
-                                        Ok(_) => break,
-                                        Err(error) => {
-                                            eprintln!("failed to coordinate runtime resource shutdown: {error}");
-                                            coordinator_state.reset_runtime_resource_exit_coordination();
-                                            return;
-                                        }
-                                    }
-                                }
-                                coordinator_state.finish_runtime_resource_exit_coordination();
-                                app_handle.exit(exit_code);
-                            });
-                        if let Err(error) = spawn_result {
-                            state.reset_runtime_resource_exit_coordination();
-                            eprintln!("failed to start runtime resource exit coordinator: {error}");
-                        }
-                    }
                 }
-                Ok(_) => {}
                 Err(error) => eprintln!("failed to stop runtime resource task: {error}"),
+                Ok(RuntimeResourceTaskShutdown::Idle | RuntimeResourceTaskShutdown::Joined) => {}
             }
+            let exit_code = code.unwrap_or(0);
+            let _result = handle_runtime_resource_exit(shutdown, || {
+                std::process::exit(exit_code);
+            });
         }
     });
     ExitCode::SUCCESS

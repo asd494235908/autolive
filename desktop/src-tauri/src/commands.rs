@@ -58,7 +58,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -83,9 +83,6 @@ const VOICE_CLONE_AUDIO_PROBE_TIMEOUT_MS: u64 = 5_000;
 const MEDIA_IMPORT_PROBE_TIMEOUT_MS: u64 = 10_000;
 const MAX_VOICE_CLONE_WORKER_STDERR_BYTES: usize = 64 * 1024;
 const VOICE_CLONE_PLAYBACK_CACHE_VERSION: u32 = 1;
-const RUNTIME_RESOURCE_EXIT_IDLE: u8 = 0;
-const RUNTIME_RESOURCE_EXIT_COORDINATING: u8 = 1;
-const RUNTIME_RESOURCE_EXIT_FINISHED: u8 = 2;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -99,7 +96,6 @@ pub struct AppState {
     research_worker: Arc<Mutex<Option<ResearchWorkerTask>>>,
     research_status: Arc<Mutex<ResearchStatusDto>>,
     runtime_resource_task: Arc<RuntimeResourceTask>,
-    runtime_resource_exit_state: Arc<AtomicU8>,
 }
 
 #[derive(Debug)]
@@ -807,7 +803,6 @@ impl Default for AppState {
             research_worker: Arc::new(Mutex::new(None)),
             research_status: Arc::new(Mutex::new(ResearchStatusDto::default())),
             runtime_resource_task: Arc::new(RuntimeResourceTask::default()),
-            runtime_resource_exit_state: Arc::new(AtomicU8::new(RUNTIME_RESOURCE_EXIT_IDLE)),
         }
     }
 }
@@ -818,40 +813,6 @@ impl AppState {
         budget: Duration,
     ) -> Result<RuntimeResourceTaskShutdown, String> {
         self.runtime_resource_task.shutdown(budget)
-    }
-
-    pub fn begin_runtime_resource_exit_coordination(&self) -> bool {
-        self.runtime_resource_exit_state
-            .compare_exchange(
-                RUNTIME_RESOURCE_EXIT_IDLE,
-                RUNTIME_RESOURCE_EXIT_COORDINATING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    pub fn runtime_resource_exit_coordination_started(&self) -> bool {
-        self.runtime_resource_exit_state.load(Ordering::Acquire)
-            == RUNTIME_RESOURCE_EXIT_COORDINATING
-    }
-
-    pub fn finish_runtime_resource_exit_coordination(&self) {
-        self.runtime_resource_exit_state
-            .store(RUNTIME_RESOURCE_EXIT_FINISHED, Ordering::Release);
-    }
-
-    pub fn reset_runtime_resource_exit_coordination(&self) {
-        let _ignored = self.runtime_resource_exit_state.compare_exchange(
-            RUNTIME_RESOURCE_EXIT_COORDINATING,
-            RUNTIME_RESOURCE_EXIT_IDLE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-    }
-
-    pub fn runtime_resource_exit_coordination_finished(&self) -> bool {
-        self.runtime_resource_exit_state.load(Ordering::Acquire) == RUNTIME_RESOURCE_EXIT_FINISHED
     }
 
     fn lock_voice_clone_launch(&self) -> Result<std::sync::MutexGuard<'_, ()>, CommandErrorDto> {
@@ -5710,7 +5671,6 @@ mod tests {
         VoiceClonePreparedSource, VOICE_CLONE_SYNTHESIS_MODEL_ID,
     };
     use std::path::PathBuf;
-    use std::sync::Arc;
 
     #[cfg(unix)]
     #[test]
@@ -5736,30 +5696,6 @@ mod tests {
         std::fs::set_permissions(&path, permissions).expect("permissions should be set");
         assert!(development_executable_ready(&path));
         let _ignored = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn runtime_exit_coordination_can_start_only_once() {
-        let state = Arc::new(AppState::default());
-        let mut workers = Vec::new();
-        for _ in 0..8 {
-            let state = Arc::clone(&state);
-            workers.push(std::thread::spawn(move || {
-                state.begin_runtime_resource_exit_coordination()
-            }));
-        }
-        let starts = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("gate worker should join"))
-            .filter(|started| *started)
-            .count();
-
-        assert_eq!(starts, 1);
-        assert!(state.runtime_resource_exit_coordination_started());
-        assert!(!state.runtime_resource_exit_coordination_finished());
-        state.finish_runtime_resource_exit_coordination();
-        assert!(state.runtime_resource_exit_coordination_finished());
-        assert!(!state.begin_runtime_resource_exit_coordination());
     }
 
     fn test_voice_clone_playback_plan(model: Option<&str>) -> VoiceClonePlaybackPlan {

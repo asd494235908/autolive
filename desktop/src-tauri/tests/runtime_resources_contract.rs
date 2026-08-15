@@ -1024,6 +1024,57 @@ fn clear_removes_a_directory_symlink_without_following_it() {
     assert!(!harness.layout.version_root.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn clear_does_not_follow_a_directory_replaced_by_an_external_symlink() {
+    use std::os::unix::fs::symlink;
+    use std::sync::Barrier;
+
+    let fixture = RangeFixture::new(FILE_BYTES);
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+    let victim = harness.layout.version_root.join("victim");
+    let displaced = harness.layout.version_root.join("displaced");
+    let outside = TestDir::new("clear-symlink-race-outside");
+    let outside_file = outside.path().join("inside.bin");
+    fs::create_dir_all(&victim).expect("victim directory");
+    fs::write(victim.join("inside.bin"), b"owned").expect("victim fixture");
+    fs::write(&outside_file, b"keep").expect("outside fixture");
+
+    let entry_reached = Arc::new(Barrier::new(2));
+    let replacement_done = Arc::new(Barrier::new(2));
+    let attacker_entry_reached = Arc::clone(&entry_reached);
+    let attacker_replacement_done = Arc::clone(&replacement_done);
+    let outside_root = outside.path().to_path_buf();
+    let attacker = thread::spawn(move || {
+        attacker_entry_reached.wait();
+        fs::rename(&victim, &displaced).expect("victim should be displaced");
+        symlink(outside_root, &victim).expect("external symlink should replace victim");
+        attacker_replacement_done.wait();
+    });
+
+    let result = harness
+        .installer
+        .clear_current_release(&AtomicBool::new(false), |status| {
+            if status.current_file.as_deref() == Some("victim/inside.bin") {
+                entry_reached.wait();
+                replacement_done.wait();
+            }
+        });
+    attacker.join().expect("attacker thread should join");
+
+    assert_eq!(
+        fs::read(&outside_file).expect("outside file must remain"),
+        b"keep"
+    );
+    if result.is_err() || harness.layout.version_root.exists() {
+        harness
+            .installer
+            .clear_current_release(&AtomicBool::new(false), |_| {})
+            .expect("retry should converge after replacement race");
+    }
+    assert!(!harness.layout.version_root.exists());
+}
+
 #[test]
 fn independent_installers_for_the_same_root_are_mutually_exclusive() {
     let fixture = RangeFixture::new(FILE_BYTES);

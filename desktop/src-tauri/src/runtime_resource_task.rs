@@ -16,6 +16,16 @@ pub enum RuntimeResourceTaskShutdown {
     TimedOut,
 }
 
+pub fn handle_runtime_resource_exit(
+    result: Result<RuntimeResourceTaskShutdown, String>,
+    force_exit: impl FnOnce(),
+) -> Result<RuntimeResourceTaskShutdown, String> {
+    if matches!(&result, Ok(RuntimeResourceTaskShutdown::TimedOut) | Err(_)) {
+        force_exit();
+    }
+    result
+}
+
 #[derive(Debug)]
 pub struct RuntimeResourceTask {
     status: Arc<Mutex<RuntimeResourceStatus>>,
@@ -316,11 +326,11 @@ fn is_terminal(state: RuntimeResourceState) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeResourceTask, RuntimeResourceTaskShutdown};
+    use super::{handle_runtime_resource_exit, RuntimeResourceTask, RuntimeResourceTaskShutdown};
     use crate::runtime_resources::{
         RuntimeResourceComponent, RuntimeResourceState, RuntimeResourceStatus,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -344,6 +354,36 @@ mod tests {
             state: RuntimeResourceState::Ready,
             ..checking_status()
         }
+    }
+
+    #[test]
+    fn exit_policy_forces_only_timeout_and_shutdown_errors() {
+        for shutdown in [
+            RuntimeResourceTaskShutdown::Idle,
+            RuntimeResourceTaskShutdown::Joined,
+        ] {
+            let forced = AtomicUsize::new(0);
+            let result = handle_runtime_resource_exit(Ok(shutdown), || {
+                forced.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(result, Ok(shutdown));
+            assert_eq!(forced.load(Ordering::Relaxed), 0);
+        }
+
+        let forced = AtomicUsize::new(0);
+        let result =
+            handle_runtime_resource_exit(Ok(RuntimeResourceTaskShutdown::TimedOut), || {
+                forced.fetch_add(1, Ordering::Relaxed);
+            });
+        assert_eq!(result, Ok(RuntimeResourceTaskShutdown::TimedOut));
+        assert_eq!(forced.load(Ordering::Relaxed), 1);
+
+        let forced = AtomicUsize::new(0);
+        let result = handle_runtime_resource_exit(Err("shutdown failed".to_owned()), || {
+            forced.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(result, Err("shutdown failed".to_owned()));
+        assert_eq!(forced.load(Ordering::Relaxed), 1);
     }
 
     #[test]

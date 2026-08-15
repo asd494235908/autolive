@@ -69,22 +69,6 @@ fn configured_worker_executable_ignores_environment_in_release() {
     }
 }
 
-#[test]
-fn release_command_source_removes_worker_and_media_overrides() {
-    let source = std::fs::read_to_string("src/speech_to_speech_worker.rs")
-        .expect("speech worker source should exist");
-    for variable in [
-        "SPEECH_TO_SPEECH_WORKER_ENV",
-        "FFMPEG_PATH_ENV",
-        "FFPROBE_PATH_ENV",
-    ] {
-        assert!(
-            source.contains(&format!("env_remove({variable})")),
-            "release command must remove {variable}"
-        );
-    }
-}
-
 #[cfg(unix)]
 fn make_executable(path: &std::path::Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
@@ -335,14 +319,18 @@ fn packaged_media_paths_are_injected_for_capability_probe_and_actual_task() {
         &resource_dir,
     )
     .expect("explicit media paths should not block the worker");
-    assert_eq!(
-        std::fs::read_to_string(&captured_environment)
-            .expect("explicit worker environment should be captured"),
-        format!(
+    let expected_after_override = match worker_environment_policy(cfg!(debug_assertions)) {
+        WorkerEnvironmentPolicy::DevelopmentOverrides => format!(
             "{}\n{}",
             explicit_ffmpeg.display(),
             explicit_ffprobe.display()
-        )
+        ),
+        WorkerEnvironmentPolicy::PackagedOnly => expected,
+    };
+    assert_eq!(
+        std::fs::read_to_string(&captured_environment)
+            .expect("explicit worker environment should be captured"),
+        expected_after_override
     );
 
     match previous_ffmpeg {

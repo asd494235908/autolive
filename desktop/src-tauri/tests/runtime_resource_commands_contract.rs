@@ -103,20 +103,6 @@ fn runtime_resource_commands_are_registered() {
 }
 
 #[test]
-fn app_state_owns_the_single_runtime_resource_task_and_exit_has_a_three_second_budget() {
-    let commands = fs::read_to_string("src/commands.rs").expect("commands source should exist");
-    let main = fs::read_to_string("src/main.rs").expect("main source should exist");
-
-    assert!(commands.contains("RuntimeResourceTask"));
-    assert!(commands.contains("runtime_resource_task"));
-    assert!(main.contains("RunEvent::ExitRequested"));
-    assert!(main.contains("Duration::from_secs(3)"));
-    assert!(main.contains("api.prevent_exit()"));
-    assert!(main.contains("app_handle.exit"));
-    assert!(main.contains("ExitCode::FAILURE"));
-}
-
-#[test]
 fn packaged_paths_are_derived_from_the_versioned_app_data_layout() {
     let target = current_target();
     if target == "unsupported" {

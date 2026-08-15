@@ -568,31 +568,62 @@ impl RuntimeResourceInstaller {
         on_status: &mut impl FnMut(RuntimeResourceStatus),
     ) -> Result<(), ResourceInstallError> {
         self.check_cancel(cancel)?;
-        match fs::symlink_metadata(&self.layout.version_root) {
-            Ok(_) => remove_tree_cancellable(
-                &self.layout.version_root,
-                &self.layout.version_root,
-                cancel,
-                &mut |relative_path| {
-                    on_status(self.status(
-                        RuntimeResourceState::Checking,
-                        None,
-                        Some(relative_path.display().to_string()),
-                        0,
-                        0,
-                        0,
-                        0,
-                        None,
-                    ));
-                },
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(io_error(
-                "inspect clear root",
-                &self.layout.version_root,
-                error,
-            )),
-        }
+        let parent_path =
+            self.layout
+                .version_root
+                .parent()
+                .ok_or_else(|| ResourceInstallError::Io {
+                    operation: "resolve clear root parent",
+                    path: self.layout.version_root.display().to_string(),
+                    message: "resource release root has no parent directory".to_owned(),
+                })?;
+        let root_name =
+            self.layout
+                .version_root
+                .file_name()
+                .ok_or_else(|| ResourceInstallError::Io {
+                    operation: "resolve clear root name",
+                    path: self.layout.version_root.display().to_string(),
+                    message: "resource release root has no directory name".to_owned(),
+                })?;
+        let parent = Dir::open_ambient_dir(parent_path, ambient_authority())
+            .map_err(|error| io_error("open clear root parent", parent_path, error))?;
+        let root = match parent.open_dir(root_name) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => {
+                return parent.remove_file(root_name).map_err(|error| {
+                    io_error("clear release root entry", &self.layout.version_root, error)
+                });
+            }
+        };
+
+        remove_directory_contents(
+            &root,
+            &self.layout.version_root,
+            Path::new(""),
+            cancel,
+            &mut |relative_path| {
+                on_status(self.status(
+                    RuntimeResourceState::Checking,
+                    None,
+                    Some(relative_path.display().to_string()),
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                ));
+            },
+        )?;
+        drop(root);
+        self.check_cancel(cancel)?;
+        remove_directory_entry(
+            &parent,
+            root_name,
+            &self.layout.version_root,
+            "clear release root",
+        )
     }
 
     fn install_inner(
@@ -1303,70 +1334,59 @@ impl Drop for OperationGuard {
     }
 }
 
-fn remove_tree_cancellable(
-    root: &Path,
-    path: &Path,
+fn remove_directory_contents(
+    directory: &Dir,
+    display_root: &Path,
+    relative_directory: &Path,
     cancel: &AtomicBool,
     on_entry: &mut impl FnMut(&Path),
 ) -> Result<(), ResourceInstallError> {
-    if cancel.load(Ordering::Acquire) {
-        return Err(ResourceInstallError::Cancelled);
-    }
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| io_error("inspect clear entry", path, error))?;
-    if metadata.file_type().is_symlink() {
-        let relative = path.strip_prefix(root).unwrap_or(path);
-        on_entry(relative);
+    let display_directory = display_root.join(relative_directory);
+    let entries = directory
+        .entries()
+        .map_err(|error| io_error("read clear directory", &display_directory, error))?;
+    for entry in entries {
         if cancel.load(Ordering::Acquire) {
             return Err(ResourceInstallError::Cancelled);
         }
-        return remove_symlink(path, metadata.file_type());
-    }
-    if metadata.is_file() {
-        let relative = path.strip_prefix(root).unwrap_or(path);
-        on_entry(relative);
+        let entry =
+            entry.map_err(|error| io_error("read clear entry", &display_directory, error))?;
+        let name = entry.file_name();
+        let relative = relative_directory.join(&name);
+        on_entry(&relative);
         if cancel.load(Ordering::Acquire) {
             return Err(ResourceInstallError::Cancelled);
         }
-        return fs::remove_file(path).map_err(|error| io_error("clear file", path, error));
-    }
-    if !metadata.is_dir() {
-        return Err(ResourceInstallError::Io {
-            operation: "clear unsupported entry",
-            path: path.display().to_string(),
-            message: "entry is neither a file, directory, nor symbolic link".to_owned(),
-        });
-    }
-    for entry in
-        fs::read_dir(path).map_err(|error| io_error("read clear directory", path, error))?
-    {
-        if cancel.load(Ordering::Acquire) {
-            return Err(ResourceInstallError::Cancelled);
+        let display_path = display_root.join(&relative);
+        match directory.open_dir(&name) {
+            Ok(child) => {
+                remove_directory_contents(&child, display_root, &relative, cancel, on_entry)?;
+                drop(child);
+                if cancel.load(Ordering::Acquire) {
+                    return Err(ResourceInstallError::Cancelled);
+                }
+                remove_directory_entry(directory, &name, &display_path, "clear directory")?;
+            }
+            Err(_) => directory
+                .remove_file(&name)
+                .map_err(|error| io_error("clear file entry", &display_path, error))?,
         }
-        let entry = entry.map_err(|error| io_error("read clear entry", path, error))?;
-        remove_tree_cancellable(root, &entry.path(), cancel, on_entry)?;
     }
-    if path != root {
-        let relative = path.strip_prefix(root).unwrap_or(path);
-        on_entry(relative);
-    }
-    if cancel.load(Ordering::Acquire) {
-        return Err(ResourceInstallError::Cancelled);
-    }
-    fs::remove_dir(path).map_err(|error| io_error("clear directory", path, error))
+    Ok(())
 }
 
-fn remove_symlink(path: &Path, file_type: fs::FileType) -> Result<(), ResourceInstallError> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileTypeExt;
-        if file_type.is_symlink_dir() {
-            return fs::remove_dir(path)
-                .map_err(|error| io_error("clear directory symlink", path, error));
-        }
+fn remove_directory_entry(
+    parent: &Dir,
+    name: &std::ffi::OsStr,
+    display_path: &Path,
+    operation: &'static str,
+) -> Result<(), ResourceInstallError> {
+    match parent.remove_dir(name) {
+        Ok(()) => Ok(()),
+        Err(_) => parent
+            .remove_file(name)
+            .map_err(|error| io_error(operation, display_path, error)),
     }
-    let _ = file_type;
-    fs::remove_file(path).map_err(|error| io_error("clear symlink", path, error))
 }
 
 fn total_size(files: &[&ManifestFile]) -> u64 {
