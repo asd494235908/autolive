@@ -31,7 +31,10 @@ function removeReleaseExcludedEntries(root) {
       rmSync(path, { recursive: true, force: true });
     } else if (entry.isDirectory()) {
       if (['trees', 'blobs'].includes(entry.name)) rmSync(path, { recursive: true, force: true });
-      else removeReleaseExcludedEntries(path);
+      else {
+        removeReleaseExcludedEntries(path);
+        if (readdirSync(path).length === 0) rmSync(path, { recursive: true, force: true });
+      }
     } else if (entry.isFile() && entry.name.endsWith('.log')) {
       rmSync(path, { force: true });
     }

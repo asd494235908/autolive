@@ -45,6 +45,8 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
   writeFixture(sourceRoot, 'voice-models/huggingface/hub/trees/tree.json', 'tree');
   writeFixture(sourceRoot, 'voice-models/huggingface/hub/blobs/blob.bin', 'blob');
   writeFixture(sourceRoot, 'voice-models/huggingface/hub/download.log', 'log');
+  mkdirSync(join(sourceRoot, 'voice-models/huggingface/xet/empty/staging'), { recursive: true });
+  mkdirSync(join(sourceRoot, 'binaries/empty'), { recursive: true });
 
   const result = buildRuntimeResourceRelease({
     target: 'aarch64-apple-darwin',
@@ -83,6 +85,14 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
   );
   assert.equal(
     existsSync(join(outputRoot, 'autolive-resources', expectedRelease, 'common/voice-models/.agent_harnesses.json')),
+    false,
+  );
+  assert.equal(
+    existsSync(join(outputRoot, 'autolive-resources', expectedRelease, 'common/voice-models/huggingface/xet')),
+    false,
+  );
+  assert.equal(
+    existsSync(join(outputRoot, 'autolive-resources', expectedRelease, 'aarch64-apple-darwin/binaries/empty')),
     false,
   );
   assert.equal(
