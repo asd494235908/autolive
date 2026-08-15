@@ -1,14 +1,15 @@
-import React from 'react';
+import React, { lazy, Suspense } from 'react';
 import ReactDOM from 'react-dom/client';
-import { App as AntApp, ConfigProvider } from 'antd';
-import App from './App';
+import { StartupErrorBoundary, StartupLoading } from './启动加载';
+
+const App = lazy(() => import('./App'));
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
   <React.StrictMode>
-    <ConfigProvider>
-      <AntApp>
+    <StartupErrorBoundary>
+      <Suspense fallback={<StartupLoading message="正在加载界面…" />}>
         <App />
-      </AntApp>
-    </ConfigProvider>
+      </Suspense>
+    </StartupErrorBoundary>
   </React.StrictMode>,
 );

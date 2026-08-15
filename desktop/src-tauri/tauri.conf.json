@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "autoLive Desktop",
+  "productName": "autolive-desktop-core",
   "version": "0.1.0",
-  "identifier": "com.gepin.autolive.desktop",
+  "identifier": "com.gepin.autolive.desktop.core",
   "build": {
     "beforeBuildCommand": "pnpm build",
     "beforeDevCommand": "pnpm dev --host 0.0.0.0 --port 5173",
@@ -31,9 +31,10 @@
     "windows": [
       {
         "label": "main",
-        "title": "autoLive Desktop",
+        "title": "autolive-desktop-core",
         "width": 1100,
         "height": 820,
+        "backgroundColor": "#ffffff",
         "resizable": true,
         "fullscreen": false,
         "visible": true,

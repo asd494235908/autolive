@@ -38,7 +38,8 @@ test('desktop page exposes the approved three-column layout contract', async () 
   assert.match(app, /aria-label="声音处理"/);
   assert.match(app, /aria-label="实时话术幻化"/);
   assert.match(app, /aria-label="视频处理"/);
-  assert.match(main, /<ConfigProvider>/);
+  assert.match(app, /<ConfigProvider>/);
+  assert.match(app, /<AntApp>/);
   assert.doesNotMatch(main, /darkAlgorithm|colorPrimary|colorBgBase/);
   assert.match(css, /grid-template-columns:\s*minmax\(0,\s*28fr\)\s+minmax\(0,\s*38fr\)\s+minmax\(0,\s*34fr\)/);
   assert.match(css, /@media\s*\(max-width:\s*800px\)/);

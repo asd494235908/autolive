@@ -17,6 +17,7 @@ type ResolveBaseAudioSourceInput = {
 type ShouldPauseInterludeInput = {
   playbackState: string;
   voiceCloneStatus: string;
+  currentTextStatus?: string;
 };
 
 type ResolvePlaybackAudioSourceInput = {
@@ -101,7 +102,14 @@ export function chooseInterludeIndex(count: number, previousIndex: number | null
   return nextIndex >= previousIndex ? nextIndex + 1 : nextIndex;
 }
 
-export function shouldPauseInterlude({ playbackState, voiceCloneStatus }: ShouldPauseInterludeInput) {
+export function shouldPauseInterlude({
+  playbackState,
+  voiceCloneStatus,
+  currentTextStatus,
+}: ShouldPauseInterludeInput) {
   if (playbackState !== 'playing') return true;
-  return voiceCloneStatus === 'generating' || voiceCloneStatus === 'playing';
+  return voiceCloneStatus === 'generating' ||
+    voiceCloneStatus === 'playing' ||
+    currentTextStatus === 'preparing' ||
+    currentTextStatus === 'playing';
 }

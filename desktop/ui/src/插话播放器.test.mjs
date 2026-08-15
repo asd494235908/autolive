@@ -117,6 +117,22 @@ test('shouldPauseInterlude 在暂停、固定话术生成中或播放中时返�
     }),
     true,
   );
+  assert.equal(
+    shouldPauseInterlude({
+      playbackState: 'playing',
+      voiceCloneStatus: 'ready',
+      currentTextStatus: 'preparing',
+    }),
+    true,
+  );
+  assert.equal(
+    shouldPauseInterlude({
+      playbackState: 'playing',
+      voiceCloneStatus: 'ready',
+      currentTextStatus: 'playing',
+    }),
+    true,
+  );
 });
 
 test('resolvePlaybackAudioSource 使用当前视频处理状态作为旧快照回退', async () => {
@@ -152,6 +168,36 @@ test('最终效果窗口会复用 Web Audio 上下文，避免 StrictMode 重复
   assert.match(appSource, /if \(audioContextRef\.current\) return scheduleAudioContextCleanup;/);
   assert.match(appSource, /window\.setTimeout\(\(\) => \{/);
   assert.match(appSource, /插话不会播放/);
+});
+
+test('实时诊断以至少 20Hz 发送 128 点采样窗口，避免曲线跳变', async () => {
+  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
+
+  assert.match(appSource, /const DIAGNOSTIC_PUBLISH_INTERVAL_MS = 50;/);
+  assert.match(appSource, /const DIAGNOSTIC_SAMPLE_COUNT = 128;/);
+  assert.match(appSource, /waveform\.slice\(0, DIAGNOSTIC_SAMPLE_COUNT\)/);
+  assert.match(appSource, /spectrum\.slice\(0, DIAGNOSTIC_SAMPLE_COUNT\)/);
+});
+
+test('实时音频为 Worker 处理和候选换轨预留足够安全余量', async () => {
+  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
+
+  assert.match(appSource, /const REALTIME_AUDIO_SAFETY_LEAD_MS = 6_000;/);
+  assert.match(appSource, /const REALTIME_AUDIO_WORKER_TIMEOUT_MS = 5_000;/);
+  assert.match(appSource, /const safetyLeadMs = REALTIME_AUDIO_SAFETY_LEAD_MS;/);
+  assert.match(appSource, /timeout_ms: REALTIME_AUDIO_WORKER_TIMEOUT_MS,/);
+});
+
+test('实时候选真正播放前保留源视频音频，并预加载候选元素', async () => {
+  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
+
+  assert.match(appSource, /const realtimeAudioPlayingRef = useRef\(false\);/);
+  assert.match(appSource, /function handleRealtimeAudioPlaying\(\)/);
+  assert.match(appSource, /onPlaying=\{handleRealtimeAudioPlaying\}/);
+  assert.match(appSource, /onError=\{handleRealtimeAudioElementError\}/);
+  assert.match(appSource, /effectiveAudioSource === 'realtime_variant'\s*&&\s*realtimeAudioPlayingRef\.current/);
+  assert.match(appSource, /effectiveAudioSource !== 'realtime_variant'\s*\|\|\s*!realtimeAudioPlaying/);
+  assert.match(appSource, /<audio[\s\S]*?preload="auto"[\s\S]*?onPlaying=\{handleRealtimeAudioPlaying\}/);
 });
 
 test('插话音频预加载，正常播放到结束后才切换，并显示加载失败原因', async () => {

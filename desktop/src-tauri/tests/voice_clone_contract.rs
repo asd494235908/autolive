@@ -2,8 +2,8 @@
 mod voice_clone;
 
 use voice_clone::{
-    locate_current_voice_segment, validate_replacement_result, validate_voice_clone_text,
-    VoiceCloneError, VoiceClonePrepareRequest, VoiceClonePrepareResult,
+    hash_voice_clone_text, locate_current_voice_segment, validate_replacement_result,
+    validate_voice_clone_text, VoiceCloneError, VoiceClonePrepareRequest, VoiceClonePrepareResult,
     VoiceCloneReplacementRequest, VoiceCloneReplacementResult, VoiceCloneSegment,
     VoiceCloneSourceIndex,
 };
@@ -56,6 +56,14 @@ fn text_validation_trims_and_rejects_empty_or_over_500_unicode_chars() {
             max_chars: 500,
             actual_chars: 501,
         })
+    );
+}
+
+#[test]
+fn text_hash_is_stable_for_the_current_text_identity() {
+    assert_eq!(
+        hash_voice_clone_text("当前文案"),
+        "47d524c3bda1396f5b91f3c10edd764f0b2eade25cea9171dc81dbce5cb8cc67"
     );
 }
 
@@ -200,6 +208,7 @@ fn replacement_result_accepts_current_source_and_absolute_audio_output() {
     let prepare_request = VoiceClonePrepareRequest {
         source_generation: request.source_generation,
         source_path: request.source_path.clone(),
+        source_sha256: request.source_sha256.clone(),
         operation_id: request.operation_id.clone(),
     };
     let prepare_result = VoiceClonePrepareResult {
@@ -210,6 +219,7 @@ fn replacement_result_accepts_current_source_and_absolute_audio_output() {
     };
     assert_eq!(prepare_result.source_index, source_index);
     assert_eq!(prepare_request.operation_id, prepare_result.operation_id);
+    assert_eq!(prepare_request.source_sha256, request.source_sha256);
     assert_eq!(
         validate_replacement_result(&sample_result(), &request),
         Ok(())

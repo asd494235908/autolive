@@ -117,7 +117,6 @@ pub enum FileHashError {
     EmptyPath,
     CanonicalizeFailed { path: String },
     NotAFile { path: String },
-    UnsupportedExtension { path: String },
     FileOpenFailed { path: String },
     FileReadFailed { path: String },
 }
@@ -131,9 +130,6 @@ impl Display for FileHashError {
                 write!(f, "文件路径规范化失败: {path}")
             }
             Self::NotAFile { path } => write!(f, "路径不是普通文件: {path}"),
-            Self::UnsupportedExtension { path } => {
-                write!(f, "MP4 哈希命令仅支持 .mp4 文件: {path}")
-            }
             Self::FileOpenFailed { path } => write!(f, "打开文件失败: {path}"),
             Self::FileReadFailed { path } => write!(f, "读取文件失败: {path}"),
         }

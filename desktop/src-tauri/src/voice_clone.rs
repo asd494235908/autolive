@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
 pub const MAX_VOICE_CLONE_TEXT_CHARS: usize = 500;
 pub const MIN_VOICE_SEGMENT_DURATION_MS: u64 = 200;
+pub const DEFAULT_VOICE_CLONE_REPLACEMENT_DURATION_MS: u64 = 3_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoiceCloneSegment {
@@ -49,6 +51,7 @@ pub struct VoiceCloneSourceIndex {
 pub struct VoiceClonePrepareRequest {
     pub source_generation: u64,
     pub source_path: String,
+    pub source_sha256: String,
     pub operation_id: String,
 }
 
@@ -164,6 +167,18 @@ pub fn validate_voice_clone_text(text: &str) -> Result<String, VoiceCloneError> 
     Ok(trimmed.to_owned())
 }
 
+pub fn hash_voice_clone_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ignored = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
 pub fn locate_current_voice_segment(
     segments: &[VoiceCloneSegment],
     position_ms: u64,
@@ -176,6 +191,20 @@ pub fn locate_current_voice_segment(
                 && position_ms < segment.end_ms
         })
         .cloned()
+}
+
+pub fn resolve_voice_clone_resume_at_ms(
+    segments: &[VoiceCloneSegment],
+    replace_at_ms: u64,
+    source_duration_ms: u64,
+) -> u64 {
+    locate_current_voice_segment(segments, replace_at_ms)
+        .map(|segment| segment.end_ms.min(source_duration_ms))
+        .unwrap_or_else(|| {
+            replace_at_ms
+                .saturating_add(DEFAULT_VOICE_CLONE_REPLACEMENT_DURATION_MS)
+                .min(source_duration_ms)
+        })
 }
 
 pub fn validate_replacement_result(
@@ -231,4 +260,41 @@ pub fn validate_replacement_result(
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_voice_clone_resume_at_ms, VoiceCloneSegment};
+
+    #[test]
+    fn resume_uses_current_speech_segment_end() {
+        let segments = vec![VoiceCloneSegment {
+            start_ms: 1_000,
+            end_ms: 2_400,
+            text: "当前话术".to_owned(),
+        }];
+
+        assert_eq!(
+            resolve_voice_clone_resume_at_ms(&segments, 1_500, 10_000),
+            2_400
+        );
+    }
+
+    #[test]
+    fn resume_uses_three_seconds_in_silence_and_caps_at_source_end() {
+        let segments = vec![VoiceCloneSegment {
+            start_ms: 1_000,
+            end_ms: 2_400,
+            text: "当前话术".to_owned(),
+        }];
+
+        assert_eq!(
+            resolve_voice_clone_resume_at_ms(&segments, 4_000, 10_000),
+            7_000
+        );
+        assert_eq!(
+            resolve_voice_clone_resume_at_ms(&segments, 9_000, 10_000),
+            10_000
+        );
+    }
 }

@@ -1,0 +1,108 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { test } from 'node:test';
+
+async function readSource(fileName) {
+  return readFile(new URL(`./${fileName}`, import.meta.url), 'utf8');
+}
+
+test('HTML 入口在 React 执行前提供静态启动反馈', async () => {
+  const source = await readSource('../index.html');
+
+  assert.match(source, /id="startup-splash"/);
+  assert.match(source, /正在启动桌面端/);
+  assert.match(source, /startup-splash-spinner/);
+  assert.match(source, /animation/);
+});
+
+test('启动壳使用 Ant Design 默认浅色主题色', async () => {
+  const html = await readSource('../index.html');
+  const loading = await readSource('启动加载.tsx');
+
+  assert.match(html, /color-scheme:\s*light/);
+  assert.match(html, /background:\s*#fff/);
+  assert.match(html, /#1677ff/);
+  assert.match(html, /rgba\(0, 0, 0, 0\.88\)/);
+  assert.match(loading, /background: '#fff'/);
+  assert.match(loading, /color: 'rgba\(0, 0, 0, 0\.88\)'/);
+  assert.match(loading, /borderTopColor: '#1677ff'/);
+});
+
+test('主窗口允许页面纵向滚动，滚动锁仅由最终效果窗口使用', async () => {
+  const html = await readSource('../index.html');
+
+  assert.match(html, /body\s*\{[\s\S]*overflow-y:\s*auto;/);
+  assert.doesNotMatch(html, /body\s*\{[\s\S]*overflow:\s*hidden;/);
+});
+
+test('React 入口懒加载 App 并提供 Suspense 与错误恢复', async () => {
+  const source = await readSource('main.tsx');
+
+  assert.match(source, /lazy\(\(\) => import\(['"]\.\/App['"]\)\)/);
+  assert.match(source, /<Suspense\b/);
+  assert.match(source, /<StartupErrorBoundary\b/);
+  assert.doesNotMatch(source, /from ['"]antd['"]/);
+  assert.doesNotMatch(source, /import App from ['"]\.\/App['"]/);
+});
+
+test('Ant Design 根外壳由延迟加载的 App 自己拥有', async () => {
+  const source = await readSource('App.tsx');
+
+  assert.match(source, /App as AntApp/);
+  assert.match(source, /ConfigProvider/);
+  assert.match(source, /<ConfigProvider>/);
+  assert.match(source, /<AntApp>/);
+});
+
+test('导入视频使用单一同步 guard 覆盖选择、探测、播放和打开窗口', async () => {
+  const source = await readSource('App.tsx');
+  const importVideo = source.slice(
+    source.indexOf('async function importVideo'),
+    source.indexOf('function updateInterludeDraft'),
+  );
+
+  assert.match(source, /const \[importVideoBusy, setImportVideoBusy\] = useState\(false\);/);
+  assert.match(source, /const importVideoInFlightRef = useRef\(false\);/);
+  assert.match(
+    importVideo,
+    /if \(importVideoInFlightRef\.current\) return;[\s\S]*importVideoInFlightRef\.current = true;[\s\S]*setImportVideoBusy\(true\);/,
+  );
+  assert.match(
+    importVideo,
+    /try \{[\s\S]*await open\([\s\S]*probe_local_mp4[\s\S]*start_playback[\s\S]*await openFinalEffectWindowFromHome\(\);/,
+  );
+  assert.match(
+    importVideo,
+    /catch \(cause\) \{[\s\S]*导入视频失败[\s\S]*\} finally \{[\s\S]*importVideoInFlightRef\.current = false;[\s\S]*setImportVideoBusy\(false\);[\s\S]*\}/,
+  );
+  assert.doesNotMatch(importVideo, /setTimeout|waitForAbortableDelay/);
+});
+
+test('导入按钮在完整导入链路中显示 loading 并禁止重复点击', async () => {
+  const source = await readSource('App.tsx');
+  const buttonLabel = source.indexOf('导入视频并播放');
+  const buttonStart = source.lastIndexOf('<Button', buttonLabel);
+  const importButton = source.slice(buttonStart, source.indexOf('</Button>', buttonStart));
+
+  assert.match(importButton, /loading=\{importVideoBusy\}/);
+  assert.match(importButton, /disabled=\{importVideoBusy\}/);
+  assert.match(importButton, /onClick=\{\(\) => void importVideo\(\)\}/);
+});
+
+test('后台重启后自动恢复上次导入的视频并继续准备人声', async () => {
+  const source = await readSource('App.tsx');
+  const importVideo = source.slice(
+    source.indexOf('async function importVideo'),
+    source.indexOf('function updateInterludeDraft'),
+  );
+
+  assert.match(source, /const sourceRestoreAttemptedRef = useRef\(false\);/);
+  assert.match(source, /window\.localStorage\.getItem\('autolive\.source\.path'\)/);
+  assert.match(
+    source,
+    /if \(!nextSnapshot\.source_media && !sourceRestoreAttemptedRef\.current\) \{[\s\S]*void importVideo\(storedSourcePath\)/,
+  );
+  assert.match(importVideo, /async function importVideo\(selectedSourcePath\?: string\)/);
+  assert.match(importVideo, /selectedSourcePath \?\?[\s\S]*await open\(/);
+  assert.match(importVideo, /probe_local_mp4[\s\S]*start_playback[\s\S]*openFinalEffectWindowFromHome[\s\S]*prepareVoiceCloneAfterImport/);
+});

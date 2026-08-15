@@ -8,6 +8,11 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+.venv-voice-clone/
+
+# Python runtime caches
+**/__pycache__/
+*.py[cod]
 
 # JavaScript dependencies and package-manager state
 node_modules/
@@ -31,6 +36,8 @@ desktop/src-tauri/voice-models/*
 !desktop/src-tauri/voice-models/.gitkeep
 desktop/src-tauri/voice-worker/*
 !desktop/src-tauri/voice-worker/.gitkeep
+desktop/voice-models/*
+!desktop/voice-models/README.md
 
 # Local backend binaries and runtime data
 backend/bin/
@@ -47,3 +54,8 @@ desktop/src-tauri/*.dmg
 desktop/src-tauri/*.msi
 desktop/src-tauri/*.exe
 desktop/src-tauri/*.AppImage
+
+# Local agent state and user-provided audio samples
+.superpowers/
+音频/
+音频.zip
