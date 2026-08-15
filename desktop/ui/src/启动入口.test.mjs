@@ -85,7 +85,7 @@ test('导入按钮在完整导入链路中显示 loading 并禁止重复点击',
   const importButton = source.slice(buttonStart, source.indexOf('</Button>', buttonStart));
 
   assert.match(importButton, /loading=\{importVideoBusy\}/);
-  assert.match(importButton, /disabled=\{importVideoBusy\}/);
+  assert.match(importButton, /disabled=\{importVideoBusy \|\| runtimeResourceBusy\}/);
   assert.match(importButton, /onClick=\{\(\) => void importVideo\(\)\}/);
 });
 
@@ -105,4 +105,53 @@ test('后台重启后自动恢复上次导入的视频并继续准备人声', as
   assert.match(importVideo, /async function importVideo\(selectedSourcePath\?: string\)/);
   assert.match(importVideo, /selectedSourcePath \?\?[\s\S]*await open\(/);
   assert.match(importVideo, /probe_local_mp4[\s\S]*start_playback[\s\S]*openFinalEffectWindowFromHome[\s\S]*prepareVoiceCloneAfterImport/);
+});
+
+test('导入视频先确保 media，资源就绪后再探测并播放一次', async () => {
+  const source = await readSource('App.tsx');
+  const importVideo = source.slice(
+    source.indexOf('async function importVideo'),
+    source.indexOf('function updateInterludeDraft'),
+  );
+
+  assert.match(importVideo, /ensureRuntimeResources\('media',[\s\S]*probe_local_mp4[\s\S]*start_playback/);
+  assert.match(source, /pendingRuntimeActionRef/);
+  assert.match(source, /token/);
+  assert.match(source, /RUNTIME_RESOURCE_POLL_INTERVAL_MS = 500/);
+  assert.doesNotMatch(source, /runtime-resource[\s\S]{0,400}position:\s*['"]fixed['"]/);
+  assert.doesNotMatch(source, /runtime-resource[\s\S]{0,400}overflow:\s*['"]hidden['"]/);
+});
+
+test('资源面板提供重试、取消、本地导入和显式清理', async () => {
+  const source = await readSource('App.tsx');
+
+  assert.match(source, /install_runtime_resources/);
+  assert.match(source, /cancel_runtime_resource_install/);
+  assert.match(source, /import_runtime_resource_directory/);
+  assert.match(source, /clear_runtime_resources/);
+  assert.match(source, /Modal\.confirm/);
+  assert.match(source, /选择本地资源目录/);
+  assert.match(source, /清理运行资源/);
+  assert.match(source, /runtimeResourceProgressDetails\(runtimeResourceStatus\)/);
+  assert.match(source, /resolvePendingRuntimeAction/);
+  assert.match(source, /isRuntimeResourceConflict/);
+  assert.match(source, /window\.clearTimeout\(timer\)/);
+  assert.match(source, /runtimeResourcePollError/);
+  const pollingEffectStart = source.indexOf('if (!runtimeResourceStatus || !shouldPollRuntimeResources(runtimeResourceStatus)) return;');
+  const pollingEffect = source.slice(pollingEffectStart, source.indexOf('useLayoutEffect', pollingEffectStart));
+  assert.doesNotMatch(pollingEffect, /state: 'failed'/);
+  assert.match(pollingEffect, /setRuntimeResourceStatus\(\(current\) => current \? \{ \.\.\.current \} : current\)/);
+
+  const cancelResources = source.slice(
+    source.indexOf('async function cancelRuntimeResources'),
+    source.indexOf('async function chooseRuntimeResourceDirectory'),
+  );
+  assert.match(cancelResources, /catch \(cause\)[\s\S]*setRuntimeResourceStatus\(\(current\) => current \? \{ \.\.\.current \} : current\)/);
+  assert.match(source, /runtimeResourceMountedRef\.current[\s\S]*runtimeResourceActionTokenRef\.current === capabilityToken/);
+
+  const chooseDirectory = source.slice(
+    source.indexOf('async function chooseRuntimeResourceDirectory'),
+    source.indexOf('function confirmClearRuntimeResources'),
+  );
+  assert.match(chooseDirectory, /try \{[\s\S]*await open\(\{ directory: true, multiple: false \}\)[\s\S]*catch \(cause\)/);
 });

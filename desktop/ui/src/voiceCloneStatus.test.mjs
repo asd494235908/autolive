@@ -29,11 +29,11 @@ test('preparation does not block on a source MP4 hash', async () => {
   );
   assert.equal(
     getVoiceCloneIdleNotice(),
-    '人声模型和运行环境由安装包提供，首次使用会加载模型，请稍候。',
+    '人声模型和运行环境首次使用时会自动下载，随后直接复用。',
   );
   assert.equal(
     getVoiceCloneIdleNotice(),
-    '人声模型和运行环境由安装包提供，首次使用会加载模型，请稍候。',
+    '人声模型和运行环境首次使用时会自动下载，随后直接复用。',
   );
   assert.equal(
     getVoiceClonePrepareDisabledReason({

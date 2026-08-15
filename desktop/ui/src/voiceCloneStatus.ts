@@ -195,5 +195,5 @@ export function getVoiceClonePrepareDisabledReason({
 }
 
 export function getVoiceCloneIdleNotice(): string {
-  return '人声模型和运行环境由安装包提供，首次使用会加载模型，请稍候。';
+  return '人声模型和运行环境首次使用时会自动下载，随后直接复用。';
 }

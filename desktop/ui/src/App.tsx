@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import { App as AntApp, Alert, Button, Card, Checkbox, ConfigProvider, Descriptions, Input, InputNumber, Layout, Progress, Select, Slider, Space, Switch, Tag, Typography } from 'antd';
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { App as AntApp, Alert, Button, Card, Checkbox, ConfigProvider, Descriptions, Input, InputNumber, Layout, Modal, Progress, Select, Slider, Space, Switch, Tag, Typography } from 'antd';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { SyntheticEvent } from 'react';
 import { buildInterludeScheduleKey, chooseInterludeIndex, INTERLUDE_LIMITS, nextInterludeAtMs, resolvePlaybackAudioSource, shouldPauseInterlude } from './插话播放器';
 import type { BaseAudioSource } from './插话播放器';
@@ -13,6 +13,8 @@ import { clampMediaTime, clampVolume, formatMediaTime, isPlaybackMediaControlMes
 import type { PlaybackMediaControlMessage, PlaybackMediaStateMessage } from './播放控制消息';
 import { scheduleAfterInitialPaint, waitForAbortableDelay } from './启动调度';
 import { getDisplayErrorMessage } from './errorDisplay';
+import { canResumeRuntimeAction, isCurrentRuntimeResourceAction, isRuntimeResourceBusy, isRuntimeResourceConflict, resolvePendingRuntimeAction, runtimeResourceMessage, runtimeResourcePercent, runtimeResourceProgressDetails, shouldPollRuntimeResources } from './runtimeResources';
+import type { RuntimeResourceComponent, RuntimeResourceStatus } from './runtimeResources';
 import { addVoiceClonePreset, loadVoiceClonePresets, removeVoiceClonePreset, updateVoiceClonePreset } from './voiceClonePresets';
 import type { VoiceClonePreset } from './voiceClonePresets';
 import {
@@ -36,6 +38,7 @@ import './desktop-layout.css';
 
 const PLAYBACK_CHANNEL_NAME = 'autolive-playback-ui-v1';
 const VOICE_CLONE_AUTO_PREPARE_DELAY_MS = 4_000;
+const RUNTIME_RESOURCE_POLL_INTERVAL_MS = 500;
 const DIAGNOSTIC_PUBLISH_INTERVAL_MS = 50;
 const DIAGNOSTIC_SAMPLE_COUNT = 128;
 const REALTIME_AUDIO_SAFETY_LEAD_MS = 6_000;
@@ -64,6 +67,14 @@ type PlaybackControlMessage = {
   type: 'playback-control';
   action: 'pause' | 'resume' | 'stop';
 };
+
+type PendingRuntimeAction = {
+  component: RuntimeResourceComponent;
+  resume: () => Promise<void>;
+  token: number;
+};
+
+class RuntimeResourceConflictError extends Error {}
 
 type PictureInPictureDocument = Document & {
   pictureInPictureEnabled?: boolean;
@@ -1807,6 +1818,8 @@ function DesktopApp() {
   const [snapshotFetchError, setSnapshotFetchError] = useState<string | null>(null);
   const [playerWindowBusy, setPlayerWindowBusy] = useState(false);
   const [importVideoBusy, setImportVideoBusy] = useState(false);
+  const [runtimeResourceStatus, setRuntimeResourceStatus] = useState<RuntimeResourceStatus | null>(null);
+  const [runtimeResourcePollError, setRuntimeResourcePollError] = useState<string | null>(null);
   const [playbackActionBusy, setPlaybackActionBusy] = useState<'pause' | 'resume' | 'stop' | null>(null);
   const [videoProcessingEnabled, setVideoProcessingEnabled] = useState(false);
   const [audioProcessingEnabled, setAudioProcessingEnabled] = useState(false);
@@ -1838,6 +1851,10 @@ function DesktopApp() {
   const [cacheCleanupBusy, setCacheCleanupBusy] = useState(false);
   const snapshotRequestRef = useRef(0);
   const importVideoInFlightRef = useRef(false);
+  const pendingRuntimeActionRef = useRef<PendingRuntimeAction | null>(null);
+  const runtimeResourceActionTokenRef = useRef(0);
+  const runtimeResourcePollGenerationRef = useRef(0);
+  const runtimeResourceMountedRef = useRef(true);
   const sourceRestoreAttemptedRef = useRef(false);
   const voiceCloneAutoPrepareKeyRef = useRef<string | null>(null);
   const voiceCloneAutoPrepareControllerRef = useRef<AbortController | null>(null);
@@ -1855,6 +1872,155 @@ function DesktopApp() {
   const runtimeSchedulerRef = useRef({ cycle: 0, lastChangeMs: null as number | null });
   const waveformCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const spectrumCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const applyRuntimeResourceStatus = useCallback(async (
+    nextStatus: RuntimeResourceStatus,
+    expectedActionToken?: number,
+  ) => {
+    if (!runtimeResourceMountedRef.current) return;
+    if (!isCurrentRuntimeResourceAction(runtimeResourceActionTokenRef.current, expectedActionToken)) {
+      return;
+    }
+    setRuntimeResourceStatus(nextStatus);
+    setRuntimeResourcePollError(null);
+    const capabilityToken = runtimeResourceActionTokenRef.current;
+    if (nextStatus.state === 'ready' && nextStatus.component === 'media') {
+      void invoke<MediaEngineCapabilities>('get_media_engine_capabilities')
+        .then((capabilities) => {
+          if (
+            runtimeResourceMountedRef.current
+            && runtimeResourceActionTokenRef.current === capabilityToken
+          ) {
+            setMediaEngineCapabilities(capabilities);
+          }
+        })
+        .catch(() => undefined);
+    }
+    if (nextStatus.state === 'ready' && nextStatus.component === 'voice') {
+      void invoke<VoiceCloneWorkerCapabilities>('get_voice_clone_worker_capabilities')
+        .then((capabilities) => {
+          if (
+            runtimeResourceMountedRef.current
+            && runtimeResourceActionTokenRef.current === capabilityToken
+          ) {
+            setVoiceCloneWorkerCapabilities(capabilities);
+          }
+        })
+        .catch(() => undefined);
+    }
+    const pending = pendingRuntimeActionRef.current;
+    const resolution = resolvePendingRuntimeAction(
+      pending,
+      nextStatus,
+      runtimeResourceActionTokenRef.current,
+      expectedActionToken,
+    );
+    pendingRuntimeActionRef.current = resolution.pending;
+    if (!pending || !resolution.shouldResume) return;
+    try {
+      await pending.resume();
+    } catch (cause) {
+      if (runtimeResourceMountedRef.current) {
+        setError(getDisplayErrorMessage(cause, '运行资源就绪后的操作恢复失败'));
+      }
+    }
+  }, []);
+
+  const ensureRuntimeResources = useCallback(async (
+    component: RuntimeResourceComponent,
+    resume: () => Promise<void>,
+  ) => {
+    const token = runtimeResourceActionTokenRef.current + 1;
+    runtimeResourceActionTokenRef.current = token;
+    pendingRuntimeActionRef.current = { component, resume, token };
+    try {
+      const currentStatus = await invoke<RuntimeResourceStatus>('get_runtime_resource_status', { component });
+      if (runtimeResourceActionTokenRef.current !== token) return;
+      await applyRuntimeResourceStatus(currentStatus, token);
+      if (canResumeRuntimeAction(currentStatus)) return;
+      if (isRuntimeResourceBusy(currentStatus)) {
+        if (isRuntimeResourceConflict(component, currentStatus)) {
+          pendingRuntimeActionRef.current = null;
+          throw new RuntimeResourceConflictError('另一项运行资源操作正在执行，请稍后再试');
+        }
+        return;
+      }
+      const installingStatus = await invoke<RuntimeResourceStatus>('install_runtime_resources', { component });
+      await applyRuntimeResourceStatus(installingStatus, token);
+      if (isRuntimeResourceConflict(component, installingStatus)) {
+        pendingRuntimeActionRef.current = null;
+        throw new RuntimeResourceConflictError('另一项运行资源操作正在执行，请稍后再试');
+      }
+    } catch (cause) {
+      if (runtimeResourceActionTokenRef.current !== token || !runtimeResourceMountedRef.current) return;
+      if (cause instanceof RuntimeResourceConflictError) throw cause;
+      setRuntimeResourceStatus({
+        state: 'failed',
+        component,
+        current_file: null,
+        downloaded_bytes: 0,
+        total_bytes: 0,
+        bytes_per_second: 0,
+        installed_bytes: 0,
+        resource_root: '',
+        error: getDisplayErrorMessage(cause, '运行资源安装失败'),
+      });
+      throw cause;
+    }
+  }, [applyRuntimeResourceStatus]);
+
+  useEffect(() => {
+    runtimeResourceMountedRef.current = true;
+    void invoke<RuntimeResourceStatus>('get_runtime_resource_status', { component: 'media' })
+      .then((status) => {
+        if (runtimeResourceMountedRef.current && !pendingRuntimeActionRef.current) {
+          setRuntimeResourceStatus(status);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      runtimeResourceMountedRef.current = false;
+      runtimeResourceActionTokenRef.current += 1;
+      runtimeResourcePollGenerationRef.current += 1;
+      pendingRuntimeActionRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!runtimeResourceStatus || !shouldPollRuntimeResources(runtimeResourceStatus)) return;
+    const component = runtimeResourceStatus.component;
+    if (!component) return;
+    const pollGeneration = runtimeResourcePollGenerationRef.current + 1;
+    runtimeResourcePollGenerationRef.current = pollGeneration;
+    const timer = window.setTimeout(() => {
+      const pending = pendingRuntimeActionRef.current;
+      void invoke<RuntimeResourceStatus>('get_runtime_resource_status', { component })
+        .then((status) => {
+          if (
+            runtimeResourceMountedRef.current
+            && runtimeResourcePollGenerationRef.current === pollGeneration
+          ) {
+            return applyRuntimeResourceStatus(status, pending?.token);
+          }
+          return undefined;
+        })
+        .catch((cause) => {
+          if (
+            runtimeResourceMountedRef.current
+            && runtimeResourcePollGenerationRef.current === pollGeneration
+          ) {
+            setRuntimeResourcePollError(getDisplayErrorMessage(cause, '读取运行资源状态失败，将自动重试'));
+            setRuntimeResourceStatus((current) => current ? { ...current } : current);
+          }
+        });
+    }, RUNTIME_RESOURCE_POLL_INTERVAL_MS);
+    return () => {
+      window.clearTimeout(timer);
+      if (runtimeResourcePollGenerationRef.current === pollGeneration) {
+        runtimeResourcePollGenerationRef.current += 1;
+      }
+    };
+  }, [applyRuntimeResourceStatus, runtimeResourceStatus]);
 
   useLayoutEffect(() => {
     voiceClonePreGenerationCurrentGenerationRef.current = snapshot?.playback_generation ?? null;
@@ -1886,6 +2052,7 @@ function DesktopApp() {
   const pictureInPictureSourceUrl = toAssetUrl(
     snapshot?.current_video_reference ?? snapshot?.source_media?.source_path ?? probe?.source.source_path,
   );
+  const runtimeResourceBusy = runtimeResourceStatus !== null && isRuntimeResourceBusy(runtimeResourceStatus);
 
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') {
@@ -2296,14 +2463,16 @@ function DesktopApp() {
     snapshot?.current_position_ms,
   );
   const voiceClonePreGenerationBusyReason = getVoiceClonePreGenerationBusyReason(preGeneration.status);
+  const voiceRuntimeReady = runtimeResourceStatus?.component === 'voice'
+    && runtimeResourceStatus.state === 'ready';
   const voiceClonePrepareDisabledReason =
     voiceClonePreGenerationBusyReason ??
     (voiceCloneModelLoading
       ? '正在加载 XTTS-v2 模型，请稍候'
       : getVoiceClonePrepareDisabledReason({
           hasSource: Boolean(currentSource),
-          workerAvailable: Boolean(voiceCloneWorkerCapabilities?.available),
-          workerReason: voiceCloneWorkerCapabilities?.reason,
+          workerAvailable: voiceRuntimeReady ? Boolean(voiceCloneWorkerCapabilities?.available) : true,
+          workerReason: voiceRuntimeReady ? voiceCloneWorkerCapabilities?.reason : null,
           status: voiceCloneStatus,
         }));
   const voiceCloneReplaceDisabledReason =
@@ -2526,24 +2695,35 @@ function DesktopApp() {
 
   async function prepareVoiceCloneSource(options: { automatic?: boolean } = {}) {
     const automatic = options.automatic === true;
-    if (voiceClonePrepareInFlightRef.current) return;
-    voiceClonePrepareInFlightRef.current = true;
-    setVoiceCloneActionBusy('prepare');
-    setVoiceCloneFormError(null);
-    if (!automatic) setError(null);
     try {
-      const nextSnapshot = await invoke<PlaybackSnapshot>('prepare_voice_clone_source', { request: {} });
-      setSnapshot(nextSnapshot);
+      await ensureRuntimeResources('voice', async () => {
+        if (voiceClonePrepareInFlightRef.current) return;
+        voiceClonePrepareInFlightRef.current = true;
+        setVoiceCloneActionBusy('prepare');
+        setVoiceCloneFormError(null);
+        if (!automatic) setError(null);
+        try {
+          const nextSnapshot = await invoke<PlaybackSnapshot>('prepare_voice_clone_source', { request: {} });
+          setSnapshot(nextSnapshot);
+        } catch (cause) {
+          const message = getDisplayErrorMessage(cause, '固定话术准备失败');
+          if (automatic) {
+            setVoiceCloneFormError(message);
+          } else {
+            setError(message);
+          }
+        } finally {
+          voiceClonePrepareInFlightRef.current = false;
+          setVoiceCloneActionBusy(null);
+        }
+      });
     } catch (cause) {
-      const message = getDisplayErrorMessage(cause, '固定话术准备失败');
+      const message = getDisplayErrorMessage(cause, '固定话术运行资源准备失败');
       if (automatic) {
         setVoiceCloneFormError(message);
       } else {
         setError(message);
       }
-    } finally {
-      voiceClonePrepareInFlightRef.current = false;
-      setVoiceCloneActionBusy(null);
     }
   }
 
@@ -2877,23 +3057,95 @@ function DesktopApp() {
       voiceCloneAutoPrepareKeyRef.current = null;
       setVoiceCloneFormError(null);
       setError(null);
-      const result = await invoke<MediaProbeResult>('probe_local_mp4', { request: { path: selected } });
-      setProbe(result);
-      window.localStorage.setItem('autolive.source.path', result.canonical_path);
-      const startedSnapshot = await invoke<PlaybackSnapshot>('start_playback');
-      setSnapshot(startedSnapshot);
-      setSnapshotLoading(false);
-      setSnapshotFetchError(null);
-      const finalEffectWindowOpened = await openFinalEffectWindowFromHome();
-      if (finalEffectWindowOpened) {
-        void prepareVoiceCloneAfterImport(startedSnapshot.playback_generation);
-      }
+      await ensureRuntimeResources('media', async () => {
+        importVideoInFlightRef.current = true;
+        setImportVideoBusy(true);
+        try {
+          const result = await invoke<MediaProbeResult>('probe_local_mp4', { request: { path: selected } });
+          setProbe(result);
+          window.localStorage.setItem('autolive.source.path', result.canonical_path);
+          const startedSnapshot = await invoke<PlaybackSnapshot>('start_playback');
+          setSnapshot(startedSnapshot);
+          setSnapshotLoading(false);
+          setSnapshotFetchError(null);
+          const finalEffectWindowOpened = await openFinalEffectWindowFromHome();
+          if (finalEffectWindowOpened) {
+            void prepareVoiceCloneAfterImport(startedSnapshot.playback_generation);
+          }
+        } catch (cause) {
+          setError(getDisplayErrorMessage(cause, '导入视频失败'));
+        } finally {
+          importVideoInFlightRef.current = false;
+          setImportVideoBusy(false);
+        }
+      });
     } catch (cause) {
       setError(getDisplayErrorMessage(cause, '导入视频失败'));
     } finally {
       importVideoInFlightRef.current = false;
       setImportVideoBusy(false);
     }
+  }
+
+  async function retryRuntimeResources() {
+    const pending = pendingRuntimeActionRef.current;
+    const component = pending?.component ?? runtimeResourceStatus?.component ?? 'media';
+    try {
+      const status = await invoke<RuntimeResourceStatus>('install_runtime_resources', { component });
+      await applyRuntimeResourceStatus(status, pending?.token);
+    } catch (cause) {
+      setError(getDisplayErrorMessage(cause, '运行资源重试失败'));
+    }
+  }
+
+  async function cancelRuntimeResources() {
+    try {
+      const pending = pendingRuntimeActionRef.current;
+      runtimeResourcePollGenerationRef.current += 1;
+      const status = await invoke<RuntimeResourceStatus>('cancel_runtime_resource_install');
+      await applyRuntimeResourceStatus(status, pending?.token);
+    } catch (cause) {
+      setError(getDisplayErrorMessage(cause, '取消运行资源安装失败'));
+      setRuntimeResourceStatus((current) => current ? { ...current } : current);
+    }
+  }
+
+  async function chooseRuntimeResourceDirectory() {
+    try {
+      const sourceRoot = await open({ directory: true, multiple: false });
+      if (typeof sourceRoot !== 'string') return;
+      const pending = pendingRuntimeActionRef.current;
+      const component = pending?.component ?? runtimeResourceStatus?.component ?? 'media';
+      const status = await invoke<RuntimeResourceStatus>('import_runtime_resource_directory', {
+        component,
+        sourceRoot,
+      });
+      await applyRuntimeResourceStatus(status, pending?.token);
+    } catch (cause) {
+      setError(getDisplayErrorMessage(cause, '导入本地运行资源失败'));
+    }
+  }
+
+  function confirmClearRuntimeResources() {
+    Modal.confirm({
+      title: '清理运行资源？',
+      content: '将删除当前版本的 FFmpeg、固定话术运行环境和模型，后续使用时需要重新下载。',
+      okText: '确认清理',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        runtimeResourceActionTokenRef.current += 1;
+        runtimeResourcePollGenerationRef.current += 1;
+        pendingRuntimeActionRef.current = null;
+        try {
+          setRuntimeResourceStatus(await invoke<RuntimeResourceStatus>('clear_runtime_resources'));
+          setMediaEngineCapabilities(null);
+          setVoiceCloneWorkerCapabilities(null);
+        } catch (cause) {
+          setError(getDisplayErrorMessage(cause, '清理运行资源失败'));
+        }
+      },
+    });
   }
 
   function updateInterludeDraft(patch: Partial<InterludeConfigDraft>) {
@@ -2973,7 +3225,7 @@ function DesktopApp() {
                 type="primary"
                 size="large"
                 loading={importVideoBusy}
-                disabled={importVideoBusy}
+                disabled={importVideoBusy || runtimeResourceBusy}
                 onClick={() => void importVideo()}
               >
                 导入视频并播放
@@ -2983,6 +3235,50 @@ function DesktopApp() {
               </Button>
             </Space>
             {error ? <Alert type="error" showIcon message={error} /> : null}
+            {runtimeResourceStatus ? (
+              <Card title="运行资源">
+                <Alert
+                  type={runtimeResourceStatus.state === 'failed' ? 'error' : runtimeResourceStatus.state === 'ready' ? 'success' : 'info'}
+                  showIcon
+                  message={runtimeResourceMessage(runtimeResourceStatus)}
+                  description={(
+                    <div className="runtime-resource-progress">
+                      <Progress
+                        percent={runtimeResourcePercent(runtimeResourceStatus)}
+                        status={runtimeResourceStatus.state === 'failed' ? 'exception' : runtimeResourceStatus.state === 'ready' ? 'success' : 'active'}
+                      />
+                      <Typography.Text type="secondary">
+                        {runtimeResourceStatus.component === 'voice'
+                          ? 'voice 包含媒体、固定话术运行环境和模型。'
+                          : 'media 包含 FFmpeg 和 FFprobe。'}
+                      </Typography.Text>
+                      <Typography.Text type="secondary">
+                        {runtimeResourceProgressDetails(runtimeResourceStatus)}
+                      </Typography.Text>
+                      {runtimeResourcePollError ? (
+                        <Typography.Text type="danger">{runtimeResourcePollError}</Typography.Text>
+                      ) : null}
+                    </div>
+                  )}
+                  action={(
+                    <Space wrap className="runtime-resource-actions">
+                      <Button disabled={runtimeResourceBusy || runtimeResourceStatus.state === 'ready'} onClick={() => void retryRuntimeResources()}>
+                        {runtimeResourceStatus.state === 'not-installed' ? '安装' : '重试'}
+                      </Button>
+                      <Button disabled={!runtimeResourceBusy} onClick={() => void cancelRuntimeResources()}>
+                        取消
+                      </Button>
+                      <Button disabled={runtimeResourceBusy} onClick={() => void chooseRuntimeResourceDirectory()}>
+                        选择本地资源目录
+                      </Button>
+                      <Button danger disabled={runtimeResourceBusy} onClick={confirmClearRuntimeResources}>
+                        清理运行资源
+                      </Button>
+                    </Space>
+                  )}
+                />
+              </Card>
+            ) : null}
             <Card title="播放状态与控制">
               <Space direction="vertical" size="middle" style={{ width: '100%' }}>
                 <Space wrap>
@@ -3325,7 +3621,7 @@ function DesktopApp() {
                   <Button
                     onClick={() => void prepareVoiceCloneSource()}
                     loading={voiceCloneActionBusy === 'prepare'}
-                    disabled={voiceClonePrepareDisabledReason !== null}
+                    disabled={voiceClonePrepareDisabledReason !== null || runtimeResourceBusy}
                   >
                     准备人声
                   </Button>
@@ -3333,7 +3629,7 @@ function DesktopApp() {
                     type="primary"
                     onClick={() => void playCurrentVoiceCloneText()}
                     loading={voiceCloneActionBusy === 'play'}
-                    disabled={voiceCloneReplaceDisabledReason !== null}
+                    disabled={voiceCloneReplaceDisabledReason !== null || runtimeResourceBusy}
                     title={voiceCloneReplaceDisabledReason ?? undefined}
                   >
                     播放当前文案

@@ -114,6 +114,24 @@ test('导入后仅在最终效果窗口打开成功后延迟四秒自动准备�
   assert.doesNotMatch(appSource, /正在等待 MP4 哈希完成/);
 });
 
+test('自动与手动准备人声都先确保 voice 资源', async () => {
+  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
+  const prepareFunction = appSource.slice(
+    appSource.indexOf('async function prepareVoiceCloneSource'),
+    appSource.indexOf('async function playCurrentVoiceCloneText'),
+  );
+  const autoPrepareFunction = appSource.slice(
+    appSource.indexOf('async function prepareVoiceCloneAfterImport'),
+    appSource.indexOf('async function importVideo'),
+  );
+
+  assert.match(prepareFunction, /ensureRuntimeResources\('voice'/);
+  assert.match(autoPrepareFunction, /prepareVoiceCloneSource\(\{ automatic: true \}\)/);
+  assert.match(appSource, /voice 包含媒体、固定话术运行环境和模型/);
+  assert.match(prepareFunction, /try \{[\s\S]*ensureRuntimeResources\('voice'[\s\S]*catch \(cause\)/);
+  assert.match(appSource, /runtimeResourceStatus\?\.component === 'voice'[\s\S]*runtimeResourceStatus\.state === 'ready'/);
+});
+
 test('固定话术预生成只批量准备文案，不影响实际播放或原音轨', async () => {
   const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
   const preGenerationEffect = appSource.slice(
