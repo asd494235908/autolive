@@ -3,6 +3,8 @@ faster-whisper==1.2.1
 TTS==0.22.0
 numpy==1.26.4
 networkx==2.8.8
+numba==0.62.1
+llvmlite==0.45.1
 torch==2.2.2; sys_platform == "darwin" and platform_machine == "x86_64"
 torchaudio==2.2.2; sys_platform == "darwin" and platform_machine == "x86_64"
 torch==2.5.1; sys_platform != "darwin" or platform_machine != "x86_64"

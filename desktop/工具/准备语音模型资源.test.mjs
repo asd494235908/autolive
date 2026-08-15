@@ -61,7 +61,14 @@ test('正式打包命令会在 Tauri 之前准备并校验 Worker 与语音模�
 
   assert.match(buildScript, /准备语音Worker资源\.mjs/);
   assert.match(buildScript, /准备语音模型资源\.mjs/);
-  assert.match(buildScript, /tauri build/);
+  assert.match(buildScript, /构建桌面产物\.mjs/);
+
+  const desktopBuildScript = readFileSync(
+    fileURLToPath(new URL('./构建桌面产物.mjs', import.meta.url)),
+    'utf8',
+  );
+  assert.match(desktopBuildScript, /'build'/);
+  assert.match(desktopBuildScript, /'--no-bundle'/);
 
   const tauriConfig = JSON.parse(
     readFileSync(fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url)), 'utf8'),
@@ -87,5 +94,8 @@ test('CI 打包环境会安装 Worker 构建依赖并显式传入许可确认', 
     requirements,
     /torch==2\.2\.2; sys_platform == "darwin" and platform_machine == "x86_64"/,
   );
+  assert.match(requirements, /numba==0\.62\.1/);
+  assert.match(requirements, /llvmlite==0\.45\.1/);
+  assert.match(workflow, /brew install opus/);
   assert.match(workflow, /b48d1f513a728a0e5ad8f51d91a0f508fe50f0a4f8de3bd3874cc5628cca5140/);
 });

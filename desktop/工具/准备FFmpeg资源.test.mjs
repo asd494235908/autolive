@@ -6,8 +6,11 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
+import { tauriBuildArguments } from './构建桌面产物.mjs';
+
 const script = fileURLToPath(new URL('./准备FFmpeg资源.mjs', import.meta.url));
 const archiveScript = fileURLToPath(new URL('./归档桌面产物.mjs', import.meta.url));
+const buildScript = fileURLToPath(new URL('./构建桌面产物.mjs', import.meta.url));
 
 test('缺少当前目标的 FFmpeg 文件时失败且不创建输出', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-ffmpeg-'));
@@ -56,10 +59,22 @@ test('按目标三元组复制当前包所需的标准资源名', () => {
 test('Tauri scripts use the package binary lookup that works on Windows', () => {
   const packageJsonPath = fileURLToPath(new URL('../ui/package.json', import.meta.url));
   const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-  const tauriScripts = `${packageJson.scripts['tauri:dev']}\n${packageJson.scripts['tauri:build']}`;
+  const buildSource = readFileSync(buildScript, 'utf8');
 
-  assert.match(tauriScripts, /\btauri (?:dev|build)\b/);
-  assert.doesNotMatch(tauriScripts, /\.\/ui\/node_modules\/\.bin\/tauri/);
+  assert.match(packageJson.scripts['tauri:build'], /构建桌面产物\.mjs/);
+  assert.match(buildSource, /'tauri'/);
+  assert.deepEqual(tauriBuildArguments('aarch64-apple-darwin'), [
+    'build',
+    '--config',
+    'src-tauri/tauri.conf.json',
+  ]);
+  assert.deepEqual(tauriBuildArguments('x86_64-pc-windows-msvc'), [
+    'build',
+    '--config',
+    'src-tauri/tauri.conf.json',
+    '--no-bundle',
+  ]);
+  assert.doesNotMatch(`${packageJson.scripts['tauri:dev']}\n${buildSource}`, /\.\/ui\/node_modules\/\.bin\/tauri/);
 });
 
 test('归档脚本按版本和目标平台目录保存 bundle', () => {
@@ -86,6 +101,48 @@ test('归档脚本按版本和目标平台目录保存 bundle', () => {
     readFileSync(join(output, `v${version}`, 'aarch64-apple-darwin', 'dmg', 'bundle.txt'), 'utf8'),
     'bundle-test',
   );
+});
+
+test('Windows 正式包归档为可直接运行的便携目录', () => {
+  const root = mkdtempSync(join(tmpdir(), 'autolive-package-'));
+  const release = join(root, 'release');
+  const resources = join(root, 'resources');
+  const output = join(root, 'package');
+  const configPath = fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url));
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  mkdirSync(release, { recursive: true });
+  writeFileSync(join(release, `${config.productName}.exe`), 'app-test');
+  for (const relativePath of [
+    ['binaries', 'ffmpeg.exe'],
+    ['binaries', 'ffprobe.exe'],
+    ['voice-worker', 'autolive-voice-clone-worker.exe'],
+    ['voice-models', 'model.bin'],
+  ]) {
+    const path = join(resources, ...relativePath);
+    mkdirSync(join(path, '..'), { recursive: true });
+    writeFileSync(path, 'resource-test');
+  }
+
+  const result = spawnSync(process.execPath, [archiveScript], {
+    env: {
+      ...process.env,
+      AUTOLIVE_RELEASE_DIR: release,
+      AUTOLIVE_RESOURCE_ROOT: resources,
+      AUTOLIVE_PACKAGE_ROOT: output,
+      AUTOLIVE_TARGET_TRIPLE: 'x86_64-pc-windows-msvc',
+    },
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+  const portable = join(output, `v${config.version}`, 'x86_64-pc-windows-msvc', 'portable');
+  assert.equal(readFileSync(join(portable, `${config.productName}.exe`), 'utf8'), 'app-test');
+  assert.equal(readFileSync(join(portable, 'binaries', 'ffmpeg.exe'), 'utf8'), 'resource-test');
+  assert.equal(
+    readFileSync(join(portable, 'voice-worker', 'autolive-voice-clone-worker.exe'), 'utf8'),
+    'resource-test',
+  );
+  assert.equal(readFileSync(join(portable, 'voice-models', 'model.bin'), 'utf8'), 'resource-test');
 });
 
 test('GitHub workflow uploads the versioned package directory', () => {
