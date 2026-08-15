@@ -6,12 +6,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use sysinfo::Disks;
 
-pub const PRODUCTION_BASE_URL: &str = "http://101.96.208.132:7088/autolive-resources/v0.1.0";
+pub const PRODUCTION_BASE_URL: &str = "http://101.96.208.132:7088/autolive-resources/v0.1.0/";
 const RELEASE: &str = "v0.1.0";
+const MAX_HTTP_REQUESTS: usize = 3;
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(50)];
 const SUPPORTED_TARGETS: [&str; 3] = [
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
@@ -187,7 +189,7 @@ impl RuntimeResourceManifest {
 
 fn validate_base_url(base_url: &str, mode: &ValidationMode) -> Result<(), ManifestValidationError> {
     let expected = match mode {
-        ValidationMode::Production => format!("{PRODUCTION_BASE_URL}/"),
+        ValidationMode::Production => PRODUCTION_BASE_URL.to_owned(),
         ValidationMode::Test { base_url } => {
             let parsed = reqwest::Url::parse(base_url)
                 .map_err(|_| ManifestValidationError("invalid test base_url".to_owned()))?;
@@ -297,6 +299,7 @@ pub enum ResourceInstallError {
     Io {
         operation: &'static str,
         path: String,
+        message: String,
     },
     Http {
         path: String,
@@ -322,6 +325,7 @@ pub enum ResourceInstallError {
         required: u64,
         available: u64,
     },
+    DiskRequirementOverflow,
     DiskUnavailable,
     UnsafeImportSource {
         path: String,
@@ -336,8 +340,15 @@ impl fmt::Display for ResourceInstallError {
             }
             Self::Busy => formatter.write_str("a runtime resource operation is already running"),
             Self::Cancelled => formatter.write_str("runtime resource operation was cancelled"),
-            Self::Io { operation, path } => {
-                write!(formatter, "failed to {operation} runtime resource: {path}")
+            Self::Io {
+                operation,
+                path,
+                message,
+            } => {
+                write!(
+                    formatter,
+                    "failed to {operation} runtime resource {path}: {message}"
+                )
             }
             Self::Http { path, message } => {
                 write!(
@@ -371,6 +382,9 @@ impl fmt::Display for ResourceInstallError {
                 formatter,
                 "insufficient disk space: need {required} bytes, have {available} bytes"
             ),
+            Self::DiskRequirementOverflow => {
+                formatter.write_str("runtime resource disk requirement exceeds u64")
+            }
             Self::DiskUnavailable => formatter.write_str("target disk is unavailable"),
             Self::UnsafeImportSource { path } => {
                 write!(
@@ -395,7 +409,7 @@ pub struct RuntimeResourceInstaller {
     manifest: Arc<RuntimeResourceManifest>,
     layout: RuntimeResourceLayout,
     client: reqwest::blocking::Client,
-    operation_running: Arc<AtomicBool>,
+    operation_key: PathBuf,
 }
 
 impl RuntimeResourceInstaller {
@@ -429,6 +443,7 @@ impl RuntimeResourceInstaller {
         app_data_dir: &Path,
     ) -> Result<Self, ResourceInstallError> {
         let layout = RuntimeResourceLayout::for_target(app_data_dir, &manifest.target)?;
+        let operation_key = operation_key(app_data_dir)?;
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -442,7 +457,7 @@ impl RuntimeResourceInstaller {
             manifest: Arc::new(manifest),
             layout,
             client,
-            operation_running: Arc::new(AtomicBool::new(false)),
+            operation_key,
         })
     }
 
@@ -496,7 +511,7 @@ impl RuntimeResourceInstaller {
         let _operation = self.acquire_operation()?;
         if self.layout.version_root.exists() {
             fs::remove_dir_all(&self.layout.version_root)
-                .map_err(|_| io_error("clear", &self.layout.version_root))?;
+                .map_err(|error| io_error("clear", &self.layout.version_root, error))?;
         }
         Ok(self.status(
             RuntimeResourceState::NotInstalled,
@@ -520,6 +535,9 @@ impl RuntimeResourceInstaller {
         let files = self.required_files(component);
         let total_bytes = total_size(&files);
         let mut installed_bytes = self.installed_bytes(&files)?;
+        if installed_bytes != total_bytes {
+            self.invalidate_installed_record()?;
+        }
         on_status(self.status(
             RuntimeResourceState::Checking,
             Some(component),
@@ -531,13 +549,13 @@ impl RuntimeResourceInstaller {
             None,
         ));
         if installed_bytes == total_bytes {
-            self.write_installed_record(component)?;
+            self.write_installed_record()?;
             return Ok(self.ready_status(component, total_bytes));
         }
 
         fs::create_dir_all(&self.layout.version_root)
-            .map_err(|_| io_error("create directory", &self.layout.version_root))?;
-        let required = self.additional_disk_bytes(&files)?;
+            .map_err(|error| io_error("create directory", &self.layout.version_root, error))?;
+        let required = required_disk_space(self.additional_disk_bytes(&files)?)?;
         self.ensure_disk_space(required)?;
 
         for file in files {
@@ -548,7 +566,7 @@ impl RuntimeResourceInstaller {
             }
             if final_path.exists() {
                 fs::remove_file(&final_path)
-                    .map_err(|_| io_error("remove invalid file", &final_path))?;
+                    .map_err(|error| io_error("remove invalid file", &final_path, error))?;
             }
             self.download_file(
                 component,
@@ -560,7 +578,7 @@ impl RuntimeResourceInstaller {
             )?;
             installed_bytes = installed_bytes.saturating_add(file.size_bytes);
         }
-        self.write_installed_record(component)?;
+        self.write_installed_record()?;
         Ok(self.ready_status(component, total_bytes))
     }
 
@@ -573,7 +591,7 @@ impl RuntimeResourceInstaller {
     ) -> Result<RuntimeResourceStatus, ResourceInstallError> {
         self.check_cancel(cancel)?;
         let canonical_root = fs::canonicalize(source_root)
-            .map_err(|_| io_error("open import directory", source_root))?;
+            .map_err(|error| io_error("open import directory", source_root, error))?;
         if !canonical_root.is_dir() {
             return Err(ResourceInstallError::UnsafeImportSource {
                 path: source_root.display().to_string(),
@@ -582,6 +600,9 @@ impl RuntimeResourceInstaller {
         let files = self.required_files(component);
         let total_bytes = total_size(&files);
         let mut installed_bytes = self.installed_bytes(&files)?;
+        if installed_bytes != total_bytes {
+            self.invalidate_installed_record()?;
+        }
         on_status(self.status(
             RuntimeResourceState::Checking,
             Some(component),
@@ -593,13 +614,13 @@ impl RuntimeResourceInstaller {
             None,
         ));
         if installed_bytes == total_bytes {
-            self.write_installed_record(component)?;
+            self.write_installed_record()?;
             return Ok(self.ready_status(component, total_bytes));
         }
 
         fs::create_dir_all(&self.layout.version_root)
-            .map_err(|_| io_error("create directory", &self.layout.version_root))?;
-        self.ensure_disk_space(self.additional_disk_bytes(&files)?)?;
+            .map_err(|error| io_error("create directory", &self.layout.version_root, error))?;
+        self.ensure_disk_space(required_disk_space(self.additional_disk_bytes(&files)?)?)?;
         for file in files {
             self.check_cancel(cancel)?;
             let final_path = self.final_path(file);
@@ -608,20 +629,26 @@ impl RuntimeResourceInstaller {
             }
             if final_path.exists() {
                 fs::remove_file(&final_path)
-                    .map_err(|_| io_error("remove invalid file", &final_path))?;
+                    .map_err(|error| io_error("remove invalid file", &final_path, error))?;
             }
             let source = canonical_root.join(&file.relative_path);
-            let canonical_source =
-                fs::canonicalize(&source).map_err(|_| io_error("open import file", &source))?;
-            if !canonical_source.starts_with(&canonical_root) || !canonical_source.is_file() {
+            let canonical_source = fs::canonicalize(&source)
+                .map_err(|error| io_error("open import file", &source, error))?;
+            if !canonical_source.starts_with(&canonical_root) {
                 return Err(ResourceInstallError::UnsafeImportSource {
                     path: source.display().to_string(),
                 });
             }
+            // Open exactly once after canonical containment. Metadata, copying, and the
+            // manifest hash gate therefore refer to this file identity even on platforms
+            // where a parent directory can be replaced after the containment check.
+            let source_file = File::open(&canonical_source)
+                .map_err(|error| io_error("open import file", &canonical_source, error))?;
             self.copy_import_file(
                 component,
                 file,
                 &canonical_source,
+                source_file,
                 installed_bytes,
                 total_bytes,
                 cancel,
@@ -629,7 +656,7 @@ impl RuntimeResourceInstaller {
             )?;
             installed_bytes = installed_bytes.saturating_add(file.size_bytes);
         }
-        self.write_installed_record(component)?;
+        self.write_installed_record()?;
         Ok(self.ready_status(component, total_bytes))
     }
 
@@ -645,17 +672,178 @@ impl RuntimeResourceInstaller {
     ) -> Result<(), ResourceInstallError> {
         let partial_path = self.partial_path(file);
         if let Some(parent) = partial_path.parent() {
-            fs::create_dir_all(parent).map_err(|_| io_error("create partial directory", parent))?;
+            fs::create_dir_all(parent)
+                .map_err(|error| io_error("create partial directory", parent, error))?;
         }
-        let mut offset = fs::metadata(&partial_path)
-            .map(|value| value.len())
-            .unwrap_or(0);
-        if offset > file.size_bytes {
-            fs::remove_file(&partial_path)
-                .map_err(|_| io_error("remove oversized partial", &partial_path))?;
-            offset = 0;
-        }
-        if offset == file.size_bytes {
+        let url = reqwest::Url::parse(&self.manifest.base_url)
+            .and_then(|base| base.join(&file.relative_path))
+            .map_err(|error| ResourceInstallError::Http {
+                path: file.relative_path.clone(),
+                message: error.to_string(),
+            })?;
+        let mut reset_from_remote_change = false;
+
+        'requests: for request_index in 0..MAX_HTTP_REQUESTS {
+            let retry_delay = RETRY_DELAYS.get(request_index).copied();
+            self.check_cancel(cancel)?;
+            let mut offset = file_size_if_present(&partial_path)?;
+            if offset > file.size_bytes {
+                fs::remove_file(&partial_path)
+                    .map_err(|error| io_error("remove oversized partial", &partial_path, error))?;
+                offset = 0;
+            }
+            if offset == file.size_bytes {
+                return self.verify_and_commit(
+                    file,
+                    &partial_path,
+                    on_status,
+                    component,
+                    total_bytes,
+                    cancel,
+                );
+            }
+
+            let mut request = self.client.get(url.clone());
+            if offset > 0 {
+                request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+            }
+            let mut response = match request.send() {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = ResourceInstallError::Http {
+                        path: file.relative_path.clone(),
+                        message: error.to_string(),
+                    };
+                    let Some(retry_delay) = retry_delay else {
+                        return Err(error);
+                    };
+                    self.wait_for_retry(cancel, retry_delay)?;
+                    continue;
+                }
+            };
+            let status = response.status();
+            if is_transient_status(status) {
+                let error = ResourceInstallError::UnexpectedHttpStatus {
+                    path: file.relative_path.clone(),
+                    status: status.as_u16(),
+                };
+                let Some(retry_delay) = retry_delay else {
+                    return Err(error);
+                };
+                self.wait_for_retry(cancel, retry_delay)?;
+                continue;
+            }
+
+            if offset > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT {
+                let expected_range =
+                    format!("bytes {offset}-{}/{}", file.size_bytes - 1, file.size_bytes);
+                let actual_range = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let expected_length = file.size_bytes - offset;
+                let actual_length = content_length(&response);
+                let remote_error = if actual_range.as_deref() != Some(expected_range.as_str()) {
+                    Some(ResourceInstallError::InvalidContentRange {
+                        expected: expected_range,
+                        actual: actual_range,
+                    })
+                } else if actual_length != Some(expected_length) {
+                    Some(ResourceInstallError::SizeMismatch {
+                        path: file.relative_path.clone(),
+                        expected: expected_length,
+                        actual: actual_length.unwrap_or(0),
+                    })
+                } else {
+                    None
+                };
+                if let Some(error) = remote_error {
+                    remove_file_if_present(&partial_path, "discard changed remote partial")?;
+                    if !reset_from_remote_change && request_index + 1 < MAX_HTTP_REQUESTS {
+                        reset_from_remote_change = true;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            } else if status == reqwest::StatusCode::OK {
+                offset = 0;
+                let actual_length = content_length(&response);
+                if actual_length != Some(file.size_bytes) {
+                    remove_file_if_present(&partial_path, "discard changed remote partial")?;
+                    return Err(ResourceInstallError::SizeMismatch {
+                        path: file.relative_path.clone(),
+                        expected: file.size_bytes,
+                        actual: actual_length.unwrap_or(0),
+                    });
+                }
+            } else {
+                return Err(ResourceInstallError::UnexpectedHttpStatus {
+                    path: file.relative_path.clone(),
+                    status: status.as_u16(),
+                });
+            }
+
+            let mut output = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(offset > 0)
+                .truncate(offset == 0)
+                .open(&partial_path)
+                .map_err(|error| io_error("open partial file", &partial_path, error))?;
+            let started = Instant::now();
+            let mut written = offset;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                self.check_cancel(cancel)?;
+                let count = match response.read(&mut buffer) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        output.sync_all().map_err(|sync_error| {
+                            io_error("sync partial file", &partial_path, sync_error)
+                        })?;
+                        drop(output);
+                        let Some(retry_delay) = retry_delay else {
+                            return Err(ResourceInstallError::Http {
+                                path: file.relative_path.clone(),
+                                message: error.to_string(),
+                            });
+                        };
+                        self.wait_for_retry(cancel, retry_delay)?;
+                        continue 'requests;
+                    }
+                };
+                if count == 0 {
+                    break;
+                }
+                output
+                    .write_all(&buffer[..count])
+                    .map_err(|error| io_error("write partial file", &partial_path, error))?;
+                written = written.saturating_add(count as u64);
+                if written > file.size_bytes {
+                    drop(output);
+                    remove_file_if_present(&partial_path, "remove oversized partial")?;
+                    return Err(ResourceInstallError::SizeMismatch {
+                        path: file.relative_path.clone(),
+                        expected: file.size_bytes,
+                        actual: written,
+                    });
+                }
+                on_status(self.status(
+                    RuntimeResourceState::Downloading,
+                    Some(component),
+                    Some(file.relative_path.clone()),
+                    installed_bytes.saturating_add(written),
+                    total_bytes,
+                    bytes_per_second(written.saturating_sub(offset), started.elapsed()),
+                    installed_bytes,
+                    None,
+                ));
+            }
+            output
+                .sync_all()
+                .map_err(|error| io_error("sync partial file", &partial_path, error))?;
+            drop(output);
             return self.verify_and_commit(
                 file,
                 &partial_path,
@@ -665,100 +853,10 @@ impl RuntimeResourceInstaller {
                 cancel,
             );
         }
-
-        let url = reqwest::Url::parse(&self.manifest.base_url)
-            .and_then(|base| base.join(&file.relative_path))
-            .map_err(|error| ResourceInstallError::Http {
-                path: file.relative_path.clone(),
-                message: error.to_string(),
-            })?;
-        let mut request = self.client.get(url);
-        if offset > 0 {
-            request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
-        }
-        let mut response = request.send().map_err(|error| ResourceInstallError::Http {
+        Err(ResourceInstallError::Http {
             path: file.relative_path.clone(),
-            message: error.to_string(),
-        })?;
-
-        if offset > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-            let expected = format!("bytes {offset}-{}/{}", file.size_bytes - 1, file.size_bytes);
-            let actual = response
-                .headers()
-                .get(reqwest::header::CONTENT_RANGE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            if actual.as_deref() != Some(expected.as_str()) {
-                let _ignored = fs::remove_file(&partial_path);
-                return Err(ResourceInstallError::InvalidContentRange { expected, actual });
-            }
-        } else if response.status() == reqwest::StatusCode::OK {
-            offset = 0;
-        } else {
-            let status = response.status().as_u16();
-            return Err(ResourceInstallError::UnexpectedHttpStatus {
-                path: file.relative_path.clone(),
-                status,
-            });
-        }
-
-        let mut output = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(offset > 0)
-            .truncate(offset == 0)
-            .open(&partial_path)
-            .map_err(|_| io_error("open partial file", &partial_path))?;
-        let started = Instant::now();
-        let mut written = offset;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            self.check_cancel(cancel)?;
-            let count = response
-                .read(&mut buffer)
-                .map_err(|error| ResourceInstallError::Http {
-                    path: file.relative_path.clone(),
-                    message: error.to_string(),
-                })?;
-            if count == 0 {
-                break;
-            }
-            output
-                .write_all(&buffer[..count])
-                .map_err(|_| io_error("write partial file", &partial_path))?;
-            written = written.saturating_add(count as u64);
-            if written > file.size_bytes {
-                drop(output);
-                let _ignored = fs::remove_file(&partial_path);
-                return Err(ResourceInstallError::SizeMismatch {
-                    path: file.relative_path.clone(),
-                    expected: file.size_bytes,
-                    actual: written,
-                });
-            }
-            on_status(self.status(
-                RuntimeResourceState::Downloading,
-                Some(component),
-                Some(file.relative_path.clone()),
-                installed_bytes.saturating_add(written),
-                total_bytes,
-                bytes_per_second(written.saturating_sub(offset), started.elapsed()),
-                installed_bytes,
-                None,
-            ));
-        }
-        output
-            .sync_all()
-            .map_err(|_| io_error("sync partial file", &partial_path))?;
-        drop(output);
-        self.verify_and_commit(
-            file,
-            &partial_path,
-            on_status,
-            component,
-            total_bytes,
-            cancel,
-        )
+            message: "HTTP retry budget exhausted".to_owned(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -767,14 +865,21 @@ impl RuntimeResourceInstaller {
         component: RuntimeResourceComponent,
         file: &ManifestFile,
         source: &Path,
+        mut source_file: File,
         installed_bytes: u64,
         total_bytes: u64,
         cancel: &AtomicBool,
         on_status: &mut impl FnMut(RuntimeResourceStatus),
     ) -> Result<(), ResourceInstallError> {
-        let source_size = fs::metadata(source)
-            .map_err(|_| io_error("read import metadata", source))?
-            .len();
+        let source_size = source_file
+            .metadata()
+            .map_err(|error| io_error("read import metadata", source, error))?;
+        if !source_size.is_file() {
+            return Err(ResourceInstallError::UnsafeImportSource {
+                path: source.display().to_string(),
+            });
+        }
+        let source_size = source_size.len();
         if source_size != file.size_bytes {
             return Err(ResourceInstallError::SizeMismatch {
                 path: file.relative_path.clone(),
@@ -784,25 +889,25 @@ impl RuntimeResourceInstaller {
         }
         let partial_path = self.partial_path(file);
         if let Some(parent) = partial_path.parent() {
-            fs::create_dir_all(parent).map_err(|_| io_error("create partial directory", parent))?;
+            fs::create_dir_all(parent)
+                .map_err(|error| io_error("create partial directory", parent, error))?;
         }
-        let mut input = File::open(source).map_err(|_| io_error("open import file", source))?;
         let mut output = File::create(&partial_path)
-            .map_err(|_| io_error("create partial file", &partial_path))?;
+            .map_err(|error| io_error("create partial file", &partial_path, error))?;
         let started = Instant::now();
         let mut written = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
         loop {
             self.check_cancel(cancel)?;
-            let count = input
+            let count = source_file
                 .read(&mut buffer)
-                .map_err(|_| io_error("read import file", source))?;
+                .map_err(|error| io_error("read import file", source, error))?;
             if count == 0 {
                 break;
             }
             output
                 .write_all(&buffer[..count])
-                .map_err(|_| io_error("write partial file", &partial_path))?;
+                .map_err(|error| io_error("write partial file", &partial_path, error))?;
             written = written.saturating_add(count as u64);
             on_status(self.status(
                 RuntimeResourceState::Downloading,
@@ -817,7 +922,7 @@ impl RuntimeResourceInstaller {
         }
         output
             .sync_all()
-            .map_err(|_| io_error("sync partial file", &partial_path))?;
+            .map_err(|error| io_error("sync partial file", &partial_path, error))?;
         drop(output);
         self.verify_and_commit(
             file,
@@ -849,7 +954,7 @@ impl RuntimeResourceInstaller {
             None,
         ));
         let actual_size = fs::metadata(partial_path)
-            .map_err(|_| io_error("read partial metadata", partial_path))?
+            .map_err(|error| io_error("read partial metadata", partial_path, error))?
             .len();
         if actual_size != file.size_bytes {
             let _ignored = fs::remove_file(partial_path);
@@ -868,10 +973,11 @@ impl RuntimeResourceInstaller {
         set_executable_if_needed(partial_path, file.executable)?;
         let final_path = self.final_path(file);
         if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).map_err(|_| io_error("create final directory", parent))?;
+            fs::create_dir_all(parent)
+                .map_err(|error| io_error("create final directory", parent, error))?;
         }
         fs::rename(partial_path, &final_path)
-            .map_err(|_| io_error("commit verified file", &final_path))?;
+            .map_err(|error| io_error("commit verified file", &final_path, error))?;
         Ok(())
     }
 
@@ -907,10 +1013,7 @@ impl RuntimeResourceInstaller {
         }
     }
 
-    fn write_installed_record(
-        &self,
-        component: RuntimeResourceComponent,
-    ) -> Result<(), ResourceInstallError> {
+    fn write_installed_record(&self) -> Result<(), ResourceInstallError> {
         #[derive(Serialize)]
         struct InstalledRecord<'a> {
             schema_version: u32,
@@ -918,11 +1021,12 @@ impl RuntimeResourceInstaller {
             target: &'a str,
             installed_components: &'a [ManifestComponent],
         }
+        let installed_components = self.verified_components()?;
         let record = InstalledRecord {
             schema_version: 1,
             release: RELEASE,
             target: &self.manifest.target,
-            installed_components: component.required_components(),
+            installed_components: &installed_components,
         };
         let bytes = serde_json::to_vec_pretty(&record).map_err(|error| {
             ResourceInstallError::Manifest(format!("failed to serialize installed record: {error}"))
@@ -932,17 +1036,52 @@ impl RuntimeResourceInstaller {
             .installed_record
             .with_file_name("installed.json.tmp");
         let mut output = File::create(&temporary)
-            .map_err(|_| io_error("create installed record", &temporary))?;
+            .map_err(|error| io_error("create installed record", &temporary, error))?;
         output
             .write_all(&bytes)
-            .map_err(|_| io_error("write installed record", &temporary))?;
+            .map_err(|error| io_error("write installed record", &temporary, error))?;
         output
             .sync_all()
-            .map_err(|_| io_error("sync installed record", &temporary))?;
+            .map_err(|error| io_error("sync installed record", &temporary, error))?;
         drop(output);
-        fs::rename(&temporary, &self.layout.installed_record)
-            .map_err(|_| io_error("commit installed record", &self.layout.installed_record))?;
+        fs::rename(&temporary, &self.layout.installed_record).map_err(|error| {
+            io_error(
+                "commit installed record",
+                &self.layout.installed_record,
+                error,
+            )
+        })?;
         Ok(())
+    }
+
+    fn invalidate_installed_record(&self) -> Result<(), ResourceInstallError> {
+        remove_file_if_present(&self.layout.installed_record, "invalidate installed record")
+    }
+
+    fn verified_components(&self) -> Result<Vec<ManifestComponent>, ResourceInstallError> {
+        let mut verified = Vec::with_capacity(3);
+        for component in [
+            ManifestComponent::Media,
+            ManifestComponent::VoiceRuntime,
+            ManifestComponent::VoiceModels,
+        ] {
+            let mut component_verified = true;
+            for file in self
+                .manifest
+                .files
+                .iter()
+                .filter(|file| file.component == component)
+            {
+                if !file_matches(&self.final_path(file), file)? {
+                    component_verified = false;
+                    break;
+                }
+            }
+            if component_verified {
+                verified.push(component);
+            }
+        }
+        Ok(verified)
     }
 
     fn required_files(&self, component: RuntimeResourceComponent) -> Vec<&ManifestFile> {
@@ -968,10 +1107,10 @@ impl RuntimeResourceInstaller {
             if file_matches(&self.final_path(file), file)? {
                 return Ok(required);
             }
-            let partial_size = fs::metadata(self.partial_path(file))
-                .map(|metadata| metadata.len().min(file.size_bytes))
-                .unwrap_or(0);
-            Ok(required.saturating_add(file.size_bytes.saturating_sub(partial_size)))
+            let partial_size = file_size_if_present(&self.partial_path(file))?.min(file.size_bytes);
+            required
+                .checked_add(file.size_bytes - partial_size)
+                .ok_or(ResourceInstallError::DiskRequirementOverflow)
         })
     }
 
@@ -993,11 +1132,16 @@ impl RuntimeResourceInstaller {
         Ok(())
     }
 
-    fn acquire_operation(&self) -> Result<OperationGuard<'_>, ResourceInstallError> {
-        self.operation_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| ResourceInstallError::Busy)?;
-        Ok(OperationGuard(&self.operation_running))
+    fn acquire_operation(&self) -> Result<OperationGuard, ResourceInstallError> {
+        let mut roots = operation_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !roots.insert(self.operation_key.clone()) {
+            return Err(ResourceInstallError::Busy);
+        }
+        Ok(OperationGuard {
+            key: self.operation_key.clone(),
+        })
     }
 
     fn check_cancel(&self, cancel: &AtomicBool) -> Result<(), ResourceInstallError> {
@@ -1008,6 +1152,20 @@ impl RuntimeResourceInstaller {
         }
     }
 
+    fn wait_for_retry(
+        &self,
+        cancel: &AtomicBool,
+        delay: Duration,
+    ) -> Result<(), ResourceInstallError> {
+        let started = Instant::now();
+        while started.elapsed() < delay {
+            self.check_cancel(cancel)?;
+            let remaining = delay.saturating_sub(started.elapsed());
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+        self.check_cancel(cancel)
+    }
+
     fn final_path(&self, file: &ManifestFile) -> PathBuf {
         self.layout.version_root.join(&file.relative_path)
     }
@@ -1015,7 +1173,7 @@ impl RuntimeResourceInstaller {
     fn partial_path(&self, file: &ManifestFile) -> PathBuf {
         self.layout
             .partial_root
-            .join(format!("{}.partial", file.relative_path))
+            .join(format!("{}.partial", file.sha256))
     }
 
     fn ready_status(
@@ -1061,11 +1219,40 @@ impl RuntimeResourceInstaller {
     }
 }
 
-struct OperationGuard<'a>(&'a AtomicBool);
+struct OperationGuard {
+    key: PathBuf,
+}
 
-impl Drop for OperationGuard<'_> {
+fn operation_registry() -> &'static Mutex<HashSet<PathBuf>> {
+    static RUNNING_ROOTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    RUNNING_ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn operation_key(app_data_dir: &Path) -> Result<PathBuf, ResourceInstallError> {
+    let app_data_dir = match fs::canonicalize(app_data_dir) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if app_data_dir.is_absolute() {
+                app_data_dir.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|error| io_error("resolve app data directory", app_data_dir, error))?
+                    .join(app_data_dir)
+            }
+        }
+        Err(error) => {
+            return Err(io_error("resolve app data directory", app_data_dir, error));
+        }
+    };
+    Ok(app_data_dir.join("runtime-resources").join(RELEASE))
+}
+
+impl Drop for OperationGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        operation_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
     }
 }
 
@@ -1075,11 +1262,52 @@ fn total_size(files: &[&ManifestFile]) -> u64 {
         .fold(0_u64, |total, file| total.saturating_add(file.size_bytes))
 }
 
+pub fn required_disk_space(missing_bytes: u64) -> Result<u64, ResourceInstallError> {
+    const FIXED_RESERVE: u64 = 512 * 1024 * 1024;
+    let ten_percent_rounded_up = missing_bytes / 10 + u64::from(!missing_bytes.is_multiple_of(10));
+    missing_bytes
+        .checked_add(FIXED_RESERVE.max(ten_percent_rounded_up))
+        .ok_or(ResourceInstallError::DiskRequirementOverflow)
+}
+
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn content_length(response: &reqwest::blocking::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+}
+
+fn file_size_if_present(path: &Path) -> Result<u64, ResourceInstallError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(io_error("read partial metadata", path, error)),
+    }
+}
+
+fn remove_file_if_present(
+    path: &Path,
+    operation: &'static str,
+) -> Result<(), ResourceInstallError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(operation, path, error)),
+    }
+}
+
 fn file_matches(path: &Path, file: &ManifestFile) -> Result<bool, ResourceInstallError> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(_) => return Err(io_error("read file metadata", path)),
+        Err(error) => return Err(io_error("read file metadata", path, error)),
     };
     if !metadata.is_file() || metadata.len() != file.size_bytes {
         return Ok(false);
@@ -1095,7 +1323,8 @@ fn hash_file_cancellable(
     path: &Path,
     cancel: Option<&AtomicBool>,
 ) -> Result<String, ResourceInstallError> {
-    let mut input = File::open(path).map_err(|_| io_error("open file for hashing", path))?;
+    let mut input =
+        File::open(path).map_err(|error| io_error("open file for hashing", path, error))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -1104,7 +1333,7 @@ fn hash_file_cancellable(
         }
         let count = input
             .read(&mut buffer)
-            .map_err(|_| io_error("read file for hashing", path))?;
+            .map_err(|error| io_error("read file for hashing", path, error))?;
         if count == 0 {
             break;
         }
@@ -1112,9 +1341,10 @@ fn hash_file_cancellable(
     }
     let digest = hasher.finalize();
     let mut output = String::with_capacity(64);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in digest {
-        use fmt::Write as _;
-        write!(&mut output, "{byte:02x}").map_err(|_| io_error("format SHA-256", path))?;
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     Ok(output)
 }
@@ -1124,7 +1354,7 @@ fn set_executable_if_needed(path: &Path, executable: bool) -> Result<(), Resourc
     if executable {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .map_err(|_| io_error("set executable permissions", path))?;
+            .map_err(|error| io_error("set executable permissions", path, error))?;
     }
     Ok(())
 }
@@ -1139,9 +1369,10 @@ fn bytes_per_second(bytes: u64, elapsed: Duration) -> u64 {
     ((bytes as u128).saturating_mul(1_000_000_000) / nanos).min(u64::MAX as u128) as u64
 }
 
-fn io_error(operation: &'static str, path: &Path) -> ResourceInstallError {
+fn io_error(operation: &'static str, path: &Path, error: std::io::Error) -> ResourceInstallError {
     ResourceInstallError::Io {
         operation,
         path: path.display().to_string(),
+        message: error.to_string(),
     }
 }

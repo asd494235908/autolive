@@ -1,7 +1,7 @@
 use autolive_desktop_core::runtime_resources::{
-    ManifestComponent, ResourceInstallError, RuntimeResourceComponent, RuntimeResourceInstaller,
-    RuntimeResourceLayout, RuntimeResourceManifest, RuntimeResourceState, ValidationMode,
-    PRODUCTION_BASE_URL,
+    required_disk_space, ManifestComponent, ResourceInstallError, RuntimeResourceComponent,
+    RuntimeResourceInstaller, RuntimeResourceLayout, RuntimeResourceManifest, RuntimeResourceState,
+    ValidationMode, PRODUCTION_BASE_URL,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -18,6 +18,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const TARGET: &str = "aarch64-apple-darwin";
 const FILE_PATH: &str = "aarch64-apple-darwin/binaries/ffmpeg";
 const FILE_BYTES: &[u8] = b"verified runtime resource";
+const VOICE_RUNTIME_PATH: &str = "aarch64-apple-darwin/voice-worker/worker";
+const VOICE_RUNTIME_BYTES: &[u8] = b"r";
+const VOICE_MODEL_PATH: &str = "common/voice-models/model.bin";
+const VOICE_MODEL_BYTES: &[u8] = b"m";
 static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn manifest_json(base_url: &str, relative_path: &str) -> Vec<u8> {
@@ -49,12 +53,12 @@ fn rejects_manifest_with_untrusted_origin_or_parent_segment() {
     );
 
     let bad_path = manifest_json(PRODUCTION_BASE_URL, "aarch64-apple-darwin/../ffmpeg");
-    assert!(
-        RuntimeResourceManifest::parse_and_validate(&bad_path, ValidationMode::Production).is_err()
-    );
+    let error = RuntimeResourceManifest::parse_and_validate(&bad_path, ValidationMode::Production)
+        .expect_err("parent segment must be rejected");
+    assert!(error.to_string().contains("unsafe manifest path"));
 
     let encoded_parent = manifest_json(
-        &format!("{PRODUCTION_BASE_URL}/"),
+        PRODUCTION_BASE_URL,
         "aarch64-apple-darwin/binaries/%2e%2e/ffmpeg",
     );
     assert!(RuntimeResourceManifest::parse_and_validate(
@@ -62,6 +66,14 @@ fn rejects_manifest_with_untrusted_origin_or_parent_segment() {
         ValidationMode::Production
     )
     .is_err());
+}
+
+#[test]
+fn production_base_url_contract_includes_the_trailing_slash() {
+    assert_eq!(
+        PRODUCTION_BASE_URL,
+        "http://101.96.208.132:7088/autolive-resources/v0.1.0/"
+    );
 }
 
 #[test]
@@ -90,16 +102,22 @@ fn voice_component_expands_to_all_required_components() {
     );
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum FixtureMode {
     Range,
     IgnoreRange,
-    WrongContentRange,
+    WrongContentRangeThenRange,
+    MissingContentRangeThenRange,
+    BadRangeContentLengthThenRange,
+    StatusesThenRange(Vec<u16>),
+    CancelAfterStatus(u16, Arc<AtomicBool>),
+    BadContentLength,
+    DisconnectThenRange(usize),
 }
 
 struct RangeFixture {
     address: SocketAddr,
-    requested_ranges: Arc<Mutex<Vec<String>>>,
+    requested_ranges: Arc<Mutex<Vec<Option<String>>>>,
     requests: Arc<Mutex<usize>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -133,7 +151,7 @@ impl RangeFixture {
                         stream
                             .set_nonblocking(false)
                             .expect("fixture connection should become blocking");
-                        serve_request(stream, &body, mode, &thread_ranges, &thread_requests)
+                        serve_request(stream, &body, &mode, &thread_ranges, &thread_requests)
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
@@ -155,7 +173,7 @@ impl RangeFixture {
         format!("http://{}/", self.address)
     }
 
-    fn requested_ranges(&self) -> Vec<String> {
+    fn requested_ranges(&self) -> Vec<Option<String>> {
         self.requested_ranges
             .lock()
             .expect("range fixture lock")
@@ -180,8 +198,8 @@ impl Drop for RangeFixture {
 fn serve_request(
     mut stream: TcpStream,
     body: &[u8],
-    mode: FixtureMode,
-    ranges: &Mutex<Vec<String>>,
+    mode: &FixtureMode,
+    ranges: &Mutex<Vec<Option<String>>>,
     requests: &Mutex<usize>,
 ) {
     stream
@@ -198,18 +216,41 @@ fn serve_request(
         }
         request.extend_from_slice(&buffer[..read]);
     }
-    *requests.lock().expect("request fixture lock") += 1;
+    let request_number = {
+        let mut requests = requests.lock().expect("request fixture lock");
+        *requests += 1;
+        *requests
+    };
     let request = String::from_utf8(request).expect("HTTP request should be UTF-8");
     let range = request.lines().find_map(|line| {
         line.strip_prefix("Range: ")
             .or_else(|| line.strip_prefix("range: "))
             .map(str::trim)
     });
-    if let Some(range) = range {
-        ranges
-            .lock()
-            .expect("range fixture lock")
-            .push(range.to_owned());
+    ranges
+        .lock()
+        .expect("range fixture lock")
+        .push(range.map(str::to_owned));
+
+    if let FixtureMode::StatusesThenRange(statuses) = mode {
+        if let Some(status) = statuses.get(request_number - 1) {
+            let header = format!(
+                "HTTP/1.1 {status} fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(header.as_bytes())
+                .expect("fixture should write status response");
+            return;
+        }
+    }
+    if let FixtureMode::CancelAfterStatus(status, cancel) = mode {
+        let header =
+            format!("HTTP/1.1 {status} fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(header.as_bytes())
+            .expect("fixture should write cancellation response");
+        cancel.store(true, Ordering::SeqCst);
+        return;
     }
 
     let start = range
@@ -218,7 +259,8 @@ fn serve_request(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
     let (status, response_body, content_range) = match (mode, range) {
-        (FixtureMode::Range, Some(_)) => (
+        (FixtureMode::Range | FixtureMode::StatusesThenRange(_), Some(_))
+        | (FixtureMode::DisconnectThenRange(_), Some(_)) => (
             "206 Partial Content",
             &body[start..],
             Some(format!(
@@ -227,7 +269,7 @@ fn serve_request(
                 body.len()
             )),
         ),
-        (FixtureMode::WrongContentRange, Some(_)) => (
+        (FixtureMode::WrongContentRangeThenRange, Some(_)) if request_number == 1 => (
             "206 Partial Content",
             &body[start..],
             Some(format!(
@@ -237,18 +279,43 @@ fn serve_request(
                 body.len()
             )),
         ),
+        (FixtureMode::MissingContentRangeThenRange, Some(_)) if request_number == 1 => {
+            ("206 Partial Content", &body[start..], None)
+        }
+        (FixtureMode::BadRangeContentLengthThenRange, Some(_)) if request_number == 1 => (
+            "206 Partial Content",
+            &body[start..],
+            Some(format!(
+                "Content-Range: bytes {start}-{}/{}\r\n",
+                body.len() - 1,
+                body.len()
+            )),
+        ),
         _ => ("200 OK", body, None),
+    };
+    let content_length = if matches!(mode, FixtureMode::BadContentLength)
+        || matches!(mode, FixtureMode::BadRangeContentLengthThenRange) && request_number == 1
+    {
+        response_body.len() as u64 + 1
+    } else {
+        response_body.len() as u64
     };
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
-        response_body.len(),
+        content_length,
         content_range.unwrap_or_default()
     );
     stream
         .write_all(header.as_bytes())
         .expect("fixture should write response header");
+    let bytes_to_write = match mode {
+        FixtureMode::DisconnectThenRange(limit) if request_number == 1 => {
+            (*limit).min(response_body.len())
+        }
+        _ => response_body.len(),
+    };
     stream
-        .write_all(response_body)
+        .write_all(&response_body[..bytes_to_write])
         .expect("fixture should write response body");
 }
 
@@ -282,9 +349,10 @@ impl Drop for TestDir {
 }
 
 struct InstallerHarness {
-    _root: TestDir,
+    root: TestDir,
     installer: RuntimeResourceInstaller,
     layout: RuntimeResourceLayout,
+    partial_hash: String,
 }
 
 impl InstallerHarness {
@@ -304,9 +372,10 @@ impl InstallerHarness {
             RuntimeResourceInstaller::for_test(&manifest, root.path(), &fixture.base_url())
                 .expect("valid installer fixture");
         Self {
-            _root: root,
+            root,
             installer,
             layout,
+            partial_hash: hash.to_owned(),
         }
     }
 
@@ -335,7 +404,17 @@ impl InstallerHarness {
     fn partial_path(&self) -> PathBuf {
         self.layout
             .partial_root
-            .join(format!("{FILE_PATH}.partial"))
+            .join(format!("{}.partial", self.partial_hash))
+    }
+
+    fn independent_installer(&self, fixture: &RangeFixture) -> RuntimeResourceInstaller {
+        let manifest = test_manifest(
+            &fixture.base_url(),
+            FILE_BYTES.len() as u64,
+            &sha256(FILE_BYTES),
+        );
+        RuntimeResourceInstaller::for_test(&manifest, self.root.path(), &fixture.base_url())
+            .expect("second installer should be valid")
     }
 }
 
@@ -355,16 +434,16 @@ fn test_manifest(base_url: &str, size_bytes: u64, hash: &str) -> Vec<u8> {
             },
             {
                 "component": "voice-runtime",
-                "relative_path": "aarch64-apple-darwin/voice-worker/worker",
+                "relative_path": VOICE_RUNTIME_PATH,
                 "size_bytes": 1,
-                "sha256": "11".repeat(32),
+                "sha256": sha256(VOICE_RUNTIME_BYTES),
                 "executable": true
             },
             {
                 "component": "voice-models",
-                "relative_path": "common/voice-models/model.bin",
+                "relative_path": VOICE_MODEL_PATH,
                 "size_bytes": 1,
-                "sha256": "22".repeat(32),
+                "sha256": sha256(VOICE_MODEL_BYTES),
                 "executable": false
             }
         ]
@@ -408,7 +487,10 @@ fn resumes_partial_file_with_matching_range_and_installs_atomically() {
 
     harness.install().expect("install succeeds");
 
-    assert_eq!(fixture.requested_ranges(), vec!["bytes=4-"]);
+    assert_eq!(
+        fixture.requested_ranges(),
+        vec![Some("bytes=4-".to_owned())]
+    );
     assert_eq!(fs::read(harness.final_path()).unwrap(), FILE_BYTES);
     assert!(!harness.partial_path().exists());
     assert!(harness.layout.installed_record.is_file());
@@ -433,21 +515,162 @@ fn restarts_partial_when_server_responds_with_200() {
 
     harness.install().expect("200 fallback should restart file");
 
-    assert_eq!(fixture.requested_ranges(), vec!["bytes=4-"]);
+    assert_eq!(
+        fixture.requested_ranges(),
+        vec![Some("bytes=4-".to_owned())]
+    );
     assert_eq!(fs::read(harness.final_path()).unwrap(), FILE_BYTES);
 }
 
 #[test]
-fn rejects_wrong_content_range_and_deletes_untrusted_partial() {
-    let fixture = RangeFixture::with_mode(FILE_BYTES, FixtureMode::WrongContentRange);
+fn wrong_content_range_discards_partial_and_restarts_without_range() {
+    let fixture = RangeFixture::with_mode(FILE_BYTES, FixtureMode::WrongContentRangeThenRange);
     let harness = InstallerHarness::with_partial(&fixture, &FILE_BYTES[..4]);
+
+    harness
+        .install()
+        .expect("invalid range metadata should restart once");
+
+    assert_eq!(
+        fixture.requested_ranges(),
+        vec![Some("bytes=4-".to_owned()), None]
+    );
+    assert_eq!(fs::read(harness.final_path()).unwrap(), FILE_BYTES);
+    assert!(!harness.partial_path().exists());
+}
+
+#[test]
+fn missing_content_range_discards_partial_and_restarts_without_range() {
+    let fixture = RangeFixture::with_mode(FILE_BYTES, FixtureMode::MissingContentRangeThenRange);
+    let harness = InstallerHarness::with_partial(&fixture, &FILE_BYTES[..4]);
+
+    harness
+        .install()
+        .expect("missing range metadata should restart once");
+
+    assert_eq!(
+        fixture.requested_ranges(),
+        vec![Some("bytes=4-".to_owned()), None]
+    );
+}
+
+#[test]
+fn wrong_range_content_length_discards_partial_and_restarts_without_range() {
+    let fixture = RangeFixture::with_mode(FILE_BYTES, FixtureMode::BadRangeContentLengthThenRange);
+    let harness = InstallerHarness::with_partial(&fixture, &FILE_BYTES[..4]);
+
+    harness
+        .install()
+        .expect("wrong remaining length should restart once");
+
+    assert_eq!(
+        fixture.requested_ranges(),
+        vec![Some("bytes=4-".to_owned()), None]
+    );
+}
+
+#[test]
+fn retries_two_transient_statuses_then_succeeds_on_the_third_request() {
+    let fixture =
+        RangeFixture::with_mode(FILE_BYTES, FixtureMode::StatusesThenRange(vec![408, 429]));
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+
+    harness
+        .install()
+        .expect("the third request should complete the installation");
+
+    assert_eq!(fixture.request_count(), 3);
+    assert_eq!(fixture.requested_ranges(), vec![None, None, None]);
+    assert_eq!(fs::read(harness.final_path()).unwrap(), FILE_BYTES);
+}
+
+#[test]
+fn retries_an_interrupted_read_from_the_existing_partial() {
+    let fixture = RangeFixture::with_mode(FILE_BYTES, FixtureMode::DisconnectThenRange(4));
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+
+    harness
+        .install()
+        .expect("read interruption should resume from bytes already written");
+
+    assert_eq!(
+        fixture.requested_ranges(),
+        vec![None, Some("bytes=4-".to_owned())]
+    );
+    assert_eq!(fs::read(harness.final_path()).unwrap(), FILE_BYTES);
+}
+
+#[test]
+fn stops_after_three_transient_requests() {
+    let fixture = RangeFixture::with_mode(
+        FILE_BYTES,
+        FixtureMode::StatusesThenRange(vec![500, 500, 500]),
+    );
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
 
     assert!(matches!(
         harness.install(),
-        Err(ResourceInstallError::InvalidContentRange { .. })
+        Err(ResourceInstallError::UnexpectedHttpStatus { status: 500, .. })
     ));
-    assert!(!harness.final_path().exists());
+    assert_eq!(fixture.request_count(), 3);
+}
+
+#[test]
+fn cancellation_interrupts_retry_backoff_before_another_request() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let fixture = RangeFixture::with_mode(
+        FILE_BYTES,
+        FixtureMode::CancelAfterStatus(500, Arc::clone(&cancel)),
+    );
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+
+    let result =
+        harness
+            .installer
+            .install(RuntimeResourceComponent::Media, cancel.as_ref(), |_| {});
+
+    assert_eq!(result, Err(ResourceInstallError::Cancelled));
+    assert_eq!(fixture.request_count(), 1);
+}
+
+#[test]
+fn does_not_retry_a_non_transient_client_error() {
+    let fixture = RangeFixture::with_mode(FILE_BYTES, FixtureMode::StatusesThenRange(vec![404]));
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+
+    assert!(matches!(
+        harness.install(),
+        Err(ResourceInstallError::UnexpectedHttpStatus { status: 404, .. })
+    ));
+    assert_eq!(fixture.request_count(), 1);
+}
+
+#[test]
+fn rejects_a_full_response_with_the_wrong_content_length_without_looping() {
+    let fixture = RangeFixture::with_mode(FILE_BYTES, FixtureMode::BadContentLength);
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+
+    assert!(matches!(
+        harness.install(),
+        Err(ResourceInstallError::SizeMismatch { .. })
+    ));
+    assert_eq!(fixture.request_count(), 1);
     assert!(!harness.partial_path().exists());
+}
+
+#[test]
+fn partial_filename_is_the_manifest_hash_without_relative_path_nesting() {
+    let fixture = RangeFixture::new(FILE_BYTES);
+    let harness = InstallerHarness::with_partial(&fixture, &FILE_BYTES[..4]);
+
+    assert_eq!(
+        harness.partial_path(),
+        harness
+            .layout
+            .partial_root
+            .join(format!("{}.partial", sha256(FILE_BYTES)))
+    );
+    assert!(!harness.layout.partial_root.join(FILE_PATH).exists());
 }
 
 #[test]
@@ -512,9 +735,87 @@ fn rejects_install_when_declared_files_exceed_available_disk_space() {
 
     assert!(matches!(
         harness.install(),
-        Err(ResourceInstallError::InsufficientDiskSpace { .. })
+        Err(ResourceInstallError::DiskRequirementOverflow)
     ));
     assert_eq!(fixture.request_count(), 0);
+}
+
+#[test]
+fn disk_requirement_uses_the_exact_reserve_and_checks_overflow() {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let fixed_reserve = 512 * MIB;
+    let threshold = 5 * GIB;
+
+    assert_eq!(required_disk_space(0).unwrap(), fixed_reserve);
+    assert_eq!(required_disk_space(1).unwrap(), fixed_reserve + 1);
+    assert_eq!(
+        required_disk_space(threshold).unwrap(),
+        threshold + fixed_reserve
+    );
+    assert_eq!(
+        required_disk_space(threshold + 1).unwrap(),
+        threshold + 1 + fixed_reserve + 1
+    );
+    assert_eq!(
+        required_disk_space(u64::MAX),
+        Err(ResourceInstallError::DiskRequirementOverflow)
+    );
+}
+
+#[test]
+fn invalidates_a_stale_installed_record_before_a_repair_can_fail() {
+    let fixture = RangeFixture::with_mode(FILE_BYTES, FixtureMode::StatusesThenRange(vec![404]));
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+    fs::create_dir_all(&harness.layout.version_root).expect("version directory");
+    fs::write(&harness.layout.installed_record, b"stale").expect("stale installed record");
+    fs::create_dir_all(harness.final_path().parent().expect("final parent"))
+        .expect("final directory");
+    fs::write(harness.final_path(), b"invalid").expect("invalid installed file");
+
+    let result = harness.installer.install(
+        RuntimeResourceComponent::Media,
+        &AtomicBool::new(false),
+        |status| {
+            if status.state == RuntimeResourceState::Checking {
+                assert!(
+                    !harness.layout.installed_record.exists(),
+                    "the stale marker must be gone before repair work is observable"
+                );
+            }
+        },
+    );
+    assert!(result.is_err());
+
+    assert!(!harness.layout.installed_record.exists());
+    assert_eq!(fixture.request_count(), 1);
+}
+
+#[test]
+fn installed_record_keeps_every_component_that_is_actually_verified() {
+    let fixture = RangeFixture::new(FILE_BYTES);
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+    for (relative_path, bytes) in [
+        (FILE_PATH, FILE_BYTES),
+        (VOICE_RUNTIME_PATH, VOICE_RUNTIME_BYTES),
+        (VOICE_MODEL_PATH, VOICE_MODEL_BYTES),
+    ] {
+        let destination = harness.layout.version_root.join(relative_path);
+        fs::create_dir_all(destination.parent().expect("component parent"))
+            .expect("component directory");
+        fs::write(destination, bytes).expect("verified component fixture");
+    }
+
+    harness.install().expect("all existing files are valid");
+
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(&harness.layout.installed_record).expect("installed record"),
+    )
+    .expect("installed record JSON");
+    assert_eq!(
+        record["installed_components"],
+        json!(["media", "voice-runtime", "voice-models"])
+    );
 }
 
 #[test]
@@ -539,6 +840,51 @@ fn imports_matching_directory_with_the_same_validation_and_layout() {
     assert_eq!(status.state, RuntimeResourceState::Ready);
     assert_eq!(fs::read(harness.final_path()).unwrap(), FILE_BYTES);
     assert_eq!(fixture.request_count(), 0);
+}
+
+#[test]
+fn import_copy_uses_the_file_handle_opened_after_canonical_containment() {
+    let source = include_str!("../src/runtime_resources.rs");
+    assert!(source.contains("let source_file = File::open(&canonical_source)"));
+    let after_canonicalization = source
+        .split("let canonical_source = fs::canonicalize(&source)")
+        .nth(1)
+        .expect("canonical source check")
+        .split("let source_file = File::open(&canonical_source)")
+        .next()
+        .expect("single-open boundary");
+    assert!(!after_canonicalization.contains(".is_file()"));
+    let copy_function = source
+        .split("fn copy_import_file")
+        .nth(1)
+        .expect("copy_import_file source")
+        .split("fn verify_and_commit")
+        .next()
+        .expect("copy_import_file body");
+    assert!(copy_function.contains("source_file: File"));
+    assert!(!copy_function.contains("File::open("));
+}
+
+#[test]
+fn io_error_includes_the_original_operating_system_message() {
+    let fixture = RangeFixture::new(FILE_BYTES);
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+    let missing = harness.root.path().join("missing-import-directory");
+    let original_message = fs::canonicalize(&missing)
+        .expect_err("fixture path must not exist")
+        .to_string();
+
+    let error = harness
+        .installer
+        .import_directory(
+            RuntimeResourceComponent::Media,
+            &missing,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .expect_err("missing import must fail");
+
+    assert!(error.to_string().contains(&original_message));
 }
 
 #[test]
@@ -567,10 +913,11 @@ fn clear_removes_only_the_fixed_current_release_directory() {
 }
 
 #[test]
-fn clear_is_rejected_while_an_installation_owns_the_installer() {
+fn independent_installers_for_the_same_root_are_mutually_exclusive() {
     let fixture = RangeFixture::new(FILE_BYTES);
     let harness = InstallerHarness::new(&fixture, FILE_BYTES);
-    let installer = harness.installer.clone();
+    let installer = harness.independent_installer(&fixture);
+    let competing_installer = harness.independent_installer(&fixture);
     let (checking_sender, checking_receiver) = sync_channel(0);
     let (release_sender, release_receiver) = sync_channel(0);
     let worker = thread::spawn(move || {
@@ -590,7 +937,7 @@ fn clear_is_rejected_while_an_installation_owns_the_installer() {
         .expect("installation should reach checking");
 
     assert_eq!(
-        harness.installer.clear_current_release(),
+        competing_installer.clear_current_release(),
         Err(ResourceInstallError::Busy)
     );
 
@@ -603,4 +950,39 @@ fn clear_is_rejected_while_an_installation_owns_the_installer() {
             .state,
         RuntimeResourceState::Ready
     );
+}
+
+#[test]
+fn installers_for_different_roots_do_not_block_each_other() {
+    let fixture = RangeFixture::new(FILE_BYTES);
+    let blocked = InstallerHarness::new(&fixture, FILE_BYTES);
+    let other = InstallerHarness::new(&fixture, FILE_BYTES);
+    let installer = blocked.independent_installer(&fixture);
+    let (checking_sender, checking_receiver) = sync_channel(0);
+    let (release_sender, release_receiver) = sync_channel(0);
+    let worker = thread::spawn(move || {
+        installer.install(
+            RuntimeResourceComponent::Media,
+            &AtomicBool::new(false),
+            |status| {
+                if status.state == RuntimeResourceState::Checking {
+                    checking_sender.send(()).expect("checking signal");
+                    release_receiver.recv().expect("release signal");
+                }
+            },
+        )
+    });
+    checking_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first installation should hold its root gate");
+
+    other
+        .install()
+        .expect("a distinct root must not share the operation gate");
+
+    release_sender.send(()).expect("release first installation");
+    worker
+        .join()
+        .expect("installation thread should join")
+        .expect("first installation should finish");
 }
