@@ -60,6 +60,21 @@
    install -d -o autolive-deploy -g autolive-deploy -m 0750 /var/lock/autolive-resources
    ```
 
+   如果资源盘挂载在 `/vol1`（btrfs 或 ext4），正式目录和 staging 必须先在该真实文件系统创建，再把它们 bind mount 到约定路径，并将两行写入 `/etc/fstab`：
+
+   ```sh
+   install -d -o autolive-deploy -g autolive-resources -m 2770 /vol1/autolive-resources
+   install -d -o autolive-deploy -g autolive-resources -m 2770 /vol1/autolive-resources-staging
+   install -d -o root -g root -m 0755 /fs/autolive-resources /fs/autolive-resources-staging
+   ```
+
+   ```fstab
+   /vol1/autolive-resources         /fs/autolive-resources         none  bind  0 0
+   /vol1/autolive-resources-staging /fs/autolive-resources-staging none  bind  0 0
+   ```
+
+   执行 `mount -a` 验证挂载后再启动服务。若 `/fs` 是 trimafs，`/fs/autolive-resources` 和 `/fs/autolive-resources-staging` 只能是 trimafs 上的空挂载点，实际数据必须来自 `/vol1` 等真实 btrfs/ext4 目录；不要让其中一根单独落在 trimafs 或其他文件系统上。unit 的 `RequiresMountsFor` 会让重启时 bind mount 先于 Caddy。
+
    不要以 root 预创建 `/var/log/autolive-resources/access.log` 为 root:root 且不可读；`LogsDirectory=autolive-resources` 会由 systemd 在启动服务前创建并按 `User=`/`Group=` 管理日志目录。若日志目录已由人工创建，应先确保 `autolive-resources` 可写，否则 Caddy 会启动失败并被 systemd 反复重启。正式目录的写入权限需要按实际发布用户与 Caddy 用户的组策略最小化配置；Caddy 只需读，发布器只需创建并移动经过校验的 release 目录。
 
 5. 启动服务并检查：
