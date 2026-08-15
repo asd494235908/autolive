@@ -20,6 +20,12 @@ test('resolvePython rejects a missing explicit interpreter', () => {
   );
 });
 
+test('resolvePython accepts an explicit command from PATH', () => {
+  const path = resolvePython('node');
+
+  assert.notEqual(path, resolve('node'));
+});
+
 test('modelResourceLayout lists all packaged model roots', () => {
   const root = resolve('autolive-models');
   assert.deepEqual(modelResourceLayout(root), {
@@ -72,4 +78,14 @@ test('CI 打包环境会安装 Worker 构建依赖并显式传入许可确认', 
 
   assert.match(workflow, /requirements-voice-clone-build\.txt/);
   assert.match(workflow, /AUTOLIVE_COQUI_TOS_AGREE/);
+
+  const requirements = readFileSync(
+    fileURLToPath(new URL('../worker/requirements-voice-clone.txt', import.meta.url)),
+    'utf8',
+  );
+  assert.match(
+    requirements,
+    /torch==2\.2\.2; sys_platform == "darwin" and platform_machine == "x86_64"/,
+  );
+  assert.match(workflow, /b48d1f513a728a0e5ad8f51d91a0f508fe50f0a4f8de3bd3874cc5628cca5140/);
 });

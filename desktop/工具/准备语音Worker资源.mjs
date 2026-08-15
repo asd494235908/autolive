@@ -15,6 +15,18 @@ function isFile(path) {
   }
 }
 
+function findExecutable(command) {
+  const lookupCommand = process.platform === 'win32' ? 'where' : 'which';
+  try {
+    return execFileSync(lookupCommand, [command], { encoding: 'utf8' })
+      .split(/\r?\n/)
+      .find((path) => path.trim() && isFile(path.trim()))
+      ?.trim();
+  } catch {
+    return undefined;
+  }
+}
+
 export function workerBinaryName(target = process.env.AUTOLIVE_TARGET_TRIPLE) {
   return target?.includes('windows') || (!target && process.platform === 'win32')
     ? `${binaryBaseName}.exe`
@@ -44,22 +56,19 @@ export function resolveWorkerBinaryPath(outputRoot, target = process.env.AUTOLIV
 
 export function resolvePython(explicit = process.env.AUTOLIVE_VOICE_PYTHON) {
   if (explicit?.trim()) {
-    const path = resolve(explicit.trim());
+    const command = explicit.trim();
+    const path = resolve(command);
     if (isFile(path)) return path;
+    if (!/[\\/]/.test(command)) {
+      const executable = findExecutable(command);
+      if (executable) return executable;
+    }
     throw new Error(`找不到可用的 Python：${path}。请设置 AUTOLIVE_VOICE_PYTHON。`);
   }
 
-  const lookupCommand = process.platform === 'win32' ? 'where' : 'which';
   for (const command of ['python3', 'python']) {
-    try {
-      const path = execFileSync(lookupCommand, [command], { encoding: 'utf8' })
-        .split(/\r?\n/)
-        .find(Boolean)
-        ?.trim();
-      if (path && isFile(path)) return path;
-    } catch {
-      // 继续尝试下一个解释器名称。
-    }
+    const path = findExecutable(command);
+    if (path) return path;
   }
   throw new Error('找不到可用的 Python，请设置 AUTOLIVE_VOICE_PYTHON。');
 }

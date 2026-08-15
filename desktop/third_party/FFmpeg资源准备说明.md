@@ -51,7 +51,7 @@ Apple Silicon 本机执行验证为 FFmpeg `9.0-https://www.martin-riedl.de`；�
 
 来源：[FFmpeg 官网下载页](https://ffmpeg.org/download.html)列出的 [BtbN FFmpeg Builds](https://github.com/BtbN/FFmpeg-Builds/releases)；使用 `ffmpeg-n8.1-latest-win64-lgpl-8.1.zip`。
 
-- [Windows x64 LGPL 压缩包](https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-8.1.zip)：`d86ff1f4941d72b2942472f3d0a3c8a0b1b3ac951932f47cfdcd7212f9ae7413`
+- [Windows x64 LGPL 压缩包](https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-8.1.zip)：`b48d1f513a728a0e5ad8f51d91a0f508fe50f0a4f8de3bd3874cc5628cca5140`（上游 `latest` 于 2026-08-14 发布的资产摘要）
 
 Windows `ffmpeg.exe` 和 `ffprobe.exe` 已通过 `file` 校验为 PE32+ x86-64。当前 macOS 环境不执行 Windows PE 文件，Windows 原生安装包验收仍需在 Windows x64 环境执行 `-version` 和媒体样片测试。
 

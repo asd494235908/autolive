@@ -6,10 +6,17 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
+  resolvePython,
   resolveWorkerBinaryPath,
   workerBinaryName,
   workerResourceLayout,
 } from './准备语音Worker资源.mjs';
+
+test('显式 Python 命令名从 PATH 解析', () => {
+  const path = resolvePython('node');
+
+  assert.notEqual(path, join(process.cwd(), 'node'));
+});
 
 test('Worker 资源使用当前平台的可执行文件名', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-voice-worker-'));
