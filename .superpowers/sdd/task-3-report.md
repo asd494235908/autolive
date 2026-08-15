@@ -251,3 +251,59 @@
 - 当前实机为 macOS arm64；能力递归和 Unix symlink 并发替换已真实执行，Windows 文件系统行为未在 Windows 主机实跑。
 - 当前 checkout 按约定没有 Task 5 才提供的生产 `runtime-resources.json`，未执行真实生产下载；manifest 失败、target/app-data 路径、跨组件状态和损坏文件均有真实 loader/installer 行为覆盖。
 - 阻塞 reqwest 无法在 3 秒内被 Rust 线程安全强杀；本轮按复审要求在有限预算后终止整个进程，明确依赖操作系统结束 worker，不再声称 join，也不存在后台无限等待。
+
+---
+
+# Task 3 最终 capability 锚点追加报告
+
+## Status
+
+最终复审剩余的 capability 初始锚点、Windows 目录 symlink/junction 删除兼容及 barrier 测试增强均已完成。本节补充并覆盖上节关于 clear 初始锚点的说明。
+
+## RED / GREEN
+
+### RED
+
+- 新增真实外层替换测试：installer 构造完成后，将整个 `app_data/runtime-resources` 重命名，并在原名放置指向 outside 的 symlink。旧 clear 在执行时重新 ambient 打开该绝对父路径，稳定删除了 `outside/v0.1.0/keep.txt`，测试以外部文件不存在失败。
+- 新增统一 capability entry helper 契约时，测试因 `remove_capability_entry` 尚不存在而编译失败。该契约要求普通文件与空目录均可删除；两种删除方式都失败时，错误必须同时保留 `remove_file` 和 `remove_dir` 的原始错误文本。
+
+### GREEN
+
+- 相同外层 symlink 替换下，clear 从构造期持有的 app-data capability 相对打开 `runtime-resources`；逃逸 symlink 无法作为目录能力打开，只解除链接本身，outside 文件在首次 clear 和恢复合法目录后的重试 clear 之后均保持不变。
+- 既有内部目录 barrier 竞态测试在重试 clear 后新增第二次 outside 内容断言并通过。
+- 统一 entry helper 对文件先尝试 `remove_file`，失败后尝试 `remove_dir`；这覆盖 Windows 目录 symlink/junction 的删除差异，两个操作都失败时合并保留两条系统错误。两者均为父目录 capability 下的相对名称操作，不跟随目标。
+- installer 的 `Clone + Send + Sync` 编译契约通过；Clone 测试使用 `Arc::ptr_eq` 确认共享同一个 app-data `Dir` 句柄。
+
+## capability 生命周期与 clear 路径
+
+- `RuntimeResourceInstaller::from_manifest` 必要时先创建 app-data 目录，随后立即通过 `Dir::open_ambient_dir(app_data_dir, ambient_authority())` 获取可信 capability，并以 `Arc<Dir>` 持有。
+- clear 不再从 `version_root` 或其绝对 parent 重新 ambient 打开锚点。完整路径为：已持有 app-data `Dir` → 相对 `open_dir("runtime-resources")` → 相对 `open_dir("v0.1.0")` → 句柄递归。
+- `runtime-resources`、release 根、递归文件条目和递归目录删除都复用 `remove_capability_entry`。所有实际 read/remove 仅接收打开的 `Dir` 与单个相对 entry name；绝对路径只用于状态和错误展示。
+- `runtime_resources.rs` 中另一个 ambient open 仍是既有的本地导入源 capability 建立点，与 clear 路径无关。旧 `remove_directory_entry`、`remove_tree_cancellable`、clear 内 ambient 打开和绝对 read-dir helper 均无残留。
+
+## 本次改动文件
+
+- `desktop/src-tauri/src/runtime_resources.rs`
+- `desktop/src-tauri/tests/runtime_resources_contract.rs`
+- `.superpowers/sdd/task-3-report.md`
+
+未修改 release speech 环境相关文件，因此按复审要求没有重复 Release 门禁。
+
+## 最终验证
+
+均在本地 `/Users/mac/work/gepin/autoLive/desktop/src-tauri` 执行：
+
+- capability helper/Clone/Send/Sync 聚焦测试：2 passed，0 failed。
+- clear 聚焦行为：5 passed，0 failed。
+- RuntimeResourceTask 聚焦行为：8 passed，0 failed。
+- runtime resource command 契约：6 passed，0 failed。
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --all-targets --all-features -- -D warnings`：通过，0 warning。
+- `cargo test --all-targets --all-features`：218 passed，0 failed。
+- `cargo check --all-targets --all-features`：通过。
+- `git diff --check`：通过。
+
+## 疑虑与未验证项
+
+- 当前实机为 macOS arm64；Unix 的外层/内层 symlink 替换均已真实执行。统一 helper 在当前平台完成文件、目录及双错误行为测试并保证跨平台编译，Windows 目录 symlink/junction 的实际系统调用分支仍由 Windows CI 矩阵验证。
+- 当前 checkout 仍没有 Task 5 才会提供的生产 manifest，未执行真实生产资源下载；本轮不改变此前已验证的 manifest/下载路径。

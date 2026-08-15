@@ -13,6 +13,7 @@ use sysinfo::Disks;
 
 pub const PRODUCTION_BASE_URL: &str = "http://101.96.208.132:7088/autolive-resources/v0.1.0/";
 const RELEASE: &str = "v0.1.0";
+const RUNTIME_RESOURCES_DIRECTORY: &str = "runtime-resources";
 const MAX_HTTP_REQUESTS: usize = 3;
 const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(50)];
 const SUPPORTED_TARGETS: [&str; 3] = [
@@ -409,6 +410,7 @@ impl From<ManifestValidationError> for ResourceInstallError {
 pub struct RuntimeResourceInstaller {
     manifest: Arc<RuntimeResourceManifest>,
     layout: RuntimeResourceLayout,
+    app_data_capability: Arc<Dir>,
     client: reqwest::blocking::Client,
     operation_key: PathBuf,
 }
@@ -477,6 +479,12 @@ impl RuntimeResourceInstaller {
         manifest: RuntimeResourceManifest,
         app_data_dir: &Path,
     ) -> Result<Self, ResourceInstallError> {
+        fs::create_dir_all(app_data_dir)
+            .map_err(|error| io_error("create app data directory", app_data_dir, error))?;
+        let app_data_capability = Arc::new(
+            Dir::open_ambient_dir(app_data_dir, ambient_authority())
+                .map_err(|error| io_error("open app data directory", app_data_dir, error))?,
+        );
         let layout = RuntimeResourceLayout::for_target(app_data_dir, &manifest.target)?;
         let operation_key = operation_key(&layout.version_root)?;
         let client = reqwest::blocking::Client::builder()
@@ -491,6 +499,7 @@ impl RuntimeResourceInstaller {
         Ok(Self {
             manifest: Arc::new(manifest),
             layout,
+            app_data_capability,
             client,
             operation_key,
         })
@@ -577,24 +586,29 @@ impl RuntimeResourceInstaller {
                     path: self.layout.version_root.display().to_string(),
                     message: "resource release root has no parent directory".to_owned(),
                 })?;
-        let root_name =
-            self.layout
-                .version_root
-                .file_name()
-                .ok_or_else(|| ResourceInstallError::Io {
-                    operation: "resolve clear root name",
-                    path: self.layout.version_root.display().to_string(),
-                    message: "resource release root has no directory name".to_owned(),
-                })?;
-        let parent = Dir::open_ambient_dir(parent_path, ambient_authority())
-            .map_err(|error| io_error("open clear root parent", parent_path, error))?;
-        let root = match parent.open_dir(root_name) {
-            Ok(root) => root,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        let parent = match self
+            .app_data_capability
+            .open_dir(RUNTIME_RESOURCES_DIRECTORY)
+        {
+            Ok(parent) => parent,
             Err(_) => {
-                return parent.remove_file(root_name).map_err(|error| {
-                    io_error("clear release root entry", &self.layout.version_root, error)
-                });
+                return remove_capability_entry(
+                    &self.app_data_capability,
+                    std::ffi::OsStr::new(RUNTIME_RESOURCES_DIRECTORY),
+                    parent_path,
+                    "clear runtime resources entry",
+                );
+            }
+        };
+        let root = match parent.open_dir(RELEASE) {
+            Ok(root) => root,
+            Err(_) => {
+                return remove_capability_entry(
+                    &parent,
+                    std::ffi::OsStr::new(RELEASE),
+                    &self.layout.version_root,
+                    "clear release root entry",
+                );
             }
         };
 
@@ -618,9 +632,9 @@ impl RuntimeResourceInstaller {
         )?;
         drop(root);
         self.check_cancel(cancel)?;
-        remove_directory_entry(
+        remove_capability_entry(
             &parent,
-            root_name,
+            std::ffi::OsStr::new(RELEASE),
             &self.layout.version_root,
             "clear release root",
         )
@@ -1365,28 +1379,38 @@ fn remove_directory_contents(
                 if cancel.load(Ordering::Acquire) {
                     return Err(ResourceInstallError::Cancelled);
                 }
-                remove_directory_entry(directory, &name, &display_path, "clear directory")?;
+                remove_capability_entry(directory, &name, &display_path, "clear directory")?;
             }
-            Err(_) => directory
-                .remove_file(&name)
-                .map_err(|error| io_error("clear file entry", &display_path, error))?,
+            Err(_) => remove_capability_entry(directory, &name, &display_path, "clear file entry")?,
         }
     }
     Ok(())
 }
 
-fn remove_directory_entry(
+fn remove_capability_entry(
     parent: &Dir,
     name: &std::ffi::OsStr,
     display_path: &Path,
     operation: &'static str,
 ) -> Result<(), ResourceInstallError> {
-    match parent.remove_dir(name) {
-        Ok(()) => Ok(()),
-        Err(_) => parent
-            .remove_file(name)
-            .map_err(|error| io_error(operation, display_path, error)),
+    let file_error = match parent.remove_file(name) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let directory_error = match parent.remove_dir(name) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if file_error.kind() == std::io::ErrorKind::NotFound
+        && directory_error.kind() == std::io::ErrorKind::NotFound
+    {
+        return Ok(());
     }
+    Err(ResourceInstallError::Io {
+        operation,
+        path: display_path.display().to_string(),
+        message: format!("remove_file failed: {file_error}; remove_dir failed: {directory_error}"),
+    })
 }
 
 fn total_size(files: &[&ManifestFile]) -> u64 {
@@ -1511,5 +1535,96 @@ fn io_error(operation: &'static str, path: &Path, error: std::io::Error) -> Reso
         operation,
         path: path.display().to_string(),
         message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        remove_capability_entry, ResourceInstallError, RuntimeResourceInstaller,
+        RuntimeResourceManifest, PRODUCTION_BASE_URL, RELEASE,
+    };
+    use cap_std::{ambient_authority, fs::Dir};
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn capability_entry_removal_handles_files_directories_and_keeps_both_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "autolive-capability-entry-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("empty-directory")).expect("directory fixture");
+        fs::create_dir_all(root.join("non-empty-directory")).expect("directory fixture");
+        fs::write(root.join("non-empty-directory/child"), b"fixture")
+            .expect("directory child fixture");
+        fs::write(root.join("file"), b"fixture").expect("file fixture");
+        let directory =
+            Dir::open_ambient_dir(&root, ambient_authority()).expect("directory capability");
+
+        remove_capability_entry(
+            &directory,
+            OsStr::new("file"),
+            &root.join("file"),
+            "clear test entry",
+        )
+        .expect("file should be removed");
+        remove_capability_entry(
+            &directory,
+            OsStr::new("empty-directory"),
+            &root.join("empty-directory"),
+            "clear test entry",
+        )
+        .expect("directory should be removed");
+        let error = remove_capability_entry(
+            &directory,
+            OsStr::new("non-empty-directory"),
+            &root.join("non-empty-directory"),
+            "clear test entry",
+        )
+        .expect_err("both removal forms should fail for a non-empty directory");
+
+        let ResourceInstallError::Io { message, .. } = error else {
+            panic!("non-empty directory should return an IO error");
+        };
+        assert!(message.contains("remove_file"));
+        assert!(message.contains("remove_dir"));
+        drop(directory);
+        fs::remove_dir_all(root).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn installer_remains_clone_send_and_sync() {
+        fn assert_contract<T: Clone + Send + Sync>() {}
+        assert_contract::<RuntimeResourceInstaller>();
+
+        let root = std::env::temp_dir().join(format!(
+            "autolive-installer-clone-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let installer = RuntimeResourceInstaller::from_manifest(
+            RuntimeResourceManifest {
+                schema_version: 1,
+                release: RELEASE.to_owned(),
+                target: "aarch64-apple-darwin".to_owned(),
+                base_url: PRODUCTION_BASE_URL.to_owned(),
+                files: Vec::new(),
+            },
+            &root,
+        )
+        .expect("installer fixture");
+        let cloned = installer.clone();
+
+        assert!(std::sync::Arc::ptr_eq(
+            &installer.app_data_capability,
+            &cloned.app_data_capability
+        ));
+        drop((installer, cloned));
+        fs::remove_dir_all(root).expect("test directory cleanup");
     }
 }

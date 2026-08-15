@@ -1026,6 +1026,46 @@ fn clear_removes_a_directory_symlink_without_following_it() {
 
 #[cfg(unix)]
 #[test]
+fn clear_uses_the_app_data_capability_held_before_runtime_root_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = RangeFixture::new(FILE_BYTES);
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+    let runtime_root = harness.root.path().join("runtime-resources");
+    let displaced_runtime_root = harness.root.path().join("runtime-resources-owned");
+    let outside = TestDir::new("clear-runtime-root-symlink-outside");
+    let outside_release = outside.path().join("v0.1.0");
+    let outside_file = outside_release.join("keep.txt");
+    fs::create_dir_all(&outside_release).expect("outside release directory");
+    fs::write(&outside_file, b"keep").expect("outside fixture");
+    fs::rename(&runtime_root, &displaced_runtime_root).expect("runtime root should move");
+    symlink(outside.path(), &runtime_root).expect("runtime root replacement symlink");
+
+    let _first_clear = harness
+        .installer
+        .clear_current_release(&AtomicBool::new(false), |_| {});
+
+    assert_eq!(
+        fs::read(&outside_file).expect("outside file must remain"),
+        b"keep"
+    );
+    if fs::symlink_metadata(&runtime_root).is_ok() {
+        fs::remove_file(&runtime_root).expect("replacement symlink should be removable");
+    }
+    fs::rename(&displaced_runtime_root, &runtime_root).expect("runtime root should be restored");
+    harness
+        .installer
+        .clear_current_release(&AtomicBool::new(false), |_| {})
+        .expect("clear should converge after restoring the runtime root");
+    assert_eq!(
+        fs::read(&outside_file).expect("outside file must remain after retry"),
+        b"keep"
+    );
+    assert!(!harness.layout.version_root.exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn clear_does_not_follow_a_directory_replaced_by_an_external_symlink() {
     use std::os::unix::fs::symlink;
     use std::sync::Barrier;
@@ -1072,6 +1112,10 @@ fn clear_does_not_follow_a_directory_replaced_by_an_external_symlink() {
             .clear_current_release(&AtomicBool::new(false), |_| {})
             .expect("retry should converge after replacement race");
     }
+    assert_eq!(
+        fs::read(&outside_file).expect("outside file must remain after retry"),
+        b"keep"
+    );
     assert!(!harness.layout.version_root.exists());
 }
 
