@@ -234,6 +234,9 @@ jobs:
     needs:
       - common-models
       - package
+    concurrency:
+      group: deploy-runtime-resources-${{ needs.common-models.outputs.version }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - name: Download common runtime resources
@@ -290,9 +293,9 @@ jobs:
           ssh_command="ssh -i $ssh_dir/key -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes -p $DEPLOY_PORT"
           for scope in common x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
             test -d "$release_root/$scope"
-            rsync --archive --compress --ignore-existing -e "$ssh_command" \
+            rsync --archive --compress --ignore-existing --mkpath -e "$ssh_command" \
               "$release_root/$scope/" \
-              "$DEPLOY_USER@$DEPLOY_HOST:/fs/autolive-resources-staging/$RELEASE_VERSION/$scope/"
+              "$DEPLOY_USER@$DEPLOY_HOST:$RELEASE_VERSION/$scope/"
             ssh -i "$ssh_dir/key" \
               -o "UserKnownHostsFile=$ssh_dir/known_hosts" \
               -o StrictHostKeyChecking=yes \

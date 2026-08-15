@@ -63,12 +63,8 @@ test('Tauri scripts use the package binary lookup that works on Windows', () => 
 
   assert.match(packageJson.scripts['tauri:build'], /构建桌面产物\.mjs/);
   assert.match(buildSource, /'tauri'/);
-  assert.deepEqual(tauriBuildArguments('aarch64-apple-darwin'), [
-    'build',
-    '--config',
-    'src-tauri/tauri.conf.json',
-  ]);
-  assert.deepEqual(tauriBuildArguments('x86_64-pc-windows-msvc'), [
+  assert.equal(tauriBuildArguments.length, 0);
+  assert.deepEqual(tauriBuildArguments(), [
     'build',
     '--config',
     'src-tauri/tauri.conf.json',

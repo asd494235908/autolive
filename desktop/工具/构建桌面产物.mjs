@@ -6,13 +6,12 @@ import { archiveDesktopArtifacts } from './归档桌面产物.mjs';
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
-export function tauriBuildArguments(targetTriple = process.env.AUTOLIVE_TARGET_TRIPLE?.trim()) {
-  void targetTriple;
+export function tauriBuildArguments() {
   return ['build', '--config', 'src-tauri/tauri.conf.json'];
 }
 
 export function buildDesktopArtifacts(targetTriple = process.env.AUTOLIVE_TARGET_TRIPLE?.trim()) {
-  const result = spawnSync('tauri', tauriBuildArguments(targetTriple), {
+  const result = spawnSync('tauri', tauriBuildArguments(), {
     cwd: desktopRoot,
     shell: process.platform === 'win32',
     stdio: 'inherit',

@@ -13,6 +13,9 @@ const packageJsonPath = fileURLToPath(new URL('../ui/package.json', import.meta.
 const workflowPath = fileURLToPath(
   new URL('../../.github/workflows/desktop-package.yml', import.meta.url),
 );
+const implementationPlanPath = fileURLToPath(
+  new URL('../../docs/superpowers/plans/2026-08-15-桌面运行资源按需下载实施计划.md', import.meta.url),
+);
 
 function assertInOrder(source, fragments) {
   assert.equal(typeof source, 'string', '缺少构建脚本');
@@ -34,13 +37,8 @@ test('Tauri 只打包内置运行资源清单', () => {
 test('Windows 与 macOS 都使用原生 Tauri bundle', () => {
   const expected = ['build', '--config', 'src-tauri/tauri.conf.json'];
 
-  for (const target of [
-    'x86_64-apple-darwin',
-    'aarch64-apple-darwin',
-    'x86_64-pc-windows-msvc',
-  ]) {
-    assert.deepEqual(tauriBuildArguments(target), expected);
-  }
+  assert.match(tauriBuildArguments.toString(), /^function tauriBuildArguments\(\)/);
+  assert.deepEqual(tauriBuildArguments(), expected);
 });
 
 test('归档器只复制原生 bundle，不复制大运行资源', () => {
@@ -114,12 +112,34 @@ test('CI 仅手动 main 部署已构建产物，强制 host key 并不覆盖已�
   assert.match(deployJob, /AUTOLIVE_RESOURCE_DEPLOY_KEY/);
   assert.match(deployJob, /AUTOLIVE_RESOURCE_DEPLOY_HOST_KEY/);
   assert.match(deployJob, /StrictHostKeyChecking=yes/);
-  assert.match(deployJob, /rsync[^\n]*--ignore-existing/);
+  assert.match(deployJob, /rsync --archive --compress --ignore-existing --mkpath/);
+  assert.match(
+    deployJob,
+    /"\$DEPLOY_USER@\$DEPLOY_HOST:\$RELEASE_VERSION\/\$scope\/"/,
+  );
+  assert.doesNotMatch(deployJob, /:\/fs\/autolive-resources-staging/);
   assert.match(deployJob, /publish-runtime-resources/);
+  assert.match(
+    deployJob,
+    /concurrency:\n\s+group: deploy-runtime-resources-\$\{\{ needs\.common-models\.outputs\.version \}\}\n\s+cancel-in-progress: false/,
+  );
   assert.match(
     deployJob,
     /if ! \[\[ "\$DEPLOY_PORT" =~ \^\[0-9\]\{1,4\}\$ \]\] \|\| \(\( DEPLOY_PORT < 1 \|\| DEPLOY_PORT > 9999 \)\); then[\s\S]*?exit 1[\s\S]*?fi/,
   );
   assert.doesNotMatch(workflow, /StrictHostKeyChecking=no|password/i);
   assert.doesNotMatch(deployJob, /cargo build|pnpm .*build|npm .*build|node .*\u6784\u5efa/);
+});
+
+test('Task 6 用 forced-command dispatcher 同时约束 rrsync 写入和精确发布命令', () => {
+  const task6 = readFileSync(implementationPlanPath, 'utf8');
+  assert.match(
+    task6,
+    /authorized_keys[^\n]*command="\/usr\/local\/sbin\/autolive-resource-deploy-dispatcher",restrict/,
+  );
+  assert.match(task6, /exec \/usr\/bin\/rrsync -wo \/fs\/autolive-resources-staging/);
+  assert.match(task6, /rsync --server[^\n]*<release>\/<scope>\//);
+  assert.match(task6, /只允许精确的 `publish-runtime-resources <release> <scope>`/);
+  assert.match(task6, /publisher[^\n]*flock[^\n]*发布锁/);
+  assert.match(task6, /禁止普通登录 shell/);
 });
