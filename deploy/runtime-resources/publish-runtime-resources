@@ -36,21 +36,11 @@ case "$release$scope$upload_id" in
 	*/|*[\\]*) exit 64 ;;
 esac
 
-if [ "${AUTOLIVE_TEST_MODE:-0}" = 1 ]; then
-	case "${TEST_ROOT:-}" in
-		/*) ;;
-		*) exit 64 ;;
-	esac
-	staging_root="$TEST_ROOT/autolive-resources-staging"
-	published_root="$TEST_ROOT/autolive-resources"
-	lock_root="$TEST_ROOT/locks"
-	flock_bin=${FLOCK_BIN:-flock}
-else
-	staging_root=/fs/autolive-resources-staging
-	published_root=/fs/autolive-resources
-	lock_root=/var/lock/autolive-resources
-	flock_bin=/usr/bin/flock
-fi
+PUBLISH_GROUP=autolive-resources
+staging_root=/fs/autolive-resources-staging
+published_root=/fs/autolive-resources
+lock_root=/var/lock/autolive-resources
+flock_bin=/usr/bin/flock
 
 inventory_name=autolive-deploy-inventory.json
 source_dir="$staging_root/$upload_id/$release/$scope"
@@ -65,6 +55,19 @@ reject_symlink_path() {
 	done
 }
 
+reject_symlink_path "$staging_root" "$published_root" "$lock_root"
+mkdir -p "$staging_root" "$published_root" "$lock_root"
+reject_symlink_path "$staging_root" "$published_root" "$lock_root"
+if ! staging_device=$(/usr/bin/stat -c %d "$staging_root"); then
+	fail "cannot inspect staging device"
+fi
+if ! published_device=$(/usr/bin/stat -c %d "$published_root"); then
+	fail "cannot inspect published device"
+fi
+case "$staging_device" in ''|*[!0-9]*) fail "invalid staging device" ;; esac
+case "$published_device" in ''|*[!0-9]*) fail "invalid published device" ;; esac
+[ "$staging_device" = "$published_device" ] || fail "staging and published roots are on different devices"
+
 reject_symlink_path \
 	"$staging_root" \
 	"$staging_root/.candidates" \
@@ -75,7 +78,7 @@ reject_symlink_path \
 	"$published_root/autolive-resources" \
 	"$published_root/autolive-resources/$release"
 reject_symlink_path "$lock_root"
-mkdir -p "$staging_root/.candidates" "$lock_root"
+mkdir -p "$staging_root/.candidates"
 reject_symlink_path "$staging_root" "$staging_root/.candidates" "$lock_root"
 lock_path="$lock_root/$release.lock"
 exec 9>"$lock_path"
@@ -85,7 +88,13 @@ test -d "$source_dir" || fail "source staging is missing"
 if [ -e "$candidate" ] || [ -L "$candidate" ]; then
 	fail "candidate already belongs to another attempt"
 fi
-mv "$source_dir" "$candidate" || fail "cannot claim source staging"
+/usr/bin/mv -T -- "$source_dir" "$candidate" || fail "cannot claim source staging"
+
+if /usr/bin/find "$candidate" -type l -print -quit | grep -q .; then
+	fail "symlink resource entry is forbidden"
+fi
+/usr/bin/chgrp -R "$PUBLISH_GROUP" "$candidate" || fail "cannot set publish group"
+/usr/bin/chmod -R g+rX,o-rwx "$candidate" || fail "cannot set publish permissions"
 
 destination_present=0
 if [ -e "$destination" ] || [ -L "$destination" ]; then
@@ -102,7 +111,9 @@ import sys
 INVENTORY_NAME = "autolive-deploy-inventory.json"
 MAX_INVENTORY_BYTES = 16 * 1024 * 1024
 MAX_FILES = 100_000
+MAX_DIRECTORIES = 100_000
 MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024 * 1024
+MAX_TOTAL_BYTES = 64 * 1024 * 1024 * 1024
 HASH_CHUNK_BYTES = 1024 * 1024
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -137,6 +148,7 @@ if not isinstance(files, list) or len(files) > MAX_FILES:
     fail("inventory file list is invalid")
 
 expected = {}
+expected_total_bytes = 0
 for entry in files:
     if not isinstance(entry, dict) or set(entry) != {"relative_path", "type", "size_bytes", "sha256"}:
         fail("inventory file entry schema is not exact")
@@ -154,6 +166,9 @@ for entry in files:
     size_bytes = entry["size_bytes"]
     if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0 or size_bytes > MAX_FILE_BYTES:
         fail("inventory file size is invalid")
+    expected_total_bytes += size_bytes
+    if expected_total_bytes > MAX_TOTAL_BYTES:
+        fail("inventory total size is too large")
     sha256 = entry["sha256"]
     if not isinstance(sha256, str) or not SHA256.fullmatch(sha256):
         fail("inventory file hash is invalid")
@@ -171,8 +186,10 @@ def validate_root(root, allow_inventory):
 
     actual_files = []
     actual_directories = set()
+    actual_total_bytes = 0
 
     def scan(directory, prefix=""):
+        nonlocal actual_total_bytes
         try:
             entries = os.scandir(directory)
         except OSError as error:
@@ -198,9 +215,14 @@ def validate_root(root, allow_inventory):
                     fail("symlink resource entry is forbidden")
                 if stat.S_ISDIR(entry_stat.st_mode):
                     actual_directories.add(relative_path)
+                    if len(actual_directories) > MAX_DIRECTORIES:
+                        fail("resource directory count is too large")
                     scan(entry.path, relative_path)
                 elif stat.S_ISREG(entry_stat.st_mode):
                     actual_files.append(relative_path)
+                    actual_total_bytes += entry_stat.st_size
+                    if actual_total_bytes > MAX_TOTAL_BYTES:
+                        fail("resource total size is too large")
                 else:
                     fail("non-regular resource entry is forbidden")
                 if len(actual_files) > MAX_FILES:
@@ -209,11 +231,15 @@ def validate_root(root, allow_inventory):
     scan(root)
     if set(actual_files) != set(expected):
         fail("resource files do not exactly match inventory")
+    if actual_total_bytes != expected_total_bytes:
+        fail("resource total size does not match inventory")
     allowed_directories = set()
     for relative_path in expected:
         parts = relative_path.split("/")
         for index in range(1, len(parts)):
             allowed_directories.add("/".join(parts[:index]))
+            if len(allowed_directories) > MAX_DIRECTORIES:
+                fail("inventory directory count is too large")
     if actual_directories != allowed_directories:
         fail("resource directories do not exactly match inventory")
 
@@ -251,7 +277,7 @@ fi
 
 case "$publish_state" in
 	DUPLICATE)
-		rm -rf "$candidate"
+		rm -rf -- "$candidate"
 		exit 0
 		;;
 	NEW) ;;
@@ -267,4 +293,4 @@ if [ -e "$destination" ] || [ -L "$destination" ]; then
 	fail "destination appeared during publication"
 fi
 rm "$candidate/$inventory_name"
-mv "$candidate" "$destination"
+/usr/bin/mv -T -- "$candidate" "$destination"

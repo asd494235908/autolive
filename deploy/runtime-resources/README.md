@@ -7,8 +7,9 @@
 - Caddy 监听 `0.0.0.0:7088`，静态根为 `/fs/autolive-resources`。
 - 正式目录为 `/fs/autolive-resources/autolive-resources/v0.1.0/<scope>/`。
 - 上传 staging 为 `/fs/autolive-resources-staging/<upload-id>/v0.1.0/<scope>/`，发布成功后才会原子移动到正式目录。
+- `/fs/autolive-resources-staging` 与 `/fs/autolive-resources` 必须位于同一文件系统；publisher 启动时用设备号检查，不一致会 fail-closed。
 - Caddy 使用无登录的 `autolive-resources:autolive-resources` 用户/组，只读正式目录，日志写入 `/var/log/autolive-resources`。
-- 发布密钥使用无登录的 `autolive-deploy` 身份，只允许 forced command dispatcher；该身份只写 staging 和已授权的发布路径，不允许普通 shell。
+- 发布密钥使用无登录的 `autolive-deploy` 身份，只允许 forced command dispatcher；该身份只写 staging 和已授权的发布路径，不允许普通 shell。`autolive-deploy` 必须加入 `autolive-resources` 组。
 - `authorized_keys` 应使用 `command="/usr/local/sbin/autolive-resource-deploy-dispatcher",restrict`，并单独保存部署私钥和服务器 host key。私钥、密码、Token 不得写入仓库、日志或聊天记录。
 
 ## 本地安装顺序
@@ -35,7 +36,7 @@
 
    ```sh
    install -d -o autolive-deploy -g autolive-resources -m 2770 /fs/autolive-resources
-   install -d -o autolive-deploy -g autolive-deploy -m 0750 /fs/autolive-resources-staging
+   install -d -o autolive-deploy -g autolive-resources -m 2770 /fs/autolive-resources-staging
    install -d -o autolive-resources -g autolive-resources -m 0750 /var/log/autolive-resources
    install -d -o autolive-deploy -g autolive-deploy -m 0750 /var/lock/autolive-resources
    ```
@@ -51,6 +52,8 @@
    ss -lnt | grep ':7088'
    ```
 
+   若尚未配置组成员关系，先执行 `usermod -a -G autolive-resources autolive-deploy`，再重新登录部署身份。publisher 会在候选发布前执行 `chgrp -R autolive-resources` 和 `chmod -R g+rX,o-rwx`，保留 owner 的可执行位并确保 Caddy 可读/遍历。
+
    发布器依赖 Debian 12 的 `/usr/bin/python3` 标准库和 `/usr/bin/flock`（util-linux）；这两个工具只负责校验 inventory 和 release 锁，不执行项目构建。
 
 ## 部署顺序
@@ -61,7 +64,7 @@ CI 对每个 scope 使用唯一的 `upload-id`（格式为正整数 run id 和�
 publish-runtime-resources v0.1.0 <scope> <upload-id>
 ```
 
-publisher 按 release 加锁，先原子认领 staging，再拒绝 symlink、隐藏项、额外文件、缺失文件、错误大小和错误 SHA-256。正式目录不存在时才原子发布；已存在目录只有在与 inventory 完全一致时才作为幂等重复发布成功，任何差异都失败。不要手工合并旧 run staging，也不要用任意路径参数调用脚本。
+publisher 按 release 加锁，先原子认领 staging，再拒绝 symlink、隐藏项、额外文件、缺失文件、错误大小和错误 SHA-256；inventory 和实际资源都受文件数、目录数和总字节数上限约束。正式目录不存在时才使用 Debian GNU `mv -T --` 原子发布；已存在目录只有在与 inventory 完全一致时才作为幂等重复发布成功，任何差异都失败。不要手工合并旧 run staging，也不要用任意路径参数调用脚本。
 
 ## 公网验收
 

@@ -37,25 +37,26 @@ validate_release_scope_upload() {
 	esac
 }
 
-if [ "${AUTOLIVE_TEST_MODE:-0}" = 1 ]; then
-	case "${TEST_ROOT:-}" in
-		/*) ;;
-		*) fail ;;
-	esac
-	RRSYNC="$TEST_ROOT/usr/local/lib/autolive-resources/rrsync"
-	PUBLISHER="$TEST_ROOT/usr/local/sbin/publish-runtime-resources"
-	STAGING_ROOT="$TEST_ROOT/autolive-resources-staging"
-else
-	RRSYNC=/usr/local/lib/autolive-resources/rrsync
-	PUBLISHER=/usr/local/sbin/publish-runtime-resources
-	STAGING_ROOT=/fs/autolive-resources-staging
-fi
+RRSYNC=/usr/local/lib/autolive-resources/rrsync
+PUBLISHER=/usr/local/sbin/publish-runtime-resources
+STAGING_ROOT=/fs/autolive-resources-staging
 
 original_command=${SSH_ORIGINAL_COMMAND:-}
 [ -n "$original_command" ] || fail
 
 set -- $original_command
 [ "$#" -ge 1 ] || fail
+
+if [ "$1" = rsync ]; then
+	canonical_command=$1
+	shift
+	while [ "$#" -gt 0 ]; do
+		canonical_command="$canonical_command $1"
+		shift
+	done
+	[ "$original_command" = "$canonical_command" ] || fail
+	set -- $canonical_command
+fi
 
 if [ "$1" = publish-runtime-resources ]; then
 	[ "$#" -eq 4 ] || fail
