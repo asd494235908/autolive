@@ -1,3 +1,4 @@
+use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -443,7 +444,7 @@ impl RuntimeResourceInstaller {
         app_data_dir: &Path,
     ) -> Result<Self, ResourceInstallError> {
         let layout = RuntimeResourceLayout::for_target(app_data_dir, &manifest.target)?;
-        let operation_key = operation_key(app_data_dir)?;
+        let operation_key = operation_key(&layout.version_root)?;
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -592,11 +593,8 @@ impl RuntimeResourceInstaller {
         self.check_cancel(cancel)?;
         let canonical_root = fs::canonicalize(source_root)
             .map_err(|error| io_error("open import directory", source_root, error))?;
-        if !canonical_root.is_dir() {
-            return Err(ResourceInstallError::UnsafeImportSource {
-                path: source_root.display().to_string(),
-            });
-        }
+        let source_dir = Dir::open_ambient_dir(&canonical_root, ambient_authority())
+            .map_err(|error| io_error("open import directory", source_root, error))?;
         let files = self.required_files(component);
         let total_bytes = total_size(&files);
         let mut installed_bytes = self.installed_bytes(&files)?;
@@ -631,23 +629,15 @@ impl RuntimeResourceInstaller {
                 fs::remove_file(&final_path)
                     .map_err(|error| io_error("remove invalid file", &final_path, error))?;
             }
-            let source = canonical_root.join(&file.relative_path);
-            let canonical_source = fs::canonicalize(&source)
-                .map_err(|error| io_error("open import file", &source, error))?;
-            if !canonical_source.starts_with(&canonical_root) {
-                return Err(ResourceInstallError::UnsafeImportSource {
-                    path: source.display().to_string(),
-                });
-            }
-            // Open exactly once after canonical containment. Metadata, copying, and the
-            // manifest hash gate therefore refer to this file identity even on platforms
-            // where a parent directory can be replaced after the containment check.
-            let source_file = File::open(&canonical_source)
-                .map_err(|error| io_error("open import file", &canonical_source, error))?;
+            let relative_path = Path::new(&file.relative_path);
+            let source_file = source_dir
+                .open(relative_path)
+                .map_err(|error| io_error("open import file", relative_path, error))?
+                .into_std();
             self.copy_import_file(
                 component,
                 file,
-                &canonical_source,
+                relative_path,
                 source_file,
                 installed_bytes,
                 total_bytes,
@@ -957,7 +947,7 @@ impl RuntimeResourceInstaller {
             .map_err(|error| io_error("read partial metadata", partial_path, error))?
             .len();
         if actual_size != file.size_bytes {
-            let _ignored = fs::remove_file(partial_path);
+            remove_untrusted_partial(partial_path)?;
             return Err(ResourceInstallError::SizeMismatch {
                 path: file.relative_path.clone(),
                 expected: file.size_bytes,
@@ -965,7 +955,7 @@ impl RuntimeResourceInstaller {
             });
         }
         if hash_file_cancellable(partial_path, Some(cancel))? != file.sha256 {
-            let _ignored = fs::remove_file(partial_path);
+            remove_untrusted_partial(partial_path)?;
             return Err(ResourceInstallError::HashMismatch {
                 path: file.relative_path.clone(),
             });
@@ -1228,23 +1218,11 @@ fn operation_registry() -> &'static Mutex<HashSet<PathBuf>> {
     RUNNING_ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn operation_key(app_data_dir: &Path) -> Result<PathBuf, ResourceInstallError> {
-    let app_data_dir = match fs::canonicalize(app_data_dir) {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if app_data_dir.is_absolute() {
-                app_data_dir.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .map_err(|error| io_error("resolve app data directory", app_data_dir, error))?
-                    .join(app_data_dir)
-            }
-        }
-        Err(error) => {
-            return Err(io_error("resolve app data directory", app_data_dir, error));
-        }
-    };
-    Ok(app_data_dir.join("runtime-resources").join(RELEASE))
+fn operation_key(version_root: &Path) -> Result<PathBuf, ResourceInstallError> {
+    fs::create_dir_all(version_root)
+        .map_err(|error| io_error("create resource directory", version_root, error))?;
+    fs::canonicalize(version_root)
+        .map_err(|error| io_error("resolve resource directory", version_root, error))
 }
 
 impl Drop for OperationGuard {
@@ -1301,6 +1279,10 @@ fn remove_file_if_present(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io_error(operation, path, error)),
     }
+}
+
+fn remove_untrusted_partial(path: &Path) -> Result<(), ResourceInstallError> {
+    fs::remove_file(path).map_err(|error| io_error("remove untrusted partial", path, error))
 }
 
 fn file_matches(path: &Path, file: &ManifestFile) -> Result<bool, ResourceInstallError> {

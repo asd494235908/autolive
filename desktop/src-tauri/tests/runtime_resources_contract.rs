@@ -408,14 +408,18 @@ impl InstallerHarness {
     }
 
     fn independent_installer(&self, fixture: &RangeFixture) -> RuntimeResourceInstaller {
-        let manifest = test_manifest(
-            &fixture.base_url(),
-            FILE_BYTES.len() as u64,
-            &sha256(FILE_BYTES),
-        );
-        RuntimeResourceInstaller::for_test(&manifest, self.root.path(), &fixture.base_url())
-            .expect("second installer should be valid")
+        installer_at(fixture, self.root.path())
     }
+}
+
+fn installer_at(fixture: &RangeFixture, app_data_dir: &Path) -> RuntimeResourceInstaller {
+    let manifest = test_manifest(
+        &fixture.base_url(),
+        FILE_BYTES.len() as u64,
+        &sha256(FILE_BYTES),
+    );
+    RuntimeResourceInstaller::for_test(&manifest, app_data_dir, &fixture.base_url())
+        .expect("installer should be valid")
 }
 
 fn test_manifest(base_url: &str, size_bytes: u64, hash: &str) -> Vec<u8> {
@@ -729,6 +733,40 @@ fn deletes_partial_when_hash_does_not_match() {
 }
 
 #[test]
+fn reports_io_error_when_an_untrusted_partial_cannot_be_deleted() {
+    let bytes = vec![0x5a; 12_345];
+    let fixture = RangeFixture::new(&bytes);
+    let harness = InstallerHarness::new(&fixture, &bytes);
+    let partial_path = harness.partial_path();
+    fs::create_dir_all(partial_path.parent().expect("partial parent")).expect("partial directory");
+    fs::write(&partial_path, &bytes).expect("complete partial fixture");
+
+    let result = harness.installer.install(
+        RuntimeResourceComponent::Media,
+        &AtomicBool::new(false),
+        |status| {
+            if status.state == RuntimeResourceState::Verifying {
+                fs::remove_file(&partial_path).expect("replace partial file");
+                fs::create_dir(&partial_path).expect("replacement directory");
+                fs::write(partial_path.join("not-empty"), b"keep")
+                    .expect("non-empty directory fixture");
+            }
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(ResourceInstallError::Io {
+            operation: "remove untrusted partial",
+            ref message,
+            ..
+        }) if !message.is_empty()
+    ));
+    assert!(partial_path.join("not-empty").is_file());
+    assert!(!harness.final_path().exists());
+}
+
+#[test]
 fn rejects_install_when_declared_files_exceed_available_disk_space() {
     let fixture = RangeFixture::new(FILE_BYTES);
     let harness = InstallerHarness::with_manifest_values(&fixture, u64::MAX, &sha256(FILE_BYTES));
@@ -843,26 +881,29 @@ fn imports_matching_directory_with_the_same_validation_and_layout() {
 }
 
 #[test]
-fn import_copy_uses_the_file_handle_opened_after_canonical_containment() {
-    let source = include_str!("../src/runtime_resources.rs");
-    assert!(source.contains("let source_file = File::open(&canonical_source)"));
-    let after_canonicalization = source
-        .split("let canonical_source = fs::canonicalize(&source)")
-        .nth(1)
-        .expect("canonical source check")
-        .split("let source_file = File::open(&canonical_source)")
-        .next()
-        .expect("single-open boundary");
-    assert!(!after_canonicalization.contains(".is_file()"));
-    let copy_function = source
-        .split("fn copy_import_file")
-        .nth(1)
-        .expect("copy_import_file source")
-        .split("fn verify_and_commit")
-        .next()
-        .expect("copy_import_file body");
-    assert!(copy_function.contains("source_file: File"));
-    assert!(!copy_function.contains("File::open("));
+#[cfg(unix)]
+fn import_rejects_a_symlink_that_points_outside_the_source_root() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = RangeFixture::new(FILE_BYTES);
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+    let source = TestDir::new("import-symlink-source");
+    let outside = TestDir::new("import-symlink-outside");
+    let outside_target_root = outside.path().join(TARGET);
+    let outside_file = outside_target_root.join("binaries/ffmpeg");
+    fs::create_dir_all(outside_file.parent().expect("outside parent")).expect("outside directory");
+    fs::write(&outside_file, FILE_BYTES).expect("matching outside fixture");
+    symlink(&outside_target_root, source.path().join(TARGET)).expect("outside symlink fixture");
+
+    let result = harness.installer.import_directory(
+        RuntimeResourceComponent::Media,
+        source.path(),
+        &AtomicBool::new(false),
+        |_| {},
+    );
+
+    assert!(result.is_err());
+    assert!(!harness.final_path().exists());
 }
 
 #[test]
@@ -918,6 +959,53 @@ fn independent_installers_for_the_same_root_are_mutually_exclusive() {
     let harness = InstallerHarness::new(&fixture, FILE_BYTES);
     let installer = harness.independent_installer(&fixture);
     let competing_installer = harness.independent_installer(&fixture);
+    assert_installers_conflict(installer, competing_installer);
+}
+
+#[cfg(unix)]
+#[test]
+fn operation_gate_canonicalizes_a_missing_leaf_through_a_symlink_parent() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = RangeFixture::new(FILE_BYTES);
+    let root = TestDir::new("operation-symlink-alias");
+    let real_parent = root.path().join("real-parent");
+    let symlink_parent = root.path().join("symlink-parent");
+    fs::create_dir(&real_parent).expect("real parent");
+    symlink(&real_parent, &symlink_parent).expect("parent symlink");
+    let real_app_data = real_parent.join("new");
+    let alias_app_data = symlink_parent.join("new");
+    assert!(!real_app_data.exists());
+    assert!(!alias_app_data.exists());
+
+    let installer = installer_at(&fixture, &real_app_data);
+    let competing_installer = installer_at(&fixture, &alias_app_data);
+
+    assert_installers_conflict(installer, competing_installer);
+}
+
+#[test]
+fn operation_gate_canonicalizes_a_missing_leaf_with_parent_segments() {
+    let fixture = RangeFixture::new(FILE_BYTES);
+    let root = TestDir::new("operation-parent-segment-alias");
+    let real_parent = root.path().join("real-parent");
+    let existing_segment = real_parent.join("existing");
+    fs::create_dir_all(&existing_segment).expect("existing parent segment");
+    let direct_app_data = real_parent.join("new");
+    let alias_app_data = existing_segment.join("..").join("new");
+    assert!(!direct_app_data.exists());
+    assert!(!alias_app_data.exists());
+
+    let installer = installer_at(&fixture, &direct_app_data);
+    let competing_installer = installer_at(&fixture, &alias_app_data);
+
+    assert_installers_conflict(installer, competing_installer);
+}
+
+fn assert_installers_conflict(
+    installer: RuntimeResourceInstaller,
+    competing_installer: RuntimeResourceInstaller,
+) {
     let (checking_sender, checking_receiver) = sync_channel(0);
     let (release_sender, release_receiver) = sync_channel(0);
     let worker = thread::spawn(move || {
@@ -936,17 +1024,18 @@ fn independent_installers_for_the_same_root_are_mutually_exclusive() {
         .recv_timeout(Duration::from_secs(2))
         .expect("installation should reach checking");
 
-    assert_eq!(
-        competing_installer.clear_current_release(),
-        Err(ResourceInstallError::Busy)
+    let competing_result = competing_installer.install(
+        RuntimeResourceComponent::Media,
+        &AtomicBool::new(false),
+        |_| {},
     );
-
     release_sender.send(()).expect("release installation");
+    let first_result = worker.join().expect("installation thread should join");
+
+    assert_eq!(competing_result, Err(ResourceInstallError::Busy));
     assert_eq!(
-        worker
-            .join()
-            .expect("installation thread should join")
-            .unwrap()
+        first_result
+            .expect("first installation should finish")
             .state,
         RuntimeResourceState::Ready
     );
