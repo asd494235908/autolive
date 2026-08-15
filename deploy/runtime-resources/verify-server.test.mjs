@@ -77,6 +77,8 @@ function publisherFixture(root, { deviceMismatch = false } = {}) {
       ? '#!/bin/sh\ncase "$3" in *published*) printf "2\\n" ;; *) printf "1\\n" ;; esac\n'
       : '#!/bin/sh\nprintf "1\\n"\n',
   );
+  const python = spawnSync('/bin/sh', ['-c', 'command -v python3'], { encoding: 'utf8' }).stdout.trim();
+  assert.ok(python);
   for (const path of [flock, mv, stat]) chmodSync(path, 0o755);
   const publisher = copyScriptForTest(root, 'publish-runtime-resources', [
     ['/fs/autolive-resources-staging', stagingRoot(root)],
@@ -85,6 +87,9 @@ function publisherFixture(root, { deviceMismatch = false } = {}) {
     ['/usr/bin/flock', flock],
     ['/usr/bin/stat', stat],
     ['/usr/bin/mv', mv],
+    ['/usr/bin/mkdir', '/bin/mkdir'],
+    ['/usr/bin/rm', '/bin/rm'],
+    ['/usr/bin/python3', python],
     ['/usr/bin/chmod', '/bin/chmod'],
     ['PUBLISH_GROUP=autolive-resources', `PUBLISH_GROUP=${testGroup}`],
   ]);
@@ -360,4 +365,21 @@ test('publisher 在固定根设备号不一致时 fail-closed，成功发布使�
   assert.match(productionPublisher, /mv -T --/);
   assert.match(productionPublisher, /PUBLISH_GROUP=autolive-resources/);
   assert.doesNotMatch(productionPublisher, /AUTOLIVE_TEST_MODE|TEST_ROOT|FLOCK_BIN/);
+});
+
+test('publisher 先完成有界 Python 校验，再收敛权限，并固定外部工具路径', () => {
+  const publisher = readFileSync(join(deployRoot, 'publish-runtime-resources'), 'utf8');
+  assert.doesNotMatch(publisher, /\/usr\/bin\/find/);
+
+  const validation = publisher.indexOf('if ! publish_state=$(');
+  const chgrp = publisher.indexOf('/usr/bin/chgrp -R "$PUBLISH_GROUP" "$candidate"');
+  const chmod = publisher.indexOf('/usr/bin/chmod -R g+rX,o-rwx "$candidate"');
+  const removeInventory = publisher.indexOf('rm "$candidate/$inventory_name"');
+  assert.ok(validation >= 0);
+  assert.ok(chgrp > validation && chmod > chgrp && removeInventory > chmod);
+
+  for (const tool of ['mkdir', 'rm', 'stat', 'mv', 'chgrp', 'chmod', 'flock', 'python3']) {
+    assert.match(publisher, new RegExp(`/usr/bin/${tool}`));
+  }
+  assert.doesNotMatch(publisher, /(^|\n)[\t ]*(?:mkdir|rm|stat|mv|chgrp|chmod|flock|python3)(?=\s|$)/m);
 });

@@ -40,7 +40,6 @@ PUBLISH_GROUP=autolive-resources
 staging_root=/fs/autolive-resources-staging
 published_root=/fs/autolive-resources
 lock_root=/var/lock/autolive-resources
-flock_bin=/usr/bin/flock
 
 inventory_name=autolive-deploy-inventory.json
 source_dir="$staging_root/$upload_id/$release/$scope"
@@ -56,7 +55,7 @@ reject_symlink_path() {
 }
 
 reject_symlink_path "$staging_root" "$published_root" "$lock_root"
-mkdir -p "$staging_root" "$published_root" "$lock_root"
+/usr/bin/mkdir -p "$staging_root" "$published_root" "$lock_root"
 reject_symlink_path "$staging_root" "$published_root" "$lock_root"
 if ! staging_device=$(/usr/bin/stat -c %d "$staging_root"); then
 	fail "cannot inspect staging device"
@@ -78,11 +77,11 @@ reject_symlink_path \
 	"$published_root/autolive-resources" \
 	"$published_root/autolive-resources/$release"
 reject_symlink_path "$lock_root"
-mkdir -p "$staging_root/.candidates"
+/usr/bin/mkdir -p "$staging_root/.candidates"
 reject_symlink_path "$staging_root" "$staging_root/.candidates" "$lock_root"
 lock_path="$lock_root/$release.lock"
 exec 9>"$lock_path"
-"$flock_bin" -x 9
+/usr/bin/flock -x 9
 
 test -d "$source_dir" || fail "source staging is missing"
 if [ -e "$candidate" ] || [ -L "$candidate" ]; then
@@ -90,17 +89,11 @@ if [ -e "$candidate" ] || [ -L "$candidate" ]; then
 fi
 /usr/bin/mv -T -- "$source_dir" "$candidate" || fail "cannot claim source staging"
 
-if /usr/bin/find "$candidate" -type l -print -quit | grep -q .; then
-	fail "symlink resource entry is forbidden"
-fi
-/usr/bin/chgrp -R "$PUBLISH_GROUP" "$candidate" || fail "cannot set publish group"
-/usr/bin/chmod -R g+rX,o-rwx "$candidate" || fail "cannot set publish permissions"
-
 destination_present=0
 if [ -e "$destination" ] || [ -L "$destination" ]; then
 	destination_present=1
 fi
-if ! publish_state=$(python3 - "$candidate/$inventory_name" "$candidate" "$destination" "$release" "$scope" "$destination_present" <<'PY'
+if ! publish_state=$(/usr/bin/python3 - "$candidate/$inventory_name" "$candidate" "$destination" "$release" "$scope" "$destination_present" <<'PY'
 import hashlib
 import json
 import os
@@ -277,14 +270,17 @@ fi
 
 case "$publish_state" in
 	DUPLICATE)
-		rm -rf -- "$candidate"
+		/usr/bin/rm -rf -- "$candidate"
 		exit 0
 		;;
-	NEW) ;;
+	NEW)
+		/usr/bin/chgrp -R "$PUBLISH_GROUP" "$candidate" || fail "cannot set publish group"
+		/usr/bin/chmod -R g+rX,o-rwx "$candidate" || fail "cannot set publish permissions"
+		;;
 	*) fail "publisher validation returned an invalid state" ;;
 esac
 
-mkdir -p "$published_root/autolive-resources/$release"
+/usr/bin/mkdir -p "$published_root/autolive-resources/$release"
 reject_symlink_path \
 	"$published_root" \
 	"$published_root/autolive-resources" \
@@ -292,5 +288,5 @@ reject_symlink_path \
 if [ -e "$destination" ] || [ -L "$destination" ]; then
 	fail "destination appeared during publication"
 fi
-rm "$candidate/$inventory_name"
+/usr/bin/rm "$candidate/$inventory_name"
 /usr/bin/mv -T -- "$candidate" "$destination"
