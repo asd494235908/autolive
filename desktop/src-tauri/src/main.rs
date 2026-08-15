@@ -128,13 +128,16 @@ mod tests {
     }
 
     #[test]
-    fn tauri_config_bundles_cross_platform_media_binaries() {
+    fn tauri_config_bundles_only_the_runtime_resource_manifest() {
         let config =
             std::fs::read_to_string("tauri.conf.json").expect("tauri.conf.json should exist");
 
         assert!(config.contains("\"active\": true"));
         assert!(config.contains("\"resources\""));
-        assert!(config.contains("binaries/"));
+        assert!(config.contains("runtime-resources.json"));
+        assert!(!config.contains("binaries/ffmpeg"));
+        assert!(!config.contains("voice-models"));
+        assert!(!config.contains("voice-worker"));
     }
 
     #[test]

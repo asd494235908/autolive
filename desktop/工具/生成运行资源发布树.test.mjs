@@ -80,3 +80,20 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
   );
   assert.deepEqual(JSON.parse(readFileSync(manifestPath, 'utf8')), result.manifest);
 });
+
+test('公共模型任务可单独生成不含缓存重复项的发布目录', async () => {
+  const module = await import('./生成运行资源发布树.mjs');
+  assert.equal(typeof module.buildRuntimeCommonRelease, 'function');
+  const root = mkdtempSync(join(tmpdir(), 'autolive-runtime-common-'));
+  const sourceRoot = join(root, 'src-tauri');
+  const outputRoot = join(root, 'output');
+  writeFixture(sourceRoot, 'voice-models/model.bin', 'model');
+  writeFixture(sourceRoot, 'voice-models/.locks/model.lock', 'lock');
+  writeFixture(sourceRoot, 'voice-models/blobs/model.bin', 'duplicate');
+
+  const result = module.buildRuntimeCommonRelease({ sourceRoot, outputRoot });
+
+  assert.equal(readFileSync(join(result.commonRoot, 'voice-models/model.bin'), 'utf8'), 'model');
+  assert.equal(existsSync(join(result.commonRoot, 'voice-models/.locks')), false);
+  assert.equal(existsSync(join(result.commonRoot, 'voice-models/blobs')), false);
+});

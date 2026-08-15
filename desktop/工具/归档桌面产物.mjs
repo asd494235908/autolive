@@ -11,12 +11,6 @@ export function archiveDesktopArtifacts({
   bundleSourceDir = resolveDesktopPath(
     process.env.AUTOLIVE_BUNDLE_SOURCE_DIR || 'src-tauri/target/release/bundle',
   ),
-  releaseDir = resolveDesktopPath(
-    process.env.AUTOLIVE_RELEASE_DIR || 'src-tauri/target/release',
-  ),
-  resourceRoot = resolveDesktopPath(
-    process.env.AUTOLIVE_RESOURCE_ROOT || 'src-tauri',
-  ),
   packageRoot = resolveDesktopPath(process.env.AUTOLIVE_PACKAGE_ROOT || 'package'),
 } = {}) {
   if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(config.version)) {
@@ -27,11 +21,7 @@ export function archiveDesktopArtifacts({
   }
 
   const destination = join(packageRoot, `v${config.version}`, targetTriple);
-  if (targetTriple === 'x86_64-pc-windows-msvc') {
-    archiveWindowsPortable({ destination, releaseDir, resourceRoot });
-  } else {
-    archiveNativeBundle({ destination, bundleSourceDir });
-  }
+  archiveNativeBundle({ destination, bundleSourceDir });
   return destination;
 }
 
@@ -42,39 +32,6 @@ function archiveNativeBundle({ destination, bundleSourceDir }) {
   rmSync(destination, { force: true, recursive: true });
   mkdirSync(destination, { recursive: true });
   cpSync(bundleSourceDir, destination, { recursive: true });
-}
-
-function archiveWindowsPortable({ destination, releaseDir, resourceRoot }) {
-  const executable = join(releaseDir, `${config.productName}.exe`);
-  const requiredFiles = [
-    executable,
-    join(resourceRoot, 'binaries', 'ffmpeg.exe'),
-    join(resourceRoot, 'binaries', 'ffprobe.exe'),
-    join(resourceRoot, 'voice-worker', 'autolive-voice-clone-worker.exe'),
-  ];
-  for (const path of requiredFiles) {
-    if (!isFile(path)) throw new Error(`Windows 便携包缺少资源：${path}`);
-  }
-  const modelRoot = join(resourceRoot, 'voice-models');
-  if (!isDirectory(modelRoot)) {
-    throw new Error(`Windows 便携包缺少模型目录：${modelRoot}`);
-  }
-
-  const portableRoot = join(destination, 'portable');
-  rmSync(destination, { force: true, recursive: true });
-  mkdirSync(portableRoot, { recursive: true });
-  cpSync(executable, join(portableRoot, `${config.productName}.exe`));
-  for (const directory of ['binaries', 'voice-models', 'voice-worker']) {
-    cpSync(join(resourceRoot, directory), join(portableRoot, directory), { recursive: true });
-  }
-}
-
-function isFile(path) {
-  try {
-    return statSync(path).isFile();
-  } catch {
-    return false;
-  }
 }
 
 function isDirectory(path) {

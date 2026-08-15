@@ -72,7 +72,6 @@ test('Tauri scripts use the package binary lookup that works on Windows', () => 
     'build',
     '--config',
     'src-tauri/tauri.conf.json',
-    '--no-bundle',
   ]);
   assert.doesNotMatch(`${packageJson.scripts['tauri:dev']}\n${buildSource}`, /\.\/ui\/node_modules\/\.bin\/tauri/);
 });
@@ -103,31 +102,19 @@ test('归档脚本按版本和目标平台目录保存 bundle', () => {
   );
 });
 
-test('Windows 正式包归档为可直接运行的便携目录', () => {
+test('Windows 正式包归档原生 Tauri bundle', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-package-'));
-  const release = join(root, 'release');
-  const resources = join(root, 'resources');
+  const source = join(root, 'bundle');
   const output = join(root, 'package');
   const configPath = fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url));
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
-  mkdirSync(release, { recursive: true });
-  writeFileSync(join(release, `${config.productName}.exe`), 'app-test');
-  for (const relativePath of [
-    ['binaries', 'ffmpeg.exe'],
-    ['binaries', 'ffprobe.exe'],
-    ['voice-worker', 'autolive-voice-clone-worker.exe'],
-    ['voice-models', 'model.bin'],
-  ]) {
-    const path = join(resources, ...relativePath);
-    mkdirSync(join(path, '..'), { recursive: true });
-    writeFileSync(path, 'resource-test');
-  }
+  mkdirSync(join(source, 'msi'), { recursive: true });
+  writeFileSync(join(source, 'msi', 'autolive.msi'), 'app-test');
 
   const result = spawnSync(process.execPath, [archiveScript], {
     env: {
       ...process.env,
-      AUTOLIVE_RELEASE_DIR: release,
-      AUTOLIVE_RESOURCE_ROOT: resources,
+      AUTOLIVE_BUNDLE_SOURCE_DIR: source,
       AUTOLIVE_PACKAGE_ROOT: output,
       AUTOLIVE_TARGET_TRIPLE: 'x86_64-pc-windows-msvc',
     },
@@ -135,14 +122,8 @@ test('Windows 正式包归档为可直接运行的便携目录', () => {
   });
 
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
-  const portable = join(output, `v${config.version}`, 'x86_64-pc-windows-msvc', 'portable');
-  assert.equal(readFileSync(join(portable, `${config.productName}.exe`), 'utf8'), 'app-test');
-  assert.equal(readFileSync(join(portable, 'binaries', 'ffmpeg.exe'), 'utf8'), 'resource-test');
-  assert.equal(
-    readFileSync(join(portable, 'voice-worker', 'autolive-voice-clone-worker.exe'), 'utf8'),
-    'resource-test',
-  );
-  assert.equal(readFileSync(join(portable, 'voice-models', 'model.bin'), 'utf8'), 'resource-test');
+  const bundle = join(output, `v${config.version}`, 'x86_64-pc-windows-msvc');
+  assert.equal(readFileSync(join(bundle, 'msi', 'autolive.msi'), 'utf8'), 'app-test');
 });
 
 test('GitHub workflow uploads the versioned package directory', () => {
@@ -154,7 +135,7 @@ test('GitHub workflow uploads the versioned package directory', () => {
   assert.match(workflow, /id: desktop-version/);
   assert.match(
     workflow,
-    /path: desktop\/package\/\*\*/,
+    /path: desktop\/package\/\$\{\{ steps\.desktop-version\.outputs\.version \}\}\/\$\{\{ matrix\.target_triple \}\}\/\*\*/,
   );
   assert.match(
     workflow,

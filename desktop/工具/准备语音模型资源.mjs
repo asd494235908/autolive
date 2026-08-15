@@ -166,6 +166,18 @@ export function isModelCacheComplete(root) {
   }
 }
 
+export function assertPreparedVoiceModelResources(
+  outputRoot = resolve(
+    process.env.AUTOLIVE_VOICE_MODEL_OUTPUT_DIR ?? join(desktopRoot, 'src-tauri', 'voice-models'),
+  ),
+) {
+  const resolvedOutputRoot = resolve(outputRoot);
+  return {
+    outputRoot: resolvedOutputRoot,
+    layout: assertModelCacheComplete(resolvedOutputRoot),
+  };
+}
+
 const MODEL_PROBE = String.raw`
 from demucs.pretrained import get_model
 get_model("htdemucs")
@@ -206,6 +218,11 @@ export function prepareVoiceModelResources({
 
 function main() {
   const target = resolveTargetTriple();
+  if (process.argv.includes('--assert-prepared')) {
+    const result = assertPreparedVoiceModelResources();
+    console.log(`已校验预准备语音模型资源：${target} -> ${result.outputRoot}`);
+    return;
+  }
   const python = resolvePython();
   const result = prepareVoiceModelResources({ python });
   console.log(`已准备语音模型资源：${target} -> ${result.outputRoot}`);

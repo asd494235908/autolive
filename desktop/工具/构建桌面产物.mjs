@@ -7,9 +7,8 @@ import { archiveDesktopArtifacts } from './归档桌面产物.mjs';
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 export function tauriBuildArguments(targetTriple = process.env.AUTOLIVE_TARGET_TRIPLE?.trim()) {
-  const args = ['build', '--config', 'src-tauri/tauri.conf.json'];
-  if (targetTriple === 'x86_64-pc-windows-msvc') args.push('--no-bundle');
-  return args;
+  void targetTriple;
+  return ['build', '--config', 'src-tauri/tauri.conf.json'];
 }
 
 export function buildDesktopArtifacts(targetTriple = process.env.AUTOLIVE_TARGET_TRIPLE?.trim()) {

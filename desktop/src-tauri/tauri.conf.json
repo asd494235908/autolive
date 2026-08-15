@@ -44,7 +44,7 @@
   },
   "bundle": {
     "active": true,
-    "resources": ["binaries/ffmpeg*", "binaries/ffprobe*", "voice-models", "voice-worker"],
+    "resources": ["runtime-resources.json"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -117,7 +117,24 @@ export function buildRuntimeResourceRelease({
   return { manifestPath, releaseRoot: join(outputRoot, 'autolive-resources', RESOURCE_RELEASE), manifest };
 }
 
+export function buildRuntimeCommonRelease({
+  sourceRoot = join(desktopRoot, 'src-tauri'),
+  outputRoot = join(desktopRoot, 'resource-release'),
+} = {}) {
+  const commonRoot = join(outputRoot, 'autolive-resources', RESOURCE_RELEASE, 'common');
+  const destination = join(commonRoot, 'voice-models');
+  rmSync(commonRoot, { recursive: true, force: true });
+  cpSync(join(sourceRoot, 'voice-models'), destination, { recursive: true, dereference: true });
+  removeReleaseCacheEntries(destination);
+  return { commonRoot };
+}
+
 function main() {
+  if (process.argv.includes('--common-only')) {
+    const result = buildRuntimeCommonRelease();
+    console.log(`已生成公共运行资源发布树：${result.commonRoot}`);
+    return;
+  }
   const result = buildRuntimeResourceRelease();
   console.log(`已生成运行资源发布树：${result.releaseRoot}`);
 }

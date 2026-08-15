@@ -12,8 +12,60 @@ permissions:
   contents: read
 
 jobs:
+  common-models:
+    name: prepare common voice models
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.desktop-version.outputs.version }}
+    env:
+      AUTOLIVE_TARGET_TRIPLE: aarch64-apple-darwin
+      AUTOLIVE_VOICE_PYTHON: python
+      AUTOLIVE_COQUI_TOS_AGREE: ${{ vars.AUTOLIVE_COQUI_TOS_AGREE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: desktop/worker/requirements-voice-clone.txt
+      - name: Install voice clone model dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r desktop/worker/requirements-voice-clone.txt
+      - name: Read desktop version
+        id: desktop-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "JSON.parse(require('fs').readFileSync('desktop/src-tauri/tauri.conf.json', 'utf8')).version")"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            printf 'invalid desktop version: %s\n' "$version" >&2
+            exit 1
+          fi
+          echo "version=v${version}" >> "$GITHUB_OUTPUT"
+      - name: Prepare shared voice models once on Linux
+        run: node desktop/工具/准备语音模型资源.mjs
+      - name: Generate pruned common runtime resources
+        run: node desktop/工具/生成运行资源发布树.mjs --common-only
+      - name: Verify common model artifact statically
+        env:
+          AUTOLIVE_VOICE_MODEL_OUTPUT_DIR: desktop/resource-release/autolive-resources/v0.1.0/common/voice-models
+        run: node desktop/工具/准备语音模型资源.mjs --assert-prepared
+      - name: Upload common runtime resources
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-common-${{ steps.desktop-version.outputs.version }}
+          path: desktop/resource-release/autolive-resources/v0.1.0/common/**
+          if-no-files-found: error
+          retention-days: 7
+
   package:
     name: package ${{ matrix.target_triple }}
+    needs: common-models
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -35,41 +87,34 @@ jobs:
             target_triple: x86_64-pc-windows-msvc
             archive_url: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-8.1.zip
             archive_sha256: b48d1f513a728a0e5ad8f51d91a0f508fe50f0a4f8de3bd3874cc5628cca5140
-
     env:
       AUTOLIVE_TARGET_TRIPLE: ${{ matrix.target_triple }}
       AUTOLIVE_VOICE_PYTHON: python
       AUTOLIVE_COQUI_TOS_AGREE: ${{ vars.AUTOLIVE_COQUI_TOS_AGREE }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
           version: 10.33.0
           run_install: false
-
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: desktop/ui/pnpm-lock.yaml
-
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target_triple }}
-
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: pip
           cache-dependency-path: desktop/worker/requirements-voice-clone-build.txt
-
       - name: Install Intel macOS native packaging dependencies
         if: matrix.target_triple == 'x86_64-apple-darwin'
         shell: bash
@@ -78,27 +123,28 @@ jobs:
           brew install opus
           printf 'PKG_CONFIG_PATH=%s/lib/pkgconfig:%s\n' \
             "$(brew --prefix opus)" "${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
-
       - name: Install voice clone packaging dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r desktop/worker/requirements-voice-clone-build.txt
-
       - name: Install desktop/ui dependencies
         run: pnpm --dir desktop/ui install --frozen-lockfile
-
       - name: Read desktop version
         id: desktop-version
         shell: bash
         run: |
           set -euo pipefail
-
           version="$(node -p "JSON.parse(require('fs').readFileSync('desktop/src-tauri/tauri.conf.json', 'utf8')).version")"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
             printf 'invalid desktop version: %s\n' "$version" >&2
             exit 1
           fi
-
           echo "version=v${version}" >> "$GITHUB_OUTPUT"
-
+      - name: Download prepared common models
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-common-${{ needs.common-models.outputs.version }}
+          path: desktop/src-tauri
+      - name: Verify downloaded models without loading model runtimes
+        run: node desktop/工具/准备语音模型资源.mjs --assert-prepared
       - name: Prepare FFmpeg resources (macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -109,45 +155,31 @@ jobs:
           FFPROBE_SHA256: ${{ matrix.ffprobe_sha256 }}
         run: |
           set -euo pipefail
-
           target_dir="desktop/third_party/ffmpeg/${AUTOLIVE_TARGET_TRIPLE}"
           work_dir="$(mktemp -d)"
           trap 'rm -rf "$work_dir"' EXIT
-
           fetch_and_extract() {
-            local label="$1"
-            local url="$2"
-            local expected_sha="$3"
-            local expected_name="$4"
-
-            local archive="$work_dir/${label}.zip"
-            local extract_dir="$work_dir/${label}"
+            local label="$1" url="$2" expected_sha="$3" expected_name="$4"
+            local archive="$work_dir/${label}.zip" extract_dir="$work_dir/${label}"
             mkdir -p "$extract_dir"
-
             curl --fail --location --silent --show-error --retry 3 --proto '=https' --tlsv1.2 \
               --output "$archive" "$url"
             printf '%s  %s\n' "$expected_sha" "$archive" | shasum -a 256 -c -
             unzip -q "$archive" -d "$extract_dir"
-
             matches=()
-            while IFS= read -r match; do
-              matches+=("$match")
-            done < <(find "$extract_dir" -type f -name "$expected_name" -print)
-
+            while IFS= read -r match; do matches+=("$match"); done \
+              < <(find "$extract_dir" -type f -name "$expected_name" -print)
             if [[ "${#matches[@]}" -ne 1 ]]; then
               printf 'expected exactly one %s in %s, found %s\n' \
                 "$expected_name" "$url" "${#matches[@]}" >&2
               exit 1
             fi
-
             mkdir -p "$target_dir"
             cp "${matches[0]}" "$target_dir/$expected_name"
             chmod 755 "$target_dir/$expected_name"
           }
-
           fetch_and_extract "ffmpeg" "$FFMPEG_URL" "$FFMPEG_SHA256" "ffmpeg"
           fetch_and_extract "ffprobe" "$FFPROBE_URL" "$FFPROBE_SHA256" "ffprobe"
-
       - name: Prepare FFmpeg resources (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -157,52 +189,114 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version Latest
-
           $targetDir = Join-Path 'desktop/third_party/ffmpeg' $env:AUTOLIVE_TARGET_TRIPLE
           $workDir = Join-Path $env:RUNNER_TEMP ("ffmpeg-" + [guid]::NewGuid().ToString('N'))
           New-Item -ItemType Directory -Path $workDir -Force | Out-Null
-
           try {
             $archive = Join-Path $workDir 'ffmpeg.zip'
             $extractDir = Join-Path $workDir 'extract'
             New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
-
             & curl.exe --fail --location --silent --show-error --retry 3 --output $archive $env:ARCHIVE_URL
-            if ($LASTEXITCODE -ne 0) {
-              throw "下载失败：$($env:ARCHIVE_URL)"
-            }
-
+            if ($LASTEXITCODE -ne 0) { throw "下载失败：$($env:ARCHIVE_URL)" }
             $actualHash = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLowerInvariant()
-            if ($actualHash -ne $env:ARCHIVE_SHA256) {
-              throw "SHA-256 校验失败：$($env:ARCHIVE_URL)"
-            }
-
+            if ($actualHash -ne $env:ARCHIVE_SHA256) { throw "SHA-256 校验失败：$($env:ARCHIVE_URL)" }
             Expand-Archive -Path $archive -DestinationPath $extractDir -Force
-
             $ffmpegMatches = @(Get-ChildItem -Path $extractDir -Recurse -File -Filter 'ffmpeg.exe')
-            if ($ffmpegMatches.Count -ne 1) {
-              throw "期望在 $($env:ARCHIVE_URL) 中找到且仅找到一个 ffmpeg.exe，实际为 $($ffmpegMatches.Count)"
-            }
-
+            if ($ffmpegMatches.Count -ne 1) { throw "ffmpeg.exe 数量无效：$($ffmpegMatches.Count)" }
             $ffprobeMatches = @(Get-ChildItem -Path $extractDir -Recurse -File -Filter 'ffprobe.exe')
-            if ($ffprobeMatches.Count -ne 1) {
-              throw "期望在 $($env:ARCHIVE_URL) 中找到且仅找到一个 ffprobe.exe，实际为 $($ffprobeMatches.Count)"
-            }
-
+            if ($ffprobeMatches.Count -ne 1) { throw "ffprobe.exe 数量无效：$($ffprobeMatches.Count)" }
             New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
             Copy-Item -Force $ffmpegMatches[0].FullName (Join-Path $targetDir 'ffmpeg.exe')
             Copy-Item -Force $ffprobeMatches[0].FullName (Join-Path $targetDir 'ffprobe.exe')
           } finally {
             Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue
           }
-
-      - name: Build desktop package
-        run: pnpm --dir desktop/ui run tauri:build
-
+      - name: Build lightweight native desktop package from prepared resources
+        run: pnpm --dir desktop/ui run tauri:build:prepared-resources
+      - name: Upload target runtime resources
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-resources-${{ steps.desktop-version.outputs.version }}-${{ matrix.target_triple }}
+          path: desktop/resource-release/autolive-resources/v0.1.0/${{ matrix.target_triple }}/**
+          if-no-files-found: error
+          retention-days: 7
       - name: Upload desktop bundle
         uses: actions/upload-artifact@v4
         with:
           name: desktop-bundle-${{ steps.desktop-version.outputs.version }}-${{ matrix.target_triple }}
-          path: desktop/package/**
+          path: desktop/package/${{ steps.desktop-version.outputs.version }}/${{ matrix.target_triple }}/**
           if-no-files-found: error
           retention-days: 7
+
+  deploy:
+    name: deploy immutable runtime resources
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs:
+      - common-models
+      - package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download common runtime resources
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-common-${{ needs.common-models.outputs.version }}
+          path: ${{ runner.temp }}/autolive-release/common
+      - name: Download Intel macOS runtime resources
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-resources-${{ needs.common-models.outputs.version }}-x86_64-apple-darwin
+          path: ${{ runner.temp }}/autolive-release/x86_64-apple-darwin
+      - name: Download Apple Silicon runtime resources
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-resources-${{ needs.common-models.outputs.version }}-aarch64-apple-darwin
+          path: ${{ runner.temp }}/autolive-release/aarch64-apple-darwin
+      - name: Download Windows runtime resources
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-resources-${{ needs.common-models.outputs.version }}-x86_64-pc-windows-msvc
+          path: ${{ runner.temp }}/autolive-release/x86_64-pc-windows-msvc
+      - name: Configure resource deployment SSH key
+        shell: bash
+        env:
+          DEPLOY_KEY: ${{ secrets.AUTOLIVE_RESOURCE_DEPLOY_KEY }}
+          DEPLOY_HOST_KEY: ${{ secrets.AUTOLIVE_RESOURCE_DEPLOY_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_KEY:?AUTOLIVE_RESOURCE_DEPLOY_KEY is required}"
+          : "${DEPLOY_HOST_KEY:?AUTOLIVE_RESOURCE_DEPLOY_HOST_KEY is required}"
+          install -d -m 700 "$RUNNER_TEMP/autolive-ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/autolive-ssh/key"
+          printf '%s\n' "$DEPLOY_HOST_KEY" > "$RUNNER_TEMP/autolive-ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/autolive-ssh/key" "$RUNNER_TEMP/autolive-ssh/known_hosts"
+      - name: Upload staging resources and invoke constrained publisher
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.AUTOLIVE_RESOURCE_DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.AUTOLIVE_RESOURCE_DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.AUTOLIVE_RESOURCE_DEPLOY_USER }}
+          RELEASE_VERSION: ${{ needs.common-models.outputs.version }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_HOST:?AUTOLIVE_RESOURCE_DEPLOY_HOST is required}"
+          : "${DEPLOY_PORT:?AUTOLIVE_RESOURCE_DEPLOY_PORT is required}"
+          : "${DEPLOY_USER:?AUTOLIVE_RESOURCE_DEPLOY_USER is required}"
+          if ! [[ "$DEPLOY_PORT" =~ ^[0-9]{1,4}$ ]] || (( DEPLOY_PORT < 1 || DEPLOY_PORT > 9999 )); then
+            printf 'AUTOLIVE_RESOURCE_DEPLOY_PORT must be between 1 and 9999\n' >&2
+            exit 1
+          fi
+          ssh_dir="$RUNNER_TEMP/autolive-ssh"
+          release_root="$RUNNER_TEMP/autolive-release"
+          ssh_command="ssh -i $ssh_dir/key -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes -p $DEPLOY_PORT"
+          for scope in common x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            test -d "$release_root/$scope"
+            rsync --archive --compress --ignore-existing -e "$ssh_command" \
+              "$release_root/$scope/" \
+              "$DEPLOY_USER@$DEPLOY_HOST:/fs/autolive-resources-staging/$RELEASE_VERSION/$scope/"
+            ssh -i "$ssh_dir/key" \
+              -o "UserKnownHostsFile=$ssh_dir/known_hosts" \
+              -o StrictHostKeyChecking=yes \
+              -p "$DEPLOY_PORT" \
+              "$DEPLOY_USER@$DEPLOY_HOST" \
+              "publish-runtime-resources $RELEASE_VERSION $scope"
+          done

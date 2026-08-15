@@ -63,18 +63,22 @@ test('正式打包命令会在 Tauri 之前准备并校验 Worker 与语音模�
   assert.match(buildScript, /准备语音模型资源\.mjs/);
   assert.match(buildScript, /构建桌面产物\.mjs/);
 
+  const preparedBuildScript = packageJson.scripts['tauri:build:prepared-resources'];
+  assert.match(preparedBuildScript, /准备语音Worker资源\.mjs/);
+  assert.match(preparedBuildScript, /准备语音模型资源\.mjs --assert-prepared/);
+  assert.match(preparedBuildScript, /构建桌面产物\.mjs/);
+
   const desktopBuildScript = readFileSync(
     fileURLToPath(new URL('./构建桌面产物.mjs', import.meta.url)),
     'utf8',
   );
   assert.match(desktopBuildScript, /'build'/);
-  assert.match(desktopBuildScript, /'--no-bundle'/);
+  assert.doesNotMatch(desktopBuildScript, /'--no-bundle'/);
 
   const tauriConfig = JSON.parse(
     readFileSync(fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url)), 'utf8'),
   );
-  assert.ok(tauriConfig.bundle.resources.includes('voice-models'));
-  assert.ok(tauriConfig.bundle.resources.includes('voice-worker'));
+  assert.deepEqual(tauriConfig.bundle.resources, ['runtime-resources.json']);
 });
 
 test('CI 打包环境会安装 Worker 构建依赖并显式传入许可确认', () => {
