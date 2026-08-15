@@ -243,6 +243,14 @@ test('Caddy 和 systemd 契约固定只读静态服务与收敛权限', () => {
     'Restart=on-failure',
     'WantedBy=multi-user.target',
   ]) assert.match(unit, new RegExp(line.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const unitStart = unit.indexOf('[Unit]');
+  const serviceStart = unit.indexOf('[Service]');
+  const installStart = unit.indexOf('[Install]');
+  assert.ok(unitStart >= 0 && serviceStart > unitStart && installStart > serviceStart);
+  const unitSection = unit.slice(unitStart, serviceStart);
+  const serviceSection = unit.slice(serviceStart, installStart);
+  assert.match(unitSection, /RequiresMountsFor=\/fs\/autolive-resources \/fs\/autolive-resources-staging/);
+  assert.doesNotMatch(serviceSection, /RequiresMountsFor=/);
 });
 
 test('部署身份使用锁定密码的 /bin/sh，并依赖 forced-command restrict', () => {

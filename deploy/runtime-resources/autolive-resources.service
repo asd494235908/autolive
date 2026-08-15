@@ -2,6 +2,7 @@
 Description=Autolive immutable runtime resource server
 Wants=network-online.target
 After=network-online.target
+RequiresMountsFor=/fs/autolive-resources /fs/autolive-resources-staging
 
 [Service]
 Type=simple
@@ -17,7 +18,6 @@ ProtectHome=true
 ReadOnlyPaths=/fs/autolive-resources
 ReadWritePaths=/var/log/autolive-resources
 LogsDirectory=autolive-resources
-RequiresMountsFor=/fs/autolive-resources /fs/autolive-resources-staging
 
 [Install]
 WantedBy=multi-user.target
