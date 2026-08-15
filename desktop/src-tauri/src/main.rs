@@ -3,22 +3,25 @@ mod commands;
 
 use auth_session::{delete_refresh_token, load_refresh_token, store_refresh_token};
 use commands::{
-    cancel_research_analysis, cancel_speech_to_speech_worker, cancel_voice_clone_operation,
-    cleanup_local_caches_command, clear_voice_clone_replacement, close_final_effect_window,
-    commit_audio_variant_candidate, commit_audio_variant_candidate_if_due,
-    commit_media_processing_if_ready, complete_playback_loop, direct_model_chat,
-    discard_audio_variant_candidate, fail_voice_clone_playback, finish_voice_clone_playback,
-    get_default_local_research_params, get_device_runtime_info, get_media_engine_capabilities,
-    get_research_status, get_research_worker_capabilities, get_snapshot,
+    cancel_research_analysis, cancel_runtime_resource_install, cancel_speech_to_speech_worker,
+    cancel_voice_clone_operation, cleanup_local_caches_command, clear_runtime_resources,
+    clear_voice_clone_replacement, close_final_effect_window, commit_audio_variant_candidate,
+    commit_audio_variant_candidate_if_due, commit_media_processing_if_ready,
+    complete_playback_loop, direct_model_chat, discard_audio_variant_candidate,
+    fail_voice_clone_playback, finish_voice_clone_playback, get_default_local_research_params,
+    get_device_runtime_info, get_media_engine_capabilities, get_research_status,
+    get_research_worker_capabilities, get_runtime_resource_status, get_snapshot,
     get_speech_to_speech_worker_capabilities, get_voice_clone_worker_capabilities,
-    open_final_effect_window, pause_playback, prepare_voice_clone_source, probe_local_mp4,
-    resize_final_effect_window, restore_original_audio, resume_playback,
-    set_audio_processing_profile, set_interlude_config, set_processing_switches,
-    stage_audio_variant_candidate, start_media_processing, start_playback, start_research_analysis,
-    start_speech_to_speech_worker, start_voice_clone_playback, start_voice_clone_pre_generation,
-    start_voice_clone_replacement, stop_playback, update_playback_position,
-    validate_local_research_params, AppState,
+    import_runtime_resource_directory, install_runtime_resources, open_final_effect_window,
+    pause_playback, prepare_voice_clone_source, probe_local_mp4, resize_final_effect_window,
+    restore_original_audio, resume_playback, set_audio_processing_profile, set_interlude_config,
+    set_processing_switches, stage_audio_variant_candidate, start_media_processing, start_playback,
+    start_research_analysis, start_speech_to_speech_worker, start_voice_clone_playback,
+    start_voice_clone_pre_generation, start_voice_clone_replacement, stop_playback,
+    update_playback_position, validate_local_research_params, AppState,
 };
+use std::time::Duration;
+use tauri::{Manager, RunEvent};
 
 fn main() {
     let builder = tauri::Builder::default()
@@ -29,6 +32,11 @@ fn main() {
             probe_local_mp4,
             get_device_runtime_info,
             get_media_engine_capabilities,
+            get_runtime_resource_status,
+            install_runtime_resources,
+            cancel_runtime_resource_install,
+            import_runtime_resource_directory,
+            clear_runtime_resources,
             get_research_worker_capabilities,
             get_research_status,
             cleanup_local_caches_command,
@@ -74,9 +82,25 @@ fn main() {
             direct_model_chat
         ]);
 
-    if let Err(error) = builder.run(tauri::generate_context!()) {
-        eprintln!("failed to run tauri desktop shell: {error}");
-    }
+    let app = match builder.build(tauri::generate_context!()) {
+        Ok(app) => app,
+        Err(error) => {
+            eprintln!("failed to build tauri desktop shell: {error}");
+            return;
+        }
+    };
+    app.run(|app_handle, event| {
+        if matches!(event, RunEvent::ExitRequested { .. }) {
+            let state = app_handle.state::<AppState>();
+            match state.shutdown_runtime_resources(Duration::from_secs(3)) {
+                Ok(autolive_desktop_core::runtime_resource_task::RuntimeResourceTaskShutdown::TimedOut) => {
+                    eprintln!("runtime resource task did not stop within the 3 second exit budget");
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("failed to stop runtime resource task: {error}"),
+            }
+        }
+    });
 }
 
 #[cfg(test)]

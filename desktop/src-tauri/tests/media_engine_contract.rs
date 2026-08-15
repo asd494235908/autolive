@@ -1,7 +1,7 @@
 use autolive_desktop_core::cancellation::CancellationToken;
 use autolive_desktop_core::media_engine::{
-    build_media_render_args, probe_media_engine_with_paths, render_media, MediaEngineError,
-    MediaRenderRequest,
+    build_media_render_args, configured_media_engine_paths_with_resource_dir,
+    probe_media_engine_with_paths, render_media, MediaEngineError, MediaRenderRequest,
 };
 use autolive_desktop_core::research_params::{AudioResearchParams, VideoResearchParams};
 use std::fs;
@@ -61,6 +61,29 @@ fn fixture_file(directory: &TestDir, name: &str) -> PathBuf {
     let path = directory.path().join(name);
     fs::write(&path, b"engine fixture").expect("fixture file should be written");
     path
+}
+
+#[test]
+fn configured_media_paths_treat_the_argument_as_the_verified_target_root() {
+    let directory = TestDir::new();
+    let target_root = directory
+        .path()
+        .join("runtime-resources/v0.1.0/current-target");
+    let expected_ffmpeg = target_root.join(if cfg!(windows) {
+        "binaries/ffmpeg.exe"
+    } else {
+        "binaries/ffmpeg"
+    });
+    let expected_ffprobe = target_root.join(if cfg!(windows) {
+        "binaries/ffprobe.exe"
+    } else {
+        "binaries/ffprobe"
+    });
+
+    let paths = configured_media_engine_paths_with_resource_dir(&target_root)
+        .expect("verified target root should resolve deterministic media paths");
+
+    assert_eq!(paths, (expected_ffmpeg, expected_ffprobe));
 }
 
 #[cfg(unix)]

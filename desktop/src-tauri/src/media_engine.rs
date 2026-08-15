@@ -32,7 +32,7 @@ pub fn configured_media_engine_paths() -> Result<(PathBuf, PathBuf), MediaEngine
 }
 
 pub fn packaged_media_engine_paths(
-    resource_dir: &Path,
+    verified_target_root: &Path,
 ) -> Result<(PathBuf, PathBuf), MediaEngineError> {
     let target = target_triple();
     if target == "unsupported" {
@@ -46,31 +46,36 @@ pub fn packaged_media_engine_paths(
         ""
     };
     Ok((
-        resource_dir
+        verified_target_root
             .join(MEDIA_ENGINE_RESOURCE_DIR)
             .join(format!("ffmpeg{extension}")),
-        resource_dir
+        verified_target_root
             .join(MEDIA_ENGINE_RESOURCE_DIR)
             .join(format!("ffprobe{extension}")),
     ))
 }
 
 pub fn configured_media_engine_paths_with_resource_dir(
-    resource_dir: &Path,
+    verified_target_root: &Path,
 ) -> Result<(PathBuf, PathBuf), MediaEngineError> {
-    if std::env::var_os(FFMPEG_PATH_ENV).is_some() || std::env::var_os(FFPROBE_PATH_ENV).is_some() {
+    if cfg!(debug_assertions)
+        && (std::env::var_os(FFMPEG_PATH_ENV).is_some()
+            || std::env::var_os(FFPROBE_PATH_ENV).is_some())
+    {
         return configured_media_engine_paths();
     }
-    packaged_media_engine_paths(resource_dir)
+    packaged_media_engine_paths(verified_target_root)
 }
 
 pub fn configured_media_engine_status() -> MediaEngineStatus {
     media_engine_status_for_paths(configured_media_engine_paths())
 }
 
-pub fn configured_media_engine_status_with_resource_dir(resource_dir: &Path) -> MediaEngineStatus {
+pub fn configured_media_engine_status_with_resource_dir(
+    verified_target_root: &Path,
+) -> MediaEngineStatus {
     media_engine_status_for_paths(configured_media_engine_paths_with_resource_dir(
-        resource_dir,
+        verified_target_root,
     ))
 }
 
@@ -99,7 +104,7 @@ fn media_engine_status_for_paths(
     }
 }
 
-fn target_triple() -> &'static str {
+pub fn target_triple() -> &'static str {
     if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
         "x86_64-apple-darwin"
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -851,6 +856,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn explicit_development_overrides_win_over_packaged_paths() {
         let _guard = TEST_ENV_LOCK

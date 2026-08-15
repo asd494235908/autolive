@@ -415,7 +415,7 @@ pub struct RuntimeResourceInstaller {
 
 impl RuntimeResourceInstaller {
     pub fn from_embedded(
-        manifest_bytes: &'static [u8],
+        manifest_bytes: &[u8],
         app_data_dir: &Path,
     ) -> Result<Self, ResourceInstallError> {
         let manifest = RuntimeResourceManifest::parse_and_validate(
@@ -423,6 +423,14 @@ impl RuntimeResourceInstaller {
             ValidationMode::Production,
         )?;
         Self::from_manifest(manifest, app_data_dir)
+    }
+
+    pub fn resource_root(&self) -> &Path {
+        &self.layout.version_root
+    }
+
+    pub fn target(&self) -> &str {
+        &self.manifest.target
     }
 
     pub fn for_test(

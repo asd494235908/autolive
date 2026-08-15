@@ -12,7 +12,7 @@ use autolive_desktop_core::interlude_player::{
 use autolive_desktop_core::media_engine::{
     build_media_render_args, configured_media_engine_paths_with_resource_dir,
     configured_media_engine_status_with_resource_dir, packaged_media_engine_paths, render_media,
-    MediaEngineStatus, MediaRenderRequest, FFMPEG_PATH_ENV, FFPROBE_PATH_ENV,
+    target_triple, MediaEngineStatus, MediaRenderRequest, FFMPEG_PATH_ENV, FFPROBE_PATH_ENV,
 };
 use autolive_desktop_core::media_library::{
     probe_user_selected_mp4_with_ffprobe, MediaProbeRequestDto, MediaProbeResultDto, SourceMediaDto,
@@ -22,6 +22,13 @@ use autolive_desktop_core::research_worker::{
     configured_research_worker_capabilities, configured_research_worker_executable, run_research,
     validate_research_identifier, ResearchAnalysisRequest, ResearchResult,
     ResearchWorkerCapabilities,
+};
+use autolive_desktop_core::runtime_resource_task::{
+    RuntimeResourceTask, RuntimeResourceTaskShutdown,
+};
+use autolive_desktop_core::runtime_resources::{
+    RuntimeResourceComponent, RuntimeResourceInstaller, RuntimeResourceLayout,
+    RuntimeResourceState, RuntimeResourceStatus,
 };
 use autolive_desktop_core::speech_to_speech::SpeechToSpeechWorkerCapabilities;
 use autolive_desktop_core::speech_to_speech::{
@@ -76,6 +83,7 @@ const VOICE_CLONE_AUDIO_PROBE_TIMEOUT_MS: u64 = 5_000;
 const MEDIA_IMPORT_PROBE_TIMEOUT_MS: u64 = 10_000;
 const MAX_VOICE_CLONE_WORKER_STDERR_BYTES: usize = 64 * 1024;
 const VOICE_CLONE_PLAYBACK_CACHE_VERSION: u32 = 1;
+const RUNTIME_RESOURCE_MANIFEST_NAME: &str = "runtime-resources.json";
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -88,6 +96,7 @@ pub struct AppState {
     media_worker: Arc<Mutex<Option<MediaWorkerTask>>>,
     research_worker: Arc<Mutex<Option<ResearchWorkerTask>>>,
     research_status: Arc<Mutex<ResearchStatusDto>>,
+    runtime_resource_task: Arc<RuntimeResourceTask>,
 }
 
 #[derive(Debug)]
@@ -133,7 +142,7 @@ struct VoiceCloneWorkerServer {
 #[derive(Debug, Clone, Copy)]
 struct VoiceCloneWorkerResources<'a> {
     model_root: Option<&'a Path>,
-    resource_dir: Option<&'a Path>,
+    target_root: Option<&'a Path>,
     server: Option<&'a Arc<Mutex<Option<VoiceCloneWorkerServer>>>>,
 }
 
@@ -433,6 +442,179 @@ impl CommandErrorDto {
     }
 }
 
+fn runtime_resource_layout(app: &AppHandle) -> Result<RuntimeResourceLayout, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("读取运行资源应用数据目录失败：{error}"))?;
+    RuntimeResourceLayout::for_target(&app_data_dir, target_triple())
+        .map_err(|error| format!("解析当前平台运行资源目录失败：{error}"))
+}
+
+fn runtime_resource_target_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let layout = runtime_resource_layout(app)?;
+    Ok(layout.target_root)
+}
+
+fn runtime_resource_installer(app: &AppHandle) -> Result<RuntimeResourceInstaller, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|error| format!("读取运行资源 manifest 所在资源目录失败：{error}"))?;
+    let manifest_path = resource_dir.join(RUNTIME_RESOURCE_MANIFEST_NAME);
+    let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| {
+        format!(
+            "读取运行资源 manifest {} 失败：{error}",
+            manifest_path.display()
+        )
+    })?;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("读取运行资源应用数据目录失败：{error}"))?;
+    let installer = RuntimeResourceInstaller::from_embedded(&manifest_bytes, &app_data_dir)
+        .map_err(|error| {
+            format!(
+                "解析运行资源 manifest {} 失败：{error}",
+                manifest_path.display()
+            )
+        })?;
+    if installer.target() != target_triple() {
+        return Err(format!(
+            "运行资源 manifest 目标平台不匹配：期望 {}，实际 {}",
+            target_triple(),
+            installer.target()
+        ));
+    }
+    Ok(installer)
+}
+
+fn development_runtime_resource_status(
+    component: RuntimeResourceComponent,
+) -> Option<RuntimeResourceStatus> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let configured_file = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .is_some_and(|path| development_executable_ready(&path))
+    };
+    let media_ready = configured_file(FFMPEG_PATH_ENV) && configured_file(FFPROBE_PATH_ENV);
+    let ready = match component {
+        RuntimeResourceComponent::Media => media_ready,
+        RuntimeResourceComponent::Voice => {
+            media_ready
+                && configured_file(VOICE_CLONE_WORKER_ENV)
+                && std::env::var_os(VOICE_CLONE_MODEL_ROOT_ENV)
+                    .map(PathBuf::from)
+                    .is_some_and(|path| voice_clone_model_resources_complete(&path))
+        }
+    };
+    ready.then(|| RuntimeResourceStatus {
+        state: RuntimeResourceState::Ready,
+        component: Some(component),
+        current_file: None,
+        downloaded_bytes: 0,
+        total_bytes: 0,
+        bytes_per_second: 0,
+        installed_bytes: 0,
+        resource_root: "development-overrides".to_owned(),
+        error: None,
+    })
+}
+
+fn development_executable_ready(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    true
+}
+
+#[tauri::command]
+pub async fn get_runtime_resource_status(
+    component: RuntimeResourceComponent,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RuntimeResourceStatus, String> {
+    let task_status = state.runtime_resource_task.status(component)?;
+    if task_status.state != RuntimeResourceState::NotInstalled
+        || !task_status.resource_root.is_empty()
+    {
+        return Ok(task_status);
+    }
+    if let Some(status) = development_runtime_resource_status(component) {
+        return Ok(status);
+    }
+    let installer = runtime_resource_installer(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        installer
+            .inspect(component)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("运行资源状态检查任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn install_runtime_resources(
+    component: RuntimeResourceComponent,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RuntimeResourceStatus, String> {
+    if let Some(status) = state.runtime_resource_task.running_status()? {
+        return Ok(status);
+    }
+    let installer = runtime_resource_installer(&app)?;
+    state
+        .runtime_resource_task
+        .start_install(component, installer)
+}
+
+#[tauri::command]
+pub async fn cancel_runtime_resource_install(
+    state: State<'_, AppState>,
+) -> Result<RuntimeResourceStatus, String> {
+    state.runtime_resource_task.cancel()
+}
+
+#[tauri::command]
+pub async fn import_runtime_resource_directory(
+    component: RuntimeResourceComponent,
+    source_root: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RuntimeResourceStatus, String> {
+    if let Some(status) = state.runtime_resource_task.running_status()? {
+        return Ok(status);
+    }
+    let installer = runtime_resource_installer(&app)?;
+    state
+        .runtime_resource_task
+        .start_import(component, installer, PathBuf::from(source_root))
+}
+
+#[tauri::command]
+pub async fn clear_runtime_resources(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RuntimeResourceStatus, String> {
+    if let Some(status) = state.runtime_resource_task.running_status()? {
+        return Ok(status);
+    }
+    let installer = runtime_resource_installer(&app)?;
+    state.runtime_resource_task.start_clear(installer)
+}
+
 fn voice_clone_timeout_ms(timeout_ms: Option<u64>) -> Result<u64, CommandErrorDto> {
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_VOICE_CLONE_TIMEOUT_MS);
     if !(MIN_VOICE_CLONE_TIMEOUT_MS..=MAX_VOICE_CLONE_TIMEOUT_MS).contains(&timeout_ms) {
@@ -549,11 +731,19 @@ impl Default for AppState {
             media_worker: Arc::new(Mutex::new(None)),
             research_worker: Arc::new(Mutex::new(None)),
             research_status: Arc::new(Mutex::new(ResearchStatusDto::default())),
+            runtime_resource_task: Arc::new(RuntimeResourceTask::default()),
         }
     }
 }
 
 impl AppState {
+    pub fn shutdown_runtime_resources(
+        &self,
+        budget: Duration,
+    ) -> Result<RuntimeResourceTaskShutdown, String> {
+        self.runtime_resource_task.shutdown(budget)
+    }
+
     fn lock_voice_clone_launch(&self) -> Result<std::sync::MutexGuard<'_, ()>, CommandErrorDto> {
         self.voice_clone_launch_lock.lock().map_err(|_| {
             CommandErrorDto::new("voice_clone_launch_lock_failed", "固定话术启动事务锁已损坏")
@@ -1351,13 +1541,13 @@ fn probe_local_mp4_blocking(
     request: MediaProbeRequestDto,
 ) -> Result<MediaProbeResultDto, CommandErrorDto> {
     state.ensure_main_window(&window)?;
-    let resource_dir = app.path().resource_dir().map_err(|error| {
+    let target_root = runtime_resource_target_root(&app).map_err(|error| {
         CommandErrorDto::new(
             "media_probe_failed",
-            format!("读取本地资源目录失败：{error}"),
+            format!("读取已验证媒体运行资源目录失败：{error}"),
         )
     })?;
-    let (_, ffprobe_path) = configured_media_engine_paths_with_resource_dir(&resource_dir)
+    let (_, ffprobe_path) = configured_media_engine_paths_with_resource_dir(&target_root)
         .map_err(|error| CommandErrorDto::new("media_probe_failed", error.to_string()))?;
     let cancellation = CancellationToken::new();
     let result = probe_user_selected_mp4_with_ffprobe(
@@ -1424,9 +1614,9 @@ pub fn get_speech_to_speech_worker_capabilities(
     state: State<'_, AppState>,
 ) -> Result<SpeechToSpeechWorkerCapabilities, CommandErrorDto> {
     state.ensure_playback_window(&window)?;
-    match app.path().resource_dir() {
-        Ok(resource_dir) => {
-            Ok(configured_speech_to_speech_worker_capabilities_with_resource_dir(&resource_dir))
+    match runtime_resource_target_root(&app) {
+        Ok(target_root) => {
+            Ok(configured_speech_to_speech_worker_capabilities_with_resource_dir(&target_root))
         }
         Err(error) => {
             let fallback = configured_speech_to_speech_worker_capabilities();
@@ -1435,7 +1625,7 @@ pub fn get_speech_to_speech_worker_capabilities(
             }
             Ok(SpeechToSpeechWorkerCapabilities::unavailable_with_reason(
                 format!(
-                    "安装包资源目录不可用：{error}；{}",
+                    "运行资源目录不可用：{error}；{}",
                     fallback
                         .reason
                         .unwrap_or_else(|| "speech-to-speech Worker 不可用".to_owned())
@@ -1491,11 +1681,11 @@ fn probe_voice_clone_worker_capabilities(
         Ok(model_root) => model_root,
         Err(error) => return Ok(unavailable_voice_clone_capabilities(error.message)),
     };
-    let resource_dir = match app.path().resource_dir() {
-        Ok(resource_dir) => resource_dir,
+    let target_root = match runtime_resource_target_root(app) {
+        Ok(target_root) => target_root,
         Err(error) => {
             return Ok(unavailable_voice_clone_capabilities(format!(
-                "安装包资源目录不可用：{error}"
+                "运行资源目录不可用：{error}"
             )))
         }
     };
@@ -1507,7 +1697,7 @@ fn probe_voice_clone_worker_capabilities(
         &CancellationToken::new(),
         VoiceCloneWorkerResources {
             model_root: model_root.as_deref(),
-            resource_dir: Some(&resource_dir),
+            target_root: Some(&target_root),
             server: None,
         },
         None,
@@ -1542,12 +1732,10 @@ pub fn get_media_engine_capabilities(
     state: State<'_, AppState>,
 ) -> Result<MediaEngineStatus, CommandErrorDto> {
     state.ensure_main_window(&window)?;
-    let resource_dir = app
-        .path()
-        .resource_dir()
-        .map_err(|error| CommandErrorDto::new("media_resource_dir_failed", error.to_string()))?;
+    let target_root = runtime_resource_target_root(&app)
+        .map_err(|error| CommandErrorDto::new("media_resource_dir_failed", error))?;
     Ok(configured_media_engine_status_with_resource_dir(
-        &resource_dir,
+        &target_root,
     ))
 }
 
@@ -1592,9 +1780,8 @@ fn prepare_voice_clone_source_blocking(
         .map_err(|reason| CommandErrorDto::new("voice_clone_worker_unavailable", reason))?;
     let cache_root = voice_clone_cache_root(&app)?;
     let model_root = voice_clone_model_root(&app)?;
-    let resource_dir = app.path().resource_dir().map_err(|error| {
-        CommandErrorDto::new("voice_clone_resource_dir_failed", error.to_string())
-    })?;
+    let target_root = runtime_resource_target_root(&app)
+        .map_err(|error| CommandErrorDto::new("voice_clone_resource_dir_failed", error))?;
     let (source_generation, canonical_source_path, source_sha256, operation_id, stale_paths) = {
         let mut playback = state
             .playback
@@ -1700,7 +1887,7 @@ fn prepare_voice_clone_source_blocking(
             &worker_cancellation,
             VoiceCloneWorkerResources {
                 model_root: thread_model_root.as_deref(),
-                resource_dir: Some(&resource_dir),
+                target_root: Some(&target_root),
                 server: Some(&thread_voice_clone_worker_server),
             },
             Some(&thread_progress_json),
@@ -1844,11 +2031,10 @@ fn start_voice_clone_replacement_blocking(
         .map_err(|reason| CommandErrorDto::new("voice_clone_worker_unavailable", reason))?;
     let cache_root = voice_clone_cache_root(&app)?;
     let model_root = voice_clone_model_root(&app)?;
-    let resource_dir = app.path().resource_dir().map_err(|error| {
-        CommandErrorDto::new("voice_clone_resource_dir_failed", error.to_string())
-    })?;
-    let (_, ffprobe_path) = configured_media_engine_paths_with_resource_dir(&resource_dir)
-        .map_err(|error| {
+    let target_root = runtime_resource_target_root(&app)
+        .map_err(|error| CommandErrorDto::new("voice_clone_resource_dir_failed", error))?;
+    let (_, ffprobe_path) =
+        configured_media_engine_paths_with_resource_dir(&target_root).map_err(|error| {
             CommandErrorDto::new("voice_clone_media_engine_unavailable", error.to_string())
         })?;
     let _ = state.reap_finished_speech_worker()?;
@@ -1944,7 +2130,7 @@ fn start_voice_clone_replacement_blocking(
             &worker_cancellation,
             VoiceCloneWorkerResources {
                 model_root: thread_model_root.as_deref(),
-                resource_dir: Some(&resource_dir),
+                target_root: Some(&target_root),
                 server: Some(&thread_voice_clone_worker_server),
             },
             Some(&thread_progress_json),
@@ -2092,11 +2278,10 @@ fn start_voice_clone_playback_blocking(
         .map_err(|reason| CommandErrorDto::new("voice_clone_worker_unavailable", reason))?;
     let cache_root = voice_clone_cache_root(&app)?;
     let model_root = voice_clone_model_root(&app)?;
-    let resource_dir = app.path().resource_dir().map_err(|error| {
-        CommandErrorDto::new("voice_clone_resource_dir_failed", error.to_string())
-    })?;
-    let (_, ffprobe_path) = configured_media_engine_paths_with_resource_dir(&resource_dir)
-        .map_err(|error| {
+    let target_root = runtime_resource_target_root(&app)
+        .map_err(|error| CommandErrorDto::new("voice_clone_resource_dir_failed", error))?;
+    let (_, ffprobe_path) =
+        configured_media_engine_paths_with_resource_dir(&target_root).map_err(|error| {
             CommandErrorDto::new("voice_clone_media_engine_unavailable", error.to_string())
         })?;
     let _ = state.reap_finished_speech_worker()?;
@@ -2150,7 +2335,7 @@ fn start_voice_clone_playback_blocking(
         let committed = ensure_voice_clone_playback_cache(
             &executable,
             model_root.as_deref(),
-            &resource_dir,
+            &target_root,
             &thread_voice_clone_worker_server,
             &cache_root,
             &ffprobe_path,
@@ -2253,11 +2438,10 @@ fn start_voice_clone_pre_generation_blocking(
         .map_err(|reason| CommandErrorDto::new("voice_clone_worker_unavailable", reason))?;
     let cache_root = voice_clone_cache_root(&app)?;
     let model_root = voice_clone_model_root(&app)?;
-    let resource_dir = app.path().resource_dir().map_err(|error| {
-        CommandErrorDto::new("voice_clone_resource_dir_failed", error.to_string())
-    })?;
-    let (_, ffprobe_path) = configured_media_engine_paths_with_resource_dir(&resource_dir)
-        .map_err(|error| {
+    let target_root = runtime_resource_target_root(&app)
+        .map_err(|error| CommandErrorDto::new("voice_clone_resource_dir_failed", error))?;
+    let (_, ffprobe_path) =
+        configured_media_engine_paths_with_resource_dir(&target_root).map_err(|error| {
             CommandErrorDto::new("voice_clone_media_engine_unavailable", error.to_string())
         })?;
     let (batch_id, source_generation, plans, snapshot) = {
@@ -2319,7 +2503,7 @@ fn start_voice_clone_pre_generation_blocking(
             let outcome = ensure_voice_clone_playback_cache(
                 &executable,
                 model_root.as_deref(),
-                &resource_dir,
+                &target_root,
                 &thread_voice_clone_worker_server,
                 &cache_root,
                 &ffprobe_path,
@@ -2850,17 +3034,17 @@ pub fn start_media_processing(
             return state.with_playback(&window, |playback| Ok(state.snapshot(playback)));
         }
     }
-    let resource_dir = match app.path().resource_dir() {
-        Ok(resource_dir) => resource_dir,
+    let target_root = match runtime_resource_target_root(&app) {
+        Ok(target_root) => target_root,
         Err(error) => {
             return state.with_playback(&window, |playback| {
-                playback.mark_media_processing_failed(format!("媒体资源目录不可用：{error}"));
+                playback.mark_media_processing_failed(format!("媒体运行资源目录不可用：{error}"));
                 Ok(state.snapshot(playback))
             })
         }
     };
     let (ffmpeg_path, ffprobe_path) =
-        match configured_media_engine_paths_with_resource_dir(&resource_dir) {
+        match configured_media_engine_paths_with_resource_dir(&target_root) {
             Ok(paths) => paths,
             Err(error) => {
                 return state.with_playback(&window, |playback| {
@@ -3388,9 +3572,9 @@ pub fn start_speech_to_speech_worker(
 ) -> Result<SpeechToSpeechStartResultDto, CommandErrorDto> {
     state.ensure_playback_window(&window)?;
     let _ = state.reap_finished_speech_worker()?;
-    let (resource_dir, resource_dir_error) = match app.path().resource_dir() {
-        Ok(resource_dir) => (Some(resource_dir), None),
-        Err(error) => (None, Some(format!("安装包资源目录不可用：{error}"))),
+    let (target_root, target_root_error) = match runtime_resource_target_root(&app) {
+        Ok(target_root) => (Some(target_root), None),
+        Err(error) => (None, Some(format!("运行资源目录不可用：{error}"))),
     };
     let cancellation = CancellationToken::new();
     let playback_generation = request.context.playback_generation;
@@ -3432,14 +3616,14 @@ pub fn start_speech_to_speech_worker(
     let thread_context = context.clone();
     let thread_input = input.clone();
     let worker_cancellation = cancellation.clone();
-    let thread_resource_dir = resource_dir.clone();
-    let thread_resource_dir_error = resource_dir_error.clone();
+    let thread_target_root = target_root.clone();
+    let thread_target_root_error = target_root_error.clone();
     let handle = thread::spawn(move || {
-        let result = match thread_resource_dir.as_deref() {
-            Some(resource_dir) => run_configured_speech_to_speech_context_worker_with_resource_dir(
+        let result = match thread_target_root.as_deref() {
+            Some(target_root) => run_configured_speech_to_speech_context_worker_with_resource_dir(
                 &thread_context,
                 &worker_cancellation,
-                resource_dir,
+                target_root,
             ),
             None => run_configured_speech_to_speech_context_worker(
                 &thread_context,
@@ -3481,7 +3665,7 @@ pub fn start_speech_to_speech_worker(
                         }
                     },
                     Err(error) => {
-                        let reason = match thread_resource_dir_error.as_deref() {
+                        let reason = match thread_target_root_error.as_deref() {
                             Some(resource_error) => {
                                 format!("{resource_error}；speech-to-speech Worker：{error}")
                             }
@@ -3672,40 +3856,32 @@ fn unavailable_voice_clone_capabilities(
 }
 
 fn configured_voice_clone_worker_executable(app: &AppHandle) -> Result<PathBuf, String> {
-    let path = match std::env::var(VOICE_CLONE_WORKER_ENV) {
-        Ok(configured) => {
-            let trimmed = configured.trim();
-            if trimmed.is_empty() {
-                return Err(format!("{VOICE_CLONE_WORKER_ENV} 不能为空"));
-            }
-            PathBuf::from(trimmed)
+    let development_override = if cfg!(debug_assertions) {
+        std::env::var(VOICE_CLONE_WORKER_ENV).ok()
+    } else {
+        None
+    };
+    let path = if let Some(configured) = development_override {
+        let trimmed = configured.trim();
+        if trimmed.is_empty() {
+            return Err(format!("{VOICE_CLONE_WORKER_ENV} 不能为空"));
         }
-        Err(_) if cfg!(debug_assertions) => {
-            return Err(format!(
-                "未设置 {VOICE_CLONE_WORKER_ENV}；开发版请由开发环境提供固定话术 Worker"
-            ));
-        }
-        Err(_) => {
-            let resource_dir = app
-                .path()
-                .resource_dir()
-                .map_err(|error| format!("安装包资源目录不可用：{error}"))?;
-            resource_dir.join("voice-worker").join(if cfg!(windows) {
+        PathBuf::from(trimmed)
+    } else {
+        runtime_resource_layout(app)?
+            .target_root
+            .join("voice-worker")
+            .join(if cfg!(windows) {
                 "autolive-voice-clone-worker.exe"
             } else {
                 "autolive-voice-clone-worker"
             })
-        }
     };
     if !path.is_absolute() {
         return Err("固定话术 Worker 路径必须是绝对路径".to_owned());
     }
     if !path.is_file() {
-        return Err(if cfg!(debug_assertions) {
-            "固定话术 Worker 文件不存在".to_owned()
-        } else {
-            "安装包缺少固定话术 Worker，请重新安装完整版本。".to_owned()
-        });
+        return Err("固定话术 Worker 文件不存在，需要下载运行资源。".to_owned());
     }
     #[cfg(unix)]
     {
@@ -3763,47 +3939,36 @@ fn allow_voice_clone_audio_file(app: &AppHandle, audio_path: &Path) -> Result<()
 }
 
 fn voice_clone_model_root(app: &AppHandle) -> Result<Option<PathBuf>, CommandErrorDto> {
-    if let Ok(configured) = std::env::var(VOICE_CLONE_MODEL_ROOT_ENV) {
-        let configured = configured.trim();
-        if configured.is_empty() {
-            return Err(CommandErrorDto::new(
-                "voice_clone_model_resources_invalid",
-                format!("{VOICE_CLONE_MODEL_ROOT_ENV} 不能为空"),
-            ));
+    if cfg!(debug_assertions) {
+        if let Ok(configured) = std::env::var(VOICE_CLONE_MODEL_ROOT_ENV) {
+            let configured = configured.trim();
+            if configured.is_empty() {
+                return Err(CommandErrorDto::new(
+                    "voice_clone_model_resources_invalid",
+                    format!("{VOICE_CLONE_MODEL_ROOT_ENV} 不能为空"),
+                ));
+            }
+            let path = PathBuf::from(configured);
+            if !path.is_absolute() {
+                return Err(CommandErrorDto::new(
+                    "voice_clone_model_resources_invalid",
+                    format!("{VOICE_CLONE_MODEL_ROOT_ENV} 必须是绝对路径"),
+                ));
+            }
+            return Ok(Some(path));
         }
-        let path = PathBuf::from(configured);
-        if !path.is_absolute() {
-            return Err(CommandErrorDto::new(
-                "voice_clone_model_resources_invalid",
-                format!("{VOICE_CLONE_MODEL_ROOT_ENV} 必须是绝对路径"),
-            ));
-        }
-        if cfg!(not(debug_assertions)) && !voice_clone_model_resources_complete(&path) {
-            return Err(CommandErrorDto::new(
-                "voice_clone_model_resources_missing",
-                "安装包中的人声模型资源不完整，请重新打包安装。",
-            ));
-        }
-        return Ok(Some(path));
     }
 
-    let resource_root = app
-        .path()
-        .resource_dir()
-        .map_err(|error| {
-            CommandErrorDto::new("voice_clone_model_resources_failed", error.to_string())
-        })?
-        .join("voice-models");
+    let layout = runtime_resource_layout(app)
+        .map_err(|error| CommandErrorDto::new("voice_clone_model_resources_failed", error))?;
+    let resource_root = layout.model_root;
     if voice_clone_model_resources_complete(&resource_root) {
         return Ok(Some(resource_root));
     }
-    if cfg!(not(debug_assertions)) {
-        return Err(CommandErrorDto::new(
-            "voice_clone_model_resources_missing",
-            "安装包中的人声模型资源不完整，请重新打包安装。",
-        ));
-    }
-    Ok(None)
+    Err(CommandErrorDto::new(
+        "voice_clone_model_resources_missing",
+        "人声模型资源不完整，需要下载运行资源。",
+    ))
 }
 
 fn voice_clone_model_resources_complete(root: &Path) -> bool {
@@ -3943,7 +4108,7 @@ fn build_voice_clone_synthesize_request(
 fn ensure_voice_clone_playback_cache(
     executable: &Path,
     model_root: Option<&Path>,
-    resource_dir: &Path,
+    target_root: &Path,
     server: &Arc<Mutex<Option<VoiceCloneWorkerServer>>>,
     cache_root: &Path,
     ffprobe_path: &Path,
@@ -3994,7 +4159,7 @@ fn ensure_voice_clone_playback_cache(
         cancellation,
         VoiceCloneWorkerResources {
             model_root,
-            resource_dir: Some(resource_dir),
+            target_root: Some(target_root),
             server: Some(server),
         },
         Some(&progress_json),
@@ -4350,11 +4515,12 @@ fn configure_voice_clone_worker_command(
     resources: VoiceCloneWorkerResources<'_>,
 ) {
     command.env("PYTHONUNBUFFERED", "1");
-    if let Some(resource_dir) = resources.resource_dir {
-        if std::env::var_os(FFMPEG_PATH_ENV).is_none()
-            && std::env::var_os(FFPROBE_PATH_ENV).is_none()
+    if let Some(target_root) = resources.target_root {
+        if !cfg!(debug_assertions)
+            || (std::env::var_os(FFMPEG_PATH_ENV).is_none()
+                && std::env::var_os(FFPROBE_PATH_ENV).is_none())
         {
-            if let Ok((ffmpeg_path, ffprobe_path)) = packaged_media_engine_paths(resource_dir) {
+            if let Ok((ffmpeg_path, ffprobe_path)) = packaged_media_engine_paths(target_root) {
                 command
                     .env(FFMPEG_PATH_ENV, ffmpeg_path)
                     .env(FFPROBE_PATH_ENV, ffprobe_path);
@@ -5415,15 +5581,16 @@ fn build_audio_variant_candidate(
 mod tests {
     use super::{
         build_voice_clone_pre_generation_plans, build_voice_clone_synthesize_request,
-        cleanup_previous_voice_clone_replacement_paths, realtime_audio_is_occupying,
-        run_voice_clone_worker_process, validate_voice_clone_pre_generation_items,
-        validate_voice_clone_synthesize_result, voice_clone_artifact_dirs,
-        voice_clone_cache_identity_matches, voice_clone_model_resources_complete,
-        voice_clone_prepare_session_identity, voice_clone_session_dir, voice_clone_timeout_ms,
-        write_voice_clone_playback_cache, AppState, VoiceClonePreGenerationItemRequestDto,
-        VoiceCloneProgressDto, VoiceCloneSynthesizeWorkerResult, VoiceCloneWorkerResources,
-        VoiceCloneWorkerRunError, VoiceCloneWorkerTask, VoiceCloneWorkerTaskKind,
-        MAX_VOICE_CLONE_TIMEOUT_MS, MIN_VOICE_CLONE_TIMEOUT_MS, VOICE_CLONE_CAPABILITY_TIMEOUT_MS,
+        cleanup_previous_voice_clone_replacement_paths, development_executable_ready,
+        realtime_audio_is_occupying, run_voice_clone_worker_process,
+        validate_voice_clone_pre_generation_items, validate_voice_clone_synthesize_result,
+        voice_clone_artifact_dirs, voice_clone_cache_identity_matches,
+        voice_clone_model_resources_complete, voice_clone_prepare_session_identity,
+        voice_clone_session_dir, voice_clone_timeout_ms, write_voice_clone_playback_cache,
+        AppState, VoiceClonePreGenerationItemRequestDto, VoiceCloneProgressDto,
+        VoiceCloneSynthesizeWorkerResult, VoiceCloneWorkerResources, VoiceCloneWorkerRunError,
+        VoiceCloneWorkerTask, VoiceCloneWorkerTaskKind, MAX_VOICE_CLONE_TIMEOUT_MS,
+        MIN_VOICE_CLONE_TIMEOUT_MS, VOICE_CLONE_CAPABILITY_TIMEOUT_MS,
     };
     use autolive_desktop_core::cancellation::CancellationToken;
     use autolive_desktop_core::media_library::SourceMediaDto;
@@ -5433,6 +5600,32 @@ mod tests {
         VoiceClonePreparedSource, VOICE_CLONE_SYNTHESIS_MODEL_ID,
     };
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn development_resource_gate_requires_an_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "autolive-runtime-resource-executable-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"fixture").expect("fixture should be written");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("fixture metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&path, permissions).expect("permissions should be set");
+        assert!(!development_executable_ready(&path));
+
+        let mut permissions = std::fs::metadata(&path)
+            .expect("fixture metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("permissions should be set");
+        assert!(development_executable_ready(&path));
+        let _ignored = std::fs::remove_file(path);
+    }
 
     fn test_voice_clone_playback_plan(model: Option<&str>) -> VoiceClonePlaybackPlan {
         VoiceClonePlaybackPlan {
@@ -6046,7 +6239,7 @@ mod tests {
             &CancellationToken::new(),
             VoiceCloneWorkerResources {
                 model_root: None,
-                resource_dir: None,
+                target_root: None,
                 server: None,
             },
             None,
@@ -6096,7 +6289,7 @@ mod tests {
             &cancellation,
             VoiceCloneWorkerResources {
                 model_root: None,
-                resource_dir: None,
+                target_root: None,
                 server: Some(&server),
             },
             None,
@@ -6116,7 +6309,7 @@ mod tests {
             &cancellation,
             VoiceCloneWorkerResources {
                 model_root: None,
-                resource_dir: None,
+                target_root: None,
                 server: Some(&server),
             },
             None,
@@ -6183,7 +6376,7 @@ mod tests {
             &cancellation,
             VoiceCloneWorkerResources {
                 model_root: None,
-                resource_dir: None,
+                target_root: None,
                 server: Some(&server),
             },
             None,
@@ -6234,7 +6427,7 @@ mod tests {
             &cancellation,
             VoiceCloneWorkerResources {
                 model_root: None,
-                resource_dir: None,
+                target_root: None,
                 server: Some(&server),
             },
             None,

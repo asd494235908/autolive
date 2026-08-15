@@ -1,4 +1,5 @@
 use autolive_desktop_core::media_library::SourceMediaDto;
+use autolive_desktop_core::runtime_resources::RuntimeResourceLayout;
 use autolive_desktop_core::voice_clone::{
     hash_voice_clone_text, VoiceCloneSegment, VoiceCloneSourceIndex,
 };
@@ -7,6 +8,46 @@ use autolive_desktop_core::{
     VoiceClonePreGenerationItemState, VoiceClonePreparedSource, VoiceCloneRuntimeError,
     VOICE_CLONE_SYNTHESIS_MODEL_ID,
 };
+use std::path::Path;
+
+#[test]
+fn release_voice_paths_use_the_versioned_app_data_layout() {
+    let target = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "x86_64-apple-darwin"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "x86_64-pc-windows-msvc"
+    } else {
+        return;
+    };
+    let layout = RuntimeResourceLayout::for_target(Path::new("/app-data"), target)
+        .expect("supported target should have a layout");
+
+    assert_eq!(
+        layout
+            .target_root
+            .join("voice-worker")
+            .join(if cfg!(windows) {
+                "autolive-voice-clone-worker.exe"
+            } else {
+                "autolive-voice-clone-worker"
+            }),
+        Path::new("/app-data")
+            .join("runtime-resources/v0.1.0")
+            .join(target)
+            .join("voice-worker")
+            .join(if cfg!(windows) {
+                "autolive-voice-clone-worker.exe"
+            } else {
+                "autolive-voice-clone-worker"
+            })
+    );
+    assert_eq!(
+        layout.model_root,
+        Path::new("/app-data/runtime-resources/v0.1.0/common/voice-models")
+    );
+}
 
 fn source(path: &str, file_name: &str) -> SourceMediaDto {
     SourceMediaDto {
