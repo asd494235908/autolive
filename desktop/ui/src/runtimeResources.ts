@@ -22,6 +22,7 @@ export type RuntimeResourceStatus = {
 };
 
 type RuntimeResourceStateInput = Pick<RuntimeResourceStatus, 'state'>;
+type RuntimeResourceLifecycleInput = Pick<RuntimeResourceStatus, 'state' | 'component'>;
 type PendingRuntimeActionDescriptor = Pick<RuntimeResourceStatus, 'component'> & { token: number };
 
 export type RuntimeResourceEnsureDecision = 'resume' | 'wait' | 'install' | 'conflict';
@@ -37,8 +38,14 @@ export type RuntimeResourceConsumers = {
   voiceClonePreparing: boolean;
   voiceCloneGenerating: boolean;
   voiceClonePlaybackPreparing: boolean;
-  realtimeAudioBusy: boolean;
+  realtimeWorkerRunning: boolean;
 };
+
+export type RuntimeResourceClearTerminalAction =
+  | 'none'
+  | 'clear-capabilities'
+  | 'revalidate-capabilities'
+  | 'conflict';
 
 export function canResumeRuntimeAction(status: RuntimeResourceStateInput): boolean {
   return status.state === 'ready';
@@ -83,25 +90,27 @@ export function runtimeResourceEnsureDecision(
 
 export function runtimeResourcePollComponent(
   status: Pick<RuntimeResourceStatus, 'state' | 'component'>,
-  clearInFlight: boolean,
 ): RuntimeResourceComponent | null {
   if (!shouldPollRuntimeResources(status)) return null;
-  return clearInFlight || status.component === null ? 'media' : status.component;
+  return status.component === null ? 'media' : status.component;
 }
 
 export function resolveRuntimeResourceClearLifecycle(
   clearInFlight: boolean,
-  status: RuntimeResourceStateInput,
-): { inFlight: boolean; clearCapabilities: boolean; conflict: boolean } {
-  if (!clearInFlight) return { inFlight: false, clearCapabilities: false, conflict: false };
+  status: RuntimeResourceLifecycleInput,
+): { inFlight: boolean; terminalAction: RuntimeResourceClearTerminalAction } {
+  const isGlobalClear = clearInFlight || status.component === null;
+  if (!isGlobalClear) return { inFlight: false, terminalAction: 'none' };
   if (isRuntimeResourceBusy(status)) {
-    return { inFlight: true, clearCapabilities: false, conflict: false };
+    return { inFlight: true, terminalAction: 'none' };
   }
-  return {
-    inFlight: false,
-    clearCapabilities: status.state === 'not-installed',
-    conflict: status.state === 'ready',
-  };
+  if (status.state === 'not-installed') {
+    return { inFlight: false, terminalAction: 'clear-capabilities' };
+  }
+  if (status.state === 'failed' || status.state === 'cancelled') {
+    return { inFlight: false, terminalAction: 'revalidate-capabilities' };
+  }
+  return { inFlight: false, terminalAction: status.state === 'ready' ? 'conflict' : 'none' };
 }
 
 export function isRuntimeResourceConflict(
@@ -117,6 +126,10 @@ export function runtimeResourceConsumerBusyReason(consumers: RuntimeResourceCons
   return Object.values(consumers).some(Boolean)
     ? '本地媒体或语音任务正在使用运行资源，请先完成或取消后再清理。'
     : null;
+}
+
+export function isRuntimeResourceRealtimeConsumerBusy(workerStatus: string | null | undefined): boolean {
+  return workerStatus === 'running';
 }
 
 export function runtimeResourceComponentLabel(component: RuntimeResourceComponent | null): string {

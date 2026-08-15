@@ -162,6 +162,7 @@ test('固定话术预生成只批量准备文案，不影响实际播放或原�
   assert.doesNotMatch(preGenerationEffect, /start_voice_clone_playback/);
   assert.doesNotMatch(preGenerationEffect, /action:\s*'resume'/);
   assert.doesNotMatch(preGenerationEffect, /setVoiceCloneAudioUrl/);
+  assert.match(appSource, /canStartVoiceClonePreGenerationForRuntime\(\s*voiceRuntimeReady,\s*runtimeResourceBusy,\s*runtimeResourceClearInFlightRef\.current,?\s*\)/);
 });
 
 test('固定话术预生成在 StrictMode 重挂载后仍接收批次快照', async () => {

@@ -42,32 +42,41 @@ test('只有 ready 才允许恢复挂起动作', async () => {
   assert.equal(runtimeResourceEnsureDecision('media', { state: 'failed', component: 'voice' }), 'install');
 });
 
-test('全局清理用 media 查询直到清理终态，并只在成功清理后清空 capabilities', async () => {
+test('component 为空表示全局清理，并按终态清空或重新探测 capabilities', async () => {
   const {
     resolveRuntimeResourceClearLifecycle,
     runtimeResourcePollComponent,
   } = await loadRuntimeResources();
 
   for (const state of ['checking', 'downloading', 'verifying']) {
-    assert.equal(runtimeResourcePollComponent({ state, component: null }, true), 'media');
-    assert.equal(runtimeResourcePollComponent({ state, component: null }, false), 'media');
+    assert.equal(runtimeResourcePollComponent({ state, component: null }), 'media');
+    assert.deepEqual(
+      resolveRuntimeResourceClearLifecycle(false, { state, component: null }),
+      { inFlight: true, terminalAction: 'none' },
+    );
   }
-  assert.equal(runtimeResourcePollComponent({ state: 'downloading', component: 'voice' }, false), 'voice');
+  assert.equal(runtimeResourcePollComponent({ state: 'downloading', component: 'voice' }), 'voice');
 
-  const checking = resolveRuntimeResourceClearLifecycle(true, { state: 'checking' });
-  assert.deepEqual(checking, { inFlight: true, clearCapabilities: false, conflict: false });
-  const completed = resolveRuntimeResourceClearLifecycle(true, { state: 'not-installed' });
-  assert.deepEqual(completed, { inFlight: false, clearCapabilities: true, conflict: false });
+  const completed = resolveRuntimeResourceClearLifecycle(true, { state: 'not-installed', component: 'media' });
+  assert.deepEqual(completed, { inFlight: false, terminalAction: 'clear-capabilities' });
   for (const state of ['failed', 'cancelled']) {
     assert.deepEqual(
-      resolveRuntimeResourceClearLifecycle(true, { state }),
-      { inFlight: false, clearCapabilities: false, conflict: false },
+      resolveRuntimeResourceClearLifecycle(true, { state, component: 'media' }),
+      { inFlight: false, terminalAction: 'revalidate-capabilities' },
     );
-    assert.equal(runtimeResourcePollComponent({ state, component: null }, true), null);
+    assert.deepEqual(
+      resolveRuntimeResourceClearLifecycle(false, { state, component: null }),
+      { inFlight: false, terminalAction: 'revalidate-capabilities' },
+    );
+    assert.equal(runtimeResourcePollComponent({ state, component: null }), null);
   }
   assert.deepEqual(
-    resolveRuntimeResourceClearLifecycle(true, { state: 'ready' }),
-    { inFlight: false, clearCapabilities: false, conflict: true },
+    resolveRuntimeResourceClearLifecycle(true, { state: 'ready', component: 'voice' }),
+    { inFlight: false, terminalAction: 'conflict' },
+  );
+  assert.deepEqual(
+    resolveRuntimeResourceClearLifecycle(false, { state: 'failed', component: 'media' }),
+    { inFlight: false, terminalAction: 'none' },
   );
 });
 
@@ -122,7 +131,10 @@ test('资源消息包含组件、失败原因和目录信息', async () => {
 });
 
 test('清理资源时覆盖所有本地资源消费者', async () => {
-  const { runtimeResourceConsumerBusyReason } = await loadRuntimeResources();
+  const {
+    isRuntimeResourceRealtimeConsumerBusy,
+    runtimeResourceConsumerBusyReason,
+  } = await loadRuntimeResources();
   const idle = {
     importVideoBusy: false,
     mediaProcessingBusy: false,
@@ -134,11 +146,15 @@ test('清理资源时覆盖所有本地资源消费者', async () => {
     voiceClonePreparing: false,
     voiceCloneGenerating: false,
     voiceClonePlaybackPreparing: false,
-    realtimeAudioBusy: false,
+    realtimeWorkerRunning: false,
   };
 
   assert.equal(runtimeResourceConsumerBusyReason(idle), null);
   for (const key of Object.keys(idle)) {
     assert.match(runtimeResourceConsumerBusyReason({ ...idle, [key]: true }), /正在使用运行资源/);
   }
+  assert.equal(isRuntimeResourceRealtimeConsumerBusy('running'), true);
+  assert.equal(isRuntimeResourceRealtimeConsumerBusy('ready'), false);
+  assert.equal(isRuntimeResourceRealtimeConsumerBusy('pending'), false);
+  assert.equal(isRuntimeResourceRealtimeConsumerBusy('active'), false);
 });

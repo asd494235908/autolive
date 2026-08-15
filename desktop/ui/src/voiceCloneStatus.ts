@@ -12,6 +12,14 @@ export type VoiceCloneAutoPrepareInput = {
   triggeredKey: string | null | undefined;
 };
 
+export type VoiceCloneAutoPrepareRestoreInput = {
+  interactivePicker: boolean;
+  hadPendingAutoPrepare: boolean;
+  selectedPath: string | null | undefined;
+  playbackGenerationBefore: number | null | undefined;
+  playbackGenerationAfter: number | null | undefined;
+};
+
 export type VoiceCloneReplaceDisabledInput = {
   hasSource: boolean;
   playbackState: string;
@@ -75,6 +83,14 @@ export function shouldStartVoiceClonePreGeneration(input: VoiceClonePreGeneratio
     && !['preparing', 'playing'].includes(input.playbackStatus)
     && key !== null
     && key !== input.lastStartedKey;
+}
+
+export function canStartVoiceClonePreGenerationForRuntime(
+  voiceRuntimeReady: boolean,
+  runtimeResourceBusy: boolean,
+  runtimeResourceClearInFlight: boolean,
+): boolean {
+  return voiceRuntimeReady && !runtimeResourceBusy && !runtimeResourceClearInFlight;
 }
 
 export function shouldAcceptVoiceClonePreGenerationResult(
@@ -158,6 +174,21 @@ export function shouldAutoPrepareVoiceCloneSource({
   if (status !== 'idle') return false;
   const sourceKey = getVoiceCloneAutoPrepareKey(sourcePath, playbackGeneration);
   return sourceKey !== null && sourceKey !== triggeredKey;
+}
+
+export function shouldRestoreVoiceCloneAutoPrepareAfterPicker({
+  interactivePicker,
+  hadPendingAutoPrepare,
+  selectedPath,
+  playbackGenerationBefore,
+  playbackGenerationAfter,
+}: VoiceCloneAutoPrepareRestoreInput): boolean {
+  return interactivePicker
+    && hadPendingAutoPrepare
+    && !selectedPath
+    && playbackGenerationBefore !== null
+    && playbackGenerationBefore !== undefined
+    && playbackGenerationBefore === playbackGenerationAfter;
 }
 
 export function getVoiceCloneReplaceDisabledReason({

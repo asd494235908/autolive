@@ -114,12 +114,14 @@ test('打开文件选择器或恢复旧路径前先取消旧视频的自动人�
     source.indexOf('function updateInterludeDraft'),
   );
   const abortIndex = importVideo.indexOf('voiceCloneAutoPrepareControllerRef.current?.abort()');
-  const selectedIndex = importVideo.indexOf('const selected =');
+  const selectedIndex = importVideo.indexOf('const selection =');
   const chooserIndex = importVideo.indexOf('await open(');
 
   assert.ok(abortIndex > -1);
   assert.ok(abortIndex < selectedIndex);
   assert.ok(abortIndex < chooserIndex);
+  assert.match(importVideo, /const restoreAutoPrepareGeneration = selectedSourcePath === undefined/);
+  assert.match(importVideo, /finally \{[\s\S]*shouldRestoreVoiceCloneAutoPrepareAfterPicker\([\s\S]*prepareVoiceCloneAfterImport\(restoreAutoPrepareGeneration\)/);
 });
 
 test('导入视频先确保 media，资源就绪后再探测并播放一次', async () => {
@@ -150,11 +152,12 @@ test('资源面板提供重试、取消、本地导入和显式清理', async ()
   assert.match(source, /runtimeResourceProgressDetails\(runtimeResourceStatus\)/);
   assert.match(source, /resolvePendingRuntimeAction/);
   assert.match(source, /runtimeResourceEnsureDecision/);
+  assert.match(source, /if \(runtimeResourceClearInFlightRef\.current\) \{[\s\S]*RuntimeResourceConflictError/);
   assert.match(source, /window\.clearTimeout\(timer\)/);
   assert.match(source, /runtimeResourcePollError/);
-  assert.match(source, /runtimeResourcePollComponent\(\s*runtimeResourceStatus,\s*runtimeResourceClearInFlightRef\.current/);
+  assert.match(source, /runtimeResourcePollComponent\(runtimeResourceStatus\)/);
   assert.match(source, /resolveRuntimeResourceClearLifecycle/);
-  assert.match(source, /clearLifecycle\.conflict/);
+  assert.match(source, /clearLifecycle\.terminalAction === 'revalidate-capabilities'/);
   assert.match(source, /resourceConsumersBusy/);
   assert.match(source, /resourceConsumersBusyReasonRef\.current/);
   assert.match(source, /title=\{runtimeResourceClearDisabledReason/);
@@ -168,13 +171,36 @@ test('资源面板提供重试、取消、本地导入和显式清理', async ()
     source.indexOf('async function chooseRuntimeResourceDirectory'),
   );
   assert.match(cancelResources, /catch \(cause\)[\s\S]*setRuntimeResourceStatus\(\(current\) => current \? \{ \.\.\.current \} : current\)/);
-  assert.match(source, /runtimeResourceMountedRef\.current[\s\S]*runtimeResourceActionTokenRef\.current === capabilityToken/);
+  assert.match(source, /refreshRuntimeResourceCapabilities/);
+  assert.match(source, /runtimeResourceMountedRef\.current[\s\S]*runtimeResourceActionTokenRef\.current === expectedActionToken/);
+
+  const initialRuntimeStatusStart = source.indexOf('runtimeResourceMountedRef.current = true;');
+  const initialRuntimeStatus = source.slice(
+    initialRuntimeStatusStart,
+    source.indexOf('useEffect(() => {', initialRuntimeStatusStart + 1),
+  );
+  assert.match(initialRuntimeStatus, /applyRuntimeResourceStatus\(status, actionToken\)/);
+  assert.doesNotMatch(initialRuntimeStatus, /setRuntimeResourceStatus\(status\)/);
+
+  const startupCapabilities = source.slice(
+    source.indexOf('const cancelIdleWork = scheduleAfterInitialPaint'),
+    source.indexOf('return () => {', source.indexOf('const cancelIdleWork = scheduleAfterInitialPaint')),
+  );
+  assert.match(startupCapabilities, /const capabilityToken = runtimeResourceActionTokenRef\.current/);
+  assert.match(startupCapabilities, /refreshRuntimeResourceCapabilities\(\['media', 'voice'\], capabilityToken\)/);
 
   const chooseDirectory = source.slice(
     source.indexOf('async function chooseRuntimeResourceDirectory'),
     source.indexOf('function confirmClearRuntimeResources'),
   );
   assert.match(chooseDirectory, /try \{[\s\S]*await open\(\{ directory: true, multiple: false \}\)[\s\S]*catch \(cause\)/);
+  assert.match(chooseDirectory, /if \(!pending\) runtimeResourceActionTokenRef\.current \+= 1;[\s\S]*applyRuntimeResourceStatus\(status, token\)/);
+
+  const retryResources = source.slice(
+    source.indexOf('async function retryRuntimeResources'),
+    source.indexOf('async function cancelRuntimeResources'),
+  );
+  assert.match(retryResources, /if \(!pending\) runtimeResourceActionTokenRef\.current \+= 1;[\s\S]*applyRuntimeResourceStatus\(status, token\)/);
 
   const clearResources = source.slice(
     source.indexOf('function confirmClearRuntimeResources'),
@@ -182,8 +208,12 @@ test('资源面板提供重试、取消、本地导入和显式清理', async ()
   );
   assert.match(clearResources, /resourceConsumersBusyReasonRef\.current/);
   assert.match(clearResources, /runtimeResourceBusyRef\.current/);
+  assert.match(clearResources, /voiceClonePreGenerationInFlightRef\.current/);
   assert.match(clearResources, /applyRuntimeResourceStatus/);
+  assert.match(clearResources, /runtimeResourceBusyRef\.current = true;[\s\S]*state: 'checking',[\s\S]*component: null,[\s\S]*clear_runtime_resources/);
+  assert.match(clearResources, /catch \(cause\) \{[\s\S]*refreshRuntimeResourceCapabilities\(\['media', 'voice'\], token\)/);
   assert.doesNotMatch(clearResources, /setMediaEngineCapabilities\(null\)[\s\S]*setVoiceCloneWorkerCapabilities\(null\)/);
+  assert.match(source, /terminalAction === 'conflict'[\s\S]*refreshRuntimeResourceCapabilities\(\['media', 'voice'\], capabilityToken\)/);
 
   const consumerBusyState = source.slice(
     source.indexOf('const resourceConsumersBusyReason ='),
@@ -191,4 +221,16 @@ test('资源面板提供重试、取消、本地导入和显式清理', async ()
   );
   assert.match(consumerBusyState, /snapshot\?\.video_processing_status === 'processing'/);
   assert.match(consumerBusyState, /snapshot\?\.audio_processing_status === 'processing'/);
+  assert.match(consumerBusyState, /realtimeWorkerRunning:\s*isRuntimeResourceRealtimeConsumerBusy\(snapshot\?\.worker_status\)/);
+  assert.match(source, /const realtimeAudioBusy =[\s\S]*current_audio_source === 'realtime_variant'/);
+});
+
+test('已有视频的媒体处理先确保 media 并只恢复一次', async () => {
+  const source = await readSource('App.tsx');
+  const mediaProcessing = source.slice(
+    source.indexOf('async function applyMediaProcessing'),
+    source.indexOf('async function startResearchAnalysis'),
+  );
+
+  assert.match(mediaProcessing, /ensureRuntimeResources\('media',[\s\S]*start_media_processing/);
 });

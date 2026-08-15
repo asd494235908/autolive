@@ -87,6 +87,26 @@ test('automatic preparation starts once per source generation without an MP4 has
   );
 });
 
+test('文件选择取消或报错时仅为未变化的旧视频恢复一次自动准备', async () => {
+  const { shouldRestoreVoiceCloneAutoPrepareAfterPicker } = await loadTypeScriptModule(
+    'voiceCloneStatus.ts',
+    ['shouldRestoreVoiceCloneAutoPrepareAfterPicker'],
+  );
+  const pendingPicker = {
+    interactivePicker: true,
+    hadPendingAutoPrepare: true,
+    selectedPath: null,
+    playbackGenerationBefore: 7,
+    playbackGenerationAfter: 7,
+  };
+
+  assert.equal(shouldRestoreVoiceCloneAutoPrepareAfterPicker(pendingPicker), true);
+  assert.equal(shouldRestoreVoiceCloneAutoPrepareAfterPicker({ ...pendingPicker, selectedPath: '/tmp/new.mp4' }), false);
+  assert.equal(shouldRestoreVoiceCloneAutoPrepareAfterPicker({ ...pendingPicker, playbackGenerationAfter: 8 }), false);
+  assert.equal(shouldRestoreVoiceCloneAutoPrepareAfterPicker({ ...pendingPicker, hadPendingAutoPrepare: false }), false);
+  assert.equal(shouldRestoreVoiceCloneAutoPrepareAfterPicker({ ...pendingPicker, interactivePicker: false }), false);
+});
+
 test('replacement is enabled after preparation is ready and the player is synchronized', async () => {
   const { getVoiceCloneReplaceDisabledReason } = await loadTypeScriptModule(
     'voiceCloneStatus.ts',
@@ -215,6 +235,18 @@ test('pre-generation starts once for a ready source and a new text revision', as
     playbackStatus: 'ready',
     lastStartedKey: key,
   }), false);
+});
+
+test('批量预生成只在 voice 资源就绪且没有安装或清理时启动', async () => {
+  const { canStartVoiceClonePreGenerationForRuntime } = await loadTypeScriptModule(
+    'voiceCloneStatus.ts',
+    ['canStartVoiceClonePreGenerationForRuntime'],
+  );
+
+  assert.equal(canStartVoiceClonePreGenerationForRuntime(true, false, false), true);
+  assert.equal(canStartVoiceClonePreGenerationForRuntime(false, false, false), false);
+  assert.equal(canStartVoiceClonePreGenerationForRuntime(true, true, false), false);
+  assert.equal(canStartVoiceClonePreGenerationForRuntime(true, false, true), false);
 });
 
 test('a submitted pre-generation key stays occupied until text revision or source generation changes', async () => {
