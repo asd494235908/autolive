@@ -122,6 +122,12 @@ jobs:
       - name: Install voice clone packaging dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r desktop/worker/requirements-voice-clone-build.txt
       - name: Install desktop/ui dependencies
+        env:
+          npm_config_fetch_retries: '5'
+          npm_config_fetch_retry_factor: '2'
+          npm_config_fetch_retry_mintimeout: '10000'
+          npm_config_fetch_retry_maxtimeout: '120000'
+          npm_config_fetch_timeout: '120000'
         run: pnpm --dir desktop/ui install --frozen-lockfile
       - name: Read desktop version
         id: desktop-version
