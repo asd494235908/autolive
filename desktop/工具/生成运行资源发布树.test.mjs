@@ -44,7 +44,7 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
   assert.ok(result.manifest.files.every((file) => !('size' in file)));
   assert.ok(
     result.manifest.files.every((file) =>
-      Object.keys(file).sort().join(',') === 'executable,relative_path,sha256,size_bytes',
+      Object.keys(file).sort().join(',') === 'component,executable,relative_path,sha256,size_bytes',
     ),
   );
   assert.equal(
@@ -65,6 +65,10 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
   assert.deepEqual(
     result.manifest.files.map((file) => file.executable),
     [true, true, true, false, false],
+  );
+  assert.deepEqual(
+    result.manifest.files.map((file) => file.component),
+    ['media', 'media', 'voice-runtime', 'voice-models', 'voice-models'],
   );
   assert.deepEqual(
     result.manifest.files.map((file) => file.size_bytes),

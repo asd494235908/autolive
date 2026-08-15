@@ -72,19 +72,20 @@ function releaseFiles(root, executable, componentRoot = root) {
 function copyComponentFiles({ target, sourceRoot, outputRoot }) {
   const releaseRoot = join(outputRoot, 'autolive-resources', RESOURCE_RELEASE);
   const components = [
-    { name: 'binaries', scope: target, executable: true },
-    { name: 'voice-worker', scope: target, executable: true },
-    { name: 'voice-models', scope: 'common', executable: false },
+    { name: 'binaries', scope: target, executable: true, component: 'media' },
+    { name: 'voice-worker', scope: target, executable: true, component: 'voice-runtime' },
+    { name: 'voice-models', scope: 'common', executable: false, component: 'voice-models' },
   ];
 
   rmSync(releaseRoot, { recursive: true, force: true });
-  return components.flatMap(({ name, scope, executable }) => {
+  return components.flatMap(({ name, scope, executable, component }) => {
     const source = join(sourceRoot, name);
     const destination = join(releaseRoot, scope, name);
     cpSync(source, destination, { recursive: true, dereference: true });
     removeReleaseCacheEntries(destination);
     return releaseFiles(destination, executable).map((file) => ({
       ...file,
+      component,
       relative_path: `${scope}/${name}/${file.relative_path}`,
     }));
   });
