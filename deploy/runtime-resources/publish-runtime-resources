@@ -1,0 +1,270 @@
+#!/bin/sh
+set -eu
+set -f
+
+fail() {
+	printf '%s\n' "$1" >&2
+	exit 65
+}
+
+[ "$#" -eq 3 ] || exit 64
+release=$1
+scope=$2
+upload_id=$3
+
+case "$release" in
+	v0.1.0) ;;
+	*) exit 64 ;;
+esac
+case "$scope" in
+	common|x86_64-apple-darwin|aarch64-apple-darwin|x86_64-pc-windows-msvc) ;;
+	*) exit 64 ;;
+esac
+case "$upload_id" in
+	*-*) ;;
+	*) exit 64 ;;
+esac
+run_id=${upload_id%%-*}
+run_attempt=${upload_id#*-}
+case "$run_id" in
+	''|0*|*[!0-9]*) exit 64 ;;
+esac
+case "$run_attempt" in
+	''|0*|*[!0-9]*|*-*) exit 64 ;;
+esac
+case "$release$scope$upload_id" in
+	*/|*[\\]*) exit 64 ;;
+esac
+
+if [ "${AUTOLIVE_TEST_MODE:-0}" = 1 ]; then
+	case "${TEST_ROOT:-}" in
+		/*) ;;
+		*) exit 64 ;;
+	esac
+	staging_root="$TEST_ROOT/autolive-resources-staging"
+	published_root="$TEST_ROOT/autolive-resources"
+	lock_root="$TEST_ROOT/locks"
+	flock_bin=${FLOCK_BIN:-flock}
+else
+	staging_root=/fs/autolive-resources-staging
+	published_root=/fs/autolive-resources
+	lock_root=/var/lock/autolive-resources
+	flock_bin=/usr/bin/flock
+fi
+
+inventory_name=autolive-deploy-inventory.json
+source_dir="$staging_root/$upload_id/$release/$scope"
+candidate="$staging_root/.candidates/$upload_id-$release-$scope"
+destination="$published_root/autolive-resources/$release/$scope"
+
+reject_symlink_path() {
+	for checked_path in "$@"; do
+		if [ -L "$checked_path" ]; then
+			fail "fixed path component is a symlink"
+		fi
+	done
+}
+
+reject_symlink_path \
+	"$staging_root" \
+	"$staging_root/.candidates" \
+	"$staging_root/$upload_id" \
+	"$staging_root/$upload_id/$release" \
+	"$source_dir" \
+	"$published_root" \
+	"$published_root/autolive-resources" \
+	"$published_root/autolive-resources/$release"
+reject_symlink_path "$lock_root"
+mkdir -p "$staging_root/.candidates" "$lock_root"
+reject_symlink_path "$staging_root" "$staging_root/.candidates" "$lock_root"
+lock_path="$lock_root/$release.lock"
+exec 9>"$lock_path"
+"$flock_bin" -x 9
+
+test -d "$source_dir" || fail "source staging is missing"
+if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+	fail "candidate already belongs to another attempt"
+fi
+mv "$source_dir" "$candidate" || fail "cannot claim source staging"
+
+destination_present=0
+if [ -e "$destination" ] || [ -L "$destination" ]; then
+	destination_present=1
+fi
+if ! publish_state=$(python3 - "$candidate/$inventory_name" "$candidate" "$destination" "$release" "$scope" "$destination_present" <<'PY'
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+INVENTORY_NAME = "autolive-deploy-inventory.json"
+MAX_INVENTORY_BYTES = 16 * 1024 * 1024
+MAX_FILES = 100_000
+MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024 * 1024
+HASH_CHUNK_BYTES = 1024 * 1024
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+inventory_path, candidate, destination, expected_release, expected_scope, destination_present = sys.argv[1:]
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+def object_without_duplicate_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail("duplicate JSON key")
+        value[key] = item
+    return value
+
+try:
+    if os.path.getsize(inventory_path) > MAX_INVENTORY_BYTES:
+        fail("inventory is too large")
+    with open(inventory_path, "rb") as handle:
+        inventory = json.load(handle, object_pairs_hook=object_without_duplicate_keys)
+except (OSError, ValueError, UnicodeDecodeError) as error:
+    fail(f"invalid inventory: {error}")
+
+if not isinstance(inventory, dict) or set(inventory) != {"schema", "release", "scope", "files"}:
+    fail("inventory schema is not exact")
+if inventory["schema"] != 1 or inventory["release"] != expected_release or inventory["scope"] != expected_scope:
+    fail("inventory release or scope does not match command")
+files = inventory["files"]
+if not isinstance(files, list) or len(files) > MAX_FILES:
+    fail("inventory file list is invalid")
+
+expected = {}
+for entry in files:
+    if not isinstance(entry, dict) or set(entry) != {"relative_path", "type", "size_bytes", "sha256"}:
+        fail("inventory file entry schema is not exact")
+    relative_path = entry["relative_path"]
+    if not isinstance(relative_path, str) or not relative_path or relative_path == INVENTORY_NAME:
+        fail("inventory path is invalid")
+    parts = relative_path.split("/")
+    if (
+        any(not part or part in (".", "..") or part.startswith(".") or "\\" in part or "\x00" in part for part in parts)
+        or re.match(r"^[A-Za-z]:", parts[0])
+    ):
+        fail("inventory path is not a safe relative path")
+    if entry["type"] != "regular-file":
+        fail("inventory file type is not regular-file")
+    size_bytes = entry["size_bytes"]
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0 or size_bytes > MAX_FILE_BYTES:
+        fail("inventory file size is invalid")
+    sha256 = entry["sha256"]
+    if not isinstance(sha256, str) or not SHA256.fullmatch(sha256):
+        fail("inventory file hash is invalid")
+    if relative_path in expected:
+        fail("inventory contains duplicate paths")
+    expected[relative_path] = (size_bytes, sha256)
+
+def validate_root(root, allow_inventory):
+    try:
+        root_stat = os.lstat(root)
+    except OSError as error:
+        fail(f"resource root is unavailable: {error}")
+    if not stat.S_ISDIR(root_stat.st_mode):
+        fail("resource root is not a directory")
+
+    actual_files = []
+    actual_directories = set()
+
+    def scan(directory, prefix=""):
+        try:
+            entries = os.scandir(directory)
+        except OSError as error:
+            fail(f"cannot scan resource root: {error}")
+        with entries:
+            for entry in entries:
+                relative_path = f"{prefix}/{entry.name}" if prefix else entry.name
+                if allow_inventory and relative_path == INVENTORY_NAME and not prefix:
+                    try:
+                        metadata_stat = os.lstat(entry.path)
+                    except OSError as error:
+                        fail(f"cannot inspect inventory: {error}")
+                    if not stat.S_ISREG(metadata_stat.st_mode):
+                        fail("inventory is not a regular file")
+                    continue
+                if entry.name.startswith("."):
+                    fail("hidden resource entry is forbidden")
+                try:
+                    entry_stat = os.lstat(entry.path)
+                except OSError as error:
+                    fail(f"cannot inspect resource entry: {error}")
+                if stat.S_ISLNK(entry_stat.st_mode):
+                    fail("symlink resource entry is forbidden")
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    actual_directories.add(relative_path)
+                    scan(entry.path, relative_path)
+                elif stat.S_ISREG(entry_stat.st_mode):
+                    actual_files.append(relative_path)
+                else:
+                    fail("non-regular resource entry is forbidden")
+                if len(actual_files) > MAX_FILES:
+                    fail("resource file count is too large")
+
+    scan(root)
+    if set(actual_files) != set(expected):
+        fail("resource files do not exactly match inventory")
+    allowed_directories = set()
+    for relative_path in expected:
+        parts = relative_path.split("/")
+        for index in range(1, len(parts)):
+            allowed_directories.add("/".join(parts[:index]))
+    if actual_directories != allowed_directories:
+        fail("resource directories do not exactly match inventory")
+
+    for relative_path, (expected_size, expected_hash) in expected.items():
+        path = os.path.join(root, *relative_path.split("/"))
+        try:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as error:
+            fail(f"cannot open resource file: {error}")
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(descriptor_stat.st_mode) or descriptor_stat.st_size != expected_size:
+                fail("resource file size or type does not match inventory")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            if digest.hexdigest() != expected_hash:
+                fail("resource file hash does not match inventory")
+        finally:
+            os.close(descriptor)
+
+validate_root(candidate, True)
+if destination_present == "1":
+    validate_root(destination, False)
+    print("DUPLICATE")
+else:
+    print("NEW")
+PY
+); then
+	fail "candidate or destination inventory validation failed"
+fi
+
+case "$publish_state" in
+	DUPLICATE)
+		rm -rf "$candidate"
+		exit 0
+		;;
+	NEW) ;;
+	*) fail "publisher validation returned an invalid state" ;;
+esac
+
+mkdir -p "$published_root/autolive-resources/$release"
+reject_symlink_path \
+	"$published_root" \
+	"$published_root/autolive-resources" \
+	"$published_root/autolive-resources/$release"
+if [ -e "$destination" ] || [ -L "$destination" ]; then
+	fail "destination appeared during publication"
+fi
+rm "$candidate/$inventory_name"
+mv "$candidate" "$destination"

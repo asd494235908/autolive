@@ -1,0 +1,21 @@
+[Unit]
+Description=Autolive immutable runtime resource server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=autolive-resources
+Group=autolive-resources
+ExecStart=/usr/local/lib/autolive-resources/caddy run --config /etc/autolive-resources/Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/fs/autolive-resources
+ReadWritePaths=/var/log/autolive-resources
+
+[Install]
+WantedBy=multi-user.target

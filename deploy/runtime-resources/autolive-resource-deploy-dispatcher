@@ -1,0 +1,99 @@
+#!/bin/sh
+set -eu
+set -f
+IFS=' '
+
+fail() {
+	exit 64
+}
+
+validate_release_scope_upload() {
+	validate_release=$1
+	validate_scope=$2
+	validate_upload_id=$3
+
+	case "$validate_release" in
+		v0.1.0) ;;
+		*) fail ;;
+	esac
+	case "$validate_scope" in
+		common|x86_64-apple-darwin|aarch64-apple-darwin|x86_64-pc-windows-msvc) ;;
+		*) fail ;;
+	esac
+	case "$validate_upload_id" in
+		*-*) ;;
+		*) fail ;;
+	esac
+	validate_run_id=${validate_upload_id%%-*}
+	validate_run_attempt=${validate_upload_id#*-}
+	case "$validate_run_id" in
+		''|0*|*[!0-9]*) fail ;;
+	esac
+	case "$validate_run_attempt" in
+		''|0*|*[!0-9]*|*-*) fail ;;
+	esac
+	case "$validate_release$validate_scope$validate_upload_id" in
+		*/|*[\\]*) fail ;;
+	esac
+}
+
+if [ "${AUTOLIVE_TEST_MODE:-0}" = 1 ]; then
+	case "${TEST_ROOT:-}" in
+		/*) ;;
+		*) fail ;;
+	esac
+	RRSYNC="$TEST_ROOT/usr/local/lib/autolive-resources/rrsync"
+	PUBLISHER="$TEST_ROOT/usr/local/sbin/publish-runtime-resources"
+	STAGING_ROOT="$TEST_ROOT/autolive-resources-staging"
+else
+	RRSYNC=/usr/local/lib/autolive-resources/rrsync
+	PUBLISHER=/usr/local/sbin/publish-runtime-resources
+	STAGING_ROOT=/fs/autolive-resources-staging
+fi
+
+original_command=${SSH_ORIGINAL_COMMAND:-}
+[ -n "$original_command" ] || fail
+
+set -- $original_command
+[ "$#" -ge 1 ] || fail
+
+if [ "$1" = publish-runtime-resources ]; then
+	[ "$#" -eq 4 ] || fail
+	[ "$original_command" = "publish-runtime-resources $2 $3 $4" ] || fail
+	validate_release_scope_upload "$2" "$3" "$4"
+	exec "$PUBLISHER" "$2" "$3" "$4"
+fi
+
+[ "$1" = rsync ] || fail
+[ "$2" = --server ] || fail
+shift 2
+[ "$#" -ge 1 ] || fail
+
+while [ "$#" -gt 1 ]; do
+	case "$1" in
+		.|-[A-Za-z0-9._,:+=@-]*) ;;
+		*) fail ;;
+	esac
+	shift
+done
+
+remote_path=$1
+case "$remote_path" in
+	*/) remote_path_without_slash=${remote_path%/} ;;
+	*) fail ;;
+esac
+case "$remote_path_without_slash" in
+	*/*/*) ;;
+	*) fail ;;
+esac
+remote_upload_id=${remote_path_without_slash%%/*}
+remote_release_and_scope=${remote_path_without_slash#*/}
+remote_release=${remote_release_and_scope%%/*}
+remote_scope=${remote_release_and_scope#*/}
+case "$remote_scope" in
+	*/*|'') fail ;;
+esac
+[ "$remote_path" = "$remote_upload_id/$remote_release/$remote_scope/" ] || fail
+validate_release_scope_upload "$remote_release" "$remote_scope" "$remote_upload_id"
+
+exec "$RRSYNC" -wo -no-overwrite -munge "$STAGING_ROOT"
