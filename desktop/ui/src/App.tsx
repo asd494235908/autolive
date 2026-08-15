@@ -13,7 +13,21 @@ import { clampMediaTime, clampVolume, formatMediaTime, isPlaybackMediaControlMes
 import type { PlaybackMediaControlMessage, PlaybackMediaStateMessage } from './播放控制消息';
 import { scheduleAfterInitialPaint, waitForAbortableDelay } from './启动调度';
 import { getDisplayErrorMessage } from './errorDisplay';
-import { canResumeRuntimeAction, isCurrentRuntimeResourceAction, isRuntimeResourceBusy, isRuntimeResourceConflict, resolvePendingRuntimeAction, runtimeResourceMessage, runtimeResourcePercent, runtimeResourceProgressDetails, shouldPollRuntimeResources } from './runtimeResources';
+import {
+  isCurrentRuntimeResourceAction,
+  isRuntimeResourceBusy,
+  isVoiceRuntimeResourceReady,
+  resolvePendingRuntimeAction,
+  resolveRuntimeResourceClearLifecycle,
+  runtimeResourceComponentDescription,
+  runtimeResourceConsumerBusyReason,
+  runtimeResourceEnsureDecision,
+  runtimeResourceMessage,
+  runtimeResourcePercent,
+  runtimeResourcePollComponent,
+  runtimeResourceProgressDetails,
+  shouldPollRuntimeResources,
+} from './runtimeResources';
 import type { RuntimeResourceComponent, RuntimeResourceStatus } from './runtimeResources';
 import { addVoiceClonePreset, loadVoiceClonePresets, removeVoiceClonePreset, updateVoiceClonePreset } from './voiceClonePresets';
 import type { VoiceClonePreset } from './voiceClonePresets';
@@ -1855,6 +1869,10 @@ function DesktopApp() {
   const runtimeResourceActionTokenRef = useRef(0);
   const runtimeResourcePollGenerationRef = useRef(0);
   const runtimeResourceMountedRef = useRef(true);
+  const runtimeResourceClearInFlightRef = useRef(false);
+  const runtimeResourceBusyRef = useRef(false);
+  const resourceConsumersBusyReasonRef = useRef<string | null>(null);
+  const voiceRuntimeReadyRef = useRef(false);
   const sourceRestoreAttemptedRef = useRef(false);
   const voiceCloneAutoPrepareKeyRef = useRef<string | null>(null);
   const voiceCloneAutoPrepareControllerRef = useRef<AbortController | null>(null);
@@ -1883,6 +1901,20 @@ function DesktopApp() {
     }
     setRuntimeResourceStatus(nextStatus);
     setRuntimeResourcePollError(null);
+    runtimeResourceBusyRef.current = isRuntimeResourceBusy(nextStatus);
+    const clearLifecycle = resolveRuntimeResourceClearLifecycle(
+      runtimeResourceClearInFlightRef.current,
+      nextStatus,
+    );
+    runtimeResourceClearInFlightRef.current = clearLifecycle.inFlight;
+    if (clearLifecycle.clearCapabilities) {
+      setMediaEngineCapabilities(null);
+      setVoiceCloneWorkerCapabilities(null);
+      voiceRuntimeReadyRef.current = false;
+    }
+    if (clearLifecycle.conflict) {
+      setError('运行资源清理未启动，另一项资源操作刚刚完成，请重试。');
+    }
     const capabilityToken = runtimeResourceActionTokenRef.current;
     if (nextStatus.state === 'ready' && nextStatus.component === 'media') {
       void invoke<MediaEngineCapabilities>('get_media_engine_capabilities')
@@ -1897,6 +1929,7 @@ function DesktopApp() {
         .catch(() => undefined);
     }
     if (nextStatus.state === 'ready' && nextStatus.component === 'voice') {
+      voiceRuntimeReadyRef.current = true;
       void invoke<VoiceCloneWorkerCapabilities>('get_voice_clone_worker_capabilities')
         .then((capabilities) => {
           if (
@@ -1937,19 +1970,22 @@ function DesktopApp() {
       const currentStatus = await invoke<RuntimeResourceStatus>('get_runtime_resource_status', { component });
       if (runtimeResourceActionTokenRef.current !== token) return;
       await applyRuntimeResourceStatus(currentStatus, token);
-      if (canResumeRuntimeAction(currentStatus)) return;
-      if (isRuntimeResourceBusy(currentStatus)) {
-        if (isRuntimeResourceConflict(component, currentStatus)) {
-          pendingRuntimeActionRef.current = null;
-          throw new RuntimeResourceConflictError('另一项运行资源操作正在执行，请稍后再试');
-        }
-        return;
+      const currentDecision = runtimeResourceEnsureDecision(component, currentStatus);
+      if (currentDecision === 'resume' || currentDecision === 'wait') return;
+      if (currentDecision === 'conflict') {
+        pendingRuntimeActionRef.current = null;
+        throw new RuntimeResourceConflictError('另一项运行资源操作正在执行，请稍后再试');
       }
       const installingStatus = await invoke<RuntimeResourceStatus>('install_runtime_resources', { component });
       await applyRuntimeResourceStatus(installingStatus, token);
-      if (isRuntimeResourceConflict(component, installingStatus)) {
+      const installingDecision = runtimeResourceEnsureDecision(component, installingStatus);
+      if (installingDecision === 'conflict') {
         pendingRuntimeActionRef.current = null;
         throw new RuntimeResourceConflictError('另一项运行资源操作正在执行，请稍后再试');
+      }
+      if (installingDecision === 'install') {
+        pendingRuntimeActionRef.current = null;
+        throw new Error(installingStatus.error || '运行资源安装未启动，请重试');
       }
     } catch (cause) {
       if (runtimeResourceActionTokenRef.current !== token || !runtimeResourceMountedRef.current) return;
@@ -1988,7 +2024,10 @@ function DesktopApp() {
 
   useEffect(() => {
     if (!runtimeResourceStatus || !shouldPollRuntimeResources(runtimeResourceStatus)) return;
-    const component = runtimeResourceStatus.component;
+    const component = runtimeResourcePollComponent(
+      runtimeResourceStatus,
+      runtimeResourceClearInFlightRef.current,
+    );
     if (!component) return;
     const pollGeneration = runtimeResourcePollGenerationRef.current + 1;
     runtimeResourcePollGenerationRef.current = pollGeneration;
@@ -2053,6 +2092,10 @@ function DesktopApp() {
     snapshot?.current_video_reference ?? snapshot?.source_media?.source_path ?? probe?.source.source_path,
   );
   const runtimeResourceBusy = runtimeResourceStatus !== null && isRuntimeResourceBusy(runtimeResourceStatus);
+
+  useLayoutEffect(() => {
+    runtimeResourceBusyRef.current = runtimeResourceBusy;
+  }, [runtimeResourceBusy]);
 
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') {
@@ -2458,13 +2501,40 @@ function DesktopApp() {
     ['running', 'pending', 'active'].includes(snapshot?.worker_status ?? '') ||
     snapshot?.pending_audio_candidate === true ||
     snapshot?.current_audio_source === 'realtime_variant';
+  const resourceConsumersBusyReason = runtimeResourceConsumerBusyReason({
+    importVideoBusy,
+    mediaProcessingBusy:
+      mediaProcessingBusy ||
+      snapshot?.video_processing_status === 'processing' ||
+      snapshot?.audio_processing_status === 'processing',
+    researchRunning: researchStatus?.state === 'running',
+    researchActionBusy: researchActionBusy || researchCancelBusy,
+    voiceCloneActionBusy: voiceCloneActionBusy !== null,
+    voiceCloneModelLoading,
+    preGenerationGenerating: preGeneration.status === 'generating',
+    voiceClonePreparing: voiceCloneStatus === 'preparing',
+    voiceCloneGenerating: voiceCloneStatus === 'generating',
+    voiceClonePlaybackPreparing: voiceClonePlaybackStatus === 'preparing',
+    realtimeAudioBusy,
+  });
+  const resourceConsumersBusy = resourceConsumersBusyReason !== null;
+  const runtimeResourceClearDisabledReason = runtimeResourceBusy
+    ? '运行资源正在安装、导入、校验或清理，请等待完成后再清理。'
+    : resourceConsumersBusyReason;
+
+  useLayoutEffect(() => {
+    resourceConsumersBusyReasonRef.current = resourceConsumersBusyReason;
+  }, [resourceConsumersBusyReason]);
   const voiceClonePositionMs = resolvePlaybackPositionMs(
     mediaState?.current_time,
     snapshot?.current_position_ms,
   );
   const voiceClonePreGenerationBusyReason = getVoiceClonePreGenerationBusyReason(preGeneration.status);
-  const voiceRuntimeReady = runtimeResourceStatus?.component === 'voice'
-    && runtimeResourceStatus.state === 'ready';
+  const voiceRuntimeReady = isVoiceRuntimeResourceReady(
+    runtimeResourceStatus,
+    Boolean(voiceCloneWorkerCapabilities?.available),
+    voiceRuntimeReadyRef.current,
+  );
   const voiceClonePrepareDisabledReason =
     voiceClonePreGenerationBusyReason ??
     (voiceCloneModelLoading
@@ -2534,7 +2604,12 @@ function DesktopApp() {
     voiceCloneProgressSource?.progress_percent ?? getVoiceCloneProgress(voiceCloneProgressSource?.status ?? voiceCloneStatus);
   const voiceCloneProgressMessage = voiceCloneProgressSource?.progress_message?.trim() || null;
   const voiceCloneNotice =
-    !voiceCloneWorkerCapabilities?.available
+    !voiceRuntimeReady
+      ? {
+          type: 'info' as const,
+          message: '固定话术运行资源尚未就绪，首次使用会自动下载（包含 FFmpeg、Worker 和模型）。',
+        }
+      : !voiceCloneWorkerCapabilities?.available
       ? {
           type: 'warning' as const,
           message: `固定话术 Worker 不可用：${voiceCloneWorkerCapabilities?.reason ?? '未完成能力探测'}`,
@@ -3030,6 +3105,7 @@ function DesktopApp() {
       ) {
         return;
       }
+      if (importVideoInFlightRef.current) return;
       voiceCloneAutoPrepareKeyRef.current = sourceKey;
       await prepareVoiceCloneSource({ automatic: true });
     } catch (cause) {
@@ -3047,14 +3123,14 @@ function DesktopApp() {
   async function importVideo(selectedSourcePath?: string) {
     if (importVideoInFlightRef.current) return;
     importVideoInFlightRef.current = true;
+    voiceCloneAutoPrepareControllerRef.current?.abort();
+    voiceCloneAutoPrepareKeyRef.current = null;
     setImportVideoBusy(true);
     try {
       const selected =
         selectedSourcePath ??
         (await open({ multiple: false, filters: [{ name: 'MP4 视频', extensions: ['mp4'] }] }));
       if (typeof selected !== 'string') return;
-      voiceCloneAutoPrepareControllerRef.current?.abort();
-      voiceCloneAutoPrepareKeyRef.current = null;
       setVoiceCloneFormError(null);
       setError(null);
       await ensureRuntimeResources('media', async () => {
@@ -3127,6 +3203,13 @@ function DesktopApp() {
   }
 
   function confirmClearRuntimeResources() {
+    const blockedReason = runtimeResourceBusyRef.current
+      ? '运行资源正在安装、导入、校验或清理，请等待完成后再清理。'
+      : resourceConsumersBusyReasonRef.current;
+    if (blockedReason) {
+      setError(blockedReason);
+      return;
+    }
     Modal.confirm({
       title: '清理运行资源？',
       content: '将删除当前版本的 FFmpeg、固定话术运行环境和模型，后续使用时需要重新下载。',
@@ -3134,14 +3217,23 @@ function DesktopApp() {
       okButtonProps: { danger: true },
       cancelText: '取消',
       onOk: async () => {
+        const latestBlockedReason = runtimeResourceBusyRef.current
+          ? '运行资源正在安装、导入、校验或清理，请等待完成后再清理。'
+          : resourceConsumersBusyReasonRef.current;
+        if (latestBlockedReason) {
+          setError(latestBlockedReason);
+          return;
+        }
         runtimeResourceActionTokenRef.current += 1;
+        const token = runtimeResourceActionTokenRef.current;
         runtimeResourcePollGenerationRef.current += 1;
         pendingRuntimeActionRef.current = null;
+        runtimeResourceClearInFlightRef.current = true;
         try {
-          setRuntimeResourceStatus(await invoke<RuntimeResourceStatus>('clear_runtime_resources'));
-          setMediaEngineCapabilities(null);
-          setVoiceCloneWorkerCapabilities(null);
+          const status = await invoke<RuntimeResourceStatus>('clear_runtime_resources');
+          await applyRuntimeResourceStatus(status, token);
         } catch (cause) {
+          runtimeResourceClearInFlightRef.current = false;
           setError(getDisplayErrorMessage(cause, '清理运行资源失败'));
         }
       },
@@ -3248,9 +3340,7 @@ function DesktopApp() {
                         status={runtimeResourceStatus.state === 'failed' ? 'exception' : runtimeResourceStatus.state === 'ready' ? 'success' : 'active'}
                       />
                       <Typography.Text type="secondary">
-                        {runtimeResourceStatus.component === 'voice'
-                          ? 'voice 包含媒体、固定话术运行环境和模型。'
-                          : 'media 包含 FFmpeg 和 FFprobe。'}
+                        {runtimeResourceComponentDescription(runtimeResourceStatus.component)}
                       </Typography.Text>
                       <Typography.Text type="secondary">
                         {runtimeResourceProgressDetails(runtimeResourceStatus)}
@@ -3271,7 +3361,12 @@ function DesktopApp() {
                       <Button disabled={runtimeResourceBusy} onClick={() => void chooseRuntimeResourceDirectory()}>
                         选择本地资源目录
                       </Button>
-                      <Button danger disabled={runtimeResourceBusy} onClick={confirmClearRuntimeResources}>
+                      <Button
+                        danger
+                        disabled={runtimeResourceBusy || resourceConsumersBusy}
+                        title={runtimeResourceClearDisabledReason ?? undefined}
+                        onClick={confirmClearRuntimeResources}
+                      >
                         清理运行资源
                       </Button>
                     </Space>

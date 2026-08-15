@@ -24,6 +24,22 @@ export type RuntimeResourceStatus = {
 type RuntimeResourceStateInput = Pick<RuntimeResourceStatus, 'state'>;
 type PendingRuntimeActionDescriptor = Pick<RuntimeResourceStatus, 'component'> & { token: number };
 
+export type RuntimeResourceEnsureDecision = 'resume' | 'wait' | 'install' | 'conflict';
+
+export type RuntimeResourceConsumers = {
+  importVideoBusy: boolean;
+  mediaProcessingBusy: boolean;
+  researchRunning: boolean;
+  researchActionBusy: boolean;
+  voiceCloneActionBusy: boolean;
+  voiceCloneModelLoading: boolean;
+  preGenerationGenerating: boolean;
+  voiceClonePreparing: boolean;
+  voiceCloneGenerating: boolean;
+  voiceClonePlaybackPreparing: boolean;
+  realtimeAudioBusy: boolean;
+};
+
 export function canResumeRuntimeAction(status: RuntimeResourceStateInput): boolean {
   return status.state === 'ready';
 }
@@ -54,6 +70,40 @@ export function isRuntimeResourceBusy(status: RuntimeResourceStateInput): boolea
 
 export const shouldPollRuntimeResources = isRuntimeResourceBusy;
 
+export function runtimeResourceEnsureDecision(
+  requestedComponent: RuntimeResourceComponent,
+  status: Pick<RuntimeResourceStatus, 'state' | 'component'>,
+): RuntimeResourceEnsureDecision {
+  if (canResumeRuntimeAction(status)) {
+    return status.component === requestedComponent ? 'resume' : 'conflict';
+  }
+  if (!isRuntimeResourceBusy(status)) return 'install';
+  return status.component === null || isRuntimeResourceConflict(requestedComponent, status) ? 'conflict' : 'wait';
+}
+
+export function runtimeResourcePollComponent(
+  status: Pick<RuntimeResourceStatus, 'state' | 'component'>,
+  clearInFlight: boolean,
+): RuntimeResourceComponent | null {
+  if (!shouldPollRuntimeResources(status)) return null;
+  return clearInFlight || status.component === null ? 'media' : status.component;
+}
+
+export function resolveRuntimeResourceClearLifecycle(
+  clearInFlight: boolean,
+  status: RuntimeResourceStateInput,
+): { inFlight: boolean; clearCapabilities: boolean; conflict: boolean } {
+  if (!clearInFlight) return { inFlight: false, clearCapabilities: false, conflict: false };
+  if (isRuntimeResourceBusy(status)) {
+    return { inFlight: true, clearCapabilities: false, conflict: false };
+  }
+  return {
+    inFlight: false,
+    clearCapabilities: status.state === 'not-installed',
+    conflict: status.state === 'ready',
+  };
+}
+
 export function isRuntimeResourceConflict(
   requestedComponent: RuntimeResourceComponent,
   status: Pick<RuntimeResourceStatus, 'state' | 'component'>,
@@ -61,6 +111,34 @@ export function isRuntimeResourceConflict(
   return isRuntimeResourceBusy(status)
     && status.component !== null
     && status.component !== requestedComponent;
+}
+
+export function runtimeResourceConsumerBusyReason(consumers: RuntimeResourceConsumers): string | null {
+  return Object.values(consumers).some(Boolean)
+    ? '本地媒体或语音任务正在使用运行资源，请先完成或取消后再清理。'
+    : null;
+}
+
+export function runtimeResourceComponentLabel(component: RuntimeResourceComponent | null): string {
+  if (component === 'voice') return '语音资源';
+  if (component === 'media') return '媒体资源';
+  return '全部运行资源';
+}
+
+export function runtimeResourceComponentDescription(component: RuntimeResourceComponent | null): string {
+  if (component === 'voice') return 'voice 包含媒体、固定话术运行环境和模型。';
+  if (component === 'media') return 'media 包含 FFmpeg 和 FFprobe。';
+  return '全部运行资源包含 FFmpeg、固定话术 Worker 和语音模型。';
+}
+
+export function isVoiceRuntimeResourceReady(
+  status: Pick<RuntimeResourceStatus, 'state' | 'component'> | null,
+  workerAvailable: boolean,
+  previouslyReady: boolean,
+): boolean {
+  return previouslyReady
+    || workerAvailable
+    || (status?.state === 'ready' && status.component === 'voice');
 }
 
 export function runtimeResourcePercent(
@@ -92,7 +170,7 @@ export function runtimeResourceProgressDetails(
 export function runtimeResourceMessage(
   status: Pick<RuntimeResourceStatus, 'state' | 'component' | 'current_file' | 'resource_root' | 'installed_bytes' | 'error'>,
 ): string {
-  const component = status.component === 'voice' ? '语音资源' : '媒体资源';
+  const component = runtimeResourceComponentLabel(status.component);
   switch (status.state) {
     case 'not-installed':
       return `${component}尚未安装，首次使用时会自动下载。`;

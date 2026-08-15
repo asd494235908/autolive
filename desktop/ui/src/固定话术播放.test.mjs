@@ -92,6 +92,10 @@ test('导入后仅在最终效果窗口打开成功后延迟四秒自动准备�
   assert.match(appSource, /const VOICE_CLONE_AUTO_PREPARE_DELAY_MS = 4_000;/);
   assert.match(appSource, /import \{ scheduleAfterInitialPaint, waitForAbortableDelay \} from '\.\/启动调度';/);
   assert.match(prepareFunction, /await waitForAbortableDelay\(VOICE_CLONE_AUTO_PREPARE_DELAY_MS, controller\.signal\)/);
+  assert.match(
+    prepareFunction,
+    /await waitForAbortableDelay\(VOICE_CLONE_AUTO_PREPARE_DELAY_MS, controller\.signal\)[\s\S]*if \(importVideoInFlightRef\.current\) return;[\s\S]*prepareVoiceCloneSource\(\{ automatic: true \}\)/,
+  );
   assert.doesNotMatch(prepareFunction, /mp4_sha256|mp4_hash_status|SHA-256/);
   assert.doesNotMatch(prepareFunction, /setVoiceCloneAutoPreparePhase\('hash'\)/);
   assert.doesNotMatch(prepareFunction, /get_voice_clone_worker_capabilities/);
@@ -127,9 +131,20 @@ test('自动与手动准备人声都先确保 voice 资源', async () => {
 
   assert.match(prepareFunction, /ensureRuntimeResources\('voice'/);
   assert.match(autoPrepareFunction, /prepareVoiceCloneSource\(\{ automatic: true \}\)/);
-  assert.match(appSource, /voice 包含媒体、固定话术运行环境和模型/);
+  assert.match(appSource, /runtimeResourceComponentDescription\(runtimeResourceStatus\.component\)/);
   assert.match(prepareFunction, /try \{[\s\S]*ensureRuntimeResources\('voice'[\s\S]*catch \(cause\)/);
-  assert.match(appSource, /runtimeResourceStatus\?\.component === 'voice'[\s\S]*runtimeResourceStatus\.state === 'ready'/);
+  assert.match(appSource, /isVoiceRuntimeResourceReady\(/);
+});
+
+test('voice 资源未就绪时优先提示首次使用自动下载', async () => {
+  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
+  const notice = appSource.slice(
+    appSource.indexOf('const voiceCloneNotice ='),
+    appSource.indexOf('const voiceCloneStatusLabel', appSource.indexOf('const voiceCloneNotice =')),
+  );
+
+  assert.match(notice, /!voiceRuntimeReady[\s\S]*首次使用会自动下载/);
+  assert.ok(notice.indexOf('!voiceRuntimeReady') < notice.indexOf('!voiceCloneWorkerCapabilities?.available'));
 });
 
 test('固定话术预生成只批量准备文案，不影响实际播放或原音轨', async () => {

@@ -107,6 +107,21 @@ test('后台重启后自动恢复上次导入的视频并继续准备人声', as
   assert.match(importVideo, /probe_local_mp4[\s\S]*start_playback[\s\S]*openFinalEffectWindowFromHome[\s\S]*prepareVoiceCloneAfterImport/);
 });
 
+test('打开文件选择器或恢复旧路径前先取消旧视频的自动人声准备', async () => {
+  const source = await readSource('App.tsx');
+  const importVideo = source.slice(
+    source.indexOf('async function importVideo'),
+    source.indexOf('function updateInterludeDraft'),
+  );
+  const abortIndex = importVideo.indexOf('voiceCloneAutoPrepareControllerRef.current?.abort()');
+  const selectedIndex = importVideo.indexOf('const selected =');
+  const chooserIndex = importVideo.indexOf('await open(');
+
+  assert.ok(abortIndex > -1);
+  assert.ok(abortIndex < selectedIndex);
+  assert.ok(abortIndex < chooserIndex);
+});
+
 test('导入视频先确保 media，资源就绪后再探测并播放一次', async () => {
   const source = await readSource('App.tsx');
   const importVideo = source.slice(
@@ -134,9 +149,15 @@ test('资源面板提供重试、取消、本地导入和显式清理', async ()
   assert.match(source, /清理运行资源/);
   assert.match(source, /runtimeResourceProgressDetails\(runtimeResourceStatus\)/);
   assert.match(source, /resolvePendingRuntimeAction/);
-  assert.match(source, /isRuntimeResourceConflict/);
+  assert.match(source, /runtimeResourceEnsureDecision/);
   assert.match(source, /window\.clearTimeout\(timer\)/);
   assert.match(source, /runtimeResourcePollError/);
+  assert.match(source, /runtimeResourcePollComponent\(\s*runtimeResourceStatus,\s*runtimeResourceClearInFlightRef\.current/);
+  assert.match(source, /resolveRuntimeResourceClearLifecycle/);
+  assert.match(source, /clearLifecycle\.conflict/);
+  assert.match(source, /resourceConsumersBusy/);
+  assert.match(source, /resourceConsumersBusyReasonRef\.current/);
+  assert.match(source, /title=\{runtimeResourceClearDisabledReason/);
   const pollingEffectStart = source.indexOf('if (!runtimeResourceStatus || !shouldPollRuntimeResources(runtimeResourceStatus)) return;');
   const pollingEffect = source.slice(pollingEffectStart, source.indexOf('useLayoutEffect', pollingEffectStart));
   assert.doesNotMatch(pollingEffect, /state: 'failed'/);
@@ -154,4 +175,20 @@ test('资源面板提供重试、取消、本地导入和显式清理', async ()
     source.indexOf('function confirmClearRuntimeResources'),
   );
   assert.match(chooseDirectory, /try \{[\s\S]*await open\(\{ directory: true, multiple: false \}\)[\s\S]*catch \(cause\)/);
+
+  const clearResources = source.slice(
+    source.indexOf('function confirmClearRuntimeResources'),
+    source.indexOf('function updateInterludeDraft'),
+  );
+  assert.match(clearResources, /resourceConsumersBusyReasonRef\.current/);
+  assert.match(clearResources, /runtimeResourceBusyRef\.current/);
+  assert.match(clearResources, /applyRuntimeResourceStatus/);
+  assert.doesNotMatch(clearResources, /setMediaEngineCapabilities\(null\)[\s\S]*setVoiceCloneWorkerCapabilities\(null\)/);
+
+  const consumerBusyState = source.slice(
+    source.indexOf('const resourceConsumersBusyReason ='),
+    source.indexOf('const voiceClonePositionMs'),
+  );
+  assert.match(consumerBusyState, /snapshot\?\.video_processing_status === 'processing'/);
+  assert.match(consumerBusyState, /snapshot\?\.audio_processing_status === 'processing'/);
 });
