@@ -44,3 +44,48 @@ fn debug_and_test_profiles_only_add_an_empty_override_when_needed() {
         Ok(RuntimeResourceConfigAction::Keep),
     );
 }
+
+#[test]
+fn release_config_allows_unrelated_override_but_rejects_resource_changes() {
+    let base_config = include_str!("../tauri.conf.json");
+
+    assert_eq!(
+        build_support::runtime_resource_config_action(Some("release"), true, true),
+        Ok(build_support::RuntimeResourceConfigAction::Keep),
+    );
+    assert!(build_support::validate_release_runtime_resource_config(
+        base_config,
+        Some(r#"{"productName":"test build"}"#),
+    )
+    .is_ok());
+    assert!(build_support::validate_release_runtime_resource_config(
+        base_config,
+        Some(r#"{"bundle":{"resources":["runtime-resources.json"]}}"#),
+    )
+    .is_ok());
+    assert!(build_support::validate_release_runtime_resource_config(
+        base_config,
+        Some(r#"{"bundle":{"resources":[]}}"#),
+    )
+    .is_err());
+    assert!(build_support::validate_release_runtime_resource_config(
+        base_config,
+        Some(r#"{"bundle":{"resources":null}}"#),
+    )
+    .is_err());
+    assert!(build_support::validate_release_runtime_resource_config(
+        base_config,
+        Some(r#"{"bundle":null}"#),
+    )
+    .is_err());
+    assert!(build_support::validate_release_runtime_resource_config(
+        base_config,
+        Some(r#"{"bundle":{"resources":["runtime-resources.json","extra.json"]}}"#),
+    )
+    .is_err());
+    assert!(build_support::validate_release_runtime_resource_config(
+        r#"{"bundle":{"resources":[]}}"#,
+        None,
+    )
+    .is_err());
+}

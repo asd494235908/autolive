@@ -1,4 +1,4 @@
-import { closeSync, cpSync, mkdirSync, openSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, cpSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -10,8 +10,19 @@ const supportedTargets = new Set([
   'x86_64-pc-windows-msvc',
 ]);
 
-export const RESOURCE_RELEASE = 'v0.1.0';
-export const RESOURCE_BASE_URL = 'http://101.96.208.132:7088/autolive-resources/v0.1.0/';
+const tauriConfigPath = join(desktopRoot, 'src-tauri', 'tauri.conf.json');
+const tauriConfig = JSON.parse(readFileSync(tauriConfigPath, 'utf8'));
+const semverPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
+
+export function resourceReleaseFromVersion(version) {
+  if (typeof version !== 'string' || !semverPattern.test(version)) {
+    throw new Error(`Tauri 版本号无效：${version}`);
+  }
+  return `v${version}`;
+}
+
+export const RESOURCE_RELEASE = resourceReleaseFromVersion(tauriConfig.version);
+export const RESOURCE_BASE_URL = `http://101.96.208.132:7088/autolive-resources/${RESOURCE_RELEASE}/`;
 
 const HASH_CHUNK_BYTES = 64 * 1024;
 const DEPLOY_INVENTORY = 'autolive-deploy-inventory.json';

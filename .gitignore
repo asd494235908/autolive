@@ -36,6 +36,8 @@ desktop/src-tauri/voice-models/*
 !desktop/src-tauri/voice-models/.gitkeep
 desktop/src-tauri/voice-worker/*
 !desktop/src-tauri/voice-worker/.gitkeep
+desktop/src-tauri/runtime-resources.json
+desktop/resource-release/
 desktop/voice-models/*
 !desktop/voice-models/README.md
 

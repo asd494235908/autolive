@@ -3,11 +3,19 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { buildRuntimeCommonRelease, buildRuntimeResourceRelease } from './生成运行资源发布树.mjs';
+import {
+  buildRuntimeCommonRelease,
+  buildRuntimeResourceRelease,
+  RESOURCE_RELEASE,
+  resourceReleaseFromVersion,
+} from './生成运行资源发布树.mjs';
 
 const DEPLOY_INVENTORY = 'autolive-deploy-inventory.json';
+const tauriConfigPath = fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url));
+const expectedRelease = `v${JSON.parse(readFileSync(tauriConfigPath, 'utf8')).version}`;
 
 function writeFixture(root, relativePath, content) {
   const path = join(root, ...relativePath.split('/'));
@@ -18,6 +26,14 @@ function writeFixture(root, relativePath, content) {
 function hasHiddenPath(relativePath) {
   return relativePath.split('/').some((part) => part.startsWith('.'));
 }
+
+test('发布版本只接受严格 SemVer', () => {
+  assert.equal(resourceReleaseFromVersion('0.1.0'), 'v0.1.0');
+  assert.equal(resourceReleaseFromVersion('1.2.3-alpha.1+build.5'), 'v1.2.3-alpha.1+build.5');
+  for (const invalid of ['01.2.3', '1.02.3', '1.2.03', '1.2.3-01', '1.2.3-', 'v1.2.3']) {
+    assert.throws(() => resourceReleaseFromVersion(invalid), /Tauri 版本号无效/);
+  }
+});
 
 test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-runtime-resources-'));
@@ -48,8 +64,9 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
   });
 
   assert.equal(result.manifest.schema_version, 1);
-  assert.equal(result.manifest.release, 'v0.1.0');
-  assert.equal(result.manifest.base_url, 'http://101.96.208.132:7088/autolive-resources/v0.1.0/');
+  assert.equal(RESOURCE_RELEASE, expectedRelease);
+  assert.equal(result.manifest.release, expectedRelease);
+  assert.equal(result.manifest.base_url, `http://101.96.208.132:7088/autolive-resources/${expectedRelease}/`);
   assert.ok(result.manifest.files.every((file) => /^[a-f0-9]{64}$/.test(file.sha256)));
   assert.ok(result.manifest.files.every((file) => !('size' in file)));
   assert.ok(
@@ -58,7 +75,7 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
     ),
   );
   assert.equal(
-    existsSync(join(outputRoot, 'autolive-resources/v0.1.0/common/voice-models/huggingface/hub/.locks')),
+    existsSync(join(outputRoot, 'autolive-resources', expectedRelease, 'common/voice-models/huggingface/hub/.locks')),
     false,
   );
   assert.equal(existsSync(join(sourceRoot, 'voice-models/huggingface/hub/.locks')), true);
@@ -67,19 +84,19 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
   assert.equal(existsSync(join(sourceRoot, 'voice-models/.agent_harnesses.json')), true);
   assert.equal(existsSync(join(sourceRoot, 'voice-models/.hidden/model.bin')), true);
   assert.equal(
-    existsSync(join(outputRoot, 'autolive-resources/v0.1.0/aarch64-apple-darwin/binaries/.gitignore')),
+    existsSync(join(outputRoot, 'autolive-resources', expectedRelease, 'aarch64-apple-darwin/binaries/.gitignore')),
     false,
   );
   assert.equal(
-    existsSync(join(outputRoot, 'autolive-resources/v0.1.0/aarch64-apple-darwin/binaries/.hidden')),
+    existsSync(join(outputRoot, 'autolive-resources', expectedRelease, 'aarch64-apple-darwin/binaries/.hidden')),
     false,
   );
   assert.equal(
-    existsSync(join(outputRoot, 'autolive-resources/v0.1.0/common/voice-models/.agent_harnesses.json')),
+    existsSync(join(outputRoot, 'autolive-resources', expectedRelease, 'common/voice-models/.agent_harnesses.json')),
     false,
   );
   assert.equal(
-    existsSync(join(outputRoot, 'autolive-resources/v0.1.0/common/voice-models/.hidden')),
+    existsSync(join(outputRoot, 'autolive-resources', expectedRelease, 'common/voice-models/.hidden')),
     false,
   );
   assert.equal(result.manifest.files.some((file) => hasHiddenPath(file.relative_path)), false);
@@ -115,13 +132,13 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
 
   const targetInventory = JSON.parse(
     readFileSync(
-      join(outputRoot, 'autolive-resources/v0.1.0/aarch64-apple-darwin', DEPLOY_INVENTORY),
+      join(outputRoot, 'autolive-resources', expectedRelease, 'aarch64-apple-darwin', DEPLOY_INVENTORY),
       'utf8',
     ),
   );
   assert.deepEqual(Object.keys(targetInventory).sort(), ['files', 'release', 'schema', 'scope']);
   assert.equal(targetInventory.schema, 1);
-  assert.equal(targetInventory.release, 'v0.1.0');
+  assert.equal(targetInventory.release, expectedRelease);
   assert.equal(targetInventory.scope, 'aarch64-apple-darwin');
   assert.equal(targetInventory.files.some((file) => hasHiddenPath(file.relative_path)), false);
   assert.deepEqual(targetInventory.files, [
@@ -146,7 +163,7 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
   ]);
 
   const commonInventory = JSON.parse(
-    readFileSync(join(outputRoot, 'autolive-resources/v0.1.0/common', DEPLOY_INVENTORY), 'utf8'),
+    readFileSync(join(outputRoot, 'autolive-resources', expectedRelease, 'common', DEPLOY_INVENTORY), 'utf8'),
   );
   assert.equal(commonInventory.files.some((file) => hasHiddenPath(file.relative_path)), false);
 });
@@ -174,7 +191,7 @@ test('公共模型任务可单独生成部署 inventory 且不含缓存重复项
   assert.equal(inventory.files.some((file) => hasHiddenPath(file.relative_path)), false);
   assert.deepEqual(inventory, {
     schema: 1,
-    release: 'v0.1.0',
+    release: expectedRelease,
     scope: 'common',
     files: [
       {

@@ -79,7 +79,9 @@ test('归档脚本按版本和目标平台目录保存 bundle', () => {
   const configPath = fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url));
   const version = JSON.parse(readFileSync(configPath, 'utf8')).version;
   mkdirSync(join(source, 'dmg'), { recursive: true });
-  writeFileSync(join(source, 'dmg', 'bundle.txt'), 'bundle-test');
+  mkdirSync(join(source, 'macos', 'autolive.app'), { recursive: true });
+  writeFileSync(join(source, 'dmg', 'autolive.dmg'), 'bundle-test');
+  writeFileSync(join(source, 'macos', 'autolive.app', 'Contents.txt'), 'not-an-installer');
 
   const result = spawnSync(process.execPath, [archiveScript], {
     env: {
@@ -93,9 +95,10 @@ test('归档脚本按版本和目标平台目录保存 bundle', () => {
 
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
   assert.equal(
-    readFileSync(join(output, `v${version}`, 'aarch64-apple-darwin', 'dmg', 'bundle.txt'), 'utf8'),
+    readFileSync(join(output, `v${version}`, 'aarch64-apple-darwin', 'dmg', 'autolive.dmg'), 'utf8'),
     'bundle-test',
   );
+  assert.throws(() => statSync(join(output, `v${version}`, 'aarch64-apple-darwin', 'macos')));
 });
 
 test('Windows 正式包归档原生 Tauri bundle', () => {
@@ -105,7 +108,9 @@ test('Windows 正式包归档原生 Tauri bundle', () => {
   const configPath = fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url));
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
   mkdirSync(join(source, 'msi'), { recursive: true });
+  mkdirSync(join(source, 'macos', 'autolive.app'), { recursive: true });
   writeFileSync(join(source, 'msi', 'autolive.msi'), 'app-test');
+  writeFileSync(join(source, 'macos', 'autolive.app', 'Contents.txt'), 'not-an-installer');
 
   const result = spawnSync(process.execPath, [archiveScript], {
     env: {
@@ -120,6 +125,7 @@ test('Windows 正式包归档原生 Tauri bundle', () => {
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
   const bundle = join(output, `v${config.version}`, 'x86_64-pc-windows-msvc');
   assert.equal(readFileSync(join(bundle, 'msi', 'autolive.msi'), 'utf8'), 'app-test');
+  assert.throws(() => statSync(join(bundle, 'macos')));
 });
 
 test('GitHub workflow uploads the versioned package directory', () => {

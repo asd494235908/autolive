@@ -16,6 +16,7 @@ const workflowPath = fileURLToPath(
 const implementationPlanPath = fileURLToPath(
   new URL('../../docs/superpowers/plans/2026-08-15-桌面运行资源按需下载实施计划.md', import.meta.url),
 );
+const gitignorePath = fileURLToPath(new URL('../../.gitignore', import.meta.url));
 
 function assertInOrder(source, fragments) {
   assert.equal(typeof source, 'string', '缺少构建脚本');
@@ -46,7 +47,9 @@ test('归档器只复制原生 bundle，不复制大运行资源', () => {
   const bundleSourceDir = join(root, 'bundle');
   const packageRoot = join(root, 'package');
   mkdirSync(join(bundleSourceDir, 'msi'), { recursive: true });
+  mkdirSync(join(bundleSourceDir, 'macos', 'autolive.app'), { recursive: true });
   writeFileSync(join(bundleSourceDir, 'msi', 'autolive.msi'), 'native-installer');
+  writeFileSync(join(bundleSourceDir, 'macos', 'autolive.app', 'Contents.txt'), 'not-an-installer');
 
   const destination = archiveDesktopArtifacts({
     targetTriple: 'x86_64-pc-windows-msvc',
@@ -58,6 +61,53 @@ test('归档器只复制原生 bundle，不复制大运行资源', () => {
   for (const name of ['portable', 'binaries', 'voice-worker', 'voice-models']) {
     assert.equal(existsSync(join(destination, name)), false);
   }
+  assert.equal(existsSync(join(destination, 'macos')), false);
+});
+
+test('归档器缺少目标平台安装文件时失败', () => {
+  const root = mkdtempSync(join(tmpdir(), 'autolive-lightweight-package-'));
+  const bundleSourceDir = join(root, 'bundle');
+  mkdirSync(join(bundleSourceDir, 'macos', 'autolive.app'), { recursive: true });
+  writeFileSync(join(bundleSourceDir, 'macos', 'autolive.app', 'Contents.txt'), 'not-an-installer');
+
+  assert.throws(
+    () => archiveDesktopArtifacts({
+      targetTriple: 'aarch64-apple-darwin',
+      bundleSourceDir,
+      packageRoot: join(root, 'package'),
+    }),
+    /找不到.*安装文件/,
+  );
+});
+
+test('运行资源生成与 CI artifact 均从 Tauri 配置版本派生', async () => {
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  const workflow = readFileSync(workflowPath, 'utf8');
+  const { RESOURCE_RELEASE } = await import('./生成运行资源发布树.mjs');
+
+  assert.equal(RESOURCE_RELEASE, `v${config.version}`);
+  assert.match(
+    workflow,
+    /desktop\/resource-release\/autolive-resources\/\$\{\{ steps\.desktop-version\.outputs\.version \}\}\/common\/\*\*/,
+  );
+  assert.match(
+    workflow,
+    /desktop\/resource-release\/autolive-resources\/\$\{\{ steps\.desktop-version\.outputs\.version \}\}\/\$\{\{ matrix\.target_triple \}\}\/\*\*/,
+  );
+  assert.doesNotMatch(workflow, /resource-release\/autolive-resources\/v0\.1\.0\//);
+});
+
+test('本地发布产物与内置清单不进入版本控制', () => {
+  const gitignore = readFileSync(gitignorePath, 'utf8');
+
+  assert.match(gitignore, /^desktop\/src-tauri\/runtime-resources\.json$/m);
+  assert.match(gitignore, /^desktop\/resource-release\/$/m);
+  assert.match(gitignore, /^desktop\/src-tauri\/binaries\/\*$/m);
+  assert.match(gitignore, /^!desktop\/src-tauri\/binaries\/\.gitignore$/m);
+  assert.match(gitignore, /^desktop\/src-tauri\/voice-models\/\*$/m);
+  assert.match(gitignore, /^!desktop\/src-tauri\/voice-models\/\.gitkeep$/m);
+  assert.match(gitignore, /^desktop\/src-tauri\/voice-worker\/\*$/m);
+  assert.match(gitignore, /^!desktop\/src-tauri\/voice-worker\/\.gitkeep$/m);
 });
 
 test('本地完整构建与 CI prepared-resources 入口顺序明确', () => {
@@ -87,7 +137,7 @@ test('CI 公共模型、目标运行资源和桌面包分层且避免 OpenMP 绕
   assert.match(workflow, /name: runtime-common-\$\{\{ steps\.desktop-version\.outputs\.version \}\}/);
   assert.match(
     workflow,
-    /path: desktop\/resource-release\/autolive-resources\/v0\.1\.0\/common\/\*\*/,
+    /path: desktop\/resource-release\/autolive-resources\/\$\{\{ steps\.desktop-version\.outputs\.version \}\}\/common\/\*\*/,
   );
   assert.match(workflow, /needs: common-models/);
   assert.match(workflow, /tauri:build:prepared-resources/);
@@ -98,7 +148,7 @@ test('CI 公共模型、目标运行资源和桌面包分层且避免 OpenMP 绕
   );
   assert.match(
     workflow,
-    /path: desktop\/resource-release\/autolive-resources\/v0\.1\.0\/\$\{\{ matrix\.target_triple \}\}\/\*\*/,
+    /path: desktop\/resource-release\/autolive-resources\/\$\{\{ steps\.desktop-version\.outputs\.version \}\}\/\$\{\{ matrix\.target_triple \}\}\/\*\*/,
   );
   assert.match(
     workflow,
@@ -156,8 +206,16 @@ test('Task 6 用 forced-command dispatcher 同时约束 rrsync 写入和精确�
   );
   assert.match(
     task6,
-    /exec \/usr\/bin\/rrsync -wo -no-overwrite -munge \/fs\/autolive-resources-staging/,
+    /exec \/usr\/local\/lib\/autolive-resources\/rrsync -wo -no-overwrite -munge \/fs\/autolive-resources-staging/,
   );
+  assert.match(task6, /rsync-3\.4\.4\.tar\.gz/);
+  assert.match(task6, /bd88cf82fa653da32314fb229136407c5c90f80d1758d8f4b091767877d8fa96/);
+  assert.match(task6, /7bc4950a886bc2f4986b8a85fe492b8b3612a0f7edab031ab79c66fca0390970/);
+  assert.match(
+    task6,
+    /\/usr\/local\/lib\/autolive-resources\/rrsync -help \/fs\/autolive-resources-staging/,
+  );
+  assert.match(task6, /-help[\s\S]*-wo[\s\S]*-no-overwrite[\s\S]*-munge/);
   assert.match(task6, /rsync --server[^\n]*<upload-id>\/<release>\/<scope>\//);
   assert.match(task6, /只允许精确的 `publish-runtime-resources <release> <scope> <upload-id>`/);
   assert.match(task6, /upload-id[^\n]*`\^\[1-9\]\[0-9\]\*-\[1-9\]\[0-9\]\*\$`/);
@@ -183,4 +241,7 @@ test('Task 6 用 forced-command dispatcher 同时约束 rrsync 写入和精确�
     /重复发布返回成功后，CI 的 scope 循环继续处理后续 scope/,
   );
   assert.match(task6, /禁止普通登录 shell/);
+  assert.match(task6, /release 只接受精确 `v0\.1\.0`/);
+  assert.match(task6, /scope 只接受 `common` 和三个目标三元组/);
+  assert.match(task6, /release、scope 和 upload-id 均显式拒绝 `\/`、`\\` 与额外字符/);
 });

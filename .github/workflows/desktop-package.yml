@@ -53,13 +53,13 @@ jobs:
         run: node desktop/工具/生成运行资源发布树.mjs --common-only
       - name: Verify common model artifact statically
         env:
-          AUTOLIVE_VOICE_MODEL_OUTPUT_DIR: desktop/resource-release/autolive-resources/v0.1.0/common/voice-models
+          AUTOLIVE_VOICE_MODEL_OUTPUT_DIR: desktop/resource-release/autolive-resources/${{ steps.desktop-version.outputs.version }}/common/voice-models
         run: node desktop/工具/准备语音模型资源.mjs --assert-prepared
       - name: Upload common runtime resources
         uses: actions/upload-artifact@v4
         with:
           name: runtime-common-${{ steps.desktop-version.outputs.version }}
-          path: desktop/resource-release/autolive-resources/v0.1.0/common/**
+          path: desktop/resource-release/autolive-resources/${{ steps.desktop-version.outputs.version }}/common/**
           if-no-files-found: error
           retention-days: 7
 
@@ -217,7 +217,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: runtime-resources-${{ steps.desktop-version.outputs.version }}-${{ matrix.target_triple }}
-          path: desktop/resource-release/autolive-resources/v0.1.0/${{ matrix.target_triple }}/**
+          path: desktop/resource-release/autolive-resources/${{ steps.desktop-version.outputs.version }}/${{ matrix.target_triple }}/**
           if-no-files-found: error
           retention-days: 7
       - name: Upload desktop bundle

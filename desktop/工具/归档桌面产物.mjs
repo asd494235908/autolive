@@ -1,5 +1,5 @@
-import { cpSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -21,17 +21,43 @@ export function archiveDesktopArtifacts({
   }
 
   const destination = join(packageRoot, `v${config.version}`, targetTriple);
-  archiveNativeBundle({ destination, bundleSourceDir });
+  archiveNativeBundle({ destination, bundleSourceDir, targetTriple });
   return destination;
 }
 
-function archiveNativeBundle({ destination, bundleSourceDir }) {
+function archiveNativeBundle({ destination, bundleSourceDir, targetTriple }) {
   if (!isDirectory(bundleSourceDir)) {
     throw new Error(`找不到 Tauri bundle 目录：${bundleSourceDir}`);
   }
+  const installers = findInstallerFiles(bundleSourceDir, targetTriple);
+  if (installers.length === 0) {
+    throw new Error(`找不到 ${targetTriple} 的用户安装文件`);
+  }
   rmSync(destination, { force: true, recursive: true });
   mkdirSync(destination, { recursive: true });
-  cpSync(bundleSourceDir, destination, { recursive: true });
+  for (const { directory, source } of installers) {
+    const targetDirectory = join(destination, directory);
+    mkdirSync(targetDirectory, { recursive: true });
+    cpSync(source, join(targetDirectory, basename(source)));
+  }
+}
+
+function findInstallerFiles(bundleSourceDir, targetTriple) {
+  const rules = targetTriple.endsWith('-apple-darwin')
+    ? [{ directory: 'dmg', extension: '.dmg' }]
+    : targetTriple === 'x86_64-pc-windows-msvc'
+      ? [
+          { directory: 'msi', extension: '.msi' },
+          { directory: 'nsis', extension: '.exe' },
+        ]
+      : [];
+  return rules.flatMap(({ directory, extension }) => {
+    const directoryPath = join(bundleSourceDir, directory);
+    if (!isDirectory(directoryPath)) return [];
+    return readdirSync(directoryPath, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(extension))
+      .map((entry) => ({ directory, source: join(directoryPath, entry.name) }));
+  });
 }
 
 function isDirectory(path) {
