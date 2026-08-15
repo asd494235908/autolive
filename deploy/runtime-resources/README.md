@@ -8,7 +8,7 @@
 - 正式目录为 `/fs/autolive-resources/autolive-resources/v0.1.0/<scope>/`。
 - 上传 staging 为 `/fs/autolive-resources-staging/<upload-id>/v0.1.0/<scope>/`，发布成功后才会原子移动到正式目录。
 - `/fs/autolive-resources-staging` 与 `/fs/autolive-resources` 必须位于同一文件系统；publisher 启动时用设备号检查，不一致会 fail-closed。
-- Caddy 使用无登录的 `autolive-resources:autolive-resources` 用户/组，只读正式目录，日志写入 `/var/log/autolive-resources`。
+- Caddy 使用无登录的 `autolive-resources:autolive-resources` 用户/组，只读正式目录，日志写入 `/var/log/autolive-resources`；systemd unit 使用 `LogsDirectory=autolive-resources` 创建并管理该目录的权限。
 - 发布密钥使用无登录的 `autolive-deploy` 身份，只允许 forced command dispatcher；该身份只写 staging 和已授权的发布路径，不允许普通 shell。`autolive-deploy` 必须加入 `autolive-resources` 组。
 - `authorized_keys` 应使用 `command="/usr/local/sbin/autolive-resource-deploy-dispatcher",restrict`，并单独保存部署私钥和服务器 host key。私钥、密码、Token 不得写入仓库、日志或聊天记录。
 
@@ -37,11 +37,10 @@
    ```sh
    install -d -o autolive-deploy -g autolive-resources -m 2770 /fs/autolive-resources
    install -d -o autolive-deploy -g autolive-resources -m 2770 /fs/autolive-resources-staging
-   install -d -o autolive-resources -g autolive-resources -m 0750 /var/log/autolive-resources
    install -d -o autolive-deploy -g autolive-deploy -m 0750 /var/lock/autolive-resources
    ```
 
-   正式目录的写入权限需要按实际发布用户与 Caddy 用户的组策略最小化配置；Caddy 只需读，发布器只需创建并移动经过校验的 release 目录。
+   不要以 root 预创建 `/var/log/autolive-resources/access.log` 为 root:root 且不可读；`LogsDirectory=autolive-resources` 会由 systemd 在启动服务前创建并按 `User=`/`Group=` 管理日志目录。若日志目录已由人工创建，应先确保 `autolive-resources` 可写，否则 Caddy 会启动失败并被 systemd 反复重启。正式目录的写入权限需要按实际发布用户与 Caddy 用户的组策略最小化配置；Caddy 只需读，发布器只需创建并移动经过校验的 release 目录。
 
 5. 启动服务并检查：
 

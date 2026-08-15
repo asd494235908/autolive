@@ -16,6 +16,7 @@ ProtectSystem=strict
 ProtectHome=true
 ReadOnlyPaths=/fs/autolive-resources
 ReadWritePaths=/var/log/autolive-resources
+LogsDirectory=autolive-resources
 
 [Install]
 WantedBy=multi-user.target

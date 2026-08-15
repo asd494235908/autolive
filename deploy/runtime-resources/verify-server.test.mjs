@@ -238,6 +238,7 @@ test('Caddy 和 systemd 契约固定只读静态服务与收敛权限', () => {
     'ProtectHome=true',
     'ReadOnlyPaths=/fs/autolive-resources',
     'ReadWritePaths=/var/log/autolive-resources',
+    'LogsDirectory=autolive-resources',
     'Restart=on-failure',
     'WantedBy=multi-user.target',
   ]) assert.match(unit, new RegExp(line.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
