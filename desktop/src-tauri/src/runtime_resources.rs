@@ -414,6 +414,32 @@ pub struct RuntimeResourceInstaller {
 }
 
 impl RuntimeResourceInstaller {
+    pub fn from_resource_directory(
+        resource_dir: &Path,
+        app_data_dir: &Path,
+        expected_target: &str,
+    ) -> Result<Self, ResourceInstallError> {
+        let manifest_path = resource_dir.join("runtime-resources.json");
+        let manifest_bytes = fs::read(&manifest_path)
+            .map_err(|error| io_error("read manifest", &manifest_path, error))?;
+        let installer =
+            Self::from_embedded(&manifest_bytes, app_data_dir).map_err(|error| match error {
+                ResourceInstallError::Manifest(message) => ResourceInstallError::Manifest(format!(
+                    "failed to parse runtime resource manifest {}: {message}",
+                    manifest_path.display()
+                )),
+                error => error,
+            })?;
+        if installer.target() != expected_target {
+            return Err(ResourceInstallError::Manifest(format!(
+                "runtime resource manifest target mismatch: expected {expected_target}, got {} ({})",
+                installer.target(),
+                manifest_path.display()
+            )));
+        }
+        Ok(installer)
+    }
+
     pub fn from_embedded(
         manifest_bytes: &[u8],
         app_data_dir: &Path,
@@ -516,22 +542,57 @@ impl RuntimeResourceInstaller {
         self.finish_operation(component, result, &mut on_status)
     }
 
-    pub fn clear_current_release(&self) -> Result<RuntimeResourceStatus, ResourceInstallError> {
+    pub fn clear_current_release(
+        &self,
+        cancel: &AtomicBool,
+        mut on_status: impl FnMut(RuntimeResourceStatus),
+    ) -> Result<RuntimeResourceStatus, ResourceInstallError> {
         let _operation = self.acquire_operation()?;
-        if self.layout.version_root.exists() {
-            fs::remove_dir_all(&self.layout.version_root)
-                .map_err(|error| io_error("clear", &self.layout.version_root, error))?;
+        let result = self.clear_current_release_inner(cancel, &mut on_status);
+        let (state, error) = match &result {
+            Ok(()) => (RuntimeResourceState::NotInstalled, None),
+            Err(ResourceInstallError::Cancelled) => (
+                RuntimeResourceState::Cancelled,
+                Some(ResourceInstallError::Cancelled.to_string()),
+            ),
+            Err(error) => (RuntimeResourceState::Failed, Some(error.to_string())),
+        };
+        let status = self.status(state, None, None, 0, 0, 0, 0, error);
+        on_status(status.clone());
+        result.map(|()| status)
+    }
+
+    fn clear_current_release_inner(
+        &self,
+        cancel: &AtomicBool,
+        on_status: &mut impl FnMut(RuntimeResourceStatus),
+    ) -> Result<(), ResourceInstallError> {
+        self.check_cancel(cancel)?;
+        match fs::symlink_metadata(&self.layout.version_root) {
+            Ok(_) => remove_tree_cancellable(
+                &self.layout.version_root,
+                &self.layout.version_root,
+                cancel,
+                &mut |relative_path| {
+                    on_status(self.status(
+                        RuntimeResourceState::Checking,
+                        None,
+                        Some(relative_path.display().to_string()),
+                        0,
+                        0,
+                        0,
+                        0,
+                        None,
+                    ));
+                },
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error(
+                "inspect clear root",
+                &self.layout.version_root,
+                error,
+            )),
         }
-        Ok(self.status(
-            RuntimeResourceState::NotInstalled,
-            None,
-            None,
-            0,
-            0,
-            0,
-            0,
-            None,
-        ))
     }
 
     fn install_inner(
@@ -1240,6 +1301,72 @@ impl Drop for OperationGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.key);
     }
+}
+
+fn remove_tree_cancellable(
+    root: &Path,
+    path: &Path,
+    cancel: &AtomicBool,
+    on_entry: &mut impl FnMut(&Path),
+) -> Result<(), ResourceInstallError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(ResourceInstallError::Cancelled);
+    }
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| io_error("inspect clear entry", path, error))?;
+    if metadata.file_type().is_symlink() {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        on_entry(relative);
+        if cancel.load(Ordering::Acquire) {
+            return Err(ResourceInstallError::Cancelled);
+        }
+        return remove_symlink(path, metadata.file_type());
+    }
+    if metadata.is_file() {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        on_entry(relative);
+        if cancel.load(Ordering::Acquire) {
+            return Err(ResourceInstallError::Cancelled);
+        }
+        return fs::remove_file(path).map_err(|error| io_error("clear file", path, error));
+    }
+    if !metadata.is_dir() {
+        return Err(ResourceInstallError::Io {
+            operation: "clear unsupported entry",
+            path: path.display().to_string(),
+            message: "entry is neither a file, directory, nor symbolic link".to_owned(),
+        });
+    }
+    for entry in
+        fs::read_dir(path).map_err(|error| io_error("read clear directory", path, error))?
+    {
+        if cancel.load(Ordering::Acquire) {
+            return Err(ResourceInstallError::Cancelled);
+        }
+        let entry = entry.map_err(|error| io_error("read clear entry", path, error))?;
+        remove_tree_cancellable(root, &entry.path(), cancel, on_entry)?;
+    }
+    if path != root {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        on_entry(relative);
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(ResourceInstallError::Cancelled);
+    }
+    fs::remove_dir(path).map_err(|error| io_error("clear directory", path, error))
+}
+
+fn remove_symlink(path: &Path, file_type: fs::FileType) -> Result<(), ResourceInstallError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if file_type.is_symlink_dir() {
+            return fs::remove_dir(path)
+                .map_err(|error| io_error("clear directory symlink", path, error));
+        }
+    }
+    let _ = file_type;
+    fs::remove_file(path).map_err(|error| io_error("clear symlink", path, error))
 }
 
 fn total_size(files: &[&ManifestFile]) -> u64 {

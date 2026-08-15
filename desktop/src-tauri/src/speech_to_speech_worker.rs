@@ -20,6 +20,20 @@ const MAX_SPEECH_TO_SPEECH_WORKER_TIMEOUT_MS: u64 = 120_000;
 
 static CAPABILITY_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerEnvironmentPolicy {
+    DevelopmentOverrides,
+    PackagedOnly,
+}
+
+pub fn worker_environment_policy(debug_assertions: bool) -> WorkerEnvironmentPolicy {
+    if debug_assertions {
+        WorkerEnvironmentPolicy::DevelopmentOverrides
+    } else {
+        WorkerEnvironmentPolicy::PackagedOnly
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeechToSpeechWorkerRequest {
     pub executable: PathBuf,
@@ -125,6 +139,9 @@ fn configured_speech_to_speech_worker_capabilities_for_resource_dir(
 }
 
 pub fn configured_worker_executable() -> Result<PathBuf, SpeechToSpeechWorkerError> {
+    if worker_environment_policy(cfg!(debug_assertions)) == WorkerEnvironmentPolicy::PackagedOnly {
+        return Err(SpeechToSpeechWorkerError::WorkerNotConfigured);
+    }
     let Some(executable) = std::env::var_os(SPEECH_TO_SPEECH_WORKER_ENV).map(PathBuf::from) else {
         return Err(SpeechToSpeechWorkerError::WorkerNotConfigured);
     };
@@ -455,16 +472,29 @@ fn cleanup(path: &Path) {
 }
 
 fn inject_packaged_media_engine_paths(command: &mut Command, resource_dir: Option<&Path>) {
+    let policy = worker_environment_policy(cfg!(debug_assertions));
+    if policy == WorkerEnvironmentPolicy::PackagedOnly {
+        command
+            .env_remove(SPEECH_TO_SPEECH_WORKER_ENV)
+            .env_remove(FFMPEG_PATH_ENV)
+            .env_remove(FFPROBE_PATH_ENV);
+    }
     let Some(resource_dir) = resource_dir else {
         return;
     };
     let Ok((ffmpeg_path, ffprobe_path)) = packaged_media_engine_paths(resource_dir) else {
         return;
     };
-    if std::env::var_os(FFMPEG_PATH_ENV).is_none() && ffmpeg_path.is_file() {
+    if (policy == WorkerEnvironmentPolicy::PackagedOnly
+        || std::env::var_os(FFMPEG_PATH_ENV).is_none())
+        && ffmpeg_path.is_file()
+    {
         command.env(FFMPEG_PATH_ENV, ffmpeg_path);
     }
-    if std::env::var_os(FFPROBE_PATH_ENV).is_none() && ffprobe_path.is_file() {
+    if (policy == WorkerEnvironmentPolicy::PackagedOnly
+        || std::env::var_os(FFPROBE_PATH_ENV).is_none())
+        && ffprobe_path.is_file()
+    {
         command.env(FFPROBE_PATH_ENV, ffprobe_path);
     }
 }

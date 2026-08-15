@@ -58,7 +58,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -83,7 +83,9 @@ const VOICE_CLONE_AUDIO_PROBE_TIMEOUT_MS: u64 = 5_000;
 const MEDIA_IMPORT_PROBE_TIMEOUT_MS: u64 = 10_000;
 const MAX_VOICE_CLONE_WORKER_STDERR_BYTES: usize = 64 * 1024;
 const VOICE_CLONE_PLAYBACK_CACHE_VERSION: u32 = 1;
-const RUNTIME_RESOURCE_MANIFEST_NAME: &str = "runtime-resources.json";
+const RUNTIME_RESOURCE_EXIT_IDLE: u8 = 0;
+const RUNTIME_RESOURCE_EXIT_COORDINATING: u8 = 1;
+const RUNTIME_RESOURCE_EXIT_FINISHED: u8 = 2;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -97,6 +99,7 @@ pub struct AppState {
     research_worker: Arc<Mutex<Option<ResearchWorkerTask>>>,
     research_status: Arc<Mutex<ResearchStatusDto>>,
     runtime_resource_task: Arc<RuntimeResourceTask>,
+    runtime_resource_exit_state: Arc<AtomicU8>,
 }
 
 #[derive(Debug)]
@@ -456,37 +459,76 @@ fn runtime_resource_target_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(layout.target_root)
 }
 
-fn runtime_resource_installer(app: &AppHandle) -> Result<RuntimeResourceInstaller, String> {
-    let resource_dir = app
-        .path()
-        .resource_dir()
-        .map_err(|error| format!("读取运行资源 manifest 所在资源目录失败：{error}"))?;
-    let manifest_path = resource_dir.join(RUNTIME_RESOURCE_MANIFEST_NAME);
-    let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| {
-        format!(
-            "读取运行资源 manifest {} 失败：{error}",
-            manifest_path.display()
+fn runtime_resource_installer_blocking(
+    app: &AppHandle,
+) -> Result<RuntimeResourceInstaller, (String, PathBuf)> {
+    let app_data_dir = app.path().app_data_dir().map_err(|error| {
+        (
+            format!("读取运行资源应用数据目录失败：{error}"),
+            PathBuf::new(),
         )
     })?;
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("读取运行资源应用数据目录失败：{error}"))?;
-    let installer = RuntimeResourceInstaller::from_embedded(&manifest_bytes, &app_data_dir)
+    let resource_root = RuntimeResourceLayout::for_target(&app_data_dir, target_triple())
         .map_err(|error| {
-            format!(
-                "解析运行资源 manifest {} 失败：{error}",
-                manifest_path.display()
+            (
+                format!("解析当前平台运行资源目录失败：{error}"),
+                PathBuf::new(),
             )
-        })?;
-    if installer.target() != target_triple() {
-        return Err(format!(
-            "运行资源 manifest 目标平台不匹配：期望 {}，实际 {}",
-            target_triple(),
-            installer.target()
-        ));
+        })?
+        .version_root;
+    let resource_dir = app.path().resource_dir().map_err(|error| {
+        (
+            format!("读取运行资源 manifest 所在资源目录失败：{error}"),
+            resource_root.clone(),
+        )
+    })?;
+    RuntimeResourceInstaller::from_resource_directory(&resource_dir, &app_data_dir, target_triple())
+        .map_err(|error| (error.to_string(), resource_root))
+}
+
+async fn runtime_resource_installer(
+    component: RuntimeResourceComponent,
+    app: AppHandle,
+    task: Arc<RuntimeResourceTask>,
+) -> Result<RuntimeResourceInstaller, RuntimeResourceStatus> {
+    let loaded =
+        tauri::async_runtime::spawn_blocking(move || runtime_resource_installer_blocking(&app))
+            .await;
+    match loaded {
+        Ok(Ok(installer)) => Ok(installer),
+        Ok(Err((error, resource_root))) => Err(record_runtime_resource_failure(
+            &task,
+            component,
+            error,
+            &resource_root,
+        )),
+        Err(error) => Err(record_runtime_resource_failure(
+            &task,
+            component,
+            format!("运行资源 manifest 加载任务失败：{error}"),
+            Path::new(""),
+        )),
     }
-    Ok(installer)
+}
+
+fn record_runtime_resource_failure(
+    task: &RuntimeResourceTask,
+    component: RuntimeResourceComponent,
+    error: String,
+    resource_root: &Path,
+) -> RuntimeResourceStatus {
+    task.record_failure(component, error.clone(), resource_root)
+        .unwrap_or_else(|state_error| RuntimeResourceStatus {
+            state: RuntimeResourceState::Failed,
+            component: Some(component),
+            current_file: None,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            bytes_per_second: 0,
+            installed_bytes: 0,
+            resource_root: resource_root.display().to_string(),
+            error: Some(format!("{error}；记录运行资源失败状态失败：{state_error}")),
+        })
 }
 
 fn development_runtime_resource_status(
@@ -546,23 +588,37 @@ pub async fn get_runtime_resource_status(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RuntimeResourceStatus, String> {
-    let task_status = state.runtime_resource_task.status(component)?;
-    if task_status.state != RuntimeResourceState::NotInstalled
-        || !task_status.resource_root.is_empty()
-    {
-        return Ok(task_status);
+    if let Some(status) = state.runtime_resource_task.running_status()? {
+        return Ok(status);
     }
     if let Some(status) = development_runtime_resource_status(component) {
         return Ok(status);
     }
-    let installer = runtime_resource_installer(&app)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        installer
-            .inspect(component)
-            .map_err(|error| error.to_string())
+    let task = Arc::clone(&state.runtime_resource_task);
+    let installer = match runtime_resource_installer(component, app, Arc::clone(&task)).await {
+        Ok(installer) => installer,
+        Err(status) => return Ok(status),
+    };
+    let resource_root = installer.resource_root().to_path_buf();
+    match tauri::async_runtime::spawn_blocking(move || {
+        task.inspect_when_idle(component, &installer)
     })
     .await
-    .map_err(|error| format!("运行资源状态检查任务失败：{error}"))?
+    {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Ok(record_runtime_resource_failure(
+            &state.runtime_resource_task,
+            component,
+            error,
+            &resource_root,
+        )),
+        Err(error) => Ok(record_runtime_resource_failure(
+            &state.runtime_resource_task,
+            component,
+            format!("运行资源状态检查任务失败：{error}"),
+            &resource_root,
+        )),
+    }
 }
 
 #[tauri::command]
@@ -574,7 +630,13 @@ pub async fn install_runtime_resources(
     if let Some(status) = state.runtime_resource_task.running_status()? {
         return Ok(status);
     }
-    let installer = runtime_resource_installer(&app)?;
+    let installer =
+        match runtime_resource_installer(component, app, Arc::clone(&state.runtime_resource_task))
+            .await
+        {
+            Ok(installer) => installer,
+            Err(status) => return Ok(status),
+        };
     state
         .runtime_resource_task
         .start_install(component, installer)
@@ -597,7 +659,13 @@ pub async fn import_runtime_resource_directory(
     if let Some(status) = state.runtime_resource_task.running_status()? {
         return Ok(status);
     }
-    let installer = runtime_resource_installer(&app)?;
+    let installer =
+        match runtime_resource_installer(component, app, Arc::clone(&state.runtime_resource_task))
+            .await
+        {
+            Ok(installer) => installer,
+            Err(status) => return Ok(status),
+        };
     state
         .runtime_resource_task
         .start_import(component, installer, PathBuf::from(source_root))
@@ -611,7 +679,14 @@ pub async fn clear_runtime_resources(
     if let Some(status) = state.runtime_resource_task.running_status()? {
         return Ok(status);
     }
-    let installer = runtime_resource_installer(&app)?;
+    let component = RuntimeResourceComponent::Media;
+    let installer =
+        match runtime_resource_installer(component, app, Arc::clone(&state.runtime_resource_task))
+            .await
+        {
+            Ok(installer) => installer,
+            Err(status) => return Ok(status),
+        };
     state.runtime_resource_task.start_clear(installer)
 }
 
@@ -732,6 +807,7 @@ impl Default for AppState {
             research_worker: Arc::new(Mutex::new(None)),
             research_status: Arc::new(Mutex::new(ResearchStatusDto::default())),
             runtime_resource_task: Arc::new(RuntimeResourceTask::default()),
+            runtime_resource_exit_state: Arc::new(AtomicU8::new(RUNTIME_RESOURCE_EXIT_IDLE)),
         }
     }
 }
@@ -742,6 +818,40 @@ impl AppState {
         budget: Duration,
     ) -> Result<RuntimeResourceTaskShutdown, String> {
         self.runtime_resource_task.shutdown(budget)
+    }
+
+    pub fn begin_runtime_resource_exit_coordination(&self) -> bool {
+        self.runtime_resource_exit_state
+            .compare_exchange(
+                RUNTIME_RESOURCE_EXIT_IDLE,
+                RUNTIME_RESOURCE_EXIT_COORDINATING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn runtime_resource_exit_coordination_started(&self) -> bool {
+        self.runtime_resource_exit_state.load(Ordering::Acquire)
+            == RUNTIME_RESOURCE_EXIT_COORDINATING
+    }
+
+    pub fn finish_runtime_resource_exit_coordination(&self) {
+        self.runtime_resource_exit_state
+            .store(RUNTIME_RESOURCE_EXIT_FINISHED, Ordering::Release);
+    }
+
+    pub fn reset_runtime_resource_exit_coordination(&self) {
+        let _ignored = self.runtime_resource_exit_state.compare_exchange(
+            RUNTIME_RESOURCE_EXIT_COORDINATING,
+            RUNTIME_RESOURCE_EXIT_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub fn runtime_resource_exit_coordination_finished(&self) -> bool {
+        self.runtime_resource_exit_state.load(Ordering::Acquire) == RUNTIME_RESOURCE_EXIT_FINISHED
     }
 
     fn lock_voice_clone_launch(&self) -> Result<std::sync::MutexGuard<'_, ()>, CommandErrorDto> {
@@ -5600,6 +5710,7 @@ mod tests {
         VoiceClonePreparedSource, VOICE_CLONE_SYNTHESIS_MODEL_ID,
     };
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[cfg(unix)]
     #[test]
@@ -5625,6 +5736,30 @@ mod tests {
         std::fs::set_permissions(&path, permissions).expect("permissions should be set");
         assert!(development_executable_ready(&path));
         let _ignored = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn runtime_exit_coordination_can_start_only_once() {
+        let state = Arc::new(AppState::default());
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let state = Arc::clone(&state);
+            workers.push(std::thread::spawn(move || {
+                state.begin_runtime_resource_exit_coordination()
+            }));
+        }
+        let starts = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("gate worker should join"))
+            .filter(|started| *started)
+            .count();
+
+        assert_eq!(starts, 1);
+        assert!(state.runtime_resource_exit_coordination_started());
+        assert!(!state.runtime_resource_exit_coordination_finished());
+        state.finish_runtime_resource_exit_coordination();
+        assert!(state.runtime_resource_exit_coordination_finished());
+        assert!(!state.begin_runtime_resource_exit_coordination());
     }
 
     fn test_voice_clone_playback_plan(model: Option<&str>) -> VoiceClonePlaybackPlan {

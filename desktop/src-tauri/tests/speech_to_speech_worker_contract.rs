@@ -1,10 +1,13 @@
 use autolive_desktop_core::cancellation::CancellationToken;
 use autolive_desktop_core::speech_to_speech::SpeechToSpeechContext;
+#[cfg(not(debug_assertions))]
+use autolive_desktop_core::speech_to_speech_worker::configured_worker_executable;
 use autolive_desktop_core::speech_to_speech_worker::{
     probe_speech_to_speech_worker, probe_speech_to_speech_worker_with_resource_dir,
     run_speech_to_speech_context_worker, run_speech_to_speech_worker,
-    run_speech_to_speech_worker_with_resource_dir, SpeechToSpeechContextWorkerRequest,
-    SpeechToSpeechWorkerError, SpeechToSpeechWorkerRequest,
+    run_speech_to_speech_worker_with_resource_dir, worker_environment_policy,
+    SpeechToSpeechContextWorkerRequest, SpeechToSpeechWorkerError, SpeechToSpeechWorkerRequest,
+    WorkerEnvironmentPolicy,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +33,55 @@ impl TestDir {
 impl Drop for TestDir {
     fn drop(&mut self) {
         let _ignored = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn worker_environment_policy_allows_overrides_only_for_debug_builds() {
+    assert_eq!(
+        worker_environment_policy(true),
+        WorkerEnvironmentPolicy::DevelopmentOverrides
+    );
+    assert_eq!(
+        worker_environment_policy(false),
+        WorkerEnvironmentPolicy::PackagedOnly
+    );
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn configured_worker_executable_ignores_environment_in_release() {
+    let _environment_guard = ENVIRONMENT_LOCK.lock().expect("environment lock");
+    let directory = TestDir::new();
+    let executable = directory.0.join("untrusted-worker");
+    std::fs::write(&executable, b"fixture").expect("worker fixture");
+    let previous = std::env::var_os("AUTOLIVE_SPEECH_TO_SPEECH_WORKER");
+    std::env::set_var("AUTOLIVE_SPEECH_TO_SPEECH_WORKER", &executable);
+
+    assert_eq!(
+        configured_worker_executable(),
+        Err(SpeechToSpeechWorkerError::WorkerNotConfigured)
+    );
+
+    match previous {
+        Some(value) => std::env::set_var("AUTOLIVE_SPEECH_TO_SPEECH_WORKER", value),
+        None => std::env::remove_var("AUTOLIVE_SPEECH_TO_SPEECH_WORKER"),
+    }
+}
+
+#[test]
+fn release_command_source_removes_worker_and_media_overrides() {
+    let source = std::fs::read_to_string("src/speech_to_speech_worker.rs")
+        .expect("speech worker source should exist");
+    for variable in [
+        "SPEECH_TO_SPEECH_WORKER_ENV",
+        "FFMPEG_PATH_ENV",
+        "FFPROBE_PATH_ENV",
+    ] {
+        assert!(
+            source.contains(&format!("env_remove({variable})")),
+            "release command must remove {variable}"
+        );
     }
 }
 

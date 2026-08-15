@@ -81,14 +81,11 @@ impl RuntimeResourceTask {
             component: None,
             ..operation_status(RuntimeResourceComponent::Media, installer.resource_root())
         };
-        self.start_operation(initial.clone(), move |_cancel, update| {
-            match installer.clear_current_release() {
-                Ok(status) => {
-                    update(status);
-                    Ok(())
-                }
-                Err(error) => Err(error.to_string()),
-            }
+        self.start_operation(initial, move |cancel, update| {
+            installer
+                .clear_current_release(cancel.as_ref(), update)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
         })
     }
 
@@ -112,6 +109,46 @@ impl RuntimeResourceTask {
             return Ok(Some(self.lock_status()?.clone()));
         }
         Ok(None)
+    }
+
+    pub fn inspect_when_idle(
+        &self,
+        component: RuntimeResourceComponent,
+        installer: &RuntimeResourceInstaller,
+    ) -> Result<RuntimeResourceStatus, String> {
+        if let Some(status) = self.running_status()? {
+            return Ok(status);
+        }
+        let inspected = installer
+            .inspect(component)
+            .map_err(|error| error.to_string())?;
+        Ok(self.running_status()?.unwrap_or(inspected))
+    }
+
+    pub fn record_failure(
+        &self,
+        component: RuntimeResourceComponent,
+        error: impl Into<String>,
+        resource_root: &std::path::Path,
+    ) -> Result<RuntimeResourceStatus, String> {
+        let mut worker = self.lock_worker()?;
+        self.reap_finished_locked(&mut worker)?;
+        if worker.is_some() {
+            return Ok(self.lock_status()?.clone());
+        }
+        let status = RuntimeResourceStatus {
+            state: RuntimeResourceState::Failed,
+            component: Some(component),
+            current_file: None,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            bytes_per_second: 0,
+            installed_bytes: 0,
+            resource_root: resource_root.display().to_string(),
+            error: Some(error.into()),
+        };
+        *self.lock_status()? = status.clone();
+        Ok(status)
     }
 
     pub fn cancel(&self) -> Result<RuntimeResourceStatus, String> {
@@ -239,6 +276,14 @@ impl RuntimeResourceTask {
 impl Drop for RuntimeResourceTask {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
+        let worker = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(worker) = worker {
+            let _ignored = worker.join();
+        }
     }
 }
 
@@ -356,6 +401,33 @@ mod tests {
     }
 
     #[test]
+    fn record_failure_does_not_overwrite_a_running_operation() {
+        let task = RuntimeResourceTask::default();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        task.start_operation(checking_status(), move |_cancel, update| {
+            started_tx.send(()).expect("start signal should send");
+            release_rx.recv().expect("release signal should arrive");
+            update(ready_status());
+            Ok(())
+        })
+        .expect("operation should start");
+        started_rx.recv().expect("operation should be running");
+
+        let status = task
+            .record_failure(
+                RuntimeResourceComponent::Voice,
+                "late manifest failure",
+                std::path::Path::new("/different-root"),
+            )
+            .expect("running status should win");
+
+        assert_eq!(status.state, RuntimeResourceState::Checking);
+        assert_eq!(status.component, Some(RuntimeResourceComponent::Media));
+        release_tx.send(()).expect("operation should finish");
+    }
+
+    #[test]
     fn terminal_status_reaps_the_finished_join_handle() {
         let task = RuntimeResourceTask::default();
         task.start_operation(checking_status(), move |_cancel, update| {
@@ -441,5 +513,30 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(!task.worker_is_owned().expect("worker should be reaped"));
+    }
+
+    #[test]
+    fn drop_cancels_and_joins_a_cooperative_worker() {
+        let task = RuntimeResourceTask::default();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        task.start_operation(checking_status(), move |cancel, update| {
+            while !cancel.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            update(RuntimeResourceStatus {
+                state: RuntimeResourceState::Cancelled,
+                ..checking_status()
+            });
+            finished_tx.send(()).expect("finish signal should send");
+            Ok(())
+        })
+        .expect("task should start");
+
+        drop(task);
+
+        finished_rx
+            .try_recv()
+            .expect("drop must wait until the worker has finished");
     }
 }

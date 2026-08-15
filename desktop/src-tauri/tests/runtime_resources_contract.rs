@@ -945,12 +945,83 @@ fn clear_removes_only_the_fixed_current_release_directory() {
 
     let status = harness
         .installer
-        .clear_current_release()
+        .clear_current_release(&AtomicBool::new(false), |_| {})
         .expect("clear should succeed");
 
     assert_eq!(status.state, RuntimeResourceState::NotInstalled);
     assert!(!harness.layout.version_root.exists());
     assert_eq!(fs::read(sibling).unwrap(), b"keep");
+}
+
+#[test]
+fn clear_can_be_cancelled_between_directory_entries_and_retried() {
+    let fixture = RangeFixture::new(FILE_BYTES);
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+    for index in 0..8 {
+        let path = harness
+            .layout
+            .version_root
+            .join(format!("nested/{index}.bin"));
+        fs::create_dir_all(path.parent().expect("entry parent")).expect("entry parent");
+        fs::write(path, [index]).expect("entry fixture");
+    }
+    let cancel = AtomicBool::new(false);
+    let mut visited = 0;
+
+    let result = harness.installer.clear_current_release(&cancel, |status| {
+        if status.current_file.is_some() {
+            visited += 1;
+            if visited == 2 {
+                cancel.store(true, Ordering::Release);
+            }
+        }
+    });
+
+    assert_eq!(result, Err(ResourceInstallError::Cancelled));
+    assert!(harness.layout.version_root.exists());
+    assert_eq!(
+        harness
+            .installer
+            .inspect(RuntimeResourceComponent::Media)
+            .expect("partially cleared release should inspect")
+            .state,
+        RuntimeResourceState::NotInstalled
+    );
+    let status = harness
+        .installer
+        .clear_current_release(&AtomicBool::new(false), |_| {})
+        .expect("retry should converge");
+    assert_eq!(status.state, RuntimeResourceState::NotInstalled);
+    assert!(!harness.layout.version_root.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn clear_removes_a_directory_symlink_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = RangeFixture::new(FILE_BYTES);
+    let harness = InstallerHarness::new(&fixture, FILE_BYTES);
+    let outside = TestDir::new("clear-symlink-outside");
+    let outside_file = outside.path().join("keep.txt");
+    fs::write(&outside_file, b"keep").expect("outside fixture");
+    fs::create_dir_all(&harness.layout.version_root).expect("release root");
+    symlink(
+        outside.path(),
+        harness.layout.version_root.join("outside-link"),
+    )
+    .expect("directory symlink");
+
+    harness
+        .installer
+        .clear_current_release(&AtomicBool::new(false), |_| {})
+        .expect("clear should remove the link");
+
+    assert_eq!(
+        fs::read(outside_file).expect("outside file remains"),
+        b"keep"
+    );
+    assert!(!harness.layout.version_root.exists());
 }
 
 #[test]
