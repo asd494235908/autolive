@@ -6,7 +6,7 @@ fn main() {
     let action = build_support::runtime_resource_config_action(
         profile.as_deref(),
         std::path::Path::new("runtime-resources.json").is_file(),
-        external_override.is_some(),
+        external_override.as_deref(),
     )
     .unwrap_or_else(|message| panic!("{message}"));
     if !matches!(profile.as_deref(), Some("debug" | "test")) {
@@ -16,11 +16,10 @@ fn main() {
         )
         .unwrap_or_else(|message| panic!("{message}"));
     }
-    if action == build_support::RuntimeResourceConfigAction::UseEmptyDevelopmentOverride {
-        const TEST_CONFIG: &str = r#"{"bundle":{"resources":[]}}"#;
+    if let build_support::RuntimeResourceConfigAction::UseDevelopmentOverride(config) = action {
         // build.rs 和 generate_context! 分属两个编译阶段，二者必须看到同一覆盖值。
-        std::env::set_var("TAURI_CONFIG", TEST_CONFIG);
-        println!("cargo:rustc-env=TAURI_CONFIG={TEST_CONFIG}");
+        std::env::set_var("TAURI_CONFIG", &config);
+        println!("cargo:rustc-env=TAURI_CONFIG={config}");
     }
     tauri_build::build()
 }

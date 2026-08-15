@@ -1,10 +1,10 @@
-import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { cpSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { readDesktopVersion } from './桌面版本.mjs';
+
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const configPath = join(desktopRoot, 'src-tauri', 'tauri.conf.json');
-const config = JSON.parse(readFileSync(configPath, 'utf8'));
 
 export function archiveDesktopArtifacts({
   targetTriple = process.env.AUTOLIVE_TARGET_TRIPLE?.trim() || detectTargetTriple(),
@@ -13,14 +13,11 @@ export function archiveDesktopArtifacts({
   ),
   packageRoot = resolveDesktopPath(process.env.AUTOLIVE_PACKAGE_ROOT || 'package'),
 } = {}) {
-  if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(config.version)) {
-    throw new Error(`Tauri 版本号无效：${config.version}`);
-  }
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(targetTriple)) {
     throw new Error(`目标三元组无效：${targetTriple}`);
   }
 
-  const destination = join(packageRoot, `v${config.version}`, targetTriple);
+  const destination = join(packageRoot, readDesktopVersion().release, targetTriple);
   archiveNativeBundle({ destination, bundleSourceDir, targetTriple });
   return destination;
 }

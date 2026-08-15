@@ -1,23 +1,44 @@
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RuntimeResourceConfigAction {
     Keep,
-    UseEmptyDevelopmentOverride,
+    UseDevelopmentOverride(String),
 }
 
 pub fn runtime_resource_config_action(
     profile: Option<&str>,
     manifest_exists: bool,
-    override_exists: bool,
+    external_override: Option<&str>,
 ) -> Result<RuntimeResourceConfigAction, &'static str> {
-    if manifest_exists || (matches!(profile, Some("debug" | "test")) && override_exists) {
+    if manifest_exists {
         return Ok(RuntimeResourceConfigAction::Keep);
     }
     if matches!(profile, Some("debug" | "test")) {
-        return Ok(RuntimeResourceConfigAction::UseEmptyDevelopmentOverride);
+        return Ok(RuntimeResourceConfigAction::UseDevelopmentOverride(
+            merge_development_override(external_override)?,
+        ));
     }
     Err("release/custom 构建缺少 runtime-resources.json")
+}
+
+fn merge_development_override(external_override: Option<&str>) -> Result<String, &'static str> {
+    let mut override_value = match external_override {
+        Some(value) => {
+            serde_json::from_str(value).map_err(|_| "TAURI_CONFIG 不是有效 JSON merge patch")?
+        }
+        None => Value::Object(Map::new()),
+    };
+    let root = override_value
+        .as_object_mut()
+        .ok_or("TAURI_CONFIG 不能替换 Tauri 配置根对象")?;
+    let bundle = root
+        .entry("bundle")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or("TAURI_CONFIG 不能替换 bundle 对象")?;
+    bundle.insert("resources".into(), Value::Array(Vec::new()));
+    serde_json::to_string(&override_value).map_err(|_| "无法生成开发 TAURI_CONFIG")
 }
 
 pub fn validate_release_runtime_resource_config(

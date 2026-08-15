@@ -3,19 +3,17 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
   buildRuntimeCommonRelease,
   buildRuntimeResourceRelease,
   RESOURCE_RELEASE,
-  resourceReleaseFromVersion,
 } from './生成运行资源发布树.mjs';
+import { readDesktopVersion } from './桌面版本.mjs';
 
 const DEPLOY_INVENTORY = 'autolive-deploy-inventory.json';
-const tauriConfigPath = fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url));
-const expectedRelease = `v${JSON.parse(readFileSync(tauriConfigPath, 'utf8')).version}`;
+const expectedRelease = readDesktopVersion().release;
 
 function writeFixture(root, relativePath, content) {
   const path = join(root, ...relativePath.split('/'));
@@ -26,14 +24,6 @@ function writeFixture(root, relativePath, content) {
 function hasHiddenPath(relativePath) {
   return relativePath.split('/').some((part) => part.startsWith('.'));
 }
-
-test('发布版本只接受严格 SemVer', () => {
-  assert.equal(resourceReleaseFromVersion('0.1.0'), 'v0.1.0');
-  assert.equal(resourceReleaseFromVersion('1.2.3-alpha.1+build.5'), 'v1.2.3-alpha.1+build.5');
-  for (const invalid of ['01.2.3', '1.02.3', '1.2.03', '1.2.3-01', '1.2.3-', 'v1.2.3']) {
-    assert.throws(() => resourceReleaseFromVersion(invalid), /Tauri 版本号无效/);
-  }
-});
 
 test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-runtime-resources-'));

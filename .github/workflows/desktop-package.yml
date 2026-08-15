@@ -41,12 +41,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(node -p "JSON.parse(require('fs').readFileSync('desktop/src-tauri/tauri.conf.json', 'utf8')).version")"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-            printf 'invalid desktop version: %s\n' "$version" >&2
-            exit 1
-          fi
-          echo "version=v${version}" >> "$GITHUB_OUTPUT"
+          version="$(node desktop/工具/桌面版本.mjs --release)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
       - name: Prepare shared voice models once on Linux
         run: node desktop/工具/准备语音模型资源.mjs
       - name: Generate pruned common runtime resources
@@ -132,12 +128,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(node -p "JSON.parse(require('fs').readFileSync('desktop/src-tauri/tauri.conf.json', 'utf8')).version")"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-            printf 'invalid desktop version: %s\n' "$version" >&2
-            exit 1
-          fi
-          echo "version=v${version}" >> "$GITHUB_OUTPUT"
+          version="$(node desktop/工具/桌面版本.mjs --release)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
       - name: Download prepared common models
         uses: actions/download-artifact@v4
         with:

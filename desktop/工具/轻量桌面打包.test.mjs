@@ -7,6 +7,7 @@ import test from 'node:test';
 
 import { tauriBuildArguments } from './构建桌面产物.mjs';
 import { archiveDesktopArtifacts } from './归档桌面产物.mjs';
+import { readDesktopVersion } from './桌面版本.mjs';
 
 const configPath = fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url));
 const packageJsonPath = fileURLToPath(new URL('../ui/package.json', import.meta.url));
@@ -80,12 +81,17 @@ test('归档器缺少目标平台安装文件时失败', () => {
   );
 });
 
-test('运行资源生成与 CI artifact 均从 Tauri 配置版本派生', async () => {
-  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+test('运行资源生成与 CI artifact 均从共享桌面版本入口派生', async () => {
   const workflow = readFileSync(workflowPath, 'utf8');
   const { RESOURCE_RELEASE } = await import('./生成运行资源发布树.mjs');
 
-  assert.equal(RESOURCE_RELEASE, `v${config.version}`);
+  assert.equal(RESOURCE_RELEASE, readDesktopVersion().release);
+  assert.equal(
+    (workflow.match(/node desktop\/工具\/桌面版本\.mjs --release/g) ?? []).length,
+    2,
+  );
+  assert.doesNotMatch(workflow, /node -p/);
+  assert.doesNotMatch(workflow, /\$version\s*=~/);
   assert.match(
     workflow,
     /desktop\/resource-release\/autolive-resources\/\$\{\{ steps\.desktop-version\.outputs\.version \}\}\/common\/\*\*/,
@@ -127,6 +133,7 @@ test('本地完整构建与 CI prepared-resources 入口顺序明确', () => {
     '生成运行资源发布树.mjs',
     '构建桌面产物.mjs',
   ]);
+  assert.match(packageJson.scripts.test, /\.\.\/工具\/桌面版本\.test\.mjs/);
 });
 
 test('CI 公共模型、目标运行资源和桌面包分层且避免 OpenMP 绕过', () => {
