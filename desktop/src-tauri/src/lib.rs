@@ -8,6 +8,7 @@ pub mod media_engine;
 pub mod media_library;
 pub mod research_params;
 pub mod research_worker;
+pub mod runtime_resources;
 pub mod speech_to_speech;
 pub mod speech_to_speech_worker;
 pub mod voice_clone;
