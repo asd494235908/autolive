@@ -47,7 +47,7 @@ pub fn validate_release_runtime_resource_config(
 ) -> Result<(), &'static str> {
     let base_config: Value =
         serde_json::from_str(base_config).map_err(|_| "tauri.conf.json 不是有效 JSON")?;
-    if !has_expected_resources(&base_config) {
+    if !has_expected_config_resources(&base_config) {
         return Err("release/custom 构建要求 bundle.resources 精确为 runtime-resources.json");
     }
     let Some(external_override) = external_override else {
@@ -65,20 +65,23 @@ pub fn validate_release_runtime_resource_config(
         return Err("TAURI_CONFIG 不能移除或替换 bundle.resources");
     };
     if let Some(resources) = bundle_override.get("resources") {
-        if !has_expected_resources(resources) {
+        if !has_expected_resource_list(resources) {
             return Err("TAURI_CONFIG 不能移除、增加或替换 bundle.resources");
         }
     }
     Ok(())
 }
 
-fn has_expected_resources(value: &Value) -> bool {
-    let Some(resources) = value
+fn has_expected_config_resources(config: &Value) -> bool {
+    config
         .get("bundle")
         .and_then(Value::as_object)
         .and_then(|bundle| bundle.get("resources"))
-    else {
-        return value == &Value::Array(vec![Value::String("runtime-resources.json".into())]);
-    };
-    resources == &Value::Array(vec![Value::String("runtime-resources.json".into())])
+        .is_some_and(has_expected_resource_list)
+}
+
+fn has_expected_resource_list(value: &Value) -> bool {
+    value.as_array().is_some_and(|resources| {
+        resources.len() == 1 && resources[0].as_str() == Some("runtime-resources.json")
+    })
 }

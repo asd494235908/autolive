@@ -27,7 +27,7 @@ export function readDesktopVersion(configPath = defaultConfigPath) {
 
 function main() {
   const [argument, ...rest] = process.argv.slice(2);
-  if (rest.length > 0 || (argument && argument !== '--version' && argument !== '--release')) {
+  if (rest.length > 0 || (argument !== undefined && argument !== '--version' && argument !== '--release')) {
     throw new Error('只支持 --version 或 --release');
   }
   const version = readDesktopVersion();

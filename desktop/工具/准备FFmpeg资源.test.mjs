@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import { tauriBuildArguments } from './构建桌面产物.mjs';
+import { readDesktopVersion } from './桌面版本.mjs';
 
 const script = fileURLToPath(new URL('./准备FFmpeg资源.mjs', import.meta.url));
 const archiveScript = fileURLToPath(new URL('./归档桌面产物.mjs', import.meta.url));
@@ -76,8 +77,7 @@ test('归档脚本按版本和目标平台目录保存 bundle', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-package-'));
   const source = join(root, 'bundle');
   const output = join(root, 'package');
-  const configPath = fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url));
-  const version = JSON.parse(readFileSync(configPath, 'utf8')).version;
+  const { release } = readDesktopVersion();
   mkdirSync(join(source, 'dmg'), { recursive: true });
   mkdirSync(join(source, 'macos', 'autolive.app'), { recursive: true });
   writeFileSync(join(source, 'dmg', 'autolive.dmg'), 'bundle-test');
@@ -95,18 +95,17 @@ test('归档脚本按版本和目标平台目录保存 bundle', () => {
 
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
   assert.equal(
-    readFileSync(join(output, `v${version}`, 'aarch64-apple-darwin', 'dmg', 'autolive.dmg'), 'utf8'),
+    readFileSync(join(output, release, 'aarch64-apple-darwin', 'dmg', 'autolive.dmg'), 'utf8'),
     'bundle-test',
   );
-  assert.throws(() => statSync(join(output, `v${version}`, 'aarch64-apple-darwin', 'macos')));
+  assert.throws(() => statSync(join(output, release, 'aarch64-apple-darwin', 'macos')));
 });
 
 test('Windows 正式包归档原生 Tauri bundle', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-package-'));
   const source = join(root, 'bundle');
   const output = join(root, 'package');
-  const configPath = fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url));
-  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  const { release } = readDesktopVersion();
   mkdirSync(join(source, 'msi'), { recursive: true });
   mkdirSync(join(source, 'macos', 'autolive.app'), { recursive: true });
   writeFileSync(join(source, 'msi', 'autolive.msi'), 'app-test');
@@ -123,7 +122,7 @@ test('Windows 正式包归档原生 Tauri bundle', () => {
   });
 
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
-  const bundle = join(output, `v${config.version}`, 'x86_64-pc-windows-msvc');
+  const bundle = join(output, release, 'x86_64-pc-windows-msvc');
   assert.equal(readFileSync(join(bundle, 'msi', 'autolive.msi'), 'utf8'), 'app-test');
   assert.throws(() => statSync(join(bundle, 'macos')));
 });

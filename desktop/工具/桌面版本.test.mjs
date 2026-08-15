@@ -48,4 +48,7 @@ test('桌面版本 CLI 提供 JSON、单字段输出并拒绝未知参数', () =
 
   const invalidResult = execute(['--unknown']);
   assert.notEqual(invalidResult.status, 0);
+
+  const emptyArgumentResult = execute(['']);
+  assert.notEqual(emptyArgumentResult.status, 0);
 });

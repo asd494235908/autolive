@@ -117,6 +117,11 @@ fn release_config_allows_unrelated_override_but_rejects_resource_changes() {
     )
     .is_err());
     assert!(build_support::validate_release_runtime_resource_config(
+        base_config,
+        Some(r#"{"bundle":{"resources":{"bundle":{"resources":["runtime-resources.json"]}}}}"#),
+    )
+    .is_err());
+    assert!(build_support::validate_release_runtime_resource_config(
         r#"{"bundle":{"resources":[]}}"#,
         None,
     )
