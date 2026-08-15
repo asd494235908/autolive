@@ -15,6 +15,10 @@ function writeFixture(root, relativePath, content) {
   writeFileSync(path, content);
 }
 
+function hasHiddenPath(relativePath) {
+  return relativePath.split('/').some((part) => part.startsWith('.'));
+}
+
 test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-runtime-resources-'));
   const sourceRoot = join(root, 'src-tauri');
@@ -23,8 +27,12 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
 
   writeFixture(sourceRoot, 'binaries/ffmpeg', 'ffmpeg');
   writeFixture(sourceRoot, 'binaries/ffprobe', 'ffprobe');
+  writeFixture(sourceRoot, 'binaries/.gitignore', 'ignored-binary');
+  writeFixture(sourceRoot, 'binaries/.hidden/tool', 'hidden-tool');
   writeFixture(sourceRoot, 'voice-worker/autolive-voice-clone-worker', 'worker');
   writeFixture(sourceRoot, 'voice-models/huggingface/hub/model.bin', 'model');
+  writeFixture(sourceRoot, 'voice-models/.agent_harnesses.json', 'agent-metadata');
+  writeFixture(sourceRoot, 'voice-models/.hidden/model.bin', 'hidden-model');
   const chunkedModel = Buffer.alloc(64 * 1024 + 1, 0x5a);
   writeFixture(sourceRoot, 'voice-models/huggingface/hub/large-model.bin', chunkedModel);
   writeFixture(sourceRoot, 'voice-models/huggingface/hub/.locks/active.lock', 'lock');
@@ -54,6 +62,27 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
     false,
   );
   assert.equal(existsSync(join(sourceRoot, 'voice-models/huggingface/hub/.locks')), true);
+  assert.equal(existsSync(join(sourceRoot, 'binaries/.gitignore')), true);
+  assert.equal(existsSync(join(sourceRoot, 'binaries/.hidden/tool')), true);
+  assert.equal(existsSync(join(sourceRoot, 'voice-models/.agent_harnesses.json')), true);
+  assert.equal(existsSync(join(sourceRoot, 'voice-models/.hidden/model.bin')), true);
+  assert.equal(
+    existsSync(join(outputRoot, 'autolive-resources/v0.1.0/aarch64-apple-darwin/binaries/.gitignore')),
+    false,
+  );
+  assert.equal(
+    existsSync(join(outputRoot, 'autolive-resources/v0.1.0/aarch64-apple-darwin/binaries/.hidden')),
+    false,
+  );
+  assert.equal(
+    existsSync(join(outputRoot, 'autolive-resources/v0.1.0/common/voice-models/.agent_harnesses.json')),
+    false,
+  );
+  assert.equal(
+    existsSync(join(outputRoot, 'autolive-resources/v0.1.0/common/voice-models/.hidden')),
+    false,
+  );
+  assert.equal(result.manifest.files.some((file) => hasHiddenPath(file.relative_path)), false);
   assert.deepEqual(
     result.manifest.files.map((file) => file.relative_path),
     [
@@ -94,6 +123,7 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
   assert.equal(targetInventory.schema, 1);
   assert.equal(targetInventory.release, 'v0.1.0');
   assert.equal(targetInventory.scope, 'aarch64-apple-darwin');
+  assert.equal(targetInventory.files.some((file) => hasHiddenPath(file.relative_path)), false);
   assert.deepEqual(targetInventory.files, [
     {
       relative_path: 'binaries/ffmpeg',
@@ -114,6 +144,11 @@ test('生成发布副本、裁剪缓存目录并写入精确清单', () => {
       sha256: createHash('sha256').update('worker').digest('hex'),
     },
   ]);
+
+  const commonInventory = JSON.parse(
+    readFileSync(join(outputRoot, 'autolive-resources/v0.1.0/common', DEPLOY_INVENTORY), 'utf8'),
+  );
+  assert.equal(commonInventory.files.some((file) => hasHiddenPath(file.relative_path)), false);
 });
 
 test('公共模型任务可单独生成部署 inventory 且不含缓存重复项', () => {
@@ -121,6 +156,8 @@ test('公共模型任务可单独生成部署 inventory 且不含缓存重复项
   const sourceRoot = join(root, 'src-tauri');
   const outputRoot = join(root, 'output');
   writeFixture(sourceRoot, 'voice-models/model.bin', 'model');
+  writeFixture(sourceRoot, 'voice-models/.agent_harnesses.json', 'agent-metadata');
+  writeFixture(sourceRoot, 'voice-models/.hidden/model.bin', 'hidden-model');
   writeFixture(sourceRoot, 'voice-models/.locks/model.lock', 'lock');
   writeFixture(sourceRoot, 'voice-models/blobs/model.bin', 'duplicate');
 
@@ -128,8 +165,13 @@ test('公共模型任务可单独生成部署 inventory 且不含缓存重复项
 
   assert.equal(readFileSync(join(result.commonRoot, 'voice-models/model.bin'), 'utf8'), 'model');
   assert.equal(existsSync(join(result.commonRoot, 'voice-models/.locks')), false);
+  assert.equal(existsSync(join(result.commonRoot, 'voice-models/.agent_harnesses.json')), false);
+  assert.equal(existsSync(join(result.commonRoot, 'voice-models/.hidden')), false);
   assert.equal(existsSync(join(result.commonRoot, 'voice-models/blobs')), false);
+  assert.equal(existsSync(join(sourceRoot, 'voice-models/.agent_harnesses.json')), true);
+  assert.equal(existsSync(join(sourceRoot, 'voice-models/.hidden/model.bin')), true);
   const inventory = JSON.parse(readFileSync(join(result.commonRoot, DEPLOY_INVENTORY), 'utf8'));
+  assert.equal(inventory.files.some((file) => hasHiddenPath(file.relative_path)), false);
   assert.deepEqual(inventory, {
     schema: 1,
     release: 'v0.1.0',

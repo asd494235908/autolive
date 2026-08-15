@@ -22,15 +22,14 @@ function assertSupportedTarget(target) {
   }
 }
 
-function removeReleaseCacheEntries(root) {
+function removeReleaseExcludedEntries(root) {
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     const path = join(root, entry.name);
-    if (entry.isDirectory()) {
-      if (['.locks', 'trees', 'blobs'].includes(entry.name)) {
-        rmSync(path, { recursive: true, force: true });
-      } else {
-        removeReleaseCacheEntries(path);
-      }
+    if (entry.name.startsWith('.')) {
+      rmSync(path, { recursive: true, force: true });
+    } else if (entry.isDirectory()) {
+      if (['trees', 'blobs'].includes(entry.name)) rmSync(path, { recursive: true, force: true });
+      else removeReleaseExcludedEntries(path);
     } else if (entry.isFile() && entry.name.endsWith('.log')) {
       rmSync(path, { force: true });
     }
@@ -83,7 +82,7 @@ function copyComponentFiles({ target, sourceRoot, outputRoot }) {
     const source = join(sourceRoot, name);
     const destination = join(releaseRoot, scope, name);
     cpSync(source, destination, { recursive: true, dereference: true });
-    removeReleaseCacheEntries(destination);
+    removeReleaseExcludedEntries(destination);
     return releaseFiles(destination, executable).map((file) => ({
       ...file,
       component,
@@ -144,7 +143,7 @@ export function buildRuntimeCommonRelease({
   const destination = join(commonRoot, 'voice-models');
   rmSync(commonRoot, { recursive: true, force: true });
   cpSync(join(sourceRoot, 'voice-models'), destination, { recursive: true, dereference: true });
-  removeReleaseCacheEntries(destination);
+  removeReleaseExcludedEntries(destination);
   writeDeploymentInventory(commonRoot, 'common');
   return { commonRoot };
 }

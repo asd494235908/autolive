@@ -172,6 +172,14 @@ test('Task 6 用 forced-command dispatcher 同时约束 rrsync 写入和精确�
   assert.match(task6, /旧 run staging 绝不能被新 run 复用或合并/);
   assert.match(
     task6,
+    /发布树生成隔离副本时递归删除所有名称以 `\.` 开头的文件和目录，sourceRoot 保持不变/,
+  );
+  assert.match(
+    task6,
+    /`autolive-deploy-inventory\.json` 是 `validate_complete_inventory` 唯一允许但不自列的部署元数据；除此之外任何额外文件都必须 fail-closed/,
+  );
+  assert.match(
+    task6,
     /重复发布返回成功后，CI 的 scope 循环继续处理后续 scope/,
   );
   assert.match(task6, /禁止普通登录 shell/);
