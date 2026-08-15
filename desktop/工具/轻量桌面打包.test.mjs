@@ -37,7 +37,7 @@ test('Tauri 只打包内置运行资源清单', () => {
 test('Windows 与 macOS 都使用原生 Tauri bundle', () => {
   const expected = ['build', '--config', 'src-tauri/tauri.conf.json'];
 
-  assert.match(tauriBuildArguments.toString(), /^function tauriBuildArguments\(\)/);
+  assert.equal(tauriBuildArguments.length, 0);
   assert.deepEqual(tauriBuildArguments(), expected);
 });
 
@@ -121,6 +121,10 @@ test('CI 仅手动 main 部署已构建产物，强制 host key 并不覆盖已�
   assert.match(deployJob, /publish-runtime-resources/);
   assert.match(
     deployJob,
+    /for scope in common x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do[\s\S]*?"publish-runtime-resources \$RELEASE_VERSION \$scope"[\s\S]*?done/,
+  );
+  assert.match(
+    deployJob,
     /concurrency:\n\s+group: deploy-runtime-resources-\$\{\{ needs\.common-models\.outputs\.version \}\}\n\s+cancel-in-progress: false/,
   );
   assert.match(
@@ -137,9 +141,21 @@ test('Task 6 用 forced-command dispatcher 同时约束 rrsync 写入和精确�
     task6,
     /authorized_keys[^\n]*command="\/usr\/local\/sbin\/autolive-resource-deploy-dispatcher",restrict/,
   );
-  assert.match(task6, /exec \/usr\/bin\/rrsync -wo \/fs\/autolive-resources-staging/);
+  assert.match(
+    task6,
+    /exec \/usr\/bin\/rrsync -wo -no-overwrite -munge \/fs\/autolive-resources-staging/,
+  );
   assert.match(task6, /rsync --server[^\n]*<release>\/<scope>\//);
   assert.match(task6, /只允许精确的 `publish-runtime-resources <release> <scope>`/);
   assert.match(task6, /publisher[^\n]*flock[^\n]*发布锁/);
+  assert.match(task6, /发布前必须递归检查 staging，发现任何 symlink 立即失败/);
+  assert.match(
+    task6,
+    /destination 已存在时，必须逐文件比较 staging 与正式目录的相对路径、文件类型、大小和 SHA-256；完全一致时删除 staging 并返回成功，任何差异都必须 fail-closed/,
+  );
+  assert.match(
+    task6,
+    /重复发布返回成功后，CI 的 scope 循环继续处理后续 scope/,
+  );
   assert.match(task6, /禁止普通登录 shell/);
 });
