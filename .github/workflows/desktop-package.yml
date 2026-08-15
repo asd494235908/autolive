@@ -279,6 +279,7 @@ jobs:
           DEPLOY_PORT: ${{ secrets.AUTOLIVE_RESOURCE_DEPLOY_PORT }}
           DEPLOY_USER: ${{ secrets.AUTOLIVE_RESOURCE_DEPLOY_USER }}
           RELEASE_VERSION: ${{ needs.common-models.outputs.version }}
+          UPLOAD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           : "${DEPLOY_HOST:?AUTOLIVE_RESOURCE_DEPLOY_HOST is required}"
@@ -288,6 +289,10 @@ jobs:
             printf 'AUTOLIVE_RESOURCE_DEPLOY_PORT must be between 1 and 9999\n' >&2
             exit 1
           fi
+          if ! [[ "$UPLOAD_ID" =~ ^[1-9][0-9]*-[1-9][0-9]*$ ]]; then
+            printf 'upload id must be positive-integer-positive-integer\n' >&2
+            exit 1
+          fi
           ssh_dir="$RUNNER_TEMP/autolive-ssh"
           release_root="$RUNNER_TEMP/autolive-release"
           ssh_command="ssh -i $ssh_dir/key -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes -p $DEPLOY_PORT"
@@ -295,11 +300,11 @@ jobs:
             test -d "$release_root/$scope"
             rsync --archive --compress --ignore-existing --mkpath -e "$ssh_command" \
               "$release_root/$scope/" \
-              "$DEPLOY_USER@$DEPLOY_HOST:$RELEASE_VERSION/$scope/"
+              "$DEPLOY_USER@$DEPLOY_HOST:$UPLOAD_ID/$RELEASE_VERSION/$scope/"
             ssh -i "$ssh_dir/key" \
               -o "UserKnownHostsFile=$ssh_dir/known_hosts" \
               -o StrictHostKeyChecking=yes \
               -p "$DEPLOY_PORT" \
               "$DEPLOY_USER@$DEPLOY_HOST" \
-              "publish-runtime-resources $RELEASE_VERSION $scope"
+              "publish-runtime-resources $RELEASE_VERSION $scope $UPLOAD_ID"
           done

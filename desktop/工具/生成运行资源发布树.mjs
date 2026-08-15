@@ -14,6 +14,7 @@ export const RESOURCE_RELEASE = 'v0.1.0';
 export const RESOURCE_BASE_URL = 'http://101.96.208.132:7088/autolive-resources/v0.1.0/';
 
 const HASH_CHUNK_BYTES = 64 * 1024;
+const DEPLOY_INVENTORY = 'autolive-deploy-inventory.json';
 
 function assertSupportedTarget(target) {
   if (!target || !supportedTargets.has(target)) {
@@ -98,6 +99,21 @@ function writeJsonAtomically(path, value) {
   renameSync(temporaryPath, path);
 }
 
+function writeDeploymentInventory(scopeRoot, scope) {
+  const files = releaseFiles(scopeRoot, false)
+    .filter((file) => file.relative_path !== DEPLOY_INVENTORY)
+    .map(({ relative_path, sha256, size_bytes }) => ({
+      relative_path,
+      type: 'regular-file',
+      size_bytes,
+      sha256,
+    }))
+    .sort((left, right) => left.relative_path.localeCompare(right.relative_path));
+  const inventory = { schema: 1, release: RESOURCE_RELEASE, scope, files };
+  writeJsonAtomically(join(scopeRoot, DEPLOY_INVENTORY), inventory);
+  return inventory;
+}
+
 export function buildRuntimeResourceRelease({
   target = process.env.AUTOLIVE_TARGET_TRIPLE,
   sourceRoot = join(desktopRoot, 'src-tauri'),
@@ -114,7 +130,10 @@ export function buildRuntimeResourceRelease({
     files: files.sort((left, right) => left.relative_path.localeCompare(right.relative_path)),
   };
   writeJsonAtomically(manifestPath, manifest);
-  return { manifestPath, releaseRoot: join(outputRoot, 'autolive-resources', RESOURCE_RELEASE), manifest };
+  const releaseRoot = join(outputRoot, 'autolive-resources', RESOURCE_RELEASE);
+  writeDeploymentInventory(join(releaseRoot, target), target);
+  writeDeploymentInventory(join(releaseRoot, 'common'), 'common');
+  return { manifestPath, releaseRoot, manifest };
 }
 
 export function buildRuntimeCommonRelease({
@@ -126,6 +145,7 @@ export function buildRuntimeCommonRelease({
   rmSync(commonRoot, { recursive: true, force: true });
   cpSync(join(sourceRoot, 'voice-models'), destination, { recursive: true, dereference: true });
   removeReleaseCacheEntries(destination);
+  writeDeploymentInventory(commonRoot, 'common');
   return { commonRoot };
 }
 

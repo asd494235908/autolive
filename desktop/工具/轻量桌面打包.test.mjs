@@ -85,12 +85,20 @@ test('CI 公共模型、目标运行资源和桌面包分层且避免 OpenMP 绕
   assert.equal((workflow.match(/^  common-models:$/gm) ?? []).length, 1);
   assert.match(workflow, /^  common-models:\n(?:.|\n)*?runs-on: ubuntu-latest/m);
   assert.match(workflow, /name: runtime-common-\$\{\{ steps\.desktop-version\.outputs\.version \}\}/);
+  assert.match(
+    workflow,
+    /path: desktop\/resource-release\/autolive-resources\/v0\.1\.0\/common\/\*\*/,
+  );
   assert.match(workflow, /needs: common-models/);
   assert.match(workflow, /tauri:build:prepared-resources/);
   assert.match(workflow, /准备语音模型资源\.mjs --assert-prepared/);
   assert.match(
     workflow,
     /name: runtime-resources-\$\{\{ steps\.desktop-version\.outputs\.version \}\}-\$\{\{ matrix\.target_triple \}\}/,
+  );
+  assert.match(
+    workflow,
+    /path: desktop\/resource-release\/autolive-resources\/v0\.1\.0\/\$\{\{ matrix\.target_triple \}\}\/\*\*/,
   );
   assert.match(
     workflow,
@@ -113,15 +121,20 @@ test('CI 仅手动 main 部署已构建产物，强制 host key 并不覆盖已�
   assert.match(deployJob, /AUTOLIVE_RESOURCE_DEPLOY_HOST_KEY/);
   assert.match(deployJob, /StrictHostKeyChecking=yes/);
   assert.match(deployJob, /rsync --archive --compress --ignore-existing --mkpath/);
+  assert.match(deployJob, /UPLOAD_ID: \$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/);
   assert.match(
     deployJob,
-    /"\$DEPLOY_USER@\$DEPLOY_HOST:\$RELEASE_VERSION\/\$scope\/"/,
+    /if ! \[\[ "\$UPLOAD_ID" =~ \^\[1-9\]\[0-9\]\*-\[1-9\]\[0-9\]\*\$ \]\]; then[\s\S]*?exit 1[\s\S]*?fi/,
+  );
+  assert.match(
+    deployJob,
+    /"\$DEPLOY_USER@\$DEPLOY_HOST:\$UPLOAD_ID\/\$RELEASE_VERSION\/\$scope\/"/,
   );
   assert.doesNotMatch(deployJob, /:\/fs\/autolive-resources-staging/);
   assert.match(deployJob, /publish-runtime-resources/);
   assert.match(
     deployJob,
-    /for scope in common x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do[\s\S]*?"publish-runtime-resources \$RELEASE_VERSION \$scope"[\s\S]*?done/,
+    /for scope in common x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do[\s\S]*?"publish-runtime-resources \$RELEASE_VERSION \$scope \$UPLOAD_ID"[\s\S]*?done/,
   );
   assert.match(
     deployJob,
@@ -145,14 +158,18 @@ test('Task 6 用 forced-command dispatcher 同时约束 rrsync 写入和精确�
     task6,
     /exec \/usr\/bin\/rrsync -wo -no-overwrite -munge \/fs\/autolive-resources-staging/,
   );
-  assert.match(task6, /rsync --server[^\n]*<release>\/<scope>\//);
-  assert.match(task6, /只允许精确的 `publish-runtime-resources <release> <scope>`/);
+  assert.match(task6, /rsync --server[^\n]*<upload-id>\/<release>\/<scope>\//);
+  assert.match(task6, /只允许精确的 `publish-runtime-resources <release> <scope> <upload-id>`/);
+  assert.match(task6, /upload-id[^\n]*`\^\[1-9\]\[0-9\]\*-\[1-9\]\[0-9\]\*\$`/);
   assert.match(task6, /publisher[^\n]*flock[^\n]*发布锁/);
-  assert.match(task6, /发布前必须递归检查 staging，发现任何 symlink 立即失败/);
+  assert.match(task6, /run-scoped source[^\n]*原子重命名[^\n]*private candidate/);
+  assert.match(task6, /candidate[^\n]*任何 symlink[^\n]*失败/);
   assert.match(
     task6,
-    /destination 已存在时，必须逐文件比较 staging 与正式目录的相对路径、文件类型、大小和 SHA-256；完全一致时删除 staging 并返回成功，任何差异都必须 fail-closed/,
+    /按 `autolive-deploy-inventory.json`[^\n]*相对路径、regular-file 类型、大小和 SHA-256[^\n]*拒绝缺失文件和额外文件/,
   );
+  assert.match(task6, /校验成功后删除 candidate 中的 inventory/);
+  assert.match(task6, /旧 run staging 绝不能被新 run 复用或合并/);
   assert.match(
     task6,
     /重复发布返回成功后，CI 的 scope 循环继续处理后续 scope/,
