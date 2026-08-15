@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, cpSync, mkdirSync, openSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -11,7 +11,9 @@ const supportedTargets = new Set([
 ]);
 
 export const RESOURCE_RELEASE = 'v0.1.0';
-export const RESOURCE_BASE_URL = 'http://101.96.208.132:7088/autolive-resources/v0.1.0';
+export const RESOURCE_BASE_URL = 'http://101.96.208.132:7088/autolive-resources/v0.1.0/';
+
+const HASH_CHUNK_BYTES = 64 * 1024;
 
 function assertSupportedTarget(target) {
   if (!target || !supportedTargets.has(target)) {
@@ -34,6 +36,21 @@ function removeReleaseCacheEntries(root) {
   }
 }
 
+function hashFile(path) {
+  const descriptor = openSync(path, 'r');
+  const buffer = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
+  const hash = createHash('sha256');
+  try {
+    for (;;) {
+      const bytesRead = readSync(descriptor, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) return hash.digest('hex');
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 function releaseFiles(root, executable, componentRoot = root) {
   const files = [];
   for (const entry of readdirSync(root, { withFileTypes: true })) {
@@ -43,8 +60,8 @@ function releaseFiles(root, executable, componentRoot = root) {
     } else if (entry.isFile()) {
       files.push({
         relative_path: relative(componentRoot, path).replaceAll('\\', '/'),
-        sha256: createHash('sha256').update(readFileSync(path)).digest('hex'),
-        size: statSync(path).size,
+        sha256: hashFile(path),
+        size_bytes: statSync(path).size,
         executable,
       });
     }
