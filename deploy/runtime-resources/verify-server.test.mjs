@@ -244,6 +244,22 @@ test('Caddy 和 systemd 契约固定只读静态服务与收敛权限', () => {
   ]) assert.match(unit, new RegExp(line.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 
+test('部署身份使用锁定密码的 /bin/sh，并依赖 forced-command restrict', () => {
+  const readme = readFileSync(join(deployRoot, 'README.md'), 'utf8');
+  assert.match(readme, /useradd[^\n]*--shell \/bin\/sh[^\n]*autolive-deploy/);
+  assert.match(readme, /usermod --shell \/bin\/sh autolive-deploy/);
+  assert.match(readme, /passwd -l autolive-deploy/);
+  assert.match(readme, /PasswordAuthentication no/);
+  assert.match(readme, /KbdInteractiveAuthentication no/);
+  assert.match(readme, /PermitTTY no/);
+  assert.match(readme, /AllowAgentForwarding no/);
+  assert.match(readme, /AllowTcpForwarding no/);
+  assert.match(readme, /X11Forwarding no/);
+  assert.match(readme, /command="\/usr\/local\/sbin\/autolive-resource-deploy-dispatcher",restrict/);
+  assert.match(readme, /restrict[^\n]*(?:PTY|终端)[^\n]*(?:转发|forwarding)/i);
+  assert.match(readme, /不要使用[^\n]*\/usr\/sbin\/nologin/);
+});
+
 test('dispatcher 只允许受限 rsync 和精确 publisher 命令', () => {
   const root = testRoot();
   const rrsyncMarker = join(root, 'rrsync.called');

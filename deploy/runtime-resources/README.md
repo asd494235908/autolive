@@ -9,13 +9,33 @@
 - 上传 staging 为 `/fs/autolive-resources-staging/<upload-id>/v0.1.0/<scope>/`，发布成功后才会原子移动到正式目录。
 - `/fs/autolive-resources-staging` 与 `/fs/autolive-resources` 必须位于同一文件系统；publisher 启动时用设备号检查，不一致会 fail-closed。
 - Caddy 使用无登录的 `autolive-resources:autolive-resources` 用户/组，只读正式目录，日志写入 `/var/log/autolive-resources`；systemd unit 使用 `LogsDirectory=autolive-resources` 创建并管理该目录的权限。
-- 发布密钥使用无登录的 `autolive-deploy` 身份，只允许 forced command dispatcher；该身份只写 staging 和已授权的发布路径，不允许普通 shell。`autolive-deploy` 必须加入 `autolive-resources` 组。
-- `authorized_keys` 应使用 `command="/usr/local/sbin/autolive-resource-deploy-dispatcher",restrict`，并单独保存部署私钥和服务器 host key。私钥、密码、Token 不得写入仓库、日志或聊天记录。
+- 发布密钥使用受限的 `autolive-deploy` 身份，只允许 forced command dispatcher；该身份只写 staging 和已授权的发布路径，不允许普通 shell 登录。账户执行壳固定为 `/bin/sh`，仅供 OpenSSH 在执行 forced command 前启动，密码必须锁定。`autolive-deploy` 必须加入 `autolive-resources` 组。
+- `authorized_keys` 中的每个部署 key 都必须使用 `command="/usr/local/sbin/autolive-resource-deploy-dispatcher",restrict`，并单独保存部署私钥和服务器 host key；`restrict` 禁止 PTY、agent/X11/port 转发。不要给该用户配置第二个未受限 key。私钥、密码、Token 不得写入仓库、日志或聊天记录。
 
 ## 本地安装顺序
 
 1. 在本地下载并校验官方预构建 Caddy 二进制，安装为 `/usr/local/lib/autolive-resources/caddy`，不要在服务器编译 Caddy。
-2. 安装本目录的 `Caddyfile`、`autolive-resources.service`、`autolive-resource-deploy-dispatcher` 和 `publish-runtime-resources` 到对应的 `/etc`、`/usr/local/sbin` 路径，并设置 root 可写、部署身份可执行的权限。
+2. 创建受限部署身份并安装本目录的 `Caddyfile`、`autolive-resources.service`、`autolive-resource-deploy-dispatcher` 和 `publish-runtime-resources` 到对应的 `/etc`、`/usr/local/sbin` 路径，并设置 root 可写、部署身份可执行的权限。账户不存在时执行 `useradd`，已存在时用 `usermod` 修正执行壳；不要使用 `/usr/sbin/nologin`，因为 OpenSSH 需要在 forced command 前启动该壳：
+
+   ```sh
+   sudo useradd --system --no-create-home --shell /bin/sh autolive-deploy
+   sudo usermod --shell /bin/sh autolive-deploy
+   sudo passwd -l autolive-deploy
+   ```
+
+   在 `/etc/ssh/sshd_config.d/autolive-deploy.conf` 使用按用户限制，并 reload sshd：
+
+   ```text
+   Match User autolive-deploy
+       PasswordAuthentication no
+       KbdInteractiveAuthentication no
+       PermitTTY no
+       AllowAgentForwarding no
+       AllowTcpForwarding no
+       X11Forwarding no
+   ```
+
+   该用户只能通过带有上述 `command=...,restrict` 的 `authorized_keys` 执行 dispatcher，不能把 `/bin/sh` 作为普通登录入口。
 3. 从 rsync 官方源码包提取 `support/rrsync`，不要使用 Debian 自带的 `/usr/bin/rrsync`：
 
    `https://download.samba.org/pub/rsync/src/rsync-3.4.4.tar.gz`
