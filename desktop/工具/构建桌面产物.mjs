@@ -2,16 +2,27 @@ import { spawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { archiveDesktopArtifacts } from './归档桌面产物.mjs';
+import { archiveDesktopArtifacts, detectTargetTriple } from './归档桌面产物.mjs';
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
-export function tauriBuildArguments() {
-  return ['build', '--config', 'src-tauri/tauri.conf.json'];
+export function tauriBuildArguments(
+  targetTriple = process.env.AUTOLIVE_TARGET_TRIPLE?.trim() || detectTargetTriple(),
+) {
+  const argumentsList = ['build', '--config', 'src-tauri/tauri.conf.json'];
+  if (targetTriple === 'x86_64-pc-windows-msvc') {
+    argumentsList.push('--bundles', 'nsis');
+    return argumentsList;
+  }
+  const bundles = process.env.AUTOLIVE_BUNDLES?.trim();
+  if (bundles) argumentsList.push('--bundles', bundles);
+  return argumentsList;
 }
 
-export function buildDesktopArtifacts(targetTriple = process.env.AUTOLIVE_TARGET_TRIPLE?.trim()) {
-  const result = spawnSync('tauri', tauriBuildArguments(), {
+export function buildDesktopArtifacts(
+  targetTriple = process.env.AUTOLIVE_TARGET_TRIPLE?.trim() || detectTargetTriple(),
+) {
+  const result = spawnSync('tauri', tauriBuildArguments(targetTriple), {
     cwd: desktopRoot,
     shell: process.platform === 'win32',
     stdio: 'inherit',

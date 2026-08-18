@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,6 +13,10 @@ import { readDesktopVersion } from './桌面版本.mjs';
 const script = fileURLToPath(new URL('./准备FFmpeg资源.mjs', import.meta.url));
 const archiveScript = fileURLToPath(new URL('./归档桌面产物.mjs', import.meta.url));
 const buildScript = fileURLToPath(new URL('./构建桌面产物.mjs', import.meta.url));
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
 
 test('缺少当前目标的 FFmpeg 文件时失败且不创建输出', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-ffmpeg-'));
@@ -64,11 +69,12 @@ test('Tauri scripts use the package binary lookup that works on Windows', () => 
 
   assert.match(packageJson.scripts['tauri:build'], /构建桌面产物\.mjs/);
   assert.match(buildSource, /'tauri'/);
-  assert.equal(tauriBuildArguments.length, 0);
-  assert.deepEqual(tauriBuildArguments(), [
+  assert.deepEqual(tauriBuildArguments('x86_64-pc-windows-msvc'), [
     'build',
     '--config',
     'src-tauri/tauri.conf.json',
+    '--bundles',
+    'nsis',
   ]);
   assert.doesNotMatch(`${packageJson.scripts['tauri:dev']}\n${buildSource}`, /\.\/ui\/node_modules\/\.bin\/tauri/);
 });
@@ -101,30 +107,52 @@ test('归档脚本按版本和目标平台目录保存 bundle', () => {
   assert.throws(() => statSync(join(output, release, 'aarch64-apple-darwin', 'macos')));
 });
 
-test('Windows 正式包归档原生 Tauri bundle', () => {
+test('Windows 正式包归档 NSIS EXE 和 Tauri portable', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-package-'));
-  const source = join(root, 'bundle');
+  const executable = join(root, 'target', 'release', 'autolive-desktop-core.exe');
+  const manifest = join(root, 'runtime-resources.json');
+  const embedded = join(root, 'embedded-runtime-resources');
+  const bundleSource = join(root, 'target', 'release', 'bundle');
   const output = join(root, 'package');
   const { release } = readDesktopVersion();
-  mkdirSync(join(source, 'msi'), { recursive: true });
-  mkdirSync(join(source, 'macos', 'autolive.app'), { recursive: true });
-  writeFileSync(join(source, 'msi', 'autolive.msi'), 'app-test');
-  writeFileSync(join(source, 'macos', 'autolive.app', 'Contents.txt'), 'not-an-installer');
+  mkdirSync(join(root, 'target', 'release'), { recursive: true });
+  mkdirSync(join(bundleSource, 'nsis'), { recursive: true });
+  mkdirSync(join(embedded, 'x86_64-pc-windows-msvc', 'binaries'), { recursive: true });
+  writeFileSync(executable, 'app-test');
+  writeFileSync(join(bundleSource, 'nsis', 'autolive-setup.exe'), 'setup-test');
+  writeFileSync(join(embedded, 'x86_64-pc-windows-msvc', 'binaries', 'ffmpeg.exe'), 'ffmpeg');
+  writeFileSync(manifest, JSON.stringify({
+    schema_version: 1,
+    release,
+    target: 'x86_64-pc-windows-msvc',
+    files: [{
+      relative_path: 'x86_64-pc-windows-msvc/binaries/ffmpeg.exe',
+      size_bytes: 6,
+      sha256: sha256('ffmpeg'),
+      component: 'media',
+      executable: true,
+    }],
+  }));
 
   const result = spawnSync(process.execPath, [archiveScript], {
     env: {
       ...process.env,
-      AUTOLIVE_BUNDLE_SOURCE_DIR: source,
+      AUTOLIVE_RELEASE_EXECUTABLE: executable,
+      AUTOLIVE_RUNTIME_RESOURCE_MANIFEST: manifest,
+      AUTOLIVE_EMBEDDED_RESOURCE_DIR: embedded,
+      AUTOLIVE_BUNDLE_SOURCE_DIR: bundleSource,
       AUTOLIVE_PACKAGE_ROOT: output,
       AUTOLIVE_TARGET_TRIPLE: 'x86_64-pc-windows-msvc',
+      AUTOLIVE_SKIP_PORTABLE_ZIP: '1',
     },
     encoding: 'utf8',
   });
 
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
   const bundle = join(output, release, 'x86_64-pc-windows-msvc');
-  assert.equal(readFileSync(join(bundle, 'msi', 'autolive.msi'), 'utf8'), 'app-test');
-  assert.throws(() => statSync(join(bundle, 'macos')));
+  assert.equal(readFileSync(join(bundle, 'portable', 'autolive-desktop-core.exe'), 'utf8'), 'app-test');
+  assert.equal(readFileSync(join(bundle, 'nsis', 'autolive-setup.exe'), 'utf8'), 'setup-test');
+  assert.throws(() => statSync(join(bundle, 'msi')));
 });
 
 test('GitHub workflow uploads the versioned package directory', () => {

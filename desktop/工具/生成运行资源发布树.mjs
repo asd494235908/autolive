@@ -14,6 +14,7 @@ const supportedTargets = new Set([
 
 export const RESOURCE_RELEASE = readDesktopVersion().release;
 export const RESOURCE_BASE_URL = `http://101.96.208.132:7088/autolive-resources/${RESOURCE_RELEASE}/`;
+export const EMBEDDED_RESOURCE_DIRECTORY = 'embedded-runtime-resources';
 
 const HASH_CHUNK_BYTES = 64 * 1024;
 const DEPLOY_INVENTORY = 'autolive-deploy-inventory.json';
@@ -78,8 +79,6 @@ function copyComponentFiles({ target, sourceRoot, outputRoot }) {
   const releaseRoot = join(outputRoot, 'autolive-resources', RESOURCE_RELEASE);
   const components = [
     { name: 'binaries', scope: target, executable: true, component: 'media' },
-    { name: 'voice-worker', scope: target, executable: true, component: 'voice-runtime' },
-    { name: 'voice-models', scope: 'common', executable: false, component: 'voice-models' },
   ];
 
   rmSync(releaseRoot, { recursive: true, force: true });
@@ -118,6 +117,17 @@ function writeDeploymentInventory(scopeRoot, scope) {
   return inventory;
 }
 
+function stageEmbeddedResourceTree({ releaseRoot, sourceRoot, target }) {
+  const embeddedRoot = join(sourceRoot, EMBEDDED_RESOURCE_DIRECTORY);
+  rmSync(embeddedRoot, { recursive: true, force: true });
+  mkdirSync(embeddedRoot, { recursive: true });
+  cpSync(join(releaseRoot, target), join(embeddedRoot, target), {
+    recursive: true,
+    dereference: true,
+  });
+  return embeddedRoot;
+}
+
 export function buildRuntimeResourceRelease({
   target = process.env.AUTOLIVE_TARGET_TRIPLE,
   sourceRoot = join(desktopRoot, 'src-tauri'),
@@ -135,30 +145,12 @@ export function buildRuntimeResourceRelease({
   };
   writeJsonAtomically(manifestPath, manifest);
   const releaseRoot = join(outputRoot, 'autolive-resources', RESOURCE_RELEASE);
+  const embeddedRoot = stageEmbeddedResourceTree({ releaseRoot, sourceRoot, target });
   writeDeploymentInventory(join(releaseRoot, target), target);
-  writeDeploymentInventory(join(releaseRoot, 'common'), 'common');
-  return { manifestPath, releaseRoot, manifest };
-}
-
-export function buildRuntimeCommonRelease({
-  sourceRoot = join(desktopRoot, 'src-tauri'),
-  outputRoot = join(desktopRoot, 'resource-release'),
-} = {}) {
-  const commonRoot = join(outputRoot, 'autolive-resources', RESOURCE_RELEASE, 'common');
-  const destination = join(commonRoot, 'voice-models');
-  rmSync(commonRoot, { recursive: true, force: true });
-  cpSync(join(sourceRoot, 'voice-models'), destination, { recursive: true, dereference: true });
-  removeReleaseExcludedEntries(destination);
-  writeDeploymentInventory(commonRoot, 'common');
-  return { commonRoot };
+  return { manifestPath, releaseRoot, embeddedRoot, manifest };
 }
 
 function main() {
-  if (process.argv.includes('--common-only')) {
-    const result = buildRuntimeCommonRelease();
-    console.log(`已生成公共运行资源发布树：${result.commonRoot}`);
-    return;
-  }
   const result = buildRuntimeResourceRelease();
   console.log(`已生成运行资源发布树：${result.releaseRoot}`);
 }

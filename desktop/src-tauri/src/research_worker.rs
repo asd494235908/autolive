@@ -4,6 +4,7 @@
 //! 报告契约、取消/超时、staging 和输出提交。该模块不实现隐形标记、鲁棒性
 //! 分析或随机扰动算法，也不把分析结果当作平台规避能力。
 
+use crate::background_process::background_command;
 use crate::cancellation::CancellationToken;
 use crate::errors::FileHashError;
 use crate::hashing::hash_file_at_path;
@@ -13,7 +14,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -254,7 +255,7 @@ pub fn run_research(
         .output_mp4_path
         .as_ref()
         .map(|path| partial_path(path, "mp4"));
-    let mut child = Command::new(&request.research_executable);
+    let mut child = background_command(&request.research_executable);
     child
         .arg("--input-mp4")
         .arg(&request.input_mp4_path)
@@ -587,7 +588,7 @@ fn windows_taskkill_args(pid: u32) -> Vec<String> {
 fn terminate_child(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
-        let _ignored = Command::new("taskkill")
+        let _ignored = background_command("taskkill")
             .args(windows_taskkill_args(child.id()))
             .stdout(Stdio::null())
             .stderr(Stdio::null())

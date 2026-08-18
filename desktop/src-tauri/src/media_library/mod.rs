@@ -1,3 +1,4 @@
+use crate::background_process::background_command;
 use crate::cancellation::CancellationToken;
 use crate::errors::MediaLibraryError;
 use mp4::{ChannelConfig, Mp4Reader, TrackType};
@@ -5,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,9 @@ use std::time::{Duration, Instant};
 use std::os::unix::process::CommandExt;
 
 const MAX_FFPROBE_OUTPUT_BYTES: u64 = 256 * 1024;
+pub const SUPPORTED_SOURCE_VIDEO_EXTENSIONS: [&str; 11] = [
+    "mp4", "mov", "mkv", "avi", "webm", "m4v", "ts", "m2ts", "flv", "wmv", "3gp",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaProbeRequestDto {
@@ -57,7 +61,7 @@ pub fn probe_user_selected_mp4(
     request: &MediaProbeRequestDto,
     cancellation: &CancellationToken,
 ) -> Result<MediaProbeResultDto, MediaLibraryError> {
-    let resolved = resolve_user_selected_file(&request.path, cancellation)?;
+    let resolved = resolve_user_selected_file(&request.path, &["mp4"], cancellation)?;
     let metadata = probe_mp4_metadata(&resolved, cancellation)?;
 
     Ok(MediaProbeResultDto {
@@ -98,16 +102,40 @@ struct FfprobeMediaStream {
 
 #[derive(Debug, Deserialize)]
 struct FfprobeMediaFormat {
+    format_name: Option<String>,
     duration: Option<String>,
 }
 
+pub fn probe_user_selected_video_with_ffprobe(
+    request: &MediaProbeRequestDto,
+    ffprobe_path: &Path,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> Result<MediaProbeResultDto, MediaLibraryError> {
+    probe_user_selected_video_with_ffprobe_impl(request, ffprobe_path, timeout_ms, cancellation)
+}
+
+/// 保留旧函数名，兼容仍按历史 MP4 入口调用的消费者。
 pub fn probe_user_selected_mp4_with_ffprobe(
     request: &MediaProbeRequestDto,
     ffprobe_path: &Path,
     timeout_ms: u64,
     cancellation: &CancellationToken,
 ) -> Result<MediaProbeResultDto, MediaLibraryError> {
-    let resolved = resolve_user_selected_file(&request.path, cancellation)?;
+    probe_user_selected_video_with_ffprobe_impl(request, ffprobe_path, timeout_ms, cancellation)
+}
+
+fn probe_user_selected_video_with_ffprobe_impl(
+    request: &MediaProbeRequestDto,
+    ffprobe_path: &Path,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> Result<MediaProbeResultDto, MediaLibraryError> {
+    let resolved = resolve_user_selected_file(
+        &request.path,
+        &SUPPORTED_SOURCE_VIDEO_EXTENSIONS,
+        cancellation,
+    )?;
     let metadata =
         std::fs::metadata(&resolved).map_err(|_| MediaLibraryError::FileMetadataReadFailed {
             path: resolved.display().to_string(),
@@ -132,14 +160,14 @@ pub fn probe_user_selected_mp4_with_ffprobe(
         ));
     }
 
-    let mut command = Command::new(ffprobe_path);
+    let mut command = background_command(ffprobe_path);
     command
         .args([
             "-hide_banner",
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=codec_type,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels",
+            "format=format_name,duration:stream=codec_type,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels",
             "-of",
             "json",
         ])
@@ -176,7 +204,7 @@ pub fn probe_user_selected_mp4_with_ffprobe(
             let _ = stderr_reader.join();
             return Err(unreadable_ffprobe_error(
                 &resolved,
-                format!("读取视频信息超时（{timeout_ms}ms），请检查 MP4 文件是否完整"),
+                format!("读取视频信息超时（{timeout_ms}ms），请检查视频文件是否完整"),
             ));
         }
         match child.try_wait() {
@@ -203,14 +231,28 @@ pub fn probe_user_selected_mp4_with_ffprobe(
         .streams
         .iter()
         .find(|stream| stream.codec_type.as_deref() == Some("video"))
-        .ok_or_else(|| unreadable_ffprobe_error(&resolved, "MP4 中没有视频轨道".to_owned()))?;
+        .ok_or_else(|| unreadable_ffprobe_error(&resolved, "文件中没有视频轨道".to_owned()))?;
     let audio = output
         .streams
         .iter()
         .find(|stream| stream.codec_type.as_deref() == Some("audio"));
-    let duration_ms = output
+    let format = output
         .format
-        .and_then(|format| format.duration)
+        .ok_or_else(|| unreadable_ffprobe_error(&resolved, "FFprobe 未返回容器信息".to_owned()))?;
+    if format
+        .format_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .is_none()
+    {
+        return Err(unreadable_ffprobe_error(
+            &resolved,
+            "FFprobe 未识别出可读容器".to_owned(),
+        ));
+    }
+    let duration_ms = format
+        .duration
         .and_then(|duration| duration.parse::<f64>().ok())
         .filter(|duration| duration.is_finite() && *duration > 0.0)
         .map(|duration| (duration * 1_000.0).round() as u64);
@@ -292,7 +334,7 @@ fn parse_ffprobe_ratio(value: &str) -> Option<f64> {
 }
 
 fn unreadable_ffprobe_error(path: &Path, message: String) -> MediaLibraryError {
-    MediaLibraryError::UnreadableMp4Container {
+    MediaLibraryError::UnreadableVideoContainer {
         path: path.display().to_string(),
         message,
     }
@@ -302,13 +344,13 @@ fn terminate_probe_process(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let process_group = format!("-{}", child.id());
-        let _ = Command::new("/bin/kill")
+        let _ = background_command("/bin/kill")
             .args(["-KILL", process_group.as_str()])
             .status();
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let _ = background_command("taskkill")
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .status();
     }
@@ -342,7 +384,7 @@ fn probe_mp4_metadata(
         })?;
     let reader = BufReader::new(file);
     let mp4 = Mp4Reader::read_header(reader, file_size_bytes).map_err(|error| {
-        MediaLibraryError::UnreadableMp4Container {
+        MediaLibraryError::UnreadableVideoContainer {
             path: path.display().to_string(),
             message: error.to_string(),
         }
@@ -405,6 +447,7 @@ fn channel_count(config: ChannelConfig) -> u16 {
 
 fn resolve_user_selected_file(
     raw_path: &str,
+    supported_extensions: &[&str],
     cancellation: &CancellationToken,
 ) -> Result<PathBuf, MediaLibraryError> {
     if cancellation.is_cancelled() {
@@ -436,10 +479,18 @@ fn resolve_user_selected_file(
         .extension()
         .and_then(std::ffi::OsStr::to_str)
         .map(str::to_ascii_lowercase);
-    if extension.as_deref() != Some("mp4") {
+    if !extension
+        .as_deref()
+        .is_some_and(|value| supported_extensions.contains(&value))
+    {
         return Err(MediaLibraryError::UnsupportedExtension {
             path: canonical_path.display().to_string(),
             extension,
+            supported_extensions: if supported_extensions == ["mp4"] {
+                "mp4"
+            } else {
+                "mp4、mov、mkv、avi、webm、m4v、ts、m2ts、flv、wmv、3gp"
+            },
         });
     }
 
@@ -448,9 +499,11 @@ fn resolve_user_selected_file(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::probe_user_selected_video_with_ffprobe;
     use super::{
-        probe_user_selected_mp4, probe_user_selected_mp4_with_ffprobe, MediaProbeRequestDto,
-        MediaProbeResultDto, SourceMediaDto,
+        probe_user_selected_mp4, resolve_user_selected_file, MediaProbeRequestDto,
+        MediaProbeResultDto, SourceMediaDto, SUPPORTED_SOURCE_VIDEO_EXTENSIONS,
     };
     use crate::cancellation::CancellationToken;
     use crate::errors::MediaLibraryError;
@@ -556,19 +609,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ffprobe_import_reads_metadata_without_hashing_the_mp4() {
+    fn ffprobe_import_reads_metadata_for_non_mp4_source_without_hashing() {
         let directory = TestDir::new("ffprobe-import");
-        let input = directory.path().join("source.mp4");
+        let input = directory.path().join("source.mkv");
         let ffprobe = directory.path().join("ffprobe");
         fs::write(&input, b"not-read-by-the-fake-probe").expect("input should be written");
         create_executable_script(
             &ffprobe,
             r#"#!/bin/sh
-printf '%s' '{"streams":[{"codec_type":"video","width":720,"height":1280,"avg_frame_rate":"30/1"},{"codec_type":"audio","sample_rate":"44100","channels":2}],"format":{"duration":"72.3"}}'
+printf '%s' '{"streams":[{"codec_type":"video","width":720,"height":1280,"avg_frame_rate":"30/1"},{"codec_type":"audio","sample_rate":"44100","channels":2}],"format":{"format_name":"matroska,webm","duration":"72.3"}}'
 "#,
         );
 
-        let result = probe_user_selected_mp4_with_ffprobe(
+        let result = probe_user_selected_video_with_ffprobe(
             &MediaProbeRequestDto {
                 path: input.display().to_string(),
             },
@@ -597,7 +650,7 @@ printf '%s' '{"streams":[{"codec_type":"video","width":720,"height":1280,"avg_fr
         fs::write(&input, b"input").expect("input should be written");
         create_executable_script(&ffprobe, "#!/bin/sh\nwhile :; do :; done\n");
 
-        let result = probe_user_selected_mp4_with_ffprobe(
+        let result = probe_user_selected_video_with_ffprobe(
             &MediaProbeRequestDto {
                 path: input.display().to_string(),
             },
@@ -608,7 +661,7 @@ printf '%s' '{"streams":[{"codec_type":"video","width":720,"height":1280,"avg_fr
 
         assert!(matches!(
             result,
-            Err(MediaLibraryError::UnreadableMp4Container { message, .. })
+            Err(MediaLibraryError::UnreadableVideoContainer { message, .. })
                 if message.contains("超时")
         ));
     }
@@ -672,6 +725,34 @@ printf '%s' '{"streams":[{"codec_type":"video","width":720,"height":1280,"avg_fr
             result,
             Err(MediaLibraryError::UnsupportedExtension { .. })
         ));
+    }
+
+    #[test]
+    fn source_video_extensions_are_allowlisted_case_insensitively() {
+        let directory = TestDir::new("source-video-extensions");
+        for extension in SUPPORTED_SOURCE_VIDEO_EXTENSIONS {
+            let file_path = directory.path().join(format!("sample.{extension}"));
+            fs::write(&file_path, b"video fixture").expect("fixture should be written");
+            let resolved = resolve_user_selected_file(
+                &file_path.display().to_string(),
+                &SUPPORTED_SOURCE_VIDEO_EXTENSIONS,
+                &CancellationToken::new(),
+            )
+            .expect("allowlisted extension should be accepted");
+            assert_eq!(
+                resolved,
+                fs::canonicalize(file_path).expect("path should resolve")
+            );
+        }
+
+        let uppercase = directory.path().join("sample.MKV");
+        fs::write(&uppercase, b"video fixture").expect("fixture should be written");
+        assert!(resolve_user_selected_file(
+            &uppercase.display().to_string(),
+            &SUPPORTED_SOURCE_VIDEO_EXTENSIONS,
+            &CancellationToken::new(),
+        )
+        .is_ok());
     }
 
     #[test]

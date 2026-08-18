@@ -12,15 +12,11 @@ permissions:
   contents: read
 
 jobs:
-  common-models:
-    name: prepare common voice models
+  metadata:
+    name: read desktop metadata
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.desktop-version.outputs.version }}
-    env:
-      AUTOLIVE_TARGET_TRIPLE: aarch64-apple-darwin
-      AUTOLIVE_VOICE_PYTHON: python
-      AUTOLIVE_COQUI_TOS_AGREE: ${{ vars.AUTOLIVE_COQUI_TOS_AGREE }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -28,14 +24,6 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 22
-      - name: Setup Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: desktop/worker/requirements-voice-clone.txt
-      - name: Install voice clone model dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -r desktop/worker/requirements-voice-clone.txt
       - name: Read desktop version
         id: desktop-version
         shell: bash
@@ -43,25 +31,9 @@ jobs:
           set -euo pipefail
           version="$(node desktop/工具/桌面版本.mjs --release)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-      - name: Prepare shared voice models once on Linux
-        run: node desktop/工具/准备语音模型资源.mjs
-      - name: Generate pruned common runtime resources
-        run: node desktop/工具/生成运行资源发布树.mjs --common-only
-      - name: Verify common model artifact statically
-        env:
-          AUTOLIVE_VOICE_MODEL_OUTPUT_DIR: desktop/resource-release/autolive-resources/${{ steps.desktop-version.outputs.version }}/common/voice-models
-        run: node desktop/工具/准备语音模型资源.mjs --assert-prepared
-      - name: Upload common runtime resources
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-common-${{ steps.desktop-version.outputs.version }}
-          path: desktop/resource-release/autolive-resources/${{ steps.desktop-version.outputs.version }}/common/**
-          if-no-files-found: error
-          retention-days: 7
-
   package:
     name: package ${{ matrix.target_triple }}
-    needs: common-models
+    needs: metadata
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -85,8 +57,6 @@ jobs:
             archive_sha256: 061f9868559f2a276dfa770046cf665440b61ef683ec9e98bd45783d72bc02a1
     env:
       AUTOLIVE_TARGET_TRIPLE: ${{ matrix.target_triple }}
-      AUTOLIVE_VOICE_PYTHON: python
-      AUTOLIVE_COQUI_TOS_AGREE: ${{ vars.AUTOLIVE_COQUI_TOS_AGREE }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -105,22 +75,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target_triple }}
-      - name: Setup Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: desktop/worker/requirements-voice-clone-build.txt
-      - name: Install Intel macOS native packaging dependencies
-        if: matrix.target_triple == 'x86_64-apple-darwin'
-        shell: bash
-        run: |
-          set -euo pipefail
-          brew install opus
-          printf 'PKG_CONFIG_PATH=%s/lib/pkgconfig:%s\n' \
-            "$(brew --prefix opus)" "${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
-      - name: Install voice clone packaging dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -r desktop/worker/requirements-voice-clone-build.txt
       - name: Install desktop/ui dependencies
         env:
           npm_config_fetch_retries: '5'
@@ -136,13 +90,6 @@ jobs:
           set -euo pipefail
           version="$(node desktop/工具/桌面版本.mjs --release)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-      - name: Download prepared common models
-        uses: actions/download-artifact@v4
-        with:
-          name: runtime-common-${{ needs.common-models.outputs.version }}
-          path: desktop/src-tauri
-      - name: Verify downloaded models without loading model runtimes
-        run: node desktop/工具/准备语音模型资源.mjs --assert-prepared
       - name: Prepare FFmpeg resources (macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -230,32 +177,27 @@ jobs:
     name: deploy immutable runtime resources
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     needs:
-      - common-models
+      - metadata
       - package
     concurrency:
-      group: deploy-runtime-resources-${{ needs.common-models.outputs.version }}
+      group: deploy-runtime-resources-${{ needs.metadata.outputs.version }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
-      - name: Download common runtime resources
-        uses: actions/download-artifact@v4
-        with:
-          name: runtime-common-${{ needs.common-models.outputs.version }}
-          path: ${{ runner.temp }}/autolive-release/common
       - name: Download Intel macOS runtime resources
         uses: actions/download-artifact@v4
         with:
-          name: runtime-resources-${{ needs.common-models.outputs.version }}-x86_64-apple-darwin
+          name: runtime-resources-${{ needs.metadata.outputs.version }}-x86_64-apple-darwin
           path: ${{ runner.temp }}/autolive-release/x86_64-apple-darwin
       - name: Download Apple Silicon runtime resources
         uses: actions/download-artifact@v4
         with:
-          name: runtime-resources-${{ needs.common-models.outputs.version }}-aarch64-apple-darwin
+          name: runtime-resources-${{ needs.metadata.outputs.version }}-aarch64-apple-darwin
           path: ${{ runner.temp }}/autolive-release/aarch64-apple-darwin
       - name: Download Windows runtime resources
         uses: actions/download-artifact@v4
         with:
-          name: runtime-resources-${{ needs.common-models.outputs.version }}-x86_64-pc-windows-msvc
+          name: runtime-resources-${{ needs.metadata.outputs.version }}-x86_64-pc-windows-msvc
           path: ${{ runner.temp }}/autolive-release/x86_64-pc-windows-msvc
       - name: Configure resource deployment SSH key
         shell: bash
@@ -276,7 +218,7 @@ jobs:
           DEPLOY_HOST: ${{ secrets.AUTOLIVE_RESOURCE_DEPLOY_HOST }}
           DEPLOY_PORT: ${{ secrets.AUTOLIVE_RESOURCE_DEPLOY_PORT }}
           DEPLOY_USER: ${{ secrets.AUTOLIVE_RESOURCE_DEPLOY_USER }}
-          RELEASE_VERSION: ${{ needs.common-models.outputs.version }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
           UPLOAD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
@@ -294,7 +236,7 @@ jobs:
           ssh_dir="$RUNNER_TEMP/autolive-ssh"
           release_root="$RUNNER_TEMP/autolive-release"
           ssh_command="ssh -i $ssh_dir/key -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes -p $DEPLOY_PORT"
-          for scope in common x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+          for scope in x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
             test -d "$release_root/$scope"
             rsync --archive --compress --ignore-existing --mkpath -e "$ssh_command" \
               "$release_root/$scope/" \

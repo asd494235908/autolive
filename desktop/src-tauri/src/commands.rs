@@ -11,11 +11,12 @@ use autolive_desktop_core::interlude_player::{
 };
 use autolive_desktop_core::media_engine::{
     build_media_render_args, configured_media_engine_paths_with_resource_dir,
-    configured_media_engine_status_with_resource_dir, packaged_media_engine_paths, render_media,
-    target_triple, MediaEngineStatus, MediaRenderRequest, FFMPEG_PATH_ENV, FFPROBE_PATH_ENV,
+    configured_media_engine_status_with_resource_dir, render_media, target_triple,
+    MediaEngineStatus, MediaRenderRequest, FFMPEG_PATH_ENV, FFPROBE_PATH_ENV,
 };
 use autolive_desktop_core::media_library::{
-    probe_user_selected_mp4_with_ffprobe, MediaProbeRequestDto, MediaProbeResultDto, SourceMediaDto,
+    probe_user_selected_video_with_ffprobe, MediaProbeRequestDto, MediaProbeResultDto,
+    SourceMediaDto,
 };
 use autolive_desktop_core::research_params::{LocalResearchParams, ParameterValidationError};
 use autolive_desktop_core::research_worker::{
@@ -27,8 +28,8 @@ use autolive_desktop_core::runtime_resource_task::{
     RuntimeResourceTask, RuntimeResourceTaskShutdown,
 };
 use autolive_desktop_core::runtime_resources::{
-    RuntimeResourceComponent, RuntimeResourceInstaller, RuntimeResourceLayout,
-    RuntimeResourceState, RuntimeResourceStatus,
+    RuntimeResourceCatalog, RuntimeResourceComponent, RuntimeResourceInstaller,
+    RuntimeResourceLayout, RuntimeResourceRoots, RuntimeResourceState, RuntimeResourceStatus,
 };
 use autolive_desktop_core::speech_to_speech::SpeechToSpeechWorkerCapabilities;
 use autolive_desktop_core::speech_to_speech::{
@@ -41,26 +42,13 @@ use autolive_desktop_core::speech_to_speech_worker::{
     run_configured_speech_to_speech_context_worker,
     run_configured_speech_to_speech_context_worker_with_resource_dir,
 };
-use autolive_desktop_core::voice_clone::{
-    hash_voice_clone_text, validate_replacement_result, validate_voice_clone_text,
-    VoiceClonePrepareRequest, VoiceCloneReplacementRequest, VoiceCloneReplacementResult,
-    VoiceCloneSegment, VoiceCloneSourceIndex,
-};
 use autolive_desktop_core::window_sizing::{calculate_window_size, WindowSizingError};
-use autolive_desktop_core::{
-    PlaybackCore, PlaybackSnapshot, VoiceCloneCommittedReplacement, VoiceClonePreparedSource,
-    VoiceCloneRuntimeError, VOICE_CLONE_SYNTHESIS_MODEL_ID,
-};
-use serde::de::DeserializeOwned;
+use autolive_desktop_core::{PlaybackCore, PlaybackSnapshot};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use sysinfo::{Disks, System};
@@ -71,27 +59,17 @@ use tauri_runtime::dpi::{LogicalSize, PhysicalSize};
 use std::os::unix::process::CommandExt;
 
 const MEDIA_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// 媒体处理产物只保留最近 N 个（外加当前/待切换保护文件）。
+const MEDIA_CACHE_MAX_FILES: usize = 3;
 const RESEARCH_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const MACOS_NATIVE_TITLEBAR_HEIGHT: f64 = 32.0;
-const VOICE_CLONE_WORKER_ENV: &str = "AUTOLIVE_VOICE_CLONE_WORKER";
-const VOICE_CLONE_MODEL_ROOT_ENV: &str = "AUTOLIVE_VOICE_CLONE_MODEL_ROOT";
-const VOICE_CLONE_CAPABILITY_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_VOICE_CLONE_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
-const MIN_VOICE_CLONE_TIMEOUT_MS: u64 = 1_000;
-const MAX_VOICE_CLONE_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
-const VOICE_CLONE_AUDIO_PROBE_TIMEOUT_MS: u64 = 5_000;
 const MEDIA_IMPORT_PROBE_TIMEOUT_MS: u64 = 10_000;
-const MAX_VOICE_CLONE_WORKER_STDERR_BYTES: usize = 64 * 1024;
-const VOICE_CLONE_PLAYBACK_CACHE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
     main_window_label: &'static str,
     playback: Arc<Mutex<PlaybackCore>>,
     speech_worker: Arc<Mutex<Option<SpeechWorkerTask>>>,
-    voice_clone_launch_lock: Arc<Mutex<()>>,
-    voice_clone_worker: Arc<Mutex<Option<VoiceCloneWorkerTask>>>,
-    voice_clone_worker_server: Arc<Mutex<Option<VoiceCloneWorkerServer>>>,
     media_worker: Arc<Mutex<Option<MediaWorkerTask>>>,
     research_worker: Arc<Mutex<Option<ResearchWorkerTask>>>,
     research_status: Arc<Mutex<ResearchStatusDto>>,
@@ -103,54 +81,6 @@ struct SpeechWorkerTask {
     cancellation: CancellationToken,
     completed: Arc<AtomicBool>,
     handle: thread::JoinHandle<()>,
-}
-
-#[derive(Debug)]
-struct VoiceCloneWorkerTask {
-    kind: VoiceCloneWorkerTaskKind,
-    cancellation: CancellationToken,
-    completed: Arc<AtomicBool>,
-    handle: thread::JoinHandle<()>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VoiceCloneWorkerTaskKind {
-    Prepare,
-    Replacement,
-    Playback,
-    PreGeneration,
-}
-
-#[derive(Debug, Deserialize)]
-struct VoiceCloneServerResponse {
-    status: String,
-    message: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Debug)]
-struct VoiceCloneWorkerServer {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    responses: Receiver<Result<VoiceCloneServerResponse, String>>,
-    stdout_reader: Option<thread::JoinHandle<()>>,
-    stderr_reader: Option<thread::JoinHandle<()>>,
-    stderr: Arc<Mutex<String>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct VoiceCloneWorkerResources<'a> {
-    model_root: Option<&'a Path>,
-    target_root: Option<&'a Path>,
-    server: Option<&'a Arc<Mutex<Option<VoiceCloneWorkerServer>>>>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-struct VoiceCloneProgressDto {
-    status: String,
-    phase: String,
-    message: String,
-    percent: u8,
 }
 
 #[derive(Debug)]
@@ -214,169 +144,9 @@ pub struct CacheCleanupResultDto {
     pub remaining_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VoiceCloneWorkerCapabilitiesDto {
-    pub available: bool,
-    pub status: String,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PrepareVoiceCloneSourceRequestDto {
-    pub timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct StartVoiceCloneReplacementRequestDto {
-    pub text: String,
-    pub position_ms: u64,
-    pub timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct StartVoiceClonePlaybackRequestDto {
-    pub text: String,
-    pub position_ms: u64,
-    pub timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct StartVoiceClonePreGenerationRequestDto {
-    pub items: Vec<VoiceClonePreGenerationItemRequestDto>,
-    pub timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct VoiceClonePreGenerationItemRequestDto {
-    pub preset_id: String,
-    pub text: String,
-}
-
-#[derive(Debug, Clone)]
-struct ValidatedVoiceClonePreGenerationItem {
-    preset_id: String,
-    input_text: String,
-    text_sha256: String,
-}
-
-#[derive(Debug, Clone)]
-struct VoiceClonePreGenerationUniqueText {
-    input_text: String,
-    text_sha256: String,
-}
-
-#[derive(Debug, Clone)]
-struct ValidatedVoiceClonePreGenerationBatch {
-    items: Vec<ValidatedVoiceClonePreGenerationItem>,
-    unique_texts: Vec<VoiceClonePreGenerationUniqueText>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FinishVoiceClonePlaybackRequestDto {
-    pub operation_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FailVoiceClonePlaybackRequestDto {
-    pub operation_id: String,
-    pub reason: String,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdatePlaybackPositionRequestDto {
     pub position_ms: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct VoiceClonePrepareWorkerResult {
-    status: String,
-    provider: Option<String>,
-    model: Option<String>,
-    reason: Option<String>,
-    operation_id: String,
-    source_path: Option<String>,
-    source_sha256: Option<String>,
-    reference_audio_path: Option<String>,
-    reference_audio_sha256: Option<String>,
-    sample_rate_hz: Option<u32>,
-    channel_count: Option<u16>,
-    duration_ms: Option<u64>,
-    #[serde(default)]
-    segments: Vec<VoiceCloneSegment>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct VoiceCloneReplaceWorkerResult {
-    status: String,
-    provider: Option<String>,
-    model: Option<String>,
-    reason: Option<String>,
-    operation_id: String,
-    source_path: Option<String>,
-    source_sha256: Option<String>,
-    replacement_audio_path: Option<String>,
-    replacement_sha256: Option<String>,
-    replace_at_ms: Option<u64>,
-    resume_at_ms: Option<u64>,
-    total_duration_ms: Option<u64>,
-    sample_rate_hz: Option<u32>,
-    channel_count: Option<u16>,
-    input_text: Option<String>,
-    source_generation: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct VoiceCloneSynthesizeWorkerResult {
-    status: String,
-    provider: Option<String>,
-    model: Option<String>,
-    reason: Option<String>,
-    operation_id: String,
-    source_generation: Option<u64>,
-    source_path: Option<String>,
-    source_sha256: Option<String>,
-    reference_audio_path: Option<String>,
-    reference_audio_sha256: Option<String>,
-    input_text: Option<String>,
-    text_sha256: Option<String>,
-    audio_path: Option<String>,
-    audio_sha256: Option<String>,
-    duration_ms: Option<u64>,
-    sample_rate_hz: Option<u32>,
-    channel_count: Option<u16>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct VoiceClonePlaybackCache {
-    version: u32,
-    source_generation: u64,
-    source_path: String,
-    source_sha256: String,
-    reference_audio_sha256: String,
-    input_text: String,
-    text_sha256: String,
-    audio_reference: String,
-    audio_sha256: String,
-    duration_ms: u64,
-    sample_rate_hz: u32,
-    channel_count: u16,
-    model: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct VoiceCloneSynthesizeRequest {
-    source_generation: u64,
-    source_path: String,
-    source_sha256: String,
-    reference_audio_path: String,
-    reference_audio_sha256: String,
-    operation_id: String,
-    text: String,
-    model: String,
-    sample_rate_hz: u32,
-    channel_count: u16,
 }
 
 fn apply_research_result(
@@ -441,7 +211,7 @@ impl CommandErrorDto {
     }
 }
 
-fn runtime_resource_layout(app: &AppHandle) -> Result<RuntimeResourceLayout, String> {
+fn writable_runtime_resource_layout(app: &AppHandle) -> Result<RuntimeResourceLayout, String> {
     let app_data_dir = app
         .path()
         .app_data_dir()
@@ -450,9 +220,59 @@ fn runtime_resource_layout(app: &AppHandle) -> Result<RuntimeResourceLayout, Str
         .map_err(|error| format!("解析当前平台运行资源目录失败：{error}"))
 }
 
+fn runtime_resource_catalog_cache() -> &'static Mutex<Option<RuntimeResourceCatalog>> {
+    static CATALOG: OnceLock<Mutex<Option<RuntimeResourceCatalog>>> = OnceLock::new();
+    CATALOG.get_or_init(|| Mutex::new(None))
+}
+
+fn runtime_resource_catalog_blocking(
+    app: &AppHandle,
+) -> Result<RuntimeResourceCatalog, (String, PathBuf)> {
+    let app_data_dir = app.path().app_data_dir().map_err(|error| {
+        (
+            format!("读取运行资源应用数据目录失败：{error}"),
+            PathBuf::new(),
+        )
+    })?;
+    let fallback_root = RuntimeResourceLayout::for_target(&app_data_dir, target_triple())
+        .map_err(|error| {
+            (
+                format!("解析当前平台运行资源目录失败：{error}"),
+                PathBuf::new(),
+            )
+        })?
+        .version_root;
+    let resource_dir = app.path().resource_dir().map_err(|error| {
+        (
+            format!("读取运行资源 manifest 所在资源目录失败：{error}"),
+            fallback_root.clone(),
+        )
+    })?;
+    let mut cached = runtime_resource_catalog_cache()
+        .lock()
+        .map_err(|_| ("运行资源目录缓存锁已损坏".to_owned(), fallback_root.clone()))?;
+    if let Some(catalog) = cached.as_ref() {
+        return Ok(catalog.clone());
+    }
+    let catalog = RuntimeResourceCatalog::from_resource_directory(
+        &resource_dir,
+        &app_data_dir,
+        target_triple(),
+    )
+    .map_err(|error| (error.to_string(), fallback_root))?;
+    *cached = Some(catalog.clone());
+    Ok(catalog)
+}
+
+fn runtime_resource_roots(app: &AppHandle) -> Result<RuntimeResourceRoots, String> {
+    runtime_resource_catalog_blocking(app)
+        .map(|catalog| catalog.roots().clone())
+        .map_err(|(error, _)| error)
+}
+
 fn runtime_resource_target_root(app: &AppHandle) -> Result<PathBuf, String> {
-    let layout = runtime_resource_layout(app)?;
-    Ok(layout.target_root)
+    let roots = runtime_resource_roots(app)?;
+    Ok(roots.target_root)
 }
 
 fn runtime_resource_installer_blocking(
@@ -507,6 +327,36 @@ async fn runtime_resource_installer(
     }
 }
 
+async fn runtime_resource_catalog(
+    component: RuntimeResourceComponent,
+    app: AppHandle,
+    task: Arc<RuntimeResourceTask>,
+) -> Result<RuntimeResourceCatalog, RuntimeResourceStatus> {
+    let loaded =
+        tauri::async_runtime::spawn_blocking(move || runtime_resource_catalog_blocking(&app)).await;
+    match loaded {
+        Ok(Ok(catalog)) => Ok(catalog),
+        Ok(Err((error, resource_root))) => Err(record_runtime_resource_failure(
+            &task,
+            component,
+            error,
+            &resource_root,
+        )),
+        Err(error) => Err(record_runtime_resource_failure(
+            &task,
+            component,
+            format!("运行资源目录解析任务失败：{error}"),
+            Path::new(""),
+        )),
+    }
+}
+
+fn bundled_clear_status(catalog: &RuntimeResourceCatalog) -> Option<RuntimeResourceStatus> {
+    let mut status = catalog.bundled_status(RuntimeResourceComponent::Media)?;
+    status.component = None;
+    Some(status)
+}
+
 fn record_runtime_resource_failure(
     task: &RuntimeResourceTask,
     component: RuntimeResourceComponent,
@@ -538,15 +388,9 @@ fn development_runtime_resource_status(
             .map(PathBuf::from)
             .is_some_and(|path| development_executable_ready(&path))
     };
-    let media_ready = configured_file(FFMPEG_PATH_ENV) && configured_file(FFPROBE_PATH_ENV);
     let ready = match component {
-        RuntimeResourceComponent::Media => media_ready,
-        RuntimeResourceComponent::Voice => {
-            media_ready
-                && configured_file(VOICE_CLONE_WORKER_ENV)
-                && std::env::var_os(VOICE_CLONE_MODEL_ROOT_ENV)
-                    .map(PathBuf::from)
-                    .is_some_and(|path| voice_clone_model_resources_complete(&path))
+        RuntimeResourceComponent::Media => {
+            configured_file(FFMPEG_PATH_ENV) && configured_file(FFPROBE_PATH_ENV)
         }
     };
     ready.then(|| RuntimeResourceStatus {
@@ -591,6 +435,13 @@ pub async fn get_runtime_resource_status(
         return Ok(status);
     }
     let task = Arc::clone(&state.runtime_resource_task);
+    let catalog = match runtime_resource_catalog(component, app.clone(), Arc::clone(&task)).await {
+        Ok(catalog) => catalog,
+        Err(status) => return Ok(status),
+    };
+    if let Some(status) = catalog.bundled_status(component) {
+        return Ok(status);
+    }
     let installer = match runtime_resource_installer(component, app, Arc::clone(&task)).await {
         Ok(installer) => installer,
         Err(status) => return Ok(status),
@@ -626,6 +477,19 @@ pub async fn install_runtime_resources(
     if let Some(status) = state.runtime_resource_task.running_status()? {
         return Ok(status);
     }
+    let catalog = match runtime_resource_catalog(
+        component,
+        app.clone(),
+        Arc::clone(&state.runtime_resource_task),
+    )
+    .await
+    {
+        Ok(catalog) => catalog,
+        Err(status) => return Ok(status),
+    };
+    if let Some(status) = catalog.bundled_status(component) {
+        return Ok(status);
+    }
     let installer =
         match runtime_resource_installer(component, app, Arc::clone(&state.runtime_resource_task))
             .await
@@ -655,6 +519,19 @@ pub async fn import_runtime_resource_directory(
     if let Some(status) = state.runtime_resource_task.running_status()? {
         return Ok(status);
     }
+    let catalog = match runtime_resource_catalog(
+        component,
+        app.clone(),
+        Arc::clone(&state.runtime_resource_task),
+    )
+    .await
+    {
+        Ok(catalog) => catalog,
+        Err(status) => return Ok(status),
+    };
+    if let Some(status) = catalog.bundled_status(component) {
+        return Ok(status);
+    }
     let installer =
         match runtime_resource_installer(component, app, Arc::clone(&state.runtime_resource_task))
             .await
@@ -676,6 +553,32 @@ pub async fn clear_runtime_resources(
         return Ok(status);
     }
     let component = RuntimeResourceComponent::Media;
+    let catalog = match runtime_resource_catalog(
+        component,
+        app.clone(),
+        Arc::clone(&state.runtime_resource_task),
+    )
+    .await
+    {
+        Ok(catalog) => catalog,
+        Err(status) => return Ok(status),
+    };
+    let writable_root = writable_runtime_resource_layout(&app)?.version_root;
+    if !writable_root.exists() {
+        return Ok(
+            bundled_clear_status(&catalog).unwrap_or(RuntimeResourceStatus {
+                state: RuntimeResourceState::NotInstalled,
+                component: None,
+                current_file: None,
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                bytes_per_second: 0,
+                installed_bytes: 0,
+                resource_root: writable_root.display().to_string(),
+                error: None,
+            }),
+        );
+    }
     let installer =
         match runtime_resource_installer(component, app, Arc::clone(&state.runtime_resource_task))
             .await
@@ -686,119 +589,12 @@ pub async fn clear_runtime_resources(
     state.runtime_resource_task.start_clear(installer)
 }
 
-fn voice_clone_timeout_ms(timeout_ms: Option<u64>) -> Result<u64, CommandErrorDto> {
-    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_VOICE_CLONE_TIMEOUT_MS);
-    if !(MIN_VOICE_CLONE_TIMEOUT_MS..=MAX_VOICE_CLONE_TIMEOUT_MS).contains(&timeout_ms) {
-        return Err(CommandErrorDto::new(
-            "voice_clone_timeout_invalid",
-            format!(
-                "固定话术 Worker 超时时间必须在 {}ms 到 {}ms 之间",
-                MIN_VOICE_CLONE_TIMEOUT_MS, MAX_VOICE_CLONE_TIMEOUT_MS
-            ),
-        ));
-    }
-    Ok(timeout_ms)
-}
-
-fn validate_voice_clone_pre_generation_items(
-    items: Vec<VoiceClonePreGenerationItemRequestDto>,
-) -> Result<ValidatedVoiceClonePreGenerationBatch, CommandErrorDto> {
-    if !(1..=10).contains(&items.len()) {
-        return Err(CommandErrorDto::new(
-            "voice_clone_pre_generation_items_invalid",
-            "固定话术预生成必须包含 1 到 10 条话术",
-        ));
-    }
-    let mut preset_ids = HashSet::with_capacity(items.len());
-    let mut text_hashes = HashSet::with_capacity(items.len());
-    let mut validated_items = Vec::with_capacity(items.len());
-    let mut unique_texts = Vec::with_capacity(items.len());
-    for item in items {
-        let preset_id = item.preset_id.trim();
-        if preset_id.is_empty() || !preset_ids.insert(preset_id.to_owned()) {
-            return Err(CommandErrorDto::new(
-                "voice_clone_pre_generation_items_invalid",
-                "固定话术预生成 ID 必须非空且不能重复",
-            ));
-        }
-        let input_text = validate_voice_clone_text(&item.text).map_err(|error| {
-            CommandErrorDto::new(
-                "voice_clone_pre_generation_items_invalid",
-                error.to_string(),
-            )
-        })?;
-        let text_sha256 = hash_voice_clone_text(&input_text);
-        if text_hashes.insert(text_sha256.clone()) {
-            unique_texts.push(VoiceClonePreGenerationUniqueText {
-                input_text: input_text.clone(),
-                text_sha256: text_sha256.clone(),
-            });
-        }
-        validated_items.push(ValidatedVoiceClonePreGenerationItem {
-            preset_id: preset_id.to_owned(),
-            input_text,
-            text_sha256,
-        });
-    }
-    Ok(ValidatedVoiceClonePreGenerationBatch {
-        items: validated_items,
-        unique_texts,
-    })
-}
-
-fn build_voice_clone_pre_generation_plans(
-    playback: &PlaybackCore,
-    batch: &ValidatedVoiceClonePreGenerationBatch,
-) -> Result<Vec<autolive_desktop_core::VoiceClonePlaybackPlan>, CommandErrorDto> {
-    let snapshot = playback.snapshot();
-    let source = snapshot
-        .source_media
-        .as_ref()
-        .ok_or_else(|| CommandErrorDto::new("source_media_required", "请先导入一个源视频"))?;
-    let prepared = playback.voice_clone_prepared_source().ok_or_else(|| {
-        command_error_from_voice_clone_runtime(VoiceCloneRuntimeError::VoiceCloneSourceNotPrepared)
-    })?;
-    if prepared.source_index.source_generation != snapshot.playback_generation
-        || prepared.source_index.source_path != source.source_path
-    {
-        return Err(command_error_from_voice_clone_runtime(
-            VoiceCloneRuntimeError::VoiceClonePreparedSourceStale,
-        ));
-    }
-    batch
-        .unique_texts
-        .iter()
-        .map(|unique| {
-            Ok(autolive_desktop_core::VoiceClonePlaybackPlan {
-                source_generation: snapshot.playback_generation,
-                source_path: source.source_path.clone(),
-                source_sha256: prepared.source_sha256.clone(),
-                operation_id: voice_clone_operation_id(
-                    "pre-generate",
-                    snapshot.playback_generation,
-                )?,
-                input_text: unique.input_text.clone(),
-                text_sha256: unique.text_sha256.clone(),
-                start_at_ms: 0,
-                reference_audio_path: prepared.reference_audio_path.clone(),
-                reference_audio_sha256: prepared.reference_audio_sha256.clone(),
-                sample_rate_hz: prepared.sample_rate_hz,
-                channel_count: prepared.channel_count,
-                model: Some(VOICE_CLONE_SYNTHESIS_MODEL_ID.to_owned()),
-            })
-        })
-        .collect()
-}
-
 impl Default for AppState {
     fn default() -> Self {
         Self {
             main_window_label: "main",
             playback: Arc::new(Mutex::new(PlaybackCore::default())),
             speech_worker: Arc::new(Mutex::new(None)),
-            voice_clone_launch_lock: Arc::new(Mutex::new(())),
-            voice_clone_worker: Arc::new(Mutex::new(None)),
-            voice_clone_worker_server: Arc::new(Mutex::new(None)),
             media_worker: Arc::new(Mutex::new(None)),
             research_worker: Arc::new(Mutex::new(None)),
             research_status: Arc::new(Mutex::new(ResearchStatusDto::default())),
@@ -813,20 +609,6 @@ impl AppState {
         budget: Duration,
     ) -> Result<RuntimeResourceTaskShutdown, String> {
         self.runtime_resource_task.shutdown(budget)
-    }
-
-    fn lock_voice_clone_launch(&self) -> Result<std::sync::MutexGuard<'_, ()>, CommandErrorDto> {
-        self.voice_clone_launch_lock.lock().map_err(|_| {
-            CommandErrorDto::new("voice_clone_launch_lock_failed", "固定话术启动事务锁已损坏")
-        })
-    }
-
-    fn with_voice_clone_launch<T>(
-        &self,
-        handler: impl FnOnce(&Self) -> Result<T, CommandErrorDto>,
-    ) -> Result<T, CommandErrorDto> {
-        let _launch_guard = self.lock_voice_clone_launch()?;
-        handler(self)
     }
 
     fn reap_finished_speech_worker(&self) -> Result<bool, CommandErrorDto> {
@@ -850,13 +632,6 @@ impl AppState {
         Ok(false)
     }
 
-    fn speech_worker_is_running(&self) -> Result<bool, CommandErrorDto> {
-        let worker = self.speech_worker.lock().map_err(|_| {
-            CommandErrorDto::new("speech_worker_lock_failed", "Worker 状态锁已损坏")
-        })?;
-        Ok(worker.is_some())
-    }
-
     fn stop_speech_worker(&self) -> Result<(), CommandErrorDto> {
         let task = self
             .speech_worker
@@ -870,72 +645,6 @@ impl AppState {
         Ok(())
     }
 
-    fn reap_finished_voice_clone_worker(&self) -> Result<bool, CommandErrorDto> {
-        let task = {
-            let mut worker = self.voice_clone_worker.lock().map_err(|_| {
-                CommandErrorDto::new(
-                    "voice_clone_worker_lock_failed",
-                    "固定话术 Worker 状态锁已损坏",
-                )
-            })?;
-            if worker
-                .as_ref()
-                .is_some_and(|task| task.completed.load(Ordering::Acquire))
-            {
-                worker.take()
-            } else {
-                None
-            }
-        };
-        if let Some(task) = task {
-            let _join_result = task.handle.join();
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    fn voice_clone_worker_is_running(&self) -> Result<bool, CommandErrorDto> {
-        let worker = self.voice_clone_worker.lock().map_err(|_| {
-            CommandErrorDto::new(
-                "voice_clone_worker_lock_failed",
-                "固定话术 Worker 状态锁已损坏",
-            )
-        })?;
-        Ok(worker.is_some())
-    }
-
-    fn voice_clone_worker_kind(&self) -> Result<Option<VoiceCloneWorkerTaskKind>, CommandErrorDto> {
-        let worker = self.voice_clone_worker.lock().map_err(|_| {
-            CommandErrorDto::new(
-                "voice_clone_worker_lock_failed",
-                "固定话术 Worker 状态锁已损坏",
-            )
-        })?;
-        Ok(worker.as_ref().map(|task| task.kind))
-    }
-
-    fn stop_voice_clone_worker_locked(
-        &self,
-    ) -> Result<Option<VoiceCloneWorkerTaskKind>, CommandErrorDto> {
-        let task = self
-            .voice_clone_worker
-            .lock()
-            .map_err(|_| {
-                CommandErrorDto::new(
-                    "voice_clone_worker_lock_failed",
-                    "固定话术 Worker 状态锁已损坏",
-                )
-            })?
-            .take();
-        if let Some(task) = task {
-            let kind = task.kind;
-            task.cancellation.cancel();
-            let _join_result = task.handle.join();
-            return Ok(Some(kind));
-        }
-        Ok(None)
-    }
-
     fn stop_media_worker(&self) -> Result<(), CommandErrorDto> {
         let task = self
             .media_worker
@@ -947,6 +656,15 @@ impl AppState {
         if let Some(task) = task {
             task.cancellation.cancel();
             let _join_result = task.handle.join();
+            // 取消后必须清掉 processing，否则 UI 会一直卡在「处理中」。
+            if let Ok(mut playback) = self.playback.lock() {
+                let snapshot = playback.snapshot();
+                if snapshot.audio_processing_status == "processing"
+                    || snapshot.video_processing_status == "processing"
+                {
+                    playback.mark_media_processing_failed("媒体处理已取消，等待应用最新参数");
+                }
+            }
         }
         Ok(())
     }
@@ -1071,21 +789,6 @@ impl AppState {
         Ok(())
     }
 
-    fn install_voice_clone_worker(
-        &self,
-        task: VoiceCloneWorkerTask,
-    ) -> Result<(), VoiceCloneWorkerTask> {
-        let mut worker = match self.voice_clone_worker.lock() {
-            Ok(worker) => worker,
-            Err(_) => return Err(task),
-        };
-        if worker.is_some() {
-            return Err(task);
-        }
-        worker.replace(task);
-        Ok(())
-    }
-
     fn install_media_worker(&self, task: MediaWorkerTask) -> Result<(), MediaWorkerTask> {
         let mut worker = match self.media_worker.lock() {
             Ok(worker) => worker,
@@ -1193,9 +896,6 @@ pub struct PlaybackSnapshotDto {
     pub audio_processing_runtime: bool,
     pub audio_processing_gain_db: f64,
     pub effective_audio_source: String,
-    pub voice_clone_replacement: autolive_desktop_core::VoiceCloneReplacementState,
-    pub voice_clone_playback: autolive_desktop_core::VoiceClonePlaybackState,
-    pub voice_clone_pre_generation: autolive_desktop_core::VoiceClonePreGenerationState,
     pub interlude: InterludeSnapshotDto,
 }
 
@@ -1236,9 +936,6 @@ impl From<PlaybackSnapshot> for PlaybackSnapshotDto {
             audio_processing_runtime: value.audio_processing_runtime,
             audio_processing_gain_db: value.audio_processing_gain_db,
             effective_audio_source: value.effective_audio_source,
-            voice_clone_replacement: value.voice_clone_replacement,
-            voice_clone_playback: value.voice_clone_playback,
-            voice_clone_pre_generation: value.voice_clone_pre_generation,
             interlude: value.interlude,
         }
     }
@@ -1337,6 +1034,7 @@ pub struct DirectModelChatResponseDto {
 fn prune_cache_dir(
     directory: &Path,
     max_bytes: u64,
+    max_files: Option<usize>,
     protected_paths: &[PathBuf],
 ) -> std::io::Result<CacheCleanupResultDto> {
     if !directory.is_dir() {
@@ -1370,78 +1068,33 @@ fn prune_cache_dir(
     let partial_expiry = SystemTime::now()
         .checked_sub(Duration::from_secs(10 * 60))
         .unwrap_or(SystemTime::UNIX_EPOCH);
-    entries.sort_by_key(|(_, _, modified)| *modified);
+    // 新→旧，便于按“最近 N 个”保留。
+    entries.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut kept_unprotected: usize = 0;
     for (path, size, modified) in entries {
         let is_partial = path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.contains(".partial"));
-        let over_budget = remaining_bytes > max_bytes;
+        let is_protected = protected.contains(&path);
         let stale_partial = is_partial && modified <= partial_expiry;
-        if protected.contains(&path) || (!over_budget && !stale_partial) {
+        let over_file_limit = max_files.is_some_and(|limit| {
+            !is_protected && !is_partial && {
+                // 非保护成品：超过最近 N 个就删。
+                let over = kept_unprotected >= limit;
+                if !over {
+                    kept_unprotected += 1;
+                }
+                over
+            }
+        });
+        // 未完成 partial 不计入 N；仅过期 partial 删。保护文件永不因额度删。
+        let over_budget = remaining_bytes > max_bytes && !is_protected;
+        let should_remove = stale_partial || over_file_limit || over_budget;
+        if is_protected && !stale_partial {
             continue;
         }
-        if std::fs::remove_file(&path).is_ok() {
-            remaining_bytes = remaining_bytes.saturating_sub(size);
-            removed_files += 1;
-            removed_bytes = removed_bytes.saturating_add(size);
-        }
-    }
-    Ok(CacheCleanupResultDto {
-        removed_files,
-        removed_bytes,
-        remaining_bytes,
-    })
-}
-
-fn prune_cache_tree(
-    directory: &Path,
-    max_bytes: u64,
-    protected_paths: &[PathBuf],
-) -> std::io::Result<CacheCleanupResultDto> {
-    if !directory.is_dir() {
-        return Ok(CacheCleanupResultDto {
-            removed_files: 0,
-            removed_bytes: 0,
-            remaining_bytes: 0,
-        });
-    }
-    let mut entries = Vec::new();
-    let mut pending = vec![directory.to_path_buf()];
-    while let Some(current) = pending.pop() {
-        for entry in std::fs::read_dir(current)? {
-            let entry = entry?;
-            let path = entry.path();
-            let metadata = entry.metadata()?;
-            if metadata.is_dir() {
-                pending.push(path);
-            } else if metadata.is_file() {
-                entries.push((
-                    path,
-                    metadata.len(),
-                    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                ));
-            }
-        }
-    }
-    let mut remaining_bytes = entries.iter().map(|(_, size, _)| *size).sum::<u64>();
-    let mut removed_files: u32 = 0;
-    let mut removed_bytes: u64 = 0;
-    let partial_expiry = SystemTime::now()
-        .checked_sub(Duration::from_secs(10 * 60))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    entries.sort_by_key(|(_, _, modified)| *modified);
-    for (path, size, modified) in entries {
-        let is_partial = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains(".partial"));
-        let over_budget = remaining_bytes > max_bytes;
-        let stale_partial = is_partial && modified <= partial_expiry;
-        let protected = protected_paths
-            .iter()
-            .any(|protected_path| path == *protected_path || path.starts_with(protected_path));
-        if protected || (!over_budget && !stale_partial) {
+        if !should_remove {
             continue;
         }
         if std::fs::remove_file(&path).is_ok() {
@@ -1477,12 +1130,46 @@ mod cache_tests {
         let stale_partial = directory.join("old.partial.mp4");
         fs::write(&protected, b"protected").expect("protected file should be written");
         fs::write(&stale_partial, b"partial").expect("partial file should be written");
-        let result = prune_cache_dir(&directory, 1, std::slice::from_ref(&protected))
+        let result = prune_cache_dir(&directory, 1, None, std::slice::from_ref(&protected))
             .expect("cache prune should succeed");
 
         assert!(protected.exists());
         assert!(!stale_partial.exists());
         assert!(result.remaining_bytes >= fs::metadata(&protected).unwrap().len());
+        let _ignored = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cache_prune_keeps_only_recent_media_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "autolive-cache-keep-n-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be valid")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("cache directory should be created");
+        let older = directory.join("processed-1.mp4");
+        let mid = directory.join("processed-2.mp4");
+        let newest = directory.join("processed-3.mp4");
+        let fourth = directory.join("processed-4.mp4");
+        fs::write(&older, b"1").expect("write");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&mid, b"2").expect("write");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&newest, b"3").expect("write");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&fourth, b"4").expect("write");
+
+        let result = prune_cache_dir(&directory, u64::MAX, Some(3), &[])
+            .expect("cache prune should succeed");
+
+        assert!(!older.exists(), "oldest should be pruned");
+        assert!(mid.exists());
+        assert!(newest.exists());
+        assert!(fourth.exists());
+        assert_eq!(result.removed_files, 1);
         let _ignored = fs::remove_dir_all(directory);
     }
 }
@@ -1495,7 +1182,7 @@ fn cleanup_local_caches(
         .path()
         .app_cache_dir()
         .map_err(|error| CommandErrorDto::new("cache_dir_failed", error.to_string()))?;
-    let (current_video, pending_video, research_paths, voice_clone_protected_paths) = {
+    let (current_video, pending_video, research_paths) = {
         let playback = state
             .playback
             .lock()
@@ -1507,34 +1194,16 @@ fn cleanup_local_caches(
             .map_err(|_| CommandErrorDto::new("research_status_lock_failed", "研究状态锁已损坏"))?
             .cache_paths
             .clone();
-        let mut voice_clone_protected_paths = playback
-            .voice_clone_prepared_source()
-            .and_then(|prepared| {
-                voice_clone_session_dir(&prepared.reference_audio_path, &prepared.operation_id)
-            })
-            .into_iter()
-            .collect::<Vec<_>>();
-        if let Some(session_dir) = snapshot
-            .voice_clone_replacement
-            .replacement_audio_reference
-            .as_deref()
-            .zip(snapshot.voice_clone_replacement.operation_id.as_deref())
-            .and_then(|(artifact_path, operation_id)| {
-                voice_clone_session_dir(artifact_path, operation_id)
-            })
-        {
-            voice_clone_protected_paths.push(session_dir);
-        }
         (
             snapshot.current_video_reference.map(PathBuf::from),
             snapshot.pending_video_reference.map(PathBuf::from),
             research_paths,
-            voice_clone_protected_paths,
         )
     };
     let media_result = prune_cache_dir(
         &cache_root.join("media-processing"),
         MEDIA_CACHE_MAX_BYTES,
+        Some(MEDIA_CACHE_MAX_FILES),
         &[current_video, pending_video]
             .into_iter()
             .flatten()
@@ -1544,25 +1213,14 @@ fn cleanup_local_caches(
     let research_result = prune_cache_dir(
         &cache_root.join("research-analysis"),
         RESEARCH_CACHE_MAX_BYTES,
+        None,
         &research_paths,
     )
     .map_err(|error| CommandErrorDto::new("research_cache_cleanup_failed", error.to_string()))?;
-    let voice_clone_result = prune_cache_tree(
-        &cache_root.join("voice-clone"),
-        1_024 * 1024 * 1024,
-        &voice_clone_protected_paths,
-    )
-    .map_err(|error| CommandErrorDto::new("voice_clone_cache_cleanup_failed", error.to_string()))?;
     Ok(CacheCleanupResultDto {
-        removed_files: media_result.removed_files
-            + research_result.removed_files
-            + voice_clone_result.removed_files,
-        removed_bytes: media_result.removed_bytes
-            + research_result.removed_bytes
-            + voice_clone_result.removed_bytes,
-        remaining_bytes: media_result.remaining_bytes
-            + research_result.remaining_bytes
-            + voice_clone_result.remaining_bytes,
+        removed_files: media_result.removed_files + research_result.removed_files,
+        removed_bytes: media_result.removed_bytes + research_result.removed_bytes,
+        remaining_bytes: media_result.remaining_bytes + research_result.remaining_bytes,
     })
 }
 
@@ -1588,7 +1246,7 @@ impl AppState {
 }
 
 #[tauri::command]
-pub async fn probe_local_mp4(
+pub async fn probe_local_video(
     window: Window,
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1597,7 +1255,7 @@ pub async fn probe_local_mp4(
     state.ensure_main_window(&window)?;
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        probe_local_mp4_blocking(window, app, state, request)
+        probe_local_video_blocking(window, app, state, request)
     })
     .await
     .map_err(|error| {
@@ -1605,7 +1263,17 @@ pub async fn probe_local_mp4(
     })?
 }
 
-fn probe_local_mp4_blocking(
+#[tauri::command]
+pub async fn probe_local_mp4(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: MediaProbeRequestDto,
+) -> Result<MediaProbeResultDto, CommandErrorDto> {
+    probe_local_video(window, app, state, request).await
+}
+
+fn probe_local_video_blocking(
     window: Window,
     app: AppHandle,
     state: AppState,
@@ -1621,26 +1289,27 @@ fn probe_local_mp4_blocking(
     let (_, ffprobe_path) = configured_media_engine_paths_with_resource_dir(&target_root)
         .map_err(|error| CommandErrorDto::new("media_probe_failed", error.to_string()))?;
     let cancellation = CancellationToken::new();
-    let result = probe_user_selected_mp4_with_ffprobe(
+    let result = probe_user_selected_video_with_ffprobe(
         &request,
         &ffprobe_path,
         MEDIA_IMPORT_PROBE_TIMEOUT_MS,
         &cancellation,
     )
     .map_err(command_error_from_media_library)?;
+    allow_local_playback_asset_file(
+        &app,
+        Path::new(&result.canonical_path),
+        "source_media_asset_scope_failed",
+        "源视频",
+    )?;
 
     state.stop_speech_worker()?;
     state.stop_media_worker()?;
     state.stop_research_worker()?;
-    let cleanup_paths = state.with_voice_clone_launch(|state| {
-        let _ = state.stop_voice_clone_worker_locked()?;
-        state.with_playback(&window, |playback| {
-            let cleanup_paths = voice_clone_artifact_dirs(playback, true);
-            playback.set_source(result.source.clone());
-            Ok(cleanup_paths)
-        })
+    state.with_playback(&window, |playback| {
+        playback.set_source(result.source.clone());
+        Ok(())
     })?;
-    cleanup_voice_clone_paths(cleanup_paths);
     Ok(result)
 }
 
@@ -1707,96 +1376,6 @@ pub fn get_speech_to_speech_worker_capabilities(
 }
 
 #[tauri::command]
-pub async fn get_voice_clone_worker_capabilities(
-    window: Window,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<VoiceCloneWorkerCapabilitiesDto, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    tauri::async_runtime::spawn_blocking(move || probe_voice_clone_worker_capabilities(&app))
-        .await
-        .map_err(|error| {
-            CommandErrorDto::new(
-                "voice_clone_capability_probe_failed",
-                format!("固定话术 Worker 能力探测任务失败：{error}"),
-            )
-        })?
-}
-
-fn probe_voice_clone_worker_capabilities(
-    app: &AppHandle,
-) -> Result<VoiceCloneWorkerCapabilitiesDto, CommandErrorDto> {
-    let executable = match configured_voice_clone_worker_executable(app) {
-        Ok(executable) => executable,
-        Err(reason) => return Ok(unavailable_voice_clone_capabilities(reason)),
-    };
-    let temp_root = std::env::temp_dir().join(format!(
-        "autolive-voice-clone-capabilities-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|error| {
-                CommandErrorDto::new("voice_clone_capability_probe_failed", error.to_string())
-            })?
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&temp_root).map_err(|error| {
-        CommandErrorDto::new("voice_clone_capability_probe_failed", error.to_string())
-    })?;
-    let output_json = temp_root.join("capabilities.json");
-    let args = vec![
-        "--capabilities-json".to_owned(),
-        output_json.display().to_string(),
-    ];
-    let model_root = match voice_clone_model_root(app) {
-        Ok(model_root) => model_root,
-        Err(error) => return Ok(unavailable_voice_clone_capabilities(error.message)),
-    };
-    let target_root = match runtime_resource_target_root(app) {
-        Ok(target_root) => target_root,
-        Err(error) => {
-            return Ok(unavailable_voice_clone_capabilities(format!(
-                "运行资源目录不可用：{error}"
-            )))
-        }
-    };
-    let mut on_progress = |_progress: &VoiceCloneProgressDto| {};
-    let result = match run_voice_clone_worker_process(
-        &executable,
-        &args,
-        VOICE_CLONE_CAPABILITY_TIMEOUT_MS,
-        &CancellationToken::new(),
-        VoiceCloneWorkerResources {
-            model_root: model_root.as_deref(),
-            target_root: Some(&target_root),
-            server: None,
-        },
-        None,
-        &mut on_progress,
-    ) {
-        Ok(()) => read_json_file::<VoiceCloneWorkerCapabilitiesDto>(
-            &output_json,
-            "voice_clone_capability_probe_failed",
-            "固定话术能力 JSON 无法解析",
-        )
-        .unwrap_or_else(|error| unavailable_voice_clone_capabilities(error.message)),
-        Err(VoiceCloneWorkerRunError::Timeout { timeout_ms }) => {
-            unavailable_voice_clone_capabilities(format!(
-                "固定话术 Worker 能力探测超时（{timeout_ms}ms）"
-            ))
-        }
-        Err(VoiceCloneWorkerRunError::Cancelled) => {
-            unavailable_voice_clone_capabilities("固定话术 Worker 能力探测被取消")
-        }
-        Err(VoiceCloneWorkerRunError::Failed(reason)) => {
-            unavailable_voice_clone_capabilities(reason)
-        }
-    };
-    cleanup_voice_clone_paths([temp_root]);
-    Ok(result)
-}
-
-#[tauri::command]
 pub fn get_media_engine_capabilities(
     window: Window,
     app: AppHandle,
@@ -1808,967 +1387,6 @@ pub fn get_media_engine_capabilities(
     Ok(configured_media_engine_status_with_resource_dir(
         &target_root,
     ))
-}
-
-#[tauri::command]
-pub async fn prepare_voice_clone_source(
-    window: Window,
-    app: AppHandle,
-    state: State<'_, AppState>,
-    request: PrepareVoiceCloneSourceRequestDto,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        prepare_voice_clone_source_blocking(window, app, state, request)
-    })
-    .await
-    .map_err(|error| {
-        CommandErrorDto::new(
-            "voice_clone_prepare_failed",
-            format!("固定话术准备任务失败：{error}"),
-        )
-    })?
-}
-
-fn prepare_voice_clone_source_blocking(
-    window: Window,
-    app: AppHandle,
-    state: AppState,
-    request: PrepareVoiceCloneSourceRequestDto,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    let _launch_guard = state.lock_voice_clone_launch()?;
-    let _ = state.reap_finished_voice_clone_worker()?;
-    if state.voice_clone_worker_is_running()? {
-        return Err(CommandErrorDto::new(
-            "voice_clone_worker_already_running",
-            "当前已有固定话术 Worker 在执行",
-        ));
-    }
-    let timeout_ms = voice_clone_timeout_ms(request.timeout_ms)?;
-    let executable = configured_voice_clone_worker_executable(&app)
-        .map_err(|reason| CommandErrorDto::new("voice_clone_worker_unavailable", reason))?;
-    let cache_root = voice_clone_cache_root(&app)?;
-    let model_root = voice_clone_model_root(&app)?;
-    let target_root = runtime_resource_target_root(&app)
-        .map_err(|error| CommandErrorDto::new("voice_clone_resource_dir_failed", error))?;
-    let (source_generation, canonical_source_path, source_sha256, operation_id, stale_paths) = {
-        let mut playback = state
-            .playback
-            .lock()
-            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
-        playback
-            .bind_window(window.label())
-            .map_err(command_error_from_playback)?;
-        let snapshot = playback.snapshot();
-        let source = snapshot
-            .source_media
-            .as_ref()
-            .ok_or_else(|| CommandErrorDto::new("source_media_required", "请先导入一个源视频"))?;
-        let canonical_source_path = std::fs::canonicalize(&source.source_path).map_err(|_| {
-            CommandErrorDto::new("source_media_invalid", "当前源视频路径无法规范化")
-        })?;
-        let operation_id = voice_clone_operation_id("prepare", snapshot.playback_generation)?;
-        // 每次准备都使用新的会话身份；它不读取、也不表示 MP4 内容哈希。
-        let source_sha256 = voice_clone_prepare_session_identity(&operation_id);
-        let stale_paths = voice_clone_artifact_dirs(&playback, true);
-        (
-            snapshot.playback_generation,
-            canonical_source_path,
-            source_sha256,
-            operation_id,
-            stale_paths,
-        )
-    };
-    let prepared_root = cache_root.join(&source_sha256);
-    std::fs::create_dir_all(&prepared_root)
-        .map_err(|error| CommandErrorDto::new("voice_clone_cache_dir_failed", error.to_string()))?;
-    let request_json = prepared_root.join(format!("{operation_id}.prepare.json"));
-    let output_json = prepared_root.join(format!("{operation_id}.prepare-result.json"));
-    let progress_json = prepared_root.join(format!("{operation_id}.prepare-progress.json"));
-    let request_payload = VoiceClonePrepareRequest {
-        source_generation,
-        source_path: canonical_source_path.display().to_string(),
-        source_sha256: source_sha256.clone(),
-        operation_id: operation_id.clone(),
-    };
-    if let Err(error) = write_json_file(&request_json, &request_payload) {
-        cleanup_voice_clone_paths([prepared_root]);
-        return Err(error);
-    }
-    let snapshot = {
-        let mut playback = state
-            .playback
-            .lock()
-            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
-        if let Err(error) = playback
-            .mark_voice_clone_preparing(&operation_id)
-            .map_err(command_error_from_voice_clone_runtime)
-        {
-            cleanup_voice_clone_paths([prepared_root]);
-            return Err(error);
-        }
-        state.snapshot(&playback)
-    };
-    cleanup_voice_clone_paths(stale_paths);
-
-    let playback = Arc::clone(&state.playback);
-    let completed = Arc::new(AtomicBool::new(false));
-    let completed_for_thread = Arc::clone(&completed);
-    let cancellation = CancellationToken::new();
-    let worker_cancellation = cancellation.clone();
-    let thread_executable = executable.clone();
-    let thread_request_json = request_json.clone();
-    let thread_output_json = output_json.clone();
-    let thread_progress_json = progress_json.clone();
-    let thread_model_root = model_root.clone();
-    let thread_voice_clone_worker_server = Arc::clone(&state.voice_clone_worker_server);
-    let thread_prepared_root = prepared_root.clone();
-    let thread_canonical_source_path = canonical_source_path.clone();
-    let thread_source_sha256 = source_sha256.clone();
-    let thread_operation_id = operation_id.clone();
-    let handle = thread::spawn(move || {
-        let args = vec![
-            "--prepare-json".to_owned(),
-            thread_request_json.display().to_string(),
-            "--output-json".to_owned(),
-            thread_output_json.display().to_string(),
-            "--progress-json".to_owned(),
-            thread_progress_json.display().to_string(),
-        ];
-        let progress_playback = Arc::clone(&playback);
-        let progress_operation_id = thread_operation_id.clone();
-        let mut on_progress = move |progress: &VoiceCloneProgressDto| {
-            if progress.status == "running" {
-                if let Ok(mut playback) = progress_playback.lock() {
-                    let _ = playback.update_voice_clone_progress(
-                        &progress_operation_id,
-                        &progress.phase,
-                        progress.percent,
-                        &progress.message,
-                    );
-                }
-            }
-        };
-        let worker_result = run_voice_clone_worker_process(
-            &thread_executable,
-            &args,
-            timeout_ms,
-            &worker_cancellation,
-            VoiceCloneWorkerResources {
-                model_root: thread_model_root.as_deref(),
-                target_root: Some(&target_root),
-                server: Some(&thread_voice_clone_worker_server),
-            },
-            Some(&thread_progress_json),
-            &mut on_progress,
-        );
-        let prepared = match worker_result {
-            Ok(()) => read_json_file::<VoiceClonePrepareWorkerResult>(
-                &thread_output_json,
-                "voice_clone_prepare_failed",
-                "固定话术准备结果 JSON 无法解析",
-            )
-            .and_then(|result| {
-                validate_voice_clone_prepare_result(
-                    &thread_prepared_root,
-                    source_generation,
-                    &thread_canonical_source_path,
-                    &thread_source_sha256,
-                    &thread_operation_id,
-                    result,
-                )
-            }),
-            Err(VoiceCloneWorkerRunError::Cancelled) => {
-                if let Ok(mut playback) = playback.lock() {
-                    let current = playback.snapshot();
-                    if current.playback_generation == source_generation
-                        && current
-                            .source_media
-                            .as_ref()
-                            .map(|source| source.source_path.as_str())
-                            == Some(thread_canonical_source_path.to_string_lossy().as_ref())
-                    {
-                        playback.mark_voice_clone_cancelled("用户取消固定话术准备");
-                    }
-                }
-                cleanup_voice_clone_paths([
-                    thread_request_json.clone(),
-                    thread_output_json.clone(),
-                    thread_progress_json.clone(),
-                    thread_prepared_root.join(&thread_operation_id),
-                ]);
-                completed_for_thread.store(true, Ordering::Release);
-                return;
-            }
-            Err(VoiceCloneWorkerRunError::Timeout { timeout_ms }) => Err(CommandErrorDto::new(
-                "voice_clone_prepare_failed",
-                format!("固定话术准备超时（{timeout_ms}ms）"),
-            )),
-            Err(VoiceCloneWorkerRunError::Failed(reason)) => {
-                Err(CommandErrorDto::new("voice_clone_prepare_failed", reason))
-            }
-        };
-
-        completed_for_thread.store(true, Ordering::Release);
-        if let Ok(mut playback) = playback.lock() {
-            match prepared {
-                Ok(prepared_source) => {
-                    if playback
-                        .set_voice_clone_prepared_source(prepared_source)
-                        .is_err()
-                    {
-                        cleanup_voice_clone_paths(
-                            [thread_prepared_root.join(&thread_operation_id)],
-                        );
-                        playback.mark_voice_clone_failed("固定话术准备结果已过期");
-                    }
-                }
-                Err(error) => {
-                    cleanup_voice_clone_paths([thread_prepared_root.join(&thread_operation_id)]);
-                    playback.mark_voice_clone_failed(error.message);
-                }
-            }
-        } else {
-            cleanup_voice_clone_paths([thread_prepared_root.join(&thread_operation_id)]);
-        }
-        cleanup_voice_clone_paths([
-            thread_request_json,
-            thread_output_json,
-            thread_progress_json,
-        ]);
-    });
-    if let Err(task) = state.install_voice_clone_worker(VoiceCloneWorkerTask {
-        kind: VoiceCloneWorkerTaskKind::Prepare,
-        cancellation,
-        completed,
-        handle,
-    }) {
-        task.cancellation.cancel();
-        let _join_result = task.handle.join();
-        cleanup_voice_clone_paths([
-            request_json,
-            output_json,
-            progress_json,
-            prepared_root.join(&operation_id),
-        ]);
-        return Err(CommandErrorDto::new(
-            "voice_clone_worker_already_running",
-            "当前已有固定话术 Worker 在执行",
-        ));
-    }
-    Ok(snapshot)
-}
-
-#[tauri::command]
-pub async fn start_voice_clone_replacement(
-    window: Window,
-    app: AppHandle,
-    state: State<'_, AppState>,
-    request: StartVoiceCloneReplacementRequestDto,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        start_voice_clone_replacement_blocking(window, app, state, request)
-    })
-    .await
-    .map_err(|error| {
-        CommandErrorDto::new(
-            "voice_clone_replace_failed",
-            format!("固定话术替换任务失败：{error}"),
-        )
-    })?
-}
-
-fn start_voice_clone_replacement_blocking(
-    window: Window,
-    app: AppHandle,
-    state: AppState,
-    request: StartVoiceCloneReplacementRequestDto,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    let _launch_guard = state.lock_voice_clone_launch()?;
-    let _ = state.reap_finished_voice_clone_worker()?;
-    if state.voice_clone_worker_is_running()? {
-        return Err(CommandErrorDto::new(
-            "voice_clone_worker_already_running",
-            "当前已有固定话术 Worker 在执行",
-        ));
-    }
-    let timeout_ms = voice_clone_timeout_ms(request.timeout_ms)?;
-    let executable = configured_voice_clone_worker_executable(&app)
-        .map_err(|reason| CommandErrorDto::new("voice_clone_worker_unavailable", reason))?;
-    let cache_root = voice_clone_cache_root(&app)?;
-    let model_root = voice_clone_model_root(&app)?;
-    let target_root = runtime_resource_target_root(&app)
-        .map_err(|error| CommandErrorDto::new("voice_clone_resource_dir_failed", error))?;
-    let (_, ffprobe_path) =
-        configured_media_engine_paths_with_resource_dir(&target_root).map_err(|error| {
-            CommandErrorDto::new("voice_clone_media_engine_unavailable", error.to_string())
-        })?;
-    let _ = state.reap_finished_speech_worker()?;
-    let speech_worker_running = state.speech_worker_is_running()?;
-    let (plan, stale_replacement_paths, snapshot) = {
-        let mut playback = state
-            .playback
-            .lock()
-            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
-        playback
-            .bind_window(window.label())
-            .map_err(command_error_from_playback)?;
-        let occupancy = speech_worker_running || realtime_audio_is_occupying(&playback.snapshot());
-        let operation_id =
-            voice_clone_operation_id("replace", playback.snapshot().playback_generation)?;
-        let stale_replacement_paths = voice_clone_artifact_dirs(&playback, false);
-        let plan = playback
-            .start_voice_clone_replacement(
-                &request.text,
-                request.position_ms,
-                &operation_id,
-                occupancy,
-            )
-            .map_err(command_error_from_voice_clone_runtime)?;
-        (plan, stale_replacement_paths, state.snapshot(&playback))
-    };
-    let replacement_root = cache_root.join(&plan.source_sha256);
-    std::fs::create_dir_all(&replacement_root)
-        .map_err(|error| CommandErrorDto::new("voice_clone_cache_dir_failed", error.to_string()))?;
-    let request_json = replacement_root.join(format!("{}.replace.json", plan.operation_id));
-    let output_json = replacement_root.join(format!("{}.replace-result.json", plan.operation_id));
-    let progress_json =
-        replacement_root.join(format!("{}.replace-progress.json", plan.operation_id));
-    let request_payload = VoiceCloneReplacementRequest {
-        source_generation: plan.source_generation,
-        source_path: plan.source_path.clone(),
-        source_sha256: plan.source_sha256.clone(),
-        audio_base_path: plan.audio_base_path.clone(),
-        source_duration_ms: plan.source_duration_ms,
-        sample_rate_hz: plan.sample_rate_hz,
-        channel_count: plan.channel_count,
-        operation_id: plan.operation_id.clone(),
-        reference_audio_path: plan.reference_audio_path.clone(),
-        text: plan.input_text.clone(),
-        replace_at_ms: plan.replace_at_ms,
-        resume_at_ms: plan.resume_at_ms,
-    };
-    write_json_file(&request_json, &request_payload)?;
-
-    let playback = Arc::clone(&state.playback);
-    let completed = Arc::new(AtomicBool::new(false));
-    let completed_for_thread = Arc::clone(&completed);
-    let cancellation = CancellationToken::new();
-    let worker_cancellation = cancellation.clone();
-    let thread_executable = executable.clone();
-    let thread_request_json = request_json.clone();
-    let thread_output_json = output_json.clone();
-    let thread_progress_json = progress_json.clone();
-    let thread_model_root = model_root.clone();
-    let thread_voice_clone_worker_server = Arc::clone(&state.voice_clone_worker_server);
-    let thread_replacement_root = replacement_root.clone();
-    let thread_plan = plan.clone();
-    let thread_stale_replacement_paths = stale_replacement_paths;
-    let thread_ffprobe_path = ffprobe_path.clone();
-    let thread_app = app.clone();
-    let handle = thread::spawn(move || {
-        let args = vec![
-            "--replace-json".to_owned(),
-            thread_request_json.display().to_string(),
-            "--output-json".to_owned(),
-            thread_output_json.display().to_string(),
-            "--progress-json".to_owned(),
-            thread_progress_json.display().to_string(),
-        ];
-        let progress_playback = Arc::clone(&playback);
-        let progress_operation_id = thread_plan.operation_id.clone();
-        let mut on_progress = move |progress: &VoiceCloneProgressDto| {
-            if progress.status == "running" {
-                if let Ok(mut playback) = progress_playback.lock() {
-                    let _ = playback.update_voice_clone_progress(
-                        &progress_operation_id,
-                        &progress.phase,
-                        progress.percent,
-                        &progress.message,
-                    );
-                }
-            }
-        };
-        let worker_result = run_voice_clone_worker_process(
-            &thread_executable,
-            &args,
-            timeout_ms,
-            &worker_cancellation,
-            VoiceCloneWorkerResources {
-                model_root: thread_model_root.as_deref(),
-                target_root: Some(&target_root),
-                server: Some(&thread_voice_clone_worker_server),
-            },
-            Some(&thread_progress_json),
-            &mut on_progress,
-        );
-        let replacement = match worker_result {
-            Ok(()) => read_json_file::<VoiceCloneReplaceWorkerResult>(
-                &thread_output_json,
-                "voice_clone_replace_failed",
-                "固定话术替换结果 JSON 无法解析",
-            )
-            .and_then(|result| {
-                validate_voice_clone_replace_result(
-                    &thread_replacement_root,
-                    &thread_plan,
-                    &thread_ffprobe_path,
-                    result,
-                )
-            })
-            .and_then(|replacement| {
-                allow_voice_clone_audio_file(
-                    &thread_app,
-                    Path::new(&replacement.replacement_audio_reference),
-                )
-                .map(|()| replacement)
-            }),
-            Err(VoiceCloneWorkerRunError::Cancelled) => {
-                if let Ok(mut playback) = playback.lock() {
-                    playback.mark_voice_clone_cancelled("用户取消固定话术替换");
-                }
-                cleanup_voice_clone_paths([
-                    thread_request_json.clone(),
-                    thread_output_json.clone(),
-                    thread_progress_json.clone(),
-                    thread_replacement_root.join(&thread_plan.operation_id),
-                ]);
-                completed_for_thread.store(true, Ordering::Release);
-                return;
-            }
-            Err(VoiceCloneWorkerRunError::Timeout { timeout_ms }) => Err(CommandErrorDto::new(
-                "voice_clone_replace_failed",
-                format!("固定话术替换超时（{timeout_ms}ms）"),
-            )),
-            Err(VoiceCloneWorkerRunError::Failed(reason)) => {
-                Err(CommandErrorDto::new("voice_clone_replace_failed", reason))
-            }
-        };
-        let replacement_applied = if let Ok(mut playback) = playback.lock() {
-            match replacement {
-                Ok(replacement) => {
-                    if playback.apply_voice_clone_replacement(replacement).is_err() {
-                        cleanup_voice_clone_paths([
-                            thread_replacement_root.join(&thread_plan.operation_id)
-                        ]);
-                        false
-                    } else {
-                        true
-                    }
-                }
-                Err(error) => {
-                    cleanup_voice_clone_paths([
-                        thread_replacement_root.join(&thread_plan.operation_id)
-                    ]);
-                    playback.mark_voice_clone_failed(error.message);
-                    false
-                }
-            }
-        } else {
-            cleanup_voice_clone_paths([thread_replacement_root.join(&thread_plan.operation_id)]);
-            false
-        };
-        if replacement_applied {
-            cleanup_previous_voice_clone_replacement_paths(
-                thread_stale_replacement_paths,
-                &thread_replacement_root.join(&thread_plan.operation_id),
-            );
-        }
-        cleanup_voice_clone_paths([
-            thread_request_json,
-            thread_output_json,
-            thread_progress_json,
-        ]);
-        completed_for_thread.store(true, Ordering::Release);
-    });
-    if let Err(task) = state.install_voice_clone_worker(VoiceCloneWorkerTask {
-        kind: VoiceCloneWorkerTaskKind::Replacement,
-        cancellation,
-        completed,
-        handle,
-    }) {
-        task.cancellation.cancel();
-        let _join_result = task.handle.join();
-        cleanup_voice_clone_paths([
-            request_json,
-            output_json,
-            progress_json,
-            replacement_root.join(&plan.operation_id),
-        ]);
-        return Err(CommandErrorDto::new(
-            "voice_clone_worker_already_running",
-            "当前已有固定话术 Worker 在执行",
-        ));
-    }
-    Ok(snapshot)
-}
-
-#[tauri::command]
-pub async fn start_voice_clone_playback(
-    window: Window,
-    app: AppHandle,
-    state: State<'_, AppState>,
-    request: StartVoiceClonePlaybackRequestDto,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        start_voice_clone_playback_blocking(window, app, state, request)
-    })
-    .await
-    .map_err(|error| {
-        CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            format!("当前文案声音任务失败：{error}"),
-        )
-    })?
-}
-
-fn start_voice_clone_playback_blocking(
-    window: Window,
-    app: AppHandle,
-    state: AppState,
-    request: StartVoiceClonePlaybackRequestDto,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    let _launch_guard = state.lock_voice_clone_launch()?;
-    let _ = state.reap_finished_voice_clone_worker()?;
-    if state.voice_clone_worker_is_running()? {
-        return Err(CommandErrorDto::new(
-            "voice_clone_worker_already_running",
-            "当前已有固定话术 Worker 在执行",
-        ));
-    }
-    let timeout_ms = voice_clone_timeout_ms(request.timeout_ms)?;
-    let executable = configured_voice_clone_worker_executable(&app)
-        .map_err(|reason| CommandErrorDto::new("voice_clone_worker_unavailable", reason))?;
-    let cache_root = voice_clone_cache_root(&app)?;
-    let model_root = voice_clone_model_root(&app)?;
-    let target_root = runtime_resource_target_root(&app)
-        .map_err(|error| CommandErrorDto::new("voice_clone_resource_dir_failed", error))?;
-    let (_, ffprobe_path) =
-        configured_media_engine_paths_with_resource_dir(&target_root).map_err(|error| {
-            CommandErrorDto::new("voice_clone_media_engine_unavailable", error.to_string())
-        })?;
-    let _ = state.reap_finished_speech_worker()?;
-    let speech_worker_running = state.speech_worker_is_running()?;
-    let (plan, snapshot) = {
-        let mut playback = state
-            .playback
-            .lock()
-            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
-        playback
-            .bind_window(window.label())
-            .map_err(command_error_from_playback)?;
-        let occupancy = speech_worker_running || realtime_audio_is_occupying(&playback.snapshot());
-        let operation_id =
-            voice_clone_operation_id("playback", playback.snapshot().playback_generation)?;
-        let plan = playback
-            .start_voice_clone_playback(
-                &request.text,
-                request.position_ms,
-                &operation_id,
-                occupancy,
-            )
-            .map_err(command_error_from_voice_clone_runtime)?;
-        let snapshot = state.snapshot(&playback);
-        (plan, snapshot)
-    };
-
-    let playback = Arc::clone(&state.playback);
-    let completed = Arc::new(AtomicBool::new(false));
-    let completed_for_thread = Arc::clone(&completed);
-    let cancellation = CancellationToken::new();
-    let worker_cancellation = cancellation.clone();
-    let thread_plan = plan.clone();
-    let thread_app = app.clone();
-    let thread_voice_clone_worker_server = Arc::clone(&state.voice_clone_worker_server);
-    let handle = thread::spawn(move || {
-        let progress_playback = Arc::clone(&playback);
-        let progress_operation_id = thread_plan.operation_id.clone();
-        let mut on_progress = move |progress: &VoiceCloneProgressDto| {
-            if progress.status == "running" {
-                if let Ok(mut playback) = progress_playback.lock() {
-                    let _ = playback.update_voice_clone_playback_progress(
-                        &progress_operation_id,
-                        &progress.phase,
-                        progress.percent,
-                        &progress.message,
-                    );
-                }
-            }
-        };
-        let committed = ensure_voice_clone_playback_cache(
-            &executable,
-            model_root.as_deref(),
-            &target_root,
-            &thread_voice_clone_worker_server,
-            &cache_root,
-            &ffprobe_path,
-            &thread_plan,
-            timeout_ms,
-            &worker_cancellation,
-            &mut on_progress,
-        );
-        let committed = match committed {
-            Ok(VoiceCloneCacheOutcome::Cached(committed)) => {
-                allow_voice_clone_audio_file(&thread_app, Path::new(&committed.audio_reference))
-                    .map(|()| committed)
-            }
-            Ok(VoiceCloneCacheOutcome::Generated(committed)) => {
-                allow_voice_clone_audio_file(&thread_app, Path::new(&committed.audio_reference))
-                    .map(|()| committed)
-            }
-            Err(VoiceCloneCacheEnsureError::Cancelled) => {
-                if let Ok(mut playback) = playback.lock() {
-                    playback.mark_voice_clone_playback_cancelled("用户取消当前文案克隆声音");
-                }
-                completed_for_thread.store(true, Ordering::Release);
-                return;
-            }
-            Err(VoiceCloneCacheEnsureError::Systemic(error))
-            | Err(VoiceCloneCacheEnsureError::Item(error)) => Err(error),
-        };
-        let committed = match committed {
-            Ok(committed) => committed,
-            Err(error) => {
-                if let Ok(mut playback) = playback.lock() {
-                    playback.mark_voice_clone_playback_failed(error.message);
-                }
-                completed_for_thread.store(true, Ordering::Release);
-                return;
-            }
-        };
-        if let Ok(mut playback) = playback.lock() {
-            if playback.apply_voice_clone_playback(committed).is_err() {
-                playback.mark_voice_clone_playback_failed("当前文案克隆声音结果已经过期");
-            }
-        }
-        completed_for_thread.store(true, Ordering::Release);
-    });
-    if let Err(task) = state.install_voice_clone_worker(VoiceCloneWorkerTask {
-        kind: VoiceCloneWorkerTaskKind::Playback,
-        cancellation,
-        completed,
-        handle,
-    }) {
-        task.cancellation.cancel();
-        let _join_result = task.handle.join();
-        return Err(CommandErrorDto::new(
-            "voice_clone_worker_already_running",
-            "当前已有固定话术 Worker 在执行",
-        ));
-    }
-    Ok(snapshot)
-}
-
-#[tauri::command]
-pub async fn start_voice_clone_pre_generation(
-    window: Window,
-    app: AppHandle,
-    state: State<'_, AppState>,
-    request: StartVoiceClonePreGenerationRequestDto,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        start_voice_clone_pre_generation_blocking(window, app, state, request)
-    })
-    .await
-    .map_err(|error| {
-        CommandErrorDto::new(
-            "voice_clone_pre_generation_failed",
-            format!("固定话术批量预生成任务失败：{error}"),
-        )
-    })?
-}
-
-fn start_voice_clone_pre_generation_blocking(
-    window: Window,
-    app: AppHandle,
-    state: AppState,
-    request: StartVoiceClonePreGenerationRequestDto,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    let _launch_guard = state.lock_voice_clone_launch()?;
-    let _ = state.reap_finished_voice_clone_worker()?;
-    if state.voice_clone_worker_is_running()? {
-        return Err(CommandErrorDto::new(
-            "voice_clone_worker_already_running",
-            "当前已有固定话术 Worker 在执行",
-        ));
-    }
-    let batch = validate_voice_clone_pre_generation_items(request.items)?;
-    let timeout_ms = voice_clone_timeout_ms(request.timeout_ms)?;
-    let executable = configured_voice_clone_worker_executable(&app)
-        .map_err(|reason| CommandErrorDto::new("voice_clone_worker_unavailable", reason))?;
-    let cache_root = voice_clone_cache_root(&app)?;
-    let model_root = voice_clone_model_root(&app)?;
-    let target_root = runtime_resource_target_root(&app)
-        .map_err(|error| CommandErrorDto::new("voice_clone_resource_dir_failed", error))?;
-    let (_, ffprobe_path) =
-        configured_media_engine_paths_with_resource_dir(&target_root).map_err(|error| {
-            CommandErrorDto::new("voice_clone_media_engine_unavailable", error.to_string())
-        })?;
-    let (batch_id, source_generation, plans, snapshot) = {
-        let mut playback = state
-            .playback
-            .lock()
-            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
-        playback
-            .bind_window(window.label())
-            .map_err(command_error_from_playback)?;
-        let plans = build_voice_clone_pre_generation_plans(&playback, &batch)?;
-        let source_generation = playback.snapshot().playback_generation;
-        let batch_id = voice_clone_operation_id("pre-generate-batch", source_generation)?;
-        let items = batch
-            .items
-            .iter()
-            .map(|item| {
-                debug_assert_eq!(hash_voice_clone_text(&item.input_text), item.text_sha256);
-                autolive_desktop_core::VoiceClonePreGenerationItemState {
-                    preset_id: item.preset_id.clone(),
-                    text_sha256: item.text_sha256.clone(),
-                    status: "pending".to_owned(),
-                    audio_sha256: None,
-                    duration_ms: None,
-                    error: None,
-                }
-            })
-            .collect();
-        playback
-            .start_voice_clone_pre_generation(&batch_id, source_generation, items)
-            .map_err(command_error_from_voice_clone_runtime)?;
-        (
-            batch_id,
-            source_generation,
-            plans,
-            state.snapshot(&playback),
-        )
-    };
-
-    let playback = Arc::clone(&state.playback);
-    let completed = Arc::new(AtomicBool::new(false));
-    let completed_for_thread = Arc::clone(&completed);
-    let cancellation = CancellationToken::new();
-    let worker_cancellation = cancellation.clone();
-    let thread_voice_clone_worker_server = Arc::clone(&state.voice_clone_worker_server);
-    let handle = thread::spawn(move || {
-        for plan in plans {
-            let current = playback.lock().ok().is_some_and(|mut playback| {
-                playback.mark_voice_clone_pre_generation_text_generating(
-                    &batch_id,
-                    source_generation,
-                    &plan.text_sha256,
-                )
-            });
-            if !current {
-                break;
-            }
-            let mut on_progress = |_progress: &VoiceCloneProgressDto| {};
-            let outcome = ensure_voice_clone_playback_cache(
-                &executable,
-                model_root.as_deref(),
-                &target_root,
-                &thread_voice_clone_worker_server,
-                &cache_root,
-                &ffprobe_path,
-                &plan,
-                timeout_ms,
-                &worker_cancellation,
-                &mut on_progress,
-            );
-            let mut playback = match playback.lock() {
-                Ok(playback) => playback,
-                Err(_) => break,
-            };
-            let updated = match outcome {
-                Ok(VoiceCloneCacheOutcome::Cached(committed)) => playback
-                    .finish_voice_clone_pre_generation_text(
-                        &batch_id,
-                        source_generation,
-                        &plan.text_sha256,
-                        "cached",
-                        Some(committed.audio_sha256),
-                        Some(committed.duration_ms),
-                        None,
-                    ),
-                Ok(VoiceCloneCacheOutcome::Generated(committed)) => playback
-                    .finish_voice_clone_pre_generation_text(
-                        &batch_id,
-                        source_generation,
-                        &plan.text_sha256,
-                        "generated",
-                        Some(committed.audio_sha256),
-                        Some(committed.duration_ms),
-                        None,
-                    ),
-                Err(VoiceCloneCacheEnsureError::Item(error)) => playback
-                    .finish_voice_clone_pre_generation_text(
-                        &batch_id,
-                        source_generation,
-                        &plan.text_sha256,
-                        "failed",
-                        None,
-                        None,
-                        Some(error.message),
-                    ),
-                Err(VoiceCloneCacheEnsureError::Systemic(error)) => {
-                    let _ = playback.stop_voice_clone_pre_generation(
-                        &batch_id,
-                        source_generation,
-                        "failed",
-                        &error.message,
-                    );
-                    break;
-                }
-                Err(VoiceCloneCacheEnsureError::Cancelled) => {
-                    let _ = playback.stop_voice_clone_pre_generation(
-                        &batch_id,
-                        source_generation,
-                        "cancelled",
-                        "用户取消固定话术批量预生成",
-                    );
-                    break;
-                }
-            };
-            if !updated {
-                break;
-            }
-        }
-        completed_for_thread.store(true, Ordering::Release);
-    });
-    if let Err(task) = state.install_voice_clone_worker(VoiceCloneWorkerTask {
-        kind: VoiceCloneWorkerTaskKind::PreGeneration,
-        cancellation,
-        completed,
-        handle,
-    }) {
-        task.cancellation.cancel();
-        let _join_result = task.handle.join();
-        return Err(CommandErrorDto::new(
-            "voice_clone_worker_already_running",
-            "当前已有固定话术 Worker 在执行",
-        ));
-    }
-    Ok(snapshot)
-}
-
-#[tauri::command]
-pub fn cancel_voice_clone_operation(
-    window: Window,
-    state: State<'_, AppState>,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    state.with_voice_clone_launch(|state| {
-        let _ = state.reap_finished_voice_clone_worker()?;
-        let task_kind = state.stop_voice_clone_worker_locked()?;
-        state.with_playback(&window, |playback| {
-            let snapshot = playback.snapshot();
-            match task_kind {
-                Some(VoiceCloneWorkerTaskKind::Prepare | VoiceCloneWorkerTaskKind::Replacement) => {
-                    playback.mark_voice_clone_cancelled("用户取消固定话术 Worker");
-                }
-                Some(VoiceCloneWorkerTaskKind::Playback) => {
-                    playback.mark_voice_clone_playback_cancelled("用户取消当前文案克隆声音");
-                }
-                Some(VoiceCloneWorkerTaskKind::PreGeneration) => {
-                    if let (Some(batch_id), Some(source_generation)) = (
-                        snapshot.voice_clone_pre_generation.batch_id.as_deref(),
-                        snapshot.voice_clone_pre_generation.source_generation,
-                    ) {
-                        let _ = playback.stop_voice_clone_pre_generation(
-                            batch_id,
-                            source_generation,
-                            "cancelled",
-                            "用户取消固定话术批量预生成",
-                        );
-                    }
-                }
-                None if matches!(
-                    snapshot.voice_clone_replacement.status.as_str(),
-                    "preparing" | "generating"
-                ) =>
-                {
-                    playback.mark_voice_clone_cancelled("用户取消固定话术 Worker")
-                }
-                None if snapshot.voice_clone_playback.status == "preparing" => {
-                    playback.mark_voice_clone_playback_cancelled("用户取消当前文案克隆声音");
-                }
-                None if snapshot.voice_clone_pre_generation.status == "generating" => {
-                    if let (Some(batch_id), Some(source_generation)) = (
-                        snapshot.voice_clone_pre_generation.batch_id.as_deref(),
-                        snapshot.voice_clone_pre_generation.source_generation,
-                    ) {
-                        let _ = playback.stop_voice_clone_pre_generation(
-                            batch_id,
-                            source_generation,
-                            "cancelled",
-                            "用户取消固定话术批量预生成",
-                        );
-                    }
-                }
-                None => {}
-            }
-            Ok(state.snapshot(playback))
-        })
-    })
-}
-
-#[tauri::command]
-pub fn finish_voice_clone_playback(
-    window: Window,
-    state: State<'_, AppState>,
-    request: FinishVoiceClonePlaybackRequestDto,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.ensure_playback_window(&window)?;
-    state.with_playback_window(&window, |playback| {
-        playback
-            .finish_voice_clone_playback(&request.operation_id)
-            .map_err(command_error_from_voice_clone_runtime)?;
-        Ok(state.snapshot(playback))
-    })
-}
-
-#[tauri::command]
-pub fn fail_voice_clone_playback(
-    window: Window,
-    state: State<'_, AppState>,
-    request: FailVoiceClonePlaybackRequestDto,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.ensure_playback_window(&window)?;
-    state.with_playback_window(&window, |playback| {
-        playback
-            .fail_voice_clone_playback(&request.operation_id, &request.reason)
-            .map_err(command_error_from_voice_clone_runtime)?;
-        Ok(state.snapshot(playback))
-    })
-}
-
-#[tauri::command]
-pub fn clear_voice_clone_replacement(
-    window: Window,
-    state: State<'_, AppState>,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    let (snapshot, cleanup_paths) = state.with_voice_clone_launch(|state| {
-        if state.voice_clone_worker_kind()? != Some(VoiceCloneWorkerTaskKind::PreGeneration) {
-            let _ = state.stop_voice_clone_worker_locked()?;
-        }
-        state.with_playback(&window, |playback| {
-            let cleanup_paths = voice_clone_artifact_dirs(playback, false);
-            playback.clear_voice_clone_replacement();
-            playback.clear_voice_clone_playback();
-            Ok((state.snapshot(playback), cleanup_paths))
-        })
-    })?;
-    cleanup_voice_clone_paths(cleanup_paths);
-    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -2796,14 +1414,6 @@ pub fn cleanup_local_caches_command(
     state: State<'_, AppState>,
 ) -> Result<CacheCleanupResultDto, CommandErrorDto> {
     state.ensure_main_window(&window)?;
-    let _launch_guard = state.lock_voice_clone_launch()?;
-    let _ = state.reap_finished_voice_clone_worker()?;
-    if state.voice_clone_worker_is_running()? {
-        return Err(CommandErrorDto::new(
-            "voice_clone_cache_cleanup_busy",
-            "固定话术正在准备或生成，请完成或取消后再清理缓存",
-        ));
-    }
     cleanup_local_caches(&app, &state)
 }
 
@@ -3050,14 +1660,7 @@ pub fn start_media_processing(
                 .join("；"),
         ));
     }
-    let (
-        source_path,
-        generation,
-        video_enabled,
-        audio_enabled,
-        realtime_audio_enabled,
-        source_audio_sample_rate_hz,
-    ) = {
+    let (source_path, generation, video_enabled, audio_enabled, source_audio_sample_rate_hz) = {
         let playback = state
             .playback
             .lock()
@@ -3073,7 +1676,6 @@ pub fn start_media_processing(
             snapshot.playback_generation,
             snapshot.video_processing_enabled,
             snapshot.audio_processing_enabled,
-            snapshot.realtime_audio_variant_enabled,
             snapshot
                 .source_media
                 .as_ref()
@@ -3082,28 +1684,6 @@ pub fn start_media_processing(
     };
     if !video_enabled && !audio_enabled {
         return state.with_playback(&window, |playback| Ok(state.snapshot(playback)));
-    }
-    if realtime_audio_enabled && audio_enabled {
-        let supported_runtime = state
-            .playback
-            .lock()
-            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
-            .snapshot()
-            .audio_processing_runtime;
-        if !supported_runtime {
-            state.with_playback(&window, |playback| {
-                playback.mark_audio_processing_unavailable(
-                    "实时音轨的当前普通声音参数尚未接入运行时 DSP；已保持原音轨，请先恢复默认增益参数",
-                );
-                Ok(state.snapshot(playback))
-            })?;
-            if !video_enabled {
-                return state.with_playback(&window, |playback| Ok(state.snapshot(playback)));
-            }
-        }
-        if !video_enabled {
-            return state.with_playback(&window, |playback| Ok(state.snapshot(playback)));
-        }
     }
     let target_root = match runtime_resource_target_root(&app) {
         Ok(target_root) => target_root,
@@ -3147,11 +1727,9 @@ pub fn start_media_processing(
         staging_output_path,
         output_mp4_path: output_mp4_path.clone(),
         video_processing_enabled: video_enabled,
-        // 实时幻化开启时，普通声音处理由最终效果窗口的音频图作用于当前
-        // 原声/候选音轨；这里不能把普通效果提前写入基础视频音轨。
-        // 实时音轨的普通处理只允许已实现的运行时增益路径；其余音频参数必须
-        // 通过真实 DSP Worker 后再启用，不能静默丢弃。
-        audio_processing_enabled: audio_enabled && !realtime_audio_enabled,
+        // 普通声音效果统一交给 FFmpeg。实时音频幻化是独立的候选音轨链路，
+        // 不再通过 Web Audio 在播放端重复套用增益、EQ、混响或淡入淡出。
+        audio_processing_enabled: audio_enabled,
         source_audio_sample_rate_hz,
         video: request.params.video,
         audio: request.params.audio,
@@ -3175,17 +1753,28 @@ pub fn start_media_processing(
     let completed = Arc::new(AtomicBool::new(false));
     let completed_for_thread = Arc::clone(&completed);
     let worker_cancellation = cancellation.clone();
+    let thread_app = app.clone();
     let handle = thread::spawn(move || {
         let result = render_media(&media_request, &worker_cancellation);
         if let Ok(mut playback) = playback.lock() {
             if playback.snapshot().playback_generation == generation {
                 match result {
                     Ok(rendered) => {
-                        let _ = playback.mark_media_processing_ready(
-                            generation,
-                            rendered.output_mp4_path.display().to_string(),
-                            rendered.output_mp4_sha256,
-                        );
+                        match allow_local_playback_asset_file(
+                            &thread_app,
+                            &rendered.output_mp4_path,
+                            "media_processing_asset_scope_failed",
+                            "处理后视频",
+                        ) {
+                            Ok(()) => {
+                                let _ = playback.mark_media_processing_ready(
+                                    generation,
+                                    rendered.output_mp4_path.display().to_string(),
+                                    rendered.output_mp4_sha256,
+                                );
+                            }
+                            Err(error) => playback.mark_media_processing_failed(error.message),
+                        }
                     }
                     Err(error) => playback.mark_media_processing_failed(error.to_string()),
                 }
@@ -3283,37 +1872,66 @@ pub fn direct_model_chat(
     })
 }
 
+fn disable_media_processing_on_final_effect_close(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let _ = state.stop_media_worker();
+    let _ = state.stop_speech_worker();
+    // ponytail: 关最终效果窗时关掉声音/视频处理；实时幻化一并关
+    let playback = Arc::clone(&state.playback);
+    let lock_result = playback.lock();
+    if let Ok(mut guard) = lock_result {
+        guard.set_processing_switches(false, false, false);
+    }
+}
+
+fn attach_final_effect_close_cleanup(app: &AppHandle, window: &tauri::WebviewWindow) {
+    let app_handle = app.clone();
+    let _ = window.on_window_event(move |event| {
+        if matches!(
+            event,
+            tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+        ) {
+            disable_media_processing_on_final_effect_close(&app_handle);
+        }
+    });
+}
+
 #[tauri::command]
-pub fn open_final_effect_window(app: AppHandle) -> Result<FinalEffectWindowDto, CommandErrorDto> {
-    if let Some(window) = app.get_webview_window("final-effect") {
+pub async fn open_final_effect_window(
+    app: AppHandle,
+    request: Option<ResizeFinalEffectWindowRequestDto>,
+) -> Result<FinalEffectWindowDto, CommandErrorDto> {
+    let created = if let Some(window) = app.get_webview_window("final-effect") {
         window
             .show()
             .and_then(|_| window.set_focus())
             .map_err(|error| {
                 CommandErrorDto::new("final_effect_window_show_failed", error.to_string())
             })?;
-        return Ok(FinalEffectWindowDto {
-            label: "final-effect".to_owned(),
-            created: false,
-        });
+        false
+    } else {
+        // ponytail: 先默认尺寸创建，有分辨率时立刻按工作区 clamp 调整
+        let window = WebviewWindowBuilder::new(&app, "final-effect", WebviewUrl::App("index.html".into()))
+            .title("autolive-desktop-core 最终效果")
+            .inner_size(1280.0, 720.0)
+            .min_inner_size(320.0, 180.0)
+            .resizable(true)
+            .center()
+            .build()
+            .map_err(|error| {
+                CommandErrorDto::new("final_effect_window_create_failed", error.to_string())
+            })?;
+        attach_final_effect_close_cleanup(&app, &window);
+        true
+    };
+    if let Some(request) = request {
+        let _ = resize_final_effect_window_for_app(&app, request)?;
     }
-    WebviewWindowBuilder::new(
-        &app,
-        "final-effect",
-        WebviewUrl::App("index.html?view=final-effect".into()),
-    )
-    .title("autolive-desktop-core 最终效果")
-    .inner_size(1280.0, 760.0)
-    .min_inner_size(320.0, 180.0)
-    .resizable(true)
-    .center()
-    .build()
-    .map_err(|error| {
-        CommandErrorDto::new("final_effect_window_create_failed", error.to_string())
-    })?;
     Ok(FinalEffectWindowDto {
         label: "final-effect".to_owned(),
-        created: true,
+        created,
     })
 }
 
@@ -3322,6 +1940,7 @@ pub fn close_final_effect_window(app: AppHandle) -> Result<bool, CommandErrorDto
     let Some(window) = app.get_webview_window("final-effect") else {
         return Ok(false);
     };
+    disable_media_processing_on_final_effect_close(&app);
     window.close().map_err(|error| {
         CommandErrorDto::new("final_effect_window_close_failed", error.to_string())
     })?;
@@ -3331,6 +1950,7 @@ pub fn close_final_effect_window(app: AppHandle) -> Result<bool, CommandErrorDto
 #[tauri::command]
 pub fn resize_final_effect_window(
     window: Window,
+    app: AppHandle,
     request: ResizeFinalEffectWindowRequestDto,
 ) -> Result<FinalEffectWindowSizeDto, CommandErrorDto> {
     if !matches!(window.label(), "main" | "final-effect") {
@@ -3339,18 +1959,39 @@ pub fn resize_final_effect_window(
             "当前窗口不允许调整播放窗口尺寸",
         ));
     }
+    resize_final_effect_window_for_app(&app, request)
+}
 
-    let monitor = window
-        .current_monitor()
-        .map_err(|error| {
-            CommandErrorDto::new("final_effect_monitor_unavailable", error.to_string())
-        })?
-        .ok_or_else(|| {
-            CommandErrorDto::new(
-                "final_effect_monitor_unavailable",
-                "无法读取当前播放窗口所在显示器",
-            )
-        })?;
+fn resolve_final_effect_monitor(
+    window: &tauri::WebviewWindow,
+) -> Result<tauri::Monitor, CommandErrorDto> {
+    for _ in 0..5 {
+        if let Ok(Some(monitor)) = window.current_monitor() {
+            return Ok(monitor);
+        }
+        if let Ok(Some(monitor)) = window.primary_monitor() {
+            return Ok(monitor);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(CommandErrorDto::new(
+        "final_effect_monitor_unavailable",
+        "无法读取当前播放窗口所在显示器",
+    ))
+}
+
+fn resize_final_effect_window_for_app(
+    app: &AppHandle,
+    request: ResizeFinalEffectWindowRequestDto,
+) -> Result<FinalEffectWindowSizeDto, CommandErrorDto> {
+    let window = app.get_webview_window("final-effect").ok_or_else(|| {
+        CommandErrorDto::new(
+            "final_effect_window_missing",
+            "最终效果窗口尚未打开，无法按视频分辨率调整",
+        )
+    })?;
+
+    let monitor = resolve_final_effect_monitor(&window)?;
     let scale_factor = monitor.scale_factor();
     if !scale_factor.is_finite() || scale_factor <= 0.0 {
         return Err(CommandErrorDto::new(
@@ -3459,16 +2100,10 @@ pub fn stop_playback(
     state.stop_speech_worker()?;
     state.stop_media_worker()?;
     state.stop_research_worker()?;
-    let (snapshot, cleanup_paths) = state.with_voice_clone_launch(|state| {
-        let _ = state.stop_voice_clone_worker_locked()?;
-        state.with_playback_window(&window, |playback| {
-            let cleanup_paths = voice_clone_artifact_dirs(playback, true);
-            playback.stop();
-            Ok((state.snapshot(playback), cleanup_paths))
-        })
-    })?;
-    cleanup_voice_clone_paths(cleanup_paths);
-    Ok(snapshot)
+    state.with_playback_window(&window, |playback| {
+        playback.stop();
+        Ok(state.snapshot(playback))
+    })
 }
 
 #[tauri::command]
@@ -3477,30 +2112,12 @@ pub fn complete_playback_loop(
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
     state.stop_speech_worker()?;
-    let (snapshot, cleanup_paths) = state.with_voice_clone_launch(|state| {
-        let should_stop_voice_clone_worker =
-            state.voice_clone_worker_kind()? != Some(VoiceCloneWorkerTaskKind::PreGeneration) && {
-                let playback = state.playback.lock().map_err(|_| {
-                    CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏")
-                })?;
-                matches!(
-                    playback.snapshot().voice_clone_replacement.status.as_str(),
-                    "preparing" | "generating"
-                )
-            };
-        if should_stop_voice_clone_worker {
-            let _ = state.stop_voice_clone_worker_locked()?;
-        }
-        state.with_playback_window(&window, |playback| {
-            let cleanup_paths = voice_clone_artifact_dirs(playback, false);
-            playback
-                .complete_loop()
-                .map_err(command_error_from_playback)?;
-            Ok((state.snapshot(playback), cleanup_paths))
-        })
-    })?;
-    cleanup_voice_clone_paths(cleanup_paths);
-    Ok(snapshot)
+    state.with_playback_window(&window, |playback| {
+        playback
+            .complete_loop()
+            .map_err(command_error_from_playback)?;
+        Ok(state.snapshot(playback))
+    })
 }
 
 #[tauri::command]
@@ -3554,7 +2171,8 @@ pub fn set_audio_processing_profile(
     state: State<'_, AppState>,
     request: AudioProcessingProfileRequestDto,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.stop_media_worker()?;
+    // 只更新配置，不打断正在跑的 FFmpeg；新参数由下一轮 start_media_processing 消费。
+    let _ = state.reap_finished_media_worker()?;
     state.with_playback(&window, |playback| {
         playback
             .set_audio_processing_profile(request.profile)
@@ -3874,6 +2492,8 @@ pub fn get_snapshot(
     window: Window,
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    // 轮询时回收已完成 Worker，避免状态一直停在 processing。
+    let _ = state.reap_finished_media_worker()?;
     if window.label() == "final-effect" {
         let playback = state
             .playback
@@ -3907,1530 +2527,32 @@ pub fn get_default_local_research_params(
     Ok(LocalResearchParams::default())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum VoiceCloneWorkerRunError {
-    Cancelled,
-    Timeout { timeout_ms: u64 },
-    Failed(String),
-}
-
-fn unavailable_voice_clone_capabilities(
-    reason: impl Into<String>,
-) -> VoiceCloneWorkerCapabilitiesDto {
-    VoiceCloneWorkerCapabilitiesDto {
-        available: false,
-        status: "unavailable".to_owned(),
-        provider: None,
-        model: None,
-        reason: Some(reason.into()),
-    }
-}
-
-fn configured_voice_clone_worker_executable(app: &AppHandle) -> Result<PathBuf, String> {
-    let development_override = if cfg!(debug_assertions) {
-        std::env::var(VOICE_CLONE_WORKER_ENV).ok()
-    } else {
-        None
-    };
-    let path = if let Some(configured) = development_override {
-        let trimmed = configured.trim();
-        if trimmed.is_empty() {
-            return Err(format!("{VOICE_CLONE_WORKER_ENV} 不能为空"));
-        }
-        PathBuf::from(trimmed)
-    } else {
-        runtime_resource_layout(app)?
-            .target_root
-            .join("voice-worker")
-            .join(if cfg!(windows) {
-                "autolive-voice-clone-worker.exe"
-            } else {
-                "autolive-voice-clone-worker"
-            })
-    };
-    if !path.is_absolute() {
-        return Err("固定话术 Worker 路径必须是绝对路径".to_owned());
-    }
-    if !path.is_file() {
-        return Err("固定话术 Worker 文件不存在，需要下载运行资源。".to_owned());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = path
-            .metadata()
-            .map_err(|error| format!("无法读取固定话术 Worker 权限：{error}"))?
-            .permissions()
-            .mode();
-        if mode & 0o111 == 0 {
-            return Err("固定话术 Worker 文件不可执行，请先赋予执行权限".to_owned());
-        }
-    }
-    Ok(path)
-}
-
-fn voice_clone_cache_root(app: &AppHandle) -> Result<PathBuf, CommandErrorDto> {
-    let cache_root = app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| CommandErrorDto::new("voice_clone_cache_dir_failed", error.to_string()))?
-        .join("voice-clone");
-    std::fs::create_dir_all(&cache_root)
-        .map_err(|error| CommandErrorDto::new("voice_clone_cache_dir_failed", error.to_string()))?;
-    Ok(cache_root)
-}
-
-fn allow_voice_clone_audio_file(app: &AppHandle, audio_path: &Path) -> Result<(), CommandErrorDto> {
-    let canonical_audio_path = std::fs::canonicalize(audio_path).map_err(|error| {
-        CommandErrorDto::new(
-            "voice_clone_asset_scope_failed",
-            format!("固定话术最终音频路径无法规范化：{error}"),
-        )
+fn allow_local_playback_asset_file(
+    app: &AppHandle,
+    asset_path: &Path,
+    error_code: &'static str,
+    asset_label: &'static str,
+) -> Result<(), CommandErrorDto> {
+    let canonical_asset_path = std::fs::canonicalize(asset_path).map_err(|error| {
+        CommandErrorDto::new(error_code, format!("{asset_label}路径无法规范化：{error}"))
     })?;
-    let metadata = std::fs::metadata(&canonical_audio_path).map_err(|error| {
-        CommandErrorDto::new(
-            "voice_clone_asset_scope_failed",
-            format!("固定话术最终音频文件无法读取：{error}"),
-        )
+    let metadata = std::fs::metadata(&canonical_asset_path).map_err(|error| {
+        CommandErrorDto::new(error_code, format!("{asset_label}文件无法读取：{error}"))
     })?;
     if !metadata.is_file() {
         return Err(CommandErrorDto::new(
-            "voice_clone_asset_scope_failed",
-            "固定话术最终音频路径不是文件",
+            error_code,
+            format!("{asset_label}路径不是文件"),
         ));
     }
     app.asset_protocol_scope()
-        .allow_file(&canonical_audio_path)
+        .allow_file(&canonical_asset_path)
         .map_err(|error| {
             CommandErrorDto::new(
-                "voice_clone_asset_scope_failed",
-                format!("固定话术最终音频无法加入 asset scope：{error}"),
+                error_code,
+                format!("{asset_label}无法加入 asset scope：{error}"),
             )
         })
-}
-
-fn voice_clone_model_root(app: &AppHandle) -> Result<Option<PathBuf>, CommandErrorDto> {
-    if cfg!(debug_assertions) {
-        if let Ok(configured) = std::env::var(VOICE_CLONE_MODEL_ROOT_ENV) {
-            let configured = configured.trim();
-            if configured.is_empty() {
-                return Err(CommandErrorDto::new(
-                    "voice_clone_model_resources_invalid",
-                    format!("{VOICE_CLONE_MODEL_ROOT_ENV} 不能为空"),
-                ));
-            }
-            let path = PathBuf::from(configured);
-            if !path.is_absolute() {
-                return Err(CommandErrorDto::new(
-                    "voice_clone_model_resources_invalid",
-                    format!("{VOICE_CLONE_MODEL_ROOT_ENV} 必须是绝对路径"),
-                ));
-            }
-            return Ok(Some(path));
-        }
-    }
-
-    let layout = runtime_resource_layout(app)
-        .map_err(|error| CommandErrorDto::new("voice_clone_model_resources_failed", error))?;
-    let resource_root = layout.model_root;
-    if voice_clone_model_resources_complete(&resource_root) {
-        return Ok(Some(resource_root));
-    }
-    Err(CommandErrorDto::new(
-        "voice_clone_model_resources_missing",
-        "人声模型资源不完整，需要下载运行资源。",
-    ))
-}
-
-fn voice_clone_model_resources_complete(root: &Path) -> bool {
-    let demucs = root.join("huggingface/hub/models--adefossez--HTDemucs");
-    let whisper = root.join("huggingface/hub/models--Systran--faster-whisper-small");
-    let xtts = root.join("tts/tts/tts_models--multilingual--multi-dataset--xtts_v2");
-    huggingface_model_resources_complete(&demucs, &["htdemucs.yaml"], Some(".safetensors"))
-        && huggingface_model_resources_complete(
-            &whisper,
-            &[
-                "config.json",
-                "model.bin",
-                "tokenizer.json",
-                "vocabulary.txt",
-            ],
-            None,
-        )
-        && [
-            "config.json",
-            "model.pth",
-            "speakers_xtts.pth",
-            "vocab.json",
-        ]
-        .iter()
-        .all(|file| non_empty_file(&xtts.join(file)))
-}
-
-fn non_empty_file(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|metadata| metadata.is_file() && metadata.len() > 0)
-        .unwrap_or(false)
-}
-
-fn huggingface_model_resources_complete(
-    root: &Path,
-    required_files: &[&str],
-    required_suffix: Option<&str>,
-) -> bool {
-    if !non_empty_file(&root.join("refs/main")) {
-        return false;
-    }
-    let snapshots = match std::fs::read_dir(root.join("snapshots")) {
-        Ok(entries) => entries,
-        Err(_) => return false,
-    };
-    snapshots
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|snapshot| snapshot.is_dir())
-        .any(|snapshot| {
-            let required_files_ready = required_files
-                .iter()
-                .all(|file| non_empty_file(&snapshot.join(file)));
-            let suffix_ready = required_suffix.is_none_or(|suffix| {
-                std::fs::read_dir(&snapshot)
-                    .map(|entries| {
-                        entries.filter_map(Result::ok).any(|entry| {
-                            entry.file_name().to_string_lossy().ends_with(suffix)
-                                && non_empty_file(&entry.path())
-                        })
-                    })
-                    .unwrap_or(false)
-            });
-            required_files_ready && suffix_ready
-        })
-}
-
-fn voice_clone_operation_id(prefix: &str, generation: u64) -> Result<String, CommandErrorDto> {
-    let nonce = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|error| {
-            CommandErrorDto::new("voice_clone_operation_id_failed", error.to_string())
-        })?
-        .as_nanos();
-    Ok(format!("{prefix}-g{generation}-{nonce}"))
-}
-
-// 由包含纳秒 nonce 的 operation_id 派生，仅作为本次 prepared session 的 64hex
-// 不透明命名空间；它不是、也不得被解释为 MP4 内容 SHA-256。
-fn voice_clone_prepare_session_identity(operation_id: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"autolive:voice-clone:prepared-session\0");
-    hasher.update(operation_id.as_bytes());
-    let digest = hasher.finalize();
-    let mut identity = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ignored = write!(&mut identity, "{byte:02x}");
-    }
-    identity
-}
-
-fn voice_clone_playback_cache_root(
-    cache_root: &Path,
-    source_sha256: &str,
-    text_sha256: &str,
-) -> PathBuf {
-    cache_root
-        .join(source_sha256)
-        .join("current-text")
-        .join(text_sha256)
-}
-
-fn voice_clone_playback_cache_path(playback_root: &Path) -> PathBuf {
-    playback_root.join("playback.json")
-}
-
-enum VoiceCloneCacheEnsureError {
-    Cancelled,
-    Systemic(CommandErrorDto),
-    Item(CommandErrorDto),
-}
-
-enum VoiceCloneCacheOutcome {
-    Cached(autolive_desktop_core::VoiceCloneCommittedPlayback),
-    Generated(autolive_desktop_core::VoiceCloneCommittedPlayback),
-}
-
-fn build_voice_clone_synthesize_request(
-    plan: &autolive_desktop_core::VoiceClonePlaybackPlan,
-) -> VoiceCloneSynthesizeRequest {
-    VoiceCloneSynthesizeRequest {
-        source_generation: plan.source_generation,
-        source_path: plan.source_path.clone(),
-        source_sha256: plan.source_sha256.clone(),
-        reference_audio_path: plan.reference_audio_path.clone(),
-        reference_audio_sha256: plan.reference_audio_sha256.clone(),
-        operation_id: plan.operation_id.clone(),
-        text: plan.input_text.clone(),
-        model: VOICE_CLONE_SYNTHESIS_MODEL_ID.to_owned(),
-        sample_rate_hz: plan.sample_rate_hz,
-        channel_count: plan.channel_count,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ensure_voice_clone_playback_cache(
-    executable: &Path,
-    model_root: Option<&Path>,
-    target_root: &Path,
-    server: &Arc<Mutex<Option<VoiceCloneWorkerServer>>>,
-    cache_root: &Path,
-    ffprobe_path: &Path,
-    plan: &autolive_desktop_core::VoiceClonePlaybackPlan,
-    timeout_ms: u64,
-    cancellation: &CancellationToken,
-    on_progress: &mut dyn FnMut(&VoiceCloneProgressDto),
-) -> Result<VoiceCloneCacheOutcome, VoiceCloneCacheEnsureError> {
-    if cancellation.is_cancelled() {
-        return Err(VoiceCloneCacheEnsureError::Cancelled);
-    }
-    let playback_root =
-        voice_clone_playback_cache_root(cache_root, &plan.source_sha256, &plan.text_sha256);
-    std::fs::create_dir_all(&playback_root).map_err(|error| {
-        VoiceCloneCacheEnsureError::Systemic(CommandErrorDto::new(
-            "voice_clone_cache_dir_failed",
-            error.to_string(),
-        ))
-    })?;
-    if let Some(cached) = load_cached_voice_clone_playback(&playback_root, plan, ffprobe_path)
-        .map_err(VoiceCloneCacheEnsureError::Systemic)?
-    {
-        if cancellation.is_cancelled() {
-            return Err(VoiceCloneCacheEnsureError::Cancelled);
-        }
-        return Ok(VoiceCloneCacheOutcome::Cached(cached));
-    }
-
-    let request_json = playback_root.join(format!("{}.synthesize.json", plan.operation_id));
-    let output_json = playback_root.join(format!("{}.synthesize-result.json", plan.operation_id));
-    let progress_json =
-        playback_root.join(format!("{}.synthesize-progress.json", plan.operation_id));
-    let request_payload = build_voice_clone_synthesize_request(plan);
-    write_json_file(&request_json, &request_payload)
-        .map_err(VoiceCloneCacheEnsureError::Systemic)?;
-    let args = vec![
-        "--synthesize-json".to_owned(),
-        request_json.display().to_string(),
-        "--output-json".to_owned(),
-        output_json.display().to_string(),
-        "--progress-json".to_owned(),
-        progress_json.display().to_string(),
-    ];
-    let worker_result = run_voice_clone_worker_process(
-        executable,
-        &args,
-        timeout_ms,
-        cancellation,
-        VoiceCloneWorkerResources {
-            model_root,
-            target_root: Some(target_root),
-            server: Some(server),
-        },
-        Some(&progress_json),
-        on_progress,
-    );
-    let result = if cancellation.is_cancelled() {
-        Err(VoiceCloneCacheEnsureError::Cancelled)
-    } else {
-        match worker_result {
-            Ok(()) => read_json_file::<VoiceCloneSynthesizeWorkerResult>(
-                &output_json,
-                "voice_clone_playback_failed",
-                "当前文案克隆声音结果 JSON 无法解析",
-            )
-            .and_then(|result| {
-                validate_voice_clone_synthesize_result(&playback_root, plan, ffprobe_path, result)
-            })
-            .and_then(|committed| {
-                write_voice_clone_playback_cache(&playback_root, plan, &committed)
-                    .map(|()| VoiceCloneCacheOutcome::Generated(committed))
-            })
-            .map_err(VoiceCloneCacheEnsureError::Item),
-            Err(VoiceCloneWorkerRunError::Cancelled) => Err(VoiceCloneCacheEnsureError::Cancelled),
-            Err(VoiceCloneWorkerRunError::Timeout { timeout_ms }) => {
-                Err(VoiceCloneCacheEnsureError::Systemic(CommandErrorDto::new(
-                    "voice_clone_playback_failed",
-                    format!("当前文案克隆声音生成超时（{timeout_ms}ms）"),
-                )))
-            }
-            Err(VoiceCloneWorkerRunError::Failed(reason)) => {
-                Err(VoiceCloneCacheEnsureError::Systemic(CommandErrorDto::new(
-                    "voice_clone_playback_failed",
-                    reason,
-                )))
-            }
-        }
-    };
-    cleanup_voice_clone_paths([request_json, output_json, progress_json]);
-    if result.is_err() {
-        cleanup_voice_clone_paths([playback_root.join(&plan.operation_id)]);
-    }
-    result
-}
-
-fn write_voice_clone_playback_cache(
-    playback_root: &Path,
-    plan: &autolive_desktop_core::VoiceClonePlaybackPlan,
-    playback: &autolive_desktop_core::VoiceCloneCommittedPlayback,
-) -> Result<(), CommandErrorDto> {
-    write_json_file(
-        &voice_clone_playback_cache_path(playback_root),
-        &VoiceClonePlaybackCache {
-            version: VOICE_CLONE_PLAYBACK_CACHE_VERSION,
-            source_generation: plan.source_generation,
-            source_path: plan.source_path.clone(),
-            source_sha256: plan.source_sha256.clone(),
-            reference_audio_sha256: plan.reference_audio_sha256.clone(),
-            input_text: plan.input_text.clone(),
-            text_sha256: plan.text_sha256.clone(),
-            audio_reference: playback.audio_reference.clone(),
-            audio_sha256: playback.audio_sha256.clone(),
-            duration_ms: playback.duration_ms,
-            sample_rate_hz: plan.sample_rate_hz,
-            channel_count: plan.channel_count,
-            model: plan.model.clone(),
-        },
-    )
-}
-
-fn voice_clone_cache_identity_matches(
-    cached_model: Option<&str>,
-    plan_model: Option<&str>,
-) -> bool {
-    plan_model.is_some() && cached_model == plan_model
-}
-
-fn load_cached_voice_clone_playback(
-    playback_root: &Path,
-    plan: &autolive_desktop_core::VoiceClonePlaybackPlan,
-    ffprobe_path: &Path,
-) -> Result<Option<autolive_desktop_core::VoiceCloneCommittedPlayback>, CommandErrorDto> {
-    let cache_path = voice_clone_playback_cache_path(playback_root);
-    if !cache_path.is_file() {
-        return Ok(None);
-    }
-    let cache = match read_json_file::<VoiceClonePlaybackCache>(
-        &cache_path,
-        "voice_clone_playback_cache_invalid",
-        "当前文案克隆声音缓存无法解析",
-    ) {
-        Ok(cache) => cache,
-        Err(_) => return Ok(None),
-    };
-    if cache.version != VOICE_CLONE_PLAYBACK_CACHE_VERSION
-        || cache.source_sha256 != plan.source_sha256
-        || cache.reference_audio_sha256 != plan.reference_audio_sha256
-        || cache.input_text != plan.input_text
-        || cache.text_sha256 != plan.text_sha256
-        || cache.sample_rate_hz != plan.sample_rate_hz
-        || cache.channel_count != plan.channel_count
-        || !voice_clone_cache_identity_matches(cache.model.as_deref(), plan.model.as_deref())
-    {
-        return Ok(None);
-    }
-    let audio_path = match canonicalize_file_within_root(
-        playback_root,
-        &cache.audio_reference,
-        "voice_clone_playback_cache_invalid",
-        "当前文案克隆声音缓存音频无效",
-    ) {
-        Ok(path) => path,
-        Err(_) => return Ok(None),
-    };
-    let actual_sha256 = match voice_clone_hash_matches(
-        &audio_path,
-        &cache.audio_sha256,
-        "voice_clone_playback_cache_invalid",
-        "当前文案克隆声音缓存哈希不一致",
-    ) {
-        Ok(hash) => hash,
-        Err(_) => return Ok(None),
-    };
-    let file_size = match std::fs::metadata(&audio_path) {
-        Ok(metadata) => metadata.len(),
-        Err(_) => return Ok(None),
-    };
-    if file_size < 44 {
-        return Ok(None);
-    }
-    let (sample_rate_hz, channel_count, duration_ms) =
-        match probe_voice_clone_audio(ffprobe_path, &audio_path) {
-            Ok(info) => info,
-            Err(_) => return Ok(None),
-        };
-    if sample_rate_hz != plan.sample_rate_hz
-        || channel_count != plan.channel_count
-        || duration_ms == 0
-        || duration_ms.abs_diff(cache.duration_ms) > 100
-    {
-        return Ok(None);
-    }
-    Ok(Some(autolive_desktop_core::VoiceCloneCommittedPlayback {
-        source_generation: plan.source_generation,
-        source_path: plan.source_path.clone(),
-        operation_id: plan.operation_id.clone(),
-        input_text: plan.input_text.clone(),
-        text_sha256: plan.text_sha256.clone(),
-        audio_reference: audio_path.display().to_string(),
-        audio_sha256: actual_sha256,
-        duration_ms,
-        start_at_ms: plan.start_at_ms,
-        model: cache.model,
-    }))
-}
-
-fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), CommandErrorDto> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            CommandErrorDto::new("voice_clone_json_dir_failed", error.to_string())
-        })?;
-    }
-    let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
-        CommandErrorDto::new("voice_clone_json_serialize_failed", error.to_string())
-    })?;
-    let partial = path.with_extension("json.partial");
-    let mut file = std::fs::File::create(&partial).map_err(|error| {
-        CommandErrorDto::new("voice_clone_json_write_failed", error.to_string())
-    })?;
-    file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|error| {
-            CommandErrorDto::new("voice_clone_json_write_failed", error.to_string())
-        })?;
-    std::fs::rename(&partial, path).map_err(|error| {
-        CommandErrorDto::new("voice_clone_json_commit_failed", error.to_string())
-    })?;
-    Ok(())
-}
-
-fn read_json_file<T: DeserializeOwned>(
-    path: &Path,
-    code: &'static str,
-    message: &'static str,
-) -> Result<T, CommandErrorDto> {
-    let bytes =
-        std::fs::read(path).map_err(|error| CommandErrorDto::new(code, error.to_string()))?;
-    serde_json::from_slice::<T>(&bytes)
-        .map_err(|error| CommandErrorDto::new(code, format!("{message}：{error}")))
-}
-
-fn read_voice_clone_progress(path: &Path) -> Option<VoiceCloneProgressDto> {
-    let bytes = std::fs::read(path).ok()?;
-    let progress = serde_json::from_slice::<VoiceCloneProgressDto>(&bytes).ok()?;
-    if progress.phase.trim().is_empty() || progress.message.trim().is_empty() {
-        return None;
-    }
-    Some(progress)
-}
-
-fn kill_child(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let process_group = format!("-{}", child.id());
-        let _kill_group_result = Command::new("/bin/kill")
-            .args(["-KILL", process_group.as_str()])
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        let _kill_tree_result = Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .status();
-    }
-    let _kill_result = child.kill();
-    let _wait_result = child.wait();
-}
-
-impl VoiceCloneWorkerServer {
-    fn spawn(
-        executable: &Path,
-        resources: VoiceCloneWorkerResources<'_>,
-    ) -> Result<Self, VoiceCloneWorkerRunError> {
-        let mut command = Command::new(executable);
-        command
-            .arg("--serve")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_voice_clone_worker_command(&mut command, resources);
-        #[cfg(unix)]
-        command.process_group(0);
-
-        let mut child = command
-            .spawn()
-            .map_err(|error| VoiceCloneWorkerRunError::Failed(error.to_string()))?;
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                kill_child(&mut child);
-                return Err(VoiceCloneWorkerRunError::Failed(
-                    "固定话术 Worker 常驻进程没有 stdin".to_owned(),
-                ));
-            }
-        };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                kill_child(&mut child);
-                return Err(VoiceCloneWorkerRunError::Failed(
-                    "固定话术 Worker 常驻进程没有 stdout".to_owned(),
-                ));
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                kill_child(&mut child);
-                return Err(VoiceCloneWorkerRunError::Failed(
-                    "固定话术 Worker 常驻进程没有 stderr".to_owned(),
-                ));
-            }
-        };
-
-        let (response_sender, responses) = mpsc::sync_channel(16);
-        let stdout_reader = thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                let line = match line {
-                    Ok(line) => line,
-                    Err(error) => {
-                        let _ = response_sender.send(Err(format!(
-                            "固定话术 Worker 常驻进程 stdout 读取失败：{error}"
-                        )));
-                        return;
-                    }
-                };
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let response = serde_json::from_str::<VoiceCloneServerResponse>(&line)
-                    .map_err(|error| format!("固定话术 Worker 常驻进程协议响应无效：{error}"));
-                if response_sender.send(response).is_err() {
-                    return;
-                }
-            }
-        });
-
-        let stderr_text = Arc::new(Mutex::new(String::new()));
-        let stderr_text_for_reader = Arc::clone(&stderr_text);
-        let stderr_reader = thread::spawn(move || {
-            use std::io::Read;
-
-            let mut stream = stderr;
-            let mut captured = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            loop {
-                match stream.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(bytes_read) => {
-                        let remaining =
-                            MAX_VOICE_CLONE_WORKER_STDERR_BYTES.saturating_sub(captured.len());
-                        if remaining > 0 {
-                            captured.extend_from_slice(&buffer[..bytes_read.min(remaining)]);
-                            if let Ok(mut message) = stderr_text_for_reader.lock() {
-                                *message = String::from_utf8_lossy(&captured).into_owned();
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Ok(Self {
-            child,
-            stdin,
-            responses,
-            stdout_reader: Some(stdout_reader),
-            stderr_reader: Some(stderr_reader),
-            stderr: stderr_text,
-        })
-    }
-
-    fn is_exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
-    }
-
-    fn stderr_message(&self) -> Option<String> {
-        self.stderr
-            .lock()
-            .ok()
-            .map(|message| message.trim().to_owned())
-            .filter(|message| !message.is_empty())
-    }
-}
-
-impl Drop for VoiceCloneWorkerServer {
-    fn drop(&mut self) {
-        kill_child(&mut self.child);
-        let _ = self
-            .stdout_reader
-            .take()
-            .and_then(|handle| handle.join().ok());
-        let _ = self
-            .stderr_reader
-            .take()
-            .and_then(|handle| handle.join().ok());
-    }
-}
-
-fn configure_voice_clone_worker_command(
-    command: &mut Command,
-    resources: VoiceCloneWorkerResources<'_>,
-) {
-    command.env("PYTHONUNBUFFERED", "1");
-    if let Some(target_root) = resources.target_root {
-        if !cfg!(debug_assertions)
-            || (std::env::var_os(FFMPEG_PATH_ENV).is_none()
-                && std::env::var_os(FFPROBE_PATH_ENV).is_none())
-        {
-            if let Ok((ffmpeg_path, ffprobe_path)) = packaged_media_engine_paths(target_root) {
-                command
-                    .env(FFMPEG_PATH_ENV, ffmpeg_path)
-                    .env(FFPROBE_PATH_ENV, ffprobe_path);
-            }
-        }
-    }
-    if let Some(model_root) = resources.model_root {
-        command
-            .env(VOICE_CLONE_MODEL_ROOT_ENV, model_root)
-            .env("TORCH_HOME", model_root.join("torch"))
-            .env("HF_HOME", model_root.join("huggingface"))
-            .env("HF_HUB_CACHE", model_root.join("huggingface").join("hub"))
-            .env("TTS_HOME", model_root.join("tts"));
-        if cfg!(not(debug_assertions)) {
-            command
-                .env("HF_HUB_OFFLINE", "1")
-                .env("TRANSFORMERS_OFFLINE", "1");
-        }
-    }
-}
-
-fn run_voice_clone_worker_process(
-    executable: &Path,
-    args: &[String],
-    timeout_ms: u64,
-    cancellation: &CancellationToken,
-    resources: VoiceCloneWorkerResources<'_>,
-    progress_path: Option<&Path>,
-    on_progress: &mut dyn FnMut(&VoiceCloneProgressDto),
-) -> Result<(), VoiceCloneWorkerRunError> {
-    if resources.server.is_some() {
-        return run_voice_clone_worker_server(
-            executable,
-            args,
-            timeout_ms,
-            cancellation,
-            resources,
-            progress_path,
-            on_progress,
-        );
-    }
-
-    run_voice_clone_worker_process_once(
-        executable,
-        args,
-        timeout_ms,
-        cancellation,
-        resources,
-        progress_path,
-        on_progress,
-    )
-}
-
-fn run_voice_clone_worker_server(
-    executable: &Path,
-    args: &[String],
-    timeout_ms: u64,
-    cancellation: &CancellationToken,
-    resources: VoiceCloneWorkerResources<'_>,
-    progress_path: Option<&Path>,
-    on_progress: &mut dyn FnMut(&VoiceCloneProgressDto),
-) -> Result<(), VoiceCloneWorkerRunError> {
-    let server_state = match resources.server {
-        Some(server_state) => server_state,
-        None => {
-            return Err(VoiceCloneWorkerRunError::Failed(
-                "固定话术 Worker 常驻进程未配置".to_owned(),
-            ))
-        }
-    };
-    let mut server_guard = server_state
-        .lock()
-        .map_err(|_| VoiceCloneWorkerRunError::Failed("固定话术 Worker 状态锁已损坏".to_owned()))?;
-    if server_guard
-        .as_mut()
-        .is_some_and(VoiceCloneWorkerServer::is_exited)
-    {
-        server_guard.take();
-    }
-    if server_guard.is_none() {
-        server_guard.replace(VoiceCloneWorkerServer::spawn(executable, resources)?);
-    }
-    let server = match server_guard.as_mut() {
-        Some(server) => server,
-        None => {
-            return Err(VoiceCloneWorkerRunError::Failed(
-                "固定话术 Worker 常驻进程未创建".to_owned(),
-            ))
-        }
-    };
-    let result = run_voice_clone_server_request(
-        server,
-        args,
-        timeout_ms,
-        cancellation,
-        progress_path,
-        on_progress,
-    );
-    if result.is_err() {
-        server_guard.take();
-    }
-    result
-}
-
-fn run_voice_clone_server_request(
-    server: &mut VoiceCloneWorkerServer,
-    args: &[String],
-    timeout_ms: u64,
-    cancellation: &CancellationToken,
-    progress_path: Option<&Path>,
-    on_progress: &mut dyn FnMut(&VoiceCloneProgressDto),
-) -> Result<(), VoiceCloneWorkerRunError> {
-    let request = serde_json::json!({ "args": args });
-    let request_line = serde_json::to_string(&request)
-        .map_err(|error| VoiceCloneWorkerRunError::Failed(error.to_string()))?;
-    server
-        .stdin
-        .write_all(request_line.as_bytes())
-        .and_then(|_| server.stdin.write_all(b"\n"))
-        .and_then(|_| server.stdin.flush())
-        .map_err(|error| {
-            VoiceCloneWorkerRunError::Failed(format!(
-                "固定话术 Worker 常驻进程请求发送失败：{error}"
-            ))
-        })?;
-
-    let started_at = Instant::now();
-    let mut last_progress = None;
-    loop {
-        if let Some(progress_path) = progress_path {
-            if let Some(progress) = read_voice_clone_progress(progress_path) {
-                if last_progress.as_ref() != Some(&progress) {
-                    on_progress(&progress);
-                    last_progress = Some(progress);
-                }
-            }
-        }
-        if cancellation.is_cancelled() {
-            return Err(VoiceCloneWorkerRunError::Cancelled);
-        }
-        if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
-            return Err(VoiceCloneWorkerRunError::Timeout { timeout_ms });
-        }
-        match server.responses.recv_timeout(Duration::from_millis(50)) {
-            Ok(Ok(response)) if response.status == "completed" => return Ok(()),
-            Ok(Ok(response)) if response.status == "failed" => {
-                let message = response
-                    .message
-                    .filter(|message| !message.trim().is_empty())
-                    .or(response.error.filter(|message| !message.trim().is_empty()))
-                    .or_else(|| server.stderr_message())
-                    .unwrap_or_else(|| "固定话术 Worker 常驻进程执行失败".to_owned());
-                return Err(VoiceCloneWorkerRunError::Failed(message));
-            }
-            Ok(Ok(response)) => {
-                return Err(VoiceCloneWorkerRunError::Failed(format!(
-                    "固定话术 Worker 常驻进程返回未知状态：{}",
-                    response.status
-                )))
-            }
-            Ok(Err(message)) => return Err(VoiceCloneWorkerRunError::Failed(message)),
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let message = server
-                    .stderr_message()
-                    .unwrap_or_else(|| "固定话术 Worker 常驻进程已断开".to_owned());
-                return Err(VoiceCloneWorkerRunError::Failed(message));
-            }
-        }
-    }
-}
-
-fn run_voice_clone_worker_process_once(
-    executable: &Path,
-    args: &[String],
-    timeout_ms: u64,
-    cancellation: &CancellationToken,
-    resources: VoiceCloneWorkerResources<'_>,
-    progress_path: Option<&Path>,
-    on_progress: &mut dyn FnMut(&VoiceCloneProgressDto),
-) -> Result<(), VoiceCloneWorkerRunError> {
-    let mut command = Command::new(executable);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    configure_voice_clone_worker_command(&mut command, resources);
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command
-        .spawn()
-        .map_err(|error| VoiceCloneWorkerRunError::Failed(error.to_string()))?;
-    let mut stderr_handle = child.stderr.take().map(|mut stream| {
-        thread::spawn(move || {
-            use std::io::Read;
-
-            let mut captured = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            loop {
-                match stream.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(bytes_read) => {
-                        let remaining =
-                            MAX_VOICE_CLONE_WORKER_STDERR_BYTES.saturating_sub(captured.len());
-                        if remaining > 0 {
-                            captured.extend_from_slice(&buffer[..bytes_read.min(remaining)]);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            String::from_utf8_lossy(&captured).into_owned()
-        })
-    });
-    let started_at = Instant::now();
-    let mut last_progress = None;
-    loop {
-        if let Some(progress_path) = progress_path {
-            if let Some(progress) = read_voice_clone_progress(progress_path) {
-                if last_progress.as_ref() != Some(&progress) {
-                    on_progress(&progress);
-                    last_progress = Some(progress);
-                }
-            }
-        }
-        if cancellation.is_cancelled() {
-            kill_child(&mut child);
-            let _ = stderr_handle.take().and_then(|handle| handle.join().ok());
-            return Err(VoiceCloneWorkerRunError::Cancelled);
-        }
-        if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
-            kill_child(&mut child);
-            let _ = stderr_handle.take().and_then(|handle| handle.join().ok());
-            return Err(VoiceCloneWorkerRunError::Timeout { timeout_ms });
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stderr = stderr_handle
-                    .take()
-                    .and_then(|handle| handle.join().ok())
-                    .unwrap_or_default();
-                if status.success() {
-                    return Ok(());
-                }
-                let message = if stderr.trim().is_empty() {
-                    format!("固定话术 Worker 退出码异常：{status}")
-                } else {
-                    stderr.trim().to_owned()
-                };
-                return Err(VoiceCloneWorkerRunError::Failed(message));
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(error) => {
-                kill_child(&mut child);
-                let _ = stderr_handle.take().and_then(|handle| handle.join().ok());
-                return Err(VoiceCloneWorkerRunError::Failed(error.to_string()));
-            }
-        }
-    }
-}
-
-fn cleanup_path(path: &Path) {
-    if !path.exists() {
-        return;
-    }
-    if path.is_dir() {
-        let _ignored = std::fs::remove_dir_all(path);
-    } else {
-        let _ignored = std::fs::remove_file(path);
-    }
-}
-
-fn cleanup_voice_clone_paths(paths: impl IntoIterator<Item = PathBuf>) {
-    let mut unique = Vec::<PathBuf>::new();
-    for path in paths {
-        if !unique.iter().any(|existing| existing == &path) {
-            unique.push(path);
-        }
-    }
-    for path in unique {
-        cleanup_path(&path);
-    }
-}
-
-fn cleanup_previous_voice_clone_replacement_paths(
-    paths: impl IntoIterator<Item = PathBuf>,
-    active_replacement_dir: &Path,
-) {
-    let active_replacement_dir = active_replacement_dir.to_path_buf();
-    cleanup_voice_clone_paths(
-        paths
-            .into_iter()
-            .filter(|path| path != &active_replacement_dir),
-    );
-}
-
-fn voice_clone_artifact_dirs(playback: &PlaybackCore, include_prepared: bool) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if include_prepared {
-        if let Some(prepared) = playback.voice_clone_prepared_source() {
-            if let Some(session_dir) =
-                voice_clone_session_dir(&prepared.reference_audio_path, &prepared.operation_id)
-            {
-                paths.push(session_dir);
-            }
-        }
-    }
-    let snapshot = playback.snapshot();
-    if let Some(reference) = snapshot
-        .voice_clone_replacement
-        .replacement_audio_reference
-        .as_deref()
-    {
-        if let Some(parent) = Path::new(reference).parent() {
-            paths.push(parent.to_path_buf());
-        }
-    }
-    paths
-}
-
-fn voice_clone_session_dir(artifact_path: &str, operation_id: &str) -> Option<PathBuf> {
-    let operation_dir = Path::new(artifact_path).parent()?;
-    if operation_dir.file_name()?.to_str()? != operation_id {
-        return None;
-    }
-    operation_dir.parent().map(Path::to_path_buf)
-}
-
-fn realtime_audio_is_occupying(snapshot: &PlaybackSnapshot) -> bool {
-    snapshot.worker_status == "running"
-}
-
-fn canonicalize_file_within_root(
-    root: &Path,
-    path: &str,
-    code: &'static str,
-    message: &'static str,
-) -> Result<PathBuf, CommandErrorDto> {
-    let canonical_root = std::fs::canonicalize(root)
-        .map_err(|error| CommandErrorDto::new(code, error.to_string()))?;
-    let canonical_path = std::fs::canonicalize(path)
-        .map_err(|error| CommandErrorDto::new(code, format!("{message}：{error}")))?;
-    if !canonical_path.starts_with(&canonical_root) {
-        return Err(CommandErrorDto::new(code, message));
-    }
-    Ok(canonical_path)
-}
-
-fn voice_clone_hash_matches(
-    path: &Path,
-    expected_sha256: &str,
-    code: &'static str,
-    mismatch_message: &'static str,
-) -> Result<String, CommandErrorDto> {
-    let actual_sha256 = hash_file_at_path(path, &CancellationToken::new())
-        .map_err(|error| CommandErrorDto::new(code, error.to_string()))?;
-    if actual_sha256 != expected_sha256 {
-        return Err(CommandErrorDto::new(code, mismatch_message));
-    }
-    Ok(actual_sha256)
-}
-
-fn probe_voice_clone_audio(
-    ffprobe_path: &Path,
-    audio_path: &Path,
-) -> Result<(u32, u16, u64), CommandErrorDto> {
-    let mut child = Command::new(ffprobe_path);
-    child
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=sample_rate,channels,duration",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "json",
-        ])
-        .arg(audio_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = child.spawn().map_err(|error| {
-        CommandErrorDto::new(
-            "voice_clone_replace_failed",
-            format!("无法探测替换音频：{error}"),
-        )
-    })?;
-    let started_at = Instant::now();
-    let status = loop {
-        if started_at.elapsed() >= Duration::from_millis(VOICE_CLONE_AUDIO_PROBE_TIMEOUT_MS) {
-            kill_child(&mut child);
-            return Err(CommandErrorDto::new(
-                "voice_clone_replace_failed",
-                "替换音频可读性探测超时",
-            ));
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(error) => {
-                kill_child(&mut child);
-                return Err(CommandErrorDto::new(
-                    "voice_clone_replace_failed",
-                    format!("替换音频探测失败：{error}"),
-                ));
-            }
-        }
-    };
-    let mut output = Vec::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        use std::io::Read;
-        stdout.read_to_end(&mut output).map_err(|error| {
-            CommandErrorDto::new(
-                "voice_clone_replace_failed",
-                format!("替换音频探测结果读取失败：{error}"),
-            )
-        })?;
-    }
-    if !status.success() {
-        return Err(CommandErrorDto::new(
-            "voice_clone_replace_failed",
-            "替换音频文件不可读",
-        ));
-    }
-    let payload: serde_json::Value = serde_json::from_slice(&output).map_err(|error| {
-        CommandErrorDto::new(
-            "voice_clone_replace_failed",
-            format!("替换音频探测结果无效：{error}"),
-        )
-    })?;
-    let stream = payload
-        .get("streams")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|streams| streams.first())
-        .ok_or_else(|| CommandErrorDto::new("voice_clone_replace_failed", "替换音频缺少音频流"))?;
-    let sample_rate_hz = stream
-        .get("sample_rate")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or_default();
-    let channel_count = stream
-        .get("channels")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u16::try_from(value).ok())
-        .unwrap_or_default();
-    let duration_seconds = stream
-        .get("duration")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| value.parse::<f64>().ok())
-        .or_else(|| {
-            payload
-                .get("format")
-                .and_then(|format| format.get("duration"))
-                .and_then(serde_json::Value::as_str)
-                .and_then(|value| value.parse::<f64>().ok())
-        })
-        .unwrap_or_default();
-    let duration_ms = if duration_seconds.is_finite() && duration_seconds > 0.0 {
-        (duration_seconds * 1_000.0).round() as u64
-    } else {
-        0
-    };
-    if sample_rate_hz == 0 || channel_count == 0 || duration_ms == 0 {
-        return Err(CommandErrorDto::new(
-            "voice_clone_replace_failed",
-            "替换音频采样率、声道或时长无效",
-        ));
-    }
-    Ok((sample_rate_hz, channel_count, duration_ms))
-}
-
-fn validate_voice_clone_prepare_result(
-    prepared_root: &Path,
-    source_generation: u64,
-    canonical_source_path: &Path,
-    source_sha256: &str,
-    operation_id: &str,
-    worker_result: VoiceClonePrepareWorkerResult,
-) -> Result<VoiceClonePreparedSource, CommandErrorDto> {
-    if worker_result.status != "success" {
-        return Err(CommandErrorDto::new(
-            "voice_clone_prepare_failed",
-            worker_result
-                .reason
-                .unwrap_or_else(|| "固定话术准备失败".to_owned()),
-        ));
-    }
-    if worker_result.operation_id != operation_id {
-        return Err(CommandErrorDto::new(
-            "voice_clone_prepare_failed",
-            "固定话术准备返回了过期的操作 ID",
-        ));
-    }
-    let worker_source_path = worker_result.source_path.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少源路径")
-    })?;
-    let canonical_worker_source = std::fs::canonicalize(&worker_source_path).map_err(|_| {
-        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备源路径无法规范化")
-    })?;
-    if canonical_worker_source != canonical_source_path {
-        return Err(CommandErrorDto::new(
-            "voice_clone_prepare_failed",
-            "固定话术准备结果不属于当前源视频",
-        ));
-    }
-    let worker_source_sha256 = worker_result.source_sha256.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少会话身份")
-    })?;
-    if worker_source_sha256 != source_sha256 {
-        return Err(CommandErrorDto::new(
-            "voice_clone_prepare_failed",
-            "固定话术准备结果的会话身份不匹配",
-        ));
-    }
-    let reference_audio_path = worker_result.reference_audio_path.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少参考音频")
-    })?;
-    if !Path::new(&reference_audio_path).is_absolute() {
-        return Err(CommandErrorDto::new(
-            "voice_clone_prepare_failed",
-            "参考音频路径必须是绝对路径",
-        ));
-    }
-    let reference_audio_sha256 = worker_result.reference_audio_sha256.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少参考音频哈希")
-    })?;
-    let canonical_reference_path = canonicalize_file_within_root(
-        prepared_root,
-        &reference_audio_path,
-        "voice_clone_prepare_failed",
-        "参考音频必须位于固定话术缓存目录内",
-    )?;
-    let actual_reference_sha256 = voice_clone_hash_matches(
-        &canonical_reference_path,
-        &reference_audio_sha256,
-        "voice_clone_prepare_failed",
-        "参考音频哈希与当前文件不一致",
-    )?;
-    let source_index = VoiceCloneSourceIndex {
-        source_generation,
-        source_path: canonical_source_path.display().to_string(),
-        segments: worker_result.segments,
-    };
-    let sample_rate_hz = worker_result.sample_rate_hz.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少采样率")
-    })?;
-    let channel_count = worker_result.channel_count.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少声道数")
-    })?;
-    let total_duration_ms = worker_result.duration_ms.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_prepare_failed", "固定话术准备缺少总时长")
-    })?;
-    if total_duration_ms == 0 {
-        return Err(CommandErrorDto::new(
-            "voice_clone_prepare_failed",
-            "固定话术准备总时长必须大于 0",
-        ));
-    }
-    Ok(VoiceClonePreparedSource {
-        operation_id: operation_id.to_owned(),
-        source_index,
-        source_sha256: source_sha256.to_owned(),
-        reference_audio_path: canonical_reference_path.display().to_string(),
-        reference_audio_sha256: actual_reference_sha256,
-        sample_rate_hz,
-        channel_count,
-        total_duration_ms,
-        model: worker_result.model.or(worker_result.provider),
-    })
-}
-
-fn validate_voice_clone_synthesize_result(
-    playback_root: &Path,
-    plan: &autolive_desktop_core::VoiceClonePlaybackPlan,
-    ffprobe_path: &Path,
-    worker_result: VoiceCloneSynthesizeWorkerResult,
-) -> Result<autolive_desktop_core::VoiceCloneCommittedPlayback, CommandErrorDto> {
-    if worker_result.status != "success" {
-        return Err(CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            worker_result
-                .reason
-                .unwrap_or_else(|| "当前文案克隆声音生成失败".to_owned()),
-        ));
-    }
-    if worker_result.operation_id != plan.operation_id {
-        return Err(CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音返回了过期的操作 ID",
-        ));
-    }
-    if worker_result.source_generation != Some(plan.source_generation)
-        || worker_result.source_sha256.as_deref() != Some(plan.source_sha256.as_str())
-        || worker_result.input_text.as_deref() != Some(plan.input_text.as_str())
-        || worker_result.text_sha256.as_deref() != Some(plan.text_sha256.as_str())
-        || worker_result.reference_audio_sha256.as_deref()
-            != Some(plan.reference_audio_sha256.as_str())
-    {
-        return Err(CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音结果与当前请求上下文不一致",
-        ));
-    }
-    let validated_model = worker_result
-        .model
-        .clone()
-        .or_else(|| worker_result.provider.clone())
-        .ok_or_else(|| {
-            CommandErrorDto::new(
-                "voice_clone_playback_failed",
-                "当前文案克隆声音缺少合成模型身份",
-            )
-        })?;
-    if !voice_clone_cache_identity_matches(Some(validated_model.as_str()), plan.model.as_deref()) {
-        return Err(CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音返回了错误的合成模型",
-        ));
-    }
-    let worker_source_path = worker_result.source_path.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_playback_failed", "当前文案克隆声音缺少源路径")
-    })?;
-    let canonical_worker_source = std::fs::canonicalize(&worker_source_path).map_err(|_| {
-        CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音源路径无法规范化",
-        )
-    })?;
-    let canonical_plan_source = std::fs::canonicalize(&plan.source_path).map_err(|_| {
-        CommandErrorDto::new("voice_clone_playback_failed", "当前源视频路径无法规范化")
-    })?;
-    if canonical_worker_source != canonical_plan_source {
-        return Err(CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音结果不属于当前源视频",
-        ));
-    }
-    let worker_reference_path = worker_result.reference_audio_path.ok_or_else(|| {
-        CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音缺少参考音频",
-        )
-    })?;
-    let canonical_reference = std::fs::canonicalize(&worker_reference_path).map_err(|_| {
-        CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音参考音频无法规范化",
-        )
-    })?;
-    let canonical_plan_reference =
-        std::fs::canonicalize(&plan.reference_audio_path).map_err(|_| {
-            CommandErrorDto::new("voice_clone_playback_failed", "当前参考音频路径无法规范化")
-        })?;
-    if canonical_reference != canonical_plan_reference {
-        return Err(CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音使用了错误的参考音频",
-        ));
-    }
-    let audio_path = worker_result.audio_path.ok_or_else(|| {
-        CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音缺少输出音频",
-        )
-    })?;
-    let reported_sha256 = worker_result.audio_sha256.ok_or_else(|| {
-        CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音缺少输出哈希",
-        )
-    })?;
-    let canonical_audio_path = canonicalize_file_within_root(
-        playback_root,
-        &audio_path,
-        "voice_clone_playback_failed",
-        "当前文案克隆声音输出必须位于固定话术缓存目录内",
-    )?;
-    let actual_sha256 = voice_clone_hash_matches(
-        &canonical_audio_path,
-        &reported_sha256,
-        "voice_clone_playback_failed",
-        "当前文案克隆声音输出哈希与当前文件不一致",
-    )?;
-    let file_size = std::fs::metadata(&canonical_audio_path)
-        .map_err(|error| CommandErrorDto::new("voice_clone_playback_failed", error.to_string()))?
-        .len();
-    if file_size < 44 {
-        return Err(CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音输出文件过小或不完整",
-        ));
-    }
-    let (sample_rate_hz, channel_count, duration_ms) =
-        probe_voice_clone_audio(ffprobe_path, &canonical_audio_path)?;
-    let reported_duration_ms = worker_result.duration_ms.ok_or_else(|| {
-        CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音缺少音频时长",
-        )
-    })?;
-    if sample_rate_hz != plan.sample_rate_hz
-        || channel_count != plan.channel_count
-        || duration_ms.abs_diff(reported_duration_ms) > 100
-        || worker_result.sample_rate_hz != Some(plan.sample_rate_hz)
-        || worker_result.channel_count != Some(plan.channel_count)
-    {
-        return Err(CommandErrorDto::new(
-            "voice_clone_playback_failed",
-            "当前文案克隆声音输出的音频参数与当前源不一致",
-        ));
-    }
-    Ok(autolive_desktop_core::VoiceCloneCommittedPlayback {
-        source_generation: plan.source_generation,
-        source_path: plan.source_path.clone(),
-        operation_id: plan.operation_id.clone(),
-        input_text: plan.input_text.clone(),
-        text_sha256: plan.text_sha256.clone(),
-        audio_reference: canonical_audio_path.display().to_string(),
-        audio_sha256: actual_sha256,
-        duration_ms,
-        start_at_ms: plan.start_at_ms,
-        model: Some(validated_model),
-    })
-}
-
-fn validate_voice_clone_replace_result(
-    replacement_root: &Path,
-    plan: &autolive_desktop_core::VoiceCloneReplacementPlan,
-    ffprobe_path: &Path,
-    worker_result: VoiceCloneReplaceWorkerResult,
-) -> Result<VoiceCloneCommittedReplacement, CommandErrorDto> {
-    if worker_result.status != "success" {
-        return Err(CommandErrorDto::new(
-            "voice_clone_replace_failed",
-            worker_result
-                .reason
-                .unwrap_or_else(|| "固定话术替换失败".to_owned()),
-        ));
-    }
-    let replacement_audio_path = worker_result.replacement_audio_path.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少输出音频")
-    })?;
-    let replacement_sha256 = worker_result.replacement_sha256.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少输出音频哈希")
-    })?;
-    let canonical_replacement_path = canonicalize_file_within_root(
-        replacement_root,
-        &replacement_audio_path,
-        "voice_clone_replace_failed",
-        "固定话术输出必须位于固定话术缓存目录内",
-    )?;
-    let actual_sha256 = voice_clone_hash_matches(
-        &canonical_replacement_path,
-        &replacement_sha256,
-        "voice_clone_replace_failed",
-        "固定话术输出哈希与当前文件不一致",
-    )?;
-    let file_size = std::fs::metadata(&canonical_replacement_path)
-        .map_err(|error| CommandErrorDto::new("voice_clone_replace_failed", error.to_string()))?
-        .len();
-    if file_size < 44 {
-        return Err(CommandErrorDto::new(
-            "voice_clone_replace_failed",
-            "固定话术输出文件过小或不完整",
-        ));
-    }
-    let (actual_sample_rate_hz, actual_channel_count, actual_duration_ms) =
-        probe_voice_clone_audio(ffprobe_path, &canonical_replacement_path)?;
-    let source_generation = worker_result.source_generation.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少源代际")
-    })?;
-    let source_path = worker_result.source_path.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少源路径")
-    })?;
-    let reported_duration_ms = worker_result.total_duration_ms.ok_or_else(|| {
-        CommandErrorDto::new("voice_clone_replace_failed", "固定话术替换缺少总时长")
-    })?;
-    let replacement_result = VoiceCloneReplacementResult {
-        source_generation,
-        source_path: source_path.clone(),
-        operation_id: worker_result.operation_id.clone(),
-        audio_reference: canonical_replacement_path.display().to_string(),
-        audio_sha256: actual_sha256.clone(),
-        replacement_duration_ms: reported_duration_ms,
-    };
-    let replacement_request = VoiceCloneReplacementRequest {
-        source_generation: plan.source_generation,
-        source_path: plan.source_path.clone(),
-        source_sha256: plan.source_sha256.clone(),
-        audio_base_path: plan.audio_base_path.clone(),
-        source_duration_ms: plan.source_duration_ms,
-        sample_rate_hz: plan.sample_rate_hz,
-        channel_count: plan.channel_count,
-        operation_id: plan.operation_id.clone(),
-        reference_audio_path: plan.reference_audio_path.clone(),
-        text: plan.input_text.clone(),
-        replace_at_ms: plan.replace_at_ms,
-        resume_at_ms: plan.resume_at_ms,
-    };
-    validate_replacement_result(&replacement_result, &replacement_request)
-        .map_err(|error| CommandErrorDto::new("voice_clone_replace_failed", error.to_string()))?;
-    if worker_result.source_sha256.as_deref() != Some(plan.source_sha256.as_str())
-        || worker_result.replace_at_ms != Some(plan.replace_at_ms)
-        || worker_result.resume_at_ms != Some(plan.resume_at_ms)
-        || worker_result.sample_rate_hz != Some(plan.sample_rate_hz)
-        || worker_result.channel_count != Some(plan.channel_count)
-        || worker_result.input_text.as_deref() != Some(plan.input_text.as_str())
-    {
-        return Err(CommandErrorDto::new(
-            "voice_clone_replace_failed",
-            "固定话术替换结果与当前请求上下文不一致",
-        ));
-    }
-    if actual_sample_rate_hz != plan.sample_rate_hz
-        || actual_channel_count != plan.channel_count
-        || actual_duration_ms.abs_diff(reported_duration_ms) > 100
-        || actual_duration_ms.abs_diff(plan.source_duration_ms) > 1_000
-    {
-        return Err(CommandErrorDto::new(
-            "voice_clone_replace_failed",
-            "固定话术输出的实际音频参数与请求不一致",
-        ));
-    }
-    Ok(VoiceCloneCommittedReplacement {
-        source_generation,
-        source_path,
-        operation_id: worker_result.operation_id,
-        input_text: plan.input_text.clone(),
-        replacement_audio_reference: canonical_replacement_path.display().to_string(),
-        replacement_audio_sha256: actual_sha256,
-        replacement_duration_ms: replacement_result.replacement_duration_ms,
-        replace_at_ms: plan.replace_at_ms,
-        resume_at_ms: plan.resume_at_ms,
-        model: worker_result.model.or(worker_result.provider),
-    })
 }
 
 fn command_error_from_playback(error: PlaybackError) -> CommandErrorDto {
@@ -5443,50 +2565,6 @@ fn command_error_from_playback(error: PlaybackError) -> CommandErrorDto {
         PlaybackError::InvalidTransition { .. } => "invalid_playback_transition",
     };
     CommandErrorDto::new(code, error.to_string())
-}
-
-fn command_error_from_voice_clone_runtime(error: VoiceCloneRuntimeError) -> CommandErrorDto {
-    let (code, message) = match error {
-        VoiceCloneRuntimeError::SourceMediaRequired => {
-            ("source_media_required", "请先导入一个源视频".to_owned())
-        }
-        VoiceCloneRuntimeError::VoiceCloneTextInvalid(error) => {
-            ("voice_clone_text_invalid", error.to_string())
-        }
-        VoiceCloneRuntimeError::PlaybackNotPlaying => (
-            "voice_clone_playback_not_playing",
-            "固定话术替换只允许在播放中启动".to_owned(),
-        ),
-        VoiceCloneRuntimeError::VoiceCloneSourceNotPrepared => (
-            "voice_clone_source_not_prepared",
-            "请先准备当前源视频的人声参考".to_owned(),
-        ),
-        VoiceCloneRuntimeError::VoiceClonePreparedSourceStale => (
-            "voice_clone_source_stale",
-            "当前固定话术参考已经过期，请重新准备".to_owned(),
-        ),
-        VoiceCloneRuntimeError::VoiceCloneAudioProcessingNotReady => (
-            "voice_clone_audio_processing_not_ready",
-            "请先应用当前普通声音处理参数，再替换固定话术".to_owned(),
-        ),
-        VoiceCloneRuntimeError::RealtimeAudioWorkerBusy => (
-            "voice_clone_realtime_audio_busy",
-            "实时音频候选正在占用音频，当前不能启动固定话术替换".to_owned(),
-        ),
-        VoiceCloneRuntimeError::VoiceCloneReplacementStale => (
-            "voice_clone_replacement_stale",
-            "固定话术结果已经过期，未应用到当前播放".to_owned(),
-        ),
-        VoiceCloneRuntimeError::VoiceClonePlaybackBusy => (
-            "voice_clone_playback_busy",
-            "当前文案克隆声音正在准备或播放".to_owned(),
-        ),
-        VoiceCloneRuntimeError::VoiceClonePlaybackStale => (
-            "voice_clone_playback_stale",
-            "当前文案克隆声音结果已经过期，未应用到当前播放".to_owned(),
-        ),
-    };
-    CommandErrorDto::new(code, message)
 }
 
 fn command_error_from_media_library(error: MediaLibraryError) -> CommandErrorDto {
@@ -5650,27 +2728,9 @@ fn build_audio_variant_candidate(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_voice_clone_pre_generation_plans, build_voice_clone_synthesize_request,
-        cleanup_previous_voice_clone_replacement_paths, development_executable_ready,
-        realtime_audio_is_occupying, run_voice_clone_worker_process,
-        validate_voice_clone_pre_generation_items, validate_voice_clone_synthesize_result,
-        voice_clone_artifact_dirs, voice_clone_cache_identity_matches,
-        voice_clone_model_resources_complete, voice_clone_prepare_session_identity,
-        voice_clone_session_dir, voice_clone_timeout_ms, write_voice_clone_playback_cache,
-        AppState, VoiceClonePreGenerationItemRequestDto, VoiceCloneProgressDto,
-        VoiceCloneSynthesizeWorkerResult, VoiceCloneWorkerResources, VoiceCloneWorkerRunError,
-        VoiceCloneWorkerTask, VoiceCloneWorkerTaskKind, MAX_VOICE_CLONE_TIMEOUT_MS,
-        MIN_VOICE_CLONE_TIMEOUT_MS, VOICE_CLONE_CAPABILITY_TIMEOUT_MS,
-    };
-    use autolive_desktop_core::cancellation::CancellationToken;
-    use autolive_desktop_core::media_library::SourceMediaDto;
-    use autolive_desktop_core::voice_clone::{VoiceCloneSegment, VoiceCloneSourceIndex};
-    use autolive_desktop_core::{
-        PlaybackCore, VoiceCloneCommittedPlayback, VoiceClonePlaybackPlan,
-        VoiceClonePreparedSource, VOICE_CLONE_SYNTHESIS_MODEL_ID,
-    };
-    use std::path::PathBuf;
+    #[cfg(unix)]
+    use super::development_executable_ready;
+    use super::AppState;
 
     #[cfg(unix)]
     #[test]
@@ -5698,503 +2758,6 @@ mod tests {
         let _ignored = std::fs::remove_file(path);
     }
 
-    fn test_voice_clone_playback_plan(model: Option<&str>) -> VoiceClonePlaybackPlan {
-        VoiceClonePlaybackPlan {
-            source_generation: 1,
-            source_path: "/tmp/source.mp4".to_owned(),
-            source_sha256: "a".repeat(64),
-            operation_id: "synthesize-operation".to_owned(),
-            input_text: "测试话术".to_owned(),
-            text_sha256: "b".repeat(64),
-            start_at_ms: 0,
-            reference_audio_path: "/tmp/reference.wav".to_owned(),
-            reference_audio_sha256: "c".repeat(64),
-            sample_rate_hz: 48_000,
-            channel_count: 2,
-            model: model.map(str::to_owned),
-        }
-    }
-
-    #[test]
-    fn voice_clone_cache_identity_requires_the_same_synthesis_model() {
-        assert!(voice_clone_cache_identity_matches(
-            Some(VOICE_CLONE_SYNTHESIS_MODEL_ID),
-            Some(VOICE_CLONE_SYNTHESIS_MODEL_ID),
-        ));
-        assert!(!voice_clone_cache_identity_matches(
-            Some("demucs+small+xtts_v2"),
-            Some(VOICE_CLONE_SYNTHESIS_MODEL_ID),
-        ));
-        assert!(!voice_clone_cache_identity_matches(
-            Some("another-model"),
-            Some(VOICE_CLONE_SYNTHESIS_MODEL_ID),
-        ));
-        assert!(!voice_clone_cache_identity_matches(
-            None,
-            Some(VOICE_CLONE_SYNTHESIS_MODEL_ID),
-        ));
-        assert!(!voice_clone_cache_identity_matches(
-            Some(VOICE_CLONE_SYNTHESIS_MODEL_ID),
-            None,
-        ));
-    }
-
-    #[test]
-    fn voice_clone_synthesize_request_serializes_the_core_model_identity() {
-        let plan = test_voice_clone_playback_plan(Some("prepared-combination-model"));
-
-        let request = build_voice_clone_synthesize_request(&plan);
-        let payload = serde_json::to_value(request).expect("request should serialize");
-
-        assert_eq!(
-            payload.get("model").and_then(serde_json::Value::as_str),
-            Some(VOICE_CLONE_SYNTHESIS_MODEL_ID)
-        );
-    }
-
-    #[test]
-    fn voice_clone_synthesize_result_rejects_a_different_worker_model() {
-        let plan = test_voice_clone_playback_plan(Some(VOICE_CLONE_SYNTHESIS_MODEL_ID));
-        let worker_result = VoiceCloneSynthesizeWorkerResult {
-            status: "success".to_owned(),
-            provider: None,
-            model: Some("different-model".to_owned()),
-            reason: None,
-            operation_id: plan.operation_id.clone(),
-            source_generation: Some(plan.source_generation),
-            source_path: Some(plan.source_path.clone()),
-            source_sha256: Some(plan.source_sha256.clone()),
-            reference_audio_path: Some(plan.reference_audio_path.clone()),
-            reference_audio_sha256: Some(plan.reference_audio_sha256.clone()),
-            input_text: Some(plan.input_text.clone()),
-            text_sha256: Some(plan.text_sha256.clone()),
-            audio_path: None,
-            audio_sha256: None,
-            duration_ms: None,
-            sample_rate_hz: None,
-            channel_count: None,
-        };
-
-        let error = validate_voice_clone_synthesize_result(
-            std::path::Path::new("/tmp"),
-            &plan,
-            std::path::Path::new("/missing-ffprobe"),
-            worker_result,
-        )
-        .expect_err("a different worker model must be rejected before file validation");
-
-        assert_eq!(error.code, "voice_clone_playback_failed");
-        assert!(error.message.contains("错误的合成模型"));
-    }
-
-    #[test]
-    fn voice_clone_playback_manifest_uses_the_plan_model() {
-        let root = std::env::temp_dir().join(format!(
-            "autolive-voice-clone-manifest-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("manifest test directory");
-        let plan = test_voice_clone_playback_plan(Some(VOICE_CLONE_SYNTHESIS_MODEL_ID));
-        let committed = VoiceCloneCommittedPlayback {
-            source_generation: plan.source_generation,
-            source_path: plan.source_path.clone(),
-            operation_id: plan.operation_id.clone(),
-            input_text: plan.input_text.clone(),
-            text_sha256: plan.text_sha256.clone(),
-            audio_reference: "/tmp/generated.wav".to_owned(),
-            audio_sha256: "d".repeat(64),
-            duration_ms: 1_000,
-            start_at_ms: plan.start_at_ms,
-            model: Some("untrusted-worker-model".to_owned()),
-        };
-
-        write_voice_clone_playback_cache(&root, &plan, &committed)
-            .expect("manifest should be written");
-        let payload: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(root.join("playback.json")).expect("manifest should be readable"),
-        )
-        .expect("manifest should be valid JSON");
-
-        assert_eq!(
-            payload.get("model").and_then(serde_json::Value::as_str),
-            plan.model.as_deref()
-        );
-        let _ignored = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn voice_clone_pre_generation_plans_use_the_synthesis_model_identity() {
-        let mut playback = PlaybackCore::default();
-        playback.set_source(SourceMediaDto {
-            source_path: "/tmp/source.mp4".to_owned(),
-            file_name: "source.mp4".to_owned(),
-            file_size_bytes: 1,
-            duration_ms: Some(1_000),
-            width: Some(1280),
-            height: Some(720),
-            frame_rate_fps: Some(30.0),
-            audio_sample_rate_hz: Some(48_000),
-            audio_channel_count: Some(2),
-            mp4_sha256: Some("a".repeat(64)),
-            mp4_hash_status: "ready".to_owned(),
-        });
-        let generation = playback.snapshot().playback_generation;
-        playback
-            .set_voice_clone_prepared_source(VoiceClonePreparedSource {
-                operation_id: "prepare-operation".to_owned(),
-                source_index: VoiceCloneSourceIndex {
-                    source_generation: generation,
-                    source_path: "/tmp/source.mp4".to_owned(),
-                    segments: vec![VoiceCloneSegment {
-                        start_ms: 0,
-                        end_ms: 1_000,
-                        text: "原话术".to_owned(),
-                    }],
-                },
-                source_sha256: "a".repeat(64),
-                reference_audio_path: "/tmp/reference.wav".to_owned(),
-                reference_audio_sha256: "b".repeat(64),
-                sample_rate_hz: 48_000,
-                channel_count: 2,
-                total_duration_ms: 1_000,
-                model: Some("demucs+small+xtts_v2".to_owned()),
-            })
-            .expect("prepared source should be accepted");
-        let batch = validate_voice_clone_pre_generation_items(vec![
-            VoiceClonePreGenerationItemRequestDto {
-                preset_id: "preset-1".to_owned(),
-                text: "预生成话术".to_owned(),
-            },
-        ])
-        .expect("pre-generation request should be valid");
-
-        let plans = build_voice_clone_pre_generation_plans(&playback, &batch)
-            .expect("pre-generation plans should be built");
-
-        assert_eq!(plans.len(), 1);
-        assert_eq!(
-            plans[0].model.as_deref(),
-            Some(VOICE_CLONE_SYNTHESIS_MODEL_ID)
-        );
-    }
-
-    #[test]
-    fn voice_clone_stop_join_and_playback_commit_are_one_launch_transaction() {
-        use std::sync::mpsc::{self, TryRecvError};
-        use std::sync::{atomic::AtomicBool, Arc};
-        use std::thread;
-        use std::time::Duration;
-
-        let state = AppState::default();
-        let cancellation = CancellationToken::new();
-        let worker_cancellation = cancellation.clone();
-        let worker_playback = Arc::clone(&state.playback);
-        let (worker_took_playback_tx, worker_took_playback_rx) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            while !worker_cancellation.is_cancelled() {
-                thread::yield_now();
-            }
-            let _playback = worker_playback
-                .lock()
-                .expect("worker should take playback while stop waits to join");
-            worker_took_playback_tx
-                .send(())
-                .expect("signal worker playback access");
-        });
-        state
-            .install_voice_clone_worker(VoiceCloneWorkerTask {
-                kind: VoiceCloneWorkerTaskKind::Playback,
-                cancellation,
-                completed: Arc::new(AtomicBool::new(false)),
-                handle: worker,
-            })
-            .expect("old worker should install");
-
-        let first_state = state.clone();
-        let (old_joined_tx, old_joined_rx) = mpsc::channel();
-        let (allow_commit_tx, allow_commit_rx) = mpsc::channel();
-        let first = thread::spawn(move || {
-            first_state
-                .with_voice_clone_launch(|state| {
-                    assert_eq!(
-                        state.stop_voice_clone_worker_locked()?,
-                        Some(VoiceCloneWorkerTaskKind::Playback)
-                    );
-                    old_joined_tx.send(()).expect("signal old worker joined");
-                    allow_commit_rx.recv().expect("allow playback commit");
-                    state
-                        .playback
-                        .lock()
-                        .expect("playback lock")
-                        .set_source(SourceMediaDto {
-                            source_path: "/tmp/new-source.mp4".to_owned(),
-                            file_name: "new-source.mp4".to_owned(),
-                            file_size_bytes: 1,
-                            duration_ms: Some(1_000),
-                            width: Some(1280),
-                            height: Some(720),
-                            frame_rate_fps: Some(30.0),
-                            audio_sample_rate_hz: Some(48_000),
-                            audio_channel_count: Some(2),
-                            mp4_sha256: Some("e".repeat(64)),
-                            mp4_hash_status: "ready".to_owned(),
-                        });
-                    Ok(())
-                })
-                .expect("first transaction should finish");
-        });
-
-        worker_took_playback_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("Join must not hold the playback lock");
-        old_joined_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("old worker should be joined before state commit");
-
-        let second_state = state.clone();
-        let (attempting_tx, attempting_rx) = mpsc::channel();
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let second = thread::spawn(move || {
-            attempting_tx.send(()).expect("signal lock attempt");
-            second_state
-                .with_voice_clone_launch(|state| {
-                    let source_path = state
-                        .playback
-                        .lock()
-                        .expect("playback lock")
-                        .snapshot()
-                        .source_media
-                        .map(|source| source.source_path);
-                    entered_tx.send(source_path).expect("signal lock entry");
-                    Ok(())
-                })
-                .expect("second transaction should finish");
-        });
-
-        attempting_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("second transaction should attempt the lock");
-        assert_eq!(entered_rx.try_recv(), Err(TryRecvError::Empty));
-
-        allow_commit_tx.send(()).expect("release playback commit");
-        assert_eq!(
-            entered_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("second transaction should enter after commit")
-                .as_deref(),
-            Some("/tmp/new-source.mp4")
-        );
-        first.join().expect("first transaction should finish");
-        second.join().expect("second transaction should finish");
-    }
-
-    #[test]
-    fn reaping_completed_prepare_joins_before_observing_the_playback_commit() {
-        use std::sync::mpsc::{self, TryRecvError};
-        use std::sync::{atomic::AtomicBool, Arc};
-        use std::thread;
-        use std::time::Duration;
-
-        let state = AppState::default();
-        let completed = Arc::new(AtomicBool::new(false));
-        let completed_for_worker = Arc::clone(&completed);
-        let playback = Arc::clone(&state.playback);
-        let (reapable_tx, reapable_rx) = mpsc::channel();
-        let (allow_commit_tx, allow_commit_rx) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            completed_for_worker.store(true, std::sync::atomic::Ordering::Release);
-            reapable_tx.send(()).expect("signal reapable task");
-            allow_commit_rx.recv().expect("allow playback commit");
-            playback
-                .lock()
-                .expect("playback lock")
-                .set_source(SourceMediaDto {
-                    source_path: "/tmp/prepare-committed.mp4".to_owned(),
-                    file_name: "prepare-committed.mp4".to_owned(),
-                    file_size_bytes: 1,
-                    duration_ms: Some(1_000),
-                    width: Some(1280),
-                    height: Some(720),
-                    frame_rate_fps: Some(30.0),
-                    audio_sample_rate_hz: Some(48_000),
-                    audio_channel_count: Some(2),
-                    mp4_sha256: None,
-                    mp4_hash_status: "not_requested".to_owned(),
-                });
-        });
-        state
-            .install_voice_clone_worker(VoiceCloneWorkerTask {
-                kind: VoiceCloneWorkerTaskKind::Prepare,
-                cancellation: CancellationToken::new(),
-                completed,
-                handle: worker,
-            })
-            .expect("prepare worker should install");
-        reapable_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("prepare task should become reapable before its final commit");
-
-        let reaper_state = state.clone();
-        let (reaped_tx, reaped_rx) = mpsc::channel();
-        let reaper = thread::spawn(move || {
-            reaper_state
-                .with_voice_clone_launch(|state| {
-                    let reaped = state.reap_finished_voice_clone_worker()?;
-                    let source_path = state
-                        .playback
-                        .lock()
-                        .expect("playback lock")
-                        .snapshot()
-                        .source_media
-                        .map(|source| source.source_path);
-                    reaped_tx
-                        .send((reaped, source_path))
-                        .expect("send reaped state");
-                    Ok(())
-                })
-                .expect("reap transaction should finish");
-        });
-
-        assert_eq!(reaped_rx.try_recv(), Err(TryRecvError::Empty));
-        allow_commit_tx
-            .send(())
-            .expect("allow final playback commit");
-        let (reaped, source_path) = reaped_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("Join should wait for the final playback commit");
-        assert!(reaped);
-        assert_eq!(source_path.as_deref(), Some("/tmp/prepare-committed.mp4"));
-        reaper.join().expect("reaper should finish");
-    }
-
-    #[test]
-    fn voice_clone_prepare_identity_is_session_scoped_opaque_hex() {
-        let first = voice_clone_prepare_session_identity("prepare-g1-100");
-        let second = voice_clone_prepare_session_identity("prepare-g1-101");
-
-        assert_eq!(first.len(), 64);
-        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_eq!(second.len(), 64);
-        assert!(second.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn prepared_session_cleanup_requires_the_operation_directory() {
-        assert_eq!(
-            voice_clone_session_dir(
-                "/tmp/voice-clone/session/prepare-operation/reference.wav",
-                "prepare-operation"
-            ),
-            Some(PathBuf::from("/tmp/voice-clone/session"))
-        );
-        assert_eq!(
-            voice_clone_session_dir(
-                "/tmp/voice-clone/session/reference.wav",
-                "prepare-operation"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn replacing_a_prepared_session_cleans_its_whole_session_cache() {
-        let root = std::env::temp_dir().join("autolive-voice-clone-session-cache-test");
-        let session_root = root.join("session-identity");
-        let reference_path = session_root.join("prepare-operation").join("reference.wav");
-        let mut playback = PlaybackCore::default();
-        playback.set_source(SourceMediaDto {
-            source_path: "/tmp/source.mp4".to_owned(),
-            file_name: "source.mp4".to_owned(),
-            file_size_bytes: 1,
-            duration_ms: Some(1_000),
-            width: Some(1280),
-            height: Some(720),
-            frame_rate_fps: Some(30.0),
-            audio_sample_rate_hz: Some(48_000),
-            audio_channel_count: Some(2),
-            mp4_sha256: None,
-            mp4_hash_status: "not_requested".to_owned(),
-        });
-        let generation = playback.snapshot().playback_generation;
-        playback
-            .set_voice_clone_prepared_source(VoiceClonePreparedSource {
-                operation_id: "prepare-operation".to_owned(),
-                source_index: VoiceCloneSourceIndex {
-                    source_generation: generation,
-                    source_path: "/tmp/source.mp4".to_owned(),
-                    segments: Vec::new(),
-                },
-                source_sha256: "a".repeat(64),
-                reference_audio_path: reference_path.display().to_string(),
-                reference_audio_sha256: "b".repeat(64),
-                sample_rate_hz: 48_000,
-                channel_count: 2,
-                total_duration_ms: 1_000,
-                model: Some("demucs+small+xtts_v2".to_owned()),
-            })
-            .expect("prepared source should be accepted");
-
-        assert_eq!(
-            voice_clone_artifact_dirs(&playback, true),
-            vec![session_root]
-        );
-    }
-
-    fn test_pre_generation_item(index: usize) -> VoiceClonePreGenerationItemRequestDto {
-        VoiceClonePreGenerationItemRequestDto {
-            preset_id: format!("preset-{index}"),
-            text: format!("文案 {index}"),
-        }
-    }
-
-    #[test]
-    fn voice_clone_pre_generation_rejects_empty_oversized_and_duplicate_ids() {
-        assert_eq!(
-            validate_voice_clone_pre_generation_items(vec![])
-                .unwrap_err()
-                .code,
-            "voice_clone_pre_generation_items_invalid"
-        );
-        assert_eq!(
-            validate_voice_clone_pre_generation_items(
-                (0..11).map(test_pre_generation_item).collect()
-            )
-            .unwrap_err()
-            .code,
-            "voice_clone_pre_generation_items_invalid"
-        );
-        let duplicate = vec![test_pre_generation_item(0), test_pre_generation_item(0)];
-        assert_eq!(
-            validate_voice_clone_pre_generation_items(duplicate)
-                .unwrap_err()
-                .code,
-            "voice_clone_pre_generation_items_invalid"
-        );
-    }
-
-    #[test]
-    fn voice_clone_pre_generation_deduplicates_normalized_text() {
-        let work = validate_voice_clone_pre_generation_items(vec![
-            VoiceClonePreGenerationItemRequestDto {
-                preset_id: "a".into(),
-                text: " 你好 ".into(),
-            },
-            VoiceClonePreGenerationItemRequestDto {
-                preset_id: "b".into(),
-                text: "你好".into(),
-            },
-        ])
-        .expect("valid batch");
-        assert_eq!(work.unique_texts.len(), 1);
-        assert_eq!(work.items.len(), 2);
-        assert_eq!(work.items[0].text_sha256, work.items[1].text_sha256);
-    }
-
     #[test]
     fn state_starts_without_a_source_or_queue() {
         let state = AppState::default();
@@ -6202,348 +2765,5 @@ mod tests {
         let snapshot = playback.snapshot();
         assert!(snapshot.source_media.is_none());
         assert_eq!(snapshot.loop_index, 0);
-    }
-
-    #[test]
-    fn voice_clone_capability_probe_allows_cpu_dependency_startup() {
-        assert_eq!(VOICE_CLONE_CAPABILITY_TIMEOUT_MS, 30_000);
-    }
-
-    #[test]
-    fn voice_clone_timeout_has_safe_bounds() {
-        assert_eq!(
-            voice_clone_timeout_ms(None).expect("default timeout"),
-            15 * 60 * 1_000
-        );
-        assert!(voice_clone_timeout_ms(Some(MIN_VOICE_CLONE_TIMEOUT_MS)).is_ok());
-        assert!(voice_clone_timeout_ms(Some(MAX_VOICE_CLONE_TIMEOUT_MS)).is_ok());
-        assert_eq!(
-            voice_clone_timeout_ms(Some(0))
-                .expect_err("zero timeout must be rejected")
-                .code,
-            "voice_clone_timeout_invalid"
-        );
-        assert!(voice_clone_timeout_ms(Some(MAX_VOICE_CLONE_TIMEOUT_MS + 1)).is_err());
-    }
-
-    #[test]
-    fn packaged_xtts_resources_match_the_files_downloaded_by_coqui_tts() {
-        let root = std::env::temp_dir().join(format!(
-            "autolive-voice-clone-model-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        let files = [
-            "huggingface/hub/models--adefossez--HTDemucs/refs/main",
-            "huggingface/hub/models--adefossez--HTDemucs/snapshots/test/htdemucs.yaml",
-            "huggingface/hub/models--adefossez--HTDemucs/snapshots/test/model.safetensors",
-            "huggingface/hub/models--Systran--faster-whisper-small/refs/main",
-            "huggingface/hub/models--Systran--faster-whisper-small/snapshots/test/config.json",
-            "huggingface/hub/models--Systran--faster-whisper-small/snapshots/test/model.bin",
-            "huggingface/hub/models--Systran--faster-whisper-small/snapshots/test/tokenizer.json",
-            "huggingface/hub/models--Systran--faster-whisper-small/snapshots/test/vocabulary.txt",
-            "tts/tts/tts_models--multilingual--multi-dataset--xtts_v2/config.json",
-            "tts/tts/tts_models--multilingual--multi-dataset--xtts_v2/model.pth",
-            "tts/tts/tts_models--multilingual--multi-dataset--xtts_v2/speakers_xtts.pth",
-            "tts/tts/tts_models--multilingual--multi-dataset--xtts_v2/vocab.json",
-        ];
-        for relative_path in files {
-            let path = root.join(relative_path);
-            std::fs::create_dir_all(path.parent().expect("model parent")).expect("model directory");
-            std::fs::write(path, b"ready").expect("model file");
-        }
-
-        assert!(voice_clone_model_resources_complete(&root));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn committed_realtime_variant_does_not_block_voice_clone_start() {
-        let mut snapshot = PlaybackCore::default().snapshot();
-        snapshot.current_audio_source = Some("realtime_variant".to_owned());
-        snapshot.pending_audio_candidate = true;
-        snapshot.worker_status = "ready".to_owned();
-
-        assert!(
-            !realtime_audio_is_occupying(&snapshot),
-            "已经提交或待切换的实时变体不应阻止固定话术最高优先级"
-        );
-
-        snapshot.worker_status = "running".to_owned();
-        assert!(
-            realtime_audio_is_occupying(&snapshot),
-            "只有实时话术 Worker 真正运行中时才阻止固定话术替换"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn verbose_worker_stderr_does_not_block_completion() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let temp_root = std::env::temp_dir().join(format!(
-            "autolive-voice-clone-stderr-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&temp_root).expect("test directory");
-        let script = temp_root.join("verbose-worker.sh");
-        std::fs::write(&script, "#!/bin/sh\nprintf '%131072s' '' >&2\n")
-            .expect("test worker script");
-        let mut permissions = std::fs::metadata(&script)
-            .expect("test worker metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("test worker permissions");
-
-        let result = run_voice_clone_worker_process(
-            &script,
-            &[],
-            2_000,
-            &CancellationToken::new(),
-            VoiceCloneWorkerResources {
-                model_root: None,
-                target_root: None,
-                server: None,
-            },
-            None,
-            &mut |_progress| {},
-        );
-        let _ = std::fs::remove_dir_all(&temp_root);
-
-        assert!(result.is_ok(), "verbose worker should finish: {result:?}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn persistent_voice_clone_server_reuses_one_process_for_multiple_requests() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::{Arc, Mutex};
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let temp_root = std::env::temp_dir().join(format!(
-            "autolive-voice-clone-server-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&temp_root).expect("test directory");
-        let script = temp_root.join("persistent-worker.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nwhile IFS= read -r _line; do printf '%s\\n' '{\"status\":\"completed\"}'; done\n",
-        )
-        .expect("test worker script");
-        let mut permissions = std::fs::metadata(&script)
-            .expect("test worker metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("test worker permissions");
-
-        let server = Arc::new(Mutex::new(None));
-        let cancellation = CancellationToken::new();
-        let args = vec!["--replace-json".to_owned(), "request.json".to_owned()];
-        let mut on_progress = |_progress: &VoiceCloneProgressDto| {};
-        let first = run_voice_clone_worker_process(
-            &script,
-            &args,
-            2_000,
-            &cancellation,
-            VoiceCloneWorkerResources {
-                model_root: None,
-                target_root: None,
-                server: Some(&server),
-            },
-            None,
-            &mut on_progress,
-        );
-        let first_pid = server
-            .lock()
-            .expect("server lock")
-            .as_ref()
-            .expect("server should stay alive after success")
-            .child
-            .id();
-        let second = run_voice_clone_worker_process(
-            &script,
-            &args,
-            2_000,
-            &cancellation,
-            VoiceCloneWorkerResources {
-                model_root: None,
-                target_root: None,
-                server: Some(&server),
-            },
-            None,
-            &mut on_progress,
-        );
-        let second_pid = server
-            .lock()
-            .expect("server lock")
-            .as_ref()
-            .expect("server should stay alive after second success")
-            .child
-            .id();
-
-        let _ = std::fs::remove_dir_all(&temp_root);
-        assert!(
-            first.is_ok(),
-            "first server request should finish: {first:?}"
-        );
-        assert!(
-            second.is_ok(),
-            "second server request should finish: {second:?}"
-        );
-        assert_eq!(
-            first_pid, second_pid,
-            "successive requests must reuse one process"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_voice_clone_server_response_discards_the_server() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::{Arc, Mutex};
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let temp_root = std::env::temp_dir().join(format!(
-            "autolive-voice-clone-server-failure-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&temp_root).expect("test directory");
-        let script = temp_root.join("failed-worker.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nwhile IFS= read -r _line; do printf '%s\\n' '{\"status\":\"failed\",\"message\":\"模拟失败\"}'; done\n",
-        )
-        .expect("test worker script");
-        let mut permissions = std::fs::metadata(&script)
-            .expect("test worker metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("test worker permissions");
-
-        let server = Arc::new(Mutex::new(None));
-        let cancellation = CancellationToken::new();
-        let args = vec!["--replace-json".to_owned(), "request.json".to_owned()];
-        let result = run_voice_clone_worker_process(
-            &script,
-            &args,
-            2_000,
-            &cancellation,
-            VoiceCloneWorkerResources {
-                model_root: None,
-                target_root: None,
-                server: Some(&server),
-            },
-            None,
-            &mut |_progress| {},
-        );
-
-        let server_is_empty = server.lock().expect("server lock").is_none();
-        let _ = std::fs::remove_dir_all(&temp_root);
-        assert!(matches!(
-            result,
-            Err(VoiceCloneWorkerRunError::Failed(message)) if message == "模拟失败"
-        ));
-        assert!(server_is_empty, "failed response must discard the server");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cancelled_voice_clone_server_request_discards_the_server() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::{Arc, Mutex};
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let temp_root = std::env::temp_dir().join(format!(
-            "autolive-voice-clone-server-cancel-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&temp_root).expect("test directory");
-        let script = temp_root.join("blocking-worker.sh");
-        std::fs::write(&script, "#!/bin/sh\nwhile IFS= read -r _line; do :; done\n")
-            .expect("test worker script");
-        let mut permissions = std::fs::metadata(&script)
-            .expect("test worker metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("test worker permissions");
-
-        let server = Arc::new(Mutex::new(None));
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let result = run_voice_clone_worker_process(
-            &script,
-            &["--replace-json".to_owned(), "request.json".to_owned()],
-            2_000,
-            &cancellation,
-            VoiceCloneWorkerResources {
-                model_root: None,
-                target_root: None,
-                server: Some(&server),
-            },
-            None,
-            &mut |_progress| {},
-        );
-
-        let server_is_empty = server.lock().expect("server lock").is_none();
-        let _ = std::fs::remove_dir_all(&temp_root);
-        assert_eq!(result, Err(VoiceCloneWorkerRunError::Cancelled));
-        assert!(server_is_empty, "cancelled request must discard the server");
-    }
-
-    #[test]
-    fn previous_replacement_is_cleaned_only_after_new_replacement_is_active() {
-        use std::time::SystemTime;
-
-        let temp_root = std::env::temp_dir().join(format!(
-            "autolive-voice-clone-cleanup-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        let previous_dir = temp_root.join("previous");
-        let active_dir = temp_root.join("active");
-        std::fs::create_dir_all(&previous_dir).expect("previous directory");
-        std::fs::create_dir_all(&active_dir).expect("active directory");
-        std::fs::write(previous_dir.join("replacement.wav"), b"old").expect("old artifact");
-        std::fs::write(active_dir.join("replacement.wav"), b"new").expect("new artifact");
-
-        cleanup_previous_voice_clone_replacement_paths(
-            [previous_dir.clone(), active_dir.clone()],
-            &active_dir,
-        );
-
-        assert!(
-            !previous_dir.exists(),
-            "previous replacement should be removed"
-        );
-        assert!(
-            active_dir.exists(),
-            "active replacement must remain available"
-        );
-        assert!(active_dir.join("replacement.wav").exists());
-        let _ = std::fs::remove_dir_all(temp_root);
     }
 }

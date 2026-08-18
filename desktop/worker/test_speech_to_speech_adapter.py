@@ -37,9 +37,11 @@ class SpeechToSpeechAdapterTest(unittest.TestCase):
             ffmpeg_path.chmod(0o755)
             source_path.write_bytes(b"source")
             captured: list[list[str]] = []
+            captured_options: list[dict[str, object]] = []
 
-            def fake_run(command, **_kwargs):
+            def fake_run(command, **kwargs):
                 captured.append(command)
+                captured_options.append(kwargs)
                 return types.SimpleNamespace(returncode=0, stdout=b"pcm", stderr=b"")
 
             context = {
@@ -54,6 +56,10 @@ class SpeechToSpeechAdapterTest(unittest.TestCase):
                 self.assertEqual(adapter.extract_pcm(context), b"pcm")
 
         self.assertEqual(captured[0][0], str(ffmpeg_path.resolve()))
+        self.assertEqual(
+            captured_options[0]["creationflags"],
+            int(getattr(adapter.subprocess, "CREATE_NO_WINDOW", 0)),
+        )
 
     def test_normalize_audio_uses_explicit_ffmpeg_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -61,9 +67,11 @@ class SpeechToSpeechAdapterTest(unittest.TestCase):
             ffmpeg_path.write_bytes(b"ffmpeg")
             ffmpeg_path.chmod(0o755)
             captured: list[list[str]] = []
+            captured_options: list[dict[str, object]] = []
 
-            def fake_run(command, **_kwargs):
+            def fake_run(command, **kwargs):
                 captured.append(command)
+                captured_options.append(kwargs)
                 return types.SimpleNamespace(returncode=0, stdout=b"wav", stderr=b"")
 
             with (
@@ -76,6 +84,10 @@ class SpeechToSpeechAdapterTest(unittest.TestCase):
                 )
 
         self.assertEqual(captured[0][0], str(ffmpeg_path.resolve()))
+        self.assertEqual(
+            captured_options[0]["creationflags"],
+            int(getattr(adapter.subprocess, "CREATE_NO_WINDOW", 0)),
+        )
 
 
 if __name__ == "__main__":

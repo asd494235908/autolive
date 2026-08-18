@@ -93,7 +93,7 @@ fn release_config_allows_unrelated_override_but_rejects_resource_changes() {
     .is_ok());
     assert!(build_support::validate_release_runtime_resource_config(
         base_config,
-        Some(r#"{"bundle":{"resources":["runtime-resources.json"]}}"#),
+        Some(r#"{"bundle":{"resources":["runtime-resources.json","embedded-runtime-resources"]}}"#),
     )
     .is_ok());
     assert!(build_support::validate_release_runtime_resource_config(

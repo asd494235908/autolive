@@ -69,6 +69,22 @@ pub struct AudioResearchParams {
     pub input_gain_db: f64,
     /// 输出增益，单位为 dB；范围 -6–6 dB。
     pub output_gain_db: f64,
+    /// 播放速度，单位为倍；范围 0.5–2.0 倍。
+    pub playback_speed: f64,
+    /// 低频均衡增益，单位为 dB；范围 -12–12 dB。
+    pub low_eq_db: f64,
+    /// 中频均衡增益，单位为 dB；范围 -12–12 dB。
+    pub mid_eq_db: f64,
+    /// 高频均衡增益，单位为 dB；范围 -12–12 dB。
+    pub high_eq_db: f64,
+    /// 降噪强度，单位为百分比；范围 0–100%。
+    pub noise_reduction_percent: f64,
+    /// 环境声混合比例，单位为百分比；范围 0–100%。
+    pub ambient_sound_mix_percent: f64,
+    /// 淡入时长，单位为毫秒；范围 0–10,000 ms。
+    pub fade_in_ms: u64,
+    /// 淡出时长，单位为毫秒；范围 0–10,000 ms。
+    pub fade_out_ms: u64,
     /// 干湿比，单位为百分比；范围 0–100%。
     pub dry_wet_percent: f64,
     /// 轻混响湿声比例，单位为百分比；范围 0–20%。
@@ -103,7 +119,7 @@ impl Default for AudioResearchParams {
     fn default() -> Self {
         Self {
             natural_voice_mode: NaturalVoiceMode::Original,
-            random_change_period_ms: 5_000,
+            random_change_period_ms: 15_000,
             pitch_shift_semitones: 0.0,
             spectral_perturbation_percent: 0.0,
             environment_noise_percent: 0.0,
@@ -113,6 +129,14 @@ impl Default for AudioResearchParams {
             loudness_adjustment_db: 0.0,
             input_gain_db: 0.0,
             output_gain_db: 0.0,
+            playback_speed: 1.0,
+            low_eq_db: 0.0,
+            mid_eq_db: 0.0,
+            high_eq_db: 0.0,
+            noise_reduction_percent: 0.0,
+            ambient_sound_mix_percent: 0.0,
+            fade_in_ms: 0,
+            fade_out_ms: 0,
             dry_wet_percent: 0.0,
             reverb_wet_percent: 0.0,
             mfcc_dimensions: 13,
@@ -397,6 +421,49 @@ impl AudioResearchParams {
             self.output_gain_db,
             -6.0,
             6.0,
+        );
+        validate_range(
+            errors,
+            "audio.playback_speed",
+            "倍",
+            self.playback_speed,
+            0.5,
+            2.0,
+        );
+        validate_range(errors, "audio.low_eq_db", "dB", self.low_eq_db, -12.0, 12.0);
+        validate_range(errors, "audio.mid_eq_db", "dB", self.mid_eq_db, -12.0, 12.0);
+        validate_range(
+            errors,
+            "audio.high_eq_db",
+            "dB",
+            self.high_eq_db,
+            -12.0,
+            12.0,
+        );
+        validate_range(
+            errors,
+            "audio.noise_reduction_percent",
+            "%",
+            self.noise_reduction_percent,
+            0.0,
+            100.0,
+        );
+        validate_range(
+            errors,
+            "audio.ambient_sound_mix_percent",
+            "%",
+            self.ambient_sound_mix_percent,
+            0.0,
+            100.0,
+        );
+        validate_u64_range(errors, "audio.fade_in_ms", "ms", self.fade_in_ms, 0, 10_000);
+        validate_u64_range(
+            errors,
+            "audio.fade_out_ms",
+            "ms",
+            self.fade_out_ms,
+            0,
+            10_000,
         );
         validate_range(
             errors,
@@ -1077,6 +1144,43 @@ mod tests {
         };
 
         assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn ordinary_audio_processing_defaults_and_ranges_are_enforced() {
+        let defaults = AudioResearchParams::default();
+        assert_eq!(defaults.playback_speed, 1.0);
+        assert_eq!(defaults.low_eq_db, 0.0);
+        assert_eq!(defaults.mid_eq_db, 0.0);
+        assert_eq!(defaults.high_eq_db, 0.0);
+        assert_eq!(defaults.noise_reduction_percent, 0.0);
+        assert_eq!(defaults.ambient_sound_mix_percent, 0.0);
+        assert_eq!(defaults.fade_in_ms, 0);
+        assert_eq!(defaults.fade_out_ms, 0);
+
+        let mut params = defaults;
+        params.playback_speed = 2.1;
+        params.low_eq_db = -12.1;
+        params.mid_eq_db = 12.1;
+        params.high_eq_db = f64::NAN;
+        params.noise_reduction_percent = 100.1;
+        params.ambient_sound_mix_percent = -0.1;
+        params.fade_in_ms = 10_001;
+        params.fade_out_ms = 10_001;
+
+        let errors = params.validate().expect_err("invalid params should fail");
+        for field in [
+            "audio.playback_speed",
+            "audio.low_eq_db",
+            "audio.mid_eq_db",
+            "audio.high_eq_db",
+            "audio.noise_reduction_percent",
+            "audio.ambient_sound_mix_percent",
+            "audio.fade_in_ms",
+            "audio.fade_out_ms",
+        ] {
+            assert!(errors.iter().any(|error| error.field == field), "{field}");
+        }
     }
 
     #[test]

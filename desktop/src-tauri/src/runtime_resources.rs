@@ -14,6 +14,7 @@ use sysinfo::Disks;
 pub const PRODUCTION_BASE_URL: &str = "http://101.96.208.132:7088/autolive-resources/v0.1.0/";
 const RELEASE: &str = "v0.1.0";
 const RUNTIME_RESOURCES_DIRECTORY: &str = "runtime-resources";
+const EMBEDDED_RESOURCE_DIRECTORY: &str = "embedded-runtime-resources";
 const MAX_HTTP_REQUESTS: usize = 3;
 const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(50)];
 const SUPPORTED_TARGETS: [&str; 3] = [
@@ -32,26 +33,18 @@ pub enum ValidationMode {
 #[serde(rename_all = "kebab-case")]
 pub enum ManifestComponent {
     Media,
-    VoiceRuntime,
-    VoiceModels,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeResourceComponent {
     Media,
-    Voice,
 }
 
 impl RuntimeResourceComponent {
     pub fn required_components(self) -> &'static [ManifestComponent] {
         match self {
             Self::Media => &[ManifestComponent::Media],
-            Self::Voice => &[
-                ManifestComponent::Media,
-                ManifestComponent::VoiceRuntime,
-                ManifestComponent::VoiceModels,
-            ],
         }
     }
 }
@@ -148,12 +141,6 @@ impl RuntimeResourceManifest {
 
         let mut paths = HashSet::with_capacity(self.files.len());
         for file in &self.files {
-            if file.size_bytes == 0 {
-                return Err(ManifestValidationError(format!(
-                    "manifest file has zero size: {}",
-                    file.relative_path
-                )));
-            }
             if file.sha256.len() != 64
                 || !file
                     .sha256
@@ -174,11 +161,7 @@ impl RuntimeResourceManifest {
                 )));
             }
         }
-        for component in [
-            ManifestComponent::Media,
-            ManifestComponent::VoiceRuntime,
-            ManifestComponent::VoiceModels,
-        ] {
+        for component in [ManifestComponent::Media] {
             if !self.files.iter().any(|file| file.component == component) {
                 return Err(ManifestValidationError(format!(
                     "manifest is missing component: {component:?}"
@@ -247,15 +230,6 @@ fn validate_component_layout(
                     .relative_path
                     .starts_with(&format!("{target}/binaries/"))
         }
-        ManifestComponent::VoiceRuntime => {
-            file.executable
-                && file
-                    .relative_path
-                    .starts_with(&format!("{target}/voice-worker/"))
-        }
-        ManifestComponent::VoiceModels => {
-            !file.executable && file.relative_path.starts_with("common/voice-models/")
-        }
     };
     if !valid {
         return Err(ManifestValidationError(format!(
@@ -270,7 +244,6 @@ fn validate_component_layout(
 pub struct RuntimeResourceLayout {
     pub version_root: PathBuf,
     pub target_root: PathBuf,
-    pub model_root: PathBuf,
     pub partial_root: PathBuf,
     pub installed_record: PathBuf,
 }
@@ -285,12 +258,139 @@ impl RuntimeResourceLayout {
         let version_root = app_data_dir.join("runtime-resources").join(RELEASE);
         Ok(Self {
             target_root: version_root.join(target),
-            model_root: version_root.join("common").join("voice-models"),
             partial_root: version_root.join("partial"),
             installed_record: version_root.join("installed.json"),
             version_root,
         })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeResourceRoots {
+    pub version_root: PathBuf,
+    pub target_root: PathBuf,
+}
+
+impl RuntimeResourceRoots {
+    fn for_version_root(
+        version_root: PathBuf,
+        target: &str,
+    ) -> Result<Self, ManifestValidationError> {
+        if !SUPPORTED_TARGETS.contains(&target) {
+            return Err(ManifestValidationError(
+                "unsupported runtime resource target".to_owned(),
+            ));
+        }
+        Ok(Self {
+            target_root: version_root.join(target),
+            version_root,
+        })
+    }
+
+    fn from_writable_layout(layout: &RuntimeResourceLayout) -> Self {
+        Self {
+            version_root: layout.version_root.clone(),
+            target_root: layout.target_root.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeResourceCatalog {
+    manifest: Arc<RuntimeResourceManifest>,
+    roots: RuntimeResourceRoots,
+    bundled: bool,
+}
+
+impl RuntimeResourceCatalog {
+    pub fn from_resource_directory(
+        resource_dir: &Path,
+        app_data_dir: &Path,
+        expected_target: &str,
+    ) -> Result<Self, ResourceInstallError> {
+        let manifest = read_production_manifest(resource_dir, expected_target)?;
+        let embedded_root = resource_dir.join(EMBEDDED_RESOURCE_DIRECTORY);
+        let bundled = embedded_resources_complete(&manifest, &embedded_root);
+        let roots = if bundled {
+            RuntimeResourceRoots::for_version_root(embedded_root, expected_target)?
+        } else {
+            let layout = RuntimeResourceLayout::for_target(app_data_dir, expected_target)?;
+            RuntimeResourceRoots::from_writable_layout(&layout)
+        };
+        Ok(Self {
+            manifest: Arc::new(manifest),
+            roots,
+            bundled,
+        })
+    }
+
+    pub fn roots(&self) -> &RuntimeResourceRoots {
+        &self.roots
+    }
+
+    pub fn is_bundled(&self) -> bool {
+        self.bundled
+    }
+
+    pub fn bundled_status(
+        &self,
+        component: RuntimeResourceComponent,
+    ) -> Option<RuntimeResourceStatus> {
+        if !self.bundled {
+            return None;
+        }
+        let total_bytes = self
+            .manifest
+            .files
+            .iter()
+            .filter(|file| component.required_components().contains(&file.component))
+            .fold(0_u64, |total, file| total.saturating_add(file.size_bytes));
+        Some(RuntimeResourceStatus {
+            state: RuntimeResourceState::Ready,
+            component: Some(component),
+            current_file: None,
+            downloaded_bytes: 0,
+            total_bytes,
+            bytes_per_second: 0,
+            installed_bytes: total_bytes,
+            resource_root: self.roots.version_root.display().to_string(),
+            error: None,
+        })
+    }
+}
+
+fn read_production_manifest(
+    resource_dir: &Path,
+    expected_target: &str,
+) -> Result<RuntimeResourceManifest, ResourceInstallError> {
+    let manifest_path = resource_dir.join("runtime-resources.json");
+    let manifest_bytes = fs::read(&manifest_path)
+        .map_err(|error| io_error("read manifest", &manifest_path, error))?;
+    let manifest =
+        RuntimeResourceManifest::parse_and_validate(&manifest_bytes, ValidationMode::Production)
+            .map_err(|error| {
+                ResourceInstallError::Manifest(format!(
+                    "failed to parse runtime resource manifest {}: {error}",
+                    manifest_path.display()
+                ))
+            })?;
+    if manifest.target != expected_target {
+        return Err(ResourceInstallError::Manifest(format!(
+            "runtime resource manifest target mismatch: expected {expected_target}, got {} ({})",
+            manifest.target,
+            manifest_path.display()
+        )));
+    }
+    Ok(manifest)
+}
+
+fn embedded_resources_complete(manifest: &RuntimeResourceManifest, embedded_root: &Path) -> bool {
+    embedded_root.is_dir()
+        && manifest.files.iter().all(|file| {
+            fs::metadata(embedded_root.join(&file.relative_path))
+                .map(|metadata| metadata.is_file() && metadata.len() == file.size_bytes)
+                .unwrap_or(false)
+        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -421,25 +521,8 @@ impl RuntimeResourceInstaller {
         app_data_dir: &Path,
         expected_target: &str,
     ) -> Result<Self, ResourceInstallError> {
-        let manifest_path = resource_dir.join("runtime-resources.json");
-        let manifest_bytes = fs::read(&manifest_path)
-            .map_err(|error| io_error("read manifest", &manifest_path, error))?;
-        let installer =
-            Self::from_embedded(&manifest_bytes, app_data_dir).map_err(|error| match error {
-                ResourceInstallError::Manifest(message) => ResourceInstallError::Manifest(format!(
-                    "failed to parse runtime resource manifest {}: {message}",
-                    manifest_path.display()
-                )),
-                error => error,
-            })?;
-        if installer.target() != expected_target {
-            return Err(ResourceInstallError::Manifest(format!(
-                "runtime resource manifest target mismatch: expected {expected_target}, got {} ({})",
-                installer.target(),
-                manifest_path.display()
-            )));
-        }
-        Ok(installer)
+        let manifest = read_production_manifest(resource_dir, expected_target)?;
+        Self::from_manifest(manifest, app_data_dir)
     }
 
     pub fn from_embedded(
@@ -475,7 +558,7 @@ impl RuntimeResourceInstaller {
         Self::from_manifest(manifest, app_data_dir)
     }
 
-    fn from_manifest(
+    pub(crate) fn from_manifest(
         manifest: RuntimeResourceManifest,
         app_data_dir: &Path,
     ) -> Result<Self, ResourceInstallError> {
@@ -511,16 +594,16 @@ impl RuntimeResourceInstaller {
     ) -> Result<RuntimeResourceStatus, ResourceInstallError> {
         let files = self.required_files(component);
         let total_bytes = total_size(&files);
-        let installed_bytes = self.installed_bytes(&files)?;
+        let (installed_bytes, downloaded_bytes, files_complete) = self.progress_bytes(&files)?;
         Ok(self.status(
-            if installed_bytes == total_bytes {
+            if files_complete {
                 RuntimeResourceState::Ready
             } else {
                 RuntimeResourceState::NotInstalled
             },
             Some(component),
             None,
-            installed_bytes,
+            downloaded_bytes,
             total_bytes,
             0,
             installed_bytes,
@@ -535,8 +618,12 @@ impl RuntimeResourceInstaller {
         mut on_status: impl FnMut(RuntimeResourceStatus),
     ) -> Result<RuntimeResourceStatus, ResourceInstallError> {
         let _operation = self.acquire_operation()?;
-        let result = self.install_inner(component, cancel, &mut on_status);
-        self.finish_operation(component, result, &mut on_status)
+        let mut last_status = None;
+        let result = self.install_inner(component, cancel, &mut |status| {
+            last_status = Some(status.clone());
+            on_status(status);
+        });
+        self.finish_operation(component, result, &mut on_status, last_status)
     }
 
     pub fn import_directory(
@@ -547,8 +634,12 @@ impl RuntimeResourceInstaller {
         mut on_status: impl FnMut(RuntimeResourceStatus),
     ) -> Result<RuntimeResourceStatus, ResourceInstallError> {
         let _operation = self.acquire_operation()?;
-        let result = self.import_inner(component, source_root, cancel, &mut on_status);
-        self.finish_operation(component, result, &mut on_status)
+        let mut last_status = None;
+        let result = self.import_inner(component, source_root, cancel, &mut |status| {
+            last_status = Some(status.clone());
+            on_status(status);
+        });
+        self.finish_operation(component, result, &mut on_status, last_status)
     }
 
     pub fn clear_current_release(
@@ -649,21 +740,22 @@ impl RuntimeResourceInstaller {
         self.check_cancel(cancel)?;
         let files = self.required_files(component);
         let total_bytes = total_size(&files);
-        let mut installed_bytes = self.installed_bytes(&files)?;
-        if installed_bytes != total_bytes {
+        let (mut installed_bytes, downloaded_bytes, files_complete) =
+            self.progress_bytes(&files)?;
+        if !files_complete {
             self.invalidate_installed_record()?;
         }
         on_status(self.status(
             RuntimeResourceState::Checking,
             Some(component),
             None,
-            installed_bytes,
+            downloaded_bytes,
             total_bytes,
             0,
             installed_bytes,
             None,
         ));
-        if installed_bytes == total_bytes {
+        if files_complete {
             self.write_installed_record()?;
             return Ok(self.ready_status(component, total_bytes));
         }
@@ -711,21 +803,22 @@ impl RuntimeResourceInstaller {
             .map_err(|error| io_error("open import directory", source_root, error))?;
         let files = self.required_files(component);
         let total_bytes = total_size(&files);
-        let mut installed_bytes = self.installed_bytes(&files)?;
-        if installed_bytes != total_bytes {
+        let (mut installed_bytes, downloaded_bytes, files_complete) =
+            self.progress_bytes(&files)?;
+        if !files_complete {
             self.invalidate_installed_record()?;
         }
         on_status(self.status(
             RuntimeResourceState::Checking,
             Some(component),
             None,
-            installed_bytes,
+            downloaded_bytes,
             total_bytes,
             0,
             installed_bytes,
             None,
         ));
-        if installed_bytes == total_bytes {
+        if files_complete {
             self.write_installed_record()?;
             return Ok(self.ready_status(component, total_bytes));
         }
@@ -796,7 +889,7 @@ impl RuntimeResourceInstaller {
                     .map_err(|error| io_error("remove oversized partial", &partial_path, error))?;
                 offset = 0;
             }
-            if offset == file.size_bytes {
+            if offset == file.size_bytes && partial_path.is_file() {
                 return self.verify_and_commit(
                     file,
                     &partial_path,
@@ -1090,6 +1183,7 @@ impl RuntimeResourceInstaller {
         component: RuntimeResourceComponent,
         result: Result<RuntimeResourceStatus, ResourceInstallError>,
         on_status: &mut impl FnMut(RuntimeResourceStatus),
+        last_status: Option<RuntimeResourceStatus>,
     ) -> Result<RuntimeResourceStatus, ResourceInstallError> {
         match result {
             Ok(status) => {
@@ -1102,16 +1196,22 @@ impl RuntimeResourceInstaller {
                 } else {
                     RuntimeResourceState::Failed
                 };
-                on_status(self.status(
-                    state,
-                    Some(component),
-                    None,
-                    0,
-                    total_size(&self.required_files(component)),
-                    0,
-                    0,
-                    Some(error.to_string()),
-                ));
+                let mut status = last_status.unwrap_or_else(|| {
+                    self.status(
+                        RuntimeResourceState::Checking,
+                        Some(component),
+                        None,
+                        0,
+                        total_size(&self.required_files(component)),
+                        0,
+                        0,
+                        None,
+                    )
+                });
+                status.state = state;
+                status.bytes_per_second = 0;
+                status.error = Some(error.to_string());
+                on_status(status);
                 Err(error)
             }
         }
@@ -1163,12 +1263,8 @@ impl RuntimeResourceInstaller {
     }
 
     fn verified_components(&self) -> Result<Vec<ManifestComponent>, ResourceInstallError> {
-        let mut verified = Vec::with_capacity(3);
-        for component in [
-            ManifestComponent::Media,
-            ManifestComponent::VoiceRuntime,
-            ManifestComponent::VoiceModels,
-        ] {
+        let mut verified = Vec::with_capacity(1);
+        for component in [ManifestComponent::Media] {
             let mut component_verified = true;
             for file in self
                 .manifest
@@ -1196,14 +1292,25 @@ impl RuntimeResourceInstaller {
             .collect()
     }
 
-    fn installed_bytes(&self, files: &[&ManifestFile]) -> Result<u64, ResourceInstallError> {
-        files.iter().try_fold(0_u64, |installed, file| {
-            if file_matches(&self.final_path(file), file)? {
-                Ok(installed.saturating_add(file.size_bytes))
-            } else {
-                Ok(installed)
-            }
-        })
+    fn progress_bytes(
+        &self,
+        files: &[&ManifestFile],
+    ) -> Result<(u64, u64, bool), ResourceInstallError> {
+        files.iter().try_fold(
+            (0_u64, 0_u64, true),
+            |(installed, downloaded, complete), file| {
+                if file_matches(&self.final_path(file), file)? {
+                    return Ok((
+                        installed.saturating_add(file.size_bytes),
+                        downloaded.saturating_add(file.size_bytes),
+                        complete,
+                    ));
+                }
+                let partial_size =
+                    file_size_if_present(&self.partial_path(file))?.min(file.size_bytes);
+                Ok((installed, downloaded.saturating_add(partial_size), false))
+            },
+        )
     }
 
     fn additional_disk_bytes(&self, files: &[&ManifestFile]) -> Result<u64, ResourceInstallError> {
@@ -1541,8 +1648,9 @@ fn io_error(operation: &'static str, path: &Path, error: std::io::Error) -> Reso
 #[cfg(test)]
 mod tests {
     use super::{
-        remove_capability_entry, ResourceInstallError, RuntimeResourceInstaller,
-        RuntimeResourceManifest, PRODUCTION_BASE_URL, RELEASE,
+        remove_capability_entry, ManifestComponent, ManifestFile, ResourceInstallError,
+        RuntimeResourceComponent, RuntimeResourceInstaller, RuntimeResourceManifest,
+        RuntimeResourceState, RuntimeResourceStatus, PRODUCTION_BASE_URL, RELEASE,
     };
     use cap_std::{ambient_authority, fs::Dir};
     use std::ffi::OsStr;
@@ -1625,6 +1733,96 @@ mod tests {
             &cloned.app_data_capability
         ));
         drop((installer, cloned));
+        fs::remove_dir_all(root).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn inspect_includes_partial_file_bytes_in_download_progress() {
+        let root = std::env::temp_dir().join(format!(
+            "autolive-runtime-partial-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = ManifestFile {
+            component: ManifestComponent::Media,
+            relative_path: "x86_64-pc-windows-msvc/binaries/ffmpeg.exe".to_owned(),
+            size_bytes: 5,
+            sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_owned(),
+            executable: true,
+        };
+        let installer = RuntimeResourceInstaller::from_manifest(
+            RuntimeResourceManifest {
+                schema_version: 1,
+                release: RELEASE.to_owned(),
+                target: "x86_64-pc-windows-msvc".to_owned(),
+                base_url: PRODUCTION_BASE_URL.to_owned(),
+                files: vec![file.clone()],
+            },
+            &root,
+        )
+        .expect("installer fixture");
+        let partial_path = installer.partial_path(&file);
+        fs::create_dir_all(partial_path.parent().expect("partial parent"))
+            .expect("partial directory");
+        fs::write(&partial_path, b"hel").expect("partial file");
+
+        let status = installer
+            .inspect(RuntimeResourceComponent::Media)
+            .expect("resource status");
+        assert_eq!(status.state, RuntimeResourceState::NotInstalled);
+        assert_eq!(status.downloaded_bytes, 3);
+        assert_eq!(status.installed_bytes, 0);
+        assert_eq!(status.total_bytes, 5);
+
+        drop(installer);
+        fs::remove_dir_all(root).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn failed_operation_preserves_last_download_progress_for_resume() {
+        let root = std::env::temp_dir().join(format!(
+            "autolive-runtime-failure-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let installer = RuntimeResourceInstaller::from_manifest(
+            RuntimeResourceManifest {
+                schema_version: 1,
+                release: RELEASE.to_owned(),
+                target: "x86_64-pc-windows-msvc".to_owned(),
+                base_url: PRODUCTION_BASE_URL.to_owned(),
+                files: Vec::new(),
+            },
+            &root,
+        )
+        .expect("installer fixture");
+        let last = RuntimeResourceStatus {
+            state: RuntimeResourceState::Downloading,
+            component: Some(RuntimeResourceComponent::Media),
+            current_file: Some("x86_64-pc-windows-msvc/binaries/ffmpeg.exe".to_owned()),
+            downloaded_bytes: 7,
+            total_bytes: 10,
+            bytes_per_second: 4,
+            installed_bytes: 3,
+            resource_root: installer.resource_root().display().to_string(),
+            error: None,
+        };
+        let mut emitted = Vec::new();
+        let result = installer.finish_operation(
+            RuntimeResourceComponent::Media,
+            Err(ResourceInstallError::Cancelled),
+            &mut |status| emitted.push(status),
+            Some(last),
+        );
+        assert_eq!(result, Err(ResourceInstallError::Cancelled));
+        let status = emitted.pop().expect("terminal status");
+        assert_eq!(status.state, RuntimeResourceState::Cancelled);
+        assert_eq!(status.downloaded_bytes, 7);
+        assert_eq!(status.installed_bytes, 3);
+        assert_eq!(status.total_bytes, 10);
+        assert!(status.error.is_some());
+
+        drop(installer);
         fs::remove_dir_all(root).expect("test directory cleanup");
     }
 }

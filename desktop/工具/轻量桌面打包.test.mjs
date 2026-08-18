@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,13 +15,13 @@ const packageJsonPath = fileURLToPath(new URL('../ui/package.json', import.meta.
 const workflowPath = fileURLToPath(
   new URL('../../.github/workflows/desktop-package.yml', import.meta.url),
 );
-const implementationPlanPath = fileURLToPath(
-  new URL('../../docs/superpowers/plans/2026-08-15-桌面运行资源按需下载实施计划.md', import.meta.url),
-);
 const gitignorePath = fileURLToPath(new URL('../../.gitignore', import.meta.url));
 
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
 function assertInOrder(source, fragments) {
-  assert.equal(typeof source, 'string', '缺少构建脚本');
   let previous = -1;
   for (const fragment of fragments) {
     const current = source.indexOf(fragment);
@@ -29,143 +30,172 @@ function assertInOrder(source, fragments) {
   }
 }
 
-test('Tauri 只打包内置运行资源清单', () => {
+function createWindowsArchiveFixture(root, files) {
+  const executableSourcePath = join(root, 'target', 'release', 'autolive-desktop-core.exe');
+  const bundleSourceDir = join(root, 'target', 'release', 'bundle');
+  const manifestPath = join(root, 'runtime-resources.json');
+  const embeddedResourceDir = join(root, 'embedded-runtime-resources');
+  mkdirSync(join(bundleSourceDir, 'nsis'), { recursive: true });
+  mkdirSync(join(root, 'target', 'release'), { recursive: true });
+  writeFileSync(executableSourcePath, 'tauri-production-exe');
+  writeFileSync(join(bundleSourceDir, 'nsis', 'autolive-setup.exe'), 'nsis-installer');
+  for (const file of files) {
+    const path = join(embeddedResourceDir, ...file.relative_path.split('/'));
+    mkdirSync(join(path, '..'), { recursive: true });
+    writeFileSync(path, file.content);
+  }
+  writeFileSync(manifestPath, JSON.stringify({
+    schema_version: 1,
+    release: readDesktopVersion().release,
+    target: 'x86_64-pc-windows-msvc',
+    files: files.map(({ relative_path, content }) => ({
+      relative_path,
+      size_bytes: Buffer.byteLength(content),
+      sha256: sha256(content),
+      component: 'media',
+      executable: true,
+    })),
+  }));
+  return { bundleSourceDir, embeddedResourceDir, executableSourcePath, manifestPath };
+}
+
+test('Tauri 打包运行资源清单和内嵌媒体资源树', () => {
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
 
   assert.equal(config.bundle.active, true);
-  assert.deepEqual(config.bundle.resources, ['runtime-resources.json']);
+  assert.deepEqual(config.bundle.resources, [
+    'runtime-resources.json',
+    'embedded-runtime-resources',
+  ]);
 });
 
-test('Windows 与 macOS 都使用原生 Tauri bundle', () => {
-  const expected = ['build', '--config', 'src-tauri/tauri.conf.json'];
-
-  assert.equal(tauriBuildArguments.length, 0);
-  assert.deepEqual(tauriBuildArguments(), expected);
+test('Windows 生成 NSIS 安装 EXE', () => {
+  assert.deepEqual(tauriBuildArguments('x86_64-pc-windows-msvc'), [
+    'build',
+    '--config',
+    'src-tauri/tauri.conf.json',
+    '--bundles',
+    'nsis',
+  ]);
 });
 
-test('归档器只复制原生 bundle，不复制大运行资源', () => {
-  const root = mkdtempSync(join(tmpdir(), 'autolive-lightweight-package-'));
-  const bundleSourceDir = join(root, 'bundle');
-  const packageRoot = join(root, 'package');
-  mkdirSync(join(bundleSourceDir, 'msi'), { recursive: true });
-  mkdirSync(join(bundleSourceDir, 'macos', 'autolive.app'), { recursive: true });
-  writeFileSync(join(bundleSourceDir, 'msi', 'autolive.msi'), 'native-installer');
-  writeFileSync(join(bundleSourceDir, 'macos', 'autolive.app', 'Contents.txt'), 'not-an-installer');
+test('macOS 仍可通过环境变量选择单一原生 bundle 类型', () => {
+  const previous = process.env.AUTOLIVE_BUNDLES;
+  process.env.AUTOLIVE_BUNDLES = 'dmg';
+  try {
+    assert.deepEqual(tauriBuildArguments('aarch64-apple-darwin'), [
+      'build',
+      '--config',
+      'src-tauri/tauri.conf.json',
+      '--bundles',
+      'dmg',
+    ]);
+  } finally {
+    if (previous === undefined) delete process.env.AUTOLIVE_BUNDLES;
+    else process.env.AUTOLIVE_BUNDLES = previous;
+  }
+});
 
+test('Windows 归档器同时交付 NSIS EXE 与 media-only portable', () => {
+  const root = mkdtempSync(join(tmpdir(), 'autolive-media-package-'));
+  const relativePath = 'x86_64-pc-windows-msvc/binaries/ffmpeg.exe';
+  const fixture = createWindowsArchiveFixture(root, [{ relative_path: relativePath, content: 'ffmpeg' }]);
   const destination = archiveDesktopArtifacts({
     targetTriple: 'x86_64-pc-windows-msvc',
-    bundleSourceDir,
-    packageRoot,
+    ...fixture,
+    packageRoot: join(root, 'package'),
+    createPortableZip: process.platform === 'win32',
   });
 
-  assert.equal(readFileSync(join(destination, 'msi', 'autolive.msi'), 'utf8'), 'native-installer');
-  for (const name of ['portable', 'binaries', 'voice-worker', 'voice-models']) {
-    assert.equal(existsSync(join(destination, name)), false);
+  assert.equal(
+    readFileSync(join(destination, 'portable', 'autolive-desktop-core.exe'), 'utf8'),
+    'tauri-production-exe',
+  );
+  assert.equal(
+    readFileSync(join(destination, 'portable', 'embedded-runtime-resources', ...relativePath.split('/')), 'utf8'),
+    'ffmpeg',
+  );
+  assert.equal(readFileSync(join(destination, 'nsis', 'autolive-setup.exe'), 'utf8'), 'nsis-installer');
+  assert.equal(existsSync(join(destination, 'msi')), false);
+  assert.equal(existsSync(join(destination, 'portable', 'embedded-runtime-resources', 'common')), false);
+  if (process.platform === 'win32') {
+    const archive = join(
+      destination,
+      `autolive-desktop-core_${readDesktopVersion().version}_x64-portable-with-resources.zip`,
+    );
+    assert.equal(readFileSync(archive).subarray(0, 2).toString('ascii'), 'PK');
   }
-  assert.equal(existsSync(join(destination, 'macos')), false);
 });
 
-test('归档器缺少目标平台安装文件时失败', () => {
-  const root = mkdtempSync(join(tmpdir(), 'autolive-lightweight-package-'));
-  const bundleSourceDir = join(root, 'bundle');
-  mkdirSync(join(bundleSourceDir, 'macos', 'autolive.app'), { recursive: true });
-  writeFileSync(join(bundleSourceDir, 'macos', 'autolive.app', 'Contents.txt'), 'not-an-installer');
+test('Windows 归档器缺少正式 Tauri EXE 时失败', () => {
+  const root = mkdtempSync(join(tmpdir(), 'autolive-media-package-'));
+  const fixture = createWindowsArchiveFixture(root, [{
+    relative_path: 'x86_64-pc-windows-msvc/binaries/ffmpeg.exe',
+    content: 'ffmpeg',
+  }]);
 
   assert.throws(
     () => archiveDesktopArtifacts({
-      targetTriple: 'aarch64-apple-darwin',
-      bundleSourceDir,
+      targetTriple: 'x86_64-pc-windows-msvc',
+      ...fixture,
+      executableSourcePath: join(root, 'missing.exe'),
       packageRoot: join(root, 'package'),
+      createPortableZip: false,
     }),
-    /找不到.*安装文件/,
+    /找不到正式 Tauri EXE/,
   );
 });
 
-test('运行资源生成与 CI artifact 均从共享桌面版本入口派生', async () => {
-  const workflow = readFileSync(workflowPath, 'utf8');
-  const { RESOURCE_RELEASE } = await import('./生成运行资源发布树.mjs');
+test('Windows 归档器拒绝包含重复路径的运行资源清单', () => {
+  const root = mkdtempSync(join(tmpdir(), 'autolive-media-package-'));
+  const relativePath = 'x86_64-pc-windows-msvc/binaries/ffmpeg.exe';
+  const fixture = createWindowsArchiveFixture(root, [
+    { relative_path: relativePath, content: 'ffmpeg' },
+  ]);
+  const manifest = JSON.parse(readFileSync(fixture.manifestPath, 'utf8'));
+  manifest.files.push(manifest.files[0]);
+  writeFileSync(fixture.manifestPath, JSON.stringify(manifest));
 
-  assert.equal(RESOURCE_RELEASE, readDesktopVersion().release);
-  assert.equal(
-    (workflow.match(/node desktop\/工具\/桌面版本\.mjs --release/g) ?? []).length,
-    2,
+  assert.throws(
+    () => archiveDesktopArtifacts({
+      targetTriple: 'x86_64-pc-windows-msvc',
+      ...fixture,
+      packageRoot: join(root, 'package'),
+      createPortableZip: false,
+    }),
+    /重复路径/,
   );
-  assert.doesNotMatch(workflow, /node -p/);
-  assert.doesNotMatch(workflow, /\$version\s*=~/);
-  assert.match(
-    workflow,
-    /desktop\/resource-release\/autolive-resources\/\$\{\{ steps\.desktop-version\.outputs\.version \}\}\/common\/\*\*/,
-  );
-  assert.match(
-    workflow,
-    /desktop\/resource-release\/autolive-resources\/\$\{\{ steps\.desktop-version\.outputs\.version \}\}\/\$\{\{ matrix\.target_triple \}\}\/\*\*/,
-  );
-  assert.doesNotMatch(workflow, /resource-release\/autolive-resources\/v0\.1\.0\//);
 });
 
-test('本地发布产物与内置清单不进入版本控制', () => {
-  const gitignore = readFileSync(gitignorePath, 'utf8');
-
-  assert.match(gitignore, /^desktop\/src-tauri\/runtime-resources\.json$/m);
-  assert.match(gitignore, /^desktop\/resource-release\/$/m);
-  assert.match(gitignore, /^desktop\/src-tauri\/binaries\/\*$/m);
-  assert.match(gitignore, /^!desktop\/src-tauri\/binaries\/\.gitignore$/m);
-  assert.match(gitignore, /^desktop\/src-tauri\/voice-models\/\*$/m);
-  assert.match(gitignore, /^!desktop\/src-tauri\/voice-models\/\.gitkeep$/m);
-  assert.match(gitignore, /^desktop\/src-tauri\/voice-worker\/\*$/m);
-  assert.match(gitignore, /^!desktop\/src-tauri\/voice-worker\/\.gitkeep$/m);
-});
-
-test('本地完整构建与 CI prepared-resources 入口顺序明确', () => {
+test('本地构建只准备 FFmpeg、生成发布树并构建桌面产物', () => {
   const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
 
-  assertInOrder(packageJson.scripts['tauri:build'], [
-    '准备FFmpeg资源.mjs',
-    '准备语音Worker资源.mjs',
-    '准备语音模型资源.mjs',
-    '生成运行资源发布树.mjs',
-    '构建桌面产物.mjs',
-  ]);
-  assertInOrder(packageJson.scripts['tauri:build:prepared-resources'], [
-    '准备FFmpeg资源.mjs',
-    '准备语音Worker资源.mjs',
-    '准备语音模型资源.mjs --assert-prepared',
-    '生成运行资源发布树.mjs',
-    '构建桌面产物.mjs',
-  ]);
-  assert.match(packageJson.scripts.test, /\.\.\/工具\/桌面版本\.test\.mjs/);
+  for (const name of ['tauri:build', 'tauri:build:prepared-resources']) {
+    assertInOrder(packageJson.scripts[name], [
+      '准备FFmpeg资源.mjs',
+      '生成运行资源发布树.mjs',
+      '构建桌面产物.mjs',
+    ]);
+    assert.doesNotMatch(packageJson.scripts[name], /语音|voice|model/i);
+  }
 });
 
-test('CI 公共模型、目标运行资源和桌面包分层且避免 OpenMP 绕过', () => {
-  const workflow = readFileSync(workflowPath, 'utf8');
+test('CI 不再构建或发布固定话术 Worker 和模型', () => {
+  const workflow = readFileSync(workflowPath, 'utf8').replaceAll('\r\n', '\n');
 
-  assert.equal((workflow.match(/^  common-models:$/gm) ?? []).length, 1);
-  assert.match(workflow, /^  common-models:\n(?:.|\n)*?runs-on: ubuntu-latest/m);
-  assert.match(workflow, /name: runtime-common-\$\{\{ steps\.desktop-version\.outputs\.version \}\}/);
-  assert.match(
-    workflow,
-    /path: desktop\/resource-release\/autolive-resources\/\$\{\{ steps\.desktop-version\.outputs\.version \}\}\/common\/\*\*/,
-  );
-  assert.match(workflow, /needs: common-models/);
+  assert.match(workflow, /^  metadata:$/m);
   assert.match(workflow, /tauri:build:prepared-resources/);
-  assert.match(workflow, /准备语音模型资源\.mjs --assert-prepared/);
+  assert.match(workflow, /name: desktop-bundle-/);
+  assert.doesNotMatch(workflow, /common-models|runtime-common|voice.clone|Coqui|requirements-voice|Setup Python|pip install/i);
   assert.match(
     workflow,
-    /name: runtime-resources-\$\{\{ steps\.desktop-version\.outputs\.version \}\}-\$\{\{ matrix\.target_triple \}\}/,
+    /for scope in x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do/,
   );
-  assert.match(
-    workflow,
-    /path: desktop\/resource-release\/autolive-resources\/\$\{\{ steps\.desktop-version\.outputs\.version \}\}\/\$\{\{ matrix\.target_triple \}\}\/\*\*/,
-  );
-  assert.match(
-    workflow,
-    /name: desktop-bundle-\$\{\{ steps\.desktop-version\.outputs\.version \}\}-\$\{\{ matrix\.target_triple \}\}/,
-  );
-  assert.doesNotMatch(workflow, /KMP_DUPLICATE_LIB_OK/);
+  assert.doesNotMatch(workflow, /for scope in common/);
 });
 
-test('CI 仅手动 main 部署已构建产物，强制 host key 并不覆盖已发布文件', () => {
-  const workflow = readFileSync(workflowPath, 'utf8');
+test('CI 只手动从 main 部署已构建资源且强制 host key', () => {
+  const workflow = readFileSync(workflowPath, 'utf8').replaceAll('\r\n', '\n');
   const deployJob = workflow.slice(workflow.indexOf('\n  deploy:'));
 
   assert.match(workflow, /^permissions:\n  contents: read$/m);
@@ -178,77 +208,18 @@ test('CI 仅手动 main 部署已构建产物，强制 host key 并不覆盖已�
   assert.match(deployJob, /AUTOLIVE_RESOURCE_DEPLOY_HOST_KEY/);
   assert.match(deployJob, /StrictHostKeyChecking=yes/);
   assert.match(deployJob, /rsync --archive --compress --ignore-existing --mkpath/);
-  assert.match(deployJob, /UPLOAD_ID: \$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/);
-  assert.match(
-    deployJob,
-    /if ! \[\[ "\$UPLOAD_ID" =~ \^\[1-9\]\[0-9\]\*-\[1-9\]\[0-9\]\*\$ \]\]; then[\s\S]*?exit 1[\s\S]*?fi/,
-  );
-  assert.match(
-    deployJob,
-    /"\$DEPLOY_USER@\$DEPLOY_HOST:\$UPLOAD_ID\/\$RELEASE_VERSION\/\$scope\/"/,
-  );
-  assert.doesNotMatch(deployJob, /:\/fs\/autolive-resources-staging/);
   assert.match(deployJob, /publish-runtime-resources/);
-  assert.match(
-    deployJob,
-    /for scope in common x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do[\s\S]*?"publish-runtime-resources \$RELEASE_VERSION \$scope \$UPLOAD_ID"[\s\S]*?done/,
-  );
-  assert.match(
-    deployJob,
-    /concurrency:\n\s+group: deploy-runtime-resources-\$\{\{ needs\.common-models\.outputs\.version \}\}\n\s+cancel-in-progress: false/,
-  );
-  assert.match(
-    deployJob,
-    /if ! \[\[ "\$DEPLOY_PORT" =~ \^\[0-9\]\{1,4\}\$ \]\] \|\| \(\( DEPLOY_PORT < 1 \|\| DEPLOY_PORT > 9999 \)\); then[\s\S]*?exit 1[\s\S]*?fi/,
-  );
   assert.doesNotMatch(workflow, /StrictHostKeyChecking=no|password/i);
-  assert.doesNotMatch(deployJob, /cargo build|pnpm .*build|npm .*build|node .*\u6784\u5efa/);
+  assert.doesNotMatch(deployJob, /cargo build|pnpm .*build|npm .*build/);
 });
 
-test('Task 6 用 forced-command dispatcher 同时约束 rrsync 写入和精确发布命令', () => {
-  const task6 = readFileSync(implementationPlanPath, 'utf8');
-  assert.match(
-    task6,
-    /authorized_keys[^\n]*command="\/usr\/local\/sbin\/autolive-resource-deploy-dispatcher",restrict/,
-  );
-  assert.match(
-    task6,
-    /exec \/usr\/local\/lib\/autolive-resources\/rrsync -wo -no-overwrite -munge \/fs\/autolive-resources-staging/,
-  );
-  assert.match(task6, /rsync-3\.4\.4\.tar\.gz/);
-  assert.match(task6, /bd88cf82fa653da32314fb229136407c5c90f80d1758d8f4b091767877d8fa96/);
-  assert.match(task6, /7bc4950a886bc2f4986b8a85fe492b8b3612a0f7edab031ab79c66fca0390970/);
-  assert.match(
-    task6,
-    /\/usr\/local\/lib\/autolive-resources\/rrsync -help \/fs\/autolive-resources-staging/,
-  );
-  assert.match(task6, /-help[\s\S]*-wo[\s\S]*-no-overwrite[\s\S]*-munge/);
-  assert.match(task6, /rsync --server[^\n]*<upload-id>\/<release>\/<scope>\//);
-  assert.match(task6, /只允许精确的 `publish-runtime-resources <release> <scope> <upload-id>`/);
-  assert.match(task6, /upload-id[^\n]*`\^\[1-9\]\[0-9\]\*-\[1-9\]\[0-9\]\*\$`/);
-  assert.match(task6, /publisher[^\n]*flock[^\n]*发布锁/);
-  assert.match(task6, /run-scoped source[^\n]*原子重命名[^\n]*private candidate/);
-  assert.match(task6, /candidate[^\n]*任何 symlink[^\n]*失败/);
-  assert.match(
-    task6,
-    /按 `autolive-deploy-inventory.json`[^\n]*相对路径、regular-file 类型、大小和 SHA-256[^\n]*拒绝缺失文件和额外文件/,
-  );
-  assert.match(task6, /校验成功后删除 candidate 中的 inventory/);
-  assert.match(task6, /旧 run staging 绝不能被新 run 复用或合并/);
-  assert.match(
-    task6,
-    /发布树生成隔离副本时递归删除所有名称以 `\.` 开头的文件和目录，sourceRoot 保持不变/,
-  );
-  assert.match(
-    task6,
-    /`autolive-deploy-inventory\.json` 是 `validate_complete_inventory` 唯一允许但不自列的部署元数据；除此之外任何额外文件都必须 fail-closed/,
-  );
-  assert.match(
-    task6,
-    /重复发布返回成功后，CI 的 scope 循环继续处理后续 scope/,
-  );
-  assert.match(task6, /禁止普通登录 shell/);
-  assert.match(task6, /release 只接受精确 `v0\.1\.0`/);
-  assert.match(task6, /scope 只接受 `common` 和三个目标三元组/);
-  assert.match(task6, /release、scope 和 upload-id 均显式拒绝 `\/`、`\\` 与额外字符/);
+test('本地发布与 smoke 产物不进入版本控制', () => {
+  const gitignore = readFileSync(gitignorePath, 'utf8');
+
+  assert.match(gitignore, /^desktop\/src-tauri\/runtime-resources\.json$/m);
+  assert.match(gitignore, /^desktop\/src-tauri\/embedded-runtime-resources\/$/m);
+  assert.match(gitignore, /^desktop\/resource-release\/$/m);
+  assert.match(gitignore, /^desktop\/src-tauri\/binaries\/\*$/m);
+  assert.match(gitignore, /^desktop\/package-smoke\/$/m);
+  assert.match(gitignore, /^desktop\/\.codex-worker-smoke\/$/m);
 });

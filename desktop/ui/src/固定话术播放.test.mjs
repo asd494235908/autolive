@@ -1,262 +1,106 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import path from 'node:path';
 import { test } from 'node:test';
 
-const currentDir = path.dirname(new URL(import.meta.url).pathname);
+const appUrl = new URL('./App.tsx', import.meta.url);
 
-test('固定话术面板标题描述实际播放用途', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
+test('固定话术从主窗口通过 BroadcastChannel 发送给最终效果窗口', async () => {
+  const source = await readFile(appUrl, 'utf8');
+  const play = source.slice(
+    source.indexOf('function playCurrentFixedSpeechText'),
+    source.indexOf('function cancelCurrentFixedSpeech'),
+  );
 
-  assert.match(appSource, /<Card title="固定话术播放">/);
-  assert.doesNotMatch(appSource, /<Card title="声音克隆替换">/);
-  assert.match(appSource, /正在准备当前 MP4 的参考人声（自动去除背景音乐）与话术索引/);
+  assert.match(source, /<Card title="固定话术播放">/);
+  assert.match(play, /type: 'fixed-speech-command'/);
+  assert.match(play, /action: 'speak'/);
+  assert.match(play, /operation_id: operationId/);
+  assert.match(play, /text: trimmedFixedSpeechText/);
+  assert.match(play, /FIXED_SPEECH_ACK_TIMEOUT_MS/);
 });
 
-test('固定话术面板保留添加文案入口并区分更新状态', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
+test('最终效果窗口只选本地系统语音并覆盖完成、失败和启动超时', async () => {
+  const source = await readFile(appUrl, 'utf8');
+  const start = source.slice(
+    source.indexOf('async function startFixedSpeech'),
+    source.indexOf('function handleRealtimeAudioPlaying'),
+  );
 
-  assert.match(appSource, /selectedVoiceClonePreset \? '更新文案' : '添加文案'/);
+  assert.match(source, /selectLocalSpeechVoice\(synthesis\.getVoices\(\)\)/);
+  assert.match(start, /new SpeechSynthesisUtterance/);
+  assert.match(start, /utterance\.onstart/);
+  assert.match(start, /utterance\.onend/);
+  assert.match(start, /utterance\.onerror/);
+  assert.match(start, /utterance\.volume = 1/);
+  assert.doesNotMatch(start, /utterance\.volume = userMutedRef/);
+  assert.match(start, /语音启动超时/);
+  assert.match(start, /speechSynthesis\.speak\(utterance\)/);
 });
 
-test('固定话术音频播放失败时不上吞错误，并通过失败 IPC 恢复原音轨', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
-  const errorHandler = appSource.slice(
-    appSource.indexOf('function handleVoiceCloneAudioError'),
-    appSource.indexOf('function handleVoiceCloneAudioElementError'),
+test('固定话术从 starting 起暂停插话，朗读结束后保留并恢复当前插话', async () => {
+  const source = await readFile(appUrl, 'utf8');
+  const start = source.slice(
+    source.indexOf('fixedSpeechOperationRef.current = {'),
+    source.indexOf('const voice = await waitForLocalSpeechVoice'),
   );
+  assert.match(start, /fixedSpeechActiveRef\.current = true/);
+  assert.match(start, /pauseInterludePlayback\(\)/);
 
-  assert.match(appSource, /onError=\{handleVoiceCloneAudioElementError\}/);
-  assert.match(appSource, /fail_voice_clone_playback/);
-  assert.match(appSource, /operation_id: currentPlayback\.operation_id/);
-  assert.match(appSource, /reason:/);
-  assert.match(appSource, /setVoiceCloneAudioUrl\(null\)/);
-  assert.match(appSource, /恢复原音轨/);
-  assert.doesNotMatch(errorHandler, /clear_voice_clone_replacement/);
-  assert.match(errorHandler, /原音轨恢复失败/);
-  assert.match(errorHandler, /回到主窗口[\s\S]*清空当前替换/);
-  assert.doesNotMatch(
-    appSource,
-    /function playCurrentVoiceCloneText[\s\S]*?voiceCloneAudio\.play\(\)\.catch\(\(\) => undefined\)/,
+  const scheduleStart = source.indexOf('const currentClockMs = performance.now();');
+  const scheduleEnd = source.indexOf('  }, [sourceUrl]);', scheduleStart);
+  const schedule = source.slice(source.lastIndexOf('useEffect(() => {', scheduleStart), scheduleEnd);
+  const pauseBranch = schedule.slice(schedule.indexOf('if (shouldPauseInterlude({'));
+  assert.match(pauseBranch, /pauseInterludePlayback\(\)/);
+  assert.doesNotMatch(pauseBranch, /clearInterludePlayback\(/);
+
+  const finalize = source.slice(
+    source.indexOf('function finalizeFixedSpeech'),
+    source.indexOf('async function waitForLocalSpeechVoice'),
   );
+  assert.match(finalize, /resumeInterludePlayback\(\)/);
+  const resume = source.slice(
+    source.indexOf('function resumeInterludePlayback'),
+    source.indexOf('function publishFixedSpeechStatus'),
+  );
+  assert.match(resume, /snapshotRef\.current\?\.playback_state !== 'playing'/);
 });
 
-test('点击播放当前文案时在用户手势同步通知播放器恢复 AudioContext', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
-  const playHandler = appSource.slice(
-    appSource.indexOf('async function playCurrentVoiceCloneText'),
-    appSource.indexOf('async function cancelVoiceCloneOperation'),
+test('朗读期间静音最终效果原声，终态与卸载均恢复', async () => {
+  const source = await readFile(appUrl, 'utf8');
+  const finalize = source.slice(
+    source.indexOf('function finalizeFixedSpeech'),
+    source.indexOf('async function waitForLocalSpeechVoice'),
   );
 
-  assert.match(playHandler, /type: 'playback-control'/);
-  assert.match(playHandler, /action: 'resume'/);
-  assert.match(appSource, /if \(event\.data\.action === 'resume'\) resumeAudioDiagnostics\(\);/);
+  assert.match(source, /fixedSpeechActiveRef\.current \|\|/);
+  assert.match(source, /muted=\{userMuted \|\| fixedSpeechActive\}/);
+  assert.match(finalize, /speechSynthesis\?\.cancel\(\)/);
+  assert.match(finalize, /fixedSpeechActiveRef\.current = false/);
+  assert.match(finalize, /syncUserAudioSettings\(\)/);
+  assert.match(source, /cancelFixedSpeech\(operationId\)/);
+  assert.match(source, /addEventListener\('pagehide', handlePageHide\)/);
+  assert.match(source, /removeEventListener\('pagehide', handlePageHide\)/);
 });
 
-test('固定话术使用独立媒体输出并在真正播放后才静音原音轨', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
-  const audioGraphSetup = appSource.slice(
-    appSource.indexOf('context = new AudioContext()'),
-    appSource.indexOf('return scheduleAudioContextCleanup;'),
-  );
-  const voiceClonePlaybackEffectStart = appSource.indexOf(
-    'voiceCloneAudioUrlRef.current = voiceCloneAudioUrl',
-  );
-  const voiceClonePlaybackEffect = appSource.slice(
-    voiceClonePlaybackEffectStart,
-    appSource.indexOf('const interludeAudio = interludeAudioRef.current', voiceClonePlaybackEffectStart),
-  );
+test('固定话术 UI 保留预设增删改与 1–500 字输入，不含旧克隆流程', async () => {
+  const source = await readFile(appUrl, 'utf8');
 
-  assert.doesNotMatch(audioGraphSetup, /createMediaElementSource\(voiceCloneAudioRef\.current\)/);
-  assert.match(appSource, /onPlaying=\{handleVoiceCloneAudioPlaying\}/);
-  assert.match(appSource, /currentVoiceCloneAudioPlaying/);
-  assert.match(voiceClonePlaybackEffect, /if \(isCurrentVoiceClonePlaybackActive\(snapshotRef\.current\)\) \{[\s\S]*playVoiceCloneAudio\(voiceCloneAudio\)/);
-  assert.doesNotMatch(voiceClonePlaybackEffect, /if \(!audioDiagnosticsReady\)/);
+  assert.match(source, /selectedFixedSpeechPreset \? '更新文案' : '添加文案'/);
+  assert.match(source, /deleteSelectedFixedSpeechPreset/);
+  assert.match(source, /aria-label="固定话术文本"/);
+  assert.match(source, /文本字数：\{fixedSpeechTextCount\} \/ 500/);
+  assert.doesNotMatch(source, /voice[_A-Z]?clone/i);
+  assert.doesNotMatch(source, /XTTS|Demucs|Whisper|预生成|参考人声/);
 });
 
-test('导入后仅在最终效果窗口打开成功后延迟四秒自动准备人声且不等待 MP4 SHA-256', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
-  const openWindowFunction = appSource.slice(
-    appSource.indexOf('async function openFinalEffectWindowFromHome'),
-    appSource.indexOf('function postPlaybackMediaControl'),
-  );
-  const importFunction = appSource.slice(
-    appSource.indexOf('async function importVideo'),
-    appSource.indexOf('function updateInterludeDraft'),
-  );
-  const prepareFunction = appSource.slice(
-    appSource.indexOf('async function prepareVoiceCloneAfterImport'),
-    appSource.indexOf('async function importVideo'),
+test('导入视频只探测，不打开窗口不播放也不准备语音资源', async () => {
+  const source = await readFile(appUrl, 'utf8');
+  const importVideo = source.slice(
+    source.indexOf('async function importVideo'),
+    source.indexOf('function updateInterludeDraft'),
   );
 
-  assert.match(appSource, /const VOICE_CLONE_AUTO_PREPARE_DELAY_MS = 4_000;/);
-  assert.match(appSource, /import \{ scheduleAfterInitialPaint, waitForAbortableDelay \} from '\.\/启动调度';/);
-  assert.match(prepareFunction, /await waitForAbortableDelay\(VOICE_CLONE_AUTO_PREPARE_DELAY_MS, controller\.signal\)/);
-  assert.match(
-    prepareFunction,
-    /await waitForAbortableDelay\(VOICE_CLONE_AUTO_PREPARE_DELAY_MS, controller\.signal\)[\s\S]*if \(importVideoInFlightRef\.current\) return;[\s\S]*prepareVoiceCloneSource\(\{ automatic: true \}\)/,
-  );
-  assert.doesNotMatch(prepareFunction, /mp4_sha256|mp4_hash_status|SHA-256/);
-  assert.doesNotMatch(prepareFunction, /setVoiceCloneAutoPreparePhase\('hash'\)/);
-  assert.doesNotMatch(prepareFunction, /get_voice_clone_worker_capabilities/);
-  assert.doesNotMatch(appSource, /function waitForVoiceCloneAutoPrepareDelay/);
-  assert.match(openWindowFunction, /Promise<boolean>/);
-  assert.match(openWindowFunction, /return true;/);
-  assert.match(openWindowFunction, /return false;/);
-  assert.match(importFunction, /const finalEffectWindowOpened = await openFinalEffectWindowFromHome\(\);/);
-  assert.match(
-    importFunction,
-    /if \(finalEffectWindowOpened\) \{[\s\S]*void prepareVoiceCloneAfterImport\(startedSnapshot\.playback_generation\);[\s\S]*\}/,
-  );
-  assert.doesNotMatch(importFunction, /await openFinalEffectWindowFromHome\(\);\s*void prepareVoiceCloneAfterImport/);
-  assert.match(appSource, /voiceCloneAutoPreparePhase !== null/);
-  assert.match(
-    appSource,
-    /async function cancelVoiceCloneOperation[\s\S]*voiceCloneAutoPrepareControllerRef\.current\?\.abort\(\)/,
-  );
-  assert.match(appSource, /最终效果窗口已打开，4 秒后开始自动准备人声/);
-  assert.doesNotMatch(appSource, /正在等待 MP4 哈希完成/);
-});
-
-test('自动与手动准备人声都先确保 voice 资源', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
-  const prepareFunction = appSource.slice(
-    appSource.indexOf('async function prepareVoiceCloneSource'),
-    appSource.indexOf('async function playCurrentVoiceCloneText'),
-  );
-  const autoPrepareFunction = appSource.slice(
-    appSource.indexOf('async function prepareVoiceCloneAfterImport'),
-    appSource.indexOf('async function importVideo'),
-  );
-
-  assert.match(prepareFunction, /ensureRuntimeResources\('voice'/);
-  assert.match(autoPrepareFunction, /prepareVoiceCloneSource\(\{ automatic: true \}\)/);
-  assert.match(appSource, /runtimeResourceComponentDescription\(runtimeResourceStatus\.component\)/);
-  assert.match(prepareFunction, /try \{[\s\S]*ensureRuntimeResources\('voice'[\s\S]*catch \(cause\)/);
-  assert.match(appSource, /isVoiceRuntimeResourceReady\(/);
-});
-
-test('voice 资源未就绪时优先提示首次使用自动下载', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
-  const notice = appSource.slice(
-    appSource.indexOf('const voiceCloneNotice ='),
-    appSource.indexOf('const voiceCloneStatusLabel', appSource.indexOf('const voiceCloneNotice =')),
-  );
-
-  assert.match(notice, /!voiceRuntimeReady[\s\S]*首次使用会自动下载/);
-  assert.ok(notice.indexOf('!voiceRuntimeReady') < notice.indexOf('!voiceCloneWorkerCapabilities?.available'));
-});
-
-test('固定话术预生成只批量准备文案，不影响实际播放或原音轨', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
-  const preGenerationEffect = appSource.slice(
-    appSource.indexOf("start_voice_clone_pre_generation"),
-    appSource.indexOf("start_voice_clone_pre_generation") + 1_500,
-  );
-
-  assert.match(appSource, /start_voice_clone_pre_generation/);
-  assert.match(
-    appSource,
-    /voiceClonePresets\.map\(\(\{ id, text \}\) => \(\{ preset_id: id, text \}\)\)/,
-  );
-  assert.doesNotMatch(preGenerationEffect, /start_voice_clone_playback/);
-  assert.doesNotMatch(preGenerationEffect, /action:\s*'resume'/);
-  assert.doesNotMatch(preGenerationEffect, /setVoiceCloneAudioUrl/);
-  assert.match(appSource, /canStartVoiceClonePreGenerationForRuntime\(\s*voiceRuntimeReady,\s*runtimeResourceBusy,\s*runtimeResourceClearInFlightRef\.current,?\s*\)/);
-});
-
-test('固定话术预生成在 StrictMode 重挂载后仍接收批次快照', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
-
-  assert.match(
-    appSource,
-    /useEffect\(\(\) => \{\s*voiceClonePreGenerationMountedRef\.current = true;[\s\S]*?return \(\) => \{\s*voiceClonePreGenerationMountedRef\.current = false;/,
-  );
-});
-
-test('旧预生成请求结束后重新评估最新来源且拒绝旧快照', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
-  const effectStart = appSource.indexOf("invoke<PlaybackSnapshot>('start_voice_clone_pre_generation'");
-  const effectEnd = appSource.indexOf('function applyVoiceClonePresetSelection', effectStart);
-  const preGenerationEffect = appSource.slice(effectStart, effectEnd);
-
-  assert.match(preGenerationEffect, /shouldAcceptVoiceClonePreGenerationResult\(\{/);
-  assert.match(
-    preGenerationEffect,
-    /currentGeneration:\s*voiceClonePreGenerationCurrentGenerationRef\.current/,
-  );
-  assert.match(
-    appSource,
-    /useLayoutEffect\(\(\) => \{\s*voiceClonePreGenerationCurrentGenerationRef\.current = snapshot\?\.playback_generation \?\? null;\s*\}, \[snapshot\?\.playback_generation\]\);/,
-  );
-  assert.match(
-    preGenerationEffect,
-    /\.finally\(\(\) => \{[\s\S]*?voiceClonePreGenerationInFlightRef\.current = false;[\s\S]*?setVoiceClonePreGenerationCompletionVersion\(\(value\) => value \+ 1\)/,
-  );
-  assert.match(preGenerationEffect, /voiceClonePreGenerationCompletionVersion,[\s\S]*?\]\);/);
-});
-
-test('固定话术预生成在提交 IPC 前同步占用 trigger key', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
-  const effectStart = appSource.indexOf('const key = getVoiceClonePreGenerationTriggerKey');
-  const effectEnd = appSource.indexOf('function applyVoiceClonePresetSelection', effectStart);
-  const preGenerationEffect = appSource.slice(effectStart, effectEnd);
-  const startedKeyWrite = 'voiceClonePreGenerationStartedKeyRef.current = key;';
-  const startedKeyIndex = preGenerationEffect.indexOf(startedKeyWrite);
-  const invokeIndex = preGenerationEffect.indexOf("invoke<PlaybackSnapshot>('start_voice_clone_pre_generation'");
-  const thenBody = preGenerationEffect.slice(
-    preGenerationEffect.indexOf('.then((nextSnapshot)'),
-    preGenerationEffect.indexOf('.catch((cause)'),
-  );
-
-  assert.notEqual(startedKeyIndex, -1);
-  assert.ok(startedKeyIndex < invokeIndex);
-  assert.doesNotMatch(thenBody, /voiceClonePreGenerationStartedKeyRef\.current = key/);
-});
-
-test('预生成 IPC 失败仅对当前 trigger key 自动重试一次', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
-  const effectStart = appSource.indexOf('const key = getVoiceClonePreGenerationTriggerKey');
-  const effectEnd = appSource.indexOf('function applyVoiceClonePresetSelection', effectStart);
-  const preGenerationEffect = appSource.slice(effectStart, effectEnd);
-  const thenBody = preGenerationEffect.slice(
-    preGenerationEffect.indexOf('.then((nextSnapshot)'),
-    preGenerationEffect.indexOf('.catch((cause)'),
-  );
-
-  assert.match(appSource, /const voiceClonePreGenerationRetriedKeyRef = useRef<string \| null>\(null\)/);
-  assert.match(appSource, /const voiceClonePreGenerationCurrentKeyRef = useRef<string \| null>\(null\)/);
-  assert.match(
-    preGenerationEffect,
-    /shouldRetryVoiceClonePreGeneration\(\{[\s\S]*?failedKey:\s*key,[\s\S]*?currentKey:\s*voiceClonePreGenerationCurrentKeyRef\.current,[\s\S]*?lastRetriedKey:\s*voiceClonePreGenerationRetriedKeyRef\.current/,
-  );
-  assert.match(
-    preGenerationEffect,
-    /voiceClonePreGenerationRetriedKeyRef\.current = key;[\s\S]*?voiceClonePreGenerationStartedKeyRef\.current = null;[\s\S]*?retryAfterFailure = true/,
-  );
-  assert.match(
-    preGenerationEffect,
-    /setVoiceCloneFormError\([\s\S]*?if \(!shouldRetryVoiceClonePreGeneration\(/,
-  );
-  assert.match(thenBody, /setVoiceCloneFormError\(null\)/);
-  assert.match(
-    preGenerationEffect,
-    /\(cancelled \|\| retryAfterFailure\) && voiceClonePreGenerationMountedRef\.current/,
-  );
-  assert.doesNotMatch(thenBody, /voiceClonePreGenerationStartedKeyRef\.current = null/);
-});
-
-test('批量预生成占用 Worker 时允许取消并禁用准备和播放', async () => {
-  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
-  const disabledReasons = appSource.slice(
-    appSource.indexOf('const voiceClonePreGenerationBusyReason'),
-    appSource.indexOf('const voiceCloneSaveDisabledReason'),
-  );
-  const canCancel = appSource.slice(
-    appSource.indexOf('const voiceCloneCanCancel'),
-    appSource.indexOf('const voiceCloneCanClear'),
-  );
-
-  assert.match(disabledReasons, /getVoiceClonePreGenerationBusyReason\(preGeneration\.status\)/);
-  assert.match(canCancel, /preGeneration\.status === 'generating'/);
+  assert.match(importVideo, /probe_local_video[\s\S]*get_snapshot/);
+  assert.doesNotMatch(importVideo, /openFinalEffectWindowFromHome|start_playback/);
+  assert.doesNotMatch(importVideo, /voice|model|worker/i);
 });

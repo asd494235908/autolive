@@ -50,15 +50,6 @@ export function clampMediaTime(value: number, duration: number): number {
   return Math.min(safeValue, duration);
 }
 
-export function resolvePlaybackPositionMs(
-  mediaCurrentTime: number | null | undefined,
-  snapshotPositionMs: number | null | undefined,
-): number | null {
-  if (isFiniteNonNegative(mediaCurrentTime)) return Math.round(mediaCurrentTime * 1000);
-  if (isFiniteNonNegative(snapshotPositionMs)) return Math.round(snapshotPositionMs);
-  return null;
-}
-
 export function clampVolume(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.min(1, Math.max(0, value));
@@ -69,4 +60,16 @@ export function formatMediaTime(seconds: number): string {
   const minutes = Math.floor(safeSeconds / 60);
   const remainder = safeSeconds % 60;
   return `${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`;
+}
+
+export function resolvePlaybackPositionMs(
+  currentTimeSeconds: number | null | undefined,
+  fallbackPositionMs: number | null | undefined,
+): number | null {
+  if (typeof currentTimeSeconds === 'number' && Number.isFinite(currentTimeSeconds) && currentTimeSeconds >= 0) {
+    return Math.round(currentTimeSeconds * 1000);
+  }
+  return typeof fallbackPositionMs === 'number' && Number.isFinite(fallbackPositionMs) && fallbackPositionMs >= 0
+    ? fallbackPositionMs
+    : null;
 }

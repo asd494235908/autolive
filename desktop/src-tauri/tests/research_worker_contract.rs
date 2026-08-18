@@ -1,6 +1,8 @@
+#[cfg(unix)]
+use autolive_desktop_core::research_worker::run_research;
 use autolive_desktop_core::research_worker::{
-    build_research_args, run_research, validate_research_report, ResearchAnalysisRequest,
-    ResearchError, ResearchReport,
+    build_research_args, validate_research_report, ResearchAnalysisRequest, ResearchError,
+    ResearchReport,
 };
 #[cfg(unix)]
 use sha2::Digest;

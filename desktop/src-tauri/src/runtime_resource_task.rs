@@ -129,6 +129,15 @@ impl RuntimeResourceTask {
         if let Some(status) = self.running_status()? {
             return Ok(status);
         }
+        let previous = self.lock_status()?.clone();
+        if previous.component == Some(component)
+            && matches!(
+                previous.state,
+                RuntimeResourceState::Failed | RuntimeResourceState::Cancelled
+            )
+        {
+            return Ok(previous);
+        }
         let inspected = installer
             .inspect(component)
             .map_err(|error| error.to_string())?;
@@ -328,7 +337,8 @@ fn is_terminal(state: RuntimeResourceState) -> bool {
 mod tests {
     use super::{handle_runtime_resource_exit, RuntimeResourceTask, RuntimeResourceTaskShutdown};
     use crate::runtime_resources::{
-        RuntimeResourceComponent, RuntimeResourceState, RuntimeResourceStatus,
+        RuntimeResourceComponent, RuntimeResourceInstaller, RuntimeResourceManifest,
+        RuntimeResourceState, RuntimeResourceStatus, PRODUCTION_BASE_URL,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -441,6 +451,47 @@ mod tests {
     }
 
     #[test]
+    fn inspect_keeps_a_terminal_failure_and_its_progress_until_retry() {
+        let task = RuntimeResourceTask::default();
+        *task.status.lock().expect("status lock should work") = RuntimeResourceStatus {
+            state: RuntimeResourceState::Failed,
+            component: Some(RuntimeResourceComponent::Media),
+            current_file: Some("x86_64-pc-windows-msvc/binaries/ffmpeg.exe".to_owned()),
+            downloaded_bytes: 7,
+            total_bytes: 10,
+            bytes_per_second: 0,
+            installed_bytes: 3,
+            resource_root: "/app-data/runtime-resources/v0.1.0".to_owned(),
+            error: Some("download failed".to_owned()),
+        };
+        let root = std::env::temp_dir().join(format!(
+            "autolive-runtime-task-inspect-{}",
+            std::process::id()
+        ));
+        let installer = RuntimeResourceInstaller::from_manifest(
+            RuntimeResourceManifest {
+                schema_version: 1,
+                release: "v0.1.0".to_owned(),
+                target: "x86_64-pc-windows-msvc".to_owned(),
+                base_url: PRODUCTION_BASE_URL.to_owned(),
+                files: Vec::new(),
+            },
+            &root,
+        )
+        .expect("installer fixture");
+
+        let status = task
+            .inspect_when_idle(RuntimeResourceComponent::Media, &installer)
+            .expect("terminal status should remain visible");
+        assert_eq!(status.state, RuntimeResourceState::Failed);
+        assert_eq!(status.downloaded_bytes, 7);
+        assert_eq!(status.error.as_deref(), Some("download failed"));
+
+        drop(installer);
+        std::fs::remove_dir_all(root).expect("test directory cleanup");
+    }
+
+    #[test]
     fn record_failure_does_not_overwrite_a_running_operation() {
         let task = RuntimeResourceTask::default();
         let (started_tx, started_rx) = mpsc::channel();
@@ -456,7 +507,7 @@ mod tests {
 
         let status = task
             .record_failure(
-                RuntimeResourceComponent::Voice,
+                RuntimeResourceComponent::Media,
                 "late manifest failure",
                 std::path::Path::new("/different-root"),
             )

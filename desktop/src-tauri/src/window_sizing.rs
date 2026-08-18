@@ -38,6 +38,7 @@ pub fn calculate_window_size(
         return Err(WindowSizingError::InvalidWorkArea);
     }
 
+    // titlebar 只占工作区，不计入 inner_size（Tauri set_size = 客户区）
     let available_video_height = (work_area_height - native_titlebar_height).max(1.0);
     let scale = (work_area_width / f64::from(video_width))
         .min(available_video_height / f64::from(video_height))
@@ -47,9 +48,9 @@ pub fn calculate_window_size(
     }
 
     let mut width = round_to_dimension(f64::from(video_width) * scale);
-    let mut height = round_to_dimension(f64::from(video_height) * scale + native_titlebar_height);
+    let mut height = round_to_dimension(f64::from(video_height) * scale);
     let max_width = round_to_dimension(work_area_width);
-    let max_height = round_to_dimension(work_area_height);
+    let max_height = round_to_dimension(available_video_height);
 
     width = width.max(MIN_WINDOW_WIDTH as u32).min(max_width);
     height = height.max(MIN_WINDOW_HEIGHT as u32).min(max_height);
@@ -82,7 +83,7 @@ mod tests {
             calculate_window_size(3840, 2160, 1440.0, 900.0, 32.0),
             Ok(WindowSize {
                 width: 1440,
-                height: 842,
+                height: 810,
             })
         );
     }
@@ -93,7 +94,7 @@ mod tests {
             calculate_window_size(720, 1280, 1440.0, 1021.0, 32.0),
             Ok(WindowSize {
                 width: 556,
-                height: 1021,
+                height: 989,
             })
         );
     }
@@ -104,7 +105,7 @@ mod tests {
             calculate_window_size(720, 1280, 1440.0, 900.0, 32.0),
             Ok(WindowSize {
                 width: 488,
-                height: 900,
+                height: 868,
             })
         );
     }
@@ -115,7 +116,7 @@ mod tests {
             calculate_window_size(320, 180, 1440.0, 900.0, 32.0),
             Ok(WindowSize {
                 width: 320,
-                height: 212,
+                height: 180,
             })
         );
     }
@@ -126,7 +127,7 @@ mod tests {
             calculate_window_size(1280, 720, 500.0, 300.0, 32.0),
             Ok(WindowSize {
                 width: 476,
-                height: 300,
+                height: 268,
             })
         );
     }

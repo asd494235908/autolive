@@ -1,14 +1,19 @@
 use autolive_desktop_core::cancellation::CancellationToken;
+#[cfg(unix)]
+use autolive_desktop_core::media_engine::probe_media_engine_with_paths;
 use autolive_desktop_core::media_engine::{
-    build_media_render_args, configured_media_engine_paths_with_resource_dir,
-    probe_media_engine_with_paths, render_media, MediaEngineError, MediaRenderRequest,
+    build_media_render_args, configured_media_engine_paths_with_resource_dir, render_media,
+    MediaEngineError, MediaRenderRequest,
 };
-use autolive_desktop_core::research_params::{AudioResearchParams, VideoResearchParams};
+use autolive_desktop_core::research_params::{
+    AudioResearchParams, NaturalVoiceMode, VideoResearchParams,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+type AudioParameterCase = (&'static str, fn(&mut AudioResearchParams));
 
 struct TestDir(PathBuf);
 
@@ -111,27 +116,229 @@ fn render_plan_reencodes_video_when_video_processing_is_enabled() {
         .map(|value| value.to_string_lossy().into_owned())
         .collect();
 
-    assert!(values.windows(2).any(|pair| pair == ["-c:v", "libx264"]));
+    // 假 ffmpeg 路径探测失败 → 回退 libopenh264；真机可能选硬编，但规划绝不能 video copy。
+    assert!(values.windows(2).any(|pair| {
+        pair[0] == "-c:v"
+            && matches!(
+                pair[1].as_str(),
+                "libopenh264" | "h264_nvenc" | "h264_amf" | "h264_qsv" | "h264_mf"
+            )
+    }));
     assert!(!values.windows(2).any(|pair| pair == ["-c:v", "copy"]));
     assert!(values.iter().any(|value| value == "-vf"));
     assert!(values.iter().any(|value| value == "-af"));
     assert!(!values.iter().any(|value| value.contains(";")));
+    let vf = values
+        .windows(2)
+        .find(|pair| pair[0] == "-vf")
+        .map(|pair| pair[1].clone())
+        .expect("video filter");
+    assert!(vf.contains("lutyuv="));
+    assert!(!vf.contains("eq="));
 }
 
 #[test]
-fn render_rejects_pitch_shift_without_source_sample_rate() {
+fn render_plan_keeps_audio_copy_when_only_video_processing_is_enabled() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.audio_processing_enabled = false;
+
+    let args = build_media_render_args(&input).expect("video-only render args should be valid");
+    let values: Vec<String> = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect();
+
+    assert!(values.windows(2).any(|pair| {
+        pair[0] == "-c:v"
+            && matches!(
+                pair[1].as_str(),
+                "libopenh264" | "h264_nvenc" | "h264_amf" | "h264_qsv" | "h264_mf"
+            )
+    }));
+    assert!(values.windows(2).any(|pair| pair == ["-c:a", "copy"]));
+    assert!(values.iter().any(|value| value == "-vf"));
+    assert!(!values.iter().any(|value| value == "-af"));
+}
+
+#[test]
+fn select_h264_encoder_falls_back_when_ffmpeg_is_unusable() {
+    use autolive_desktop_core::media_engine::select_h264_encoder;
+    let directory = TestDir::new();
+    let fake = fixture_file(&directory, "not-a-real-ffmpeg");
+    assert_eq!(select_h264_encoder(&fake), "libopenh264");
+}
+
+#[test]
+fn render_plan_keeps_video_copy_when_only_audio_processing_is_enabled() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.video_processing_enabled = false;
+
+    let args = build_media_render_args(&input).expect("audio-only render args should be valid");
+    let values: Vec<String> = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect();
+
+    assert!(values.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+    assert!(values.windows(2).any(|pair| pair == ["-c:a", "aac"]));
+    assert!(!values.iter().any(|value| value == "-vf"));
+    assert!(values.iter().any(|value| value == "-af"));
+}
+
+#[test]
+fn render_maps_independent_audio_eq_speed_and_reverb_filters() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.video_processing_enabled = false;
+    input.audio.playback_speed = 1.25;
+    input.audio.low_eq_db = 3.0;
+    input.audio.mid_eq_db = -2.0;
+    input.audio.high_eq_db = 1.5;
+    input.audio.fade_in_ms = 250;
+    input.audio.fade_out_ms = 500;
+    input.audio.reverb_wet_percent = 10.0;
+
+    let args = build_media_render_args(&input).expect("audio filters should be mapped");
+    let values: Vec<String> = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect();
+    let filter = values
+        .windows(2)
+        .find(|pair| pair[0] == "-af")
+        .map(|pair| pair[1].clone())
+        .expect("audio filter should be present");
+
+    assert!(filter.contains("equalizer=f=200"));
+    assert!(filter.contains("equalizer=f=1000"));
+    assert!(filter.contains("equalizer=f=8000"));
+    assert!(filter.contains("atempo=1.250000"));
+    assert!(filter.contains("afade=t=in:st=0:d=0.250000"));
+    assert!(filter.contains("afade=t=out:d=0.500000"));
+    assert!(filter.contains("aecho=1.0:1.0:"));
+}
+
+#[test]
+fn render_plan_accepts_an_allowlisted_non_mp4_source() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    input.input_mp4_path = directory.path().join("source.mkv");
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+
+    let args = build_media_render_args(&input).expect("allowlisted source should be accepted");
+
+    assert!(args.iter().any(|value| value == &input.input_mp4_path));
+}
+
+#[test]
+fn render_accepts_pitch_shift_with_fallback_sample_rate() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
     input.audio.pitch_shift_semitones = 0.5;
     input.source_audio_sample_rate_hz = None;
 
-    let result = build_media_render_args(&input);
+    let args = build_media_render_args(&input).expect("pitch should fall back to 48000");
+    let values: Vec<String> = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect();
+    let filter = values
+        .windows(2)
+        .find(|pair| pair[0] == "-af")
+        .map(|pair| pair[1].clone())
+        .expect("audio filter");
+    assert!(filter.contains("asetrate="));
+    assert!(filter.contains("aresample=48000"));
+}
 
-    assert!(matches!(
-        result,
-        Err(MediaEngineError::InvalidParameters { .. })
-    ));
+#[test]
+fn render_rejects_unmapped_audio_parameters() {
+    let directory = TestDir::new();
+    let cases: [AudioParameterCase; 6] = [
+        ("audio.natural_voice_mode", |audio| {
+            audio.natural_voice_mode = NaturalVoiceMode::NaturalDynamic
+        }),
+        ("audio.ambient_sound_mix_percent", |audio| {
+            audio.ambient_sound_mix_percent = 1.0
+        }),
+        ("audio.dry_wet_percent", |audio| audio.dry_wet_percent = 1.0),
+        ("audio.mfcc_shift_percent", |audio| {
+            audio.mfcc_shift_percent = 1.0
+        }),
+        ("audio.formant_shift_percent", |audio| {
+            audio.formant_shift_percent = 1.0
+        }),
+        ("audio.spectral_perturbation_percent", |audio| {
+            audio.spectral_perturbation_percent = 1.0
+        }),
+    ];
+
+    for (field, configure) in cases {
+        let mut input = request(&directory);
+        fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+        configure(&mut input.audio);
+
+        let error = build_media_render_args(&input).expect_err("unmapped parameter should fail");
+        assert!(
+            matches!(&error, MediaEngineError::InvalidParameters { message } if message.contains(field)),
+            "{field}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn render_maps_ffmpeg_native_noise_phase_and_vibrato_filters() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.audio.noise_reduction_percent = 20.0;
+    input.audio.phase_perturbation_percent = 5.0;
+    input.audio.vibrato_frequency_hz = 5.5;
+    input.audio.vibrato_depth_percent = 1.0;
+
+    let args = build_media_render_args(&input).expect("native audio filters should be mapped");
+    let values: Vec<String> = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect();
+    let filter = values
+        .windows(2)
+        .find(|pair| pair[0] == "-af")
+        .map(|pair| pair[1].clone())
+        .expect("audio filter should be present");
+
+    assert!(filter.contains("afftdn=nr=19.400000"));
+    assert!(filter.contains("aphaser="));
+    assert!(filter.contains("vibrato=f=5.500000:d=0.010000"));
+}
+
+#[test]
+fn render_maps_environment_noise_with_ffmpeg_native_mix() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.audio.environment_noise_percent = 8.0;
+    input.audio.environment_noise_dbfs = -42.0;
+
+    let args = build_media_render_args(&input).expect("environment noise should be mapped");
+    let values: Vec<String> = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect();
+    let filter = values
+        .windows(2)
+        .find(|pair| pair[0] == "-af")
+        .map(|pair| pair[1].clone())
+        .expect("audio filter should be present");
+
+    assert!(filter.contains("anoisesrc=color=white:amplitude="));
+    assert!(filter.contains("amix=inputs=2:weights=0.920000 0.080000:duration=first"));
 }
 
 #[test]

@@ -1,4 +1,4 @@
-export type BaseAudioSource = 'voice_clone' | 'realtime_variant' | 'processed_original' | 'original';
+export type BaseAudioSource = 'realtime_variant' | 'processed_original' | 'original';
 
 export const INTERLUDE_LIMITS = {
   intervalMinMs: { min: 500, max: 60_000 },
@@ -9,20 +9,17 @@ export const INTERLUDE_LIMITS = {
 } as const;
 
 type ResolveBaseAudioSourceInput = {
-  voiceCloneActive: boolean;
   realtimeVariantActive: boolean;
   processedOriginalActive: boolean;
 };
 
 type ShouldPauseInterludeInput = {
   playbackState: string;
-  voiceCloneStatus: string;
-  currentTextStatus?: string;
+  fixedSpeechActive: boolean;
 };
 
 type ResolvePlaybackAudioSourceInput = {
   effectiveAudioSource?: string | null;
-  voiceCloneStatus?: string | null;
   currentAudioSource?: string | null;
   currentVideoSource?: string | null;
 };
@@ -35,26 +32,22 @@ function clampRandomUnit(randomValue: number) {
 }
 
 export function resolveBaseAudioSource({
-  voiceCloneActive,
   realtimeVariantActive,
   processedOriginalActive,
 }: ResolveBaseAudioSourceInput): BaseAudioSource {
-  if (voiceCloneActive) return 'voice_clone';
   if (realtimeVariantActive) return 'realtime_variant';
   if (processedOriginalActive) return 'processed_original';
   return 'original';
 }
 
 function isBaseAudioSource(value: string): value is BaseAudioSource {
-  return value === 'voice_clone' ||
-    value === 'realtime_variant' ||
+  return value === 'realtime_variant' ||
     value === 'processed_original' ||
     value === 'original';
 }
 
 export function resolvePlaybackAudioSource({
   effectiveAudioSource,
-  voiceCloneStatus,
   currentAudioSource,
   currentVideoSource,
 }: ResolvePlaybackAudioSourceInput): BaseAudioSource {
@@ -62,7 +55,6 @@ export function resolvePlaybackAudioSource({
     return effectiveAudioSource;
   }
   return resolveBaseAudioSource({
-    voiceCloneActive: voiceCloneStatus === 'playing',
     realtimeVariantActive: currentAudioSource === 'realtime_variant',
     processedOriginalActive: currentVideoSource === 'processed',
   });
@@ -104,12 +96,7 @@ export function chooseInterludeIndex(count: number, previousIndex: number | null
 
 export function shouldPauseInterlude({
   playbackState,
-  voiceCloneStatus,
-  currentTextStatus,
+  fixedSpeechActive,
 }: ShouldPauseInterludeInput) {
-  if (playbackState !== 'playing') return true;
-  return voiceCloneStatus === 'generating' ||
-    voiceCloneStatus === 'playing' ||
-    currentTextStatus === 'preparing' ||
-    currentTextStatus === 'playing';
+  return playbackState !== 'playing' || fixedSpeechActive;
 }

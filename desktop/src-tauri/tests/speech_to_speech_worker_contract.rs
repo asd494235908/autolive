@@ -1,23 +1,37 @@
+#[cfg(unix)]
 use autolive_desktop_core::cancellation::CancellationToken;
+#[cfg(unix)]
 use autolive_desktop_core::speech_to_speech::SpeechToSpeechContext;
 #[cfg(not(debug_assertions))]
 use autolive_desktop_core::speech_to_speech_worker::configured_worker_executable;
+#[cfg(any(unix, not(debug_assertions)))]
+use autolive_desktop_core::speech_to_speech_worker::SpeechToSpeechWorkerError;
+#[cfg(unix)]
 use autolive_desktop_core::speech_to_speech_worker::{
     probe_speech_to_speech_worker, probe_speech_to_speech_worker_with_resource_dir,
     run_speech_to_speech_context_worker, run_speech_to_speech_worker,
-    run_speech_to_speech_worker_with_resource_dir, worker_environment_policy,
-    SpeechToSpeechContextWorkerRequest, SpeechToSpeechWorkerError, SpeechToSpeechWorkerRequest,
-    WorkerEnvironmentPolicy,
+    run_speech_to_speech_worker_with_resource_dir, SpeechToSpeechContextWorkerRequest,
+    SpeechToSpeechWorkerRequest,
 };
+use autolive_desktop_core::speech_to_speech_worker::{
+    worker_environment_policy, WorkerEnvironmentPolicy,
+};
+#[cfg(any(unix, not(debug_assertions)))]
 use std::path::PathBuf;
+#[cfg(any(unix, not(debug_assertions)))]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(unix, not(debug_assertions)))]
 use std::sync::Mutex;
 
+#[cfg(any(unix, not(debug_assertions)))]
 static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(unix, not(debug_assertions)))]
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(any(unix, not(debug_assertions)))]
 struct TestDir(PathBuf);
 
+#[cfg(any(unix, not(debug_assertions)))]
 impl TestDir {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
@@ -30,6 +44,7 @@ impl TestDir {
     }
 }
 
+#[cfg(any(unix, not(debug_assertions)))]
 impl Drop for TestDir {
     fn drop(&mut self) {
         let _ignored = std::fs::remove_dir_all(&self.0);

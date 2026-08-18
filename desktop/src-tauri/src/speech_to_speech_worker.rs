@@ -1,3 +1,4 @@
+use crate::background_process::background_command;
 use crate::cancellation::CancellationToken;
 use crate::media_engine::{packaged_media_engine_paths, FFMPEG_PATH_ENV, FFPROBE_PATH_ENV};
 use crate::speech_to_speech::{
@@ -179,7 +180,7 @@ fn probe_speech_to_speech_worker_for_resource_dir(
     }
     let capability_output = capability_output_path();
     cleanup(&capability_output);
-    let mut command = Command::new(executable);
+    let mut command = background_command(executable);
     command
         .arg("--capabilities-json")
         .arg(&capability_output)
@@ -255,7 +256,7 @@ fn run_speech_to_speech_worker_for_resource_dir(
 
     let output_partial = partial_path(&request.output_json_path);
     let _ = fs::remove_file(&output_partial);
-    let mut command = Command::new(&request.executable);
+    let mut command = background_command(&request.executable);
     command
         .arg("--input-json")
         .arg(&request.input_json_path)
@@ -503,13 +504,13 @@ fn terminate_child(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let process_group = format!("-{}", child.id());
-        let _ = Command::new("/bin/kill")
+        let _ = background_command("/bin/kill")
             .args(["-KILL", process_group.as_str()])
             .status();
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let _ = background_command("taskkill")
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .status();
     }

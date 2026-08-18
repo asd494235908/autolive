@@ -1,12 +1,15 @@
+use crate::background_process::background_command;
 use crate::cancellation::CancellationToken;
 use crate::hashing::hash_file_at_path;
+use crate::media_library::SUPPORTED_SOURCE_VIDEO_EXTENSIONS;
 use crate::research_params::{AudioResearchParams, ResearchExperimentParams, VideoResearchParams};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,6 +18,14 @@ const MAX_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
 pub const FFMPEG_PATH_ENV: &str = "AUTOLIVE_FFMPEG_PATH";
 pub const FFPROBE_PATH_ENV: &str = "AUTOLIVE_FFPROBE_PATH";
 const MEDIA_ENGINE_RESOURCE_DIR: &str = "binaries";
+const MEDIA_ENGINE_CAPABILITY_PROBE_TIMEOUT_MS: u64 = 10_000;
+const FALLBACK_H264_ENCODER: &str = "libopenh264";
+// 各机型候选：按常见硬件加速顺序；运行时探测/编码失败自动降级，不绑死某台机器。
+// Windows 才试 MediaFoundation；其它平台跳过 h264_mf。
+const H264_ENCODER_CANDIDATES_COMMON: &[&str] = &["h264_nvenc", "h264_amf", "h264_qsv"];
+const H264_ENCODER_WINDOWS_EXTRA: &[&str] = &["h264_mf"];
+// ponytail: 按 ffmpeg 路径缓存首选；失败后清缓存再探。
+static SELECTED_H264_ENCODER: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaEngineStatus {
@@ -93,7 +104,11 @@ fn media_engine_status_for_paths(
             }
         }
     };
-    match probe_media_engine_with_paths(&ffmpeg_path, &ffprobe_path, 1_000) {
+    match probe_media_engine_with_paths(
+        &ffmpeg_path,
+        &ffprobe_path,
+        MEDIA_ENGINE_CAPABILITY_PROBE_TIMEOUT_MS,
+    ) {
         Ok(status) => status,
         Err(error) => MediaEngineStatus {
             available: false,
@@ -212,6 +227,18 @@ pub fn probe_media_engine_with_paths(
 pub fn build_media_render_args(
     request: &MediaRenderRequest,
 ) -> Result<Vec<std::ffi::OsString>, MediaEngineError> {
+    let preferred = if request.video_processing_enabled {
+        Some(select_h264_encoder(&request.ffmpeg_path))
+    } else {
+        None
+    };
+    build_media_render_args_with_video_encoder(request, preferred.as_deref())
+}
+
+fn build_media_render_args_with_video_encoder(
+    request: &MediaRenderRequest,
+    video_encoder: Option<&str>,
+) -> Result<Vec<std::ffi::OsString>, MediaEngineError> {
     validate_request_shape(request)?;
     let mut args: Vec<std::ffi::OsString> = vec![
         "-hide_banner".into(),
@@ -227,12 +254,8 @@ pub fn build_media_render_args(
 
     if request.video_processing_enabled {
         args.extend(["-vf".into(), video_filter(&request.video).into()]);
-        args.extend([
-            "-c:v".into(),
-            "libx264".into(),
-            "-preset".into(),
-            "veryfast".into(),
-        ]);
+        let encoder = video_encoder.unwrap_or(FALLBACK_H264_ENCODER);
+        args.extend(video_encoder_codec_args(encoder));
     } else {
         args.extend(["-c:v".into(), "copy".into()]);
     }
@@ -293,49 +316,95 @@ pub fn render_media(
     }
 
     let _ignored = fs::remove_file(&request.staging_output_path);
-    let args = build_media_render_args(request)?;
-    let mut child = Command::new(&request.ffmpeg_path)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| MediaEngineError::SpawnFailed {
-            path: request.ffmpeg_path.display().to_string(),
-            message: error.to_string(),
-        })?;
-    let started = Instant::now();
-    loop {
+    let encoder_attempts = if request.video_processing_enabled {
+        h264_encoder_attempt_order(&request.ffmpeg_path)
+    } else {
+        vec![FALLBACK_H264_ENCODER.to_owned()]
+    };
+    let mut last_failure: Option<MediaEngineError> = None;
+    let mut encoded_ok = false;
+    for encoder in encoder_attempts {
         if cancellation.is_cancelled() {
-            terminate_child(&mut child);
             cleanup(&request.staging_output_path);
             return Err(MediaEngineError::Cancelled);
         }
-        if started.elapsed() >= Duration::from_secs(request.timeout_seconds) {
-            terminate_child(&mut child);
-            cleanup(&request.staging_output_path);
-            return Err(MediaEngineError::Timeout {
-                seconds: request.timeout_seconds,
-            });
-        }
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break,
-            Ok(Some(status)) => {
-                cleanup(&request.staging_output_path);
-                return Err(MediaEngineError::Failed {
-                    code: status.code(),
-                });
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
+        let args = if request.video_processing_enabled {
+            build_media_render_args_with_video_encoder(request, Some(&encoder))?
+        } else {
+            build_media_render_args_with_video_encoder(request, None)?
+        };
+        let _ignored = fs::remove_file(&request.staging_output_path);
+        let mut child = match background_command(&request.ffmpeg_path)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
             Err(error) => {
-                terminate_child(&mut child);
-                cleanup(&request.staging_output_path);
-                return Err(MediaEngineError::SpawnFailed {
+                last_failure = Some(MediaEngineError::SpawnFailed {
                     path: request.ffmpeg_path.display().to_string(),
                     message: error.to_string(),
                 });
+                continue;
+            }
+        };
+        let started = Instant::now();
+        let run_result = loop {
+            if cancellation.is_cancelled() {
+                terminate_child(&mut child);
+                cleanup(&request.staging_output_path);
+                return Err(MediaEngineError::Cancelled);
+            }
+            if started.elapsed() >= Duration::from_secs(request.timeout_seconds) {
+                terminate_child(&mut child);
+                cleanup(&request.staging_output_path);
+                return Err(MediaEngineError::Timeout {
+                    seconds: request.timeout_seconds,
+                });
+            }
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => break Ok(()),
+                Ok(Some(status)) => {
+                    cleanup(&request.staging_output_path);
+                    break Err(MediaEngineError::Failed {
+                        code: status.code(),
+                    });
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(25)),
+                Err(error) => {
+                    terminate_child(&mut child);
+                    cleanup(&request.staging_output_path);
+                    break Err(MediaEngineError::SpawnFailed {
+                        path: request.ffmpeg_path.display().to_string(),
+                        message: error.to_string(),
+                    });
+                }
+            }
+        };
+        match run_result {
+            Ok(()) => {
+                // 编码成功：缓存此编码器，供本机后续任务复用。
+                if request.video_processing_enabled {
+                    if let Ok(mut cache) = SELECTED_H264_ENCODER.lock() {
+                        *cache = Some((request.ffmpeg_path.clone(), encoder));
+                    }
+                }
+                encoded_ok = true;
+                break;
+            }
+            Err(error) => {
+                // 当前编码器不可用（无 GPU/驱动差）：清缓存并试下一个，适配各机型。
+                if let Ok(mut cache) = SELECTED_H264_ENCODER.lock() {
+                    *cache = None;
+                }
+                last_failure = Some(error);
             }
         }
+    }
+    if !encoded_ok {
+        return Err(last_failure.unwrap_or(MediaEngineError::Failed { code: None }));
     }
 
     let metadata = fs::metadata(&request.staging_output_path).map_err(|_| {
@@ -390,14 +459,15 @@ fn validate_request_shape(request: &MediaRenderRequest) -> Result<(), MediaEngin
             });
         }
     }
+    let input_extension = request
+        .input_mp4_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
     if !request.input_mp4_path.is_file()
-        || request
-            .input_mp4_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_ascii_lowercase)
+        || !input_extension
             .as_deref()
-            != Some("mp4")
+            .is_some_and(|value| SUPPORTED_SOURCE_VIDEO_EXTENSIONS.contains(&value))
     {
         return Err(MediaEngineError::InvalidInput {
             path: request.input_mp4_path.display().to_string(),
@@ -499,26 +569,17 @@ fn validate_filter_support(request: &MediaRenderRequest) -> Result<(), MediaEngi
     }
     if request.audio_processing_enabled {
         let defaults = AudioResearchParams::default();
+        if request.audio.natural_voice_mode != defaults.natural_voice_mode {
+            return Err(MediaEngineError::InvalidParameters {
+                message: "当前媒体 Worker 尚未映射参数 audio.natural_voice_mode".to_owned(),
+            });
+        }
+        // random_change_period_ms 仅驱动前端预览调度，不进 FFmpeg，不得当 unsupported 拦截。
         let unsupported = [
-            (
-                "audio.random_change_period_ms",
-                request.audio.random_change_period_ms as f64,
-                defaults.random_change_period_ms as f64,
-            ),
             (
                 "audio.spectral_perturbation_percent",
                 request.audio.spectral_perturbation_percent,
                 defaults.spectral_perturbation_percent,
-            ),
-            (
-                "audio.environment_noise_percent",
-                request.audio.environment_noise_percent,
-                defaults.environment_noise_percent,
-            ),
-            (
-                "audio.environment_noise_dbfs",
-                request.audio.environment_noise_dbfs,
-                defaults.environment_noise_dbfs,
             ),
             (
                 "audio.mfcc_shift_percent",
@@ -526,19 +587,14 @@ fn validate_filter_support(request: &MediaRenderRequest) -> Result<(), MediaEngi
                 defaults.mfcc_shift_percent,
             ),
             (
-                "audio.phase_perturbation_percent",
-                request.audio.phase_perturbation_percent,
-                defaults.phase_perturbation_percent,
+                "audio.ambient_sound_mix_percent",
+                request.audio.ambient_sound_mix_percent,
+                defaults.ambient_sound_mix_percent,
             ),
             (
                 "audio.dry_wet_percent",
                 request.audio.dry_wet_percent,
                 defaults.dry_wet_percent,
-            ),
-            (
-                "audio.reverb_wet_percent",
-                request.audio.reverb_wet_percent,
-                defaults.reverb_wet_percent,
             ),
             (
                 "audio.mfcc_dimensions",
@@ -556,21 +612,6 @@ fn validate_filter_support(request: &MediaRenderRequest) -> Result<(), MediaEngi
                 defaults.formant_shift_percent,
             ),
             (
-                "audio.vibrato_frequency_hz",
-                request.audio.vibrato_frequency_hz,
-                defaults.vibrato_frequency_hz,
-            ),
-            (
-                "audio.vibrato_depth_percent",
-                request.audio.vibrato_depth_percent,
-                defaults.vibrato_depth_percent,
-            ),
-            (
-                "audio.spectrum_blind_spot_percent",
-                request.audio.spectrum_blind_spot_percent,
-                defaults.spectrum_blind_spot_percent,
-            ),
-            (
                 "audio.snr_target_db",
                 request.audio.snr_target_db.unwrap_or_default(),
                 defaults.snr_target_db.unwrap_or_default(),
@@ -580,20 +621,13 @@ fn validate_filter_support(request: &MediaRenderRequest) -> Result<(), MediaEngi
                 request.audio.current_formant_hz.unwrap_or_default(),
                 defaults.current_formant_hz.unwrap_or_default(),
             ),
-            ("audio.filter_q", request.audio.filter_q, defaults.filter_q),
         ];
         if request.audio.voice_library_id != defaults.voice_library_id {
             return Err(MediaEngineError::InvalidParameters {
                 message: "当前媒体 Worker 尚未映射参数 audio.voice_library_id".to_owned(),
             });
         }
-        if request.audio.pitch_shift_semitones.abs() > f64::EPSILON
-            && request.source_audio_sample_rate_hz.is_none()
-        {
-            return Err(MediaEngineError::InvalidParameters {
-                message: "音高微移需要源音轨采样率".to_owned(),
-            });
-        }
+        // 源采样率缺失时 audio_filter 回退 48000，不因微扰音高拒整次处理。
         if let Some((field, value, _default)) = unsupported
             .into_iter()
             .find(|(_, value, default)| (value - default).abs() > f64::EPSILON)
@@ -695,7 +729,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let mut child = Command::new(path)
+    let mut child = background_command(path)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -736,18 +770,162 @@ where
     Ok((status, stdout))
 }
 
+/// 选择可用 H.264 编码器（本机探测，不写死硬件）：
+/// nvenc → amf → qsv → (Windows) mf → openh264。
+pub fn select_h264_encoder(ffmpeg_path: &Path) -> String {
+    if let Ok(cache) = SELECTED_H264_ENCODER.lock() {
+        if let Some((path, encoder)) = cache.as_ref() {
+            if path == ffmpeg_path {
+                return encoder.clone();
+            }
+        }
+    }
+    let encoder = detect_h264_encoder(ffmpeg_path);
+    if let Ok(mut cache) = SELECTED_H264_ENCODER.lock() {
+        *cache = Some((ffmpeg_path.to_path_buf(), encoder.clone()));
+    }
+    encoder
+}
+
+fn h264_encoder_candidates() -> Vec<&'static str> {
+    let mut candidates = H264_ENCODER_CANDIDATES_COMMON.to_vec();
+    if cfg!(windows) {
+        candidates.extend_from_slice(H264_ENCODER_WINDOWS_EXTRA);
+    }
+    candidates.push(FALLBACK_H264_ENCODER);
+    candidates
+}
+
+/// 渲染时尝试顺序：缓存首选优先，再按候选列表，最后强制软编。
+fn h264_encoder_attempt_order(ffmpeg_path: &Path) -> Vec<String> {
+    let preferred = select_h264_encoder(ffmpeg_path);
+    let mut order = vec![preferred];
+    for candidate in h264_encoder_candidates() {
+        if !order.iter().any(|name| name == candidate) {
+            order.push((*candidate).to_owned());
+        }
+    }
+    if !order.iter().any(|name| name == FALLBACK_H264_ENCODER) {
+        order.push(FALLBACK_H264_ENCODER.to_owned());
+    }
+    order
+}
+
+fn detect_h264_encoder(ffmpeg_path: &Path) -> String {
+    let available = list_video_encoders(ffmpeg_path);
+    for candidate in h264_encoder_candidates() {
+        if !available.iter().any(|name| name == candidate) {
+            continue;
+        }
+        if candidate == FALLBACK_H264_ENCODER {
+            return candidate.to_owned();
+        }
+        if probe_h264_encoder(ffmpeg_path, candidate) {
+            return candidate.to_owned();
+        }
+    }
+    FALLBACK_H264_ENCODER.to_owned()
+}
+
+fn list_video_encoders(ffmpeg_path: &Path) -> Vec<String> {
+    let Ok((status, stdout)) =
+        run_command_with_timeout(ffmpeg_path, ["-hide_banner", "-encoders"], 5_000)
+    else {
+        return Vec::new();
+    };
+    if !status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&stdout)
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            // 形如 " V....D h264_nvenc  NVIDIA ..."
+            if !trimmed.starts_with('V') {
+                return None;
+            }
+            let mut parts = trimmed.split_whitespace();
+            let _flags = parts.next()?;
+            let name = parts.next()?;
+            Some(name.to_owned())
+        })
+        .collect()
+}
+
+fn probe_h264_encoder(ffmpeg_path: &Path, encoder: &str) -> bool {
+    let null_output = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        "color=c=black:s=64x64:d=0.04".into(),
+        "-frames:v".into(),
+        "1".into(),
+        "-an".into(),
+    ];
+    args.extend(video_encoder_codec_args(encoder));
+    args.extend(["-f".into(), "null".into(), null_output.into()]);
+    match run_command_with_timeout(ffmpeg_path, args, 8_000) {
+        Ok((status, _)) => status.success(),
+        Err(_) => false,
+    }
+}
+
+fn video_encoder_codec_args(encoder: &str) -> Vec<std::ffi::OsString> {
+    match encoder {
+        // NVIDIA：各代 NVENC 通用 p 系列 preset。
+        "h264_nvenc" => vec![
+            "-c:v".into(),
+            "h264_nvenc".into(),
+            "-preset".into(),
+            "p4".into(),
+            "-tune".into(),
+            "ll".into(),
+        ],
+        // AMD AMF。
+        "h264_amf" => vec![
+            "-c:v".into(),
+            "h264_amf".into(),
+            "-quality".into(),
+            "speed".into(),
+        ],
+        // Intel QSV。
+        "h264_qsv" => vec![
+            "-c:v".into(),
+            "h264_qsv".into(),
+            "-preset".into(),
+            "veryfast".into(),
+        ],
+        // Windows MediaFoundation：有硬解就加速，没有也能软回退。
+        "h264_mf" => vec![
+            "-c:v".into(),
+            "h264_mf".into(),
+            "-hw_encoding".into(),
+            "true".into(),
+        ],
+        // 任意机器最终兜底：OpenH264 软编。
+        _ => vec!["-c:v".into(), FALLBACK_H264_ENCODER.into()],
+    }
+}
+
 fn video_filter(video: &VideoResearchParams) -> String {
+    // 当前打包 FFmpeg 无 eq/boxblur；用 lutyuv + hue + gblur 等价映射。
+    let brightness = (video.brightness_percent / 100.0).clamp(-1.0, 1.0);
+    let contrast = (video.contrast_percent / 100.0).clamp(0.0, 2.0);
+    let saturation = (video.saturation_percent / 100.0).clamp(0.0, 3.0);
     let mut filters = vec![format!(
-        "eq=brightness={:.6}:contrast={:.6}:saturation={:.6}",
-        video.brightness_percent / 100.0,
-        video.contrast_percent / 100.0,
-        video.saturation_percent / 100.0
+        "lutyuv=y='clip((val-128)*{contrast:.6}+128+{brightness:.6}*128,0,255)'"
     )];
-    if video.hue_rotation_degrees != 0.0 {
-        filters.push(format!("hue=h={:.6}", video.hue_rotation_degrees));
+    if (saturation - 1.0).abs() > f64::EPSILON || video.hue_rotation_degrees != 0.0 {
+        filters.push(format!(
+            "hue=h={:.6}:s={saturation:.6}",
+            video.hue_rotation_degrees
+        ));
     }
     if video.blur_radius_px > 0.0 {
-        filters.push(format!("boxblur={:.6}", video.blur_radius_px));
+        filters.push(format!("gblur=sigma={:.6}", video.blur_radius_px.max(0.01)));
     }
     let detail_strength = (video.sharpen_percent + video.detail_enhancement_percent) / 100.0;
     if detail_strength > 0.0 {
@@ -792,14 +970,71 @@ fn video_filter(video: &VideoResearchParams) -> String {
 fn audio_filter(audio: &AudioResearchParams, source_sample_rate_hz: Option<u32>) -> String {
     let gain_db = audio.input_gain_db + audio.output_gain_db + audio.loudness_adjustment_db;
     let mut filters = vec![format!("volume={gain_db:.6}dB")];
-    if audio.pitch_shift_semitones.abs() > f64::EPSILON {
-        if let Some(source_sample_rate_hz) = source_sample_rate_hz {
-            let factor = 2_f64.powf(audio.pitch_shift_semitones / 12.0);
-            let shifted_sample_rate_hz = (f64::from(source_sample_rate_hz) * factor).round();
-            filters.push(format!("asetrate={shifted_sample_rate_hz:.0}"));
-            filters.push(format!("aresample={source_sample_rate_hz}"));
-            filters.push(format!("atempo={:.6}", 1.0 / factor));
+    for (frequency_hz, gain_db) in [
+        (200_u32, audio.low_eq_db),
+        (1_000_u32, audio.mid_eq_db),
+        (8_000_u32, audio.high_eq_db),
+    ] {
+        if gain_db.abs() > f64::EPSILON {
+            filters.push(format!(
+                "equalizer=f={frequency_hz}:t=q:w={:.6}:g={gain_db:.6}",
+                audio.filter_q
+            ));
         }
+    }
+    if audio.pitch_shift_semitones.abs() > f64::EPSILON {
+        // ponytail: 无探测采样率时回退 48k，避免微扰音高整次失败
+        let source_sample_rate_hz = source_sample_rate_hz.unwrap_or(48_000);
+        let factor = 2_f64.powf(audio.pitch_shift_semitones / 12.0);
+        let shifted_sample_rate_hz = (f64::from(source_sample_rate_hz) * factor).round();
+        filters.push(format!("asetrate={shifted_sample_rate_hz:.0}"));
+        filters.push(format!("aresample={source_sample_rate_hz}"));
+        filters.push(format!("atempo={:.6}", 1.0 / factor));
+    }
+    if (audio.playback_speed - 1.0).abs() > f64::EPSILON {
+        filters.push(format!("atempo={:.6}", audio.playback_speed));
+    }
+    if audio.fade_in_ms > 0 {
+        filters.push(format!(
+            "afade=t=in:st=0:d={:.6}",
+            audio.fade_in_ms as f64 / 1_000.0
+        ));
+    }
+    if audio.fade_out_ms > 0 {
+        filters.push(format!(
+            "afade=t=out:d={:.6}",
+            audio.fade_out_ms as f64 / 1_000.0
+        ));
+    }
+    if audio.reverb_wet_percent > 0.0 {
+        let decay = audio.reverb_wet_percent / 100.0;
+        filters.push(format!("aecho=1.0:1.0:80:{decay:.6}"));
+    }
+    if audio.noise_reduction_percent > 0.0 {
+        let reduction_db = (audio.noise_reduction_percent * 0.97).clamp(0.01, 97.0);
+        filters.push(format!("afftdn=nr={reduction_db:.6}"));
+    }
+    if audio.phase_perturbation_percent.abs() > f64::EPSILON {
+        let depth = (audio.phase_perturbation_percent.abs() / 20.0).clamp(0.0, 1.0);
+        filters.push(format!(
+            "aphaser=in_gain=0.4:out_gain=0.74:delay=3:decay={depth:.6}:speed=0.5"
+        ));
+    }
+    if audio.vibrato_depth_percent > 0.0 {
+        let depth = (audio.vibrato_depth_percent / 100.0).clamp(0.0, 1.0);
+        filters.push(format!(
+            "vibrato=f={:.6}:d={depth:.6}",
+            audio.vibrato_frequency_hz
+        ));
+    }
+    if audio.environment_noise_percent > 0.0 {
+        let ratio = (audio.environment_noise_percent / 100.0).clamp(0.0, 1.0);
+        let amplitude =
+            (10_f64.powf(audio.environment_noise_dbfs / 20.0) * ratio).clamp(0.000_001, 1.0);
+        let dry_weight = (1.0 - ratio).max(0.0);
+        filters.push(format!(
+            "asplit=1[a];anoisesrc=color=white:amplitude={amplitude:.6}[noise];[a][noise]amix=inputs=2:weights={dry_weight:.6} {ratio:.6}:duration=first:dropout_transition=0"
+        ));
     }
     if let Some(sample_rate_hz) = audio.sample_rate_hz {
         if Some(sample_rate_hz) != source_sample_rate_hz {

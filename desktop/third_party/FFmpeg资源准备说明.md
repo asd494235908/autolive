@@ -1,6 +1,6 @@
 # FFmpeg 资源准备说明
 
-桌面端正式安装包会把 FFmpeg 和 FFprobe 放入 Tauri 资源目录，用户不需要单独安装 FFmpeg。
+桌面端正式产物会把 FFmpeg 和 FFprobe 放入 Tauri 资源目录。Windows x64 交付解压即用的 portable ZIP，不生成 MSI/NSIS；用户不需要单独安装 FFmpeg。
 
 ## 目标目录
 
@@ -16,7 +16,7 @@ desktop/third_party/ffmpeg/
   x86_64-pc-windows-msvc/ffprobe.exe
 ```
 
-执行 `cd desktop/ui && pnpm run tauri:build` 时，准备脚本只选择当前构建目标，将文件复制到 `desktop/src-tauri/binaries/ffmpeg[.exe]` 和 `ffprobe[.exe]`，再由 Tauri 打包 `binaries/` 资源目录。
+执行 `cd desktop/ui && pnpm run tauri:build` 时，准备脚本只选择当前构建目标，将文件复制到 `desktop/src-tauri/binaries/ffmpeg[.exe]` 和 `ffprobe[.exe]`。Windows 通过正式 Tauri `--no-bundle` 构建生成 EXE，再把清单和完整 `embedded-runtime-resources/` 与 EXE 相邻归档为 portable ZIP。
 
 可使用以下环境变量进行 CI 或本地构建：
 
@@ -29,7 +29,7 @@ desktop/third_party/ffmpeg/
 - 二进制必须与目标三元组匹配，并能执行 `ffmpeg -version`、`ffprobe -version`。
 - 记录 FFmpeg 版本、构建参数、来源、SHA-256 和对应源码归档。
 - 许可证不能仅根据文件名推断，必须以实际构建参数和随包许可证材料为准。若要求 LGPL-only，构建参数不得启用 `--enable-gpl` 或 `--enable-nonfree`；本次 macOS 资源实测包含 `--enable-gpl`，因此当前不能标记为 LGPL-only，正式发布前必须完成许可证复核或替换为 LGPL-only 构建。
-- 安装包附带 FFmpeg 的许可证、版权声明和源码获取说明；许可证问题不由准备脚本自动判断。
+- 发布产物附带 FFmpeg 的许可证、版权声明和源码获取说明；许可证问题不由准备脚本自动判断。
 - macOS 安装包还需要对内置可执行文件进行签名并通过 notarization 验证。
 
 ## 本次已下载资源

@@ -8,7 +8,14 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Legacy fixed-phrase artifacts may still exist on developer machines after migration.
+# New builds never read these paths; remove the local copies with an explicit cleanup.
 .venv-voice-clone/
+build/autolive-voice-clone-worker/
+desktop/src-tauri/voice-models/
+desktop/src-tauri/voice-worker/
+desktop/voice-models/
 
 # Python runtime caches
 **/__pycache__/
@@ -32,14 +39,10 @@ desktop/third_party/ffmpeg/*/ffmpeg
 desktop/third_party/ffmpeg/*/ffprobe
 desktop/third_party/ffmpeg/*/ffmpeg.exe
 desktop/third_party/ffmpeg/*/ffprobe.exe
-desktop/src-tauri/voice-models/*
-!desktop/src-tauri/voice-models/.gitkeep
-desktop/src-tauri/voice-worker/*
-!desktop/src-tauri/voice-worker/.gitkeep
 desktop/src-tauri/runtime-resources.json
+desktop/src-tauri/embedded-runtime-resources/
+!desktop/src-tauri/embedded-runtime-resources/.gitkeep
 desktop/resource-release/
-desktop/voice-models/*
-!desktop/voice-models/README.md
 
 # Local backend binaries and runtime data
 backend/bin/
@@ -51,6 +54,8 @@ deploy/data/
 
 # Tauri bundles and installers
 desktop/package/
+desktop/package-smoke/
+desktop/.codex-worker-smoke/
 desktop/src-tauri/bundle/
 desktop/src-tauri/*.dmg
 desktop/src-tauri/*.msi

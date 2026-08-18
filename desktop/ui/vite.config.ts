@@ -8,6 +8,8 @@ const packageJson = JSON.parse(
 
 export default defineConfig({
   plugins: [react()],
+  // Tauri serves the bundled frontend from its asset protocol, not `/`.
+  base: './',
   clearScreen: false,
   define: {
     __APP_VERSION__: JSON.stringify(packageJson.version ?? '0.1.0'),

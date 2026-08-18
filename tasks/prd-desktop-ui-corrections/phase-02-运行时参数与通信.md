@@ -35,7 +35,7 @@ Before editing code, re-check:
 
 ### Out of Scope
 
-- 不把运行时参数写回 Rust 研究参数或覆盖源 MP4。
+- 不把运行时参数写回 Rust 研究参数或覆盖源视频。
 - 不把每次周期变化变成 FFmpeg 重编码任务，不生成离线版本。
 - 不新增消息队列、全局 Store 或第三方跨窗口库。
 

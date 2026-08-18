@@ -22,20 +22,11 @@ async function loadInterludeModule() {
   return import(moduleUrl);
 }
 
-test('resolveBaseAudioSource 按固定话术、实时变体、处理后原声、原声优先级解析', async () => {
+test('resolveBaseAudioSource 按实时变体、处理后原声、原声优先级解析', async () => {
   const { resolveBaseAudioSource } = await loadInterludeModule();
 
   assert.equal(
     resolveBaseAudioSource({
-      voiceCloneActive: true,
-      realtimeVariantActive: true,
-      processedOriginalActive: true,
-    }),
-    'voice_clone',
-  );
-  assert.equal(
-    resolveBaseAudioSource({
-      voiceCloneActive: false,
       realtimeVariantActive: true,
       processedOriginalActive: true,
     }),
@@ -43,7 +34,6 @@ test('resolveBaseAudioSource 按固定话术、实时变体、处理后原声、
   );
   assert.equal(
     resolveBaseAudioSource({
-      voiceCloneActive: false,
       realtimeVariantActive: false,
       processedOriginalActive: true,
     }),
@@ -51,7 +41,6 @@ test('resolveBaseAudioSource 按固定话术、实时变体、处理后原声、
   );
   assert.equal(
     resolveBaseAudioSource({
-      voiceCloneActive: false,
       realtimeVariantActive: false,
       processedOriginalActive: false,
     }),
@@ -86,50 +75,27 @@ test('chooseInterludeIndex 在有多个文件时避免连续重复，空目录�
   assert.equal(chooseInterludeIndex(3, 1, () => 0.99), 2);
 });
 
-test('shouldPauseInterlude 在暂停、固定话术生成中或播放中时返回 true', async () => {
+test('shouldPauseInterlude 在视频暂停或系统语音朗读时返回 true', async () => {
   const { shouldPauseInterlude } = await loadInterludeModule();
 
   assert.equal(
     shouldPauseInterlude({
       playbackState: 'playing',
-      voiceCloneStatus: 'idle',
+      fixedSpeechActive: false,
     }),
     false,
   );
   assert.equal(
     shouldPauseInterlude({
       playbackState: 'paused',
-      voiceCloneStatus: 'idle',
+      fixedSpeechActive: false,
     }),
     true,
   );
   assert.equal(
     shouldPauseInterlude({
       playbackState: 'playing',
-      voiceCloneStatus: 'generating',
-    }),
-    true,
-  );
-  assert.equal(
-    shouldPauseInterlude({
-      playbackState: 'playing',
-      voiceCloneStatus: 'playing',
-    }),
-    true,
-  );
-  assert.equal(
-    shouldPauseInterlude({
-      playbackState: 'playing',
-      voiceCloneStatus: 'ready',
-      currentTextStatus: 'preparing',
-    }),
-    true,
-  );
-  assert.equal(
-    shouldPauseInterlude({
-      playbackState: 'playing',
-      voiceCloneStatus: 'ready',
-      currentTextStatus: 'playing',
+      fixedSpeechActive: true,
     }),
     true,
   );
@@ -141,7 +107,6 @@ test('resolvePlaybackAudioSource 使用当前视频处理状态作为旧快照�
   assert.equal(
     resolvePlaybackAudioSource({
       effectiveAudioSource: null,
-      voiceCloneStatus: 'idle',
       currentAudioSource: 'original',
       currentVideoSource: 'processed',
     }),
@@ -161,10 +126,26 @@ test('插话输入范围与 Rust 契约一致', async () => {
   });
 });
 
-test('最终效果窗口会复用 Web Audio 上下文，避免 StrictMode 重复绑定媒体元素', async () => {
+test('接入 Web Audio 的本地媒体会在 src 前启用匿名 CORS，避免跨源音轨静音', async () => {
   const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
+  const finalEffectMedia = appSource.slice(
+    appSource.indexOf('<video', appSource.indexOf('function FinalEffectWindow')),
+    appSource.indexOf('</>', appSource.indexOf('<video', appSource.indexOf('function FinalEffectWindow'))),
+  );
 
   assert.match(appSource, /audioContextCleanupTimerRef/);
+  assert.match(
+    finalEffectMedia,
+    /<video\s+ref=\{videoRef\}\s+crossOrigin="anonymous"\s+src=\{sourceUrl\}/,
+  );
+  assert.match(
+    finalEffectMedia,
+    /<audio\s+ref=\{audioRef\}\s+crossOrigin="anonymous"\s+src=\{audioUrl \?\? undefined\}/,
+  );
+  assert.match(
+    finalEffectMedia,
+    /<audio\s+ref=\{interludeAudioRef\}\s+crossOrigin="anonymous"\s+src=\{interludeAudioUrl \?\? undefined\}/,
+  );
   assert.match(appSource, /if \(audioContextRef\.current\) return scheduleAudioContextCleanup;/);
   assert.match(appSource, /window\.setTimeout\(\(\) => \{/);
   assert.match(appSource, /插话不会播放/);
@@ -196,7 +177,9 @@ test('实时候选真正播放前保留源视频音频，并预加载候选元�
   assert.match(appSource, /onPlaying=\{handleRealtimeAudioPlaying\}/);
   assert.match(appSource, /onError=\{handleRealtimeAudioElementError\}/);
   assert.match(appSource, /effectiveAudioSource === 'realtime_variant'\s*&&\s*realtimeAudioPlayingRef\.current/);
-  assert.match(appSource, /effectiveAudioSource !== 'realtime_variant'\s*\|\|\s*!realtimeAudioPlaying/);
+  assert.match(appSource, /audioSource\.connect\(analyser\)/);
+  assert.doesNotMatch(appSource, /createBiquadFilter\(\)/);
+  assert.doesNotMatch(appSource, /createDelay\(\)/);
   assert.match(appSource, /<audio[\s\S]*?preload="auto"[\s\S]*?onPlaying=\{handleRealtimeAudioPlaying\}/);
 });
 

@@ -205,13 +205,10 @@ pub fn prepare_interlude_snapshot(
 }
 
 pub fn resolve_effective_audio_source(
-    voice_clone_status: &str,
     current_audio_source: Option<&str>,
     current_video_source: Option<&str>,
 ) -> &'static str {
-    if voice_clone_status == "playing" {
-        "voice_clone"
-    } else if current_audio_source == Some("realtime_variant") {
+    if current_audio_source == Some("realtime_variant") {
         "realtime_variant"
     } else if current_video_source == Some("processed") {
         "processed_original"

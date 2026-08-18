@@ -48,7 +48,7 @@ pub fn validate_release_runtime_resource_config(
     let base_config: Value =
         serde_json::from_str(base_config).map_err(|_| "tauri.conf.json 不是有效 JSON")?;
     if !has_expected_config_resources(&base_config) {
-        return Err("release/custom 构建要求 bundle.resources 精确为 runtime-resources.json");
+        return Err("release/custom 构建要求 bundle.resources 包含运行资源清单和内置资源目录");
     }
     let Some(external_override) = external_override else {
         return Ok(());
@@ -82,6 +82,8 @@ fn has_expected_config_resources(config: &Value) -> bool {
 
 fn has_expected_resource_list(value: &Value) -> bool {
     value.as_array().is_some_and(|resources| {
-        resources.len() == 1 && resources[0].as_str() == Some("runtime-resources.json")
+        resources.len() == 2
+            && resources[0].as_str() == Some("runtime-resources.json")
+            && resources[1].as_str() == Some("embedded-runtime-resources")
     })
 }

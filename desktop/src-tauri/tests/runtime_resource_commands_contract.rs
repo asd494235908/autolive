@@ -1,7 +1,7 @@
 use autolive_desktop_core::runtime_resource_task::RuntimeResourceTask;
 use autolive_desktop_core::runtime_resources::{
-    RuntimeResourceComponent, RuntimeResourceInstaller, RuntimeResourceLayout,
-    RuntimeResourceState, PRODUCTION_BASE_URL,
+    RuntimeResourceCatalog, RuntimeResourceComponent, RuntimeResourceInstaller,
+    RuntimeResourceLayout, RuntimeResourceState, PRODUCTION_BASE_URL,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -54,15 +54,9 @@ fn production_manifest() -> String {
             "release": "v0.1.0",
             "target": "{target}",
             "base_url": "{PRODUCTION_BASE_URL}",
-            "files": [
-                {{"component":"media","relative_path":"{target}/binaries/ffmpeg","size_bytes":1,"sha256":"{}","executable":true}},
-                {{"component":"voice-runtime","relative_path":"{target}/voice-worker/autolive-voice-clone-worker","size_bytes":1,"sha256":"{}","executable":true}},
-                {{"component":"voice-models","relative_path":"common/voice-models/model.bin","size_bytes":1,"sha256":"{}","executable":false}}
-            ]
+            "files": [{{"component":"media","relative_path":"{target}/binaries/ffmpeg","size_bytes":1,"sha256":"{}","executable":true}}]
         }}"#,
         "a".repeat(64),
-        "b".repeat(64),
-        "c".repeat(64),
     )
 }
 
@@ -79,11 +73,7 @@ fn behavior_manifest(base_url: &str) -> Vec<u8> {
         "release": "v0.1.0",
         "target": target,
         "base_url": base_url,
-        "files": [
-            {"component":"media","relative_path":format!("{target}/binaries/ffmpeg"),"size_bytes":1,"sha256":hash(b"a"),"executable":true},
-            {"component":"voice-runtime","relative_path":format!("{target}/voice-worker/autolive-voice-clone-worker"),"size_bytes":1,"sha256":hash(b"b"),"executable":true},
-            {"component":"voice-models","relative_path":"common/voice-models/model.bin","size_bytes":1,"sha256":hash(b"c"),"executable":false}
-        ]
+        "files": [{"component":"media","relative_path":format!("{target}/binaries/ffmpeg"),"size_bytes":1,"sha256":hash(b"a"),"executable":true}]
     }))
     .expect("behavior manifest should serialize")
 }
@@ -103,7 +93,7 @@ fn runtime_resource_commands_are_registered() {
 }
 
 #[test]
-fn packaged_paths_are_derived_from_the_versioned_app_data_layout() {
+fn fallback_paths_are_derived_from_the_versioned_app_data_layout() {
     let target = current_target();
     if target == "unsupported" {
         return;
@@ -118,6 +108,75 @@ fn packaged_paths_are_derived_from_the_versioned_app_data_layout() {
             .join(target)
             .join("binaries/ffprobe")
     );
+}
+
+#[test]
+fn complete_packaged_resources_are_used_in_place_without_creating_app_data() {
+    let target = current_target();
+    if target == "unsupported" {
+        return;
+    }
+    let directory = TestDir::new();
+    let resource_dir = directory.path().join("resources");
+    let app_data_dir = directory.path().join("app-data");
+    let embedded_root = resource_dir.join("embedded-runtime-resources");
+    fs::create_dir_all(&resource_dir).expect("resource directory");
+    fs::write(
+        resource_dir.join("runtime-resources.json"),
+        behavior_manifest(PRODUCTION_BASE_URL),
+    )
+    .expect("manifest fixture");
+    let path = embedded_root.join(format!("{target}/binaries/ffmpeg"));
+    fs::create_dir_all(path.parent().expect("embedded parent")).expect("embedded directory");
+    fs::write(path, b"a").expect("embedded fixture");
+
+    let catalog =
+        RuntimeResourceCatalog::from_resource_directory(&resource_dir, &app_data_dir, target)
+            .expect("packaged resource catalog");
+
+    assert!(catalog.is_bundled());
+    assert_eq!(catalog.roots().version_root, embedded_root);
+    assert_eq!(catalog.roots().target_root, embedded_root.join(target));
+    let status = catalog
+        .bundled_status(RuntimeResourceComponent::Media)
+        .expect("complete bundled media status");
+    assert_eq!(status.state, RuntimeResourceState::Ready);
+    assert_eq!(status.installed_bytes, 1);
+    assert_eq!(status.resource_root, embedded_root.display().to_string());
+    assert!(!app_data_dir.exists());
+}
+
+#[test]
+fn incomplete_packaged_resources_fall_back_to_the_writable_layout_without_creating_it() {
+    let target = current_target();
+    if target == "unsupported" {
+        return;
+    }
+    let directory = TestDir::new();
+    let resource_dir = directory.path().join("resources");
+    let app_data_dir = directory.path().join("app-data");
+    let embedded_root = resource_dir.join("embedded-runtime-resources");
+    fs::create_dir_all(embedded_root.join(format!("{target}/binaries")))
+        .expect("embedded directory");
+    fs::write(
+        resource_dir.join("runtime-resources.json"),
+        behavior_manifest(PRODUCTION_BASE_URL),
+    )
+    .expect("manifest fixture");
+
+    let catalog =
+        RuntimeResourceCatalog::from_resource_directory(&resource_dir, &app_data_dir, target)
+            .expect("fallback resource catalog");
+
+    let expected =
+        RuntimeResourceLayout::for_target(&app_data_dir, target).expect("writable fallback layout");
+    assert!(!catalog.is_bundled());
+    assert!(catalog
+        .bundled_status(RuntimeResourceComponent::Media)
+        .is_none());
+    assert_eq!(catalog.roots().version_root, expected.version_root);
+    assert_eq!(catalog.roots().target_root, expected.target_root);
+    assert!(!app_data_dir.exists());
 }
 
 #[test]
@@ -158,12 +217,6 @@ fn idle_status_rechecks_the_requested_component_and_detects_damaged_files() {
     {
         std::thread::yield_now();
     }
-
-    let voice = task
-        .inspect_when_idle(RuntimeResourceComponent::Voice, &installer)
-        .expect("voice status should inspect its own files");
-    assert_eq!(voice.component, Some(RuntimeResourceComponent::Voice));
-    assert_eq!(voice.state, RuntimeResourceState::NotInstalled);
 
     fs::write(&media_path, b"damaged").expect("media fixture should be damaged");
     let media = task
@@ -252,7 +305,7 @@ fn missing_and_invalid_manifests_are_recorded_as_failed_terminal_statuses() {
     };
     let app_data_status = task
         .record_failure(
-            RuntimeResourceComponent::Voice,
+            RuntimeResourceComponent::Media,
             app_data_error,
             Path::new(""),
         )
@@ -260,7 +313,7 @@ fn missing_and_invalid_manifests_are_recorded_as_failed_terminal_statuses() {
     assert_eq!(app_data_status.state, RuntimeResourceState::Failed);
     assert_eq!(
         app_data_status.component,
-        Some(RuntimeResourceComponent::Voice)
+        Some(RuntimeResourceComponent::Media)
     );
     assert!(app_data_status
         .error

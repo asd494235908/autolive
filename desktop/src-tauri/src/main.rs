@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod auth_session;
 mod commands;
 
@@ -7,20 +9,17 @@ use autolive_desktop_core::runtime_resource_task::{
 };
 use commands::{
     cancel_research_analysis, cancel_runtime_resource_install, cancel_speech_to_speech_worker,
-    cancel_voice_clone_operation, cleanup_local_caches_command, clear_runtime_resources,
-    clear_voice_clone_replacement, close_final_effect_window, commit_audio_variant_candidate,
-    commit_audio_variant_candidate_if_due, commit_media_processing_if_ready,
-    complete_playback_loop, direct_model_chat, discard_audio_variant_candidate,
-    fail_voice_clone_playback, finish_voice_clone_playback, get_default_local_research_params,
-    get_device_runtime_info, get_media_engine_capabilities, get_research_status,
-    get_research_worker_capabilities, get_runtime_resource_status, get_snapshot,
-    get_speech_to_speech_worker_capabilities, get_voice_clone_worker_capabilities,
+    cleanup_local_caches_command, clear_runtime_resources, close_final_effect_window,
+    commit_audio_variant_candidate, commit_audio_variant_candidate_if_due,
+    commit_media_processing_if_ready, complete_playback_loop, direct_model_chat,
+    discard_audio_variant_candidate, get_default_local_research_params, get_device_runtime_info,
+    get_media_engine_capabilities, get_research_status, get_research_worker_capabilities,
+    get_runtime_resource_status, get_snapshot, get_speech_to_speech_worker_capabilities,
     import_runtime_resource_directory, install_runtime_resources, open_final_effect_window,
-    pause_playback, prepare_voice_clone_source, probe_local_mp4, resize_final_effect_window,
+    pause_playback, probe_local_mp4, probe_local_video, resize_final_effect_window,
     restore_original_audio, resume_playback, set_audio_processing_profile, set_interlude_config,
     set_processing_switches, stage_audio_variant_candidate, start_media_processing, start_playback,
-    start_research_analysis, start_speech_to_speech_worker, start_voice_clone_playback,
-    start_voice_clone_pre_generation, start_voice_clone_replacement, stop_playback,
+    start_research_analysis, start_speech_to_speech_worker, stop_playback,
     update_playback_position, validate_local_research_params, AppState,
 };
 use std::process::ExitCode;
@@ -33,6 +32,7 @@ fn main() -> ExitCode {
         .plugin(tauri_plugin_http::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
+            probe_local_video,
             probe_local_mp4,
             get_device_runtime_info,
             get_media_engine_capabilities,
@@ -45,7 +45,6 @@ fn main() -> ExitCode {
             get_research_status,
             cleanup_local_caches_command,
             get_speech_to_speech_worker_capabilities,
-            get_voice_clone_worker_capabilities,
             get_default_local_research_params,
             start_playback,
             pause_playback,
@@ -53,14 +52,6 @@ fn main() -> ExitCode {
             update_playback_position,
             stop_playback,
             complete_playback_loop,
-            prepare_voice_clone_source,
-            start_voice_clone_playback,
-            start_voice_clone_pre_generation,
-            start_voice_clone_replacement,
-            finish_voice_clone_playback,
-            fail_voice_clone_playback,
-            cancel_voice_clone_operation,
-            clear_voice_clone_replacement,
             commit_media_processing_if_ready,
             set_processing_switches,
             set_audio_processing_profile,
@@ -116,6 +107,15 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn release_build_hides_the_windows_console_window() {
+        let source = include_str!("main.rs");
+
+        assert!(
+            source.contains("#![cfg_attr(not(debug_assertions), windows_subsystem = \"windows\")]")
+        );
+    }
+
+    #[test]
     fn tauri_config_enables_asset_protocol_and_media_csp() {
         let config =
             std::fs::read_to_string("tauri.conf.json").expect("tauri.conf.json should exist");
@@ -128,16 +128,14 @@ mod tests {
     }
 
     #[test]
-    fn tauri_config_bundles_only_the_runtime_resource_manifest() {
+    fn tauri_config_bundles_the_manifest_and_embedded_runtime_resources() {
         let config =
             std::fs::read_to_string("tauri.conf.json").expect("tauri.conf.json should exist");
 
         assert!(config.contains("\"active\": true"));
         assert!(config.contains("\"resources\""));
         assert!(config.contains("runtime-resources.json"));
-        assert!(!config.contains("binaries/ffmpeg"));
-        assert!(!config.contains("voice-models"));
-        assert!(!config.contains("voice-worker"));
+        assert!(config.contains("embedded-runtime-resources"));
     }
 
     #[test]

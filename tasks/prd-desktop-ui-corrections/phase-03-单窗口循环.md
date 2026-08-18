@@ -50,7 +50,7 @@ Before editing code, re-check:
 
 ## Validation Strategy
 
-循环是竞态敏感的行为，先用无时间等待的纯逻辑测试证明门禁，再用现有 Rust playback tests 验证状态转移，最后用 3–6 秒带音视频的本地 MP4 手工验证至少两轮、暂停/继续、停止、关闭/重开和 IPC 失败降级。
+循环是竞态敏感的行为，先用无时间等待的纯逻辑测试证明门禁，再用现有 Rust playback tests 验证状态转移，最后用 3–6 秒带音视频的本地受支持格式视频手工验证至少两轮、暂停/继续、停止、关闭/重开和 IPC 失败降级；至少抽样覆盖非 MP4 格式。
 
 ## Validation Checklist
 

@@ -1,7 +1,7 @@
 use autolive_desktop_core::runtime_resources::{
-    required_disk_space, ManifestComponent, ResourceInstallError, RuntimeResourceComponent,
-    RuntimeResourceInstaller, RuntimeResourceLayout, RuntimeResourceManifest, RuntimeResourceState,
-    ValidationMode, PRODUCTION_BASE_URL,
+    required_disk_space, ResourceInstallError, RuntimeResourceComponent, RuntimeResourceInstaller,
+    RuntimeResourceLayout, RuntimeResourceManifest, RuntimeResourceState, ValidationMode,
+    PRODUCTION_BASE_URL,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -18,10 +18,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const TARGET: &str = "aarch64-apple-darwin";
 const FILE_PATH: &str = "aarch64-apple-darwin/binaries/ffmpeg";
 const FILE_BYTES: &[u8] = b"verified runtime resource";
-const VOICE_RUNTIME_PATH: &str = "aarch64-apple-darwin/voice-worker/worker";
-const VOICE_RUNTIME_BYTES: &[u8] = b"r";
-const VOICE_MODEL_PATH: &str = "common/voice-models/model.bin";
-const VOICE_MODEL_BYTES: &[u8] = b"m";
 static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn manifest_json(base_url: &str, relative_path: &str) -> Vec<u8> {
@@ -77,7 +73,7 @@ fn production_base_url_contract_includes_the_trailing_slash() {
 }
 
 #[test]
-fn rejects_manifest_missing_a_required_component() {
+fn accepts_manifest_with_the_media_component() {
     let fixture = RangeFixture::new(FILE_BYTES);
     let media_only = manifest_json(&fixture.base_url(), FILE_PATH);
 
@@ -87,19 +83,7 @@ fn rejects_manifest_missing_a_required_component() {
             base_url: fixture.base_url(),
         },
     )
-    .is_err());
-}
-
-#[test]
-fn voice_component_expands_to_all_required_components() {
-    assert_eq!(
-        RuntimeResourceComponent::Voice.required_components(),
-        [
-            ManifestComponent::Media,
-            ManifestComponent::VoiceRuntime,
-            ManifestComponent::VoiceModels,
-        ],
-    );
+    .is_ok());
 }
 
 #[derive(Clone)]
@@ -428,29 +412,13 @@ fn test_manifest(base_url: &str, size_bytes: u64, hash: &str) -> Vec<u8> {
         "release": "v0.1.0",
         "target": TARGET,
         "base_url": base_url,
-        "files": [
-            {
-                "component": "media",
-                "relative_path": FILE_PATH,
-                "size_bytes": size_bytes,
-                "sha256": hash,
-                "executable": true
-            },
-            {
-                "component": "voice-runtime",
-                "relative_path": VOICE_RUNTIME_PATH,
-                "size_bytes": 1,
-                "sha256": sha256(VOICE_RUNTIME_BYTES),
-                "executable": true
-            },
-            {
-                "component": "voice-models",
-                "relative_path": VOICE_MODEL_PATH,
-                "size_bytes": 1,
-                "sha256": sha256(VOICE_MODEL_BYTES),
-                "executable": false
-            }
-        ]
+        "files": [{
+            "component": "media",
+            "relative_path": FILE_PATH,
+            "size_bytes": size_bytes,
+            "sha256": hash,
+            "executable": true
+        }]
     }))
     .expect("test manifest should serialize")
 }
@@ -474,6 +442,37 @@ fn skips_an_existing_verified_file() {
 
     assert_eq!(fixture.request_count(), 0);
     assert!(harness.layout.installed_record.is_file());
+    assert_eq!(
+        harness
+            .installer
+            .inspect(RuntimeResourceComponent::Media)
+            .expect("inspect succeeds")
+            .state,
+        RuntimeResourceState::Ready
+    );
+}
+
+#[test]
+fn installs_a_missing_empty_runtime_file() {
+    let fixture = RangeFixture::new(b"");
+    let harness = InstallerHarness::new(&fixture, b"");
+
+    harness
+        .install()
+        .expect("empty runtime file should install");
+
+    assert_eq!(fixture.request_count(), 1);
+    assert_eq!(
+        fs::metadata(harness.final_path())
+            .expect("installed empty file metadata")
+            .len(),
+        0
+    );
+    assert_eq!(
+        sha256(&fs::read(harness.final_path()).expect("installed empty file")),
+        sha256(b"")
+    );
+    assert!(!harness.partial_path().exists());
     assert_eq!(
         harness
             .installer
@@ -833,16 +832,10 @@ fn invalidates_a_stale_installed_record_before_a_repair_can_fail() {
 fn installed_record_keeps_every_component_that_is_actually_verified() {
     let fixture = RangeFixture::new(FILE_BYTES);
     let harness = InstallerHarness::new(&fixture, FILE_BYTES);
-    for (relative_path, bytes) in [
-        (FILE_PATH, FILE_BYTES),
-        (VOICE_RUNTIME_PATH, VOICE_RUNTIME_BYTES),
-        (VOICE_MODEL_PATH, VOICE_MODEL_BYTES),
-    ] {
-        let destination = harness.layout.version_root.join(relative_path);
-        fs::create_dir_all(destination.parent().expect("component parent"))
-            .expect("component directory");
-        fs::write(destination, bytes).expect("verified component fixture");
-    }
+    let destination = harness.layout.version_root.join(FILE_PATH);
+    fs::create_dir_all(destination.parent().expect("component parent"))
+        .expect("component directory");
+    fs::write(destination, FILE_BYTES).expect("verified component fixture");
 
     harness.install().expect("all existing files are valid");
 
@@ -850,10 +843,7 @@ fn installed_record_keeps_every_component_that_is_actually_verified() {
         &fs::read(&harness.layout.installed_record).expect("installed record"),
     )
     .expect("installed record JSON");
-    assert_eq!(
-        record["installed_components"],
-        json!(["media", "voice-runtime", "voice-models"])
-    );
+    assert_eq!(record["installed_components"], json!(["media"]));
 }
 
 #[test]

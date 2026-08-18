@@ -30,6 +30,8 @@ import wave
 from pathlib import Path
 from typing import Any
 
+from windows_subprocess_policy import subprocess_creation_flags
+
 
 DEFAULT_ENDPOINT = "ws://127.0.0.1:8765/v1/realtime"
 DEFAULT_OUTPUT_SAMPLE_RATE_HZ = 24_000
@@ -167,7 +169,13 @@ def extract_pcm(context: dict[str, Any]) -> bytes:
         "s16le",
         "pipe:1",
     ]
-    completed = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess_creation_flags(),
+    )
     if completed.returncode != 0 or not completed.stdout:
         raise RuntimeError("无法从源媒体提取当前音频片段")
     return completed.stdout
@@ -302,7 +310,14 @@ def normalize_audio(
         "wav",
         "pipe:1",
     ]
-    completed = subprocess.run(command, input=audio, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    completed = subprocess.run(
+        command,
+        input=audio,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess_creation_flags(),
+    )
     if completed.returncode != 0 or not completed.stdout:
         raise RuntimeError("无法将候选音频转换为当前音轨格式")
     return completed.stdout

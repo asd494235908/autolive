@@ -57,6 +57,7 @@ pub enum MediaLibraryError {
     UnsupportedExtension {
         path: String,
         extension: Option<String>,
+        supported_extensions: &'static str,
     },
     FileNameUnavailable {
         path: String,
@@ -67,7 +68,7 @@ pub enum MediaLibraryError {
     FileOpenFailed {
         path: String,
     },
-    UnreadableMp4Container {
+    UnreadableVideoContainer {
         path: String,
         message: String,
     },
@@ -85,8 +86,12 @@ impl Display for MediaLibraryError {
                 write!(f, "文件路径规范化失败: {path}")
             }
             Self::NotAFile { path } => write!(f, "路径不是普通文件: {path}"),
-            Self::UnsupportedExtension { path, extension } => {
-                write!(f, "当前仅支持 MP4 文件: {path}")?;
+            Self::UnsupportedExtension {
+                path,
+                extension,
+                supported_extensions,
+            } => {
+                write!(f, "当前仅支持 {supported_extensions} 视频文件: {path}")?;
                 if let Some(extension) = extension {
                     write!(f, " (extension={extension})")?;
                 }
@@ -99,8 +104,8 @@ impl Display for MediaLibraryError {
                 write!(f, "读取文件元数据失败: {path}")
             }
             Self::FileOpenFailed { path } => write!(f, "打开文件失败: {path}"),
-            Self::UnreadableMp4Container { path, message } => {
-                write!(f, "MP4 容器不可读: {path}; {message}")
+            Self::UnreadableVideoContainer { path, message } => {
+                write!(f, "视频容器不可读: {path}; {message}")
             }
             Self::NumericOverflow { field } => {
                 write!(f, "数值超出当前实现可表达范围: {field}")

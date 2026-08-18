@@ -5,10 +5,7 @@ use autolive_desktop_core::media_library::SourceMediaDto;
 use autolive_desktop_core::speech_to_speech::{
     AudioTrackInput, AudioVariantCandidate, SpeechToSpeechContext,
 };
-use autolive_desktop_core::voice_clone::{VoiceCloneSegment, VoiceCloneSourceIndex};
-use autolive_desktop_core::{
-    PlaybackCore, VoiceCloneCommittedReplacement, VoiceClonePreparedSource,
-};
+use autolive_desktop_core::PlaybackCore;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -107,47 +104,6 @@ fn audio_candidate(playback_generation: u64, loop_index: u64) -> AudioVariantCan
         sample_rate_hz: 48_000,
         channel_count: 2,
         ready: true,
-    }
-}
-
-fn prepared_source(generation: u64, source_path: &str) -> VoiceClonePreparedSource {
-    VoiceClonePreparedSource {
-        operation_id: "prepare-operation".to_owned(),
-        source_index: VoiceCloneSourceIndex {
-            source_generation: generation,
-            source_path: source_path.to_owned(),
-            segments: vec![VoiceCloneSegment {
-                start_ms: 1_000,
-                end_ms: 3_000,
-                text: "当前话术".to_owned(),
-            }],
-        },
-        source_sha256: "a".repeat(64),
-        reference_audio_path: "/tmp/voice-clone/reference.wav".to_owned(),
-        reference_audio_sha256: "b".repeat(64),
-        sample_rate_hz: 48_000,
-        channel_count: 2,
-        total_duration_ms: 10_000,
-        model: Some("demucs+small+xtts_v2".to_owned()),
-    }
-}
-
-fn committed_replacement(
-    generation: u64,
-    source_path: &str,
-    operation_id: &str,
-) -> VoiceCloneCommittedReplacement {
-    VoiceCloneCommittedReplacement {
-        source_generation: generation,
-        source_path: source_path.to_owned(),
-        operation_id: operation_id.to_owned(),
-        input_text: "替换后的固定话术".to_owned(),
-        replacement_audio_reference: "/tmp/voice-clone/replacement.wav".to_owned(),
-        replacement_audio_sha256: "c".repeat(64),
-        replacement_duration_ms: 1_500,
-        replace_at_ms: 1_500,
-        resume_at_ms: 3_000,
-        model: Some("tts_models/multilingual/multi-dataset/xtts_v2".to_owned()),
     }
 }
 
@@ -296,7 +252,8 @@ fn playback_snapshot_reports_effective_audio_source_priority_without_mutating_ba
     core.set_processing_switches(true, false, true);
     core.mark_media_processing_ready(generation, "/tmp/processed.mp4".to_owned(), "f".repeat(64))
         .expect("processed media should be accepted");
-    assert!(core.commit_media_processing_if_ready());
+    // ready 已立即 commit，无需再 commit。
+    assert!(!core.commit_media_processing_if_ready());
     assert_eq!(core.snapshot().effective_audio_source, "processed_original");
 
     core.stage_audio_variant_candidate(
@@ -308,25 +265,10 @@ fn playback_snapshot_reports_effective_audio_source_priority_without_mutating_ba
     .expect("realtime candidate should stage");
     core.commit_audio_variant_candidate(generation, 0, "segment-1")
         .expect("realtime candidate should commit");
-    assert_eq!(core.snapshot().effective_audio_source, "realtime_variant");
-
-    core.set_voice_clone_prepared_source(prepared_source(generation, "/tmp/source.mp4"))
-        .expect("prepared source should be accepted");
-    core.start().expect("playback should start");
-    let operation = core
-        .start_voice_clone_replacement("替换后的固定话术", 1_500, "replace-operation", false)
-        .expect("voice clone replacement should start");
-    core.apply_voice_clone_replacement(committed_replacement(
-        operation.source_generation,
-        &operation.source_path,
-        &operation.operation_id,
-    ))
-    .expect("voice clone replacement should apply");
-
     let snapshot = core.snapshot();
     assert_eq!(
         snapshot.current_audio_source.as_deref(),
         Some("realtime_variant")
     );
-    assert_eq!(snapshot.effective_audio_source, "voice_clone");
+    assert_eq!(snapshot.effective_audio_source, "realtime_variant");
 }
