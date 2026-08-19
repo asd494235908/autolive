@@ -245,6 +245,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "autolive-desktop-core"
 version = "0.1.0"
 dependencies = [
+ "autolive-portaudio-output",
  "cap-std",
  "keyring",
  "mp4",
@@ -258,6 +259,13 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-http",
  "tauri-runtime",
+]
+
+[[package]]
+name = "autolive-portaudio-output"
+version = "0.1.0"
+dependencies = [
+ "ringbuf",
 ]
 
 [[package]]
@@ -3427,6 +3435,17 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "ringbuf"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a158e09ede21a14b172ca6cdd6208386c6ae2cb6acef58d774368ef8c450dfa7"
+dependencies = [
+ "crossbeam-utils",
+ "portable-atomic",
+ "portable-atomic-util",
 ]
 
 [[package]]

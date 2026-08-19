@@ -1,3 +1,6 @@
+use autolive_desktop_core::audio_mixer::{
+    AudioMixerConfigContext, AudioMixerReadinessError, AudioMixerTask,
+};
 use autolive_desktop_core::audio_processing::AudioProcessingProfile;
 use autolive_desktop_core::cancellation::CancellationToken;
 use autolive_desktop_core::direct_model::{
@@ -10,7 +13,8 @@ use autolive_desktop_core::interlude_player::{
     prepare_interlude_snapshot, InterludeConfig, InterludeError, InterludeSnapshot,
 };
 use autolive_desktop_core::media_engine::{
-    build_media_render_args, configured_media_engine_paths_with_resource_dir,
+    build_audio_stream_filter_graph, build_media_render_args,
+    configured_media_engine_paths_with_resource_dir,
     configured_media_engine_status_with_resource_dir, render_media, target_triple,
     MediaEngineStatus, MediaRenderRequest, FFMPEG_PATH_ENV, FFPROBE_PATH_ENV,
 };
@@ -43,14 +47,14 @@ use autolive_desktop_core::speech_to_speech_worker::{
     run_configured_speech_to_speech_context_worker_with_resource_dir,
 };
 use autolive_desktop_core::window_sizing::{calculate_window_size, WindowSizingError};
-use autolive_desktop_core::{PlaybackCore, PlaybackSnapshot};
+use autolive_desktop_core::{PlaybackCore, PlaybackSnapshot, PlaybackState};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, System};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, Window};
 use tauri_runtime::dpi::{LogicalSize, PhysicalSize};
@@ -64,6 +68,132 @@ const MEDIA_CACHE_MAX_FILES: usize = 3;
 const RESEARCH_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const MACOS_NATIVE_TITLEBAR_HEIGHT: f64 = 32.0;
 const MEDIA_IMPORT_PROBE_TIMEOUT_MS: u64 = 10_000;
+const PORTAUDIO_CALLBACK_STALL_MS: u64 = 1_500;
+// FFmpeg 的 loudnorm + 多支路滤镜需要完成初始化后才会输出首批 PCM。
+const PORTAUDIO_SWITCH_READY_TIMEOUT_MS: u64 = 5_000;
+const PORTAUDIO_SWITCH_READY_POLL_MS: u64 = 10;
+
+fn audio_mixer_readiness_error(
+    timeout_code: &'static str,
+    ffmpeg_code: &'static str,
+    error: AudioMixerReadinessError,
+) -> CommandErrorDto {
+    let code = if matches!(error, AudioMixerReadinessError::Ffmpeg { .. }) {
+        ffmpeg_code
+    } else {
+        timeout_code
+    };
+    CommandErrorDto::new(code, error.to_string())
+}
+
+fn take_pending_audio_mixer<T>(slot: &Mutex<Option<T>>) -> Result<Option<T>, CommandErrorDto> {
+    slot.lock()
+        .map_err(|_| {
+            CommandErrorDto::new(
+                "audio_mixer_pending_lock_failed",
+                "待切换音频混音状态锁已损坏",
+            )
+        })
+        .map(|mut pending| pending.take())
+}
+
+fn resolve_audio_start_position_ms(
+    requested_position_ms: Option<u64>,
+    current_position_ms: u64,
+) -> u64 {
+    requested_position_ms
+        .unwrap_or(current_position_ms)
+        .max(current_position_ms)
+}
+
+fn resolve_audio_commit_position_ms(
+    requested_position_ms: Option<u64>,
+    current_position_ms: u64,
+    preparation_elapsed_ms: u64,
+    playback_rate: f64,
+    pending_ms: u64,
+    output_latency_ms: u64,
+) -> u64 {
+    let elapsed_media_ms = if playback_rate.is_finite() && playback_rate > 0.0 {
+        (preparation_elapsed_ms as f64 * playback_rate)
+            .round()
+            .clamp(0.0, u64::MAX as f64) as u64
+    } else {
+        preparation_elapsed_ms
+    };
+    let requested_now_ms =
+        requested_position_ms.map(|position_ms| position_ms.saturating_add(elapsed_media_ms));
+    resolve_audio_start_position_ms(requested_now_ms, current_position_ms)
+        .saturating_add(pending_ms)
+        .saturating_add(output_latency_ms)
+}
+
+fn resolve_audio_output_latency_ms(
+    output_latency_us: Option<u64>,
+    callback_dac_lead_us: i64,
+) -> u64 {
+    let callback_dac_lead_us = u64::try_from(callback_dac_lead_us).unwrap_or(0);
+    output_latency_us
+        .unwrap_or(0)
+        .max(callback_dac_lead_us)
+        .saturating_add(999)
+        .saturating_div(1_000)
+}
+
+fn resolve_audio_candidate_pcm_position_ms(
+    candidate_start_position_ms: u64,
+    media_position_ms: u64,
+    playback_rate: f64,
+) -> u64 {
+    let playback_rate = if playback_rate.is_finite() && playback_rate > 0.0 {
+        playback_rate
+    } else {
+        1.0
+    };
+    let media_elapsed_ms = media_position_ms.saturating_sub(candidate_start_position_ms);
+    let pcm_elapsed_ms = (media_elapsed_ms as f64 / playback_rate)
+        .round()
+        .clamp(0.0, u64::MAX as f64) as u64;
+    candidate_start_position_ms.saturating_add(pcm_elapsed_ms)
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AudioMixerSourceIdentity {
+    playback_generation: u64,
+    loop_index: u64,
+    playback_state: PlaybackState,
+    source_path: Option<String>,
+    current_video_reference: Option<String>,
+    current_audio_source: Option<String>,
+    current_audio_reference: Option<String>,
+    current_audio_start_at_ms: u64,
+    audio_processing_enabled: bool,
+    audio_stream_revision: u64,
+}
+
+impl From<&PlaybackSnapshot> for AudioMixerSourceIdentity {
+    fn from(snapshot: &PlaybackSnapshot) -> Self {
+        Self {
+            playback_generation: snapshot.playback_generation,
+            loop_index: snapshot.loop_index,
+            playback_state: snapshot.playback_state,
+            source_path: snapshot
+                .source_media
+                .as_ref()
+                .map(|source| source.source_path.clone()),
+            current_video_reference: snapshot.current_video_reference.clone(),
+            current_audio_source: snapshot.current_audio_source.clone(),
+            current_audio_reference: snapshot.current_audio_reference.clone(),
+            current_audio_start_at_ms: snapshot.current_audio_start_at_ms,
+            audio_processing_enabled: snapshot.audio_processing_enabled,
+            audio_stream_revision: snapshot.audio_stream_revision,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -74,6 +204,20 @@ pub struct AppState {
     research_worker: Arc<Mutex<Option<ResearchWorkerTask>>>,
     research_status: Arc<Mutex<ResearchStatusDto>>,
     runtime_resource_task: Arc<RuntimeResourceTask>,
+    /// PortAudio 硬件出口；与 WebView 互斥。None = WebView。
+    audio_output: Arc<Mutex<Option<autolive_portaudio_output::PortAudioOutput>>>,
+    /// FFmpeg 解码线程 → 音频混音线程；PortAudio 失败时整体停止并回退 WebView。
+    audio_mixer: Arc<Mutex<Option<AudioMixerTask>>>,
+    /// 尚未提交的候选音轨；预热期间不占用当前音轨槽位，停止/暂停可取消并 Join。
+    audio_mixer_pending: Arc<Mutex<Option<AudioMixerTask>>>,
+    /// 串行化设备重开、源切换、停止和候选提交，避免旧任务清空新任务环缓。
+    audio_mixer_switch_lock: Arc<Mutex<()>>,
+    audio_output_preferred: Arc<Mutex<bool>>,
+    /// 轮询时用回调计数确认 PortAudio 仍在实际推进，而不是只看对象是否存在。
+    audio_output_last_callback_count: Arc<AtomicU64>,
+    audio_output_last_callback_progress_ms: Arc<AtomicU64>,
+    /// 测试音进行中，防止连点起多线程。
+    audio_output_tone_inflight: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -599,6 +743,14 @@ impl Default for AppState {
             research_worker: Arc::new(Mutex::new(None)),
             research_status: Arc::new(Mutex::new(ResearchStatusDto::default())),
             runtime_resource_task: Arc::new(RuntimeResourceTask::default()),
+            audio_output: Arc::new(Mutex::new(None)),
+            audio_mixer: Arc::new(Mutex::new(None)),
+            audio_mixer_pending: Arc::new(Mutex::new(None)),
+            audio_mixer_switch_lock: Arc::new(Mutex::new(())),
+            audio_output_preferred: Arc::new(Mutex::new(false)),
+            audio_output_last_callback_count: Arc::new(AtomicU64::new(0)),
+            audio_output_last_callback_progress_ms: Arc::new(AtomicU64::new(0)),
+            audio_output_tone_inflight: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -608,7 +760,570 @@ impl AppState {
         &self,
         budget: Duration,
     ) -> Result<RuntimeResourceTaskShutdown, String> {
+        self.stop_audio_mixer().map_err(|error| error.message)?;
         self.runtime_resource_task.shutdown(budget)
+    }
+
+    fn stop_audio_mixer(&self) -> Result<(), CommandErrorDto> {
+        let _switch_guard = self.audio_mixer_switch_lock.lock().map_err(|_| {
+            CommandErrorDto::new("audio_mixer_switch_lock_failed", "音频切换锁已损坏")
+        })?;
+        self.stop_audio_mixer_unlocked()
+    }
+
+    fn stop_audio_mixer_unlocked(&self) -> Result<(), CommandErrorDto> {
+        self.stop_pending_audio_mixer_unlocked()?;
+        let task = self
+            .audio_mixer
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?
+            .take();
+        if let Some(mut task) = task {
+            task.stop();
+        }
+        Ok(())
+    }
+
+    fn stop_pending_audio_mixer_unlocked(&self) -> Result<(), CommandErrorDto> {
+        let task = take_pending_audio_mixer(&self.audio_mixer_pending)?;
+        if let Some(mut task) = task {
+            task.stop_preserving_output();
+        }
+        Ok(())
+    }
+
+    fn pause_audio_output_unlocked(&self) -> Result<(), CommandErrorDto> {
+        // 先封住硬件 callback，再等待混音线程确认，避免确认期间继续消费环缓导致
+        // 暂停后恢复时少播一段或把旧音轨时钟继续向前推进。
+        self.audio_output
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))
+            .map(|mut output| {
+                if let Some(stream) = output.as_mut() {
+                    stream.set_callback_paused(true);
+                }
+            })?;
+        let mixer = self
+            .audio_mixer
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?;
+        let pause_result = mixer.as_ref().map_or(Ok(()), |task| {
+            task.pause_output_for_switch()
+                .map_err(|error| CommandErrorDto::new("audio_mixer_pause_failed", error))
+        });
+        drop(mixer);
+        self.stop_pending_audio_mixer_unlocked()?;
+        pause_result
+    }
+
+    fn pause_audio_output(&self) -> Result<(), CommandErrorDto> {
+        let _switch_guard = self.audio_mixer_switch_lock.lock().map_err(|_| {
+            CommandErrorDto::new("audio_mixer_switch_lock_failed", "音频切换锁已损坏")
+        })?;
+        self.pause_audio_output_unlocked()
+    }
+
+    fn stop_audio_for_playback(&self) -> Result<(), CommandErrorDto> {
+        let _switch_guard = self.audio_mixer_switch_lock.lock().map_err(|_| {
+            CommandErrorDto::new("audio_mixer_switch_lock_failed", "音频切换锁已损坏")
+        })?;
+        {
+            let mut output = self.audio_output.lock().map_err(|_| {
+                CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏")
+            })?;
+            if let Some(stream) = output.as_mut() {
+                stream.set_callback_paused(true);
+                stream.clear_ring();
+            }
+        }
+        self.stop_audio_mixer_unlocked()
+    }
+
+    fn resume_audio_output(&self, app: &AppHandle) -> Result<(), CommandErrorDto> {
+        let _switch_guard = self.audio_mixer_switch_lock.lock().map_err(|_| {
+            CommandErrorDto::new("audio_mixer_switch_lock_failed", "音频切换锁已损坏")
+        })?;
+        let preferred = *self.audio_output_preferred.lock().map_err(|_| {
+            CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏")
+        })?;
+        if !preferred {
+            return Ok(());
+        }
+        let sample_rate_hz = self
+            .audio_output
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))?
+            .as_ref()
+            .map(|stream| stream.sample_rate_hz())
+            .unwrap_or(autolive_portaudio_output::DEFAULT_SAMPLE_RATE_HZ);
+        let has_mixer = self
+            .audio_mixer
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?
+            .is_some();
+        if !has_mixer {
+            self.start_audio_mixer_from_snapshot_unlocked(app, sample_rate_hz, None)?;
+        }
+        self.enable_audio_mixer_output()?;
+        {
+            let mut output = self.audio_output.lock().map_err(|_| {
+                CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏")
+            })?;
+            if let Some(stream) = output.as_mut() {
+                stream.set_callback_paused(false);
+            }
+        }
+        Ok(())
+    }
+
+    fn audio_output_timing_ms(&self, fallback_sample_rate_hz: u32) -> (u64, u64) {
+        self.audio_output
+            .lock()
+            .ok()
+            .and_then(|output| {
+                output.as_ref().map(|stream| {
+                    let health = stream.stream_health();
+                    let sample_rate_hz = health
+                        .actual_sample_rate_hz
+                        .unwrap_or(fallback_sample_rate_hz)
+                        .max(1);
+                    let channels = u64::from(stream.channels().max(1));
+                    let pending_ms = (stream.ring_len_samples() as u64 / channels)
+                        .saturating_mul(1_000)
+                        .saturating_div(u64::from(sample_rate_hz));
+                    let output_latency_ms = resolve_audio_output_latency_ms(
+                        health.output_latency_us,
+                        health.callback_output_buffer_dac_time_delta_us,
+                    );
+                    (pending_ms, output_latency_ms)
+                })
+            })
+            .unwrap_or((0, 0))
+    }
+
+    fn ensure_audio_mixer_source_current(
+        &self,
+        expected: &AudioMixerSourceIdentity,
+    ) -> Result<(), CommandErrorDto> {
+        let current = self
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+            .snapshot();
+        let current_identity = AudioMixerSourceIdentity::from(&current);
+        if current_identity != *expected || current.playback_state != PlaybackState::Playing {
+            return Err(CommandErrorDto::new(
+                "audio_mixer_candidate_stale",
+                "候选预热期间播放轮次、媒体源或声音参数已经变化，保持旧轨并等待最新请求",
+            ));
+        }
+        Ok(())
+    }
+
+    fn enable_audio_mixer_output(&self) -> Result<(), CommandErrorDto> {
+        let mixer = self
+            .audio_mixer
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?;
+        if let Some(task) = mixer.as_ref() {
+            task.enable_output();
+        }
+        Ok(())
+    }
+
+    fn start_audio_mixer_from_snapshot_unlocked(
+        &self,
+        app: &AppHandle,
+        sample_rate_hz: u32,
+        start_position_ms: Option<u64>,
+    ) -> Result<(), CommandErrorDto> {
+        let preparation_started_at = Instant::now();
+        let current_position_ms = self
+            .playback
+            .lock()
+            .ok()
+            .map(|playback| playback.snapshot().current_position_ms)
+            .unwrap_or(0);
+        let observed_position_ms =
+            resolve_audio_start_position_ms(start_position_ms, current_position_ms);
+        let has_fresh_ui_position = start_position_ms.is_some();
+        let (pending_ms, output_latency_ms) = self.audio_output_timing_ms(sample_rate_hz);
+        let candidate_start_position_ms = observed_position_ms
+            .saturating_add(pending_ms)
+            .saturating_add(output_latency_ms);
+        let Some((task, source_identity, playback_rate)) = self.audio_mixer_task_from_snapshot(
+            app,
+            sample_rate_hz,
+            true,
+            Some(candidate_start_position_ms),
+        )?
+        else {
+            return Ok(());
+        };
+        if let Err(error) = task
+            .wait_until_ready_with_reason(Duration::from_millis(PORTAUDIO_SWITCH_READY_TIMEOUT_MS))
+        {
+            let mut task = task;
+            task.stop_preserving_output();
+            return Err(audio_mixer_readiness_error(
+                "audio_mixer_start_not_ready",
+                "audio_mixer_start_ffmpeg_failed",
+                error,
+            ));
+        }
+        let mut task = task;
+        if let Err(error) = self.ensure_audio_mixer_source_current(&source_identity) {
+            task.stop_preserving_output();
+            return Err(error);
+        }
+        let current_position_ms = self
+            .playback
+            .lock()
+            .ok()
+            .map(|playback| playback.snapshot().current_position_ms)
+            .unwrap_or(0);
+        let (pending_ms, output_latency_ms) = self.audio_output_timing_ms(sample_rate_hz);
+        let commit_position_ms = resolve_audio_commit_position_ms(
+            has_fresh_ui_position.then_some(observed_position_ms),
+            current_position_ms,
+            if has_fresh_ui_position {
+                elapsed_millis(preparation_started_at)
+            } else {
+                0
+            },
+            playback_rate,
+            pending_ms,
+            output_latency_ms,
+        );
+        let candidate_pcm_position_ms = resolve_audio_candidate_pcm_position_ms(
+            candidate_start_position_ms,
+            commit_position_ms,
+            playback_rate,
+        );
+        if let Err(error) = task.commit_at_position(candidate_pcm_position_ms) {
+            task.stop_preserving_output();
+            return Err(CommandErrorDto::new("audio_mixer_commit_failed", error));
+        }
+        let mut mixer = self
+            .audio_mixer
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?;
+        mixer.replace(task);
+        Ok(())
+    }
+
+    fn audio_mixer_task_from_snapshot(
+        &self,
+        app: &AppHandle,
+        sample_rate_hz: u32,
+        candidate: bool,
+        start_position_ms: Option<u64>,
+    ) -> Result<Option<(AudioMixerTask, AudioMixerSourceIdentity, f64)>, CommandErrorDto> {
+        let (
+            source_path,
+            start_position_ms,
+            has_audio,
+            filter_graph,
+            audio_stream_variant_count,
+            source_identity,
+            playback_rate,
+        ) = {
+            let playback = self
+                .playback
+                .lock()
+                .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+            let snapshot = playback.snapshot();
+            let Some(source) = snapshot.source_media.as_ref() else {
+                return Ok(None);
+            };
+            let realtime_audio_path = (snapshot.current_audio_source.as_deref()
+                == Some("realtime_variant"))
+            .then(|| snapshot.current_audio_reference.clone())
+            .flatten()
+            .map(PathBuf::from);
+            let has_realtime_audio = realtime_audio_path.is_some();
+            let stream_processed_audio =
+                snapshot.audio_processing_enabled && realtime_audio_path.is_none();
+            let source_path = realtime_audio_path.or_else(|| {
+                if stream_processed_audio {
+                    Some(PathBuf::from(source.source_path.clone()))
+                } else {
+                    snapshot
+                        .current_video_reference
+                        .clone()
+                        .or_else(|| Some(source.source_path.clone()))
+                        .map(PathBuf::from)
+                }
+            });
+            let (filter_graph, playback_rate) = if stream_processed_audio {
+                let (audio, variants) = playback.audio_stream_configuration();
+                let playback_rate = audio.playback_speed;
+                (
+                    Some(
+                        build_audio_stream_filter_graph(
+                            &audio,
+                            &variants,
+                            source.audio_sample_rate_hz,
+                            sample_rate_hz,
+                        )
+                        .map_err(|error| {
+                            CommandErrorDto::new("audio_stream_filter_invalid", error.to_string())
+                        })?,
+                    ),
+                    playback_rate,
+                )
+            } else {
+                (None, 1.0)
+            };
+            (
+                source_path,
+                resolve_audio_start_position_ms(start_position_ms, snapshot.current_position_ms),
+                source.audio_sample_rate_hz.is_some() || has_realtime_audio,
+                filter_graph,
+                if stream_processed_audio {
+                    snapshot.audio_stream_variant_count
+                } else {
+                    0
+                },
+                AudioMixerSourceIdentity::from(&snapshot),
+                playback_rate,
+            )
+        };
+        if !has_audio {
+            return Ok(None);
+        }
+        let Some(source_path) = source_path else {
+            return Ok(None);
+        };
+        let target_root = runtime_resource_target_root(app)
+            .map_err(|error| CommandErrorDto::new("media_resource_dir_failed", error))?;
+        let (ffmpeg_path, _) = configured_media_engine_paths_with_resource_dir(&target_root)
+            .map_err(|error| CommandErrorDto::new("media_engine_unavailable", error.to_string()))?;
+        let task = if candidate {
+            AudioMixerTask::start_candidate_with_filter_and_variant_count(
+                Arc::clone(&self.audio_output),
+                ffmpeg_path,
+                source_path,
+                sample_rate_hz,
+                start_position_ms,
+                filter_graph,
+                audio_stream_variant_count,
+                playback_rate,
+            )
+        } else {
+            AudioMixerTask::start_with_filter_and_variant_count(
+                Arc::clone(&self.audio_output),
+                ffmpeg_path,
+                source_path,
+                sample_rate_hz,
+                start_position_ms,
+                filter_graph,
+                audio_stream_variant_count,
+            )
+        }
+        .map_err(|error| CommandErrorDto::new("audio_mixer_start_failed", error))?;
+        Ok(Some((task, source_identity, playback_rate)))
+    }
+
+    // 切换提交边界需要同时携带两个时钟、一次预热事务和候选身份，拆成一次性结构会隐藏校验关系。
+    #[allow(clippy::too_many_arguments)]
+    fn commit_audio_mixer_candidate(
+        &self,
+        mut candidate: AudioMixerTask,
+        sample_rate_hz: u32,
+        observed_position_ms: u64,
+        candidate_start_position_ms: u64,
+        preparation_started_at: Instant,
+        playback_rate: f64,
+        source_identity: &AudioMixerSourceIdentity,
+    ) -> Result<(), CommandErrorDto> {
+        if let Err(error) = self.ensure_audio_mixer_source_current(source_identity) {
+            candidate.stop_preserving_output();
+            return Err(error);
+        }
+        // 先确认候选已经追上“画面位置 + 旧环缓待播时长”，再停止旧轨。
+        // 停旧轨后画面向前推进、旧环缓等量排空，二者之和基本不变，可复用该提交位置。
+        let current_position_ms = self
+            .playback
+            .lock()
+            .ok()
+            .map(|playback| playback.snapshot().current_position_ms)
+            .unwrap_or(0);
+        let (pending_ms, output_latency_ms) = self.audio_output_timing_ms(sample_rate_hz);
+        let commit_position_ms = resolve_audio_commit_position_ms(
+            Some(observed_position_ms),
+            current_position_ms,
+            elapsed_millis(preparation_started_at),
+            playback_rate,
+            pending_ms,
+            output_latency_ms,
+        );
+        let candidate_pcm_position_ms = resolve_audio_candidate_pcm_position_ms(
+            candidate_start_position_ms,
+            commit_position_ms,
+            playback_rate,
+        );
+        if let Err(error) = candidate.validate_commit_at_position(candidate_pcm_position_ms) {
+            let mut candidate = candidate;
+            candidate.stop_preserving_output();
+            return Err(CommandErrorDto::new(
+                "audio_mixer_candidate_not_caught_up",
+                error,
+            ));
+        }
+
+        // 提交前再次确认硬件消费者仍在推进；如果 callback 已停，必须保留旧任务和旧环缓，
+        // 不能先停旧轨再把候选写入一个不会被消费的输出。
+        let output_consumer_active = self
+            .audio_output
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))?
+            .as_ref()
+            .is_some_and(|stream| {
+                let health = stream.stream_health();
+                health.application_running
+                    && matches!(
+                        health.hardware_state,
+                        autolive_portaudio_output::PortAudioHardwareState::Active
+                    )
+            });
+        if !output_consumer_active {
+            let mut candidate = candidate;
+            candidate.stop_preserving_output();
+            return Err(CommandErrorDto::new(
+                "audio_output_consumer_inactive",
+                "PortAudio 硬件消费者未处于活动状态，保持旧轨",
+            ));
+        }
+
+        // 先暂停旧任务，并等待它确认不再向共享环缓写入；候选提交期间旧轨仍保留在
+        // audio_mixer 槽位，提交失败可以立即恢复，不会先停旧轨再进入静音。
+        let old_paused = {
+            let mixer = self.audio_mixer.lock().map_err(|_| {
+                CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏")
+            })?;
+            mixer.as_ref().map(|old| old.pause_output_for_switch())
+        };
+        let Some(old_paused) = old_paused else {
+            candidate.stop_preserving_output();
+            return Err(CommandErrorDto::new(
+                "audio_mixer_old_track_missing",
+                "旧音轨不存在，取消候选切换",
+            ));
+        };
+        if let Err(error) = old_paused {
+            if let Ok(mixer) = self.audio_mixer.lock() {
+                if let Some(old) = mixer.as_ref() {
+                    old.resume_output_after_switch_failure();
+                }
+            }
+            let mut candidate = candidate;
+            candidate.stop_preserving_output();
+            return Err(CommandErrorDto::new(
+                "audio_mixer_old_track_pause_failed",
+                error,
+            ));
+        }
+        if let Err(error) = self.ensure_audio_mixer_source_current(source_identity) {
+            if let Ok(mixer) = self.audio_mixer.lock() {
+                if let Some(old) = mixer.as_ref() {
+                    old.resume_output_after_switch_failure();
+                }
+            }
+            candidate.stop_preserving_output();
+            return Err(error);
+        }
+        if let Err(error) = candidate.commit_at_position(candidate_pcm_position_ms) {
+            if let Ok(mixer) = self.audio_mixer.lock() {
+                if let Some(old) = mixer.as_ref() {
+                    old.resume_output_after_switch_failure();
+                }
+            }
+            candidate.stop_preserving_output();
+            return Err(CommandErrorDto::new("audio_mixer_commit_failed", error));
+        }
+        candidate.enable_output();
+        let mut mixer = match self.audio_mixer.lock() {
+            Ok(mixer) => mixer,
+            Err(_) => {
+                candidate.stop_preserving_output();
+                return Err(CommandErrorDto::new(
+                    "audio_mixer_lock_failed",
+                    "音频混音状态锁已损坏",
+                ));
+            }
+        };
+        let old = mixer.take();
+        mixer.replace(candidate);
+        drop(mixer);
+        if let Some(mut old) = old {
+            old.stop_preserving_output();
+        }
+        Ok(())
+    }
+
+    /// 预热只短暂持有候选槽锁；每次最多等待一个轮询片段，让暂停/停止可以取走并取消候选。
+    fn wait_for_pending_audio_mixer(&self) -> Result<(), CommandErrorDto> {
+        let started = Instant::now();
+        let mut config = AudioMixerConfigContext {
+            sample_rate_hz: autolive_portaudio_output::DEFAULT_SAMPLE_RATE_HZ,
+            prebuffer_ms: 50,
+            audio_stream_variant_count: 1,
+        };
+        loop {
+            let elapsed = started.elapsed();
+            let timeout = Duration::from_millis(PORTAUDIO_SWITCH_READY_TIMEOUT_MS);
+            if elapsed >= timeout {
+                return Err(audio_mixer_readiness_error(
+                    "audio_mixer_candidate_not_ready",
+                    "audio_mixer_candidate_ffmpeg_failed",
+                    AudioMixerReadinessError::PreheatTimeout {
+                        waited_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+                        timeout_ms: PORTAUDIO_SWITCH_READY_TIMEOUT_MS,
+                        config,
+                    },
+                ));
+            }
+            let wait_for =
+                (timeout - elapsed).min(Duration::from_millis(PORTAUDIO_SWITCH_READY_POLL_MS));
+            let readiness = {
+                let pending = self.audio_mixer_pending.lock().map_err(|_| {
+                    CommandErrorDto::new(
+                        "audio_mixer_pending_lock_failed",
+                        "待切换音频混音状态锁已损坏",
+                    )
+                })?;
+                let Some(task) = pending.as_ref() else {
+                    return Err(audio_mixer_readiness_error(
+                        "audio_mixer_candidate_cancelled",
+                        "audio_mixer_candidate_ffmpeg_failed",
+                        AudioMixerReadinessError::Runtime {
+                            waited_ms: started.elapsed().as_millis().min(u128::from(u64::MAX))
+                                as u64,
+                            config,
+                            reason: "候选音轨已被暂停或停止取消".to_owned(),
+                        },
+                    ));
+                };
+                task.wait_until_ready_with_reason(wait_for)
+            };
+            match readiness {
+                Ok(()) => return Ok(()),
+                Err(AudioMixerReadinessError::PreheatTimeout {
+                    config: latest_config,
+                    ..
+                }) => {
+                    config = latest_config;
+                }
+                Err(error) => {
+                    return Err(audio_mixer_readiness_error(
+                        "audio_mixer_candidate_not_ready",
+                        "audio_mixer_candidate_ffmpeg_failed",
+                        error,
+                    ));
+                }
+            }
+        }
     }
 
     fn reap_finished_speech_worker(&self) -> Result<bool, CommandErrorDto> {
@@ -761,10 +1476,10 @@ impl AppState {
             let mut worker = self.media_worker.lock().map_err(|_| {
                 CommandErrorDto::new("media_worker_lock_failed", "媒体 Worker 状态锁已损坏")
             })?;
-            if worker
-                .as_ref()
-                .is_some_and(|task| task.completed.load(Ordering::Acquire))
-            {
+            let finished = worker.as_ref().is_some_and(|task| {
+                task.completed.load(Ordering::Acquire) || task.handle.is_finished()
+            });
+            if finished {
                 worker.take()
             } else {
                 None
@@ -892,6 +1607,8 @@ pub struct PlaybackSnapshotDto {
     pub pending_audio_start_at_ms: Option<u64>,
     pub pending_audio_duration_ms: Option<u64>,
     pub audio_processing_parameters_version: String,
+    pub audio_stream_variant_count: usize,
+    pub audio_stream_revision: u64,
     pub audio_processing_status: String,
     pub audio_processing_runtime: bool,
     pub audio_processing_gain_db: f64,
@@ -932,6 +1649,8 @@ impl From<PlaybackSnapshot> for PlaybackSnapshotDto {
             pending_audio_start_at_ms: value.pending_audio_start_at_ms,
             pending_audio_duration_ms: value.pending_audio_duration_ms,
             audio_processing_parameters_version: value.audio_processing_parameters_version,
+            audio_stream_variant_count: value.audio_stream_variant_count,
+            audio_stream_revision: value.audio_stream_revision,
             audio_processing_status: value.audio_processing_status,
             audio_processing_runtime: value.audio_processing_runtime,
             audio_processing_gain_db: value.audio_processing_gain_db,
@@ -990,6 +1709,9 @@ pub struct MediaParameterValidationResultDto {
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartMediaProcessingRequestDto {
     pub params: LocalResearchParams,
+    /// 多虚拟轨音频参数；空则只用 params.audio。
+    #[serde(default)]
+    pub audio_variants: Option<Vec<autolive_desktop_core::research_params::AudioResearchParams>>,
     pub timeout_seconds: Option<u64>,
 }
 
@@ -1069,7 +1791,7 @@ fn prune_cache_dir(
         .checked_sub(Duration::from_secs(10 * 60))
         .unwrap_or(SystemTime::UNIX_EPOCH);
     // 新→旧，便于按“最近 N 个”保留。
-    entries.sort_by(|a, b| b.2.cmp(&a.2));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.2));
     let mut kept_unprotected: usize = 0;
     for (path, size, modified) in entries {
         let is_partial = path
@@ -1091,7 +1813,7 @@ fn prune_cache_dir(
         // 未完成 partial 不计入 N；仅过期 partial 删。保护文件永不因额度删。
         let over_budget = remaining_bytes > max_bytes && !is_protected;
         let should_remove = stale_partial || over_file_limit || over_budget;
-        if is_protected && !stale_partial {
+        if is_protected {
             continue;
         }
         if !should_remove {
@@ -1110,10 +1832,83 @@ fn prune_cache_dir(
     })
 }
 
+fn remove_media_processing_cache_files_at(
+    directory: &Path,
+    protected_paths: &[PathBuf],
+    now: SystemTime,
+) -> std::io::Result<CacheCleanupResultDto> {
+    if !directory.is_dir() {
+        return Ok(CacheCleanupResultDto {
+            removed_files: 0,
+            removed_bytes: 0,
+            remaining_bytes: 0,
+        });
+    }
+    let protected = protected_paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let partial_expiry = now
+        .checked_sub(Duration::from_secs(10 * 60))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        entries.push((
+            path,
+            metadata.len(),
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        ));
+    }
+    let mut remaining_bytes = entries.iter().map(|(_, size, _)| *size).sum::<u64>();
+    let mut removed_files: u32 = 0;
+    let mut removed_bytes: u64 = 0;
+    for (path, size, modified) in entries {
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let is_partial = name.starts_with("processed-") && name.contains(".partial");
+        let is_completed = name.starts_with("processed-") && name.ends_with(".mp4") && !is_partial;
+        let stale_partial = is_partial && modified <= partial_expiry;
+        if protected.contains(&path) || (!is_completed && !stale_partial) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                remaining_bytes = remaining_bytes.saturating_sub(size);
+                removed_files += 1;
+                removed_bytes = removed_bytes.saturating_add(size);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                remaining_bytes = remaining_bytes.saturating_sub(size);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(CacheCleanupResultDto {
+        removed_files,
+        removed_bytes,
+        remaining_bytes,
+    })
+}
+
+fn remove_media_processing_cache_files(
+    directory: &Path,
+    protected_paths: &[PathBuf],
+) -> std::io::Result<CacheCleanupResultDto> {
+    remove_media_processing_cache_files_at(directory, protected_paths, SystemTime::now())
+}
+
 #[cfg(test)]
 mod cache_tests {
-    use super::prune_cache_dir;
+    use super::{prune_cache_dir, remove_media_processing_cache_files_at};
     use std::fs;
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn cache_prune_keeps_protected_files_and_removes_old_partials() {
@@ -1172,6 +1967,55 @@ mod cache_tests {
         assert_eq!(result.removed_files, 1);
         let _ignored = fs::remove_dir_all(directory);
     }
+
+    #[test]
+    fn media_cache_cleanup_removes_only_unprotected_completed_files_and_stale_partials() {
+        let directory = std::env::temp_dir().join(format!(
+            "autolive-media-cache-delete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be valid")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("cache directory should be created");
+        let protected = directory.join("processed-current.mp4");
+        let completed = directory.join("processed-old.mp4");
+        let stale_partial = directory.join("processed-old.partial.mp4");
+        let fresh_partial = directory.join("processed-fresh.partial.mp4");
+        let unrelated = directory.join("other.mp4");
+        fs::write(&protected, b"keep").expect("write");
+        fs::write(&completed, b"done").expect("write");
+        fs::write(&stale_partial, b"stale").expect("write");
+        fs::write(&unrelated, b"other").expect("write");
+
+        let result = remove_media_processing_cache_files_at(
+            &directory,
+            std::slice::from_ref(&protected),
+            SystemTime::now() + Duration::from_secs(11 * 60),
+        )
+        .expect("media cache cleanup should succeed");
+
+        assert!(protected.exists());
+        assert!(!completed.exists());
+        assert!(!stale_partial.exists());
+        assert!(unrelated.exists());
+        assert_eq!(result.removed_files, 2);
+        assert_eq!(result.removed_bytes, 9);
+        assert_eq!(result.remaining_bytes, 9);
+
+        fs::write(&fresh_partial, b"fresh").expect("write");
+        let fresh_result = remove_media_processing_cache_files_at(
+            &directory,
+            std::slice::from_ref(&protected),
+            SystemTime::now(),
+        )
+        .expect("fresh partial cleanup should succeed");
+        assert!(fresh_partial.exists());
+        assert_eq!(fresh_result.removed_files, 0);
+        assert_eq!(fresh_result.remaining_bytes, 14);
+        let _ignored = fs::remove_dir_all(directory);
+    }
 }
 
 fn cleanup_local_caches(
@@ -1182,7 +2026,7 @@ fn cleanup_local_caches(
         .path()
         .app_cache_dir()
         .map_err(|error| CommandErrorDto::new("cache_dir_failed", error.to_string()))?;
-    let (current_video, pending_video, research_paths) = {
+    let (current_video, pending_video, current_audio, pending_audio, research_paths) = {
         let playback = state
             .playback
             .lock()
@@ -1197,6 +2041,8 @@ fn cleanup_local_caches(
         (
             snapshot.current_video_reference.map(PathBuf::from),
             snapshot.pending_video_reference.map(PathBuf::from),
+            snapshot.current_audio_reference.map(PathBuf::from),
+            snapshot.pending_audio_reference.map(PathBuf::from),
             research_paths,
         )
     };
@@ -1204,7 +2050,7 @@ fn cleanup_local_caches(
         &cache_root.join("media-processing"),
         MEDIA_CACHE_MAX_BYTES,
         Some(MEDIA_CACHE_MAX_FILES),
-        &[current_video, pending_video]
+        &[current_video, pending_video, current_audio, pending_audio]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>(),
@@ -1222,6 +2068,59 @@ fn cleanup_local_caches(
         removed_bytes: media_result.removed_bytes + research_result.removed_bytes,
         remaining_bytes: media_result.remaining_bytes + research_result.remaining_bytes,
     })
+}
+
+fn cleanup_media_processing_cache(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<CacheCleanupResultDto, CommandErrorDto> {
+    let _ = state.reap_finished_media_worker()?;
+    if state.media_worker_is_running()? {
+        return Err(CommandErrorDto::new(
+            "media_cache_cleanup_busy",
+            "媒体处理仍在进行，请完成后再删除已生成缓存",
+        ));
+    }
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| CommandErrorDto::new("cache_dir_failed", error.to_string()))?
+        .join("media-processing");
+    let protected_paths = {
+        let playback = state
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+        let snapshot = playback.snapshot();
+        if snapshot.video_processing_status == "processing"
+            || snapshot.audio_processing_status == "processing"
+        {
+            return Err(CommandErrorDto::new(
+                "media_cache_cleanup_busy",
+                "媒体处理仍在进行，请完成后再删除已生成缓存",
+            ));
+        }
+        if matches!(snapshot.playback_state, PlaybackState::Playing)
+            && snapshot.audio_processing_enabled
+        {
+            return Err(CommandErrorDto::new(
+                "media_cache_cleanup_playing",
+                "声音处理正在播放，请先暂停或停止播放后再删除缓存",
+            ));
+        }
+        [
+            snapshot.current_video_reference,
+            snapshot.pending_video_reference,
+            snapshot.current_audio_reference,
+            snapshot.pending_audio_reference,
+        ]
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>()
+    };
+    remove_media_processing_cache_files(&cache_dir, &protected_paths)
+        .map_err(|error| CommandErrorDto::new("media_cache_cleanup_failed", error.to_string()))
 }
 
 impl AppState {
@@ -1389,6 +2288,1099 @@ pub fn get_media_engine_capabilities(
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AudioOutputBackendStatusDto {
+    pub available: bool,
+    pub selected_backend: String,
+    pub preferred_portaudio: bool,
+    pub running: bool,
+    pub reason: Option<String>,
+    pub xrun_count: u64,
+    pub hardware_state: String,
+    pub callback_status_flags: u64,
+    pub callback_status_flags_count: u64,
+    pub callback_underrun_count: u64,
+    pub producer_drop_count: u64,
+    /// PortAudio 报告的实际输出/DAC 提前量，取两种硬件时钟中的较大值。
+    pub output_latency_ms: u64,
+    pub actual_sample_rate_hz: Option<u32>,
+    pub callback_pcm_frames_total: u64,
+    pub callback_stalled_ms: Option<u64>,
+    pub ring_len_samples: u64,
+    pub ring_capacity_samples: u64,
+    pub device_index: Option<i32>,
+    pub memory_buffer_kib: u32,
+    pub frames_per_buffer: u32,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    /// 当前音轨与候选音轨的任务数；最多为 2（current + pending）。
+    pub audio_task_count: usize,
+    pub current_audio_ffmpeg_pid: Option<u32>,
+    pub pending_audio_ffmpeg_pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AudioOutputDeviceDto {
+    pub id: String,
+    pub name: String,
+    pub host_api: String,
+    pub max_output_channels: u16,
+    pub default_sample_rate_hz: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetAudioOutputBackendRequestDto {
+    /// true = 尝试 PortAudio；false = WebView。
+    pub prefer_portaudio: bool,
+    /// PortAudio 设备索引；None = 默认输出。
+    pub device_index: Option<i32>,
+    /// PortAudio 硬件回调帧数；仅供内部兼容和诊断，不是 UI 的内存缓冲。
+    pub frames_per_buffer: Option<u32>,
+    /// 应用侧 PCM 环形内存缓冲，范围 128–2048 KiB；省略时默认 1024 KiB。
+    pub memory_buffer_kib: Option<u32>,
+    /// 与 Web Audio Context 对齐；None = 48k。
+    pub sample_rate_hz: Option<u32>,
+    /// UI 在启动/重开出口前读取的 video.currentTime，避免使用过期 Rust 快照。
+    pub position_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncAudioOutputSourceRequestDto {
+    /// 本次候选音轨创建时的视频位置；提交时后端仍会读取最新快照做校正。
+    pub position_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlayPortAudioTestToneRequestDto {
+    pub frequency_hz: Option<f32>,
+    pub duration_ms: Option<u32>,
+    pub amplitude: Option<f32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WritePortAudioPcmRequestDto {
+    /// 交错 f32，长度必须是声道数的整数倍；单次上限防炸 IPC。
+    pub samples: Vec<f32>,
+}
+
+const PORTAUDIO_PCM_WRITE_MAX_SAMPLES: usize = 16_384;
+
+fn host_api_label(kind: autolive_portaudio_output::HostApiKind) -> &'static str {
+    match kind {
+        autolive_portaudio_output::HostApiKind::Default => "default",
+        autolive_portaudio_output::HostApiKind::Wasapi => "wasapi",
+        autolive_portaudio_output::HostApiKind::Asio => "asio",
+        autolive_portaudio_output::HostApiKind::Mme => "mme",
+        autolive_portaudio_output::HostApiKind::DirectSound => "dsound",
+        autolive_portaudio_output::HostApiKind::Wdmks => "wdmks",
+        autolive_portaudio_output::HostApiKind::Other => "other",
+    }
+}
+
+fn portaudio_hardware_state_label(
+    state: autolive_portaudio_output::PortAudioHardwareState,
+) -> &'static str {
+    match state {
+        autolive_portaudio_output::PortAudioHardwareState::Unsupported => "unsupported",
+        autolive_portaudio_output::PortAudioHardwareState::NotCreated => "not_created",
+        autolive_portaudio_output::PortAudioHardwareState::Active => "active",
+        autolive_portaudio_output::PortAudioHardwareState::Stopped => "stopped",
+        autolive_portaudio_output::PortAudioHardwareState::Inactive => "inactive",
+        autolive_portaudio_output::PortAudioHardwareState::Unknown => "unknown",
+        autolive_portaudio_output::PortAudioHardwareState::QueryError(_) => "query_error",
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn reset_audio_output_callback_observation(state: &AppState) {
+    state
+        .audio_output_last_callback_count
+        .store(0, Ordering::Relaxed);
+    state
+        .audio_output_last_callback_progress_ms
+        .store(0, Ordering::Relaxed);
+}
+
+fn audio_output_status_dto(
+    state: &AppState,
+) -> Result<AudioOutputBackendStatusDto, CommandErrorDto> {
+    // 源/设备切换事务期间，状态轮询只能报告快照，不能抢先关闭正在预热的出口。
+    let switch_in_progress = state.audio_mixer_switch_lock.try_lock().is_err()
+        || state
+            .audio_mixer_pending
+            .lock()
+            .ok()
+            .is_some_and(|pending| pending.is_some());
+    let preferred = *state
+        .audio_output_preferred
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))?;
+    let mut output = state
+        .audio_output
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))?;
+    let now_ms = unix_now_ms();
+    let health = output
+        .as_ref()
+        .map(autolive_portaudio_output::PortAudioOutput::stream_health);
+    let callback_count = health.map(|snapshot| snapshot.callback_count).unwrap_or(0);
+    let application_running = health.is_some_and(|snapshot| snapshot.application_running);
+    let hardware_state = health
+        .map(|snapshot| snapshot.hardware_state)
+        .unwrap_or(autolive_portaudio_output::PortAudioHardwareState::NotCreated);
+    let hardware_active = matches!(
+        hardware_state,
+        autolive_portaudio_output::PortAudioHardwareState::Active
+    );
+    let hardware_unhealthy = output.is_some() && !hardware_active;
+    let hardware_inactive = matches!(
+        hardware_state,
+        autolive_portaudio_output::PortAudioHardwareState::Stopped
+            | autolive_portaudio_output::PortAudioHardwareState::Inactive
+            | autolive_portaudio_output::PortAudioHardwareState::Unknown
+            | autolive_portaudio_output::PortAudioHardwareState::QueryError(_)
+    );
+    // 已创建输出流时直接使用真实流快照，不重复 Pa_Initialize/枚举设备，
+    // 避免和混音线程争用 PortAudio 全局锁；硬件状态由 stream_health() 查询。
+    let probe = if output.is_some() {
+        autolive_portaudio_output::OutputBackendStatus {
+            available: true,
+            selected_backend: "portaudio",
+            reason: None,
+            xrun_count: 0,
+        }
+    } else {
+        autolive_portaudio_output::probe_portaudio()
+    };
+    let xrun_count = health
+        .map(|snapshot| snapshot.xrun_count)
+        .unwrap_or(probe.xrun_count);
+    let callback_status_flags = health
+        .map(|snapshot| snapshot.callback_last_status_flags)
+        .unwrap_or(0);
+    let callback_status_flags_count = health
+        .map(|snapshot| snapshot.callback_status_flags_count)
+        .unwrap_or(0);
+    let callback_underrun_count = health
+        .map(|snapshot| snapshot.callback_underrun_count)
+        .unwrap_or(0);
+    let producer_drop_count = health
+        .map(|snapshot| snapshot.producer_drop_count)
+        .unwrap_or(0);
+    let output_latency_ms = health
+        .map(|snapshot| {
+            resolve_audio_output_latency_ms(
+                snapshot.output_latency_us,
+                snapshot.callback_output_buffer_dac_time_delta_us,
+            )
+        })
+        .unwrap_or(0);
+    let actual_sample_rate_hz = health.and_then(|snapshot| snapshot.actual_sample_rate_hz);
+    let callback_pcm_frames_total = health
+        .map(|snapshot| snapshot.callback_pcm_frames_total)
+        .unwrap_or(0);
+    let ring_len_samples = health
+        .map(|snapshot| snapshot.ring_len_samples as u64)
+        .unwrap_or(0);
+    let ring_capacity_samples = health
+        .map(|snapshot| snapshot.ring_capacity_samples as u64)
+        .unwrap_or(0);
+    let previous_callback_count = state
+        .audio_output_last_callback_count
+        .load(Ordering::Relaxed);
+    let previous_progress_ms = state
+        .audio_output_last_callback_progress_ms
+        .load(Ordering::Relaxed);
+    let callback_stalled = if output.is_none() || hardware_unhealthy {
+        state
+            .audio_output_last_callback_count
+            .store(callback_count, Ordering::Relaxed);
+        state
+            .audio_output_last_callback_progress_ms
+            .store(now_ms, Ordering::Relaxed);
+        true
+    } else if callback_count < previous_callback_count {
+        // 新流的回调计数从 0 重新开始，给它一个与首次启动相同的观察宽限期。
+        state
+            .audio_output_last_callback_count
+            .store(callback_count, Ordering::Relaxed);
+        state
+            .audio_output_last_callback_progress_ms
+            .store(now_ms, Ordering::Relaxed);
+        false
+    } else if callback_count > previous_callback_count {
+        state
+            .audio_output_last_callback_count
+            .store(callback_count, Ordering::Relaxed);
+        state
+            .audio_output_last_callback_progress_ms
+            .store(now_ms, Ordering::Relaxed);
+        false
+    } else if previous_progress_ms == 0 {
+        state
+            .audio_output_last_callback_progress_ms
+            .store(now_ms, Ordering::Relaxed);
+        false
+    } else {
+        now_ms.saturating_sub(previous_progress_ms) > PORTAUDIO_CALLBACK_STALL_MS
+    };
+    // 启动阶段的短暂欠载不应立刻切走 PortAudio：应用侧内存环缓和 FFmpeg
+    // loudnorm 初始化可能跨过若干回调。仅在运行约 5 秒且至少 75% 回调欠载
+    // 时认定为持续无声，保留真正无源时的 WebView 回退能力。
+    let sustained_underrun = output.is_some()
+        && callback_count > 1_024
+        && callback_underrun_count > 32
+        && callback_underrun_count.saturating_mul(4) >= callback_count.saturating_mul(3);
+    let callback_stalled_ms = if output.is_none() || hardware_unhealthy {
+        None
+    } else if callback_count != previous_callback_count || previous_progress_ms == 0 {
+        Some(0)
+    } else {
+        Some(now_ms.saturating_sub(previous_progress_ms))
+    };
+    let callback_paused = output
+        .as_ref()
+        .is_some_and(|stream| stream.is_callback_paused());
+    let running = output.is_some()
+        && application_running
+        && hardware_active
+        && !callback_paused
+        && !callback_stalled
+        && !sustained_underrun;
+    let portaudio_unhealthy =
+        output.is_none() || hardware_unhealthy || callback_stalled || sustained_underrun;
+    let device_index = output.as_ref().and_then(|stream| stream.device_index());
+    let frames_per_buffer = output
+        .as_ref()
+        .map(|stream| stream.frames_per_buffer())
+        .unwrap_or(autolive_portaudio_output::DEFAULT_FRAMES_PER_BUFFER);
+    let memory_buffer_kib = output
+        .as_ref()
+        .map(|stream| stream.ring_capacity_kib())
+        .unwrap_or(autolive_portaudio_output::DEFAULT_RING_CAPACITY_KIB);
+    let sample_rate_hz = output
+        .as_ref()
+        .map(|stream| stream.sample_rate_hz())
+        .unwrap_or(autolive_portaudio_output::DEFAULT_SAMPLE_RATE_HZ);
+    let channels = output.as_ref().map(|stream| stream.channels()).unwrap_or(2);
+    let (
+        mixer_backpressure,
+        mixer_failure,
+        audio_task_count,
+        current_audio_ffmpeg_pid,
+        pending_audio_ffmpeg_pid,
+    ) = {
+        let mixer = state.audio_mixer.lock().ok();
+        let current_task = mixer.as_ref().and_then(|mixer| mixer.as_ref());
+        let pending = state.audio_mixer_pending.lock().ok();
+        let pending_task = pending.as_ref().and_then(|pending| pending.as_ref());
+        (
+            current_task.is_some_and(AudioMixerTask::has_output_backpressure),
+            current_task.and_then(AudioMixerTask::failure),
+            (if current_task.is_some() { 1 } else { 0 })
+                + (if pending_task.is_some() { 1 } else { 0 }),
+            current_task.and_then(AudioMixerTask::ffmpeg_pid),
+            pending_task.and_then(AudioMixerTask::ffmpeg_pid),
+        )
+    };
+    let hardware_state_label = portaudio_hardware_state_label(hardware_state).to_owned();
+    if preferred
+        && output.is_some()
+        && (portaudio_unhealthy || mixer_failure.is_some() || callback_status_flags != 0)
+    {
+        eprintln!(
+            "autolive audio output health: hardware_state={}, application_running={}, callback_count={}, callback_status_flags=0x{:x}, callback_status_flags_count={}, callback_underrun_count={}, producer_drop_count={}, output_latency_ms={}, actual_sample_rate_hz={:?}, callback_pcm_frames_total={}, callback_stalled_ms={:?}, xrun_count={}, ring_len_samples={}, ring_capacity_samples={}",
+            hardware_state_label,
+            application_running,
+            callback_count,
+            callback_status_flags,
+            callback_status_flags_count,
+            callback_underrun_count,
+            producer_drop_count,
+            output_latency_ms,
+            actual_sample_rate_hz,
+            callback_pcm_frames_total,
+            callback_stalled_ms,
+            xrun_count,
+            ring_len_samples,
+            ring_capacity_samples,
+        );
+    }
+    if preferred && !switch_in_progress && (portaudio_unhealthy || mixer_failure.is_some()) {
+        let fallback_reason = mixer_failure
+            .as_deref()
+            .map(|reason| format!("PortAudio 音频处理失败，已回退 WebView：{reason}"))
+            .unwrap_or_else(|| {
+                if mixer_backpressure {
+                    "PortAudio 输出消费者无进度，已回退 WebView".to_owned()
+                } else if sustained_underrun {
+                    "PortAudio 环形缓冲持续欠载，已回退 WebView".to_owned()
+                } else if hardware_inactive {
+                    format!(
+                        "PortAudio 硬件流已停止（{}），已回退 WebView",
+                        hardware_state_label
+                    )
+                } else if hardware_unhealthy {
+                    format!(
+                        "PortAudio 硬件流状态异常（{}），已回退 WebView",
+                        hardware_state_label
+                    )
+                } else {
+                    "PortAudio 回调已停止或无进度，已回退 WebView".to_owned()
+                }
+            });
+        eprintln!("autolive audio output fallback: {fallback_reason}");
+        if let Some(mut stream) = output.take() {
+            stream.stop();
+        }
+        reset_audio_output_callback_observation(state);
+        drop(output);
+        if let Ok(mut preferred_state) = state.audio_output_preferred.lock() {
+            *preferred_state = false;
+        }
+        let mixer_stopped = match state.stop_audio_mixer() {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "autolive audio mixer cleanup after fallback failed: {}",
+                    error.message
+                );
+                false
+            }
+        };
+        return Ok(AudioOutputBackendStatusDto {
+            available: probe.available,
+            selected_backend: "webview".to_owned(),
+            preferred_portaudio: false,
+            running: false,
+            reason: Some(fallback_reason),
+            xrun_count,
+            hardware_state: hardware_state_label.clone(),
+            callback_status_flags,
+            callback_status_flags_count,
+            callback_underrun_count,
+            producer_drop_count,
+            output_latency_ms,
+            actual_sample_rate_hz,
+            callback_pcm_frames_total,
+            callback_stalled_ms,
+            ring_len_samples,
+            ring_capacity_samples,
+            device_index,
+            memory_buffer_kib,
+            frames_per_buffer,
+            sample_rate_hz,
+            channels,
+            audio_task_count: if mixer_stopped { 0 } else { audio_task_count },
+            current_audio_ffmpeg_pid: if mixer_stopped {
+                None
+            } else {
+                current_audio_ffmpeg_pid
+            },
+            pending_audio_ffmpeg_pid: if mixer_stopped {
+                None
+            } else {
+                pending_audio_ffmpeg_pid
+            },
+        });
+    }
+    if preferred && running {
+        return Ok(AudioOutputBackendStatusDto {
+            available: true,
+            selected_backend: "portaudio".to_owned(),
+            preferred_portaudio: true,
+            running: true,
+            reason: mixer_failure,
+            xrun_count,
+            hardware_state: hardware_state_label.clone(),
+            callback_status_flags,
+            callback_status_flags_count,
+            callback_underrun_count,
+            producer_drop_count,
+            output_latency_ms,
+            actual_sample_rate_hz,
+            callback_pcm_frames_total,
+            callback_stalled_ms,
+            ring_len_samples,
+            ring_capacity_samples,
+            device_index,
+            memory_buffer_kib,
+            frames_per_buffer,
+            sample_rate_hz,
+            channels,
+            audio_task_count,
+            current_audio_ffmpeg_pid,
+            pending_audio_ffmpeg_pid,
+        });
+    }
+    if preferred && !probe.available {
+        // 偏好 PortAudio 但不可用 → 回退标记
+        if let Some(mut stream) = output.take() {
+            stream.stop();
+        }
+        return Ok(AudioOutputBackendStatusDto {
+            available: false,
+            selected_backend: "webview".to_owned(),
+            preferred_portaudio: true,
+            running: false,
+            reason: probe
+                .reason
+                .or_else(|| Some("PortAudio 不可用，已回退 WebView".to_owned())),
+            xrun_count,
+            hardware_state: hardware_state_label.clone(),
+            callback_status_flags,
+            callback_status_flags_count,
+            callback_underrun_count,
+            producer_drop_count,
+            output_latency_ms,
+            actual_sample_rate_hz,
+            callback_pcm_frames_total,
+            callback_stalled_ms,
+            ring_len_samples,
+            ring_capacity_samples,
+            device_index: None,
+            memory_buffer_kib: autolive_portaudio_output::DEFAULT_RING_CAPACITY_KIB,
+            frames_per_buffer: autolive_portaudio_output::DEFAULT_FRAMES_PER_BUFFER,
+            sample_rate_hz: autolive_portaudio_output::DEFAULT_SAMPLE_RATE_HZ,
+            channels: 2,
+            audio_task_count,
+            current_audio_ffmpeg_pid,
+            pending_audio_ffmpeg_pid,
+        });
+    }
+    Ok(AudioOutputBackendStatusDto {
+        available: probe.available,
+        selected_backend: if preferred && probe.available {
+            "portaudio".to_owned()
+        } else {
+            "webview".to_owned()
+        },
+        preferred_portaudio: preferred,
+        running: false,
+        reason: mixer_failure.or_else(|| {
+            if preferred {
+                Some("PortAudio 已选择但未启动流".to_owned())
+            } else {
+                probe.reason
+            }
+        }),
+        xrun_count,
+        hardware_state: hardware_state_label,
+        callback_status_flags,
+        callback_status_flags_count,
+        callback_underrun_count,
+        producer_drop_count,
+        output_latency_ms,
+        actual_sample_rate_hz,
+        callback_pcm_frames_total,
+        callback_stalled_ms,
+        ring_len_samples,
+        ring_capacity_samples,
+        device_index,
+        memory_buffer_kib,
+        frames_per_buffer,
+        sample_rate_hz,
+        channels,
+        audio_task_count,
+        current_audio_ffmpeg_pid,
+        pending_audio_ffmpeg_pid,
+    })
+}
+
+/// 分块写测试音：每块只短持锁，sleep 在锁外，避免堵 write_portaudio_pcm。
+fn write_sine_tone_chunked(
+    output_slot: &Mutex<Option<autolive_portaudio_output::PortAudioOutput>>,
+    sample_rate_hz: u32,
+    channels: u16,
+    frequency_hz: f32,
+    duration_ms: u32,
+    amplitude: f32,
+) -> Result<(), String> {
+    let channels = channels.max(1);
+    let total_frames =
+        ((u64::from(sample_rate_hz) * u64::from(duration_ms.max(1))) / 1000).max(1) as usize;
+    let mut phase = 0.0_f32;
+    let delta = std::f32::consts::TAU * frequency_hz.max(1.0) / sample_rate_hz as f32;
+    let amp = amplitude.clamp(0.01, 0.4);
+    let chunk_frames = 512usize;
+    let mut buffer = vec![0.0_f32; chunk_frames * usize::from(channels)];
+    let mut written = 0usize;
+    let result = (|| {
+        while written < total_frames {
+            let frames = chunk_frames.min(total_frames - written);
+            for frame in 0..frames {
+                let sample = phase.sin() * amp;
+                phase = (phase + delta) % std::f32::consts::TAU;
+                for ch in 0..usize::from(channels) {
+                    buffer[frame * usize::from(channels) + ch] = sample;
+                }
+            }
+            {
+                let mut guard = output_slot
+                    .lock()
+                    .map_err(|_| "PortAudio 状态锁已损坏".to_owned())?;
+                let stream = guard
+                    .as_mut()
+                    .ok_or_else(|| "PortAudio 流已关闭".to_owned())?;
+                stream.write_interleaved_forced(&buffer[..frames * usize::from(channels)])?;
+            }
+            written += frames;
+            std::thread::sleep(Duration::from_millis(
+                (frames as u64 * 1000 / u64::from(sample_rate_hz.max(1))).max(1),
+            ));
+        }
+        // 按环缓水位 drain，避免固定 120ms 过长/过短。
+        let pending = {
+            let guard = output_slot
+                .lock()
+                .map_err(|_| "PortAudio 状态锁已损坏".to_owned())?;
+            guard
+                .as_ref()
+                .map(|stream| stream.ring_len_samples())
+                .unwrap_or(0)
+        };
+        let frames_left = pending / usize::from(channels);
+        let drain_ms = ((frames_left as u64 * 1000) / u64::from(sample_rate_hz.max(1)))
+            .saturating_add(20)
+            .min(6_000);
+        if drain_ms > 0 {
+            std::thread::sleep(Duration::from_millis(drain_ms));
+        }
+        Ok(())
+    })();
+    if let Ok(mut guard) = output_slot.lock() {
+        if let Some(stream) = guard.as_mut() {
+            stream.set_live_pcm_paused(false);
+        }
+    }
+    result
+}
+
+#[tauri::command]
+pub fn get_audio_output_backend_status(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<AudioOutputBackendStatusDto, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    audio_output_status_dto(&state)
+}
+
+#[tauri::command]
+pub fn list_audio_output_devices(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<Vec<AudioOutputDeviceDto>, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    autolive_portaudio_output::list_output_devices()
+        .map(|devices| {
+            devices
+                .into_iter()
+                .map(|device| AudioOutputDeviceDto {
+                    id: device.id,
+                    name: device.name,
+                    host_api: host_api_label(device.host_api).to_owned(),
+                    max_output_channels: device.max_output_channels,
+                    default_sample_rate_hz: device.default_sample_rate_hz,
+                })
+                .collect()
+        })
+        .map_err(|message| CommandErrorDto::new("audio_output_devices_failed", message))
+}
+
+#[tauri::command]
+pub async fn set_audio_output_backend(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: SetAudioOutputBackendRequestDto,
+) -> Result<AudioOutputBackendStatusDto, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        set_audio_output_backend_blocking(app, state, request)
+    })
+    .await
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "audio_output_task_failed",
+            format!("PortAudio 后台切换任务失败：{error}"),
+        )
+    })?
+}
+
+fn set_audio_output_backend_blocking(
+    app: AppHandle,
+    state: AppState,
+    request: SetAudioOutputBackendRequestDto,
+) -> Result<AudioOutputBackendStatusDto, CommandErrorDto> {
+    if let Some(capacity_kib) = request.memory_buffer_kib {
+        autolive_portaudio_output::validate_ring_capacity_kib(capacity_kib).map_err(|message| {
+            CommandErrorDto::new("audio_output_invalid_memory_buffer", message)
+        })?;
+    }
+    if let Some(frames) = request.frames_per_buffer {
+        autolive_portaudio_output::validate_frames_per_buffer(frames).map_err(|message| {
+            CommandErrorDto::new("audio_output_invalid_frames_per_buffer", message)
+        })?;
+    }
+    let _switch_guard = state
+        .audio_mixer_switch_lock
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_mixer_switch_lock_failed", "音频切换锁已损坏"))?;
+    state.stop_audio_mixer_unlocked()?;
+    let should_start_audio_mixer = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot()
+        .playback_state
+        == PlaybackState::Playing;
+    {
+        let mut preferred = state.audio_output_preferred.lock().map_err(|_| {
+            CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏")
+        })?;
+        *preferred = request.prefer_portaudio;
+    }
+    let mut output = state
+        .audio_output
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))?;
+    if !request.prefer_portaudio {
+        if let Some(mut stream) = output.take() {
+            stream.stop();
+        }
+        drop(output);
+        reset_audio_output_callback_observation(&state);
+        return audio_output_status_dto(&state);
+    }
+    let probe = autolive_portaudio_output::probe_portaudio();
+    if !probe.available {
+        output.take();
+        drop(output);
+        reset_audio_output_callback_observation(&state);
+        return Ok(AudioOutputBackendStatusDto {
+            available: false,
+            selected_backend: "webview".to_owned(),
+            preferred_portaudio: true,
+            running: false,
+            reason: probe
+                .reason
+                .or_else(|| Some("PortAudio 不可用，保持 WebView".to_owned())),
+            xrun_count: 0,
+            hardware_state: "not_created".to_owned(),
+            callback_status_flags: 0,
+            callback_status_flags_count: 0,
+            callback_underrun_count: 0,
+            producer_drop_count: 0,
+            output_latency_ms: 0,
+            actual_sample_rate_hz: None,
+            callback_pcm_frames_total: 0,
+            callback_stalled_ms: None,
+            ring_len_samples: 0,
+            ring_capacity_samples: 0,
+            device_index: None,
+            memory_buffer_kib: autolive_portaudio_output::DEFAULT_RING_CAPACITY_KIB,
+            frames_per_buffer: autolive_portaudio_output::DEFAULT_FRAMES_PER_BUFFER,
+            sample_rate_hz: autolive_portaudio_output::DEFAULT_SAMPLE_RATE_HZ,
+            channels: 2,
+            audio_task_count: 0,
+            current_audio_ffmpeg_pid: None,
+            pending_audio_ffmpeg_pid: None,
+        });
+    }
+    // 切换设备/缓冲：停旧流再开。
+    if let Some(mut old) = output.take() {
+        old.stop();
+    }
+    let sample_rate_hz = request
+        .sample_rate_hz
+        .filter(|hz| matches!(*hz, 44_100 | 48_000))
+        .unwrap_or(autolive_portaudio_output::DEFAULT_SAMPLE_RATE_HZ);
+    let memory_buffer_kib = request
+        .memory_buffer_kib
+        .unwrap_or(autolive_portaudio_output::DEFAULT_RING_CAPACITY_KIB);
+    let mut stream =
+        autolive_portaudio_output::PortAudioOutput::new(sample_rate_hz, memory_buffer_kib, 2);
+    stream.set_device_index(request.device_index);
+    if let Some(frames) = request.frames_per_buffer {
+        stream.set_frames_per_buffer(frames).map_err(|message| {
+            CommandErrorDto::new("audio_output_invalid_frames_per_buffer", message)
+        })?;
+    }
+    // 先启动真实硬件流但保持 callback 静音暂停：预热期间 WebView 继续发声，
+    // 同时可读取 PaStreamInfo.outputLatency 后计算首个可听 PCM 的时间点。
+    stream.set_callback_paused(true);
+    *output = Some(stream);
+    drop(output);
+    reset_audio_output_callback_observation(&state);
+    let start_error = state
+        .audio_output
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))
+        .and_then(|mut output| {
+            let stream = output.as_mut().ok_or_else(|| {
+                CommandErrorDto::new("portaudio_start_failed", "PortAudio 输出未创建")
+            })?;
+            stream
+                .start()
+                .map_err(|message| CommandErrorDto::new("portaudio_start_failed", message))?;
+            Ok(())
+        })
+        .and_then(|()| {
+            if !should_start_audio_mixer {
+                return Ok(());
+            }
+            state.start_audio_mixer_from_snapshot_unlocked(
+                &app,
+                sample_rate_hz,
+                request.position_ms,
+            )?;
+            state.enable_audio_mixer_output()?;
+            let mut output = state.audio_output.lock().map_err(|_| {
+                CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏")
+            })?;
+            let stream = output.as_mut().ok_or_else(|| {
+                CommandErrorDto::new("portaudio_start_failed", "PortAudio 输出未创建")
+            })?;
+            stream.set_callback_paused(false);
+            Ok(())
+        });
+    if let Err(error) = start_error {
+        let _ = state.stop_audio_mixer_unlocked();
+        if let Ok(mut preferred) = state.audio_output_preferred.lock() {
+            *preferred = false;
+        }
+        if let Ok(mut output) = state.audio_output.lock() {
+            if let Some(mut stream) = output.take() {
+                stream.stop();
+            }
+        }
+        let mut status = audio_output_status_dto(&state)?;
+        status.reason = Some(format!(
+            "PortAudio 启动或混音启用失败，已回退 WebView：{}",
+            error.message
+        ));
+        return Ok(status);
+    }
+    audio_output_status_dto(&state)
+}
+
+#[tauri::command]
+pub async fn sync_audio_output_source(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: Option<SyncAudioOutputSourceRequestDto>,
+) -> Result<AudioOutputBackendStatusDto, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        sync_audio_output_source_blocking(app, state, request)
+    })
+    .await
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "audio_source_sync_task_failed",
+            format!("PortAudio 音频源后台同步任务失败：{error}"),
+        )
+    })?
+}
+
+fn sync_audio_output_source_blocking(
+    app: AppHandle,
+    state: AppState,
+    request: Option<SyncAudioOutputSourceRequestDto>,
+) -> Result<AudioOutputBackendStatusDto, CommandErrorDto> {
+    let preferred = *state
+        .audio_output_preferred
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))?;
+    if !preferred {
+        return audio_output_status_dto(&state);
+    }
+    let switch_guard = state
+        .audio_mixer_switch_lock
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_mixer_switch_lock_failed", "音频切换锁已损坏"))?;
+    let playback_state = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot()
+        .playback_state;
+    if playback_state != PlaybackState::Playing {
+        state.pause_audio_output_unlocked()?;
+        return audio_output_status_dto(&state);
+    }
+    let sample_rate_hz = state
+        .audio_output
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))?
+        .as_ref()
+        .map(|stream| stream.sample_rate_hz())
+        .unwrap_or(autolive_portaudio_output::DEFAULT_SAMPLE_RATE_HZ);
+    let had_previous_mixer = state
+        .audio_mixer
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?
+        .is_some();
+    let start_position_ms = request.and_then(|request| request.position_ms);
+    if had_previous_mixer {
+        let pending_in_progress = state
+            .audio_mixer_pending
+            .lock()
+            .map_err(|_| {
+                CommandErrorDto::new(
+                    "audio_mixer_pending_lock_failed",
+                    "待切换音频混音状态锁已损坏",
+                )
+            })?
+            .is_some();
+        if pending_in_progress {
+            drop(switch_guard);
+            let mut status = audio_output_status_dto(&state)?;
+            status.reason = Some("候选音轨正在预热，继续保持旧轨".to_owned());
+            return Ok(status);
+        }
+
+        let current_position_ms = state
+            .playback
+            .lock()
+            .ok()
+            .map(|playback| playback.snapshot().current_position_ms)
+            .unwrap_or(0);
+        let observed_position_ms =
+            resolve_audio_start_position_ms(start_position_ms, current_position_ms);
+        let (pending_ms, output_latency_ms) = state.audio_output_timing_ms(sample_rate_hz);
+        let candidate_start_position_ms = observed_position_ms
+            .saturating_add(pending_ms)
+            .saturating_add(output_latency_ms);
+        let preparation_started_at = Instant::now();
+        let Some((candidate, source_identity, playback_rate)) = state
+            .audio_mixer_task_from_snapshot(
+                &app,
+                sample_rate_hz,
+                true,
+                Some(candidate_start_position_ms),
+            )?
+        else {
+            drop(switch_guard);
+            return audio_output_status_dto(&state);
+        };
+        let mut pending = match state.audio_mixer_pending.lock() {
+            Ok(pending) => pending,
+            Err(_) => {
+                let mut candidate = candidate;
+                candidate.stop_preserving_output();
+                return Err(CommandErrorDto::new(
+                    "audio_mixer_pending_lock_failed",
+                    "待切换音频混音状态锁已损坏",
+                ));
+            }
+        };
+        let previous = pending.replace(candidate);
+        drop(pending);
+        if let Some(mut previous) = previous {
+            previous.stop_preserving_output();
+        }
+        drop(switch_guard);
+
+        let readiness = state.wait_for_pending_audio_mixer();
+        let switch_guard = state.audio_mixer_switch_lock.lock().map_err(|_| {
+            CommandErrorDto::new("audio_mixer_switch_lock_failed", "音频切换锁已损坏")
+        })?;
+        let candidate = take_pending_audio_mixer(&state.audio_mixer_pending)?;
+        let Some(candidate) = candidate else {
+            drop(switch_guard);
+            return audio_output_status_dto(&state);
+        };
+        let switch_result = match readiness {
+            Ok(()) => state.commit_audio_mixer_candidate(
+                candidate,
+                sample_rate_hz,
+                observed_position_ms,
+                candidate_start_position_ms,
+                preparation_started_at,
+                playback_rate,
+                &source_identity,
+            ),
+            Err(error) => {
+                let mut candidate = candidate;
+                candidate.stop_preserving_output();
+                Err(error)
+            }
+        };
+        if let Err(error) = switch_result {
+            drop(switch_guard);
+            let mut status = audio_output_status_dto(&state)?;
+            status.reason = Some(format!("候选音轨未就绪，继续保持旧轨：{}", error.message));
+            return Ok(status);
+        }
+        drop(switch_guard);
+        return audio_output_status_dto(&state);
+    }
+
+    let switch_result = state
+        .start_audio_mixer_from_snapshot_unlocked(&app, sample_rate_hz, start_position_ms)
+        .and_then(|()| state.enable_audio_mixer_output());
+    if let Err(error) = switch_result {
+        if let Ok(mut preferred) = state.audio_output_preferred.lock() {
+            *preferred = false;
+        }
+        if let Ok(mut output) = state.audio_output.lock() {
+            if let Some(mut stream) = output.take() {
+                stream.stop();
+            }
+        }
+        drop(switch_guard);
+        let mut status = audio_output_status_dto(&state)?;
+        status.reason = Some(format!(
+            "PortAudio 音频源不可用，已回退 WebView：{}",
+            error.message
+        ));
+        return Ok(status);
+    }
+    audio_output_status_dto(&state)
+}
+
+#[tauri::command]
+pub fn write_portaudio_pcm(
+    window: Window,
+    state: State<'_, AppState>,
+    request: WritePortAudioPcmRequestDto,
+) -> Result<(), CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    if request.samples.is_empty() {
+        return Ok(());
+    }
+    if request.samples.len() > PORTAUDIO_PCM_WRITE_MAX_SAMPLES {
+        return Err(CommandErrorDto::new(
+            "portaudio_pcm_too_large",
+            format!(
+                "PCM 单次最多 {PORTAUDIO_PCM_WRITE_MAX_SAMPLES} 个采样，收到 {}",
+                request.samples.len()
+            ),
+        ));
+    }
+    if request.samples.iter().any(|sample| !sample.is_finite()) {
+        return Err(CommandErrorDto::new(
+            "portaudio_pcm_non_finite",
+            "PCM 采样必须是有限数值",
+        ));
+    }
+    let preferred = *state
+        .audio_output_preferred
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))?;
+    if !preferred {
+        return Ok(());
+    }
+    let mut output = state
+        .audio_output
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))?;
+    let Some(stream) = output.as_mut() else {
+        return Ok(());
+    };
+    let channels = usize::from(stream.channels().max(1));
+    if !request.samples.len().is_multiple_of(channels) {
+        return Err(CommandErrorDto::new(
+            "portaudio_pcm_bad_alignment",
+            format!(
+                "PCM 长度 {} 不是声道数 {channels} 的整数倍",
+                request.samples.len()
+            ),
+        ));
+    }
+    stream
+        .write_interleaved(&request.samples)
+        .map_err(|message| CommandErrorDto::new("portaudio_pcm_write_failed", message))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn play_portaudio_test_tone(
+    window: Window,
+    state: State<'_, AppState>,
+    request: PlayPortAudioTestToneRequestDto,
+) -> Result<AudioOutputBackendStatusDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    let preferred = *state
+        .audio_output_preferred
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))?;
+    if !preferred {
+        return Err(CommandErrorDto::new(
+            "portaudio_not_preferred",
+            "请先切换到 PortAudio 出口",
+        ));
+    }
+    if state
+        .audio_output_tone_inflight
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(CommandErrorDto::new(
+            "portaudio_tone_busy",
+            "测试音正在播放，请稍候",
+        ));
+    }
+    let (sample_rate_hz, channels) = {
+        let mut output = state.audio_output.lock().map_err(|_| {
+            state
+                .audio_output_tone_inflight
+                .store(false, Ordering::SeqCst);
+            CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏")
+        })?;
+        if output.is_none() {
+            let mut stream = autolive_portaudio_output::PortAudioOutput::new(
+                autolive_portaudio_output::DEFAULT_SAMPLE_RATE_HZ,
+                autolive_portaudio_output::DEFAULT_RING_CAPACITY_KIB,
+                2,
+            );
+            if let Err(message) = stream.start() {
+                state
+                    .audio_output_tone_inflight
+                    .store(false, Ordering::SeqCst);
+                return Err(CommandErrorDto::new("portaudio_start_failed", message));
+            }
+            *output = Some(stream);
+        }
+        let stream = output.as_mut().ok_or_else(|| {
+            state
+                .audio_output_tone_inflight
+                .store(false, Ordering::SeqCst);
+            CommandErrorDto::new("portaudio_missing", "PortAudio 流未启动")
+        })?;
+        stream.set_live_pcm_paused(true);
+        stream.clear_ring();
+        (stream.sample_rate_hz(), stream.channels())
+    };
+    let output_slot = Arc::clone(&state.audio_output);
+    let tone_flag = Arc::clone(&state.audio_output_tone_inflight);
+    let frequency_hz = request.frequency_hz.unwrap_or(440.0);
+    let duration_ms = request.duration_ms.unwrap_or(500).min(2_000);
+    let amplitude = request.amplitude.unwrap_or(0.15);
+    thread::spawn(move || {
+        let _ = write_sine_tone_chunked(
+            output_slot.as_ref(),
+            sample_rate_hz,
+            channels,
+            frequency_hz,
+            duration_ms,
+            amplitude,
+        );
+        tone_flag.store(false, Ordering::SeqCst);
+    });
+    audio_output_status_dto(&state)
+}
+
 #[tauri::command]
 pub fn get_research_worker_capabilities(
     window: Window,
@@ -1414,7 +3406,7 @@ pub fn cleanup_local_caches_command(
     state: State<'_, AppState>,
 ) -> Result<CacheCleanupResultDto, CommandErrorDto> {
     state.ensure_main_window(&window)?;
-    cleanup_local_caches(&app, &state)
+    cleanup_media_processing_cache(&app, &state)
 }
 
 #[tauri::command]
@@ -1682,6 +3674,7 @@ pub fn start_media_processing(
                 .and_then(|source| source.audio_sample_rate_hz),
         )
     };
+    let audio_variants = request.audio_variants.unwrap_or_default();
     if !video_enabled && !audio_enabled {
         return state.with_playback(&window, |playback| Ok(state.snapshot(playback)));
     }
@@ -1704,12 +3697,51 @@ pub fn start_media_processing(
                 })
             }
         };
+    if audio_enabled {
+        build_audio_stream_filter_graph(
+            &request.params.audio,
+            &audio_variants,
+            source_audio_sample_rate_hz,
+            autolive_portaudio_output::DEFAULT_SAMPLE_RATE_HZ,
+        )
+        .map_err(|error| CommandErrorDto::new("audio_stream_filter_invalid", error.to_string()))?;
+    }
+    state.with_playback(&window, |playback| {
+        if audio_enabled {
+            playback
+                .set_audio_stream_configuration(
+                    request.params.audio.clone(),
+                    audio_variants.clone(),
+                )
+                .map_err(|errors| {
+                    CommandErrorDto::new(
+                        "audio_stream_params_invalid",
+                        errors
+                            .iter()
+                            .map(|error| format!("{}: {}", error.field, error.message))
+                            .collect::<Vec<_>>()
+                            .join("；"),
+                    )
+                })?;
+        }
+        playback
+            .mark_media_processing_running()
+            .map_err(command_error_from_playback)
+    })?;
+    // 普通声音处理不生成临时 MP4。PortAudio 直接从源视频解码并套用滤镜图；
+    // 没有硬件出口时，WebView 仍播放原视频流并保留实时预览回退。
+    if audio_enabled && !video_enabled {
+        return state.with_playback(&window, |playback| {
+            playback.mark_audio_processing_runtime();
+            Ok(state.snapshot(playback))
+        });
+    }
     let cache_dir = app
         .path()
         .app_cache_dir()
         .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?
         .join("media-processing");
-    let _ = cleanup_local_caches(&app, &state)?;
+    // ponytail: 开渲前不清缓存；正在播的 processed 被删会静音
     std::fs::create_dir_all(&cache_dir)
         .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?;
     let nonce = std::time::SystemTime::now()
@@ -1727,13 +3759,14 @@ pub fn start_media_processing(
         staging_output_path,
         output_mp4_path: output_mp4_path.clone(),
         video_processing_enabled: video_enabled,
-        // 普通声音效果统一交给 FFmpeg。实时音频幻化是独立的候选音轨链路，
-        // 不再通过 Web Audio 在播放端重复套用增益、EQ、混响或淡入淡出。
-        audio_processing_enabled: audio_enabled,
+        // 声音处理走 PortAudio 的实时 FFmpeg PCM 流，不写入视频缓存；
+        // 视频缓存只编码视觉效果，并复制源 AAC 作为 WebView 回退音轨。
+        audio_processing_enabled: false,
         source_audio_sample_rate_hz,
-        video: request.params.video,
-        audio: request.params.audio,
-        research: request.params.research,
+        video: request.params.video.clone(),
+        audio: request.params.audio.clone(),
+        audio_variants,
+        research: request.params.research.clone(),
         timeout_seconds,
     };
     if let Err(error) = build_media_render_args(&media_request) {
@@ -1743,11 +3776,6 @@ pub fn start_media_processing(
         })?;
         return state.with_playback(&window, |playback| Ok(state.snapshot(playback)));
     }
-    state.with_playback(&window, |playback| {
-        playback
-            .mark_media_processing_running()
-            .map_err(command_error_from_playback)
-    })?;
     let cancellation = CancellationToken::new();
     let playback = Arc::clone(&state.playback);
     let completed = Arc::new(AtomicBool::new(false));
@@ -1757,7 +3785,8 @@ pub fn start_media_processing(
     let handle = thread::spawn(move || {
         let result = render_media(&media_request, &worker_cancellation);
         if let Ok(mut playback) = playback.lock() {
-            if playback.snapshot().playback_generation == generation {
+            let current_generation = playback.snapshot().playback_generation;
+            if current_generation == generation {
                 match result {
                     Ok(rendered) => {
                         match allow_local_playback_asset_file(
@@ -1778,6 +3807,11 @@ pub fn start_media_processing(
                     }
                     Err(error) => playback.mark_media_processing_failed(error.to_string()),
                 }
+            } else {
+                // 根因：generation 漂移时若不清 processing，UI 会永久卡死并拒启新任务
+                playback.mark_media_processing_failed(format!(
+                    "媒体处理结果已过期（generation {generation} → {current_generation}），请重新应用"
+                ));
             }
         }
         completed_for_thread.store(true, Ordering::Release);
@@ -1878,6 +3912,16 @@ fn disable_media_processing_on_final_effect_close(app: &AppHandle) {
     };
     let _ = state.stop_media_worker();
     let _ = state.stop_speech_worker();
+    let _ = state.stop_audio_mixer();
+    // 关窗释放 PortAudio，避免设备被占。
+    if let Ok(mut preferred) = state.audio_output_preferred.lock() {
+        *preferred = false;
+    }
+    if let Ok(mut output) = state.audio_output.lock() {
+        if let Some(mut stream) = output.take() {
+            stream.stop();
+        }
+    }
     // ponytail: 关最终效果窗时关掉声音/视频处理；实时幻化一并关
     let playback = Arc::clone(&state.playback);
     let lock_result = playback.lock();
@@ -1888,7 +3932,7 @@ fn disable_media_processing_on_final_effect_close(app: &AppHandle) {
 
 fn attach_final_effect_close_cleanup(app: &AppHandle, window: &tauri::WebviewWindow) {
     let app_handle = app.clone();
-    let _ = window.on_window_event(move |event| {
+    window.on_window_event(move |event| {
         if matches!(
             event,
             tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
@@ -1913,16 +3957,17 @@ pub async fn open_final_effect_window(
         false
     } else {
         // ponytail: 先默认尺寸创建，有分辨率时立刻按工作区 clamp 调整
-        let window = WebviewWindowBuilder::new(&app, "final-effect", WebviewUrl::App("index.html".into()))
-            .title("autolive-desktop-core 最终效果")
-            .inner_size(1280.0, 720.0)
-            .min_inner_size(320.0, 180.0)
-            .resizable(true)
-            .center()
-            .build()
-            .map_err(|error| {
-                CommandErrorDto::new("final_effect_window_create_failed", error.to_string())
-            })?;
+        let window =
+            WebviewWindowBuilder::new(&app, "final-effect", WebviewUrl::App("index.html".into()))
+                .title("autolive-desktop-core 最终效果")
+                .inner_size(1280.0, 720.0)
+                .min_inner_size(320.0, 180.0)
+                .resizable(true)
+                .center()
+                .build()
+                .map_err(|error| {
+                    CommandErrorDto::new("final_effect_window_create_failed", error.to_string())
+                })?;
         attach_final_effect_close_cleanup(&app, &window);
         true
     };
@@ -2034,6 +4079,16 @@ fn resize_final_effect_window_for_app(
         ),
     })?;
 
+    let previous_logical_width = (f64::from(previous_size.width) / scale_factor).round() as u32;
+    let previous_logical_height = (f64::from(previous_size.height) / scale_factor).round() as u32;
+    // ponytail: 同尺寸不 center，避免声音处理 ready 时整窗跳回屏幕中央
+    if previous_logical_width == target.width && previous_logical_height == target.height {
+        return Ok(FinalEffectWindowSizeDto {
+            width: target.width,
+            height: target.height,
+        });
+    }
+
     window
         .set_size(LogicalSize::new(
             f64::from(target.width),
@@ -2059,9 +4114,12 @@ fn resize_final_effect_window_for_app(
 #[tauri::command]
 pub fn start_playback(
     window: Window,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.playback_action(&window, PlaybackCore::start)
+    let snapshot = state.playback_action(&window, PlaybackCore::start)?;
+    state.resume_audio_output(&app)?;
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -2069,15 +4127,20 @@ pub fn pause_playback(
     window: Window,
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.playback_action(&window, PlaybackCore::pause)
+    let snapshot = state.playback_action(&window, PlaybackCore::pause)?;
+    state.pause_audio_output()?;
+    Ok(snapshot)
 }
 
 #[tauri::command]
 pub fn resume_playback(
     window: Window,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.playback_action(&window, PlaybackCore::resume)
+    let snapshot = state.playback_action(&window, PlaybackCore::resume)?;
+    state.resume_audio_output(&app)?;
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -2097,6 +4160,7 @@ pub fn stop_playback(
     window: Window,
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.stop_audio_for_playback()?;
     state.stop_speech_worker()?;
     state.stop_media_worker()?;
     state.stop_research_worker()?;
@@ -2155,14 +4219,18 @@ pub fn set_processing_switches(
     if !request.realtime_audio_variant_enabled {
         state.stop_speech_worker()?;
     }
-    state.with_playback(&window, |playback| {
+    let snapshot = state.with_playback(&window, |playback| {
         playback.set_processing_switches(
             request.video_processing_enabled,
             request.audio_processing_enabled,
             request.realtime_audio_variant_enabled,
         );
         Ok(state.snapshot(playback))
-    })
+    })?;
+    if !request.audio_processing_enabled && !request.realtime_audio_variant_enabled {
+        state.stop_audio_mixer()?;
+    }
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -2494,14 +4562,30 @@ pub fn get_snapshot(
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
     // 轮询时回收已完成 Worker，避免状态一直停在 processing。
     let _ = state.reap_finished_media_worker()?;
+    let worker_running = state.media_worker_is_running()?;
+    let clear_stale_processing = |playback: &mut PlaybackCore| {
+        let snapshot = playback.snapshot();
+        let stuck = !worker_running
+            && (snapshot.audio_processing_status == "processing"
+                || snapshot.video_processing_status == "processing");
+        if stuck {
+            playback.mark_media_processing_failed(
+                "媒体处理 Worker 已结束但状态未更新，已恢复可用（请重新应用）",
+            );
+        }
+    };
     if window.label() == "final-effect" {
-        let playback = state
+        let mut playback = state
             .playback
             .lock()
             .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+        clear_stale_processing(&mut playback);
         return Ok(state.snapshot(&playback));
     }
-    state.with_playback(&window, |playback| Ok(state.snapshot(playback)))
+    state.with_playback(&window, |playback| {
+        clear_stale_processing(playback);
+        Ok(state.snapshot(playback))
+    })
 }
 
 #[tauri::command]
@@ -2730,7 +4814,12 @@ fn build_audio_variant_candidate(
 mod tests {
     #[cfg(unix)]
     use super::development_executable_ready;
-    use super::AppState;
+    use super::{
+        audio_mixer_readiness_error, resolve_audio_candidate_pcm_position_ms,
+        resolve_audio_commit_position_ms, resolve_audio_output_latency_ms,
+        resolve_audio_start_position_ms, take_pending_audio_mixer, AppState,
+    };
+    use autolive_desktop_core::audio_mixer::{AudioMixerConfigContext, AudioMixerReadinessError};
 
     #[cfg(unix)]
     #[test]
@@ -2765,5 +4854,120 @@ mod tests {
         let snapshot = playback.snapshot();
         assert!(snapshot.source_media.is_none());
         assert_eq!(snapshot.loop_index, 0);
+    }
+
+    #[test]
+    fn audio_start_position_never_uses_a_stale_ui_clock() {
+        assert_eq!(
+            resolve_audio_start_position_ms(Some(21_017), 21_475),
+            21_475
+        );
+        assert_eq!(
+            resolve_audio_start_position_ms(Some(22_000), 21_475),
+            22_000
+        );
+        assert_eq!(resolve_audio_start_position_ms(None, 21_475), 21_475);
+        assert_eq!(
+            resolve_audio_commit_position_ms(Some(22_000), 21_475, 500, 1.0, 50, 100),
+            22_650
+        );
+        assert_eq!(
+            resolve_audio_commit_position_ms(Some(21_017), 21_475, 500, 1.0, 50, 100),
+            21_667
+        );
+        assert_eq!(
+            resolve_audio_commit_position_ms(None, 21_475, 500, 2.0, 50, 100),
+            21_625
+        );
+        assert_eq!(
+            resolve_audio_commit_position_ms(Some(22_000), 21_475, 500, 1.25, 50, 100),
+            22_775
+        );
+    }
+
+    #[test]
+    fn audio_output_latency_uses_the_larger_portaudio_clock_without_double_counting() {
+        assert_eq!(resolve_audio_output_latency_ms(Some(100_001), 150_000), 150);
+        assert_eq!(resolve_audio_output_latency_ms(Some(100_001), -10), 101);
+        assert_eq!(resolve_audio_output_latency_ms(None, 49_001), 50);
+        assert_eq!(resolve_audio_output_latency_ms(None, 0), 0);
+    }
+
+    #[test]
+    fn candidate_trim_converts_media_time_to_post_atempo_pcm_time() {
+        assert_eq!(
+            resolve_audio_candidate_pcm_position_ms(10_000, 11_000, 1.0),
+            11_000
+        );
+        assert_eq!(
+            resolve_audio_candidate_pcm_position_ms(10_000, 11_000, 2.0),
+            10_500
+        );
+        assert_eq!(
+            resolve_audio_candidate_pcm_position_ms(10_000, 11_000, 0.5),
+            12_000
+        );
+        assert_eq!(
+            resolve_audio_candidate_pcm_position_ms(10_000, 9_000, 2.0),
+            10_000
+        );
+    }
+
+    #[test]
+    fn audio_mixer_readiness_error_keeps_timeout_and_ffmpeg_codes_distinct() {
+        let config = AudioMixerConfigContext {
+            sample_rate_hz: 44_100,
+            prebuffer_ms: 50,
+            audio_stream_variant_count: 2,
+        };
+        let timeout = audio_mixer_readiness_error(
+            "candidate_timeout",
+            "candidate_ffmpeg",
+            AudioMixerReadinessError::PreheatTimeout {
+                waited_ms: 5_000,
+                timeout_ms: 5_000,
+                config,
+            },
+        );
+        assert_eq!(timeout.code, "candidate_timeout");
+        assert!(timeout.message.contains("预热超时"));
+
+        let ffmpeg = audio_mixer_readiness_error(
+            "candidate_timeout",
+            "candidate_ffmpeg",
+            AudioMixerReadinessError::Ffmpeg {
+                waited_ms: 12,
+                config,
+                reason: "invalid filter".to_owned(),
+            },
+        );
+        assert_eq!(ffmpeg.code, "candidate_ffmpeg");
+        assert!(ffmpeg.message.contains("FFmpeg 真实错误"));
+    }
+
+    #[test]
+    fn pending_candidate_slot_is_independent_from_switch_lock() {
+        let state = AppState::default();
+        let _switch_guard = state
+            .audio_mixer_switch_lock
+            .lock()
+            .expect("switch lock should be available");
+        assert!(state.audio_mixer_pending.try_lock().is_ok());
+    }
+
+    #[test]
+    fn cancelling_pending_candidate_does_not_touch_current_slot() {
+        let pending = std::sync::Mutex::new(Some("candidate"));
+        let current = Some("old");
+
+        assert_eq!(
+            take_pending_audio_mixer(&pending).expect("pending lock"),
+            Some("candidate")
+        );
+        assert_eq!(current, Some("old"));
+        assert_eq!(
+            take_pending_audio_mixer(&pending).expect("pending lock"),
+            None
+        );
     }
 }

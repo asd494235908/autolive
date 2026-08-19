@@ -6,13 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "test": "node --test src/heartbeatOutbox.test.mjs src/runtimeResources.test.mjs src/运行时参数自动调度.test.mjs src/播放循环.test.mjs src/播放控制消息.test.mjs src/fixedSpeech.test.mjs src/fixedSpeechPresets.test.mjs src/桌面三列布局.test.mjs src/插话播放器.test.mjs src/固定话术播放.test.mjs src/启动加载.test.mjs src/启动入口.test.mjs src/启动调度.test.mjs ../工具/准备FFmpeg资源.test.mjs ../工具/启动桌面开发环境.test.mjs ../工具/桌面版本.test.mjs ../工具/生成运行资源发布树.test.mjs ../工具/轻量桌面打包.test.mjs",
+    "test": "node --test src/heartbeatOutbox.test.mjs src/runtimeResources.test.mjs src/runtime-parameter-scheduler.test.mjs src/audio-playback-sync.test.mjs src/playback-loop.test.mjs src/playback-control-message.test.mjs src/fixedSpeech.test.mjs src/fixedSpeechPresets.test.mjs src/desktop-three-column-layout.test.mjs src/interlude-player.test.mjs src/fixed-speech-playback.test.mjs src/startup-loader.test.mjs src/startup-entry.test.mjs src/startup-scheduler.test.mjs ../tools/prepare-ffmpeg-resources.test.mjs ../tools/start-desktop-dev.test.mjs ../tools/desktop-version.test.mjs ../tools/generate-runtime-resource-tree.test.mjs ../tools/lightweight-desktop-build.test.mjs",
     "preview": "vite preview",
-    "tauri:dev": "node ../工具/启动桌面开发环境.mjs",
-    "ffmpeg:prepare": "node ../工具/准备FFmpeg资源.mjs",
-    "ffmpeg:test": "node --test ../工具/准备FFmpeg资源.test.mjs",
-    "tauri:build": "node ../工具/准备FFmpeg资源.mjs && node ../工具/生成运行资源发布树.mjs && node ../工具/构建桌面产物.mjs",
-    "tauri:build:prepared-resources": "node ../工具/准备FFmpeg资源.mjs && node ../工具/生成运行资源发布树.mjs && node ../工具/构建桌面产物.mjs"
+    "tauri:dev": "node ../tools/start-desktop-dev.mjs",
+    "ffmpeg:prepare": "node ../tools/prepare-ffmpeg-resources.mjs",
+    "ffmpeg:test": "node --test ../tools/prepare-ffmpeg-resources.test.mjs",
+    "tauri:build": "node ../tools/prepare-ffmpeg-resources.mjs && node ../tools/generate-runtime-resource-tree.mjs && node ../tools/build-desktop-artifact.mjs",
+    "tauri:build:prepared-resources": "node ../tools/prepare-ffmpeg-resources.mjs && node ../tools/generate-runtime-resource-tree.mjs && node ../tools/build-desktop-artifact.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

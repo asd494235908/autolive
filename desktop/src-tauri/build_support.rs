@@ -82,8 +82,12 @@ fn has_expected_config_resources(config: &Value) -> bool {
 
 fn has_expected_resource_list(value: &Value) -> bool {
     value.as_array().is_some_and(|resources| {
-        resources.len() == 2
-            && resources[0].as_str() == Some("runtime-resources.json")
-            && resources[1].as_str() == Some("embedded-runtime-resources")
+        resources.len() >= 2
+            && resources
+                .iter()
+                .any(|item| item.as_str() == Some("runtime-resources.json"))
+            && resources
+                .iter()
+                .any(|item| item.as_str() == Some("embedded-runtime-resources"))
     })
 }

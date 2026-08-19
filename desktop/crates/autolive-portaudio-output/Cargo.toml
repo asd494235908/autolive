@@ -1,0 +1,14 @@
+[package]
+name = "autolive-portaudio-output"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "PortAudio output backend (Audacity-style I/O). FFI lives here so the main crate can keep unsafe_code=forbid."
+
+[dependencies]
+ringbuf = "0.5.1"
+
+[lints.rust]
+# FFI 仅本 crate；主 crate 仍 forbid
+unsafe_code = "allow"

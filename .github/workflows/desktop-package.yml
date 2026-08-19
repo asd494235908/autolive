@@ -29,7 +29,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(node desktop/工具/桌面版本.mjs --release)"
+          version="$(node desktop/tools/desktop-version.mjs --release)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
   package:
     name: package ${{ matrix.target_triple }}
@@ -88,7 +88,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(node desktop/工具/桌面版本.mjs --release)"
+          version="$(node desktop/tools/desktop-version.mjs --release)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
       - name: Prepare FFmpeg resources (macOS)
         if: runner.os != 'Windows'

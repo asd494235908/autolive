@@ -1,6 +1,6 @@
 import React, { lazy, Suspense } from 'react';
 import ReactDOM from 'react-dom/client';
-import { StartupErrorBoundary, StartupLoading } from './启动加载';
+import { StartupErrorBoundary, StartupLoading } from './startup-loader';
 
 const App = lazy(() => import('./App'));
 

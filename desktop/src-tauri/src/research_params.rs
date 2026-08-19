@@ -119,7 +119,7 @@ impl Default for AudioResearchParams {
     fn default() -> Self {
         Self {
             natural_voice_mode: NaturalVoiceMode::Original,
-            random_change_period_ms: 15_000,
+            random_change_period_ms: 4_000,
             pitch_shift_semitones: 0.0,
             spectral_perturbation_percent: 0.0,
             environment_noise_percent: 0.0,
@@ -342,12 +342,13 @@ impl AudioResearchParams {
     }
 
     fn validate_into(&self, errors: &mut Vec<ParameterValidationError>) {
+        // 前端按用户区间随机抽本轮时长后写入；硬范围 1–60 s。
         validate_u64_range(
             errors,
             "audio.random_change_period_ms",
             "ms",
             self.random_change_period_ms,
-            500,
+            1_000,
             60_000,
         );
         validate_range(
@@ -1108,7 +1109,7 @@ mod tests {
     fn normal_values_are_accepted() {
         let params = LocalResearchParams {
             audio: AudioResearchParams {
-                random_change_period_ms: 30_000,
+                random_change_period_ms: 4_000,
                 pitch_shift_semitones: -1.5,
                 spectral_perturbation_percent: 4.0,
                 environment_noise_percent: 2.0,

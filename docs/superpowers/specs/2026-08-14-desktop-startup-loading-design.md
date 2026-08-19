@@ -1,5 +1,7 @@
 # 桌面端启动 Loading 与首屏白屏优化设计
 
+> 当前版本范围声明（2026-08-19）：本版本不开发实时话术幻化。本文中的 speech-to-speech Worker 能力探测只表示历史/兼容代码的延后探测，不构成当前版本入口、功能或验收项；当前启动流程不得准备或启动实时话术链路。
+
 ## 背景与目标
 
 当前 Tauri 主窗口在 HTML 只有空 `#root` 时就可见，React 入口又同步加载 Ant Design 和约 3200 行的 `App.tsx`。因此在生产包中，用户可能先看到空白窗口；如果入口模块加载失败，也没有顶层错误回退。目标是让开发版和生产包都在 React 完成加载前显示稳定的启动反馈，并减少首屏必须执行的工作。
@@ -12,8 +14,8 @@
 - 将主应用通过 `React.lazy` 延迟加载，并使用轻量 `Suspense` Loading。
 - 增加顶层 Error Boundary，显示可操作的失败信息和重新加载按钮。
 - 将 Ant Design `ConfigProvider` 与 `AntApp` 放到延迟加载的应用模块中，避免阻塞入口。
-- 将媒体引擎、研究 Worker、研究默认参数和 speech-to-speech Worker 的非必要能力探测安排到首屏渲染后的空闲阶段；用户实际使用研究/实时音频能力时仍保留必要的显式刷新路径。
-- 保留固定话术自动准备的现有业务语义；语音克隆能力在导入等待或手动操作时仍可按需探测。
+- 将媒体引擎的非必要能力探测安排到首屏渲染后的空闲阶段；研究 Worker 和 speech-to-speech Worker 属于历史/后续版本，本版本不准备、不探测、不提供显式刷新入口。
+- 固定话术使用前端 `speechSynthesis` 系统本地语音；不再自动准备人声、探测语音克隆 Worker 或加载语音模型。启动 Loading 不得触发固定话术朗读或任何模型准备。
 - 用 Node 内置测试锁定 HTML 启动壳、入口懒加载、Suspense 和 Error Boundary 契约。
 
 ### 本轮不包含
@@ -40,7 +42,7 @@ Tauri 可见窗口
 
 `启动加载.tsx`只依赖 React：`StartupLoading`负责 Suspense 回退，`StartupErrorBoundary`负责捕获懒加载或渲染异常，并提供 `window.location.reload()` 恢复入口。它不调用 IPC，不引入 Ant Design，避免错误回退再次依赖可能失败的重模块。
 
-`App.tsx`继续作为业务单一所有者，只把 `ConfigProvider` 和 `AntApp`移动到其默认导出内部。首屏必须的 `get_snapshot`保持现有轮询；研究、媒体引擎和 speech-to-speech 能力探测在首屏交互稳定后执行，固定话术自动准备继续使用当前源视频代际、哈希和 Worker 可用性门禁。
+`App.tsx`继续作为业务单一所有者，只把 `ConfigProvider` 和 `AntApp`移动到其默认导出内部。首屏必须的 `get_snapshot`保持现有轮询；媒体引擎能力探测在首屏交互稳定后执行，研究和 speech-to-speech 能力本版本不准备，固定话术不进入任何自动准备或 Worker 能力探测路径。
 
 ## 错误、恢复与兼容性
 

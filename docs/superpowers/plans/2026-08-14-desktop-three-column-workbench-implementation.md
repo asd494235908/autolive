@@ -1,5 +1,7 @@
 # Desktop Three-Column Workbench Implementation Plan
 
+> 当前版本范围声明（2026-08-19）：本版本不开发实时话术幻化。本计划只调整当前桌面页面布局和主题；不新增实时话术设置、speech-to-speech Worker 状态、候选音轨或模型租约入口。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将桌面端主页面改为 28% / 38% / 34% 的三列工作台，并恢复 Ant Design 默认亮色主题，同时保持现有媒体行为不变。
@@ -15,7 +17,7 @@
 - 不修改 Rust/Tauri 命令、播放状态机、媒体处理流程、API、数据库或媒体任务模型。
 - 不新增组件库、状态管理库或测试框架；继续复用现有 Ant Design 组件。
 - 不覆盖 `.ant-*` 内部选择器，不把服务端状态复制到新的 Store，不引入未授权的持久化。
-- 三个处理开关保持独立；导入成功后源视频立即在同一窗口单源循环播放。
+- 三个处理开关保持独立；导入成功后保持 `Ready`，用户点击“播放”才在同一窗口开始单源循环播放。
 - 直接在当前分支和工作区开发，不使用 Git worktree，不把代码放到服务器构建。
 - 交付前删除本次改动产生的未使用导入、类型、样式、依赖、调试日志和重复实现。
 
@@ -24,7 +26,7 @@
 ### Task 1: 建立三列布局契约测试
 
 **Files:**
-- Create: `desktop/ui/src/桌面三列布局.test.mjs`
+- Create: `desktop/ui/src/desktop-three-column-layout.test.mjs`
 - Modify: `desktop/ui/package.json`
 
 **Interfaces:**
@@ -33,7 +35,7 @@
 
 - [ ] **Step 1: Write the failing test**
 
-Create `desktop/ui/src/桌面三列布局.test.mjs`:
+Create `desktop/ui/src/desktop-three-column-layout.test.mjs`:
 
 ```js
 import assert from 'node:assert/strict';
@@ -67,19 +69,19 @@ test('desktop page exposes the approved three-column layout contract', async () 
 Run:
 
 ```bash
-cd desktop/ui && node --test src/桌面三列布局.test.mjs
+cd desktop/ui && node --test src/desktop-three-column-layout.test.mjs
 ```
 
 Expected: one assertion failure because the current `App.tsx` has no three-column markers and the stylesheet does not exist.
 
 - [ ] **Step 3: Register the test in the existing test script**
 
-In `desktop/ui/package.json`, append `src/桌面三列布局.test.mjs` to the existing `node --test` command without changing the other test files or adding a dependency.
+In `desktop/ui/package.json`, append `src/desktop-three-column-layout.test.mjs` to the existing `node --test` command without changing the other test files or adding a dependency.
 
 - [ ] **Step 4: Commit the red test and test-script registration**
 
 ```bash
-git add desktop/ui/src/桌面三列布局.test.mjs desktop/ui/package.json
+git add desktop/ui/src/desktop-three-column-layout.test.mjs desktop/ui/package.json
 git commit -m "test: define desktop three-column layout contract"
 ```
 
@@ -90,7 +92,7 @@ git commit -m "test: define desktop three-column layout contract"
 **Files:**
 - Create: `desktop/ui/src/desktop-layout.css`
 - Modify: `desktop/ui/src/App.tsx`
-- Test: `desktop/ui/src/桌面三列布局.test.mjs`
+- Test: `desktop/ui/src/desktop-three-column-layout.test.mjs`
 
 **Interfaces:**
 - `DesktopApp` continues to use the existing state variables and callbacks; no new state owner or Tauri command is introduced.
@@ -194,8 +196,8 @@ Keep the existing Ant Design `Card`, `Alert`, `Descriptions`, `Space`, `Button`,
 Move existing JSX blocks without changing their handlers or labels:
 
 1. Source column: page title, single-source alert, import/open actions, page error, “播放状态与控制”, and “当前源素材”.
-2. Audio column: audio switch and realtime-audio switch from “处理开关”; audio-side worker alerts; “声音克隆替换”; audio-only runtime values; “实时诊断”; audio fields from “本地研究参数”.
-3. Video column: video switch and media-engine/apply controls from “处理开关”; video-only runtime values; video fields from “本地研究参数”; “本地研究分析 Worker” card. The homepage does not show a video frame.
+2. Audio column: audio switch and realtime-audio switch from “处理开关”; audio-side worker alerts; fixed speech/interlude controls; audio-only runtime values; “实时诊断”; current ordinary audio fields only.
+3. Video column: video switch and media-engine/apply controls from “处理开关”; video-only runtime values; current mapped video fields only. Do not add a “本地研究分析 Worker” card. The homepage does not show a video frame.
 
 The combined `applyMediaProcessing()` action remains in the video column but keeps its existing guard, request order, loading state, and error handling. The research Worker card remains one card and keeps its existing commands; only its position changes.
 
@@ -208,7 +210,7 @@ Keep the existing `pictureInPictureVideoRef` as an invisible, muted media elemen
 Run:
 
 ```bash
-cd desktop/ui && node --test src/桌面三列布局.test.mjs
+cd desktop/ui && node --test src/desktop-three-column-layout.test.mjs
 cd desktop/ui && pnpm build
 ```
 
@@ -217,7 +219,7 @@ Expected: the focused layout test passes and the TypeScript/Vite production buil
 - [ ] **Step 6: Commit the layout implementation**
 
 ```bash
-git add desktop/ui/src/App.tsx desktop/ui/src/desktop-layout.css desktop/ui/src/桌面三列布局.test.mjs desktop/ui/package.json
+git add desktop/ui/src/App.tsx desktop/ui/src/desktop-layout.css desktop/ui/src/desktop-three-column-layout.test.mjs desktop/ui/package.json
 git commit -m "feat: arrange desktop UI as three-column workbench"
 ```
 

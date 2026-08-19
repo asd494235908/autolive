@@ -1,28 +1,55 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-dialog';
-import { App as AntApp, Alert, Button, Card, Checkbox, ConfigProvider, Descriptions, Input, InputNumber, Layout, Progress, Select, Slider, Space, Switch, Tag, Typography } from 'antd';
+import { App as AntApp, Alert, Button, Card, Checkbox, ConfigProvider, Descriptions, Drawer, Input, InputNumber, Layout, Popconfirm, Progress, Select, Slider, Space, Switch, Tag, Typography } from 'antd';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { SyntheticEvent } from 'react';
-import { buildInterludeScheduleKey, chooseInterludeIndex, INTERLUDE_LIMITS, nextInterludeAtMs, resolvePlaybackAudioSource, shouldPauseInterlude } from './插话播放器';
-import type { BaseAudioSource } from './插话播放器';
+import { buildInterludeScheduleKey, chooseInterludeIndex, INTERLUDE_LIMITS, nextInterludeAtMs, resolvePlaybackAudioSource, shouldPauseInterlude } from './interlude-player';
+import type { BaseAudioSource } from './interlude-player';
 import {
+  AUDIO_MIX_PICK_HARD_MAX,
   AUDIO_VALUE_PRESETS,
+  DEFAULT_AUDIO_MIX_PICK_MAX,
+  DEFAULT_AUDIO_MIX_PICK_MIN,
   DEFAULT_AUDIO_VALUE_PRESET_IDS,
+  AUDIO_PARAM_CROSSFADE_SEC,
+  buildAudioFxSignature,
+  buildAudioVariantsFromCycle,
   buildRuntimePreviewParameters,
+  getUnsupportedAudioPresetFields,
+  UNMAPPED_AUDIO_PRESET_FIELD_LABELS,
   isRuntimeVariationDue,
-  normalizeRuntimeVariationPeriod,
-  sampleSubtleAudioParams,
-  sampleSubtleResearchParams,
+  loadAudioMixSession,
+  DEFAULT_AUDIO_PERIOD_MAX_MS,
+  DEFAULT_AUDIO_PERIOD_MIN_MS,
+  DEFAULT_VIDEO_PERIOD_MAX_MS,
+  DEFAULT_VIDEO_PERIOD_MIN_MS,
+  PERIOD_HARD_MAX_MS,
+  PERIOD_HARD_MIN_MS,
+  normalizeAudioMixPickMax,
+  normalizeAudioMixPickMin,
+  normalizeAudioPeriodRange,
+  normalizeAudioVariationPeriod,
+  normalizeVideoPeriodRange,
+  loadAudioPeriodRange,
+  loadVideoPeriodRange,
+  sampleAudioCycle,
+  samplePeriodMsInRange,
   sampleSubtleVideoParams,
-} from './运行时参数自动调度';
-import type { RuntimeBaseParameters, RuntimePreviewParameters } from './运行时参数自动调度';
-import { buildAudioCapabilityRows } from './音频处理能力';
-import { shouldRestartPlayback } from './播放循环';
-import { buildFinalEffectWindowResizeKey } from './最终效果窗口尺寸';
-import { clampMediaTime, clampVolume, formatMediaTime, isPlaybackMediaControlMessage, isPlaybackMediaStateMessage } from './播放控制消息';
-import type { PlaybackMediaControlMessage, PlaybackMediaStateMessage } from './播放控制消息';
-import { scheduleAfterInitialPaint } from './启动调度';
+  sanitizeMappedVideoSample,
+  saveAudioMixSession,
+  saveAudioPeriodRange,
+  saveVideoPeriodRange,
+} from './runtime-parameter-scheduler';
+import type { AudioCycleSample, PeriodRangeMs, RuntimeBaseParameters, RuntimePreviewParameters, SubtleAudioSample } from './runtime-parameter-scheduler';
+import { appendAudioCycleSnapshot } from './audioCycleSnapshot';
+import { buildAudioCapabilityRows } from './audio-processing-capabilities';
+import { resolveSynchronizedVideoPlaybackRate } from './audio-playback-sync';
+import { shouldRestartPlayback } from './playback-loop';
+import { buildFinalEffectWindowResizeKey } from './final-effect-window-size';
+import { clampMediaTime, clampVolume, formatMediaTime, isPlaybackMediaControlMessage, isPlaybackMediaStateMessage } from './playback-control-message';
+import type { PlaybackMediaControlMessage, PlaybackMediaStateMessage } from './playback-control-message';
+import { scheduleAfterInitialPaint } from './startup-scheduler';
 import { getDisplayErrorMessage } from './errorDisplay';
 import {
   isCurrentRuntimeResourceAction,
@@ -57,10 +84,18 @@ import './desktop-layout.css';
 const PLAYBACK_CHANNEL_NAME = 'autolive-playback-ui-v1';
 const FIXED_SPEECH_ACK_TIMEOUT_MS = 3_000;
 const RUNTIME_RESOURCE_POLL_INTERVAL_MS = 500;
+const PLAYBACK_SNAPSHOT_POLL_MS = 1_000;
+const AUDIO_OUTPUT_STATUS_POLL_MS = 2_000;
 const DIAGNOSTIC_PUBLISH_INTERVAL_MS = 50;
 const DIAGNOSTIC_SAMPLE_COUNT = 128;
 const REALTIME_AUDIO_SAFETY_LEAD_MS = 6_000;
 const REALTIME_AUDIO_WORKER_TIMEOUT_MS = 5_000;
+const PORTAUDIO_FORMAL_SOURCE_SYNC_READY = true;
+const PORTAUDIO_SAMPLE_RATE_HZ = 44_100;
+const PORTAUDIO_MIN_MEMORY_BUFFER_KIB = 128;
+const PORTAUDIO_MAX_MEMORY_BUFFER_KIB = 2_048;
+const PORTAUDIO_DEFAULT_MEMORY_BUFFER_KIB = 1_024;
+const PORTAUDIO_DEFAULT_FRAMES_PER_BUFFER = 256;
 const SUPPORTED_VIDEO_EXTENSIONS = [
   'mp4', 'mov', 'mkv', 'avi', 'webm', 'm4v', 'ts', 'm2ts', 'flv', 'wmv', '3gp',
 ] as const;
@@ -87,6 +122,21 @@ type PlaybackControlMessage = {
   version: 1;
   type: 'playback-control';
   action: 'pause' | 'resume' | 'stop';
+};
+
+type AudioOutputBackendMessage = {
+  version: 1;
+  type: 'audio-output-backend';
+  preferred_portaudio: boolean;
+  running: boolean;
+  selected_backend: string;
+  channels?: number;
+  sample_rate_hz?: number;
+};
+
+type AudioOutputBackendClosedMessage = {
+  version: 1;
+  type: 'audio-output-backend-closed';
 };
 
 type PendingRuntimeAction = {
@@ -153,6 +203,8 @@ type PlaybackSnapshot = {
   pending_audio_start_at_ms: number | null;
   pending_audio_duration_ms: number | null;
   audio_processing_parameters_version: string;
+  audio_stream_variant_count?: number | null;
+  audio_stream_revision: number;
   audio_processing_status: string;
   audio_processing_runtime: boolean;
   audio_processing_gain_db: number;
@@ -204,6 +256,59 @@ type FixedSpeechViewState = {
   status: 'idle' | FixedSpeechStatus;
   error: string | null;
 };
+
+type AudioOutputBackendStatus = {
+  available: boolean;
+  selected_backend: string;
+  preferred_portaudio: boolean;
+  running: boolean;
+  reason: string | null;
+  xrun_count: number;
+  hardware_state: string;
+  callback_status_flags: number;
+  callback_status_flags_count: number;
+  callback_underrun_count: number;
+  producer_drop_count: number;
+  output_latency_ms: number;
+  actual_sample_rate_hz: number | null;
+  callback_stalled_ms: number | null;
+  ring_len_samples: number;
+  ring_capacity_samples: number;
+  device_index: number | null;
+  memory_buffer_kib: number;
+  frames_per_buffer: number;
+  sample_rate_hz: number;
+  channels: number;
+  audio_task_count: number;
+  current_audio_ffmpeg_pid: number | null;
+  pending_audio_ffmpeg_pid: number | null;
+};
+
+type AudioOutputDevice = {
+  id: string;
+  name: string;
+  host_api: string;
+  max_output_channels: number;
+  default_sample_rate_hz: number;
+};
+
+function getActualAudioOutputLabel(status: AudioOutputBackendStatus | null): 'PortAudio' | 'WebView' {
+  return status?.running === true && status.selected_backend?.trim().toLowerCase() === 'portaudio'
+    ? 'PortAudio'
+    : 'WebView';
+}
+
+function getAudioRingBufferedLabel(status: AudioOutputBackendStatus | null): string {
+  const sampleRateHz = status?.actual_sample_rate_hz ?? status?.sample_rate_hz ?? 0;
+  if (!status || sampleRateHz <= 0 || status.channels <= 0) return '';
+  const milliseconds = Math.round((status.ring_len_samples * 1_000) / (sampleRateHz * status.channels));
+  return `（约 ${milliseconds}ms）`;
+}
+
+function getActualAudioStreamVariantCount(snapshot: PlaybackSnapshot | null): number | null {
+  const count = snapshot?.audio_stream_variant_count;
+  return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : null;
+}
 
 type MediaEngineCapabilities = {
   available: boolean;
@@ -359,6 +464,24 @@ function isRuntimePreviewParameters(value: unknown): value is RuntimePreviewPara
   return RUNTIME_PARAMETER_FIELDS.every((field) => typeof record[field] === 'number' && Number.isFinite(record[field]));
 }
 
+function isAudioOutputBackendMessage(value: unknown): value is AudioOutputBackendMessage {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.version === 1
+    && record.type === 'audio-output-backend'
+    && typeof record.preferred_portaudio === 'boolean'
+    && typeof record.running === 'boolean'
+    && typeof record.selected_backend === 'string'
+  );
+}
+
+function isAudioOutputBackendClosedMessage(value: unknown): value is AudioOutputBackendClosedMessage {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  return record.version === 1 && record.type === 'audio-output-backend-closed';
+}
+
 function isRuntimeParameterMessage(value: unknown): value is RuntimeParameterMessage {
   if (!value || typeof value !== 'object') return false;
   const record = value as Record<string, unknown>;
@@ -425,7 +548,7 @@ function toAssetUrl(path: string | null | undefined) {
 
 type PlaybackDisplayState = 'loading' | 'no-source' | 'error' | 'disabled' | 'ready' | 'playing' | 'paused' | 'stopped' | 'unknown';
 
-type ProcessingStatusKey = 'disabled' | 'configured' | 'processing' | 'ready' | 'runtime' | 'unavailable' | 'failed';
+type ProcessingStatusKey = 'disabled' | 'configured' | 'processing' | 'ready' | 'runtime' | 'unavailable' | 'failed' | 'unsupported';
 type MediaProcessingScope = 'video' | 'audio' | 'both';
 
 function getProcessingStatusKey(status: string | null | undefined, enabled: boolean, configured = false): ProcessingStatusKey {
@@ -448,6 +571,8 @@ function getProcessingStatusColor(status: ProcessingStatusKey) {
       return 'red';
     case 'unavailable':
       return 'orange';
+    case 'unsupported':
+      return 'gold';
     case 'configured':
       return 'blue';
     default:
@@ -467,6 +592,8 @@ function getProcessingStatusLabel(status: ProcessingStatusKey) {
       return '处理中';
     case 'unavailable':
       return '未接入';
+    case 'unsupported':
+      return '暂未支持';
     case 'failed':
       return '失败回退';
     default:
@@ -478,6 +605,34 @@ function formatAudioPreviewValue(value: number | null | undefined, unit = '', di
   if (value === null || value === undefined || !Number.isFinite(value)) return '未设置';
   return `${value.toFixed(digits)}${unit ? ` ${unit}` : ''}`;
 }
+
+const AUDIO_PRESET_FIELD_DEFINITIONS: readonly {
+  key: keyof SubtleAudioSample;
+  label: string;
+  unit: string;
+  digits: number;
+}[] = [
+  { key: 'pitch_shift_semitones', label: '音高', unit: '半音', digits: 3 },
+  { key: 'input_gain_db', label: '输入增益', unit: 'dB', digits: 3 },
+  { key: 'output_gain_db', label: '输出增益', unit: 'dB', digits: 3 },
+  { key: 'loudness_adjustment_db', label: '响度调整', unit: 'dB', digits: 3 },
+  { key: 'low_eq_db', label: '低频 EQ', unit: 'dB', digits: 3 },
+  { key: 'mid_eq_db', label: '中频 EQ', unit: 'dB', digits: 3 },
+  { key: 'high_eq_db', label: '高频 EQ', unit: 'dB', digits: 3 },
+  { key: 'filter_q', label: '滤波 Q', unit: '', digits: 3 },
+  { key: 'phase_perturbation_percent', label: '相位扰动', unit: '%', digits: 3 },
+  { key: 'vibrato_frequency_hz', label: '颤音频率', unit: 'Hz', digits: 3 },
+  { key: 'vibrato_depth_percent', label: '颤音深度', unit: '%', digits: 3 },
+  { key: 'reverb_wet_percent', label: '轻混响', unit: '%', digits: 3 },
+  { key: 'noise_reduction_percent', label: '降噪', unit: '%', digits: 3 },
+  { key: 'environment_noise_percent', label: '环境噪声', unit: '%', digits: 3 },
+  { key: 'environment_noise_dbfs', label: '环境噪声电平', unit: 'dBFS', digits: 3 },
+  { key: 'fade_in_ms', label: '淡入', unit: 'ms', digits: 3 },
+  { key: 'fade_out_ms', label: '淡出', unit: 'ms', digits: 3 },
+  { key: 'dry_wet_percent', label: '干湿比', unit: '%', digits: 3 },
+  { key: 'ambient_sound_mix_percent', label: '环境声混合', unit: '%', digits: 3 },
+  { key: 'spectral_perturbation_percent', label: '频谱微扰', unit: '%', digits: 3 },
+];
 
 function getPlaybackDisplayLabel(state: PlaybackDisplayState) {
   switch (state) {
@@ -559,17 +714,36 @@ function buildInterludeDraft(interlude?: InterludeSnapshot | null): InterludeCon
 function FinalEffectWindow() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const processedAudioARef = useRef<HTMLAudioElement | null>(null);
+  const processedAudioBRef = useRef<HTMLAudioElement | null>(null);
   const interludeAudioRef = useRef<HTMLAudioElement | null>(null);
+  const videoDryGainRef = useRef<GainNode | null>(null);
+  const processedSlotGainARef = useRef<GainNode | null>(null);
+  const processedSlotGainBRef = useRef<GainNode | null>(null);
+  const processedActiveSlotRef = useRef<0 | 1>(0);
+  const processedAudioGainTargetRef = useRef<'dry' | 'slot-a' | 'slot-b' | null>(null);
+  const processedAudioPlayingRef = useRef(false);
+  const processedAudioUrlRef = useRef<string | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioContextCleanupTimerRef = useRef<number | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  // 实时预览链：Gain + 三段 peaking EQ；FFmpeg 仅「应用」固化，预览不当双重。
+  // 实时预览链：Gain + EQ + 轻混响 + 底噪；FFmpeg 仅「应用」固化，预览不当双重。
   const videoFxGainRef = useRef<GainNode | null>(null);
   const videoFxLowEqRef = useRef<BiquadFilterNode | null>(null);
   const videoFxMidEqRef = useRef<BiquadFilterNode | null>(null);
   const videoFxHighEqRef = useRef<BiquadFilterNode | null>(null);
+  const videoFxReverbDelayRef = useRef<DelayNode | null>(null);
+  const videoFxReverbFeedbackRef = useRef<GainNode | null>(null);
+  const videoFxReverbWetRef = useRef<GainNode | null>(null);
+  const videoFxNoiseGainRef = useRef<GainNode | null>(null);
+  const videoFxNoiseSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const speakerMuteGainRef = useRef<GainNode | null>(null);
+  const portAudioHardwareRef = useRef(false);
+  const audioSourceSyncRef = useRef({ latestRequest: 0, pending: false, running: false });
   const runtimeAudioEnabledRef = useRef(false);
   const runtimeAudioParamsRef = useRef<RuntimePreviewParameters | null>(null);
+  // ponytail: 参数切换 30ms 增益交叉淡化；duck/音量仍走同一出口但不强制淡化键
+  const lastRealtimeFxKeyRef = useRef<string>('init');
   const interludeGainLevelRef = useRef(0);
   const duckGainLevelRef = useRef(1);
   const suppressMediaEventRef = useRef(false);
@@ -590,6 +764,10 @@ function FinalEffectWindow() {
   const loopGenerationRef = useRef<number | null>(null);
   const loopSequenceRef = useRef(0);
   const lastRestartTokenRef = useRef<string | number | null>(null);
+  // ponytail: src 一切换 currentTime 先归零；用 ref 保住续播点
+  const playbackPositionSecRef = useRef(0);
+  const [processedAudioUrl, setProcessedAudioUrl] = useState<string | null>(null);
+  const [processedAudioReady, setProcessedAudioReady] = useState(false);
   const interludeScheduleKeyRef = useRef<string | null>(null);
   const nextInterludeAtMsRef = useRef<number | null>(null);
   const lastInterludeIndexRef = useRef<number | null>(null);
@@ -611,11 +789,15 @@ function FinalEffectWindow() {
   const finalEffectResizeKeyRef = useRef<string | null>(null);
   const workerAvailableRef = useRef(false);
   const [audioDiagnosticsReady, setAudioDiagnosticsReady] = useState(false);
+  const [portAudioHardwareEnabled, setPortAudioHardwareEnabled] = useState(false);
   const [realtimeAudioPlaying, setRealtimeAudioPlaying] = useState(false);
   const [userMuted, setUserMuted] = useState(false);
   const [userVolume, setUserVolume] = useState(1);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [finalEffectResizeError, setFinalEffectResizeError] = useState<string | null>(null);
+  const portAudioSourcePath = snapshot?.current_video_reference
+    ?? snapshot?.source_media?.source_path
+    ?? null;
 
   useEffect(() => {
     const html = document.documentElement;
@@ -648,6 +830,7 @@ function FinalEffectWindow() {
     };
   }, []);
   const snapshotSyncVersionRef = useRef(0);
+  const snapshotPollInFlightRef = useRef(false);
 
   function applyPlayerSnapshot(nextSnapshot: PlaybackSnapshot) {
     snapshotSyncVersionRef.current += 1;
@@ -661,13 +844,24 @@ function FinalEffectWindow() {
   }
 
   function applyRealtimeVideoFx(params: RuntimePreviewParameters | null, audioEnabled: boolean) {
+    // 画面时钟独立于 Web Audio 图是否创建成功；音高保持时长，只有显式变速可改这里。
+    const live = audioEnabled && params && !processedAudioPlayingRef.current;
+    const video = videoRef.current;
+    if (video) {
+      video.playbackRate = resolveSynchronizedVideoPlaybackRate(
+        Boolean(audioEnabled && params),
+        params?.audio_playback_speed,
+      );
+    }
     const gain = videoFxGainRef.current;
     const low = videoFxLowEqRef.current;
     const mid = videoFxMidEqRef.current;
     const high = videoFxHighEqRef.current;
-    if (!gain || !low || !mid || !high) return;
-    // 声音开启即实时预览（播的是源文件）；关闭则中性。
-    const live = audioEnabled && params;
+    const reverbWet = videoFxReverbWetRef.current;
+    const reverbFeedback = videoFxReverbFeedbackRef.current;
+    const noiseGain = videoFxNoiseGainRef.current;
+    if (!gain || !low || !mid || !high || !reverbWet || !reverbFeedback || !noiseGain) return;
+    // 真轨已挂上隐藏音轨时关实时 FX，避免双重；否则预览垫底。
     const totalDb = live
       ? (params.audio_input_gain_db ?? 0)
         + (params.audio_output_gain_db ?? 0)
@@ -675,56 +869,142 @@ function FinalEffectWindow() {
       : 0;
     const duck = interludeActiveRef.current ? duckGainLevelRef.current : 1;
     const user = clampVolume(userVolumeRef.current);
-    gain.gain.value = (live ? 10 ** (totalDb / 20) : 1) * user * duck;
+    const targetGain = (live ? 10 ** (totalDb / 20) : 1) * user * duck;
     const q = Math.max(0.3, Math.min(10, live ? (params.audio_filter_q ?? 1) : 1));
+    const lowDb = live ? (params.audio_low_eq_db ?? 0) : 0;
+    const midDb = live ? (params.audio_mid_eq_db ?? 0) : 0;
+    const highDb = live ? (params.audio_high_eq_db ?? 0) : 0;
+    const reverbRatio = live
+      ? Math.max(0, Math.min(1, (params.audio_reverb_wet_percent ?? 0) / 100))
+      : 0;
+    const noiseRatio = live
+      ? Math.max(0, Math.min(1, (params.audio_environment_noise_percent ?? 0) / 100))
+      : 0;
+    const noiseAmp = live
+      ? Math.max(0.000_001, Math.min(1, 10 ** ((params.audio_environment_noise_dbfs ?? -40) / 20) * noiseRatio))
+      : 0;
+    const fxKey = buildAudioFxSignature(params, Boolean(live));
+    const shouldCrossfade = fxKey !== lastRealtimeFxKeyRef.current;
+    lastRealtimeFxKeyRef.current = fxKey;
+    const ctx = audioContextRef.current;
+    if (shouldCrossfade && ctx) {
+      const now = ctx.currentTime;
+      const end = now + AUDIO_PARAM_CROSSFADE_SEC;
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.setValueAtTime(gain.gain.value, now);
+      gain.gain.linearRampToValueAtTime(targetGain, end);
+      for (const [node, value] of [
+        [low.gain, lowDb],
+        [mid.gain, midDb],
+        [high.gain, highDb],
+        [reverbWet.gain, reverbRatio],
+        [reverbFeedback.gain, reverbRatio * 0.45],
+        [noiseGain.gain, noiseAmp],
+      ] as const) {
+        node.cancelScheduledValues(now);
+        node.setValueAtTime(node.value, now);
+        node.linearRampToValueAtTime(value, end);
+      }
+    } else {
+      gain.gain.value = targetGain;
+      low.gain.value = lowDb;
+      mid.gain.value = midDb;
+      high.gain.value = highDb;
+      reverbWet.gain.value = reverbRatio;
+      reverbFeedback.gain.value = reverbRatio * 0.45;
+      noiseGain.gain.value = noiseAmp;
+    }
     low.Q.value = q;
     mid.Q.value = q;
     high.Q.value = q;
-    low.gain.value = live ? (params.audio_low_eq_db ?? 0) : 0;
-    mid.gain.value = live ? (params.audio_mid_eq_db ?? 0) : 0;
-    high.gain.value = live ? (params.audio_high_eq_db ?? 0) : 0;
-    const video = videoRef.current;
-    if (video && live) {
-      // 微扰音高用 playbackRate 近似（±0.08st ≈ 0.5%），人耳几乎只当音色差。
-      const st = params.audio_pitch_shift_semitones ?? 0;
-      video.playbackRate = 2 ** (st / 12);
-    } else if (video) {
-      video.playbackRate = 1;
+  }
+
+  function scheduleProcessedAudioCrossfade(processedActive: boolean, activeSlot: 0 | 1) {
+    const target = processedActive ? (activeSlot === 0 ? 'slot-a' : 'slot-b') : 'dry';
+    if (processedAudioGainTargetRef.current === target) return;
+    const context = audioContextRef.current;
+    if (!context) return;
+    processedAudioGainTargetRef.current = target;
+    const now = context.currentTime;
+    const end = now + AUDIO_PARAM_CROSSFADE_SEC;
+    const gains: Array<[GainNode | null, number]> = [
+      [videoDryGainRef.current, processedActive ? 0 : 1],
+      [processedSlotGainARef.current, processedActive && activeSlot === 0 ? 1 : 0],
+      [processedSlotGainBRef.current, processedActive && activeSlot === 1 ? 1 : 0],
+    ];
+    for (const [gain, value] of gains) {
+      if (!gain) continue;
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.setValueAtTime(gain.gain.value, now);
+      gain.gain.linearRampToValueAtTime(value, end);
     }
   }
 
   function syncUserAudioSettings() {
     const video = videoRef.current;
     const audio = audioRef.current;
+    const processedA = processedAudioARef.current;
+    const processedB = processedAudioBRef.current;
     const interludeAudio = interludeAudioRef.current;
     const volume = userVolumeRef.current;
     const muted = userMutedRef.current;
+    const hardwareOut = portAudioHardwareRef.current;
     const effectiveAudioSource = getEffectiveAudioSource(snapshotRef.current);
     const replacementAudioActive =
       fixedSpeechActiveRef.current ||
       (audioDiagnosticsReadyRef.current &&
         effectiveAudioSource === 'realtime_variant' &&
         realtimeAudioPlayingRef.current);
+    const processedActive =
+      !replacementAudioActive && processedAudioPlayingRef.current;
+    const activeSlot = processedActiveSlotRef.current;
     const graphOwnsVideo = Boolean(videoFxGainRef.current);
+    scheduleProcessedAudioCrossfade(processedActive, activeSlot);
+    if (speakerMuteGainRef.current) {
+      speakerMuteGainRef.current.gain.value = hardwareOut || muted ? 0 : 1;
+    }
+    if (processedActive) {
+      if (videoFxReverbWetRef.current) videoFxReverbWetRef.current.gain.value = 0;
+      if (videoFxReverbFeedbackRef.current) videoFxReverbFeedbackRef.current.gain.value = 0;
+      if (videoFxNoiseGainRef.current) videoFxNoiseGainRef.current.gain.value = 0;
+    }
     if (video) {
-      // 图接管后 volume 走 GainNode；元素 volume 固定 1。
       video.volume = graphOwnsVideo
         ? 1
         : clampVolume(volume * (interludeActiveRef.current ? duckGainLevelRef.current : 1));
-      video.muted = replacementAudioActive || muted;
+      video.muted = hardwareOut
+        ? replacementAudioActive || processedActive
+        : replacementAudioActive || processedActive || muted;
     }
     if (audio) {
       audio.volume = volume;
-      audio.muted = muted || fixedSpeechActiveRef.current;
+      audio.muted = hardwareOut ? fixedSpeechActiveRef.current : muted || fixedSpeechActiveRef.current;
+    }
+    for (const el of [processedA, processedB]) {
+      if (!el) continue;
+      el.volume = 1;
+      el.muted = hardwareOut ? false : muted;
     }
     if (interludeAudio) {
+      // 插话自身用电平；主轨 duck 已在 videoFxGain。PA 模式下元素仍出声进 tap。
       interludeAudio.volume = clampVolume(volume * interludeGainLevelRef.current);
-      interludeAudio.muted = muted;
+      interludeAudio.muted = hardwareOut ? false : muted;
     }
     applyRealtimeVideoFx(
       runtimeAudioParamsRef.current,
-      runtimeAudioEnabledRef.current && !replacementAudioActive && !muted,
+      runtimeAudioEnabledRef.current && !replacementAudioActive && !processedActive && !(muted && !hardwareOut),
     );
+  }
+
+  function setPortAudioHardwareActive(requested: boolean) {
+    const nextActive = requested && PORTAUDIO_FORMAL_SOURCE_SYNC_READY;
+    if (portAudioHardwareRef.current === nextActive) {
+      syncUserAudioSettings();
+      return;
+    }
+    portAudioHardwareRef.current = nextActive;
+    setPortAudioHardwareEnabled(nextActive);
+    syncUserAudioSettings();
   }
 
   function clearInterludeStopTimer() {
@@ -1067,6 +1347,15 @@ function FinalEffectWindow() {
         }
         return;
       }
+      if (isAudioOutputBackendMessage(event.data)) {
+        setPortAudioHardwareActive(
+          event.data.preferred_portaudio
+            && event.data.running
+            && event.data.selected_backend === 'portaudio'
+            && PORTAUDIO_FORMAL_SOURCE_SYNC_READY,
+        );
+        return;
+      }
       if (!isRuntimeParameterMessage(event.data)) return;
       const currentGeneration = snapshotRef.current?.playback_generation;
       if (
@@ -1088,6 +1377,15 @@ function FinalEffectWindow() {
     const handlePageHide = () => {
       const operationId = fixedSpeechOperationRef.current?.operationId;
       if (operationId) cancelFixedSpeech(operationId);
+      setPortAudioHardwareActive(false);
+      try {
+        channel.postMessage({
+          version: 1,
+          type: 'audio-output-backend-closed',
+        } satisfies AudioOutputBackendClosedMessage);
+      } catch {
+        // 通道可能已关
+      }
     };
     window.addEventListener('pagehide', handlePageHide);
     return () => {
@@ -1149,23 +1447,109 @@ function FinalEffectWindow() {
 
   useEffect(() => {
     const refreshSnapshot = () => {
+      if (snapshotPollInFlightRef.current) return;
+      snapshotPollInFlightRef.current = true;
       const version = snapshotSyncVersionRef.current;
       void invoke<PlaybackSnapshot>('get_snapshot').then((nextSnapshot) => {
         if (version === snapshotSyncVersionRef.current) applyPlayerSnapshot(nextSnapshot);
-      }).catch(() => undefined);
+      }).catch(() => undefined).finally(() => {
+        snapshotPollInFlightRef.current = false;
+      });
     };
     refreshSnapshot();
-    const timer = window.setInterval(refreshSnapshot, 500);
+    const timer = window.setInterval(refreshSnapshot, PLAYBACK_SNAPSHOT_POLL_MS);
     return () => window.clearInterval(timer);
   }, []);
 
-  // 图只建一次：video → Gain/EQ → Analyser → 出声。换 src 不拆图（MediaElementSource 只能绑一次）。
+  // 最终效果窗自行探测 PortAudio，避免只依赖 BroadcastChannel 时序。
+  useEffect(() => {
+    let cancelled = false;
+    let realignBusy = false;
+    let realignAttemptedForHz: number | null = null;
+    let realignFailedForHz: number | null = null;
+    let outputStatusPollInFlight = false;
+    const refreshOutput = () => {
+      if (outputStatusPollInFlight) return;
+      outputStatusPollInFlight = true;
+      void invoke<AudioOutputBackendStatus>('get_audio_output_backend_status')
+        .then(async (status) => {
+          if (cancelled) return;
+          const targetRate = PORTAUDIO_SAMPLE_RATE_HZ;
+          const hardware =
+            PORTAUDIO_FORMAL_SOURCE_SYNC_READY
+            && Boolean(status.preferred_portaudio)
+            && Boolean(status.running)
+            && status.selected_backend === 'portaudio';
+          const needsRealign =
+            hardware
+            && Math.abs(targetRate - (status.sample_rate_hz || 0)) > 1
+            && !realignBusy
+            && realignAttemptedForHz !== targetRate
+            && realignFailedForHz !== targetRate;
+          // 同一目标 SR 只对齐一次；失败则退避，避免每 2s 重开流抖动。
+          if (needsRealign) {
+            realignBusy = true;
+            realignAttemptedForHz = targetRate;
+            try {
+              const next = await invoke<AudioOutputBackendStatus>('set_audio_output_backend', {
+                request: {
+                  prefer_portaudio: true,
+                  device_index: status.device_index,
+                  memory_buffer_kib: status.memory_buffer_kib,
+                  frames_per_buffer: status.frames_per_buffer,
+                  sample_rate_hz: targetRate,
+                  position_ms: (() => {
+                    const video = videoRef.current;
+                    return video && Number.isFinite(video.currentTime)
+                      ? Math.max(0, Math.round(video.currentTime * 1000))
+                      : Math.max(0, Math.round(snapshotRef.current?.current_position_ms ?? 0));
+                  })(),
+                },
+              });
+              if (cancelled) return;
+              const aligned =
+                PORTAUDIO_FORMAL_SOURCE_SYNC_READY
+                && Boolean(next.preferred_portaudio)
+                && Boolean(next.running)
+                && next.selected_backend === 'portaudio';
+              if (!aligned || Math.abs(targetRate - (next.sample_rate_hz || 0)) > 1) {
+                realignFailedForHz = targetRate;
+              }
+              setPortAudioHardwareActive(aligned);
+            } catch {
+              realignFailedForHz = targetRate;
+              setPortAudioHardwareActive(hardware);
+            } finally {
+              realignBusy = false;
+            }
+            return;
+          }
+          setPortAudioHardwareActive(hardware);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          outputStatusPollInFlight = false;
+        });
+    };
+    refreshOutput();
+    const timer = window.setInterval(refreshOutput, AUDIO_OUTPUT_STATUS_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  // 图只建一次：video → Gain/EQ → Analyser → speakerMute → destination。换 src 不拆图。
   useEffect(() => {
     let cancelled = false;
     let retryTimer: number | null = null;
 
     const ensureGraph = () => {
       if (cancelled) return;
+      if (audioContextCleanupTimerRef.current !== null) {
+        window.clearTimeout(audioContextCleanupTimerRef.current);
+        audioContextCleanupTimerRef.current = null;
+      }
       if (audioContextRef.current && videoFxGainRef.current) {
         void audioContextRef.current.resume().catch(() => undefined);
         audioDiagnosticsReadyRef.current = true;
@@ -1175,14 +1559,17 @@ function FinalEffectWindow() {
       }
       const video = videoRef.current;
       const audio = audioRef.current;
+      const processedA = processedAudioARef.current;
+      const processedB = processedAudioBRef.current;
       const interlude = interludeAudioRef.current;
-      if (!video || !audio || !interlude) {
+      if (!video || !audio || !processedA || !processedB || !interlude) {
         retryTimer = window.setTimeout(ensureGraph, 50);
         return;
       }
       let context: AudioContext | null = null;
       try {
-        context = new AudioContext();
+        // WebView 诊断图与 PortAudio 正式出口统一使用 44.1k。
+        context = new AudioContext({ sampleRate: PORTAUDIO_SAMPLE_RATE_HZ });
         const analyser = context.createAnalyser();
         analyser.fftSize = 2_048;
         analyser.smoothingTimeConstant = 0.75;
@@ -1190,6 +1577,10 @@ function FinalEffectWindow() {
         const low = context.createBiquadFilter();
         const mid = context.createBiquadFilter();
         const high = context.createBiquadFilter();
+        const reverbDelay = context.createDelay(0.2);
+        const reverbFeedback = context.createGain();
+        const reverbWet = context.createGain();
+        const noiseGain = context.createGain();
         low.type = 'peaking';
         mid.type = 'peaking';
         high.type = 'peaking';
@@ -1199,26 +1590,73 @@ function FinalEffectWindow() {
         low.Q.value = 1;
         mid.Q.value = 1;
         high.Q.value = 1;
-        // video 进实时预览链；隐藏轨直连 analyser（插话/实时候选）。
-        context.createMediaElementSource(video).connect(gain);
+        reverbDelay.delayTime.value = 0.08;
+        reverbFeedback.gain.value = 0;
+        reverbWet.gain.value = 0;
+        noiseGain.gain.value = 0;
+        // ponytail: 1s 白噪循环；环境噪声只调 gain
+        const noiseBuffer = context.createBuffer(1, Math.max(1, Math.floor(context.sampleRate)), context.sampleRate);
+        const noiseData = noiseBuffer.getChannelData(0);
+        for (let i = 0; i < noiseData.length; i += 1) noiseData[i] = Math.random() * 2 - 1;
+        const noiseSource = context.createBufferSource();
+        noiseSource.buffer = noiseBuffer;
+        noiseSource.loop = true;
+        // 画面锁源片；A/B 真轨槽预加载，就绪再切，加载期不断声。
+        const dryGain = context.createGain();
+        const slotGainA = context.createGain();
+        const slotGainB = context.createGain();
+        dryGain.gain.value = 1;
+        slotGainA.gain.value = 0;
+        slotGainB.gain.value = 0;
+        context.createMediaElementSource(video).connect(dryGain);
+        dryGain.connect(gain);
         gain.connect(low);
         low.connect(mid);
         mid.connect(high);
         high.connect(analyser);
+        high.connect(reverbDelay);
+        reverbDelay.connect(reverbFeedback);
+        reverbFeedback.connect(reverbDelay);
+        reverbDelay.connect(reverbWet);
+        reverbWet.connect(analyser);
+        noiseSource.connect(noiseGain);
+        noiseGain.connect(analyser);
+        noiseSource.start(0);
+        context.createMediaElementSource(processedA).connect(slotGainA);
+        context.createMediaElementSource(processedB).connect(slotGainB);
+        slotGainA.connect(analyser);
+        slotGainB.connect(analyser);
         context.createMediaElementSource(audio).connect(analyser);
         context.createMediaElementSource(interlude).connect(analyser);
-        analyser.connect(context.destination);
+        videoDryGainRef.current = dryGain;
+        processedSlotGainARef.current = slotGainA;
+        processedSlotGainBRef.current = slotGainB;
+        const speakerMute = context.createGain();
+        speakerMute.gain.value = 1;
+        analyser.connect(speakerMute);
+        speakerMute.connect(context.destination);
         audioContextRef.current = context;
         analyserRef.current = analyser;
         videoFxGainRef.current = gain;
         videoFxLowEqRef.current = low;
         videoFxMidEqRef.current = mid;
         videoFxHighEqRef.current = high;
+        videoFxReverbDelayRef.current = reverbDelay;
+        videoFxReverbFeedbackRef.current = reverbFeedback;
+        videoFxReverbWetRef.current = reverbWet;
+        videoFxNoiseGainRef.current = noiseGain;
+        videoFxNoiseSourceRef.current = noiseSource;
+        speakerMuteGainRef.current = speakerMute;
         audioDiagnosticsReadyRef.current = true;
         setAudioDiagnosticsReady(true);
         void context.resume().catch(() => undefined);
         syncUserAudioSettings();
       } catch (cause) {
+        try {
+          videoFxNoiseSourceRef.current?.stop();
+        } catch {
+          // ignore
+        }
         void context?.close().catch(() => undefined);
         audioContextRef.current = null;
         analyserRef.current = null;
@@ -1226,6 +1664,16 @@ function FinalEffectWindow() {
         videoFxLowEqRef.current = null;
         videoFxMidEqRef.current = null;
         videoFxHighEqRef.current = null;
+        videoFxReverbDelayRef.current = null;
+        videoFxReverbFeedbackRef.current = null;
+        videoFxReverbWetRef.current = null;
+        videoFxNoiseGainRef.current = null;
+        videoFxNoiseSourceRef.current = null;
+        videoDryGainRef.current = null;
+        processedSlotGainARef.current = null;
+        processedSlotGainBRef.current = null;
+        processedAudioGainTargetRef.current = null;
+        speakerMuteGainRef.current = null;
         audioDiagnosticsReadyRef.current = false;
         setAudioDiagnosticsReady(false);
         setPlaybackError(cause instanceof Error ? `音频图初始化失败：${cause.message}` : '音频图初始化失败');
@@ -1238,18 +1686,39 @@ function FinalEffectWindow() {
       if (retryTimer !== null) window.clearTimeout(retryTimer);
       if (audioContextCleanupTimerRef.current !== null) {
         window.clearTimeout(audioContextCleanupTimerRef.current);
-        audioContextCleanupTimerRef.current = null;
       }
-      const context = audioContextRef.current;
-      audioContextRef.current = null;
-      analyserRef.current = null;
-      videoFxGainRef.current = null;
-      videoFxLowEqRef.current = null;
-      videoFxMidEqRef.current = null;
-      videoFxHighEqRef.current = null;
-      audioDiagnosticsReadyRef.current = false;
-      setAudioDiagnosticsReady(false);
-      void context?.close().catch(() => undefined);
+      // React StrictMode/HMR 可能只短暂清理后立即重新挂载；媒体元素不能绑定第二个
+      // MediaElementSourceNode，因此给同一窗口的图一次短暂复用机会，再释放资源。
+      audioContextCleanupTimerRef.current = window.setTimeout(() => {
+        audioContextCleanupTimerRef.current = null;
+        const context = audioContextRef.current;
+        audioContextRef.current = null;
+        analyserRef.current = null;
+        try {
+          videoFxNoiseSourceRef.current?.stop();
+        } catch {
+          // ignore
+        }
+        videoFxGainRef.current = null;
+        videoFxLowEqRef.current = null;
+        videoFxMidEqRef.current = null;
+        videoFxHighEqRef.current = null;
+        videoFxReverbDelayRef.current = null;
+        videoFxReverbFeedbackRef.current = null;
+        videoFxReverbWetRef.current = null;
+        videoFxNoiseGainRef.current = null;
+        videoFxNoiseSourceRef.current = null;
+        videoDryGainRef.current = null;
+        processedSlotGainARef.current = null;
+        processedSlotGainBRef.current = null;
+        processedAudioGainTargetRef.current = null;
+        speakerMuteGainRef.current = null;
+        portAudioHardwareRef.current = false;
+        setPortAudioHardwareEnabled(false);
+        audioDiagnosticsReadyRef.current = false;
+        setAudioDiagnosticsReady(false);
+        void context?.close().catch(() => undefined);
+      }, 100);
     };
   }, []);
 
@@ -1260,6 +1729,69 @@ function FinalEffectWindow() {
     syncUserAudioSettings();
   }, [sourceUrl]);
 
+  function syncAudioOutputSourceLatest() {
+    const sync = audioSourceSyncRef.current;
+    sync.latestRequest += 1;
+    sync.pending = true;
+    if (sync.running) return;
+    sync.running = true;
+    void (async () => {
+      let latestFailure: string | null = null;
+      try {
+        while (sync.pending) {
+          sync.pending = false;
+          const requestId = sync.latestRequest;
+          try {
+            const video = videoRef.current;
+            const position_ms = video && Number.isFinite(video.currentTime)
+              ? Math.max(0, Math.round(video.currentTime * 1000))
+              : Math.max(0, Math.round(snapshotRef.current?.current_position_ms ?? 0));
+            const status = await invoke('sync_audio_output_source', {
+              request: { position_ms },
+            }) as AudioOutputBackendStatus;
+            if (requestId !== sync.latestRequest) continue;
+            latestFailure =
+              status.preferred_portaudio && status.selected_backend === 'portaudio' && status.running
+                ? null
+                : status.reason ?? '当前源音频不可用。';
+          } catch (cause) {
+            if (requestId === sync.latestRequest) {
+              latestFailure = getDisplayErrorMessage(cause, '当前源音频不可用。');
+            }
+          }
+        }
+        if (latestFailure && sync.latestRequest === audioSourceSyncRef.current.latestRequest) {
+          if (portAudioHardwareRef.current) setPortAudioHardwareActive(false);
+          setPlaybackError(`PortAudio 源同步失败，已回退 WebView：${latestFailure}`);
+        }
+      } finally {
+        sync.running = false;
+        if (sync.pending) {
+          // 最新源在本次 IPC 结束后再同步，避免并发调用。
+          syncAudioOutputSourceLatest();
+        }
+      }
+    })();
+  }
+
+  useEffect(() => {
+    if (!portAudioHardwareEnabled || !portAudioSourcePath) return;
+    syncAudioOutputSourceLatest();
+    const sync = audioSourceSyncRef.current;
+    return () => {
+      sync.latestRequest += 1;
+      sync.pending = false;
+    };
+  }, [
+    portAudioHardwareEnabled,
+    portAudioSourcePath,
+    snapshot?.current_video_reference,
+    snapshot?.source_media?.source_path,
+    snapshot?.playback_generation,
+    snapshot?.loop_index,
+    snapshot?.audio_stream_revision,
+  ]);
+
   useEffect(() => {
     void invoke<SpeechToSpeechWorkerCapabilities>('get_speech_to_speech_worker_capabilities')
       .then(setWorkerCapabilities)
@@ -1267,25 +1799,42 @@ function FinalEffectWindow() {
   }, []);
 
   useEffect(() => {
-    // 声音开启：始终播源文件 + Web Audio 实时预览（立刻有声）。
-    // 仅视频处理且已有 processed 时才切固化文件。
-    const audioLive = Boolean(snapshot?.audio_processing_enabled);
-    const videoBaked =
-      !audioLive &&
-      snapshot?.current_video_source === 'processed' &&
-      snapshot.current_video_reference;
-    const path = audioLive
-      ? (snapshot?.source_media?.source_path ?? snapshot?.current_video_reference)
-      : videoBaked
-        ? snapshot.current_video_reference
-        : (snapshot?.current_video_reference ?? snapshot?.source_media?.source_path);
+    // 普通声音已改为独立流式出口，视频缓存可以安全地只承担画面处理；
+    // PortAudio 会从源视频取音频，WebView 回退则使用缓存中的源 AAC。
+    const useProcessedVideo =
+      snapshot?.current_video_source === 'processed'
+      && Boolean(snapshot.current_video_reference);
+    const path = useProcessedVideo
+      ? snapshot.current_video_reference
+      : (snapshot?.source_media?.source_path ?? null);
     const nextUrl = toAssetUrl(path);
-    setSourceUrl(nextUrl);
+    setSourceUrl((prev) => (prev === nextUrl ? prev : nextUrl));
   }, [
     snapshot?.audio_processing_enabled,
     snapshot?.current_video_reference,
     snapshot?.current_video_source,
     snapshot?.source_media?.source_path,
+  ]);
+
+  useEffect(() => {
+    // 兼容旧快照：只有旧版仍标记为 ready 的处理音频才加载隐藏轨。
+    // 新的 runtime 路径不保存处理后音频文件，不能把视频缓存误当成处理音轨。
+    const audioLive = Boolean(snapshot?.audio_processing_enabled);
+    const ref = snapshot?.audio_processing_status === 'ready'
+      && snapshot?.current_video_source === 'processed'
+      ? snapshot.current_video_reference
+      : null;
+    const next = audioLive && ref ? toAssetUrl(ref) : null;
+    setProcessedAudioUrl((prev) => (prev === next ? prev : next));
+    if (!next) {
+      processedAudioPlayingRef.current = false;
+      setProcessedAudioReady(false);
+    }
+  }, [
+    snapshot?.audio_processing_enabled,
+    snapshot?.current_video_reference,
+    snapshot?.current_video_source,
+    snapshot?.audio_processing_status,
   ]);
 
   useEffect(() => {
@@ -1298,8 +1847,6 @@ function FinalEffectWindow() {
     const resizeKey = buildFinalEffectWindowResizeKey({
       width: source?.width,
       height: source?.height,
-      sourcePath: source?.source_path,
-      videoReference: snapshot?.current_video_reference,
     });
     if (!resizeKey || resizeKey === finalEffectResizeKeyRef.current) return;
 
@@ -1331,27 +1878,25 @@ function FinalEffectWindow() {
       if (retryTimer !== null) window.clearTimeout(retryTimer);
     };
   }, [
-    snapshot?.current_video_reference,
     snapshot?.source_media?.height,
-    snapshot?.source_media?.source_path,
     snapshot?.source_media?.width,
   ]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !sourceUrl) return;
-    // 处理产物切换：保持进度并强制继续播放+出声（编完立即听效果）。
-    const resumeAt = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    const resumeAt = playbackPositionSecRef.current;
     let cancelled = false;
     const restore = () => {
       if (cancelled) return;
-      if (resumeAt > 0 && Number.isFinite(video.duration) && video.duration > 0) {
-        video.currentTime = Math.min(resumeAt, Math.max(0, video.duration - 0.05));
+      if (resumeAt > 0.05 && Number.isFinite(video.duration) && video.duration > 0) {
+        const safeEnd = Math.max(0, video.duration - 0.2);
+        video.currentTime = Math.min(resumeAt, safeEnd);
+        playbackPositionSecRef.current = video.currentTime;
       }
       void audioContextRef.current?.resume().catch(() => undefined);
       userMutedRef.current = false;
       syncUserAudioSettings();
-      // ponytail: 仅 playing 才自动播；ready 等主页「播放」按钮
       if (snapshotRef.current?.playback_state === 'playing') {
         suppressMediaEventRef.current = true;
         void video.play().catch(() => {
@@ -1367,6 +1912,151 @@ function FinalEffectWindow() {
     };
   }, [sourceUrl]);
 
+  function restoreDryAudioOutput() {
+    processedAudioPlayingRef.current = false;
+    setProcessedAudioReady(false);
+    for (const el of [processedAudioARef.current, processedAudioBRef.current]) {
+      el?.pause();
+    }
+    const video = videoRef.current;
+    if (video && !portAudioHardwareRef.current && !userMutedRef.current) {
+      video.muted = false;
+    }
+    syncUserAudioSettings();
+  }
+
+  useEffect(() => {
+    const video = videoRef.current;
+    const slotA = processedAudioARef.current;
+    const slotB = processedAudioBRef.current;
+    if (!slotA || !slotB) return;
+    if (!processedAudioUrl) {
+      processedAudioUrlRef.current = null;
+      for (const el of [slotA, slotB]) {
+        el.pause();
+        el.removeAttribute('src');
+        el.load();
+      }
+      restoreDryAudioOutput();
+      return;
+    }
+    if (processedAudioUrlRef.current === processedAudioUrl) return;
+    let cancelled = false;
+    let cutDone = false;
+    // 空闲槽预载；干声/旧槽一直播到新槽真正 playing，再切（根因：play() resolve ≠ 已出声）
+    const nextSlot: 0 | 1 = processedAudioPlayingRef.current
+      ? (processedActiveSlotRef.current === 0 ? 1 : 0)
+      : 0;
+    const standby = nextSlot === 0 ? slotA : slotB;
+    const active = processedActiveSlotRef.current === 0 ? slotA : slotB;
+    standby.pause();
+    standby.src = processedAudioUrl;
+    standby.load();
+    const failStandby = () => {
+      if (cancelled || cutDone) return;
+      if (!processedAudioPlayingRef.current) restoreDryAudioOutput();
+    };
+    const cutOver = () => {
+      if (cancelled || cutDone) return;
+      cutDone = true;
+      processedActiveSlotRef.current = nextSlot;
+      processedAudioUrlRef.current = processedAudioUrl;
+      processedAudioPlayingRef.current = true;
+      setProcessedAudioReady(true);
+      syncUserAudioSettings();
+      if (active !== standby) {
+        window.setTimeout(() => {
+          if (
+            !cancelled
+            && processedAudioPlayingRef.current
+            && processedActiveSlotRef.current === nextSlot
+          ) {
+            active.pause();
+          }
+        }, AUDIO_PARAM_CROSSFADE_SEC * 1000);
+      }
+    };
+    const waitAudibleThenCut = () => {
+      if (cancelled) return;
+      const onPlaying = () => {
+        standby.removeEventListener('playing', onPlaying);
+        standby.removeEventListener('timeupdate', onPlaying);
+        cutOver();
+      };
+      standby.addEventListener('playing', onPlaying);
+      standby.addEventListener('timeupdate', onPlaying);
+      // 保险：仍无事件则 400ms 后切，避免永远不切
+      window.setTimeout(() => {
+        if (!cancelled && !cutDone && !standby.paused) cutOver();
+      }, 400);
+    };
+    const activate = () => {
+      if (cancelled) return;
+      const t = video && Number.isFinite(video.currentTime) ? video.currentTime : 0;
+      const target = Number.isFinite(standby.duration) && standby.duration > 0
+        ? Math.min(Math.max(0, t), Math.max(0, standby.duration - 0.05))
+        : Math.max(0, t);
+      const startPlay = () => {
+        if (cancelled) return;
+        void standby.play().then(waitAudibleThenCut).catch(failStandby);
+      };
+      if (Math.abs((standby.currentTime || 0) - target) > 0.05) {
+        const onSeeked = () => {
+          standby.removeEventListener('seeked', onSeeked);
+          startPlay();
+        };
+        standby.addEventListener('seeked', onSeeked);
+        try {
+          standby.currentTime = target;
+        } catch {
+          startPlay();
+        }
+      } else {
+        startPlay();
+      }
+    };
+    if (standby.readyState >= 1) activate();
+    else {
+      standby.addEventListener('loadedmetadata', activate, { once: true });
+      standby.addEventListener('error', failStandby, { once: true });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [processedAudioUrl]);
+
+  // 真轨失效回干声；加载/seek 中的短暂停不算失效
+  useEffect(() => {
+    let badSince: number | null = null;
+    const timer = window.setInterval(() => {
+      if (!processedAudioPlayingRef.current) {
+        badSince = null;
+        return;
+      }
+      if (snapshotRef.current?.playback_state !== 'playing') {
+        badSince = null;
+        return;
+      }
+      const active = processedActiveSlotRef.current === 0
+        ? processedAudioARef.current
+        : processedAudioBRef.current;
+      const broken = !active || Boolean(active.error) || (active.paused && !active.seeking);
+      if (!broken) {
+        badSince = null;
+        return;
+      }
+      if (badSince === null) badSince = Date.now();
+      if (Date.now() - badSince >= 1_200) restoreDryAudioOutput();
+    }, 300);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (snapshot?.audio_processing_status !== 'failed') return;
+    // 处理失败时强制回到源视频声音，避免旧 A/B 槽仍保持静音接管状态。
+    restoreDryAudioOutput();
+  }, [snapshot?.audio_processing_status, snapshot?.fallback_reason]);
+
   useEffect(() => {
     const video = videoRef.current;
     const audio = audioRef.current;
@@ -1374,9 +2064,16 @@ function FinalEffectWindow() {
     if (!video || !sourceUrl) return;
     if (snapshot?.playback_state === 'stopped') {
       video.pause();
+      playbackPositionSecRef.current = 0;
       video.currentTime = 0;
       audio?.pause();
       if (audio) audio.currentTime = 0;
+      for (const el of [processedAudioARef.current, processedAudioBRef.current]) {
+        if (!el) continue;
+        el.pause();
+        el.currentTime = 0;
+      }
+      restoreDryAudioOutput();
       const operationId = fixedSpeechOperationRef.current?.operationId;
       if (operationId) cancelFixedSpeech(operationId);
       clearInterludePlayback({ releaseMs: interlude?.ducking_release_ms ?? 0, resetSchedule: true, resetIndex: true });
@@ -1386,6 +2083,8 @@ function FinalEffectWindow() {
       // ready：导入后只展示首帧，等主页「播放」
       video.pause();
       audio?.pause();
+      processedAudioARef.current?.pause();
+      processedAudioBRef.current?.pause();
       window.speechSynthesis?.pause();
       pauseInterludePlayback();
       return;
@@ -1397,9 +2096,18 @@ function FinalEffectWindow() {
       if (effectiveAudioSource === 'realtime_variant' && audioUrl && audioDiagnosticsReady && audio) {
         void audio.play().catch(() => undefined);
       }
+      if (processedAudioPlayingRef.current) {
+        const active = processedActiveSlotRef.current === 0
+          ? processedAudioARef.current
+          : processedAudioBRef.current;
+        if (active) {
+          active.currentTime = video.currentTime;
+          void active.play().catch(() => undefined);
+        }
+      }
       resumeInterludePlayback();
     }
-  }, [audioDiagnosticsReady, audioUrl, snapshot?.interlude, snapshot?.playback_state, snapshot?.effective_audio_source, snapshot?.current_audio_source, sourceUrl]);
+  }, [audioDiagnosticsReady, audioUrl, snapshot?.interlude, snapshot?.playback_state, snapshot?.effective_audio_source, snapshot?.current_audio_source, sourceUrl, processedAudioReady]);
 
   useEffect(() => {
     if (!snapshot || !sourceUrl) return;
@@ -1655,8 +2363,8 @@ function FinalEffectWindow() {
     return () => window.clearInterval(timer);
   }, []);
 
-  const currentSourceKey =
-    snapshot?.current_video_reference ?? snapshot?.source_media?.source_path ?? sourceUrl ?? null;
+  // 循环令牌跟当前画面 URL，不跟后台 processed 路径（声音-only 画面锁源片）
+  const currentSourceKey = sourceUrl ?? snapshot?.source_media?.source_path ?? null;
 
   useEffect(() => {
     if (
@@ -1680,10 +2388,20 @@ function FinalEffectWindow() {
     const previousVideoReference = snapshotRef.current?.current_video_reference;
     lastRestartTokenRef.current = restartToken;
     loopSequenceRef.current += 1;
+    playbackPositionSecRef.current = 0;
+    // 声音-only：画面只 seek；真轨与画面同帧回 0
     video.currentTime = 0;
     if (audioRef.current) audioRef.current.currentTime = 0;
+    const processed = processedAudioPlayingRef.current
+      ? (processedActiveSlotRef.current === 0 ? processedAudioARef.current : processedAudioBRef.current)
+      : null;
+    if (processed) processed.currentTime = 0;
     suppressMediaEventRef.current = true;
-    void video.play().catch(() => {
+    void video.play().then(() => {
+      if (processed && processedAudioPlayingRef.current) {
+        void processed.play().catch(() => undefined);
+      }
+    }).catch(() => {
       suppressMediaEventRef.current = false;
       setPlaybackError('视频已回到开头，但自动播放失败，请点击视频播放。');
     });
@@ -1710,6 +2428,8 @@ function FinalEffectWindow() {
     const currentSnapshot = snapshotRef.current;
     if (!currentSnapshot || currentSnapshot.playback_state !== 'playing' || !currentSourceKey) return;
     const currentTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    if (currentTime > 0) playbackPositionSecRef.current = currentTime;
+    // ponytail: 不在 timeupdate 里 seek 真轨，频繁 seek 会卡顿；只在循环边界对齐
     const duration = Number.isFinite(video.duration) ? video.duration : 0;
     const restartToken = `${currentSourceKey}:${currentSnapshot.playback_generation}:${loopSequenceRef.current}`;
     if (
@@ -1822,6 +2542,20 @@ function FinalEffectWindow() {
                 hidden
               />
               <audio
+                ref={processedAudioARef}
+                crossOrigin="anonymous"
+                preload="auto"
+                onError={restoreDryAudioOutput}
+                hidden
+              />
+              <audio
+                ref={processedAudioBRef}
+                crossOrigin="anonymous"
+                preload="auto"
+                onError={restoreDryAudioOutput}
+                hidden
+              />
+              <audio
                 ref={interludeAudioRef}
                 crossOrigin="anonymous"
                 src={interludeAudioUrl ?? undefined}
@@ -1871,17 +2605,79 @@ function DesktopApp() {
   const [interludeDirty, setInterludeDirty] = useState(false);
   const [interludeSaving, setInterludeSaving] = useState(false);
   const [mediaEngineCapabilities, setMediaEngineCapabilities] = useState<MediaEngineCapabilities | null>(null);
+  const [audioOutputBackend, setAudioOutputBackend] = useState<AudioOutputBackendStatus | null>(null);
+  const [audioOutputDevices, setAudioOutputDevices] = useState<AudioOutputDevice[]>([]);
+  const [audioOutputBusy, setAudioOutputBusy] = useState(false);
+  const [audioOutputDeviceId, setAudioOutputDeviceId] = useState<string | null>(null);
+  const [audioOutputMemoryKib, setAudioOutputMemoryKib] = useState(PORTAUDIO_DEFAULT_MEMORY_BUFFER_KIB);
+  const [audioOutputMemoryKibInput, setAudioOutputMemoryKibInput] = useState<number | null>(
+    PORTAUDIO_DEFAULT_MEMORY_BUFFER_KIB,
+  );
+  const [audioOutputHostApiFilter, setAudioOutputHostApiFilter] = useState<string>('all');
+
+  function publishAudioOutputBackend(status: AudioOutputBackendStatus) {
+    setAudioOutputBackend(status);
+    if (typeof status.device_index === 'number') {
+      setAudioOutputDeviceId(String(status.device_index));
+    }
+    if (typeof status.memory_buffer_kib === 'number') {
+      setAudioOutputMemoryKib(status.memory_buffer_kib);
+      setAudioOutputMemoryKibInput(status.memory_buffer_kib);
+    }
+    playbackChannelRef.current?.postMessage({
+      version: 1,
+      type: 'audio-output-backend',
+      preferred_portaudio: Boolean(status.preferred_portaudio),
+      running: Boolean(status.running),
+      selected_backend: status.selected_backend,
+      channels: status.channels,
+      sample_rate_hz: status.sample_rate_hz,
+    } satisfies AudioOutputBackendMessage);
+  }
+
+  async function applyAudioOutputBackend(
+    preferPortaudio: boolean,
+    deviceId = audioOutputDeviceId,
+    memoryBufferKib = audioOutputMemoryKib,
+  ) {
+    setAudioOutputBusy(true);
+    const position_ms = Number.isFinite(mediaState?.current_time)
+      ? Math.max(0, Math.round((mediaState?.current_time ?? 0) * 1000))
+      : Math.max(0, Math.round(snapshot?.current_position_ms ?? 0));
+    try {
+      const sampleRateHz = PORTAUDIO_SAMPLE_RATE_HZ;
+      const status = await invoke<AudioOutputBackendStatus>('set_audio_output_backend', {
+        request: {
+          prefer_portaudio: preferPortaudio,
+          device_index: deviceId !== null && deviceId !== '' ? Number(deviceId) : null,
+          memory_buffer_kib: memoryBufferKib,
+          sample_rate_hz: sampleRateHz,
+          position_ms,
+        },
+      });
+      publishAudioOutputBackend(status);
+      if (status.preferred_portaudio && status.selected_backend !== 'portaudio') {
+        setError(status.reason ?? 'PortAudio 启动失败，已回退 WebView');
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '切换音频出口失败');
+    } finally {
+      setAudioOutputBusy(false);
+    }
+  }
   const [researchWorkerCapabilities, setResearchWorkerCapabilities] = useState<ResearchWorkerCapabilities | null>(null);
   const [researchStatus, setResearchStatus] = useState<ResearchStatus | null>(null);
   const [researchParams, setResearchParams] = useState<ResearchParams | null>(null);
   const [researchValidation, setResearchValidation] = useState<ParameterValidationError[]>([]);
   const [researchValidationStatus, setResearchValidationStatus] = useState<'idle' | 'valid' | 'invalid'>('idle');
   const [cacheCleanup, setCacheCleanup] = useState<CacheCleanupResult | null>(null);
+  const [cacheCleanupError, setCacheCleanupError] = useState<string | null>(null);
   const [mediaProcessingBusy, setMediaProcessingBusy] = useState<MediaProcessingScope | null>(null);
   const [researchActionBusy, setResearchActionBusy] = useState(false);
   const [researchCancelBusy, setResearchCancelBusy] = useState(false);
   const [cacheCleanupBusy, setCacheCleanupBusy] = useState(false);
   const snapshotRequestRef = useRef(0);
+  const snapshotPollInFlightRef = useRef(false);
   const importVideoInFlightRef = useRef(false);
   const pendingRuntimeActionRef = useRef<PendingRuntimeAction | null>(null);
   const runtimeResourceActionTokenRef = useRef(0);
@@ -1896,8 +2692,17 @@ function DesktopApp() {
   const runtimeMessageRef = useRef<RuntimeParameterMessage | null>(null);
   const runtimeSchedulerRef = useRef({ cycle: 0, lastChangeMs: null as number | null });
   const audioSchedulerRef = useRef({ cycle: 0, lastChangeMs: null as number | null });
-  const pendingAudioApplyRef = useRef<ResearchParams | null>(null);
+  const pendingAudioApplyRef = useRef<{
+    params: ResearchParams;
+    cycle: AudioCycleSample | null;
+  } | null>(null);
   const mediaApplyInFlightRef = useRef(false);
+  const researchParamsRef = useRef<ResearchParams | null>(null);
+  const researchParamsMutationVersionRef = useRef(0);
+  const audioProcessingEnabledRef = useRef(false);
+  const videoProcessingEnabledRef = useRef(false);
+  const snapshotRefHome = useRef<PlaybackSnapshot | null>(null);
+  const schedulePeriodRenderRef = useRef<(params: ResearchParams) => void>(() => undefined);
   const waveformCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const spectrumCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -2062,14 +2867,144 @@ function DesktopApp() {
   const [runtimeLastChangeMs, setRuntimeLastChangeMs] = useState<number | null>(null);
   const [audioVariationCycle, setAudioVariationCycle] = useState(0);
   const [audioLastChangeMs, setAudioLastChangeMs] = useState<number | null>(null);
-  // 每个预设=完整 20 参数值；默认勾选全部，周期随机抽一套
-  const [audioValuePresetIds, setAudioValuePresetIds] = useState<string[]>(() => [
-    ...DEFAULT_AUDIO_VALUE_PRESET_IDS,
-  ]);
+  // 每个预设=完整 20 参数值；默认勾选全部；mix 默认关（单轨）；会话可持久化
+  const [audioValuePresetIds, setAudioValuePresetIds] = useState<string[]>(() => {
+    const saved = loadAudioMixSession();
+    return saved?.selectedPresetIds?.length
+      ? saved.selectedPresetIds
+      : [...DEFAULT_AUDIO_VALUE_PRESET_IDS];
+  });
+  const [audioMixEnabled, setAudioMixEnabled] = useState(() => Boolean(loadAudioMixSession()?.mixEnabled));
+  const [audioMixPickMin, setAudioMixPickMin] = useState(() => {
+    const saved = loadAudioMixSession();
+    return normalizeAudioMixPickMin(saved?.pickMin ?? DEFAULT_AUDIO_MIX_PICK_MIN, saved?.pickMax ?? DEFAULT_AUDIO_MIX_PICK_MAX);
+  });
+  const [audioMixPickMax, setAudioMixPickMax] = useState(() =>
+    normalizeAudioMixPickMax(loadAudioMixSession()?.pickMax ?? DEFAULT_AUDIO_MIX_PICK_MAX),
+  );
+  const [audioActivePresetIds, setAudioActivePresetIds] = useState<string[]>([]);
+  const [audioCycleSeed, setAudioCycleSeed] = useState<number | null>(null);
+  const [audioCycleWeights, setAudioCycleWeights] = useState<number[]>([]);
+  const [audioPresetDrawerOpen, setAudioPresetDrawerOpen] = useState(false);
+  const audioCycleSampleRef = useRef<AudioCycleSample | null>(null);
+  const lastAudioCycleSnapshotSignatureRef = useRef<string | null>(null);
   const audioValuePresetIdsRef = useRef(audioValuePresetIds);
+  const audioMixEnabledRef = useRef(audioMixEnabled);
+  const audioMixPickMinRef = useRef(audioMixPickMin);
+  const audioMixPickMaxRef = useRef(audioMixPickMax);
   useEffect(() => {
     audioValuePresetIdsRef.current = audioValuePresetIds;
   }, [audioValuePresetIds]);
+  useEffect(() => {
+    audioMixEnabledRef.current = audioMixEnabled;
+  }, [audioMixEnabled]);
+  useEffect(() => {
+    audioMixPickMinRef.current = audioMixPickMin;
+  }, [audioMixPickMin]);
+  useEffect(() => {
+    audioMixPickMaxRef.current = audioMixPickMax;
+  }, [audioMixPickMax]);
+  useEffect(() => {
+    saveAudioMixSession({
+      selectedPresetIds: audioValuePresetIds,
+      mixEnabled: audioMixEnabled,
+      pickMin: audioMixPickMin,
+      pickMax: audioMixPickMax,
+    });
+  }, [audioValuePresetIds, audioMixEnabled, audioMixPickMin, audioMixPickMax]);
+
+  useEffect(() => {
+    researchParamsRef.current = researchParams;
+  }, [researchParams]);
+  useEffect(() => {
+    audioProcessingEnabledRef.current = audioProcessingEnabled;
+  }, [audioProcessingEnabled]);
+  useEffect(() => {
+    videoProcessingEnabledRef.current = videoProcessingEnabled;
+  }, [videoProcessingEnabled]);
+  useEffect(() => {
+    snapshotRefHome.current = snapshot;
+  }, [snapshot]);
+
+  function commitAudioCycleSample(
+    sample: AudioCycleSample,
+    options: {
+      scheduleRender?: boolean;
+      applyAudioToResearchParams?: boolean;
+      baseParams?: ResearchParams;
+      randomChangePeriodMs?: number;
+    } = {},
+  ) {
+    const {
+      scheduleRender = true,
+      applyAudioToResearchParams = true,
+      baseParams,
+      randomChangePeriodMs,
+    } = options;
+    audioCycleSampleRef.current = sample;
+    setAudioActivePresetIds(sample.presetIds);
+    setAudioCycleSeed(sample.seed);
+    setAudioCycleWeights(sample.weights);
+    const snapshotSignature = JSON.stringify({
+      seed: sample.seed,
+      presetIds: sample.presetIds,
+      weights: sample.weights,
+      values: sample.values,
+    });
+    if (lastAudioCycleSnapshotSignatureRef.current !== snapshotSignature) {
+      // 可复现：落盘 seed + preset ids + weights + 参数快照 + 提交时间。
+      appendAudioCycleSnapshot({
+        at: new Date().toISOString(),
+        seed: sample.seed,
+        presetIds: sample.presetIds,
+        weights: sample.weights,
+        values: { ...sample.values },
+      });
+      lastAudioCycleSnapshotSignatureRef.current = snapshotSignature;
+    }
+    if (!applyAudioToResearchParams) return sample;
+    setResearchParams((current) => {
+      const source = baseParams ?? current;
+      if (!source) return source;
+      const next = {
+        ...source,
+        audio: {
+          ...source.audio,
+          ...sample.values,
+          ...(typeof randomChangePeriodMs === 'number'
+            ? { random_change_period_ms: randomChangePeriodMs }
+            : {}),
+        },
+      };
+      // 首轮/周期都提交流式配置；PortAudio 候选预热后再切轨，失败沿用旧轨。
+      if (scheduleRender) {
+        queueMicrotask(() => schedulePeriodRenderRef.current(next));
+      }
+      return next;
+    });
+    return sample;
+  }
+
+  function sampleAndCommitAudioCycle(options: {
+    scheduleRender?: boolean;
+    applyAudioToResearchParams?: boolean;
+    baseParams?: ResearchParams;
+    randomChangePeriodMs?: number;
+  } = {}) {
+    return commitAudioCycleSample(
+      sampleAudioCycle(audioValuePresetIdsRef.current, {
+        mixEnabled: audioMixEnabledRef.current,
+        pickMin: audioMixPickMinRef.current,
+        pickMax: audioMixPickMaxRef.current,
+        previousPresetIds: audioCycleSampleRef.current?.presetIds,
+      }),
+      options,
+    );
+  }
+
+  function applyAudioCycleSample(scheduleRender = true) {
+    sampleAndCommitAudioCycle({ scheduleRender });
+  }
   const [runtimeNowMs, setRuntimeNowMs] = useState(() => Date.now());
   const [runtimePreview, setRuntimePreview] = useState<RuntimePreviewParameters | null>(null);
   const [runtimeChannelError, setRuntimeChannelError] = useState<string | null>(null);
@@ -2117,6 +3052,57 @@ function DesktopApp() {
           status: event.data.status,
           error: event.data.error,
         });
+        return;
+      }
+      if (isAudioOutputBackendClosedMessage(event.data)) {
+        setAudioOutputBackend((current) =>
+          current
+            ? {
+                ...current,
+                preferred_portaudio: false,
+                running: false,
+                selected_backend: 'webview',
+                hardware_state: 'not_created',
+                callback_status_flags: 0,
+                callback_status_flags_count: 0,
+                callback_underrun_count: 0,
+                producer_drop_count: 0,
+                output_latency_ms: 0,
+                actual_sample_rate_hz: null,
+                callback_stalled_ms: null,
+                ring_len_samples: 0,
+                ring_capacity_samples: 0,
+                audio_task_count: 0,
+                current_audio_ffmpeg_pid: null,
+                pending_audio_ffmpeg_pid: null,
+              }
+            : {
+                available: false,
+                selected_backend: 'webview',
+                hardware_state: 'not_created',
+                callback_status_flags: 0,
+                callback_status_flags_count: 0,
+                callback_underrun_count: 0,
+                producer_drop_count: 0,
+                output_latency_ms: 0,
+                actual_sample_rate_hz: null,
+                callback_stalled_ms: null,
+                ring_len_samples: 0,
+                ring_capacity_samples: 0,
+                preferred_portaudio: false,
+                running: false,
+                reason: '最终效果窗已关闭',
+                xrun_count: 0,
+                device_index: null,
+                memory_buffer_kib: PORTAUDIO_DEFAULT_MEMORY_BUFFER_KIB,
+                frames_per_buffer: PORTAUDIO_DEFAULT_FRAMES_PER_BUFFER,
+                sample_rate_hz: PORTAUDIO_SAMPLE_RATE_HZ,
+                channels: 2,
+                audio_task_count: 0,
+                current_audio_ffmpeg_pid: null,
+                pending_audio_ffmpeg_pid: null,
+              },
+        );
         return;
       }
       if (!isDiagnosticMessage(event.data)) return;
@@ -2194,9 +3180,71 @@ function DesktopApp() {
     return () => window.clearInterval(timer);
   }, []);
 
+  // 关最终效果窗会清 PortAudio preferred；主窗轮询对齐开关状态。
+  useEffect(() => {
+    let cancelled = false;
+    let outputStatusPollInFlight = false;
+    const refreshOutputStatus = () => {
+      if (outputStatusPollInFlight) return;
+      outputStatusPollInFlight = true;
+      void invoke<AudioOutputBackendStatus>('get_audio_output_backend_status')
+        .then((status) => {
+          if (cancelled) return;
+          setAudioOutputBackend((current) => {
+            if (
+              current
+              && current.preferred_portaudio === status.preferred_portaudio
+              && current.running === status.running
+              && current.selected_backend === status.selected_backend
+              && current.xrun_count === status.xrun_count
+              && current.hardware_state === status.hardware_state
+              && current.callback_status_flags === status.callback_status_flags
+              && current.callback_status_flags_count === status.callback_status_flags_count
+              && current.callback_underrun_count === status.callback_underrun_count
+              && current.producer_drop_count === status.producer_drop_count
+              && current.output_latency_ms === status.output_latency_ms
+              && current.actual_sample_rate_hz === status.actual_sample_rate_hz
+              && current.callback_stalled_ms === status.callback_stalled_ms
+              && current.audio_task_count === status.audio_task_count
+              && current.current_audio_ffmpeg_pid === status.current_audio_ffmpeg_pid
+              && current.pending_audio_ffmpeg_pid === status.pending_audio_ffmpeg_pid
+            ) {
+              return current;
+            }
+            return status;
+          });
+          if (!status.preferred_portaudio) {
+            playbackChannelRef.current?.postMessage({
+              version: 1,
+              type: 'audio-output-backend',
+              preferred_portaudio: false,
+              running: false,
+              selected_backend: status.selected_backend,
+              channels: status.channels,
+              sample_rate_hz: status.sample_rate_hz,
+            } satisfies AudioOutputBackendMessage);
+          }
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          outputStatusPollInFlight = false;
+        });
+    };
+    refreshOutputStatus();
+    const timer = window.setInterval(refreshOutputStatus, AUDIO_OUTPUT_STATUS_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const mediaWasProcessingRef = useRef(false);
+
   useEffect(() => {
     let cancelled = false;
     const refreshSnapshot = async () => {
+      if (snapshotPollInFlightRef.current) return;
+      snapshotPollInFlightRef.current = true;
       const requestId = ++snapshotRequestRef.current;
       setSnapshotLoading(true);
       try {
@@ -2208,6 +3256,7 @@ function DesktopApp() {
         if (cancelled || requestId !== snapshotRequestRef.current) return;
         setSnapshotFetchError(cause instanceof Error ? cause.message : '读取播放状态失败');
       } finally {
+        snapshotPollInFlightRef.current = false;
         if (!cancelled && requestId === snapshotRequestRef.current) {
           setSnapshotLoading(false);
         }
@@ -2216,7 +3265,7 @@ function DesktopApp() {
     void refreshSnapshot();
     const timer = window.setInterval(() => {
       void refreshSnapshot();
-    }, 500);
+    }, PLAYBACK_SNAPSHOT_POLL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -2249,6 +3298,7 @@ function DesktopApp() {
   useEffect(() => {
     let cancelled = false;
     let researchStatusTimer: number | undefined;
+    const initialMutationVersion = researchParamsMutationVersionRef.current;
     const cancelIdleWork = scheduleAfterInitialPaint(() => {
       if (cancelled) return;
       const capabilityToken = runtimeResourceActionTokenRef.current;
@@ -2265,6 +3315,20 @@ function DesktopApp() {
         .catch(() => {
           if (!cancelled) setResearchWorkerCapabilities(null);
         });
+      void invoke<AudioOutputDevice[]>('list_audio_output_devices')
+        .then((devices) => {
+          if (!cancelled) {
+            setAudioOutputDevices(
+              devices.filter(
+                (device) => typeof device.host_api === 'string'
+                  && device.host_api.trim().toLowerCase() !== 'asio',
+              ),
+            );
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setAudioOutputDevices([]);
+        });
       void invoke<ResearchStatus>('get_research_status')
         .then((status) => {
           if (!cancelled) setResearchStatus(status);
@@ -2274,11 +3338,12 @@ function DesktopApp() {
         });
       void invoke<ResearchParams>('get_default_local_research_params')
         .then((params) => {
-          if (!cancelled) {
-            // 声音处理参数默认微扰随机，用户不手填；采样率/码率等结构字段保留默认。
-            setResearchParams({
-              ...params,
-              audio: { ...params.audio, ...sampleSubtleAudioParams(audioValuePresetIdsRef.current) },
+          if (!cancelled && researchParamsMutationVersionRef.current === initialMutationVersion) {
+            // 声音处理参数默认从预设抽样；采样率/码率等结构字段保留默认。
+            sampleAndCommitAudioCycle({
+              scheduleRender: false,
+              baseParams: params,
+              randomChangePeriodMs: samplePeriodMsInRange(audioPeriodRangeRef.current),
             });
           }
         })
@@ -2379,10 +3444,27 @@ function DesktopApp() {
     researchParams?.video.space_x_offset_px,
     researchParams?.video.space_y_offset_px,
   ]);
-  const runtimePeriodMs = normalizeRuntimeVariationPeriod(researchParams?.audio.random_change_period_ms);
+  const [audioPeriodRange, setAudioPeriodRange] = useState<PeriodRangeMs>(() => loadAudioPeriodRange());
+  const [videoPeriodRange, setVideoPeriodRange] = useState<PeriodRangeMs>(() => loadVideoPeriodRange());
+  const audioPeriodRangeRef = useRef(audioPeriodRange);
+  const videoPeriodRangeRef = useRef(videoPeriodRange);
+  const nextAudioPeriodMsRef = useRef(samplePeriodMsInRange(audioPeriodRange));
+  const nextVideoPeriodMsRef = useRef(samplePeriodMsInRange(videoPeriodRange));
+  const [audioPeriodMs, setAudioPeriodMs] = useState(() => nextAudioPeriodMsRef.current);
+  const [videoPeriodMs, setVideoPeriodMs] = useState(() => nextVideoPeriodMsRef.current);
   const playbackActive = snapshot?.playback_state?.toLowerCase() === 'playing';
+  // 暂停/停止时冻结音视频周期变化，避免画面停了参数还在跳。
   const runtimeActive = playbackActive && videoProcessingEnabled;
-  const audioPeriodActive = audioProcessingEnabled && Boolean(researchParams);
+  const audioPeriodActive = playbackActive && audioProcessingEnabled && Boolean(researchParams);
+
+  useEffect(() => {
+    audioPeriodRangeRef.current = audioPeriodRange;
+    saveAudioPeriodRange(audioPeriodRange);
+  }, [audioPeriodRange]);
+  useEffect(() => {
+    videoPeriodRangeRef.current = videoPeriodRange;
+    saveVideoPeriodRange(videoPeriodRange);
+  }, [videoPeriodRange]);
 
   useEffect(() => {
     if (!runtimeActive || !runtimeBaseParameters) {
@@ -2403,10 +3485,10 @@ function DesktopApp() {
       setRuntimeLastChangeMs(initialNowMs);
       setResearchParams((current) => {
         if (!current) return current;
+        // 只微扰已映射视频字段；research 实验参数不进 FFmpeg
         return {
           ...current,
           video: { ...current.video, ...sampleSubtleVideoParams() },
-          research: { ...current.research, ...sampleSubtleResearchParams() },
         };
       });
     }
@@ -2415,26 +3497,27 @@ function DesktopApp() {
     const timer = window.setInterval(() => {
       const nowMs = Date.now();
       const current = runtimeSchedulerRef.current;
-      if (current.lastChangeMs === null || !isRuntimeVariationDue(nowMs, current.lastChangeMs, runtimePeriodMs)) return;
+      if (current.lastChangeMs === null || !isRuntimeVariationDue(nowMs, current.lastChangeMs, nextVideoPeriodMsRef.current)) return;
       current.cycle += 1;
       current.lastChangeMs = nowMs;
+      const nextPeriod = samplePeriodMsInRange(videoPeriodRangeRef.current);
+      nextVideoPeriodMsRef.current = nextPeriod;
+      setVideoPeriodMs(nextPeriod);
       setRuntimeCycle(current.cycle);
       setRuntimeLastChangeMs(nowMs);
-      // ponytail: 周期到重采样 video+research；预览用新基线
+      // ponytail: 周期到只重采样已映射视频字段
       setResearchParams((params) => {
         if (!params) return params;
         return {
           ...params,
           video: { ...params.video, ...sampleSubtleVideoParams() },
-          research: { ...params.research, ...sampleSubtleResearchParams() },
         };
       });
     }, 100);
     return () => window.clearInterval(timer);
-  }, [runtimeActive, runtimeBaseParameters, runtimePeriodMs, snapshot?.playback_state]);
+  }, [runtimeActive, runtimeBaseParameters, snapshot?.playback_state]);
 
-  // 声音开启：立刻采样；周期到再采样。实时 Web Audio 立刻出声，不自动 FFmpeg。
-  // FFmpeg 固化：仅「应用音频参数 / 音视频同时应用」。
+  // 声音开启：立刻采样；周期到再提交新的 FFmpeg 流式配置，候选未就绪沿用当前出口。
   useEffect(() => {
     if (!audioPeriodActive) {
       audioSchedulerRef.current = { cycle: 0, lastChangeMs: null };
@@ -2446,19 +3529,15 @@ function DesktopApp() {
 
     if (audioSchedulerRef.current.cycle === 0 || audioSchedulerRef.current.lastChangeMs === null) {
       const nowMs = Date.now();
+      const firstPeriod = samplePeriodMsInRange(audioPeriodRangeRef.current);
+      nextAudioPeriodMsRef.current = firstPeriod;
+      setAudioPeriodMs(firstPeriod);
       audioSchedulerRef.current = { cycle: 1, lastChangeMs: nowMs };
       setAudioVariationCycle(1);
       setAudioLastChangeMs(nowMs);
-      setResearchParams((current) => {
-        if (!current) return current;
-        return {
-          ...current,
-          audio: { ...current.audio, ...sampleSubtleAudioParams(audioValuePresetIdsRef.current) },
-        };
-      });
+      applyAudioCycleSample();
     }
 
-    const periodMs = runtimePeriodMs;
     let cancelled = false;
     const timer = window.setInterval(() => {
       if (cancelled) return;
@@ -2469,31 +3548,30 @@ function DesktopApp() {
         setAudioLastChangeMs(nowMs);
         return;
       }
-      if (!isRuntimeVariationDue(nowMs, scheduler.lastChangeMs, periodMs)) return;
+      if (!isRuntimeVariationDue(nowMs, scheduler.lastChangeMs, nextAudioPeriodMsRef.current)) return;
       scheduler.cycle += 1;
       scheduler.lastChangeMs = nowMs;
+      const nextPeriod = samplePeriodMsInRange(audioPeriodRangeRef.current);
+      nextAudioPeriodMsRef.current = nextPeriod;
+      setAudioPeriodMs(nextPeriod);
       setAudioVariationCycle(scheduler.cycle);
       setAudioLastChangeMs(nowMs);
-      setResearchParams((current) => {
-        if (!current) return current;
-        return {
-          ...current,
-          audio: { ...current.audio, ...sampleSubtleAudioParams(audioValuePresetIdsRef.current) },
-        };
-      });
+      applyAudioCycleSample(true);
     }, 100);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [audioPeriodActive, runtimePeriodMs]);
+  }, [audioPeriodActive]);
 
-  // 有声音处理时始终推送音频参数给播放窗（实时预览）；视频预览仍只在 runtimeActive 时变画面。
+  // 仅播放中才推送实时参数；暂停时冻结播放窗效果。
   useEffect(() => {
-    const audioPayload = runtimeBaseParameters
+    const liveAudio = playbackActive && audioProcessingEnabled;
+    const liveVideo = runtimeActive;
+    const audioPayload = runtimeBaseParameters && (liveAudio || liveVideo)
       ? {
           ...runtimeBaseParameters,
-          ...(runtimeActive && runtimePreview
+          ...(liveVideo && runtimePreview
             ? {
                 video_brightness_percent: runtimePreview.video_brightness_percent,
                 video_contrast_percent: runtimePreview.video_contrast_percent,
@@ -2510,14 +3588,15 @@ function DesktopApp() {
     runtimeMessageRef.current = {
       version: 1,
       type: 'runtime-parameters',
-      payload: audioProcessingEnabled || runtimeActive ? audioPayload : null,
-      audio_processing_enabled: audioProcessingEnabled,
-      video_processing_enabled: videoProcessingEnabled,
+      payload: audioPayload,
+      audio_processing_enabled: liveAudio,
+      video_processing_enabled: liveVideo,
       playback_generation: snapshot?.playback_generation ?? null,
     };
     playbackChannelRef.current?.postMessage(runtimeMessageRef.current);
   }, [
     audioProcessingEnabled,
+    playbackActive,
     runtimeActive,
     runtimeBaseParameters,
     runtimePreview,
@@ -2536,6 +3615,7 @@ function DesktopApp() {
 
   function updateResearchParam(section: 'audio' | 'video' | 'research', field: string, value: number | null) {
     if (value === null || !researchParams) return;
+    researchParamsMutationVersionRef.current += 1;
     setResearchParams({
       ...researchParams,
       [section]: { ...researchParams[section], [field]: value },
@@ -2558,12 +3638,11 @@ function DesktopApp() {
   }
 
   async function resetResearchParams() {
+    const mutationVersion = ++researchParamsMutationVersionRef.current;
     try {
       const defaults = await invoke<ResearchParams>('get_default_local_research_params');
-      setResearchParams({
-        ...defaults,
-        audio: { ...defaults.audio, ...sampleSubtleAudioParams(audioValuePresetIdsRef.current) },
-      });
+      if (mutationVersion !== researchParamsMutationVersionRef.current) return;
+      sampleAndCommitAudioCycle({ scheduleRender: false, baseParams: defaults });
       setResearchValidation([]);
       setResearchValidationStatus('idle');
     } catch (cause) {
@@ -2573,10 +3652,6 @@ function DesktopApp() {
 
   function rerollSubtleAudioParams() {
     if (!researchParams) return;
-    const next = {
-      ...researchParams,
-      audio: { ...researchParams.audio, ...sampleSubtleAudioParams(audioValuePresetIdsRef.current) },
-    };
     const nowMs = Date.now();
     audioSchedulerRef.current = {
       cycle: Math.max(1, audioSchedulerRef.current.cycle + 1),
@@ -2584,9 +3659,8 @@ function DesktopApp() {
     };
     setAudioVariationCycle(audioSchedulerRef.current.cycle);
     setAudioLastChangeMs(nowMs);
-    setResearchParams(next);
+    applyAudioCycleSample(true);
     setResearchValidationStatus('idle');
-    // 重新随机：立刻实时预览；固化请点「应用音频参数」。
   }
 
   const currentSource = snapshot?.source_media ?? probe?.source ?? null;
@@ -2898,25 +3972,32 @@ function DesktopApp() {
     audio_processing_enabled: boolean;
     realtime_audio_variant_enabled: boolean;
   }) {
+    researchParamsMutationVersionRef.current += 1;
     setVideoProcessingEnabled(next.video_processing_enabled);
     setAudioProcessingEnabled(next.audio_processing_enabled);
     setRealtimeAudioVariantEnabled(next.realtime_audio_variant_enabled);
-    // 打开声音/视频：立刻微扰采样；不自动 FFmpeg。
+    // 打开声音/视频：立刻抽样；不自动 FFmpeg。
     if (researchParams && (next.audio_processing_enabled || next.video_processing_enabled)) {
       const nowMs = Date.now();
-      const nextParams = {
-        ...researchParams,
-        audio: next.audio_processing_enabled
-          ? { ...researchParams.audio, ...sampleSubtleAudioParams(audioValuePresetIdsRef.current) }
-          : researchParams.audio,
-        video: next.video_processing_enabled
-          ? { ...researchParams.video, ...sampleSubtleVideoParams() }
-          : researchParams.video,
-        research: next.video_processing_enabled
-          ? { ...researchParams.research, ...sampleSubtleResearchParams() }
-          : researchParams.research,
-      };
-      setResearchParams(nextParams);
+      const audioSample = next.audio_processing_enabled
+        ? sampleAndCommitAudioCycle({
+            scheduleRender: false,
+            applyAudioToResearchParams: false,
+          })
+        : null;
+      setResearchParams((current) => {
+        const base = current ?? researchParams;
+        return {
+          ...base,
+          audio: audioSample
+            ? { ...base.audio, ...audioSample.values }
+            : base.audio,
+          video: next.video_processing_enabled
+            ? { ...base.video, ...sampleSubtleVideoParams() }
+            : base.video,
+          research: base.research,
+        };
+      });
       if (next.audio_processing_enabled) {
         audioSchedulerRef.current = { cycle: 1, lastChangeMs: nowMs };
         setAudioVariationCycle(1);
@@ -2950,23 +4031,79 @@ function DesktopApp() {
     }
   }
 
+  function schedulePeriodMediaRender(params: ResearchParams) {
+    if (!audioProcessingEnabledRef.current) return;
+    if (!snapshotRefHome.current?.source_media) return;
+    const scope: MediaProcessingScope = videoProcessingEnabledRef.current ? 'both' : 'audio';
+    void applyMediaProcessing(scope, params);
+  }
+  schedulePeriodRenderRef.current = schedulePeriodMediaRender;
+
   async function applyMediaProcessing(
     scope: MediaProcessingScope,
     paramsOverride?: ResearchParams,
   ) {
-    const params = paramsOverride ?? researchParams;
+    const rawParams = paramsOverride ?? researchParams;
+    const params = rawParams
+      ? {
+          ...rawParams,
+          // 未映射声音字段保留原值；下面在 UI 边界显式报错，Rust 仍会再次校验。
+          audio: { ...rawParams.audio },
+          video: { ...rawParams.video, ...sanitizeMappedVideoSample(rawParams.video as never) },
+          // research 实验参数当前 Worker 未映射；必须与 Rust Default 一致，否则范围校验/未映射检查会拒渲染
+          research: {
+            ...rawParams.research,
+            band_weights: Object.fromEntries(
+              Object.keys(rawParams.research.band_weights ?? {}).map((key) => [key, 1]),
+            ),
+            target_frequency_hz: null,
+            core_frequency_hz: null,
+            wave_intensity: 0,
+            wave_level: 0,
+            wave_grain_count: 20,
+            dynamic_eq_threshold: 10,
+            channel_offset_percent: 0,
+            space_dimension: 2,
+            frequency_space_x_offset_px: 0,
+            frequency_space_y_offset_px: 0,
+            frame_perturbation_probability_percent: 0,
+            random_graphic_opacity_percent: 0,
+            random_graphic_size_px: 4,
+            abstract_face_count: 0,
+            abstract_face_size_percent: 2,
+            abstract_face_opacity_percent: 0,
+            overlay_offset_px: 0,
+            slice_length_ms: 5_000,
+            slice_min_length_ms: 10_000,
+            slice_trigger_interval_ms: 15_000,
+          },
+        }
+      : null;
     const scopeEnabled = scope === 'video'
       ? videoProcessingEnabled && !audioProcessingEnabled
       : scope === 'audio'
         ? audioProcessingEnabled && !videoProcessingEnabled
         : videoProcessingEnabled && audioProcessingEnabled;
-    if (!params || !snapshot?.source_media || !scopeEnabled || mediaApplyInFlightRef.current) return;
-    // 已有 FFmpeg 在跑：只排队最新参数，绝不中断当前任务。
+    if (!params || !snapshot?.source_media || !scopeEnabled) return;
+    const unsupportedAudioFields = getUnsupportedAudioPresetFields(params.audio);
+    if (unsupportedAudioFields.length > 0) {
+      setError(
+        `声音参数暂未支持：${unsupportedAudioFields
+          .map((field) => UNMAPPED_AUDIO_PRESET_FIELD_LABELS[field])
+          .join('、')}。请恢复为默认值后再应用。`,
+      );
+      return;
+    }
+    // 已有 FFmpeg 在跑 / IPC 在途：只排队最新参数，绝不中断当前任务。
     if (
-      snapshot.audio_processing_status === 'processing' ||
-      snapshot.video_processing_status === 'processing'
+      mediaApplyInFlightRef.current
+      || snapshot.audio_processing_status === 'processing'
+      || snapshot.video_processing_status === 'processing'
     ) {
-      pendingAudioApplyRef.current = params;
+      pendingAudioApplyRef.current = {
+        params,
+        cycle: audioCycleSampleRef.current,
+      };
       return;
     }
     mediaApplyInFlightRef.current = true;
@@ -2977,8 +4114,13 @@ function DesktopApp() {
         setMediaProcessingBusy(scope);
         try {
           // 不在这里 stop worker：start 直接带上最新 params。
+          const cycle = audioCycleSampleRef.current;
+          const audio_variants =
+            audioMixEnabledRef.current && cycle && cycle.variants.length > 1
+              ? buildAudioVariantsFromCycle(params.audio, cycle)
+              : undefined;
           const nextSnapshot = await invoke<PlaybackSnapshot>('start_media_processing', {
-            request: { params },
+            request: { params, audio_variants },
           });
           setSnapshot(nextSnapshot);
           if (
@@ -3005,9 +4147,27 @@ function DesktopApp() {
     if (mediaApplyInFlightRef.current || mediaProcessingBusy !== null) return;
     if (snapshot.audio_processing_status === 'processing' || snapshot.video_processing_status === 'processing') return;
     pendingAudioApplyRef.current = null;
+    if (pending.cycle) {
+      commitAudioCycleSample(pending.cycle, { applyAudioToResearchParams: false });
+    }
     const scope: MediaProcessingScope = videoProcessingEnabled ? 'both' : 'audio';
-    await applyMediaProcessing(scope, pending);
+    await applyMediaProcessing(scope, pending.params);
   }
+
+  // FFmpeg 结束后稍等再续跑排队任务，避免 Tag 一直停在 processing、听感被连续重渲打断。
+  useEffect(() => {
+    const processing =
+      snapshot?.audio_processing_status === 'processing'
+      || snapshot?.video_processing_status === 'processing';
+    if (mediaWasProcessingRef.current && !processing) {
+      const timer = window.setTimeout(() => {
+        void flushPendingAudioApply();
+      }, 2_500);
+      mediaWasProcessingRef.current = false;
+      return () => window.clearTimeout(timer);
+    }
+    mediaWasProcessingRef.current = Boolean(processing);
+  }, [snapshot?.audio_processing_status, snapshot?.video_processing_status]);
 
   async function startResearchAnalysis(generateOutputMp4: boolean) {
     if (!researchParams || !snapshot?.source_media) return;
@@ -3037,11 +4197,17 @@ function DesktopApp() {
   }
 
   async function cleanupLocalCaches() {
+    if (cacheCleanupBusy) return;
+    setCacheCleanupError(null);
+    setCacheCleanup(null);
+    setError(null);
     setCacheCleanupBusy(true);
     try {
       setCacheCleanup(await invoke<CacheCleanupResult>('cleanup_local_caches_command'));
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '清理本地缓存失败');
+      const message = getDisplayErrorMessage(cause, '删除已生成缓存失败');
+      setCacheCleanupError(message);
+      setError(message);
     } finally {
       setCacheCleanupBusy(false);
     }
@@ -3124,10 +4290,10 @@ function DesktopApp() {
 
   const runtimeRemainingMs = runtimeLastChangeMs === null
     ? null
-    : Math.max(0, runtimePeriodMs - (runtimeNowMs - runtimeLastChangeMs));
+    : Math.max(0, videoPeriodMs - (runtimeNowMs - runtimeLastChangeMs));
   const audioRemainingMs = audioLastChangeMs === null
     ? null
-    : Math.max(0, runtimePeriodMs - (runtimeNowMs - audioLastChangeMs));
+    : Math.max(0, audioPeriodMs - (runtimeNowMs - audioLastChangeMs));
   const diagnosticFresh = diagnosticMessage !== null && Date.now() - diagnosticMessage.sent_at_ms < 1_500;
   const interludePlaybackNotice = interludeDraft.enabled
     ? playbackDisplayState !== 'playing'
@@ -3156,10 +4322,25 @@ function DesktopApp() {
   const audioPreviewStatus = !audioProcessingEnabled
     ? '已关闭'
     : audioProcessingStatus === 'processing'
-      ? 'FFmpeg 固化中'
+      ? '后台 FFmpeg 渲染中'
       : audioProcessingStatus === 'ready' || audioProcessingStatus === 'runtime'
-        ? 'FFmpeg 已固化'
-        : '实时预览中（立刻出声）';
+        ? '后台缓存已就绪'
+        : '实时预览中';
+  const actualAudioOutputLabel = getActualAudioOutputLabel(audioOutputBackend);
+  const actualAudioStreamVariantCount = getActualAudioStreamVariantCount(snapshot);
+  const actualAudioMixLabel = actualAudioStreamVariantCount === null
+    ? '未上报（兼容旧快照）'
+    : actualAudioOutputLabel === 'PortAudio'
+      ? `${actualAudioStreamVariantCount} 条支路`
+      : `未进入正式输出（配置 ${actualAudioStreamVariantCount} 条）`;
+  const portAudioFallback = Boolean(audioOutputBackend?.preferred_portaudio)
+    && actualAudioOutputLabel === 'WebView';
+  const activeAudioPresets = useMemo(
+    () => audioActivePresetIds
+      .map((id) => AUDIO_VALUE_PRESETS.find((preset) => preset.id === id))
+      .filter((preset): preset is (typeof AUDIO_VALUE_PRESETS)[number] => Boolean(preset)),
+    [audioActivePresetIds],
+  );
   const audioCapabilityRows = useMemo(
     () => buildAudioCapabilityRows(
       researchParams?.audio ?? null,
@@ -3332,7 +4513,7 @@ function DesktopApp() {
           <section className="desktop-column desktop-column-audio" aria-label="音频设置">
             <Card title="声音设置">
               <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-                <Space align="center">
+                <Space align="center" wrap>
                   <Switch
                     aria-label="声音处理"
                     checked={audioProcessingEnabled}
@@ -3344,14 +4525,14 @@ function DesktopApp() {
                       })
                     }
                   />
-                  <Typography.Text>声音处理</Typography.Text>
-                </Space>
-                <Space wrap>
+                  <Typography.Text>声音处理（总开关）</Typography.Text>
                   <Tag color={getProcessingStatusColor(audioProcessingStatus)}>
-                    声音状态：{audioProcessingStatus}
+                    {audioProcessingStatus}
                   </Tag>
-                  <Tag>开关：{audioProcessingEnabled ? 'enabled' : 'disabled'}</Tag>
                 </Space>
+                <Typography.Text type="secondary">
+                  总开关：开启后才做周期随机、实时预览和 FFmpeg 固化。关闭=保持源音轨，多轨合并也无效。
+                </Typography.Text>
                 <Space align="center">
                   <Switch
                     aria-label="实时话术幻化"
@@ -3395,42 +4576,275 @@ function DesktopApp() {
                   <Button size="small" onClick={rerollSubtleAudioParams} disabled={!researchParams}>
                     重新随机
                   </Button>
-                  {researchParams ? (
-                    <InputNumber
-                      aria-label="随机变声周期"
-                      addonBefore="随机周期"
-                      addonAfter="秒"
-                      min={0.5}
-                      max={60}
-                      step={0.5}
-                      value={researchParams.audio.random_change_period_ms / 1000}
-                      onChange={(value) => {
-                        if (typeof value !== 'number' || !Number.isFinite(value)) return;
-                        updateResearchParam('audio', 'random_change_period_ms', Math.round(value * 1000));
-                      }}
-                    />
-                  ) : null}
+                  <InputNumber
+                    aria-label="声音周期最小秒"
+                    addonBefore="声音最小"
+                    addonAfter="秒"
+                    min={PERIOD_HARD_MIN_MS / 1000}
+                    max={PERIOD_HARD_MAX_MS / 1000}
+                    step={1}
+                    value={audioPeriodRange.minMs / 1000}
+                    onChange={(value) => {
+                      if (typeof value !== 'number' || !Number.isFinite(value)) return;
+                      setAudioPeriodRange((current) =>
+                        normalizeAudioPeriodRange(Math.round(value * 1000), current.maxMs),
+                      );
+                    }}
+                  />
+                  <InputNumber
+                    aria-label="声音周期最大秒"
+                    addonBefore="声音最大"
+                    addonAfter="秒"
+                    min={PERIOD_HARD_MIN_MS / 1000}
+                    max={PERIOD_HARD_MAX_MS / 1000}
+                    step={1}
+                    value={audioPeriodRange.maxMs / 1000}
+                    onChange={(value) => {
+                      if (typeof value !== 'number' || !Number.isFinite(value)) return;
+                      setAudioPeriodRange((current) =>
+                        normalizeAudioPeriodRange(current.minMs, Math.round(value * 1000)),
+                      );
+                    }}
+                  />
                 </Space>
                 <Typography.Text type="secondary">
-                  每个预设包含完整 {Object.keys(AUDIO_VALUE_PRESETS[0].values).length} 个参数值；勾选多个后，周期随机从中抽一套应用。
+                  每个预设=一条处理支路。关多轨=每周期 1 套；开多轨=1～N 套后台混成单轨。声音开着：画面锁源片；真声 A/B 双缓冲（加载中不断声，就绪再切）；未好前实时预览垫底。听感验收请显式勾选「22. 明显变调与空间（手动）」；它不进入默认随机池。
                 </Typography.Text>
                 <Space wrap>
-                  <Button size="small" onClick={() => setAudioValuePresetIds([...DEFAULT_AUDIO_VALUE_PRESET_IDS])}>
+                  <Tag color={actualAudioOutputLabel === 'PortAudio' ? 'green' : 'blue'}>
+                    实际输出：{actualAudioOutputLabel}
+                  </Tag>
+                  <Tag color={actualAudioStreamVariantCount === null ? 'default' : 'processing'}>
+                    实际混音：{actualAudioMixLabel}
+                  </Tag>
+                </Space>
+                {portAudioFallback ? (
+                  <Alert
+                    type="warning"
+                    showIcon
+                    message="PortAudio 回退到 WebView；多轨当前未进入正式输出。"
+                  />
+                ) : null}
+                <Space align="center" wrap>
+                  <Switch
+                    aria-label="PortAudio 硬件出口"
+                    checked={Boolean(audioOutputBackend?.preferred_portaudio)}
+                    loading={audioOutputBusy}
+                    disabled={!audioOutputBackend?.available && !audioOutputBackend?.preferred_portaudio}
+                    onChange={(checked) => {
+                      void applyAudioOutputBackend(checked);
+                    }}
+                  />
+                  <Typography.Text>PortAudio 硬件出口</Typography.Text>
+                  <Tag color={audioOutputBackend?.running ? 'green' : audioOutputBackend?.available ? 'processing' : 'default'}>
+                    {audioOutputBackend?.selected_backend ?? 'webview'}
+                    {audioOutputBackend?.running ? ' · 运行中' : ''}
+                    {typeof audioOutputBackend?.xrun_count === 'number' && audioOutputBackend.xrun_count > 0
+                      ? ` · xrun ${audioOutputBackend.xrun_count}`
+                      : ''}
+                  </Tag>
+                  {audioOutputBackend ? (
+                    <Typography.Text type="secondary">
+                      硬件 {audioOutputBackend.hardware_state} · 回调欠载 {audioOutputBackend.callback_underrun_count}
+                      {' · '}写入丢弃 {audioOutputBackend.producer_drop_count}
+                      {' · '}输出延迟 {audioOutputBackend.output_latency_ms}ms
+                      {' · '}实际采样率 {audioOutputBackend.actual_sample_rate_hz ?? audioOutputBackend.sample_rate_hz}Hz
+                      {' · '}音频任务 {audioOutputBackend.audio_task_count}/2
+                      {audioOutputBackend.current_audio_ffmpeg_pid !== null
+                        ? ` · 当前 FFmpeg PID ${audioOutputBackend.current_audio_ffmpeg_pid}`
+                        : ''}
+                      {audioOutputBackend.pending_audio_ffmpeg_pid !== null
+                        ? ` · 候选 FFmpeg PID ${audioOutputBackend.pending_audio_ffmpeg_pid}`
+                        : ''}
+                      {' · '}环缓 {audioOutputBackend.ring_len_samples}/{audioOutputBackend.ring_capacity_samples}
+                      {getAudioRingBufferedLabel(audioOutputBackend)}
+                    </Typography.Text>
+                  ) : null}
+                  <Button
+                    size="small"
+                    loading={audioOutputBusy}
+                    disabled={!audioOutputBackend?.preferred_portaudio || audioOutputBusy}
+                    onClick={() => {
+                      setAudioOutputBusy(true);
+                      void invoke<AudioOutputBackendStatus>('play_portaudio_test_tone', {
+                        request: { frequency_hz: 440, duration_ms: 400, amplitude: 0.12 },
+                      })
+                        .then((status) => publishAudioOutputBackend(status))
+                        .catch((cause) => {
+                          setError(cause instanceof Error ? cause.message : 'PortAudio 测试音失败');
+                        })
+                        .finally(() => setAudioOutputBusy(false));
+                    }}
+                  >
+                    测试音
+                  </Button>
+                </Space>
+                {audioOutputBackend?.preferred_portaudio ? (
+                  <Space wrap>
+                    <Select
+                      aria-label="PortAudio Host API"
+                      style={{ minWidth: 140 }}
+                      value={audioOutputHostApiFilter}
+                      options={[
+                        { value:'all', label:'全部 Host API' },
+                        { value:'wasapi', label:'WASAPI' },
+                        { value:'mme', label:'MME' },
+                        { value:'dsound', label:'DirectSound' },
+                        { value:'wdmks', label:'WDMKS' },
+                      ]}
+                      onChange={(value) => setAudioOutputHostApiFilter(String(value))}
+                    />
+                    <Select
+                      aria-label="PortAudio 输出设备"
+                      style={{ minWidth: 220 }}
+                      placeholder="默认输出设备"
+                      allowClear
+                      value={audioOutputDeviceId ?? undefined}
+                      options={audioOutputDevices
+                        .filter(
+                          (device) => typeof device.host_api === 'string'
+                            && device.host_api.trim().toLowerCase() !== 'asio',
+                        )
+                        .filter((device) =>
+                          audioOutputHostApiFilter === 'all'
+                            ? true
+                            : device.host_api === audioOutputHostApiFilter,
+                        )
+                        .map((device) => ({
+                          value: device.id,
+                          label: `${device.name} · ${device.host_api}`,
+                        }))}
+                      onChange={(value) => {
+                        const nextId = value === undefined ? null : String(value);
+                        setAudioOutputDeviceId(nextId);
+                        void applyAudioOutputBackend(true, nextId, audioOutputMemoryKib);
+                      }}
+                    />
+                    <InputNumber
+                      aria-label="PortAudio 内存缓冲区大小"
+                      style={{ width: 140 }}
+                      min={PORTAUDIO_MIN_MEMORY_BUFFER_KIB}
+                      max={PORTAUDIO_MAX_MEMORY_BUFFER_KIB}
+                      step={1}
+                      precision={0}
+                      value={audioOutputMemoryKibInput}
+                      onChange={(value) => {
+                        setAudioOutputMemoryKibInput(value);
+                      }}
+                      onBlur={() => {
+                        const value = audioOutputMemoryKibInput;
+                        if (
+                          typeof value !== 'number'
+                          || !Number.isInteger(value)
+                          || value < PORTAUDIO_MIN_MEMORY_BUFFER_KIB
+                          || value > PORTAUDIO_MAX_MEMORY_BUFFER_KIB
+                        ) {
+                          setAudioOutputMemoryKibInput(audioOutputMemoryKib);
+                          return;
+                        }
+                        setAudioOutputMemoryKib(value);
+                        void applyAudioOutputBackend(true, audioOutputDeviceId, value);
+                      }}
+                    />
+                    <Typography.Text type="secondary">内存缓冲 128–2048 KiB，默认 1024 KiB</Typography.Text>
+                  </Space>
+                ) : null}
+                <Typography.Text type="secondary">
+                  参考 Audacity：PortAudio I/O + 多轨混单轨；非完整 DAW。当前仅显示已启用的 Host API。
+                </Typography.Text>
+                {audioOutputBackend?.reason ? (
+                  <Typography.Text type="secondary">{audioOutputBackend.reason}</Typography.Text>
+                ) : null}
+                <Space align="center" wrap>
+                  <Switch
+                    aria-label="多轨合并"
+                    checked={audioMixEnabled}
+                    disabled={!audioProcessingEnabled}
+                    onChange={(checked) => setAudioMixEnabled(checked)}
+                  />
+                  <Typography.Text>多轨合并（声音处理的子模式）</Typography.Text>
+                  <Tag color={audioProcessingEnabled && audioMixEnabled ? 'processing' : 'default'}>
+                    {!audioProcessingEnabled
+                      ? '需先开声音处理'
+                      : audioMixEnabled
+                        ? `每周期 ${audioMixPickMin}-${audioMixPickMax} 轨`
+                        : '单轨'}
+                  </Tag>
+                </Space>
+                {audioProcessingEnabled && audioMixEnabled ? (
+                  <Space wrap>
+                    <InputNumber
+                      aria-label="最少随机轨数"
+                      addonBefore="最少轨数"
+                      min={1}
+                      max={AUDIO_MIX_PICK_HARD_MAX}
+                      value={audioMixPickMin}
+                      onChange={(value) => {
+                        if (typeof value !== 'number' || !Number.isFinite(value)) return;
+                        const nextMax = normalizeAudioMixPickMax(audioMixPickMax);
+                        const nextMin = normalizeAudioMixPickMin(value, nextMax);
+                        setAudioMixPickMin(nextMin);
+                        setAudioMixPickMax(Math.max(nextMin, nextMax));
+                      }}
+                    />
+                    <InputNumber
+                      aria-label="最多随机轨数"
+                      addonBefore="最多轨数"
+                      min={1}
+                      max={AUDIO_MIX_PICK_HARD_MAX}
+                      value={audioMixPickMax}
+                      onChange={(value) => {
+                        if (typeof value !== 'number' || !Number.isFinite(value)) return;
+                        const nextMax = normalizeAudioMixPickMax(value);
+                        const nextMin = normalizeAudioMixPickMin(audioMixPickMin, nextMax);
+                        setAudioMixPickMax(nextMax);
+                        setAudioMixPickMin(nextMin);
+                      }}
+                    />
+                  </Space>
+                ) : null}
+                <Space wrap>
+                  <Button
+                    size="small"
+                    disabled={!audioProcessingEnabled}
+                    onClick={() => setAudioValuePresetIds([...DEFAULT_AUDIO_VALUE_PRESET_IDS])}
+                  >
                     全选
                   </Button>
-                  <Button size="small" onClick={() => setAudioValuePresetIds([])}>
+                  <Button
+                    size="small"
+                    disabled={!audioProcessingEnabled}
+                    onClick={() => setAudioValuePresetIds([])}
+                  >
                     全不选
                   </Button>
-                  <Tag>已勾选 {audioValuePresetIds.length}/{AUDIO_VALUE_PRESETS.length}</Tag>
+                  <Tag>已勾选 {audioValuePresetIds.length}/{AUDIO_VALUE_PRESETS.filter((preset) => preset.id !== 'p21').length}</Tag>
+                  {audioProcessingEnabled && audioActivePresetIds.length > 0 ? (
+                    <Button
+                      type="link"
+                      size="small"
+                      aria-label="查看当前声音预设参数"
+                      onClick={() => setAudioPresetDrawerOpen(true)}
+                    >
+                      本周期：{activeAudioPresets.length > 0
+                        ? activeAudioPresets.map((preset) => preset.label).join('、')
+                        : audioActivePresetIds.join('、')}
+                    </Button>
+                  ) : null}
+                  {audioProcessingEnabled && audioCycleSeed !== null ? <Tag>seed {audioCycleSeed}</Tag> : null}
+                  {audioProcessingEnabled && audioCycleWeights.length > 1 ? (
+                    <Tag>weights {audioCycleWeights.map((w) => w.toFixed(2)).join('/')}</Tag>
+                  ) : null}
                 </Space>
                 <Checkbox.Group
                   aria-label="声音参数值预设"
                   value={audioValuePresetIds}
+                  disabled={!audioProcessingEnabled}
                   onChange={(values) => setAudioValuePresetIds(values.map(String))}
                   style={{ width: '100%' }}
                 >
                   <Space wrap>
-                    {AUDIO_VALUE_PRESETS.map((preset) => (
+                    {AUDIO_VALUE_PRESETS.filter((preset) => preset.id !== 'p21').map((preset) => (
                       <Checkbox key={preset.id} value={preset.id}>
                         {preset.label}
                       </Checkbox>
@@ -3442,29 +4856,64 @@ function DesktopApp() {
                 ) : null}
               </Space>
             </Card>
+            <Drawer
+              title={`当前声音预设${audioVariationCycle > 0 ? `（第 ${audioVariationCycle} 轮）` : ''}`}
+              placement="right"
+              width={520}
+              open={audioPresetDrawerOpen}
+              onClose={() => setAudioPresetDrawerOpen(false)}
+            >
+              {activeAudioPresets.length === 0 ? (
+                <Typography.Text type="secondary">当前没有可展示的声音预设。</Typography.Text>
+              ) : (
+                <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                  <Typography.Text type="secondary">
+                    以下是本周期实际参与处理的预设值；多轨时每张卡片对应一条处理支路。
+                  </Typography.Text>
+                  {activeAudioPresets.map((preset) => (
+                    <Card key={preset.id} size="small" title={preset.label} extra={<Tag>{preset.id}</Tag>}>
+                      <Descriptions column={1} size="small" bordered>
+                        {AUDIO_PRESET_FIELD_DEFINITIONS.map((field) => (
+                          <Descriptions.Item key={field.key} label={field.label}>
+                            {formatAudioPreviewValue(preset.values[field.key], field.unit, field.digits)}
+                          </Descriptions.Item>
+                        ))}
+                      </Descriptions>
+                    </Card>
+                  ))}
+                </Space>
+              )}
+            </Drawer>
             <Card title="音频实时参数与生效状态">
               <Space direction="vertical" size="middle" style={{ width: '100%' }}>
                 <Space wrap>
                   <Tag color={audioProcessingEnabled ? 'green' : 'default'}>
                     声音处理：{audioPreviewStatus}
                   </Tag>
-                  <Tag color="blue">FFmpeg 参数：{audioCapabilityRows.length} 项</Tag>
+                  <Tag color="blue">
+                    配置字段：{audioCapabilityRows.length} 项
+                  </Tag>
+                  <Tag color={audioMixEnabled ? 'processing' : 'default'}>
+                    {audioMixEnabled
+                      ? `多轨：本周期 ${audioActivePresetIds.length || 0} 套（后台混）`
+                      : '单轨'}
+                  </Tag>
                   <Tag color={audioPeriodActive ? 'processing' : 'default'}>
                     随机轮次：{audioPeriodActive ? `第 ${audioVariationCycle} 轮` : '未启动'}
                   </Tag>
                 </Space>
                 <div>
                   <Typography.Text type="secondary">
-                    周期 {(runtimePeriodMs / 1000).toFixed(1)} s
+                    声音区间 {(audioPeriodRange.minMs / 1000).toFixed(0)}–{(audioPeriodRange.maxMs / 1000).toFixed(0)} s · 本轮 {(audioPeriodMs / 1000).toFixed(1)} s
                     {!audioPeriodActive || audioRemainingMs === null
                       ? ' · 未启动'
                       : ` · 剩余 ${(audioRemainingMs / 1000).toFixed(1)} s`}
                   </Typography.Text>
                   <Progress
                     percent={
-                      !audioPeriodActive || audioRemainingMs === null || runtimePeriodMs <= 0
+                      !audioPeriodActive || audioRemainingMs === null || audioPeriodMs <= 0
                         ? 0
-                        : Math.min(100, Math.round(((runtimePeriodMs - audioRemainingMs) / runtimePeriodMs) * 100))
+                        : Math.min(100, Math.round(((audioPeriodMs - audioRemainingMs) / audioPeriodMs) * 100))
                     }
                     status={audioPeriodActive ? 'active' : 'normal'}
                     showInfo={false}
@@ -3472,7 +4921,7 @@ function DesktopApp() {
                   />
                 </div>
                 <Typography.Text type="secondary">
-                  听感=实时预览（立刻）。数值=当前随机轮次；状态=是否已写入/已生效 FFmpeg。点「应用音频参数」才固化。
+                  「配置字段」= 本周期参数表行数（固定约 22），不是轨道数。多轨时列表仍显示第一套配置；混音结果在后台缓存，听感当前是源视频+实时预览。
                 </Typography.Text>
                 <Descriptions column={2} size="small" bordered>
                   {audioCapabilityRows.map((row) => (
@@ -3787,19 +5236,49 @@ function DesktopApp() {
                     视频动态：{videoProcessingEnabled ? '开启' : '关闭'}
                   </Tag>
                   <Tag>第 {runtimeCycle} 次变化</Tag>
+                  <InputNumber
+                    aria-label="视频周期最小秒"
+                    addonBefore="视频最小"
+                    addonAfter="秒"
+                    min={PERIOD_HARD_MIN_MS / 1000}
+                    max={PERIOD_HARD_MAX_MS / 1000}
+                    step={1}
+                    value={videoPeriodRange.minMs / 1000}
+                    onChange={(value) => {
+                      if (typeof value !== 'number' || !Number.isFinite(value)) return;
+                      setVideoPeriodRange((current) =>
+                        normalizeVideoPeriodRange(Math.round(value * 1000), current.maxMs),
+                      );
+                    }}
+                  />
+                  <InputNumber
+                    aria-label="视频周期最大秒"
+                    addonBefore="视频最大"
+                    addonAfter="秒"
+                    min={PERIOD_HARD_MIN_MS / 1000}
+                    max={PERIOD_HARD_MAX_MS / 1000}
+                    step={1}
+                    value={videoPeriodRange.maxMs / 1000}
+                    onChange={(value) => {
+                      if (typeof value !== 'number' || !Number.isFinite(value)) return;
+                      setVideoPeriodRange((current) =>
+                        normalizeVideoPeriodRange(current.minMs, Math.round(value * 1000)),
+                      );
+                    }}
+                  />
                 </Space>
                 <div>
                   <Typography.Text type="secondary">
-                    周期 {(runtimePeriodMs / 1000).toFixed(1)} s
+                    视频区间 {(videoPeriodRange.minMs / 1000).toFixed(0)}–{(videoPeriodRange.maxMs / 1000).toFixed(0)} s · 本轮 {(videoPeriodMs / 1000).toFixed(1)} s
                     {runtimeRemainingMs === null
                       ? ' · 未启动'
                       : ` · 剩余 ${(runtimeRemainingMs / 1000).toFixed(1)} s`}
                   </Typography.Text>
                   <Progress
                     percent={
-                      runtimeRemainingMs === null || runtimePeriodMs <= 0
+                      runtimeRemainingMs === null || videoPeriodMs <= 0
                         ? 0
-                        : Math.min(100, Math.round(((runtimePeriodMs - runtimeRemainingMs) / runtimePeriodMs) * 100))
+                        : Math.min(100, Math.round(((videoPeriodMs - runtimeRemainingMs) / videoPeriodMs) * 100))
                     }
                     status={runtimeActive ? 'active' : 'normal'}
                     showInfo={false}
@@ -3926,13 +5405,22 @@ function DesktopApp() {
                   </Descriptions>
                 ) : null}
                 <Space wrap>
-                  <Button loading={cacheCleanupBusy} onClick={() => void cleanupLocalCaches()} disabled={cacheCleanupBusy}>清理本地缓存</Button>
+                  <Popconfirm
+                    title="删除已生成缓存？"
+                    description="请先暂停或停止声音处理播放；将删除未被当前或待切换引用的处理后 MP4，以及超过 10 分钟的临时文件。"
+                    okText="确认删除"
+                    cancelText="取消"
+                    onConfirm={() => void cleanupLocalCaches()}
+                  >
+                    <Button loading={cacheCleanupBusy} disabled={cacheCleanupBusy}>删除已生成缓存</Button>
+                  </Popconfirm>
                   {cacheCleanup ? (
                     <Tag>
-                      已清理 {cacheCleanup.removed_files} 个文件 / {(cacheCleanup.removed_bytes / 1024 / 1024).toFixed(1)} MB
+                      已删除 {cacheCleanup.removed_files} 个文件 / {(cacheCleanup.removed_bytes / 1024 / 1024).toFixed(1)} MB；剩余 {(cacheCleanup.remaining_bytes / 1024 / 1024).toFixed(1)} MB
                     </Tag>
                   ) : null}
                 </Space>
+                {cacheCleanupError ? <Alert type="error" showIcon message={cacheCleanupError} /> : null}
               </Space>
             </Card>
           </section>

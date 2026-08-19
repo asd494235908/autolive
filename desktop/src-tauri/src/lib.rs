@@ -1,3 +1,4 @@
+pub mod audio_mixer;
 pub mod audio_processing;
 pub mod background_process;
 pub mod cancellation;
@@ -19,6 +20,7 @@ use crate::audio_processing::AudioProcessingProfile;
 use crate::errors::PlaybackError;
 use crate::interlude_player::{resolve_effective_audio_source, InterludeSnapshot};
 use crate::media_library::SourceMediaDto;
+use crate::research_params::AudioResearchParams;
 use crate::speech_to_speech::{
     AudioTrackInput, AudioVariantCandidate, CandidateValidationError, SpeechToSpeechContext,
 };
@@ -62,6 +64,8 @@ pub struct PlaybackSnapshot {
     pub pending_audio_start_at_ms: Option<u64>,
     pub pending_audio_duration_ms: Option<u64>,
     pub audio_processing_parameters_version: String,
+    pub audio_stream_variant_count: usize,
+    pub audio_stream_revision: u64,
     pub audio_processing_status: String,
     pub audio_processing_runtime: bool,
     pub audio_processing_gain_db: f64,
@@ -94,6 +98,8 @@ pub struct PlaybackCore {
     fallback_reason: Option<String>,
     pending_audio_candidate: Option<AudioVariantCandidate>,
     audio_processing_profile: AudioProcessingProfile,
+    audio_stream_variants: Vec<AudioResearchParams>,
+    audio_stream_revision: u64,
     audio_processing_status: String,
     interlude_snapshot: InterludeSnapshot,
     current_position_ms: u64,
@@ -125,6 +131,8 @@ impl Default for PlaybackCore {
             fallback_reason: None,
             pending_audio_candidate: None,
             audio_processing_profile: AudioProcessingProfile::default(),
+            audio_stream_variants: Vec::new(),
+            audio_stream_revision: 0,
             audio_processing_status: "disabled".to_owned(),
             interlude_snapshot: InterludeSnapshot::default(),
             current_position_ms: 0,
@@ -221,7 +229,7 @@ impl PlaybackCore {
         } else {
             "disabled".to_owned()
         };
-        self.audio_processing_status = self.audio_processing_status_for("ready");
+        self.audio_processing_status = self.audio_processing_status_for("runtime");
         self.fallback_reason = None;
         // 编码完成立即切到当前播放源，不等下一轮循环边界。
         self.commit_pending_video();
@@ -236,7 +244,11 @@ impl PlaybackCore {
         } else {
             "disabled".to_owned()
         };
-        self.audio_processing_status = self.audio_processing_status_for("failed");
+        self.audio_processing_status = if self.audio_processing_enabled {
+            "runtime".to_owned()
+        } else {
+            "disabled".to_owned()
+        };
         self.fallback_reason = Some(reason.into());
     }
 
@@ -247,6 +259,13 @@ impl PlaybackCore {
             "disabled".to_owned()
         };
         self.fallback_reason = Some(reason.into());
+    }
+
+    pub fn mark_audio_processing_runtime(&mut self) {
+        if self.audio_processing_enabled {
+            self.audio_processing_status = "runtime".to_owned();
+            self.fallback_reason = None;
+        }
     }
 
     pub fn commit_media_processing_if_ready(&mut self) -> bool {
@@ -328,6 +347,54 @@ impl PlaybackCore {
             self.audio_processing_status = self.audio_processing_status_for("configured");
         }
         Ok(())
+    }
+
+    pub fn set_audio_stream_configuration(
+        &mut self,
+        params: AudioResearchParams,
+        variants: Vec<AudioResearchParams>,
+    ) -> Result<(), Vec<crate::research_params::ParameterValidationError>> {
+        let mut errors = Vec::new();
+        if let Err(mut params_errors) = params.validate() {
+            errors.append(&mut params_errors);
+        }
+        for (index, variant) in variants.iter().enumerate() {
+            if let Err(variant_errors) = variant.validate() {
+                errors.extend(variant_errors.into_iter().map(|mut error| {
+                    error.field = format!("audio_variants[{index}].{}", error.field);
+                    error
+                }));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        self.audio_processing_profile.params = params;
+        self.audio_stream_variants = variants;
+        self.audio_stream_revision = self.audio_stream_revision.wrapping_add(1);
+        Ok(())
+    }
+
+    pub fn audio_stream_configuration(&self) -> (AudioResearchParams, Vec<AudioResearchParams>) {
+        (
+            self.audio_processing_profile.params.clone(),
+            self.audio_stream_variants.clone(),
+        )
+    }
+
+    fn effective_audio_stream_variant_count(&self) -> usize {
+        if !self.audio_processing_enabled
+            || self.current_audio_source.as_deref() == Some("realtime_variant")
+            || self
+                .source_media
+                .as_ref()
+                .and_then(|source| source.audio_sample_rate_hz)
+                .is_none()
+        {
+            0
+        } else {
+            self.audio_stream_variants.len().max(1)
+        }
     }
 
     pub fn set_interlude_snapshot(&mut self, snapshot: InterludeSnapshot) {
@@ -524,6 +591,13 @@ impl PlaybackCore {
         self.reset_video_to_original();
         self.pending_video_reference = None;
         self.pending_video_sha256 = None;
+        self.video_processing_status = if self.video_processing_enabled {
+            "unavailable".to_owned()
+        } else {
+            "disabled".to_owned()
+        };
+        self.audio_processing_status = self.audio_processing_status_for("unavailable");
+        self.fallback_reason = None;
     }
 
     pub fn complete_loop(&mut self) -> Result<(), PlaybackError> {
@@ -589,6 +663,8 @@ impl PlaybackCore {
                 .audio_processing_profile
                 .parameters_version
                 .clone(),
+            audio_stream_variant_count: self.effective_audio_stream_variant_count(),
+            audio_stream_revision: self.audio_stream_revision,
             audio_processing_status: self.audio_processing_status.clone(),
             audio_processing_runtime: self.audio_processing_status == "runtime",
             audio_processing_gain_db: self.audio_processing_profile.params.input_gain_db
@@ -662,6 +738,7 @@ mod tests {
     use super::{PlaybackCore, PlaybackState};
     use crate::audio_processing::AudioProcessingProfile;
     use crate::media_library::SourceMediaDto;
+    use crate::research_params::AudioResearchParams;
     use crate::speech_to_speech::{AudioTrackInput, AudioVariantCandidate, SpeechToSpeechContext};
 
     fn source() -> SourceMediaDto {
@@ -717,6 +794,7 @@ mod tests {
         assert!(snapshot.video_processing_enabled);
         assert_eq!(snapshot.video_processing_status, "unavailable");
         assert!(snapshot.audio_processing_enabled);
+        assert_eq!(snapshot.audio_stream_variant_count, 1);
         assert_eq!(snapshot.audio_processing_status, "unavailable");
         assert!(snapshot.realtime_audio_variant_enabled);
         assert_eq!(snapshot.current_audio_source.as_deref(), Some("original"));
@@ -727,6 +805,24 @@ mod tests {
             snapshot.current_mp4_sha256.as_deref(),
             Some("a".repeat(64).as_str())
         );
+    }
+
+    #[test]
+    fn snapshot_reports_effective_audio_stream_variant_count() {
+        let mut core = PlaybackCore::default();
+        core.set_source(source());
+        core.set_processing_switches(false, true, false);
+        assert_eq!(core.snapshot().audio_stream_variant_count, 1);
+
+        core.set_audio_stream_configuration(
+            AudioResearchParams::default(),
+            vec![AudioResearchParams::default(); 3],
+        )
+        .expect("audio stream configuration should be valid");
+        assert_eq!(core.snapshot().audio_stream_variant_count, 3);
+
+        core.set_processing_switches(false, false, false);
+        assert_eq!(core.snapshot().audio_stream_variant_count, 0);
     }
 
     #[test]
@@ -747,7 +843,7 @@ mod tests {
             snapshot.audio_processing_parameters_version,
             "audio_processing_v2"
         );
-        assert_eq!(snapshot.audio_processing_status, "unavailable");
+        assert_eq!(snapshot.audio_processing_status, "configured");
 
         let invalid_profile = AudioProcessingProfile {
             parameters_version: String::new(),
@@ -831,7 +927,7 @@ mod tests {
         .expect("processed media should be accepted");
         let snapshot = core.snapshot();
         assert_eq!(snapshot.video_processing_status, "ready");
-        assert_eq!(snapshot.audio_processing_status, "ready");
+        assert_eq!(snapshot.audio_processing_status, "runtime");
         // ready 时已立即 commit，无需等循环边界。
         assert!(snapshot.pending_video_reference.is_none());
         assert!(!core.commit_media_processing_if_ready());
@@ -851,6 +947,24 @@ mod tests {
     }
 
     #[test]
+    fn stop_clears_cancelled_media_failure() {
+        let mut core = PlaybackCore::default();
+        core.set_source(source());
+        core.set_processing_switches(true, true, false);
+        core.mark_media_processing_running()
+            .expect("media processing should start");
+        core.mark_media_processing_failed("媒体处理已取消");
+
+        core.stop();
+
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.playback_state, PlaybackState::Stopped);
+        assert_eq!(snapshot.video_processing_status, "unavailable");
+        assert_eq!(snapshot.audio_processing_status, "unavailable");
+        assert_eq!(snapshot.fallback_reason, None);
+    }
+
+    #[test]
     fn ordinary_audio_processing_waits_for_ffmpeg_cache_even_with_realtime_variant_enabled() {
         let mut core = PlaybackCore::default();
         core.set_source(source());
@@ -864,7 +978,7 @@ mod tests {
         core.set_audio_processing_profile(profile)
             .expect("validated profile should be accepted");
         let snapshot = core.snapshot();
-        assert_eq!(snapshot.audio_processing_status, "unavailable");
+        assert_eq!(snapshot.audio_processing_status, "configured");
         assert!(!snapshot.audio_processing_runtime);
     }
 
@@ -1120,6 +1234,10 @@ mod tests {
         )
         .expect_err("stale loop candidate should be rejected");
         core.stop();
-        assert!(!core.snapshot().pending_audio_candidate);
+        let snapshot = core.snapshot();
+        assert!(!snapshot.pending_audio_candidate);
+        assert_eq!(snapshot.video_processing_status, "disabled");
+        assert_eq!(snapshot.audio_processing_status, "disabled");
+        assert_eq!(snapshot.fallback_reason, None);
     }
 }

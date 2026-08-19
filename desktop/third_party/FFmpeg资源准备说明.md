@@ -1,5 +1,7 @@
 # FFmpeg 资源准备说明
 
+> 产品范围同步（2026-08-19）：本版本不开发实时话术幻化。本文只说明 FFmpeg/FFprobe 资源准备，不包含 speech-to-speech、VAD/ASR/LLM/TTS 或实时话术候选资源。
+
 桌面端正式产物会把 FFmpeg 和 FFprobe 放入 Tauri 资源目录。Windows x64 交付解压即用的 portable ZIP，不生成 MSI/NSIS；用户不需要单独安装 FFmpeg。
 
 ## 目标目录
