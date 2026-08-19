@@ -36,6 +36,18 @@ const CANDIDATE_MIN_READ_RATE: f64 = 2.0;
 const SWITCH_PREBUFFER_MS: usize = 50;
 const SWITCH_CATCH_UP_MAX_MS: usize = 5_000;
 
+#[derive(Debug, Clone, Copy)]
+enum CandidatePrebufferPolicy {
+    CatchUp,
+    FixedWindow { buffer_ms: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecoderPacing {
+    RealTime,
+    CatchUp,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioMixerConfigContext {
     pub sample_rate_hz: u32,
@@ -229,11 +241,14 @@ impl AudioMixerTask {
             source_path,
             sample_rate_hz,
             start_position_ms,
+            start_position_ms,
             filter_graph,
             audio_stream_variant_count,
             false,
-            true,
+            DecoderPacing::RealTime,
             1.0,
+            CandidatePrebufferPolicy::CatchUp,
+            SWITCH_PREBUFFER_MS,
         )
     }
 
@@ -294,11 +309,47 @@ impl AudioMixerTask {
             source_path,
             sample_rate_hz,
             start_position_ms,
+            start_position_ms,
             filter_graph,
             audio_stream_variant_count,
             false,
-            false,
+            DecoderPacing::CatchUp,
             playback_rate,
+            CandidatePrebufferPolicy::CatchUp,
+            SWITCH_PREBUFFER_MS,
+        )
+    }
+
+    /// 为未来媒体时间窗准备候选。`seek_position_ms` 是源文件内位置，
+    /// `timeline_start_position_ms` 是跨循环的绝对媒体位置。
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_scheduled_candidate_with_filter_and_variant_count(
+        output_slot: AudioOutputSlot,
+        ffmpeg_path: PathBuf,
+        source_path: PathBuf,
+        sample_rate_hz: u32,
+        seek_position_ms: u64,
+        timeline_start_position_ms: u64,
+        filter_graph: Option<String>,
+        audio_stream_variant_count: usize,
+        playback_rate: f64,
+        buffer_ms: usize,
+        minimum_commit_tail_ms: usize,
+    ) -> Result<Self, String> {
+        Self::start_internal(
+            output_slot,
+            ffmpeg_path,
+            source_path,
+            sample_rate_hz,
+            seek_position_ms,
+            timeline_start_position_ms,
+            filter_graph,
+            audio_stream_variant_count,
+            false,
+            DecoderPacing::RealTime,
+            playback_rate,
+            CandidatePrebufferPolicy::FixedWindow { buffer_ms },
+            minimum_commit_tail_ms,
         )
     }
 
@@ -309,12 +360,15 @@ impl AudioMixerTask {
         ffmpeg_path: PathBuf,
         source_path: PathBuf,
         sample_rate_hz: u32,
-        start_position_ms: u64,
+        seek_position_ms: u64,
+        timeline_start_position_ms: u64,
         filter_graph: Option<String>,
         audio_stream_variant_count: usize,
         write_enabled_initially: bool,
-        realtime_decode: bool,
+        decoder_pacing: DecoderPacing,
         playback_rate: f64,
+        candidate_prebuffer_policy: CandidatePrebufferPolicy,
+        minimum_commit_tail_ms: usize,
     ) -> Result<Self, String> {
         validate_audio_source(&ffmpeg_path, &source_path)?;
         let sample_rate_hz = match sample_rate_hz {
@@ -329,15 +383,19 @@ impl AudioMixerTask {
         let paused_acknowledged = Arc::new(AtomicBool::new(!write_enabled_initially));
         let ready = Arc::new(AtomicBool::new(write_enabled_initially));
         let prebuffer = Arc::new(Mutex::new(VecDeque::new()));
+        let prebuffer_limit_ms = match candidate_prebuffer_policy {
+            CandidatePrebufferPolicy::CatchUp => SWITCH_CATCH_UP_MAX_MS + SWITCH_PREBUFFER_MS,
+            CandidatePrebufferPolicy::FixedWindow { buffer_ms } => buffer_ms,
+        };
         let prebuffer_limit_samples = sample_rate_hz
-            .saturating_mul((SWITCH_CATCH_UP_MAX_MS + SWITCH_PREBUFFER_MS) as u32)
+            .saturating_mul(prebuffer_limit_ms as u32)
             .saturating_div(1_000)
             .saturating_mul(OUTPUT_CHANNELS as u32)
             .max(PCM_FRAME_BYTES as u32) as usize;
         let prebuffer_started_at = Instant::now();
         let config = AudioMixerConfigContext {
             sample_rate_hz,
-            prebuffer_ms: SWITCH_PREBUFFER_MS,
+            prebuffer_ms: minimum_commit_tail_ms,
             audio_stream_variant_count,
         };
         let (sender, receiver) = mpsc::sync_channel(MIX_QUEUE_CAPACITY);
@@ -355,10 +413,10 @@ impl AudioMixerTask {
                     &ffmpeg_path,
                     &source_path,
                     sample_rate_hz,
-                    start_position_ms,
+                    seek_position_ms,
                     filter_graph.as_deref(),
                     decoder_process_slot,
-                    realtime_decode,
+                    decoder_pacing,
                     playback_rate,
                 );
             })
@@ -388,6 +446,7 @@ impl AudioMixerTask {
                     prebuffer_limit_samples,
                     sample_rate_hz,
                     prebuffer_started_at,
+                    candidate_prebuffer_policy,
                 );
             }) {
             Ok(handle) => handle,
@@ -412,8 +471,8 @@ impl AudioMixerTask {
             paused_acknowledged,
             ready,
             prebuffer,
-            start_position_ms,
-            clear_output_on_stop: true,
+            start_position_ms: timeline_start_position_ms,
+            clear_output_on_stop: write_enabled_initially,
         })
     }
 
@@ -559,6 +618,25 @@ impl AudioMixerTask {
             .map(|failure| failure.message().to_owned())
     }
 
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+            && !self.cancellation.is_cancelled()
+            && self.failure_snapshot().is_none()
+    }
+
+    pub fn prebuffered_ms(&self) -> u64 {
+        let samples = self
+            .prebuffer
+            .lock()
+            .ok()
+            .map(|buffered| buffered.len())
+            .unwrap_or(0);
+        (samples as u64)
+            .saturating_mul(1_000)
+            .saturating_div(u64::from(self.config.sample_rate_hz.max(1)))
+            .saturating_div(OUTPUT_CHANNELS as u64)
+    }
+
     /// 返回当前实时 FFmpeg 子进程 PID；任务尚未生成或已经退出时返回 None。
     pub fn ffmpeg_pid(&self) -> Option<u32> {
         self.decoder_process
@@ -626,7 +704,7 @@ fn decode_audio_loop(
     start_position_ms: u64,
     filter_graph: Option<&str>,
     decoder_process: DecoderProcessSlot,
-    realtime_decode: bool,
+    decoder_pacing: DecoderPacing,
     playback_rate: f64,
 ) {
     let mut first_loop = true;
@@ -638,11 +716,14 @@ fn decode_audio_loop(
         };
         let mut command = Command::new(ffmpeg_path);
         command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-        if realtime_decode {
-            command.args(REALTIME_FFMPEG_RATE_ARGS);
-        } else {
-            let read_rate = format!("{:.3}", candidate_ffmpeg_read_rate(playback_rate));
-            command.args(["-readrate", &read_rate, "-readrate_initial_burst", "0.5"]);
+        match decoder_pacing {
+            DecoderPacing::RealTime => {
+                command.args(REALTIME_FFMPEG_RATE_ARGS);
+            }
+            DecoderPacing::CatchUp => {
+                let read_rate = format!("{:.3}", candidate_ffmpeg_read_rate(playback_rate));
+                command.args(["-readrate", &read_rate, "-readrate_initial_burst", "0.5"]);
+            }
         }
         command
             .args(["-ss", &start_seconds, "-stream_loop", "-1", "-i"])
@@ -868,6 +949,7 @@ fn mix_audio_loop(
     prebuffer_limit_samples: usize,
     sample_rate_hz: u32,
     prebuffer_started_at: Instant,
+    candidate_prebuffer_policy: CandidatePrebufferPolicy,
 ) {
     let mut prebuffer_pending = true;
     while !cancellation.is_cancelled() {
@@ -912,10 +994,11 @@ fn mix_audio_loop(
                 let buffered_samples =
                     append_prebuffer(&mut buffered, &samples, prebuffer_limit_samples);
                 let elapsed_ms = elapsed_ms(prebuffer_started_at) as usize;
-                let required_samples = candidate_required_prebuffer_samples(
+                let required_samples = candidate_readiness_samples(
                     sample_rate_hz,
                     elapsed_ms,
                     prebuffer_limit_samples,
+                    candidate_prebuffer_policy,
                 );
                 if buffered_samples >= required_samples {
                     ready.store(true, Ordering::Release);
@@ -1001,6 +1084,22 @@ fn candidate_required_prebuffer_samples(
         .saturating_div(1_000)
         .saturating_mul(OUTPUT_CHANNELS as u64);
     required_samples.min(max_samples as u64) as usize
+}
+
+fn candidate_readiness_samples(
+    sample_rate_hz: u32,
+    elapsed_ms: usize,
+    max_samples: usize,
+    policy: CandidatePrebufferPolicy,
+) -> usize {
+    match policy {
+        CandidatePrebufferPolicy::CatchUp => {
+            candidate_required_prebuffer_samples(sample_rate_hz, elapsed_ms, max_samples)
+        }
+        CandidatePrebufferPolicy::FixedWindow { buffer_ms } => {
+            stereo_samples_for_ms(sample_rate_hz, buffer_ms).min(max_samples)
+        }
+    }
 }
 
 fn write_samples_to_output(
@@ -1375,12 +1474,13 @@ mod tests {
 
     use super::{
         append_prebuffer, candidate_ffmpeg_read_rate, candidate_prime_samples,
-        candidate_required_prebuffer_samples, handle_output_write_error, process_audio_bus,
+        candidate_readiness_samples, candidate_required_prebuffer_samples,
+        handle_output_write_error, prebuffer_skip_samples, process_audio_bus,
         sanitize_error_detail, send_samples_with_cancellation, take_complete_stereo_samples,
         trim_prebuffer_to_position, validate_candidate_prebuffer_capacity, write_samples_to_output,
         write_samples_to_output_with_timeout, write_samples_to_output_with_timeout_observed,
-        AudioMixerConfigContext, AudioMixerReadinessError, AudioMixerTask, OutputWriteError,
-        SWITCH_PREBUFFER_MS,
+        AudioMixerConfigContext, AudioMixerReadinessError, AudioMixerTask,
+        CandidatePrebufferPolicy, OutputWriteError, SWITCH_PREBUFFER_MS,
     };
     use crate::cancellation::CancellationToken;
 
@@ -1645,6 +1745,32 @@ mod tests {
             candidate_required_prebuffer_samples(1_000, 2_000, 10_100),
             4_100
         );
+    }
+
+    #[test]
+    fn scheduled_candidate_readiness_uses_a_fixed_window() {
+        let max_samples = 20_000;
+        let policy = CandidatePrebufferPolicy::FixedWindow { buffer_ms: 750 };
+
+        assert_eq!(
+            candidate_readiness_samples(1_000, 100, max_samples, policy),
+            1_500
+        );
+        assert_eq!(
+            candidate_readiness_samples(1_000, 10_000, max_samples, policy),
+            1_500
+        );
+    }
+
+    #[test]
+    fn scheduled_candidate_requires_the_full_commit_tail() {
+        let buffered_samples = 700 * 2;
+
+        assert_eq!(
+            prebuffer_skip_samples(buffered_samples, 0, 600, 1_000, 100),
+            Ok(1_200)
+        );
+        assert!(prebuffer_skip_samples(buffered_samples, 0, 601, 1_000, 100).is_err());
     }
 
     #[test]

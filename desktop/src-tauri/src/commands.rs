@@ -1,3 +1,6 @@
+use crate::audio_cycle_switch::{
+    AudioCycleCandidate, AudioMixerSourceIdentity, PendingAudioMixerKind, PendingAudioMixerTask,
+};
 use autolive_desktop_core::audio_mixer::{
     AudioMixerConfigContext, AudioMixerReadinessError, AudioMixerTask,
 };
@@ -47,7 +50,9 @@ use autolive_desktop_core::speech_to_speech_worker::{
     run_configured_speech_to_speech_context_worker_with_resource_dir,
 };
 use autolive_desktop_core::window_sizing::{calculate_window_size, WindowSizingError};
-use autolive_desktop_core::{PlaybackCore, PlaybackSnapshot, PlaybackState};
+use autolive_desktop_core::{
+    PlaybackCore, PlaybackSnapshot, PlaybackState, ValidatedAudioStreamConfiguration,
+};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -72,6 +77,10 @@ const PORTAUDIO_CALLBACK_STALL_MS: u64 = 1_500;
 // FFmpeg 的 loudnorm + 多支路滤镜需要完成初始化后才会输出首批 PCM。
 const PORTAUDIO_SWITCH_READY_TIMEOUT_MS: u64 = 5_000;
 const PORTAUDIO_SWITCH_READY_POLL_MS: u64 = 10;
+const AUDIO_CYCLE_CANDIDATE_PRE_ROLL_MS: u64 = 250;
+const AUDIO_CYCLE_CANDIDATE_BUFFER_MS: usize = 750;
+const AUDIO_CYCLE_MINIMUM_COMMIT_TAIL_MS: usize = 100;
+const AUDIO_CYCLE_TARGET_HORIZON_MS: u64 = 60_000;
 
 fn audio_mixer_readiness_error(
     timeout_code: &'static str,
@@ -161,38 +170,24 @@ fn elapsed_millis(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AudioMixerSourceIdentity {
-    playback_generation: u64,
-    loop_index: u64,
-    playback_state: PlaybackState,
-    source_path: Option<String>,
-    current_video_reference: Option<String>,
-    current_audio_source: Option<String>,
-    current_audio_reference: Option<String>,
-    current_audio_start_at_ms: u64,
-    audio_processing_enabled: bool,
-    audio_stream_revision: u64,
+fn source_duration_ms(snapshot: &PlaybackSnapshot) -> Result<u64, CommandErrorDto> {
+    snapshot
+        .source_media
+        .as_ref()
+        .and_then(|source| source.duration_ms)
+        .filter(|duration_ms| *duration_ms > 0)
+        .ok_or_else(|| {
+            CommandErrorDto::new(
+                "audio_candidate_source_duration_missing",
+                "源视频时长不可用，无法建立候选音轨绝对时间轴",
+            )
+        })
 }
 
-impl From<&PlaybackSnapshot> for AudioMixerSourceIdentity {
-    fn from(snapshot: &PlaybackSnapshot) -> Self {
-        Self {
-            playback_generation: snapshot.playback_generation,
-            loop_index: snapshot.loop_index,
-            playback_state: snapshot.playback_state,
-            source_path: snapshot
-                .source_media
-                .as_ref()
-                .map(|source| source.source_path.clone()),
-            current_video_reference: snapshot.current_video_reference.clone(),
-            current_audio_source: snapshot.current_audio_source.clone(),
-            current_audio_reference: snapshot.current_audio_reference.clone(),
-            current_audio_start_at_ms: snapshot.current_audio_start_at_ms,
-            audio_processing_enabled: snapshot.audio_processing_enabled,
-            audio_stream_revision: snapshot.audio_stream_revision,
-        }
-    }
+fn absolute_media_position_ms(loop_index: u64, position_ms: u64, duration_ms: u64) -> u64 {
+    loop_index
+        .saturating_mul(duration_ms)
+        .saturating_add(position_ms.min(duration_ms))
 }
 
 #[derive(Debug, Clone)]
@@ -209,7 +204,9 @@ pub struct AppState {
     /// FFmpeg 解码线程 → 音频混音线程；PortAudio 失败时整体停止并回退 WebView。
     audio_mixer: Arc<Mutex<Option<AudioMixerTask>>>,
     /// 尚未提交的候选音轨；预热期间不占用当前音轨槽位，停止/暂停可取消并 Join。
-    audio_mixer_pending: Arc<Mutex<Option<AudioMixerTask>>>,
+    audio_mixer_pending: Arc<Mutex<Option<PendingAudioMixerTask>>>,
+    /// 绑定异步预热等待与候选槽，防止旧请求误取后来替换的新候选。
+    audio_mixer_pending_token: Arc<AtomicU64>,
     /// 串行化设备重开、源切换、停止和候选提交，避免旧任务清空新任务环缓。
     audio_mixer_switch_lock: Arc<Mutex<()>>,
     audio_output_preferred: Arc<Mutex<bool>>,
@@ -746,6 +743,7 @@ impl Default for AppState {
             audio_output: Arc::new(Mutex::new(None)),
             audio_mixer: Arc::new(Mutex::new(None)),
             audio_mixer_pending: Arc::new(Mutex::new(None)),
+            audio_mixer_pending_token: Arc::new(AtomicU64::new(0)),
             audio_mixer_switch_lock: Arc::new(Mutex::new(())),
             audio_output_preferred: Arc::new(Mutex::new(false)),
             audio_output_last_callback_count: Arc::new(AtomicU64::new(0)),
@@ -756,6 +754,13 @@ impl Default for AppState {
 }
 
 impl AppState {
+    fn next_audio_mixer_pending_token(&self) -> u64 {
+        self.audio_mixer_pending_token
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+            .max(1)
+    }
+
     pub fn shutdown_runtime_resources(
         &self,
         budget: Duration,
@@ -806,12 +811,20 @@ impl AppState {
         let mixer = self
             .audio_mixer
             .lock()
-            .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?;
+            .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?
+            .take();
         let pause_result = mixer.as_ref().map_or(Ok(()), |task| {
             task.pause_output_for_switch()
                 .map_err(|error| CommandErrorDto::new("audio_mixer_pause_failed", error))
         });
-        drop(mixer);
+        if let Some(mixer) = mixer {
+            self.audio_mixer
+                .lock()
+                .map_err(|_| {
+                    CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏")
+                })?
+                .replace(mixer);
+        }
         self.stop_pending_audio_mixer_unlocked()?;
         pause_result
     }
@@ -904,14 +917,14 @@ impl AppState {
     fn ensure_audio_mixer_source_current(
         &self,
         expected: &AudioMixerSourceIdentity,
+        expected_loop_index: u64,
     ) -> Result<(), CommandErrorDto> {
         let current = self
             .playback
             .lock()
             .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
             .snapshot();
-        let current_identity = AudioMixerSourceIdentity::from(&current);
-        if current_identity != *expected || current.playback_state != PlaybackState::Playing {
+        if !expected.matches_playing(&current, expected_loop_index) {
             return Err(CommandErrorDto::new(
                 "audio_mixer_candidate_stale",
                 "候选预热期间播放轮次、媒体源或声音参数已经变化，保持旧轨并等待最新请求",
@@ -972,7 +985,9 @@ impl AppState {
             ));
         }
         let mut task = task;
-        if let Err(error) = self.ensure_audio_mixer_source_current(&source_identity) {
+        if let Err(error) =
+            self.ensure_audio_mixer_source_current(&source_identity, source_identity.loop_index)
+        {
             task.stop_preserving_output();
             return Err(error);
         }
@@ -1125,6 +1140,156 @@ impl AppState {
         Ok(Some((task, source_identity, playback_rate)))
     }
 
+    fn scheduled_audio_cycle_task(
+        &self,
+        app: &AppHandle,
+        request: &PrepareAudioCycleCandidateRequestDto,
+    ) -> Result<PendingAudioMixerTask, CommandErrorDto> {
+        if request.candidate_id == 0 {
+            return Err(CommandErrorDto::new(
+                "audio_candidate_id_invalid",
+                "候选 ID 必须大于 0",
+            ));
+        }
+        let configuration = ValidatedAudioStreamConfiguration::new(
+            request.audio.clone(),
+            request.audio_variants.clone(),
+        )
+        .map_err(|errors| {
+            CommandErrorDto::new(
+                "audio_candidate_params_invalid",
+                errors
+                    .iter()
+                    .map(|error| format!("{}: {}", error.field, error.message))
+                    .collect::<Vec<_>>()
+                    .join("；"),
+            )
+        })?;
+
+        let snapshot = self
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+            .snapshot();
+        if snapshot.playback_state != PlaybackState::Playing || !snapshot.audio_processing_enabled {
+            return Err(CommandErrorDto::new(
+                "audio_candidate_stale",
+                "当前没有处于播放状态的普通声音处理轨",
+            ));
+        }
+        if snapshot.current_audio_source.as_deref() == Some("realtime_variant") {
+            return Err(CommandErrorDto::new(
+                "audio_candidate_stale",
+                "实时话术音轨正在生效，普通声音周期候选不能覆盖它",
+            ));
+        }
+        if snapshot.playback_generation != request.playback_generation
+            || snapshot.audio_stream_revision != request.base_audio_stream_revision
+        {
+            return Err(CommandErrorDto::new(
+                "audio_candidate_stale",
+                "播放代次或声音参数版本已经变化，拒绝旧候选",
+            ));
+        }
+        let duration_ms = source_duration_ms(&snapshot)?;
+        let current_absolute_position_ms = absolute_media_position_ms(
+            snapshot.loop_index,
+            snapshot.current_position_ms,
+            duration_ms,
+        );
+        if request.target_absolute_position_ms <= current_absolute_position_ms
+            || request.target_absolute_position_ms
+                > current_absolute_position_ms.saturating_add(AUDIO_CYCLE_TARGET_HORIZON_MS)
+        {
+            return Err(CommandErrorDto::new(
+                "audio_candidate_target_invalid",
+                format!(
+                    "候选目标必须位于当前绝对媒体时间之后 {}ms 内",
+                    AUDIO_CYCLE_TARGET_HORIZON_MS
+                ),
+            ));
+        }
+        let source = snapshot
+            .source_media
+            .as_ref()
+            .ok_or_else(|| CommandErrorDto::new("source_media_required", "请先导入一个源视频"))?;
+        if source.audio_sample_rate_hz.is_none() {
+            return Err(CommandErrorDto::new(
+                "audio_candidate_source_missing",
+                "源视频没有可供周期处理的音频流",
+            ));
+        }
+
+        let sample_rate_hz = self
+            .audio_output
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))?
+            .as_ref()
+            .filter(|stream| {
+                let health = stream.stream_health();
+                health.application_running
+                    && matches!(
+                        health.hardware_state,
+                        autolive_portaudio_output::PortAudioHardwareState::Active
+                    )
+            })
+            .map(|stream| stream.sample_rate_hz())
+            .ok_or_else(|| {
+                CommandErrorDto::new(
+                    "audio_output_inactive",
+                    "PortAudio 硬件出口未处于活动状态，保持当前输出",
+                )
+            })?;
+        let filter_graph = build_audio_stream_filter_graph(
+            &request.audio,
+            &request.audio_variants,
+            source.audio_sample_rate_hz,
+            sample_rate_hz,
+        )
+        .map_err(|error| {
+            CommandErrorDto::new("audio_candidate_params_invalid", error.to_string())
+        })?;
+        let target_root = runtime_resource_target_root(app)
+            .map_err(|error| CommandErrorDto::new("media_resource_dir_failed", error))?;
+        let (ffmpeg_path, _) = configured_media_engine_paths_with_resource_dir(&target_root)
+            .map_err(|error| CommandErrorDto::new("media_engine_unavailable", error.to_string()))?;
+        let candidate_start_position_ms = request
+            .target_absolute_position_ms
+            .saturating_sub(AUDIO_CYCLE_CANDIDATE_PRE_ROLL_MS);
+        let seek_position_ms = candidate_start_position_ms % duration_ms;
+        let task = AudioMixerTask::start_scheduled_candidate_with_filter_and_variant_count(
+            Arc::clone(&self.audio_output),
+            ffmpeg_path,
+            PathBuf::from(&source.source_path),
+            sample_rate_hz,
+            seek_position_ms,
+            candidate_start_position_ms,
+            Some(filter_graph),
+            request.audio_variants.len().max(1),
+            request.audio.playback_speed,
+            AUDIO_CYCLE_CANDIDATE_BUFFER_MS,
+            AUDIO_CYCLE_MINIMUM_COMMIT_TAIL_MS,
+        )
+        .map_err(|error| CommandErrorDto::new("audio_candidate_start_failed", error))?;
+
+        Ok(PendingAudioMixerTask {
+            token: self.next_audio_mixer_pending_token(),
+            task,
+            source_identity: AudioMixerSourceIdentity::from(&snapshot),
+            sample_rate_hz,
+            observed_position_ms: snapshot.current_position_ms,
+            candidate_start_position_ms,
+            preparation_started_at: Instant::now(),
+            playback_rate: request.audio.playback_speed,
+            kind: PendingAudioMixerKind::AudioCycle(Box::new(AudioCycleCandidate {
+                candidate_id: request.candidate_id,
+                configuration,
+                target_loop_index: request.target_absolute_position_ms / duration_ms,
+                target_absolute_position_ms: request.target_absolute_position_ms,
+            })),
+        })
+    }
+
     // 切换提交边界需要同时携带两个时钟、一次预热事务和候选身份，拆成一次性结构会隐藏校验关系。
     #[allow(clippy::too_many_arguments)]
     fn commit_audio_mixer_candidate(
@@ -1137,7 +1302,9 @@ impl AppState {
         playback_rate: f64,
         source_identity: &AudioMixerSourceIdentity,
     ) -> Result<(), CommandErrorDto> {
-        if let Err(error) = self.ensure_audio_mixer_source_current(source_identity) {
+        if let Err(error) =
+            self.ensure_audio_mixer_source_current(source_identity, source_identity.loop_index)
+        {
             candidate.stop_preserving_output();
             return Err(error);
         }
@@ -1196,27 +1363,28 @@ impl AppState {
             ));
         }
 
-        // 先暂停旧任务，并等待它确认不再向共享环缓写入；候选提交期间旧轨仍保留在
-        // audio_mixer 槽位，提交失败可以立即恢复，不会先停旧轨再进入静音。
-        let old_paused = {
-            let mixer = self.audio_mixer.lock().map_err(|_| {
-                CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏")
-            })?;
-            mixer.as_ref().map(|old| old.pause_output_for_switch())
-        };
-        let Some(old_paused) = old_paused else {
+        // 先从槽中取出旧任务再等待暂停确认，避免把最长 500ms 的等待放在数据锁内。
+        // 外层切换事务锁仍保证此时没有并发设备重开、停止或第二次提交。
+        let old = self
+            .audio_mixer
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?
+            .take();
+        let Some(mut old) = old else {
             candidate.stop_preserving_output();
             return Err(CommandErrorDto::new(
                 "audio_mixer_old_track_missing",
                 "旧音轨不存在，取消候选切换",
             ));
         };
-        if let Err(error) = old_paused {
-            if let Ok(mixer) = self.audio_mixer.lock() {
-                if let Some(old) = mixer.as_ref() {
-                    old.resume_output_after_switch_failure();
-                }
-            }
+        if let Err(error) = old.pause_output_for_switch() {
+            old.resume_output_after_switch_failure();
+            self.audio_mixer
+                .lock()
+                .map_err(|_| {
+                    CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏")
+                })?
+                .replace(old);
             let mut candidate = candidate;
             candidate.stop_preserving_output();
             return Err(CommandErrorDto::new(
@@ -1224,46 +1392,41 @@ impl AppState {
                 error,
             ));
         }
-        if let Err(error) = self.ensure_audio_mixer_source_current(source_identity) {
-            if let Ok(mixer) = self.audio_mixer.lock() {
-                if let Some(old) = mixer.as_ref() {
-                    old.resume_output_after_switch_failure();
-                }
-            }
+        if let Err(error) =
+            self.ensure_audio_mixer_source_current(source_identity, source_identity.loop_index)
+        {
+            old.resume_output_after_switch_failure();
+            self.audio_mixer
+                .lock()
+                .map_err(|_| {
+                    CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏")
+                })?
+                .replace(old);
             candidate.stop_preserving_output();
             return Err(error);
         }
         if let Err(error) = candidate.commit_at_position(candidate_pcm_position_ms) {
-            if let Ok(mixer) = self.audio_mixer.lock() {
-                if let Some(old) = mixer.as_ref() {
-                    old.resume_output_after_switch_failure();
-                }
-            }
+            old.resume_output_after_switch_failure();
+            self.audio_mixer
+                .lock()
+                .map_err(|_| {
+                    CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏")
+                })?
+                .replace(old);
             candidate.stop_preserving_output();
             return Err(CommandErrorDto::new("audio_mixer_commit_failed", error));
         }
         candidate.enable_output();
-        let mut mixer = match self.audio_mixer.lock() {
-            Ok(mixer) => mixer,
-            Err(_) => {
-                candidate.stop_preserving_output();
-                return Err(CommandErrorDto::new(
-                    "audio_mixer_lock_failed",
-                    "音频混音状态锁已损坏",
-                ));
-            }
-        };
-        let old = mixer.take();
-        mixer.replace(candidate);
-        drop(mixer);
-        if let Some(mut old) = old {
-            old.stop_preserving_output();
-        }
+        self.audio_mixer
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?
+            .replace(candidate);
+        old.stop_preserving_output();
         Ok(())
     }
 
     /// 预热只短暂持有候选槽锁；每次最多等待一个轮询片段，让暂停/停止可以取走并取消候选。
-    fn wait_for_pending_audio_mixer(&self) -> Result<(), CommandErrorDto> {
+    fn wait_for_pending_audio_mixer(&self, expected_token: u64) -> Result<(), CommandErrorDto> {
         let started = Instant::now();
         let mut config = AudioMixerConfigContext {
             sample_rate_hz: autolive_portaudio_output::DEFAULT_SAMPLE_RATE_HZ,
@@ -1305,7 +1468,19 @@ impl AppState {
                         },
                     ));
                 };
-                task.wait_until_ready_with_reason(wait_for)
+                if task.token != expected_token {
+                    return Err(audio_mixer_readiness_error(
+                        "audio_mixer_candidate_cancelled",
+                        "audio_mixer_candidate_ffmpeg_failed",
+                        AudioMixerReadinessError::Runtime {
+                            waited_ms: started.elapsed().as_millis().min(u128::from(u64::MAX))
+                                as u64,
+                            config,
+                            reason: "候选音轨已被更新请求替换".to_owned(),
+                        },
+                    ));
+                }
+                task.task.wait_until_ready_with_reason(wait_for)
             };
             match readiness {
                 Ok(()) => return Ok(()),
@@ -2351,6 +2526,54 @@ pub struct SyncAudioOutputSourceRequestDto {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct PrepareAudioCycleCandidateRequestDto {
+    pub candidate_id: u64,
+    pub audio: autolive_desktop_core::research_params::AudioResearchParams,
+    #[serde(default)]
+    pub audio_variants: Vec<autolive_desktop_core::research_params::AudioResearchParams>,
+    pub playback_generation: u64,
+    pub base_audio_stream_revision: u64,
+    /// 未按视频时长回绕的目标媒体时间。
+    pub target_absolute_position_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrepareAudioCycleCandidateResultDto {
+    pub candidate_id: u64,
+    pub state: String,
+    pub target_absolute_position_ms: u64,
+    pub buffered_ms: u64,
+    pub ffmpeg_pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitAudioCycleCandidateRequestDto {
+    pub candidate_id: u64,
+    pub playback_generation: u64,
+    pub loop_index: u64,
+    pub position_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitAudioCycleCandidateResultDto {
+    pub candidate_id: u64,
+    pub committed: bool,
+    pub reason: Option<String>,
+    pub snapshot: PlaybackSnapshotDto,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CancelAudioCycleCandidateRequestDto {
+    pub candidate_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CancelAudioCycleCandidateResultDto {
+    pub candidate_id: Option<u64>,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct PlayPortAudioTestToneRequestDto {
     pub frequency_hz: Option<f32>,
     pub duration_ms: Option<u32>,
@@ -2586,7 +2809,7 @@ fn audio_output_status_dto(
             (if current_task.is_some() { 1 } else { 0 })
                 + (if pending_task.is_some() { 1 } else { 0 }),
             current_task.and_then(AudioMixerTask::ffmpeg_pid),
-            pending_task.and_then(AudioMixerTask::ffmpeg_pid),
+            pending_task.and_then(|pending| pending.task.ffmpeg_pid()),
         )
     };
     let hardware_state_label = portaudio_hardware_state_label(hardware_state).to_owned();
@@ -3092,6 +3315,415 @@ pub async fn sync_audio_output_source(
     })?
 }
 
+#[tauri::command]
+pub async fn prepare_audio_cycle_candidate(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: PrepareAudioCycleCandidateRequestDto,
+) -> Result<PrepareAudioCycleCandidateResultDto, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _switch_guard = state.audio_mixer_switch_lock.lock().map_err(|_| {
+            CommandErrorDto::new("audio_mixer_switch_lock_failed", "音频切换锁已损坏")
+        })?;
+
+        let previous = take_pending_audio_mixer(&state.audio_mixer_pending)?;
+        if let Some(mut previous) = previous {
+            previous.stop_preserving_output();
+        }
+
+        let candidate = state.scheduled_audio_cycle_task(&app, &request)?;
+        let result = PrepareAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            state: if candidate.task.is_ready() {
+                "ready".to_owned()
+            } else {
+                "preparing".to_owned()
+            },
+            target_absolute_position_ms: request.target_absolute_position_ms,
+            buffered_ms: candidate.task.prebuffered_ms(),
+            ffmpeg_pid: candidate.task.ffmpeg_pid(),
+        };
+        state
+            .audio_mixer_pending
+            .lock()
+            .map_err(|_| {
+                CommandErrorDto::new(
+                    "audio_mixer_pending_lock_failed",
+                    "待切换音频混音状态锁已损坏",
+                )
+            })?
+            .replace(candidate);
+        Ok(result)
+    })
+    .await
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "audio_candidate_prepare_task_failed",
+            format!("候选音轨后台准备任务失败：{error}"),
+        )
+    })?
+}
+
+#[tauri::command]
+pub async fn commit_audio_cycle_candidate(
+    window: Window,
+    state: State<'_, AppState>,
+    request: CommitAudioCycleCandidateRequestDto,
+) -> Result<CommitAudioCycleCandidateResultDto, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        commit_audio_cycle_candidate_blocking(state, request)
+    })
+    .await
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "audio_candidate_commit_task_failed",
+            format!("候选音轨后台提交任务失败：{error}"),
+        )
+    })?
+}
+
+fn commit_audio_cycle_candidate_blocking(
+    state: AppState,
+    request: CommitAudioCycleCandidateRequestDto,
+) -> Result<CommitAudioCycleCandidateResultDto, CommandErrorDto> {
+    let _switch_guard = state
+        .audio_mixer_switch_lock
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_mixer_switch_lock_failed", "音频切换锁已损坏"))?;
+    let snapshot = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot();
+    let snapshot_dto = || PlaybackSnapshotDto::from(snapshot.clone());
+    if request.playback_generation != snapshot.playback_generation {
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some("播放代次已经变化，旧候选已失效".to_owned()),
+            snapshot: snapshot_dto(),
+        });
+    }
+
+    let duration_ms = source_duration_ms(&snapshot)?;
+    let live_absolute_position_ms =
+        absolute_media_position_ms(request.loop_index, request.position_ms, duration_ms);
+    let rust_absolute_position_ms = absolute_media_position_ms(
+        snapshot.loop_index,
+        snapshot.current_position_ms,
+        duration_ms,
+    );
+    let mut pending_guard = state.audio_mixer_pending.lock().map_err(|_| {
+        CommandErrorDto::new(
+            "audio_mixer_pending_lock_failed",
+            "待切换音频混音状态锁已损坏",
+        )
+    })?;
+    let Some(pending) = pending_guard.as_ref() else {
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some("候选音轨不存在或已取消".to_owned()),
+            snapshot: snapshot_dto(),
+        });
+    };
+    if pending.candidate_id() != Some(request.candidate_id) {
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some("候选 ID 已过期，保持当前音轨".to_owned()),
+            snapshot: snapshot_dto(),
+        });
+    }
+    if let Some(reason) = pending.task.failure() {
+        let Some(mut failed) = pending_guard.take() else {
+            return Err(CommandErrorDto::new(
+                "audio_candidate_state_invalid",
+                "候选状态在提交期间意外丢失",
+            ));
+        };
+        drop(pending_guard);
+        failed.stop_preserving_output();
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some(format!("候选 FFmpeg 已退出：{reason}")),
+            snapshot: snapshot_dto(),
+        });
+    }
+    if !pending.task.is_ready() {
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some(format!(
+                "候选音轨仍在准备，当前已缓冲 {}ms",
+                pending.task.prebuffered_ms()
+            )),
+            snapshot: snapshot_dto(),
+        });
+    }
+    let PendingAudioMixerKind::AudioCycle(candidate_state) = &pending.kind else {
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some("候选槽正在处理首次音频同步".to_owned()),
+            snapshot: snapshot_dto(),
+        });
+    };
+    if pending.expected_loop_index() != request.loop_index {
+        let stale = pending_guard.take();
+        drop(pending_guard);
+        if let Some(mut stale) = stale {
+            stale.stop_preserving_output();
+        }
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some("候选目标循环与当前视频循环不一致".to_owned()),
+            snapshot: snapshot_dto(),
+        });
+    }
+    if live_absolute_position_ms.saturating_add(AUDIO_CYCLE_CANDIDATE_PRE_ROLL_MS)
+        < candidate_state.target_absolute_position_ms
+    {
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some("尚未到达候选音轨切换点".to_owned()),
+            snapshot: snapshot_dto(),
+        });
+    }
+    if !pending
+        .source_identity
+        .matches_playing(&snapshot, request.loop_index)
+    {
+        let Some(mut stale) = pending_guard.take() else {
+            return Err(CommandErrorDto::new(
+                "audio_candidate_state_invalid",
+                "候选状态在过期清理期间意外丢失",
+            ));
+        };
+        drop(pending_guard);
+        stale.stop_preserving_output();
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some("播放轮次、媒体源或声音版本已经变化，旧候选已取消".to_owned()),
+            snapshot: snapshot_dto(),
+        });
+    }
+
+    let (pending_ms, output_latency_ms) = state.audio_output_timing_ms(pending.sample_rate_hz);
+    let commit_absolute_position_ms = live_absolute_position_ms
+        .max(rust_absolute_position_ms)
+        .saturating_add(pending_ms)
+        .saturating_add(output_latency_ms);
+    let candidate_pcm_position_ms = resolve_audio_candidate_pcm_position_ms(
+        pending.candidate_start_position_ms,
+        commit_absolute_position_ms,
+        pending.playback_rate,
+    );
+    if let Err(reason) = pending
+        .task
+        .validate_commit_at_position(candidate_pcm_position_ms)
+    {
+        let missed = pending_guard.take();
+        drop(pending_guard);
+        if let Some(mut missed) = missed {
+            missed.stop_preserving_output();
+        }
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some(format!("候选音轨未覆盖当前画面：{reason}")),
+            snapshot: snapshot_dto(),
+        });
+    }
+    let output_active = state
+        .audio_output
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_output_lock_failed", "音频出口状态锁已损坏"))?
+        .as_ref()
+        .is_some_and(|stream| {
+            let health = stream.stream_health();
+            health.application_running
+                && matches!(
+                    health.hardware_state,
+                    autolive_portaudio_output::PortAudioHardwareState::Active
+                )
+        });
+    if !output_active {
+        let inactive = pending_guard.take();
+        drop(pending_guard);
+        if let Some(mut inactive) = inactive {
+            inactive.stop_preserving_output();
+        }
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some("PortAudio 硬件消费者未处于活动状态".to_owned()),
+            snapshot: snapshot_dto(),
+        });
+    }
+
+    let Some(pending) = pending_guard.take() else {
+        return Err(CommandErrorDto::new(
+            "audio_candidate_state_invalid",
+            "候选状态在提交期间意外丢失",
+        ));
+    };
+    drop(pending_guard);
+    let PendingAudioMixerTask {
+        task: candidate,
+        source_identity,
+        kind: PendingAudioMixerKind::AudioCycle(candidate_state),
+        ..
+    } = pending
+    else {
+        return Err(CommandErrorDto::new(
+            "audio_candidate_state_invalid",
+            "候选状态类型不一致",
+        ));
+    };
+    let old = state
+        .audio_mixer
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?
+        .take();
+    let Some(mut old) = old else {
+        let mut candidate = candidate;
+        candidate.stop_preserving_output();
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some("当前音轨不存在，不能安全切换候选".to_owned()),
+            snapshot: snapshot_dto(),
+        });
+    };
+    if let Err(reason) = old.pause_output_for_switch() {
+        old.resume_output_after_switch_failure();
+        state
+            .audio_mixer
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?
+            .replace(old);
+        let mut candidate = candidate;
+        candidate.stop_preserving_output();
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some(format!("当前音轨未能进入切换状态：{reason}")),
+            snapshot: snapshot_dto(),
+        });
+    }
+    if let Err(reason) =
+        state.ensure_audio_mixer_source_current(&source_identity, request.loop_index)
+    {
+        old.resume_output_after_switch_failure();
+        state
+            .audio_mixer
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?
+            .replace(old);
+        let mut candidate = candidate;
+        candidate.stop_preserving_output();
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some(reason.message),
+            snapshot: snapshot_dto(),
+        });
+    }
+    if let Err(reason) = candidate.commit_at_position(candidate_pcm_position_ms) {
+        old.resume_output_after_switch_failure();
+        state
+            .audio_mixer
+            .lock()
+            .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?
+            .replace(old);
+        let mut candidate = candidate;
+        candidate.stop_preserving_output();
+        return Ok(CommitAudioCycleCandidateResultDto {
+            candidate_id: request.candidate_id,
+            committed: false,
+            reason: Some(format!("候选音轨提交失败：{reason}")),
+            snapshot: snapshot_dto(),
+        });
+    }
+    candidate.enable_output();
+    state
+        .audio_mixer
+        .lock()
+        .map_err(|_| CommandErrorDto::new("audio_mixer_lock_failed", "音频混音状态锁已损坏"))?
+        .replace(candidate);
+    let committed_snapshot = {
+        let mut playback = state
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+        playback.commit_validated_audio_stream_configuration(candidate_state.configuration);
+        PlaybackSnapshotDto::from(playback.snapshot())
+    };
+    old.stop_preserving_output();
+    Ok(CommitAudioCycleCandidateResultDto {
+        candidate_id: request.candidate_id,
+        committed: true,
+        reason: None,
+        snapshot: committed_snapshot,
+    })
+}
+
+#[tauri::command]
+pub async fn cancel_audio_cycle_candidate(
+    window: Window,
+    state: State<'_, AppState>,
+    request: CancelAudioCycleCandidateRequestDto,
+) -> Result<CancelAudioCycleCandidateResultDto, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _switch_guard = state.audio_mixer_switch_lock.lock().map_err(|_| {
+            CommandErrorDto::new("audio_mixer_switch_lock_failed", "音频切换锁已损坏")
+        })?;
+        let mut pending = state.audio_mixer_pending.lock().map_err(|_| {
+            CommandErrorDto::new(
+                "audio_mixer_pending_lock_failed",
+                "待切换音频混音状态锁已损坏",
+            )
+        })?;
+        let matches = pending.as_ref().is_some_and(|candidate| {
+            matches!(candidate.kind, PendingAudioMixerKind::AudioCycle(_))
+                && request
+                    .candidate_id
+                    .is_none_or(|candidate_id| candidate.candidate_id() == Some(candidate_id))
+        });
+        let candidate = matches.then(|| pending.take()).flatten();
+        drop(pending);
+        let cancelled_id = candidate
+            .as_ref()
+            .and_then(PendingAudioMixerTask::candidate_id);
+        if let Some(mut candidate) = candidate {
+            candidate.stop_preserving_output();
+        }
+        Ok(CancelAudioCycleCandidateResultDto {
+            candidate_id: cancelled_id.or(request.candidate_id),
+            cancelled: matches,
+        })
+    })
+    .await
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "audio_candidate_cancel_task_failed",
+            format!("候选音轨后台取消任务失败：{error}"),
+        )
+    })?
+}
+
 fn sync_audio_output_source_blocking(
     app: AppHandle,
     state: AppState,
@@ -3173,6 +3805,18 @@ fn sync_audio_output_source_blocking(
             drop(switch_guard);
             return audio_output_status_dto(&state);
         };
+        let pending_token = state.next_audio_mixer_pending_token();
+        let candidate = PendingAudioMixerTask {
+            token: pending_token,
+            task: candidate,
+            source_identity: source_identity.clone(),
+            sample_rate_hz,
+            observed_position_ms,
+            candidate_start_position_ms,
+            preparation_started_at,
+            playback_rate,
+            kind: PendingAudioMixerKind::SourceSync,
+        };
         let mut pending = match state.audio_mixer_pending.lock() {
             Ok(pending) => pending,
             Err(_) => {
@@ -3191,25 +3835,53 @@ fn sync_audio_output_source_blocking(
         }
         drop(switch_guard);
 
-        let readiness = state.wait_for_pending_audio_mixer();
+        let readiness = state.wait_for_pending_audio_mixer(pending_token);
         let switch_guard = state.audio_mixer_switch_lock.lock().map_err(|_| {
             CommandErrorDto::new("audio_mixer_switch_lock_failed", "音频切换锁已损坏")
         })?;
-        let candidate = take_pending_audio_mixer(&state.audio_mixer_pending)?;
+        let candidate = {
+            let mut pending = state.audio_mixer_pending.lock().map_err(|_| {
+                CommandErrorDto::new(
+                    "audio_mixer_pending_lock_failed",
+                    "待切换音频混音状态锁已损坏",
+                )
+            })?;
+            if pending
+                .as_ref()
+                .is_some_and(|candidate| candidate.token == pending_token)
+            {
+                pending.take()
+            } else {
+                None
+            }
+        };
         let Some(candidate) = candidate else {
             drop(switch_guard);
             return audio_output_status_dto(&state);
         };
         let switch_result = match readiness {
-            Ok(()) => state.commit_audio_mixer_candidate(
-                candidate,
-                sample_rate_hz,
-                observed_position_ms,
-                candidate_start_position_ms,
-                preparation_started_at,
-                playback_rate,
-                &source_identity,
-            ),
+            Ok(()) => {
+                let PendingAudioMixerTask {
+                    token: _,
+                    task,
+                    source_identity,
+                    sample_rate_hz,
+                    observed_position_ms,
+                    candidate_start_position_ms,
+                    preparation_started_at,
+                    playback_rate,
+                    kind: _,
+                } = candidate;
+                state.commit_audio_mixer_candidate(
+                    task,
+                    sample_rate_hz,
+                    observed_position_ms,
+                    candidate_start_position_ms,
+                    preparation_started_at,
+                    playback_rate,
+                    &source_identity,
+                )
+            }
             Err(error) => {
                 let mut candidate = candidate;
                 candidate.stop_preserving_output();
@@ -4815,9 +5487,10 @@ mod tests {
     #[cfg(unix)]
     use super::development_executable_ready;
     use super::{
-        audio_mixer_readiness_error, resolve_audio_candidate_pcm_position_ms,
-        resolve_audio_commit_position_ms, resolve_audio_output_latency_ms,
-        resolve_audio_start_position_ms, take_pending_audio_mixer, AppState,
+        absolute_media_position_ms, audio_mixer_readiness_error,
+        resolve_audio_candidate_pcm_position_ms, resolve_audio_commit_position_ms,
+        resolve_audio_output_latency_ms, resolve_audio_start_position_ms, take_pending_audio_mixer,
+        AppState,
     };
     use autolive_desktop_core::audio_mixer::{AudioMixerConfigContext, AudioMixerReadinessError};
 
@@ -4910,6 +5583,15 @@ mod tests {
         assert_eq!(
             resolve_audio_candidate_pcm_position_ms(10_000, 9_000, 2.0),
             10_000
+        );
+    }
+
+    #[test]
+    fn absolute_media_position_keeps_loop_identity_without_overflow() {
+        assert_eq!(absolute_media_position_ms(2, 1_500, 1_000), 3_000);
+        assert_eq!(
+            absolute_media_position_ms(u64::MAX, u64::MAX, 1_000),
+            u64::MAX
         );
     }
 

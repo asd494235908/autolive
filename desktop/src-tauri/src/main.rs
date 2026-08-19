@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio_cycle_switch;
 mod auth_session;
 mod commands;
 
@@ -8,16 +9,17 @@ use autolive_desktop_core::runtime_resource_task::{
     handle_runtime_resource_exit, RuntimeResourceTaskShutdown,
 };
 use commands::{
-    cancel_research_analysis, cancel_runtime_resource_install, cancel_speech_to_speech_worker,
-    cleanup_local_caches_command, clear_runtime_resources, close_final_effect_window,
-    commit_audio_variant_candidate, commit_audio_variant_candidate_if_due,
-    commit_media_processing_if_ready, complete_playback_loop, direct_model_chat,
-    discard_audio_variant_candidate, get_audio_output_backend_status,
-    get_default_local_research_params, get_device_runtime_info, get_media_engine_capabilities,
-    get_research_status, get_research_worker_capabilities, get_runtime_resource_status,
-    get_snapshot, get_speech_to_speech_worker_capabilities, import_runtime_resource_directory,
-    install_runtime_resources, list_audio_output_devices, open_final_effect_window, pause_playback,
-    play_portaudio_test_tone, probe_local_mp4, probe_local_video, resize_final_effect_window,
+    cancel_audio_cycle_candidate, cancel_research_analysis, cancel_runtime_resource_install,
+    cancel_speech_to_speech_worker, cleanup_local_caches_command, clear_runtime_resources,
+    close_final_effect_window, commit_audio_cycle_candidate, commit_audio_variant_candidate,
+    commit_audio_variant_candidate_if_due, commit_media_processing_if_ready,
+    complete_playback_loop, direct_model_chat, discard_audio_variant_candidate,
+    get_audio_output_backend_status, get_default_local_research_params, get_device_runtime_info,
+    get_media_engine_capabilities, get_research_status, get_research_worker_capabilities,
+    get_runtime_resource_status, get_snapshot, get_speech_to_speech_worker_capabilities,
+    import_runtime_resource_directory, install_runtime_resources, list_audio_output_devices,
+    open_final_effect_window, pause_playback, play_portaudio_test_tone,
+    prepare_audio_cycle_candidate, probe_local_mp4, probe_local_video, resize_final_effect_window,
     restore_original_audio, resume_playback, set_audio_output_backend,
     set_audio_processing_profile, set_interlude_config, set_processing_switches,
     stage_audio_variant_candidate, start_media_processing, start_playback, start_research_analysis,
@@ -42,6 +44,9 @@ fn main() -> ExitCode {
             list_audio_output_devices,
             set_audio_output_backend,
             sync_audio_output_source,
+            prepare_audio_cycle_candidate,
+            commit_audio_cycle_candidate,
+            cancel_audio_cycle_candidate,
             play_portaudio_test_tone,
             write_portaudio_pcm,
             get_runtime_resource_status,

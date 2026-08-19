@@ -152,12 +152,25 @@ test('处理候选槽切换使用 30ms 双向 Gain ramp，并在失败时保留�
   assert.match(candidateEffect, /if \(!processedAudioPlayingRef\.current\) restoreDryAudioOutput\(\)/);
 });
 
-test('所有声音周期抽样入口统一提交快照，且 PortAudio 正式路径不创建 ScriptProcessor', async () => {
+test('声音周期仅在提交成功后升级当前快照，且 PortAudio 正式路径不创建 ScriptProcessor', async () => {
   const app = await readFile(appPath, 'utf8');
   const sampleCalls = [...app.matchAll(/sampleAudioCycle\(/g)];
-  assert.equal(sampleCalls.length, 1, 'App 只允许提交函数内部直接抽样');
+  assert.equal(sampleCalls.length, 2, 'App 只允许当前轮提交和下一轮规划直接抽样');
   assert.match(app, /function sampleAndCommitAudioCycle\(/);
-  assert.match(app, /appendAudioCycleSnapshot\([\s\S]*at:\s*new Date\(\)\.toISOString\(\)/);
+  const commitStart = app.indexOf('function commitAudioCycleSample');
+  const commitEnd = app.indexOf('function sampleAndCommitAudioCycle', commitStart);
+  const commit = app.slice(commitStart, commitEnd);
+  const planStart = app.indexOf('function planNextAudioCycle');
+  const planEnd = app.indexOf('function postAudioCycleCommand', planStart);
+  const plan = app.slice(planStart, planEnd);
+  assert.ok(commitStart >= 0 && commitEnd > commitStart);
+  assert.ok(planStart >= 0 && planEnd > planStart);
+  assert.match(commit, /appendAudioCycleSnapshot\([\s\S]*at:\s*new Date\(\)\.toISOString\(\)/);
+  assert.doesNotMatch(plan, /appendAudioCycleSnapshot|audioCycleSampleRef\.current\s*=/);
+  assert.match(app, /invoke<PrepareAudioCycleCandidateResult>\('prepare_audio_cycle_candidate'/);
+  assert.match(app, /invoke<CommitAudioCycleCandidateResult>\('commit_audio_cycle_candidate'/);
+  assert.match(app, /'cancel_audio_cycle_candidate'/);
+  assert.match(app, /Math\.round\(video\.currentTime \* 1_000\)/);
   const initialStart = app.indexOf("void invoke<ResearchParams>('get_default_local_research_params')");
   const initialEnd = app.indexOf("void invoke<SpeechToSpeechWorkerCapabilities", initialStart);
   const initial = app.slice(initialStart, initialEnd);

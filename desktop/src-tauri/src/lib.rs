@@ -20,7 +20,7 @@ use crate::audio_processing::AudioProcessingProfile;
 use crate::errors::PlaybackError;
 use crate::interlude_player::{resolve_effective_audio_source, InterludeSnapshot};
 use crate::media_library::SourceMediaDto;
-use crate::research_params::AudioResearchParams;
+use crate::research_params::{AudioResearchParams, ParameterValidationError};
 use crate::speech_to_speech::{
     AudioTrackInput, AudioVariantCandidate, CandidateValidationError, SpeechToSpeechContext,
 };
@@ -32,6 +32,54 @@ pub enum PlaybackState {
     Playing,
     Paused,
     Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAudioStreamConfiguration {
+    params: AudioResearchParams,
+    variants: Vec<AudioResearchParams>,
+}
+
+impl ValidatedAudioStreamConfiguration {
+    pub fn new(
+        params: AudioResearchParams,
+        variants: Vec<AudioResearchParams>,
+    ) -> Result<Self, Vec<ParameterValidationError>> {
+        let mut errors = Vec::new();
+        if let Err(mut params_errors) = params.validate() {
+            errors.append(&mut params_errors);
+        }
+        if variants.len() > 4 {
+            errors.push(ParameterValidationError {
+                field: "audio_variants".to_owned(),
+                code: "too_many_items".to_owned(),
+                unit: "条".to_owned(),
+                value: Some(variants.len() as f64),
+                min: Some(0.0),
+                max: Some(4.0),
+                message: format!(
+                    "audio_variants 最多允许 4 条，实际收到 {} 条",
+                    variants.len()
+                ),
+            });
+        }
+        for (index, variant) in variants.iter().enumerate() {
+            if let Err(variant_errors) = variant.validate() {
+                errors.extend(variant_errors.into_iter().map(|mut error| {
+                    error.field = format!("audio_variants[{index}].{}", error.field);
+                    error
+                }));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        Ok(Self { params, variants })
+    }
+
+    fn into_parts(self) -> (AudioResearchParams, Vec<AudioResearchParams>) {
+        (self.params, self.variants)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -354,25 +402,19 @@ impl PlaybackCore {
         params: AudioResearchParams,
         variants: Vec<AudioResearchParams>,
     ) -> Result<(), Vec<crate::research_params::ParameterValidationError>> {
-        let mut errors = Vec::new();
-        if let Err(mut params_errors) = params.validate() {
-            errors.append(&mut params_errors);
-        }
-        for (index, variant) in variants.iter().enumerate() {
-            if let Err(variant_errors) = variant.validate() {
-                errors.extend(variant_errors.into_iter().map(|mut error| {
-                    error.field = format!("audio_variants[{index}].{}", error.field);
-                    error
-                }));
-            }
-        }
-        if !errors.is_empty() {
-            return Err(errors);
-        }
+        let configuration = ValidatedAudioStreamConfiguration::new(params, variants)?;
+        self.commit_validated_audio_stream_configuration(configuration);
+        Ok(())
+    }
+
+    pub fn commit_validated_audio_stream_configuration(
+        &mut self,
+        configuration: ValidatedAudioStreamConfiguration,
+    ) {
+        let (params, variants) = configuration.into_parts();
         self.audio_processing_profile.params = params;
         self.audio_stream_variants = variants;
         self.audio_stream_revision = self.audio_stream_revision.wrapping_add(1);
-        Ok(())
     }
 
     pub fn audio_stream_configuration(&self) -> (AudioResearchParams, Vec<AudioResearchParams>) {
@@ -735,7 +777,7 @@ impl PlaybackCore {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlaybackCore, PlaybackState};
+    use super::{PlaybackCore, PlaybackState, ValidatedAudioStreamConfiguration};
     use crate::audio_processing::AudioProcessingProfile;
     use crate::media_library::SourceMediaDto;
     use crate::research_params::AudioResearchParams;
@@ -823,6 +865,31 @@ mod tests {
 
         core.set_processing_switches(false, false, false);
         assert_eq!(core.snapshot().audio_stream_variant_count, 0);
+    }
+
+    #[test]
+    fn validated_audio_configuration_commits_revision_exactly_once() {
+        let mut core = PlaybackCore::default();
+        let revision = core.snapshot().audio_stream_revision;
+        let configuration = ValidatedAudioStreamConfiguration::new(
+            AudioResearchParams::default(),
+            vec![AudioResearchParams::default(); 2],
+        )
+        .expect("configuration should be valid");
+
+        assert_eq!(core.snapshot().audio_stream_revision, revision);
+        core.commit_validated_audio_stream_configuration(configuration);
+        assert_eq!(core.snapshot().audio_stream_revision, revision + 1);
+    }
+
+    #[test]
+    fn audio_configuration_rejects_more_than_four_variants() {
+        let result = ValidatedAudioStreamConfiguration::new(
+            AudioResearchParams::default(),
+            vec![AudioResearchParams::default(); 5],
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]

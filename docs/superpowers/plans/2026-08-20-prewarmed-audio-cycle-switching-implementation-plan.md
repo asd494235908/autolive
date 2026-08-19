@@ -1,6 +1,6 @@
 # 下一周期音轨预热与无阻塞切换实施方案
 
-> 状态：待实施
+> 状态：Phase 0–1 已完成代码实施与静态/单元验证；Phase 2–4 待实施和实机长测
 > 日期：2026-08-20
 > 代码基线：`dev-2.0` / `20f7da4`
 > 适用范围：桌面端 React 调度、Rust/Tauri 音频生命周期、FFmpeg 流式处理、PortAudio 输出
@@ -420,6 +420,8 @@ candidate_window_end_ms
 
 ### Phase 0：回归测试与观测基线
 
+实施状态（2026-08-20）：已完成固定时间窗 readiness、100ms 提交尾部、绝对媒体时间和配置 revision 原子提交测试；运行态继续复用 current/pending PID 与任务数。真实 CPU、内存、xrun 和 A/V 偏差基线仍需目标 Windows 设备长测，未以单元测试替代。
+
 先写失败测试并补齐状态字段，不改变播放行为。
 
 - Rust：复现“ready 后画面继续前进，提交只剩 32ms”的竞态。
@@ -431,6 +433,8 @@ candidate_window_end_ms
 
 ### Phase 1：下一周期提前抽样和未来时间窗预热
 
+实施状态（2026-08-20）：已完成。React 使用独立 coordinator 保存 current/next，默认提前 4 秒通过最终效果窗口发起 prepare；Rust 新增 `prepare_audio_cycle_candidate`、`commit_audio_cycle_candidate`、`cancel_audio_cycle_candidate`，Scheduled 候选使用 `-re` 和固定 750ms 时间窗，prepare 不修改当前参数/revision，commit 成功后才提交已验证配置并递增一次 revision。首次启动的 CatchUp 路径暂时保留，且通过 pending token 防止旧等待误取新候选。
+
 - 引入前端 coordinator。
 - 当前周期提交后立即生成 N+1，但不改当前 UI 参数事实源。
 - 默认到切换前约 4 秒才启动候选 FFmpeg；候选样本可以提前展示，但只有 commit 成功后才能升级为 current。
@@ -441,6 +445,8 @@ candidate_window_end_ms
 验收：切换时刻的进程日志中不出现新的 FFmpeg spawn；任意时刻 PID `<=2`。
 
 ### Phase 2：单一混音线程与真实 30ms 交叉淡化
+
+实施状态：待实施。当前 Phase 1 仍沿用“暂停旧写入者 → 原子预填候选 → 切换任务”的兼容提交路径，尚不能宣称已经完成单一输出生产者或真实样本域 30ms 双向交叉淡化。
 
 - 解码任务改为写各自有界 PCM 队列。
 - `audio_cycle_mixer` 成为 PortAudio 环缓唯一生产者。

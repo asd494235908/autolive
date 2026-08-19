@@ -43,6 +43,19 @@ import {
 } from './runtime-parameter-scheduler';
 import type { AudioCycleSample, PeriodRangeMs, RuntimeBaseParameters, RuntimePreviewParameters, SubtleAudioSample } from './runtime-parameter-scheduler';
 import { appendAudioCycleSnapshot } from './audioCycleSnapshot';
+import {
+  createAudioCycleCandidatePlan,
+  getAudioCycleCoordinatorAction,
+  isAudioCycleCommandMessage,
+  isAudioCycleResultMessage,
+  recoverAudioCycleCandidate,
+  updateAudioCycleCandidateStatus,
+} from './audio-cycle-prewarm-coordinator';
+import type {
+  AudioCycleCandidatePlan,
+  AudioCycleCommandMessage,
+  AudioCycleResultMessage,
+} from './audio-cycle-prewarm-coordinator';
 import { buildAudioCapabilityRows } from './audio-processing-capabilities';
 import { resolveSynchronizedVideoPlaybackRate } from './audio-playback-sync';
 import { shouldRestartPlayback } from './playback-loop';
@@ -290,6 +303,30 @@ type AudioOutputDevice = {
   host_api: string;
   max_output_channels: number;
   default_sample_rate_hz: number;
+};
+
+type PrepareAudioCycleCandidateResult = {
+  candidate_id: number;
+  state: 'preparing' | 'ready';
+  target_absolute_position_ms: number;
+  buffered_ms: number;
+  ffmpeg_pid: number | null;
+};
+
+type CommitAudioCycleCandidateResult = {
+  candidate_id: number;
+  committed: boolean;
+  reason: string | null;
+  snapshot: PlaybackSnapshot;
+};
+
+type PendingAudioCyclePayload = {
+  sample: AudioCycleSample;
+  audio: ResearchParams['audio'];
+  audioVariants: ResearchParams['audio'][];
+  playbackGeneration: number;
+  baseAudioStreamRevision: number;
+  periodMs: number;
 };
 
 function getActualAudioOutputLabel(status: AudioOutputBackendStatus | null): 'PortAudio' | 'WebView' {
@@ -740,6 +777,7 @@ function FinalEffectWindow() {
   const speakerMuteGainRef = useRef<GainNode | null>(null);
   const portAudioHardwareRef = useRef(false);
   const audioSourceSyncRef = useRef({ latestRequest: 0, pending: false, running: false });
+  const committedAudioCycleRevisionRef = useRef<number | null>(null);
   const runtimeAudioEnabledRef = useRef(false);
   const runtimeAudioParamsRef = useRef<RuntimePreviewParameters | null>(null);
   // ponytail: 参数切换 30ms 增益交叉淡化；duck/音量仍走同一出口但不强制淡化键
@@ -1303,6 +1341,114 @@ function FinalEffectWindow() {
 
   }
 
+  function publishAudioCycleResult(message: AudioCycleResultMessage) {
+    try {
+      playbackChannelRef.current?.postMessage(message);
+    } catch {
+      // 最终效果窗关闭时，Rust 生命周期命令仍由停止/暂停路径兜底回收。
+    }
+  }
+
+  async function handleAudioCycleCommand(message: AudioCycleCommandMessage) {
+    const currentSnapshot = snapshotRef.current;
+    const video = videoRef.current;
+    try {
+      if (message.action === 'cancel') {
+        const result = await invoke<{ candidate_id: number | null; cancelled: boolean }>(
+          'cancel_audio_cycle_candidate',
+          { request: { candidate_id: message.candidate_id } },
+        );
+        publishAudioCycleResult({
+          version: 1,
+          type: 'audio-cycle-result',
+          action: 'cancel',
+          candidate_id: message.candidate_id,
+          accepted: result.cancelled,
+          committed: false,
+          reason: null,
+        });
+        return;
+      }
+      if (!currentSnapshot || !video) throw new Error('最终效果窗口尚未建立视频时钟');
+
+      if (message.action === 'prepare') {
+        if (
+          typeof message.target_at_ms !== 'number'
+          || typeof message.base_audio_stream_revision !== 'number'
+          || !message.audio
+        ) {
+          throw new Error('候选音轨准备参数不完整');
+        }
+        const sourceDurationMs = Math.round(currentSnapshot.source_media?.duration_ms ?? 0);
+        const durationMs = sourceDurationMs > 0
+          ? sourceDurationMs
+          : Number.isFinite(video.duration) && video.duration > 0
+            ? Math.round(video.duration * 1_000)
+            : 0;
+        if (durationMs <= 0) throw new Error('源视频时长不可用');
+        const currentPositionMs = Math.max(0, Math.round(video.currentTime * 1_000));
+        const currentAbsolutePositionMs = currentSnapshot.loop_index * durationMs + currentPositionMs;
+        const remainingWallMs = Math.max(1, message.target_at_ms - Date.now());
+        const targetAbsolutePositionMs = currentAbsolutePositionMs
+          + Math.round(remainingWallMs * Math.max(0.5, Math.min(2, video.playbackRate || 1)));
+        const result = await invoke<PrepareAudioCycleCandidateResult>('prepare_audio_cycle_candidate', {
+          request: {
+            candidate_id: message.candidate_id,
+            audio: message.audio,
+            audio_variants: message.audio_variants ?? [],
+            playback_generation: message.playback_generation,
+            base_audio_stream_revision: message.base_audio_stream_revision,
+            target_absolute_position_ms: targetAbsolutePositionMs,
+          },
+        });
+        publishAudioCycleResult({
+          version: 1,
+          type: 'audio-cycle-result',
+          action: 'prepare',
+          candidate_id: message.candidate_id,
+          accepted: result.candidate_id === message.candidate_id,
+          committed: false,
+          reason: null,
+        });
+        return;
+      }
+
+      const currentPositionMs = Math.max(0, Math.round(video.currentTime * 1_000));
+      const result = await invoke<CommitAudioCycleCandidateResult>('commit_audio_cycle_candidate', {
+        request: {
+          candidate_id: message.candidate_id,
+          playback_generation: message.playback_generation,
+          loop_index: currentSnapshot.loop_index,
+          position_ms: currentPositionMs,
+        },
+      });
+      if (result.committed) {
+        committedAudioCycleRevisionRef.current = result.snapshot.audio_stream_revision;
+        applyPlayerSnapshot(result.snapshot);
+      }
+      publishAudioCycleResult({
+        version: 1,
+        type: 'audio-cycle-result',
+        action: 'commit',
+        candidate_id: message.candidate_id,
+        accepted: true,
+        committed: result.committed,
+        reason: result.reason,
+        snapshot: result.snapshot,
+      });
+    } catch (cause) {
+      publishAudioCycleResult({
+        version: 1,
+        type: 'audio-cycle-result',
+        action: message.action,
+        candidate_id: message.candidate_id,
+        accepted: false,
+        committed: false,
+        reason: getDisplayErrorMessage(cause, '候选音轨操作失败'),
+      });
+    }
+  }
+
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') return;
     let channel: BroadcastChannel;
@@ -1313,6 +1459,10 @@ function FinalEffectWindow() {
     }
     playbackChannelRef.current = channel;
     const handleMessage = (event: MessageEvent<unknown>) => {
+      if (isAudioCycleCommandMessage(event.data)) {
+        void handleAudioCycleCommand(event.data);
+        return;
+      }
       if (isFixedSpeechCommandMessage(event.data)) {
         if (event.data.action === 'cancel') cancelFixedSpeech(event.data.operation_id);
         else void startFixedSpeech(event.data);
@@ -1776,6 +1926,10 @@ function FinalEffectWindow() {
 
   useEffect(() => {
     if (!portAudioHardwareEnabled || !portAudioSourcePath) return;
+    if (committedAudioCycleRevisionRef.current === snapshot?.audio_stream_revision) {
+      committedAudioCycleRevisionRef.current = null;
+      return;
+    }
     syncAudioOutputSourceLatest();
     const sync = audioSourceSyncRef.current;
     return () => {
@@ -2692,6 +2846,8 @@ function DesktopApp() {
   const runtimeMessageRef = useRef<RuntimeParameterMessage | null>(null);
   const runtimeSchedulerRef = useRef({ cycle: 0, lastChangeMs: null as number | null });
   const audioSchedulerRef = useRef({ cycle: 0, lastChangeMs: null as number | null });
+  const audioCycleCandidateIdRef = useRef(0);
+  const nextAudioCyclePlanRef = useRef<AudioCycleCandidatePlan<PendingAudioCyclePayload> | null>(null);
   const pendingAudioApplyRef = useRef<{
     params: ResearchParams;
     cycle: AudioCycleSample | null;
@@ -2912,6 +3068,9 @@ function DesktopApp() {
       pickMax: audioMixPickMax,
     });
   }, [audioValuePresetIds, audioMixEnabled, audioMixPickMin, audioMixPickMax]);
+  useEffect(() => {
+    cancelNextAudioCycle();
+  }, [audioValuePresetIds, audioMixEnabled, audioMixPickMin, audioMixPickMax]);
 
   useEffect(() => {
     researchParamsRef.current = researchParams;
@@ -2963,6 +3122,19 @@ function DesktopApp() {
       lastAudioCycleSnapshotSignatureRef.current = snapshotSignature;
     }
     if (!applyAudioToResearchParams) return sample;
+    const refSource = baseParams ?? researchParamsRef.current;
+    if (refSource) {
+      researchParamsRef.current = {
+        ...refSource,
+        audio: {
+          ...refSource.audio,
+          ...sample.values,
+          ...(typeof randomChangePeriodMs === 'number'
+            ? { random_change_period_ms: randomChangePeriodMs }
+            : {}),
+        },
+      };
+    }
     setResearchParams((current) => {
       const source = baseParams ?? current;
       if (!source) return source;
@@ -3005,6 +3177,70 @@ function DesktopApp() {
   function applyAudioCycleSample(scheduleRender = true) {
     sampleAndCommitAudioCycle({ scheduleRender });
   }
+
+  function planNextAudioCycle(committedAtMs: number, periodMs: number) {
+    const base = researchParamsRef.current;
+    const currentSnapshot = snapshotRefHome.current;
+    if (!base || !currentSnapshot?.source_media) {
+      nextAudioCyclePlanRef.current = null;
+      return;
+    }
+    const sample = sampleAudioCycle(audioValuePresetIdsRef.current, {
+      mixEnabled: audioMixEnabledRef.current,
+      pickMin: audioMixPickMinRef.current,
+      pickMax: audioMixPickMaxRef.current,
+      previousPresetIds: audioCycleSampleRef.current?.presetIds,
+    });
+    const audio = {
+      ...base.audio,
+      ...sample.values,
+      random_change_period_ms: periodMs,
+    };
+    const audioVariants = audioMixEnabledRef.current && sample.variants.length > 1
+      ? buildAudioVariantsFromCycle(audio, sample)
+      : [];
+    audioCycleCandidateIdRef.current += 1;
+    nextAudioCyclePlanRef.current = createAudioCycleCandidatePlan(
+      audioCycleCandidateIdRef.current,
+      {
+        sample,
+        audio,
+        audioVariants,
+        playbackGeneration: currentSnapshot.playback_generation,
+        baseAudioStreamRevision: currentSnapshot.audio_stream_revision,
+        periodMs,
+      },
+      committedAtMs,
+      periodMs,
+    );
+  }
+
+  function postAudioCycleCommand(
+    plan: AudioCycleCandidatePlan<PendingAudioCyclePayload>,
+    action: 'prepare' | 'commit' | 'cancel',
+  ) {
+    playbackChannelRef.current?.postMessage({
+      version: 1,
+      type: 'audio-cycle-command',
+      action,
+      candidate_id: plan.candidateId,
+      playback_generation: plan.sample.playbackGeneration,
+      ...(action === 'prepare'
+        ? {
+            base_audio_stream_revision: plan.sample.baseAudioStreamRevision,
+            target_at_ms: plan.targetAtMs,
+            audio: plan.sample.audio,
+            audio_variants: plan.sample.audioVariants,
+          }
+        : {}),
+    } satisfies AudioCycleCommandMessage);
+  }
+
+  function cancelNextAudioCycle() {
+    const plan = nextAudioCyclePlanRef.current;
+    nextAudioCyclePlanRef.current = null;
+    if (plan) postAudioCycleCommand(plan, 'cancel');
+  }
   const [runtimeNowMs, setRuntimeNowMs] = useState(() => Date.now());
   const [runtimePreview, setRuntimePreview] = useState<RuntimePreviewParameters | null>(null);
   const [runtimeChannelError, setRuntimeChannelError] = useState<string | null>(null);
@@ -3036,6 +3272,48 @@ function DesktopApp() {
     const handleMessage = (event: MessageEvent<unknown>) => {
       if (isPlaybackMediaStateMessage(event.data)) {
         setMediaState(event.data);
+        return;
+      }
+      if (isAudioCycleResultMessage(event.data)) {
+        const plan = nextAudioCyclePlanRef.current;
+        if (!plan || plan.candidateId !== event.data.candidate_id) return;
+        const nowMs = Date.now();
+        if (event.data.action === 'prepare') {
+          nextAudioCyclePlanRef.current = event.data.accepted
+            ? updateAudioCycleCandidateStatus(plan, 'prepared')
+            : updateAudioCycleCandidateStatus(plan, 'preparing');
+          if (!event.data.accepted && event.data.reason) setError(event.data.reason);
+          return;
+        }
+        if (event.data.action === 'cancel') {
+          nextAudioCyclePlanRef.current = null;
+          return;
+        }
+        if (!event.data.committed) {
+          nextAudioCyclePlanRef.current = recoverAudioCycleCandidate(plan, 'commit', nowMs);
+          return;
+        }
+        const committedSnapshot = event.data.snapshot as PlaybackSnapshot | undefined;
+        if (!committedSnapshot || committedSnapshot.playback_generation !== plan.sample.playbackGeneration) {
+          nextAudioCyclePlanRef.current = null;
+          setError('候选音轨已提交，但返回的播放快照无效');
+          return;
+        }
+        snapshotRefHome.current = committedSnapshot;
+        setSnapshot(committedSnapshot);
+        commitAudioCycleSample(plan.sample.sample, {
+          scheduleRender: false,
+          randomChangePeriodMs: plan.sample.periodMs,
+        });
+        const scheduler = audioSchedulerRef.current;
+        scheduler.cycle += 1;
+        scheduler.lastChangeMs = nowMs;
+        setAudioVariationCycle(scheduler.cycle);
+        setAudioLastChangeMs(nowMs);
+        const nextPeriod = samplePeriodMsInRange(audioPeriodRangeRef.current);
+        nextAudioPeriodMsRef.current = nextPeriod;
+        setAudioPeriodMs(nextPeriod);
+        planNextAudioCycle(nowMs, nextPeriod);
         return;
       }
       if (isFixedSpeechStatusMessage(event.data)) {
@@ -3456,6 +3734,7 @@ function DesktopApp() {
   // 暂停/停止时冻结音视频周期变化，避免画面停了参数还在跳。
   const runtimeActive = playbackActive && videoProcessingEnabled;
   const audioPeriodActive = playbackActive && audioProcessingEnabled && Boolean(researchParams);
+  const portAudioCycleEnabled = getActualAudioOutputLabel(audioOutputBackend) === 'PortAudio';
 
   useEffect(() => {
     audioPeriodRangeRef.current = audioPeriodRange;
@@ -3517,11 +3796,12 @@ function DesktopApp() {
     return () => window.clearInterval(timer);
   }, [runtimeActive, runtimeBaseParameters, snapshot?.playback_state]);
 
-  // 声音开启：立刻采样；周期到再提交新的 FFmpeg 流式配置，候选未就绪沿用当前出口。
+  // 首轮沿用现有启动路径；之后 PortAudio 在到期前准备下一候选，到期只提交已准备音轨。
   useEffect(() => {
     if (!audioPeriodActive) {
       audioSchedulerRef.current = { cycle: 0, lastChangeMs: null };
       pendingAudioApplyRef.current = null;
+      cancelNextAudioCycle();
       setAudioVariationCycle(0);
       setAudioLastChangeMs(null);
       return;
@@ -3548,6 +3828,37 @@ function DesktopApp() {
         setAudioLastChangeMs(nowMs);
         return;
       }
+      if (portAudioCycleEnabled) {
+        const currentSnapshot = snapshotRefHome.current;
+        let plan = nextAudioCyclePlanRef.current;
+        const stalePlan = plan && currentSnapshot && (
+          plan.sample.playbackGeneration !== currentSnapshot.playback_generation
+          || plan.sample.baseAudioStreamRevision !== currentSnapshot.audio_stream_revision
+        );
+        if (stalePlan) {
+          cancelNextAudioCycle();
+          plan = null;
+        }
+        if (!plan) {
+          planNextAudioCycle(scheduler.lastChangeMs, nextAudioPeriodMsRef.current);
+          plan = nextAudioCyclePlanRef.current;
+        }
+        const action = getAudioCycleCoordinatorAction(plan, nowMs);
+        if (plan && action === 'prepare') {
+          nextAudioCyclePlanRef.current = updateAudioCycleCandidateStatus(plan, 'preparing');
+          postAudioCycleCommand(plan, 'prepare');
+        } else if (plan && action === 'commit') {
+          nextAudioCyclePlanRef.current = updateAudioCycleCandidateStatus(plan, 'committing');
+          postAudioCycleCommand(plan, 'commit');
+        } else if (plan && action === 'expire') {
+          cancelNextAudioCycle();
+          const nextPeriod = samplePeriodMsInRange(audioPeriodRangeRef.current);
+          nextAudioPeriodMsRef.current = nextPeriod;
+          setAudioPeriodMs(nextPeriod);
+          planNextAudioCycle(nowMs, nextPeriod);
+        }
+        return;
+      }
       if (!isRuntimeVariationDue(nowMs, scheduler.lastChangeMs, nextAudioPeriodMsRef.current)) return;
       scheduler.cycle += 1;
       scheduler.lastChangeMs = nowMs;
@@ -3561,8 +3872,9 @@ function DesktopApp() {
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      cancelNextAudioCycle();
     };
-  }, [audioPeriodActive]);
+  }, [audioPeriodActive, portAudioCycleEnabled]);
 
   // 仅播放中才推送实时参数；暂停时冻结播放窗效果。
   useEffect(() => {
@@ -3616,10 +3928,13 @@ function DesktopApp() {
   function updateResearchParam(section: 'audio' | 'video' | 'research', field: string, value: number | null) {
     if (value === null || !researchParams) return;
     researchParamsMutationVersionRef.current += 1;
-    setResearchParams({
+    if (section === 'audio') cancelNextAudioCycle();
+    const next = {
       ...researchParams,
       [section]: { ...researchParams[section], [field]: value },
-    });
+    };
+    researchParamsRef.current = next;
+    setResearchParams(next);
     setResearchValidationStatus('idle');
   }
 
@@ -3639,6 +3954,7 @@ function DesktopApp() {
 
   async function resetResearchParams() {
     const mutationVersion = ++researchParamsMutationVersionRef.current;
+    cancelNextAudioCycle();
     try {
       const defaults = await invoke<ResearchParams>('get_default_local_research_params');
       if (mutationVersion !== researchParamsMutationVersionRef.current) return;
@@ -3652,6 +3968,7 @@ function DesktopApp() {
 
   function rerollSubtleAudioParams() {
     if (!researchParams) return;
+    cancelNextAudioCycle();
     const nowMs = Date.now();
     audioSchedulerRef.current = {
       cycle: Math.max(1, audioSchedulerRef.current.cycle + 1),
@@ -3944,6 +4261,7 @@ function DesktopApp() {
     action: 'pause' | 'resume' | 'stop',
     command: 'pause_playback' | 'resume_playback' | 'stop_playback' | 'start_playback',
   ) {
+    if (action === 'pause' || action === 'stop') cancelNextAudioCycle();
     const requestId = ++playbackActionRequestRef.current;
     setPlaybackActionBusy(action);
     setError(null);
@@ -3972,6 +4290,7 @@ function DesktopApp() {
     audio_processing_enabled: boolean;
     realtime_audio_variant_enabled: boolean;
   }) {
+    cancelNextAudioCycle();
     researchParamsMutationVersionRef.current += 1;
     setVideoProcessingEnabled(next.video_processing_enabled);
     setAudioProcessingEnabled(next.audio_processing_enabled);
@@ -4445,6 +4764,7 @@ function DesktopApp() {
                     value={mediaCurrentTime}
                     onChange={(value) => {
                       if (typeof value !== 'number') return;
+                      cancelNextAudioCycle();
                       postPlaybackMediaControl({
                         version: 1,
                         type: 'playback-media-control',
