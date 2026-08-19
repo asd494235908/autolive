@@ -24,7 +24,7 @@ use commands::{
     set_audio_processing_profile, set_interlude_config, set_processing_switches,
     stage_audio_variant_candidate, start_media_processing, start_playback, start_research_analysis,
     start_speech_to_speech_worker, stop_playback, sync_audio_output_source,
-    update_playback_position, validate_local_research_params, write_portaudio_pcm, AppState,
+    update_playback_position, validate_local_research_params, AppState,
 };
 use std::process::ExitCode;
 use std::time::Duration;
@@ -48,7 +48,6 @@ fn main() -> ExitCode {
             commit_audio_cycle_candidate,
             cancel_audio_cycle_candidate,
             play_portaudio_test_tone,
-            write_portaudio_pcm,
             get_runtime_resource_status,
             install_runtime_resources,
             cancel_runtime_resource_install,

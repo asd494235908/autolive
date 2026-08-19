@@ -6,6 +6,10 @@ const appPath = new URL('./App.tsx', import.meta.url);
 const audioCapabilityPath = new URL('./audio-processing-capabilities.ts', import.meta.url);
 const layoutPath = new URL('./desktop-layout.css', import.meta.url);
 const mainPath = new URL('./main.tsx', import.meta.url);
+const tauriCommandsPath = new URL('../../src-tauri/src/commands.rs', import.meta.url);
+const tauriMainPath = new URL('../../src-tauri/src/main.rs', import.meta.url);
+const audioMixerPath = new URL('../../src-tauri/src/audio_mixer.rs', import.meta.url);
+const audioCycleOutputPath = new URL('../../src-tauri/src/audio_cycle_output.rs', import.meta.url);
 
 test('desktop page exposes the approved three-column layout contract', async () => {
   const app = await readFile(appPath, 'utf8');
@@ -194,6 +198,23 @@ test('声音周期仅在提交成功后升级当前快照，且 PortAudio 正式
   assert.match(app, /portAudioHardwareEnabled/);
   assert.match(app, /playback_generation:\s*snapshot\?\.playback_generation/);
   assert.match(app, /set_audio_output_backend/);
+});
+
+test('PortAudio 普通播放只有 audio_cycle_output 一个 PCM 生产者', async () => {
+  const [commands, tauriMain, audioMixer, audioCycleOutput] = await Promise.all([
+    readFile(tauriCommandsPath, 'utf8'),
+    readFile(tauriMainPath, 'utf8'),
+    readFile(audioMixerPath, 'utf8'),
+    readFile(audioCycleOutputPath, 'utf8'),
+  ]);
+
+  assert.doesNotMatch(commands, /write_portaudio_pcm|PortAudioOutput::new|write_stereo_interleaved/);
+  assert.doesNotMatch(tauriMain, /write_portaudio_pcm/);
+  assert.doesNotMatch(audioMixer, /write_stereo_interleaved|prime_stereo_interleaved/);
+  assert.match(audioCycleOutput, /PortAudioOutput::new/);
+  assert.match(audioCycleOutput, /write_stereo_interleaved_available/);
+  assert.match(audioCycleOutput, /prime_stereo_interleaved_available/);
+  assert.match(audioCycleOutput, /linear_crossfade/);
 });
 
 test('本周期声音预设可点击打开抽屉并展示完整参数值', async () => {

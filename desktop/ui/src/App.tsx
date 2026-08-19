@@ -99,6 +99,9 @@ const FIXED_SPEECH_ACK_TIMEOUT_MS = 3_000;
 const RUNTIME_RESOURCE_POLL_INTERVAL_MS = 500;
 const PLAYBACK_SNAPSHOT_POLL_MS = 1_000;
 const AUDIO_OUTPUT_STATUS_POLL_MS = 2_000;
+const AUDIO_VIDEO_REALIGN_THRESHOLD_MS = 80;
+const AUDIO_VIDEO_REALIGN_CONSECUTIVE_POLLS = 3;
+const AUDIO_VIDEO_REALIGN_COOLDOWN_MS = 10_000;
 const DIAGNOSTIC_PUBLISH_INTERVAL_MS = 50;
 const DIAGNOSTIC_SAMPLE_COUNT = 128;
 const REALTIME_AUDIO_SAFETY_LEAD_MS = 6_000;
@@ -284,6 +287,8 @@ type AudioOutputBackendStatus = {
   producer_drop_count: number;
   output_latency_ms: number;
   actual_sample_rate_hz: number | null;
+  audio_timeline_position_ms: number | null;
+  av_offset_ms: number | null;
   callback_stalled_ms: number | null;
   ring_len_samples: number;
   ring_capacity_samples: number;
@@ -1617,6 +1622,8 @@ function FinalEffectWindow() {
     let realignBusy = false;
     let realignAttemptedForHz: number | null = null;
     let realignFailedForHz: number | null = null;
+    let avDriftPollCount = 0;
+    let avDriftCooldownUntilMs = 0;
     let outputStatusPollInFlight = false;
     const refreshOutput = () => {
       if (outputStatusPollInFlight) return;
@@ -1630,6 +1637,25 @@ function FinalEffectWindow() {
             && Boolean(status.preferred_portaudio)
             && Boolean(status.running)
             && status.selected_backend === 'portaudio';
+          const avOffsetMs = status.av_offset_ms;
+          if (
+            hardware
+            && typeof avOffsetMs === 'number'
+            && Number.isFinite(avOffsetMs)
+            && Math.abs(avOffsetMs) > AUDIO_VIDEO_REALIGN_THRESHOLD_MS
+          ) {
+            avDriftPollCount += 1;
+          } else {
+            avDriftPollCount = 0;
+          }
+          if (
+            avDriftPollCount >= AUDIO_VIDEO_REALIGN_CONSECUTIVE_POLLS
+            && Date.now() >= avDriftCooldownUntilMs
+          ) {
+            avDriftPollCount = 0;
+            avDriftCooldownUntilMs = Date.now() + AUDIO_VIDEO_REALIGN_COOLDOWN_MS;
+            syncAudioOutputSourceLatest();
+          }
           const needsRealign =
             hardware
             && Math.abs(targetRate - (status.sample_rate_hz || 0)) > 1
@@ -3347,6 +3373,8 @@ function DesktopApp() {
                 producer_drop_count: 0,
                 output_latency_ms: 0,
                 actual_sample_rate_hz: null,
+                audio_timeline_position_ms: null,
+                av_offset_ms: null,
                 callback_stalled_ms: null,
                 ring_len_samples: 0,
                 ring_capacity_samples: 0,
@@ -3364,6 +3392,8 @@ function DesktopApp() {
                 producer_drop_count: 0,
                 output_latency_ms: 0,
                 actual_sample_rate_hz: null,
+                audio_timeline_position_ms: null,
+                av_offset_ms: null,
                 callback_stalled_ms: null,
                 ring_len_samples: 0,
                 ring_capacity_samples: 0,
@@ -3482,6 +3512,8 @@ function DesktopApp() {
               && current.producer_drop_count === status.producer_drop_count
               && current.output_latency_ms === status.output_latency_ms
               && current.actual_sample_rate_hz === status.actual_sample_rate_hz
+              && current.audio_timeline_position_ms === status.audio_timeline_position_ms
+              && current.av_offset_ms === status.av_offset_ms
               && current.callback_stalled_ms === status.callback_stalled_ms
               && current.audio_task_count === status.audio_task_count
               && current.current_audio_ffmpeg_pid === status.current_audio_ffmpeg_pid
@@ -4660,6 +4692,21 @@ function DesktopApp() {
       .filter((preset): preset is (typeof AUDIO_VALUE_PRESETS)[number] => Boolean(preset)),
     [audioActivePresetIds],
   );
+  const nextAudioCyclePlan = nextAudioCyclePlanRef.current;
+  const nextAudioPresetLabels = nextAudioCyclePlan?.sample.sample.presetIds.map((id) => (
+    AUDIO_VALUE_PRESETS.find((preset) => preset.id === id)?.label ?? id
+  )) ?? [];
+  const nextAudioCycleStatusLabel = nextAudioCyclePlan
+    ? {
+        planned: '已计划',
+        preparing: '准备中',
+        prepared: '已接收，待切换校验',
+        committing: '切换中',
+      }[nextAudioCyclePlan.status]
+    : null;
+  const nextAudioCycleCountdownMs = nextAudioCyclePlan
+    ? Math.max(0, nextAudioCyclePlan.targetAtMs - runtimeNowMs)
+    : null;
   const audioCapabilityRows = useMemo(
     () => buildAudioCapabilityRows(
       researchParams?.audio ?? null,
@@ -4969,6 +5016,9 @@ function DesktopApp() {
                       {' · '}写入丢弃 {audioOutputBackend.producer_drop_count}
                       {' · '}输出延迟 {audioOutputBackend.output_latency_ms}ms
                       {' · '}实际采样率 {audioOutputBackend.actual_sample_rate_hz ?? audioOutputBackend.sample_rate_hz}Hz
+                      {audioOutputBackend.av_offset_ms !== null
+                        ? ` · A/V 偏差 ${audioOutputBackend.av_offset_ms >= 0 ? '+' : ''}${audioOutputBackend.av_offset_ms}ms`
+                        : ''}
                       {' · '}音频任务 {audioOutputBackend.audio_task_count}/2
                       {audioOutputBackend.current_audio_ffmpeg_pid !== null
                         ? ` · 当前 FFmpeg PID ${audioOutputBackend.current_audio_ffmpeg_pid}`
@@ -5154,6 +5204,15 @@ function DesktopApp() {
                   {audioProcessingEnabled && audioCycleSeed !== null ? <Tag>seed {audioCycleSeed}</Tag> : null}
                   {audioProcessingEnabled && audioCycleWeights.length > 1 ? (
                     <Tag>weights {audioCycleWeights.map((w) => w.toFixed(2)).join('/')}</Tag>
+                  ) : null}
+                  {audioProcessingEnabled && nextAudioCyclePlan ? (
+                    <Tag color={nextAudioCyclePlan.status === 'prepared' ? 'success' : 'processing'}>
+                      下一轮：{nextAudioPresetLabels.join('、') || '未选择'} · {nextAudioCycleStatusLabel}
+                      {' · '}#{nextAudioCyclePlan.candidateId}
+                      {nextAudioCycleCountdownMs !== null
+                        ? ` · ${(nextAudioCycleCountdownMs / 1_000).toFixed(1)}s`
+                        : ''}
+                    </Tag>
                   ) : null}
                 </Space>
                 <Checkbox.Group

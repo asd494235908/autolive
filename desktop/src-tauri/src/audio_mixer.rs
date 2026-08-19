@@ -1,8 +1,8 @@
 //! PortAudio 的本地 PCM 数据路径。
 //!
 //! FFmpeg 解码线程只负责把当前音轨转换为交错 f32；有界 channel 将解码和
-//! 混音/输出解耦，混音线程执行有限值清理和 true-peak 保护，最后写入
-//! PortAudio crate 提供的 SPSC 环形缓冲。WebView 不再按音频回调频率发送 IPC。
+//! PCM 队列解耦，混音线程执行有限值清理和 true-peak 保护。真正的交叉淡化、
+//! PortAudio SPSC 写入和 callback 时间轴由 `audio_cycle_output` 单线程负责。
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -15,15 +15,12 @@ use std::time::{Duration, Instant};
 
 use crate::cancellation::CancellationToken;
 
-type AudioOutputSlot = Arc<Mutex<Option<autolive_portaudio_output::PortAudioOutput>>>;
 type DecoderProcessSlot = Arc<Mutex<Option<Child>>>;
 
 const OUTPUT_CHANNELS: usize = 2;
 const DECODE_BUFFER_BYTES: usize = 16 * 1024;
 const MIX_QUEUE_CAPACITY: usize = 8;
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
-const OUTPUT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
-const OUTPUT_PAUSE_TIMEOUT: Duration = Duration::from_millis(500);
 const TRUE_PEAK_DBTP: f32 = -1.5;
 const PCM_FRAME_BYTES: usize = std::mem::size_of::<f32>() * OUTPUT_CHANNELS;
 const MAX_DECODER_STDERR_BYTES: usize = 16 * 1024;
@@ -32,8 +29,10 @@ const REALTIME_FFMPEG_RATE_ARGS: [&str; 1] = ["-re"];
 // 最低 2x；显式变速超过 1x 时再增加 1x 源时间余量，保证经过 atempo 后仍能追赶。
 // 500ms 初始突发、有界 channel 和预缓冲上限继续限制内存与 CPU。
 const CANDIDATE_MIN_READ_RATE: f64 = 2.0;
-// 候选至少保留 50ms 可播放 PCM，并在有界预缓冲内追上滤镜启动期间推进的视频时钟。
-const SWITCH_PREBUFFER_MS: usize = 50;
+// 候选提交需要 30ms 交叉淡化加 100ms 淡化后连续 PCM。
+pub const AUDIO_CROSSFADE_MS: usize = 30;
+pub const AUDIO_POST_CROSSFADE_TAIL_MS: usize = 100;
+pub const AUDIO_CANDIDATE_COMMIT_TAIL_MS: usize = AUDIO_CROSSFADE_MS + AUDIO_POST_CROSSFADE_TAIL_MS;
 const SWITCH_CATCH_UP_MAX_MS: usize = 5_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -42,10 +41,56 @@ enum CandidatePrebufferPolicy {
     FixedWindow { buffer_ms: usize },
 }
 
+struct AudioMixerLoopContext {
+    cancellation: CancellationToken,
+    failure: Arc<Mutex<Option<AudioMixerFailure>>>,
+    receiver: mpsc::Receiver<Vec<f32>>,
+    ready: Arc<AtomicBool>,
+    prebuffer: Arc<Mutex<VecDeque<f32>>>,
+    prebuffer_limit_samples: usize,
+    sample_rate_hz: u32,
+    prebuffer_started_at: Instant,
+    candidate_prebuffer_policy: CandidatePrebufferPolicy,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecoderPacing {
     RealTime,
     CatchUp,
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioMixerTrack {
+    samples: Arc<Mutex<VecDeque<f32>>>,
+}
+
+impl AudioMixerTrack {
+    pub(crate) fn available_samples(&self) -> usize {
+        self.samples
+            .lock()
+            .map(|samples| samples.len())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn take_exact(&self, sample_count: usize) -> Result<Option<Vec<f32>>, String> {
+        let mut samples = self
+            .samples
+            .lock()
+            .map_err(|_| "音轨 PCM 缓冲锁已损坏".to_owned())?;
+        if samples.len() < sample_count {
+            return Ok(None);
+        }
+        Ok(Some(samples.drain(..sample_count).collect()))
+    }
+
+    pub(crate) fn take_up_to(&self, sample_count: usize) -> Result<Vec<f32>, String> {
+        let mut samples = self
+            .samples
+            .lock()
+            .map_err(|_| "音轨 PCM 缓冲锁已损坏".to_owned())?;
+        let take = samples.len().min(sample_count);
+        Ok(samples.drain(..take).collect())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,50 +169,13 @@ impl std::fmt::Display for AudioMixerReadinessError {
 enum AudioMixerFailure {
     Ffmpeg(String),
     Runtime(String),
-    OutputBackpressure(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OutputWriteError {
-    ConsumerNoProgress {
-        waited_ms: u64,
-        remaining_samples: usize,
-    },
-    OutputState(String),
-}
-
-impl OutputWriteError {
-    fn preserves_output(&self) -> bool {
-        matches!(self, Self::ConsumerNoProgress { .. })
-    }
-}
-
-impl std::fmt::Display for OutputWriteError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ConsumerNoProgress {
-                waited_ms,
-                remaining_samples,
-            } => write!(
-                formatter,
-                "输出消费者无进度：PortAudio 环缓背压，已等待 {waited_ms}ms，剩余 {remaining_samples} 个 PCM 样本未写入；候选 PCM 未判定为失效"
-            ),
-            Self::OutputState(reason) => formatter.write_str(reason),
-        }
-    }
 }
 
 impl AudioMixerFailure {
     fn message(&self) -> &str {
         match self {
-            Self::Ffmpeg(message) | Self::Runtime(message) | Self::OutputBackpressure(message) => {
-                message
-            }
+            Self::Ffmpeg(message) | Self::Runtime(message) => message,
         }
-    }
-
-    fn is_output_backpressure(&self) -> bool {
-        matches!(self, Self::OutputBackpressure(_))
     }
 }
 
@@ -177,124 +185,19 @@ pub struct AudioMixerTask {
     decoder_handle: Option<JoinHandle<()>>,
     mixer_handle: Option<JoinHandle<()>>,
     decoder_process: DecoderProcessSlot,
-    output_slot: AudioOutputSlot,
     failure: Arc<Mutex<Option<AudioMixerFailure>>>,
     config: AudioMixerConfigContext,
-    write_enabled: Arc<AtomicBool>,
-    resume_requested: Arc<AtomicBool>,
-    paused_acknowledged: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
     prebuffer: Arc<Mutex<VecDeque<f32>>>,
     start_position_ms: u64,
-    clear_output_on_stop: bool,
 }
 
 impl AudioMixerTask {
-    pub fn start(
-        output_slot: AudioOutputSlot,
-        ffmpeg_path: PathBuf,
-        source_path: PathBuf,
-        sample_rate_hz: u32,
-        start_position_ms: u64,
-    ) -> Result<Self, String> {
-        Self::start_with_filter(
-            output_slot,
-            ffmpeg_path,
-            source_path,
-            sample_rate_hz,
-            start_position_ms,
-            None,
-        )
-    }
-
-    pub fn start_with_filter(
-        output_slot: AudioOutputSlot,
-        ffmpeg_path: PathBuf,
-        source_path: PathBuf,
-        sample_rate_hz: u32,
-        start_position_ms: u64,
-        filter_graph: Option<String>,
-    ) -> Result<Self, String> {
-        Self::start_with_filter_and_variant_count(
-            output_slot,
-            ffmpeg_path,
-            source_path,
-            sample_rate_hz,
-            start_position_ms,
-            filter_graph,
-            1,
-        )
-    }
-
-    pub fn start_with_filter_and_variant_count(
-        output_slot: AudioOutputSlot,
-        ffmpeg_path: PathBuf,
-        source_path: PathBuf,
-        sample_rate_hz: u32,
-        start_position_ms: u64,
-        filter_graph: Option<String>,
-        audio_stream_variant_count: usize,
-    ) -> Result<Self, String> {
-        Self::start_internal(
-            output_slot,
-            ffmpeg_path,
-            source_path,
-            sample_rate_hz,
-            start_position_ms,
-            start_position_ms,
-            filter_graph,
-            audio_stream_variant_count,
-            false,
-            DecoderPacing::RealTime,
-            1.0,
-            CandidatePrebufferPolicy::CatchUp,
-            SWITCH_PREBUFFER_MS,
-        )
-    }
-
     /// 启动待切换音轨，但先把首段 PCM 以受控追赶速率预热到内存，不接管当前硬件出口。
     /// 候选最低使用 2x 读取速率；显式加速时增加有界余量，并保留 500ms 初始突发，
     /// 避免经过 `atempo` 后退化为等速读取而无法追上画面时钟。
-    pub fn start_candidate(
-        output_slot: AudioOutputSlot,
-        ffmpeg_path: PathBuf,
-        source_path: PathBuf,
-        sample_rate_hz: u32,
-        start_position_ms: u64,
-    ) -> Result<Self, String> {
-        Self::start_candidate_with_filter(
-            output_slot,
-            ffmpeg_path,
-            source_path,
-            sample_rate_hz,
-            start_position_ms,
-            None,
-        )
-    }
-
-    pub fn start_candidate_with_filter(
-        output_slot: AudioOutputSlot,
-        ffmpeg_path: PathBuf,
-        source_path: PathBuf,
-        sample_rate_hz: u32,
-        start_position_ms: u64,
-        filter_graph: Option<String>,
-    ) -> Result<Self, String> {
-        Self::start_candidate_with_filter_and_variant_count(
-            output_slot,
-            ffmpeg_path,
-            source_path,
-            sample_rate_hz,
-            start_position_ms,
-            filter_graph,
-            1,
-            1.0,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn start_candidate_with_filter_and_variant_count(
-        output_slot: AudioOutputSlot,
         ffmpeg_path: PathBuf,
         source_path: PathBuf,
         sample_rate_hz: u32,
@@ -304,7 +207,6 @@ impl AudioMixerTask {
         playback_rate: f64,
     ) -> Result<Self, String> {
         Self::start_internal(
-            output_slot,
             ffmpeg_path,
             source_path,
             sample_rate_hz,
@@ -312,11 +214,10 @@ impl AudioMixerTask {
             start_position_ms,
             filter_graph,
             audio_stream_variant_count,
-            false,
             DecoderPacing::CatchUp,
             playback_rate,
             CandidatePrebufferPolicy::CatchUp,
-            SWITCH_PREBUFFER_MS,
+            AUDIO_CANDIDATE_COMMIT_TAIL_MS,
         )
     }
 
@@ -324,7 +225,6 @@ impl AudioMixerTask {
     /// `timeline_start_position_ms` 是跨循环的绝对媒体位置。
     #[allow(clippy::too_many_arguments)]
     pub fn start_scheduled_candidate_with_filter_and_variant_count(
-        output_slot: AudioOutputSlot,
         ffmpeg_path: PathBuf,
         source_path: PathBuf,
         sample_rate_hz: u32,
@@ -337,7 +237,6 @@ impl AudioMixerTask {
         minimum_commit_tail_ms: usize,
     ) -> Result<Self, String> {
         Self::start_internal(
-            output_slot,
             ffmpeg_path,
             source_path,
             sample_rate_hz,
@@ -345,7 +244,6 @@ impl AudioMixerTask {
             timeline_start_position_ms,
             filter_graph,
             audio_stream_variant_count,
-            false,
             DecoderPacing::RealTime,
             playback_rate,
             CandidatePrebufferPolicy::FixedWindow { buffer_ms },
@@ -356,7 +254,6 @@ impl AudioMixerTask {
     // 线程启动边界显式传递所有权；为减少参数数目包装一次性配置对象反而会隐藏生命周期。
     #[allow(clippy::too_many_arguments)]
     fn start_internal(
-        output_slot: AudioOutputSlot,
         ffmpeg_path: PathBuf,
         source_path: PathBuf,
         sample_rate_hz: u32,
@@ -364,7 +261,6 @@ impl AudioMixerTask {
         timeline_start_position_ms: u64,
         filter_graph: Option<String>,
         audio_stream_variant_count: usize,
-        write_enabled_initially: bool,
         decoder_pacing: DecoderPacing,
         playback_rate: f64,
         candidate_prebuffer_policy: CandidatePrebufferPolicy,
@@ -378,13 +274,12 @@ impl AudioMixerTask {
         let cancellation = CancellationToken::new();
         let failure: Arc<Mutex<Option<AudioMixerFailure>>> = Arc::new(Mutex::new(None));
         let decoder_process = Arc::new(Mutex::new(None));
-        let write_enabled = Arc::new(AtomicBool::new(write_enabled_initially));
-        let resume_requested = Arc::new(AtomicBool::new(false));
-        let paused_acknowledged = Arc::new(AtomicBool::new(!write_enabled_initially));
-        let ready = Arc::new(AtomicBool::new(write_enabled_initially));
+        let ready = Arc::new(AtomicBool::new(false));
         let prebuffer = Arc::new(Mutex::new(VecDeque::new()));
         let prebuffer_limit_ms = match candidate_prebuffer_policy {
-            CandidatePrebufferPolicy::CatchUp => SWITCH_CATCH_UP_MAX_MS + SWITCH_PREBUFFER_MS,
+            CandidatePrebufferPolicy::CatchUp => {
+                SWITCH_CATCH_UP_MAX_MS + AUDIO_CANDIDATE_COMMIT_TAIL_MS
+            }
             CandidatePrebufferPolicy::FixedWindow { buffer_ms } => buffer_ms,
         };
         let prebuffer_limit_samples = sample_rate_hz
@@ -424,30 +319,22 @@ impl AudioMixerTask {
 
         let mixer_cancellation = cancellation.clone();
         let mixer_failure = Arc::clone(&failure);
-        let mixer_output_slot = Arc::clone(&output_slot);
-        let mixer_write_enabled = Arc::clone(&write_enabled);
-        let mixer_resume_requested = Arc::clone(&resume_requested);
-        let mixer_paused_acknowledged = Arc::clone(&paused_acknowledged);
         let mixer_ready = Arc::clone(&ready);
         let mixer_prebuffer = Arc::clone(&prebuffer);
         let mixer_handle = match thread::Builder::new()
             .name("autolive-audio-mixer".to_owned())
             .spawn(move || {
-                mix_audio_loop(
-                    &mixer_cancellation,
-                    &mixer_failure,
+                mix_audio_loop(AudioMixerLoopContext {
+                    cancellation: mixer_cancellation,
+                    failure: mixer_failure,
                     receiver,
-                    mixer_output_slot,
-                    mixer_write_enabled,
-                    mixer_resume_requested,
-                    mixer_paused_acknowledged,
-                    mixer_ready,
-                    mixer_prebuffer,
+                    ready: mixer_ready,
+                    prebuffer: mixer_prebuffer,
                     prebuffer_limit_samples,
                     sample_rate_hz,
                     prebuffer_started_at,
                     candidate_prebuffer_policy,
-                );
+                });
             }) {
             Ok(handle) => handle,
             Err(error) => {
@@ -463,60 +350,24 @@ impl AudioMixerTask {
             decoder_handle: Some(decoder_handle),
             mixer_handle: Some(mixer_handle),
             decoder_process,
-            output_slot,
             failure,
             config,
-            write_enabled,
-            resume_requested,
-            paused_acknowledged,
             ready,
             prebuffer,
             start_position_ms: timeline_start_position_ms,
-            clear_output_on_stop: write_enabled_initially,
         })
     }
 
     pub fn stop(&mut self) {
-        self.stop_inner(self.clear_output_on_stop);
+        self.stop_inner();
     }
 
-    /// 停止任务但保留环缓中尚未播放的旧轨，供候选切换失败时继续播放。
+    /// 解码任务不拥有硬件环缓；兼容调用统一走同一幂等停止路径。
     pub fn stop_preserving_output(&mut self) {
-        self.clear_output_on_stop = false;
-        self.stop_inner(false);
+        self.stop_inner();
     }
 
-    /// 暂停旧轨向共享环缓写入，等待混音线程确认后才能提交候选。
-    /// 失败时旧任务仍保留在调用方手中，可继续播放或恢复。
-    pub fn pause_output_for_switch(&self) -> Result<(), String> {
-        if self.cancellation.is_cancelled() {
-            return Err("旧音轨已取消，无法暂停切换".to_owned());
-        }
-        self.resume_requested.store(false, Ordering::Release);
-        self.write_enabled.store(false, Ordering::Release);
-        let started = Instant::now();
-        while !self.paused_acknowledged.load(Ordering::Acquire) {
-            if let Some(failure) = self.failure_snapshot() {
-                return Err(failure.message().to_owned());
-            }
-            if started.elapsed() >= OUTPUT_PAUSE_TIMEOUT {
-                return Err("旧音轨混音线程未在 500ms 内确认暂停".to_owned());
-            }
-            thread::sleep(OUTPUT_RETRY_INTERVAL);
-        }
-        Ok(())
-    }
-
-    /// 候选提交失败时恢复旧轨；候选成功时不调用此方法。
-    pub fn resume_output_after_switch_failure(&self) {
-        if self.cancellation.is_cancelled() {
-            return;
-        }
-        self.resume_requested.store(true, Ordering::Release);
-        self.write_enabled.store(true, Ordering::Release);
-    }
-
-    fn stop_inner(&mut self, clear_output: bool) {
+    fn stop_inner(&mut self) {
         self.cancellation.cancel();
         terminate_decoder_process(&self.decoder_process);
         if let Some(handle) = self.mixer_handle.take() {
@@ -524,13 +375,6 @@ impl AudioMixerTask {
         }
         if let Some(handle) = self.decoder_handle.take() {
             join_thread(handle, "FFmpeg 解码");
-        }
-        if clear_output {
-            if let Ok(mut output) = self.output_slot.lock() {
-                if let Some(stream) = output.as_mut() {
-                    stream.clear_ring();
-                }
-            }
         }
     }
 
@@ -565,11 +409,8 @@ impl AudioMixerTask {
         })
     }
 
-    /// 在当前视频位置提交候选音轨，丢弃预热期间已经落后的 PCM。
-    ///
-    /// 提交只把固定 50ms 的候选 PCM 原子放入输出环缓；多余连续 PCM 仍留在候选
-    /// 预缓冲中，待调用方确认 PortAudio 消费者 Active 后由 [`Self::enable_output`]
-    /// 触发混音线程按正常 50ms 水位继续写入。这样候选预缓冲失败时可以在停止旧轨前回滚。
+    /// 丢弃目标位置之前的 PCM，并保留 30ms 淡化与其后 100ms 连续尾部。
+    /// 本任务不直接写 PortAudio；真正的首次预填或交叉淡化由输出线程完成。
     pub fn commit_at_position(&self, position_ms: u64) -> Result<(), String> {
         let mut prebuffer = self
             .prebuffer
@@ -580,21 +421,9 @@ impl AudioMixerTask {
             self.start_position_ms,
             position_ms,
             self.config.sample_rate_hz,
-            SWITCH_PREBUFFER_MS,
+            self.config.prebuffer_ms,
         )?;
-        let prime_samples = candidate_prime_samples(&prebuffer, self.config.sample_rate_hz)?;
-        let ring_capacity_samples = output_slot_capacity_samples(&self.output_slot)?;
-        validate_candidate_prebuffer_capacity(prime_samples.len(), ring_capacity_samples)?;
-        prime_samples_to_output(&self.cancellation, &self.output_slot, &prime_samples)?;
-        prebuffer.drain(..prime_samples.len());
         Ok(())
-    }
-
-    /// 在输出消费者确认已经 Active 后启用候选混音线程。
-    pub fn enable_output(&self) {
-        if !self.cancellation.is_cancelled() {
-            self.write_enabled.store(true, Ordering::Release);
-        }
     }
 
     /// 只验证候选是否已经追上目标位置；验证失败时旧混音任务仍继续供给硬件出口。
@@ -637,17 +466,18 @@ impl AudioMixerTask {
             .saturating_div(OUTPUT_CHANNELS as u64)
     }
 
+    pub fn output_track(&self) -> AudioMixerTrack {
+        AudioMixerTrack {
+            samples: Arc::clone(&self.prebuffer),
+        }
+    }
+
     /// 返回当前实时 FFmpeg 子进程 PID；任务尚未生成或已经退出时返回 None。
     pub fn ffmpeg_pid(&self) -> Option<u32> {
         self.decoder_process
             .lock()
             .ok()
             .and_then(|process| process.as_ref().map(Child::id))
-    }
-
-    pub fn has_output_backpressure(&self) -> bool {
-        self.failure_snapshot()
-            .is_some_and(|failure| failure.is_output_backpressure())
     }
 
     fn failure_snapshot(&self) -> Option<AudioMixerFailure> {
@@ -665,13 +495,11 @@ impl AudioMixerTask {
                 config: self.config,
                 reason,
             },
-            AudioMixerFailure::Runtime(reason) | AudioMixerFailure::OutputBackpressure(reason) => {
-                AudioMixerReadinessError::Runtime {
-                    waited_ms,
-                    config: self.config,
-                    reason,
-                }
-            }
+            AudioMixerFailure::Runtime(reason) => AudioMixerReadinessError::Runtime {
+                waited_ms,
+                config: self.config,
+                reason,
+            },
         }
     }
 }
@@ -934,134 +762,54 @@ fn send_samples_with_cancellation(
     }
 }
 
-// 混音线程入口显式接收有界队列、状态与时钟，便于审查取消和所有权边界。
-#[allow(clippy::too_many_arguments)]
-fn mix_audio_loop(
-    cancellation: &CancellationToken,
-    failure: &Arc<Mutex<Option<AudioMixerFailure>>>,
-    receiver: mpsc::Receiver<Vec<f32>>,
-    output_slot: AudioOutputSlot,
-    write_enabled: Arc<AtomicBool>,
-    resume_requested: Arc<AtomicBool>,
-    paused_acknowledged: Arc<AtomicBool>,
-    ready: Arc<AtomicBool>,
-    prebuffer: Arc<Mutex<VecDeque<f32>>>,
-    prebuffer_limit_samples: usize,
-    sample_rate_hz: u32,
-    prebuffer_started_at: Instant,
-    candidate_prebuffer_policy: CandidatePrebufferPolicy,
-) {
-    let mut prebuffer_pending = true;
-    while !cancellation.is_cancelled() {
-        if write_enabled.load(Ordering::Acquire) {
-            if resume_requested.swap(false, Ordering::AcqRel) {
-                prebuffer_pending = true;
-            }
-            paused_acknowledged.store(false, Ordering::Release);
-        } else {
-            paused_acknowledged.store(true, Ordering::Release);
-        }
-        // 候选追时钟缓存到达上限后暂停消费，让有界 channel 反压 FFmpeg；
-        // 不能继续读取后丢弃，否则提交后的下一块 PCM 会产生时间跳跃。
-        if !write_enabled.load(Ordering::Acquire)
-            && prebuffer
-                .lock()
-                .ok()
-                .is_some_and(|buffered| buffered.len() >= prebuffer_limit_samples)
+// 音轨处理线程只填充自己的有界 PCM 队列；PortAudio 由 audio_cycle_output 单线程写入。
+fn mix_audio_loop(context: AudioMixerLoopContext) {
+    while !context.cancellation.is_cancelled() {
+        // 缓冲达到上限后暂停消费，让有界 channel 反压 FFmpeg；不能读取后丢弃，
+        // 否则当前轨或候选轨恢复消费时会出现时间跳跃。
+        if context
+            .prebuffer
+            .lock()
+            .ok()
+            .is_some_and(|buffered| buffered.len() >= context.prebuffer_limit_samples)
         {
             thread::sleep(OUTPUT_RETRY_INTERVAL);
             continue;
         }
-        let mut samples = match receiver.recv_timeout(Duration::from_millis(50)) {
+        let mut samples = match context.receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(samples) => samples,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if !cancellation.is_cancelled() {
+                if !context.cancellation.is_cancelled() {
                     set_failure(
-                        failure,
+                        &context.failure,
                         AudioMixerFailure::Runtime("音频解码输入已断开".to_owned()),
                     );
-                }
-                if write_enabled.load(Ordering::Acquire) && !cancellation.is_cancelled() {
-                    stop_output(&output_slot);
                 }
                 return;
             }
         };
         process_audio_bus(&mut samples);
-        if !write_enabled.load(Ordering::Acquire) {
-            if let Ok(mut buffered) = prebuffer.lock() {
-                let buffered_samples =
-                    append_prebuffer(&mut buffered, &samples, prebuffer_limit_samples);
-                let elapsed_ms = elapsed_ms(prebuffer_started_at) as usize;
-                let required_samples = candidate_readiness_samples(
-                    sample_rate_hz,
-                    elapsed_ms,
-                    prebuffer_limit_samples,
-                    candidate_prebuffer_policy,
-                );
-                if buffered_samples >= required_samples {
-                    ready.store(true, Ordering::Release);
-                }
-            } else {
-                set_failure(
-                    failure,
-                    AudioMixerFailure::Runtime("音频候选预缓冲锁已损坏".to_owned()),
-                );
-                return;
+        if let Ok(mut buffered) = context.prebuffer.lock() {
+            let buffered_samples =
+                append_prebuffer(&mut buffered, &samples, context.prebuffer_limit_samples);
+            let elapsed_ms = elapsed_ms(context.prebuffer_started_at) as usize;
+            let required_samples = candidate_readiness_samples(
+                context.sample_rate_hz,
+                elapsed_ms,
+                context.prebuffer_limit_samples,
+                context.candidate_prebuffer_policy,
+            );
+            if buffered_samples >= required_samples {
+                context.ready.store(true, Ordering::Release);
             }
-            continue;
-        }
-        if prebuffer_pending {
-            // commit_at_position 只 prime 固定 50ms；这里先按顺序消费剩余候选 PCM，
-            // 交给正常 50ms 水位写入，再处理新解码块，避免丢弃或重排连续音频。
-            let buffered = match prebuffer.lock() {
-                Ok(mut buffered) => buffered.drain(..).collect::<Vec<_>>(),
-                Err(_) => {
-                    set_failure(
-                        failure,
-                        AudioMixerFailure::Runtime("音频候选预缓冲锁已损坏".to_owned()),
-                    );
-                    return;
-                }
-            };
-            if let Err(error) = write_samples_to_output(cancellation, &output_slot, &buffered) {
-                handle_output_write_error(cancellation, failure, &output_slot, "预缓冲", error);
-                return;
-            }
-            prebuffer_pending = false;
-        }
-        let write_result = write_samples_to_output(cancellation, &output_slot, &samples);
-        if let Err(error) = write_result {
-            handle_output_write_error(cancellation, failure, &output_slot, "输出", error);
+        } else {
+            set_failure(
+                &context.failure,
+                AudioMixerFailure::Runtime("音频候选预缓冲锁已损坏".to_owned()),
+            );
             return;
         }
-    }
-}
-
-fn handle_output_write_error(
-    cancellation: &CancellationToken,
-    failure: &Arc<Mutex<Option<AudioMixerFailure>>>,
-    output_slot: &AudioOutputSlot,
-    stage: &str,
-    error: OutputWriteError,
-) {
-    if !cancellation.is_cancelled() {
-        set_failure(
-            failure,
-            if error.preserves_output() {
-                AudioMixerFailure::OutputBackpressure(format!(
-                    "音频混音线程{stage}写入异常：{error}"
-                ))
-            } else {
-                AudioMixerFailure::Runtime(format!("音频混音线程{stage}写入异常：{error}"))
-            },
-        );
-    }
-    // 环缓背压只说明消费者暂时没有进度；保留现有环缓，交给上层的
-    // PortAudio 健康检查决定是否回退，避免候选失败时主动清掉旧轨。
-    if !cancellation.is_cancelled() && !error.preserves_output() {
-        stop_output(output_slot);
     }
 }
 
@@ -1078,7 +826,7 @@ fn candidate_required_prebuffer_samples(
     elapsed_ms: usize,
     max_samples: usize,
 ) -> usize {
-    let required_ms = elapsed_ms.saturating_add(SWITCH_PREBUFFER_MS);
+    let required_ms = elapsed_ms.saturating_add(AUDIO_CANDIDATE_COMMIT_TAIL_MS);
     let required_samples = u64::from(sample_rate_hz)
         .saturating_mul(required_ms as u64)
         .saturating_div(1_000)
@@ -1102,134 +850,6 @@ fn candidate_readiness_samples(
     }
 }
 
-fn write_samples_to_output(
-    cancellation: &CancellationToken,
-    output_slot: &AudioOutputSlot,
-    samples: &[f32],
-) -> Result<(), OutputWriteError> {
-    write_samples_to_output_with_timeout(
-        cancellation,
-        output_slot,
-        samples,
-        OUTPUT_WRITE_TIMEOUT,
-        |output, samples| output.write_stereo_interleaved_available(samples),
-    )
-}
-
-fn write_samples_to_output_with_timeout<F>(
-    cancellation: &CancellationToken,
-    output_slot: &AudioOutputSlot,
-    samples: &[f32],
-    timeout: Duration,
-    write: F,
-) -> Result<(), OutputWriteError>
-where
-    F: FnMut(&mut autolive_portaudio_output::PortAudioOutput, &[f32]) -> Result<usize, String>,
-{
-    write_samples_to_output_with_timeout_observed(
-        cancellation,
-        output_slot,
-        samples,
-        timeout,
-        |output| output.progress_snapshot(),
-        write,
-    )
-}
-
-fn write_samples_to_output_with_timeout_observed<F, O>(
-    cancellation: &CancellationToken,
-    output_slot: &AudioOutputSlot,
-    samples: &[f32],
-    timeout: Duration,
-    mut observe: O,
-    mut write: F,
-) -> Result<(), OutputWriteError>
-where
-    F: FnMut(&mut autolive_portaudio_output::PortAudioOutput, &[f32]) -> Result<usize, String>,
-    O: FnMut(
-        &autolive_portaudio_output::PortAudioOutput,
-    ) -> autolive_portaudio_output::PortAudioOutputProgress,
-{
-    let mut offset = 0_usize;
-    let mut last_progress = None;
-    let mut last_progress_at = Instant::now();
-    while offset < samples.len() {
-        if cancellation.is_cancelled() {
-            return Ok(());
-        }
-        let (written, progress_before, progress_after) = output_slot
-            .lock()
-            .map_err(|_| OutputWriteError::OutputState("PortAudio 状态锁已损坏".to_owned()))
-            .and_then(|mut output| {
-                let output = output.as_mut().ok_or_else(|| {
-                    OutputWriteError::OutputState("PortAudio 输出已停止".to_owned())
-                })?;
-                let progress_before = observe(output);
-                let written =
-                    write(output, &samples[offset..]).map_err(OutputWriteError::OutputState)?;
-                let progress_after = observe(output);
-                Ok((written, progress_before, progress_after))
-            })?;
-
-        if last_progress.is_none() {
-            last_progress = Some(progress_before);
-            last_progress_at = Instant::now();
-        }
-        if last_progress.is_some_and(|previous| consumer_progressed(previous, progress_before)) {
-            last_progress = Some(progress_before);
-            last_progress_at = Instant::now();
-        }
-        if last_progress.is_some_and(|previous| consumer_progressed(previous, progress_after)) {
-            last_progress = Some(progress_after);
-            last_progress_at = Instant::now();
-        }
-
-        if written == 0 {
-            if last_progress_at.elapsed() >= timeout {
-                return Err(OutputWriteError::ConsumerNoProgress {
-                    waited_ms: elapsed_ms(last_progress_at),
-                    remaining_samples: samples.len().saturating_sub(offset),
-                });
-            }
-            thread::sleep(OUTPUT_RETRY_INTERVAL);
-        } else {
-            offset = offset.saturating_add(written).min(samples.len());
-        }
-    }
-    Ok(())
-}
-
-fn consumer_progressed(
-    previous: autolive_portaudio_output::PortAudioOutputProgress,
-    current: autolive_portaudio_output::PortAudioOutputProgress,
-) -> bool {
-    current.callback_count > previous.callback_count
-        || current.ring_len_samples < previous.ring_len_samples
-}
-
-fn output_slot_capacity_samples(output_slot: &AudioOutputSlot) -> Result<usize, String> {
-    let output = output_slot
-        .lock()
-        .map_err(|_| "PortAudio 状态锁已损坏".to_owned())?;
-    output
-        .as_ref()
-        .map(autolive_portaudio_output::PortAudioOutput::ring_capacity_samples)
-        .ok_or_else(|| "PortAudio 输出已停止".to_owned())
-}
-
-fn validate_candidate_prebuffer_capacity(
-    candidate_samples: usize,
-    ring_capacity_samples: usize,
-) -> Result<(), String> {
-    if candidate_samples <= ring_capacity_samples {
-        return Ok(());
-    }
-    Err(format!(
-        "候选预缓冲无法原子提交：{} 个 PCM 样本超过 PortAudio 环缓容量 {} 个样本",
-        candidate_samples, ring_capacity_samples
-    ))
-}
-
 fn stereo_samples_for_ms(sample_rate_hz: u32, duration_ms: usize) -> usize {
     usize::try_from(
         u64::from(sample_rate_hz)
@@ -1238,35 +858,6 @@ fn stereo_samples_for_ms(sample_rate_hz: u32, duration_ms: usize) -> usize {
             .saturating_mul(OUTPUT_CHANNELS as u64),
     )
     .unwrap_or(usize::MAX)
-}
-
-fn candidate_prime_samples(
-    buffered: &VecDeque<f32>,
-    sample_rate_hz: u32,
-) -> Result<Vec<f32>, String> {
-    let prime_len = stereo_samples_for_ms(sample_rate_hz, SWITCH_PREBUFFER_MS);
-    if buffered.len() < prime_len {
-        return Err(format!(
-            "候选音轨剩余 PCM 不足 {}ms，无法原子提交",
-            SWITCH_PREBUFFER_MS
-        ));
-    }
-    Ok(buffered.iter().take(prime_len).copied().collect())
-}
-
-fn prime_samples_to_output(
-    cancellation: &CancellationToken,
-    output_slot: &AudioOutputSlot,
-    samples: &[f32],
-) -> Result<(), String> {
-    write_samples_to_output_with_timeout(
-        cancellation,
-        output_slot,
-        samples,
-        OUTPUT_WRITE_TIMEOUT,
-        |output, samples| output.prime_stereo_interleaved_available(samples),
-    )
-    .map_err(|error| error.to_string())
 }
 
 fn trim_prebuffer_to_position(
@@ -1313,14 +904,6 @@ fn prebuffer_skip_samples(
         ));
     }
     Ok(skip_samples)
-}
-
-fn stop_output(output_slot: &AudioOutputSlot) {
-    if let Ok(mut output) = output_slot.lock() {
-        if let Some(mut stream) = output.take() {
-            stream.stop();
-        }
-    }
 }
 
 fn process_audio_bus(samples: &mut [f32]) {
@@ -1469,18 +1052,14 @@ fn set_failure(failure: &Arc<Mutex<Option<AudioMixerFailure>>>, reason: AudioMix
 mod tests {
     use std::collections::VecDeque;
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use super::{
-        append_prebuffer, candidate_ffmpeg_read_rate, candidate_prime_samples,
-        candidate_readiness_samples, candidate_required_prebuffer_samples,
-        handle_output_write_error, prebuffer_skip_samples, process_audio_bus,
+        append_prebuffer, candidate_ffmpeg_read_rate, candidate_readiness_samples,
+        candidate_required_prebuffer_samples, prebuffer_skip_samples, process_audio_bus,
         sanitize_error_detail, send_samples_with_cancellation, take_complete_stereo_samples,
-        trim_prebuffer_to_position, validate_candidate_prebuffer_capacity, write_samples_to_output,
-        write_samples_to_output_with_timeout, write_samples_to_output_with_timeout_observed,
-        AudioMixerConfigContext, AudioMixerReadinessError, AudioMixerTask,
-        CandidatePrebufferPolicy, OutputWriteError, SWITCH_PREBUFFER_MS,
+        trim_prebuffer_to_position, AudioMixerConfigContext, AudioMixerReadinessError,
+        AudioMixerTrack, CandidatePrebufferPolicy,
     };
     use crate::cancellation::CancellationToken;
 
@@ -1528,15 +1107,6 @@ mod tests {
     }
 
     #[test]
-    fn mixer_write_exits_when_cancelled_before_output_access() {
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let output = Arc::new(Mutex::new(None));
-
-        write_samples_to_output(&cancellation, &output, &[0.0, 0.0]).unwrap();
-    }
-
-    #[test]
     fn decoder_send_exits_when_cancelled_while_channel_is_full() {
         let cancellation = CancellationToken::new();
         let (sender, receiver) = std::sync::mpsc::sync_channel(0);
@@ -1552,182 +1122,17 @@ mod tests {
     }
 
     #[test]
-    fn finite_ring_without_consumer_reports_backpressure_timeout() {
-        let mut stream = autolive_portaudio_output::PortAudioOutput::new(1_000, 128, 2);
-        stream.set_prestart_writes_enabled(true);
-        let capacity = autolive_portaudio_output::ring_capacity_samples(128, 2);
-        let fill = vec![0.0; capacity];
-        assert_eq!(
-            stream.prime_stereo_interleaved_available(&fill).unwrap(),
-            capacity
-        );
-        let output = Arc::new(Mutex::new(Some(stream)));
-        let error = write_samples_to_output_with_timeout(
-            &CancellationToken::new(),
-            &output,
-            &[0.0, 0.0],
-            std::time::Duration::from_millis(5),
-            |stream, samples| stream.write_stereo_interleaved_available(samples),
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, OutputWriteError::ConsumerNoProgress { .. }));
-        assert!(error.to_string().contains("输出消费者无进度"));
-        assert!(error.to_string().contains("环缓背压"));
-        assert_eq!(
-            output.lock().unwrap().as_ref().unwrap().ring_len_samples(),
-            capacity
-        );
-    }
-
-    #[test]
-    fn partial_batch_with_callback_progress_does_not_timeout() {
-        let stream = autolive_portaudio_output::PortAudioOutput::new(1_000, 128, 2);
-        let output = Arc::new(Mutex::new(Some(stream)));
-        let callback_count = Arc::new(AtomicU64::new(0));
-        let observed_callback_count = Arc::clone(&callback_count);
-        let mut attempts = 0_u8;
-
-        let result = write_samples_to_output_with_timeout_observed(
-            &CancellationToken::new(),
-            &output,
-            &[0.0, 0.0],
-            std::time::Duration::from_millis(5),
-            |stream| autolive_portaudio_output::PortAudioOutputProgress {
-                callback_count: observed_callback_count.load(Ordering::Relaxed),
-                ring_len_samples: stream.ring_len_samples(),
-            },
-            |_stream, samples| {
-                attempts = attempts.saturating_add(1);
-                if attempts < 8 {
-                    callback_count.fetch_add(1, Ordering::Relaxed);
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    Ok(0)
-                } else {
-                    Ok(samples.len())
-                }
-            },
-        );
-
-        assert!(result.is_ok());
-        assert!(callback_count.load(Ordering::Relaxed) >= 7);
-    }
-
-    #[test]
-    fn backpressure_failure_keeps_existing_output_ring() {
-        let mut stream = autolive_portaudio_output::PortAudioOutput::new(1_000, 128, 2);
-        stream.set_prestart_writes_enabled(true);
-        let capacity = autolive_portaudio_output::ring_capacity_samples(128, 2);
-        stream
-            .prime_stereo_interleaved_available(&vec![0.0; capacity])
-            .unwrap();
-        let output = Arc::new(Mutex::new(Some(stream)));
-        let failure = Arc::new(Mutex::new(None));
-
-        handle_output_write_error(
-            &CancellationToken::new(),
-            &failure,
-            &output,
-            "预缓冲",
-            OutputWriteError::ConsumerNoProgress {
-                waited_ms: 500,
-                remaining_samples: 2,
-            },
-        );
-
-        let output = output.lock().unwrap();
-        assert_eq!(output.as_ref().unwrap().ring_len_samples(), capacity);
-        assert!(failure
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|failure| failure.message().contains("环缓背压")));
-    }
-
-    #[test]
-    fn candidate_commit_rejects_prebuffer_larger_than_ring_capacity() {
-        assert!(validate_candidate_prebuffer_capacity(100, 100).is_ok());
-        let error = validate_candidate_prebuffer_capacity(101, 100).unwrap_err();
-        assert!(error.contains("候选预缓冲无法原子提交"));
-        assert!(error.contains("101"));
-        assert!(error.contains("100"));
-    }
-
-    #[test]
-    fn candidate_commit_primes_only_fixed_50ms_and_keeps_the_contiguous_tail() {
-        let buffered = (0..10_000)
-            .map(|value| value as f32)
-            .collect::<VecDeque<_>>();
-        let prime = candidate_prime_samples(&buffered, 1_000).unwrap();
-
-        assert_eq!(prime.len(), 100);
-        assert_eq!(prime.first(), Some(&0.0));
-        assert_eq!(prime.last(), Some(&99.0));
-        assert_eq!(buffered.len(), 10_000);
-
-        let insufficient = (0..99).map(|value| value as f32).collect::<VecDeque<_>>();
-        assert!(candidate_prime_samples(&insufficient, 1_000).is_err());
-    }
-
-    #[test]
-    fn candidate_commit_capacity_uses_fixed_prime_not_full_prebuffer() {
-        let full_prebuffer = candidate_required_prebuffer_samples(48_000, 5_000, usize::MAX);
-        let buffered = vec![0.0; full_prebuffer]
-            .into_iter()
-            .collect::<VecDeque<_>>();
-        let prime = candidate_prime_samples(&buffered, 48_000).unwrap();
-        let ring_capacity = autolive_portaudio_output::ring_capacity_samples(1_024, 2);
-
-        assert!(prime.len() < ring_capacity);
-        assert!(validate_candidate_prebuffer_capacity(prime.len(), ring_capacity).is_ok());
-        assert!(validate_candidate_prebuffer_capacity(buffered.len(), ring_capacity).is_err());
-    }
-
-    #[test]
-    fn candidate_commit_primes_fixed_depth_and_leaves_tail_for_mixer() {
-        let mut output = autolive_portaudio_output::PortAudioOutput::new(48_000, 1_024, 2);
-        output.set_prestart_writes_enabled(true);
-        let output_slot = Arc::new(Mutex::new(Some(output)));
-        let prebuffer = Arc::new(Mutex::new(
-            (0..10_000)
-                .map(|value| value as f32)
-                .collect::<VecDeque<_>>(),
-        ));
-        let task = AudioMixerTask {
-            cancellation: CancellationToken::new(),
-            decoder_handle: None,
-            mixer_handle: None,
-            decoder_process: Arc::new(Mutex::new(None)),
-            output_slot: Arc::clone(&output_slot),
-            failure: Arc::new(Mutex::new(None)),
-            config: AudioMixerConfigContext {
-                sample_rate_hz: 48_000,
-                prebuffer_ms: SWITCH_PREBUFFER_MS,
-                audio_stream_variant_count: 1,
-            },
-            write_enabled: Arc::new(AtomicBool::new(false)),
-            resume_requested: Arc::new(AtomicBool::new(false)),
-            paused_acknowledged: Arc::new(AtomicBool::new(true)),
-            ready: Arc::new(AtomicBool::new(true)),
-            prebuffer: Arc::clone(&prebuffer),
-            start_position_ms: 0,
-            clear_output_on_stop: true,
+    fn output_track_is_consumed_only_through_explicit_take_operations() {
+        let samples = Arc::new(Mutex::new(VecDeque::from([1.0, 2.0, 3.0, 4.0])));
+        let track = AudioMixerTrack {
+            samples: Arc::clone(&samples),
         };
 
-        task.commit_at_position(0).unwrap();
-
-        assert_eq!(
-            output_slot
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .ring_len_samples(),
-            4_800
-        );
-        let prebuffer = prebuffer.lock().unwrap();
-        assert_eq!(prebuffer.len(), 5_200);
-        assert_eq!(prebuffer.front(), Some(&4_800.0));
+        assert_eq!(track.available_samples(), 4);
+        assert_eq!(track.take_exact(6).unwrap(), None);
+        assert_eq!(track.take_exact(2).unwrap(), Some(vec![1.0, 2.0]));
+        assert_eq!(track.take_up_to(8).unwrap(), vec![3.0, 4.0]);
+        assert!(samples.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1739,11 +1144,11 @@ mod tests {
         assert_eq!(append_prebuffer(&mut buffered, &[7.0, 8.0, 9.0], 4), 6);
         assert_eq!(buffered.len(), 6);
 
-        // 1kHz 双声道、滤镜启动耗时 2 秒时，候选必须保留 2.05 秒 PCM，
-        // 而不是只保留最早 50ms 后继续丢弃后续数据。
+        // 1kHz 双声道、滤镜启动耗时 2 秒时，候选必须保留 2.13 秒 PCM，
+        // 覆盖 30ms 交叉淡化和其后的 100ms 连续尾部。
         assert_eq!(
             candidate_required_prebuffer_samples(1_000, 2_000, 10_100),
-            4_100
+            4_260
         );
     }
 

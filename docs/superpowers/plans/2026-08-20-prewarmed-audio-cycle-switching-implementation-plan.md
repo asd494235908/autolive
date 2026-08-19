@@ -1,8 +1,8 @@
 # 下一周期音轨预热与无阻塞切换实施方案
 
-> 状态：Phase 0–1 已完成代码实施与静态/单元验证；Phase 2–4 待实施和实机长测
+> 状态：Phase 0–2 已完成代码实施与静态/单元验证；Phase 3–4 的时钟观测、自动重对齐、UI 与清理已落地，目标 Windows 设备长测仍待完成
 > 日期：2026-08-20
-> 代码基线：`dev-2.0` / `20f7da4`
+> 代码基线：`dev-2.0` / Phase 1 提交 `d8b8e19`；本文同步 Phase 2–4 当前工作区实现
 > 适用范围：桌面端 React 调度、Rust/Tauri 音频生命周期、FFmpeg 流式处理、PortAudio 输出
 
 ## 1. 结论
@@ -92,15 +92,15 @@ required_tail_ms
 
 只有 `candidate_buffered_end_ms >= commit_target_ms + required_tail_ms` 才能提交。
 
-### 3.4 当前任务和候选任务都直接写共享输出
+### 3.4 改造前问题：当前任务和候选任务都直接写共享输出
 
-现有每个 `AudioMixerTask` 都持有共享 PortAudio 输出槽，并由自己的混音线程写入环缓。切换需要依次暂停旧写入者、检查消费者、向同一环缓追加候选、替换任务、停止旧任务，形成较复杂的锁和背压关系。
+Phase 2 改造前，每个 `AudioMixerTask` 都持有共享 PortAudio 输出槽，并由自己的混音线程写入环缓。切换需要依次暂停旧写入者、检查消费者、向同一环缓追加候选、替换任务、停止旧任务，形成较复杂的锁和背压关系；该直接写入路径现已删除。
 
 最终结构应改为单一输出所有者：
 
 ```text
 当前 FFmpeg 解码任务 ──► 有界 PCM 队列 ──┐
-                                         ├─► audio_cycle_mixer 单线程
+                                         ├─► audio_cycle_output 单线程
 候选 FFmpeg 解码任务 ──► 有界 PCM 队列 ──┘       │
                                                     ▼
                                           SPSC f32 环形缓冲
@@ -109,7 +109,7 @@ required_tail_ms
                                           PortAudio callback
 ```
 
-只有 `audio_cycle_mixer` 可以写 PortAudio 环缓；PortAudio callback 仍只读环缓并补零，不加 Mutex、不执行 FFmpeg、不访问 UI。
+只有 `audio_cycle_output` 可以写 PortAudio 环缓；PortAudio callback 仍只读环缓并补零，不加 Mutex、不执行 FFmpeg、不访问 UI。
 
 ### 3.5 音画同步必须使用统一的媒体时间轴
 
@@ -171,7 +171,7 @@ Ready(next=N+1)
 1. FFmpeg 活跃 PID 数量始终 `<= 2`。
 2. 当前任务、候选任务各最多 1 个。
 3. PortAudio 流始终最多 1 个。
-4. PortAudio 环缓始终只有一个生产者：`audio_cycle_mixer`。
+4. PortAudio 环缓始终只有一个生产者：`audio_cycle_output`。
 5. 任何锁内都不等待 FFmpeg 退出、不 Join 线程、不等待 IPC。
 6. 候选提交失败不能清空当前可播放 PCM。
 7. 停止完成前必须取消并 Join 当前任务和候选任务，不能丢弃句柄。
@@ -227,11 +227,11 @@ candidate_id
 | `candidate_pre_roll_ms` | 250ms | 预计切换点之前保留的容错窗口 |
 | `candidate_post_roll_ms` | 500ms | 预计切换点之后可提交/淡化的 PCM |
 | `switch_crossfade_ms` | 30ms | 旧轨 1→0、新轨 0→1 |
-| `minimum_commit_tail_ms` | 100ms | 提交后必须仍有的连续 PCM |
+| `minimum_commit_tail_ms` | 100ms | 30ms 淡化结束后仍必须保留的连续 PCM |
 | `candidate_prepare_timeout_ms` | 5000ms | 只约束准备结果，不关闭当前轨 |
 | `decoder_queue_blocks` | 8 | 复用现有有界队列原则 |
 
-上述值必须通过真实设备长测调整，不暴露为第一版 UI 配置。候选 PCM 上限按时间窗计算，不使用 1024KiB PortAudio 环缓容量充当候选缓存上限。
+候选提交总余量为 `30ms crossfade + 100ms post-fade tail = 130ms`。上述值必须通过真实设备长测调整，不暴露为第一版 UI 配置。候选 PCM 上限按时间窗计算，不使用 1024KiB PortAudio 环缓容量充当候选缓存上限。
 
 ## 7. 调度时序
 
@@ -256,7 +256,7 @@ candidate_id
 5. 候选缓冲达到目标窗口后由有界队列自然背压，不继续增长。
 6. 到期时最终效果窗口只发送 `commit(candidate_id, live_position)`。
 7. Rust 用同一份时钟快照计算实际可听目标，验证候选覆盖范围。
-8. `audio_cycle_mixer` 在 30ms 内同时对旧轨降益和新轨升益，然后把新轨设为当前轨。
+8. `audio_cycle_output` 在 30ms 内同时对旧轨降益和新轨升益，然后把新轨设为当前轨。
 9. 旧 FFmpeg 在锁外取消并 Join；随后抽样并计划 N+2。
 
 ### 7.3 候选未就绪
@@ -420,7 +420,7 @@ candidate_window_end_ms
 
 ### Phase 0：回归测试与观测基线
 
-实施状态（2026-08-20）：已完成固定时间窗 readiness、100ms 提交尾部、绝对媒体时间和配置 revision 原子提交测试；运行态继续复用 current/pending PID 与任务数。真实 CPU、内存、xrun 和 A/V 偏差基线仍需目标 Windows 设备长测，未以单元测试替代。
+实施状态（2026-08-20）：已完成固定时间窗 readiness、30ms 淡化加 100ms 淡化后尾部（总计 130ms）、绝对媒体时间和配置 revision 原子提交测试；运行态继续复用 current/pending PID 与任务数。真实 CPU、内存、xrun 和 A/V 偏差基线仍需目标 Windows 设备长测，未以单元测试替代。
 
 先写失败测试并补齐状态字段，不改变播放行为。
 
@@ -440,16 +440,16 @@ candidate_window_end_ms
 - 默认到切换前约 4 秒才启动候选 FFmpeg；候选样本可以提前展示，但只有 commit 成功后才能升级为 current。
 - 新增 prepare/cancel IPC。
 - FFmpeg seek 到预计切换点前 250ms，只缓冲有界时间窗。
-- 保持当前直接写输出的提交路径，先消除“到点才创建进程”。
+- Phase 1 曾暂时保留直接写输出的兼容提交路径；Phase 2 已将其删除。
 
 验收：切换时刻的进程日志中不出现新的 FFmpeg spawn；任意时刻 PID `<=2`。
 
 ### Phase 2：单一混音线程与真实 30ms 交叉淡化
 
-实施状态：待实施。当前 Phase 1 仍沿用“暂停旧写入者 → 原子预填候选 → 切换任务”的兼容提交路径，尚不能宣称已经完成单一输出生产者或真实样本域 30ms 双向交叉淡化。
+实施状态（2026-08-20）：已完成。`AudioMixerTask` 只向各自有界 PCM 队列生产数据；`audio_cycle_output` 按值持有唯一 `PortAudioOutput`，是 SPSC 环缓唯一生产者。提交需要 130ms 连续候选 PCM，原子追加 30ms 线性交叉淡化，成功后才切换 current，并在状态锁外停止、Join 旧任务。普通切换不清空旧环缓；短暂 commit 原子门禁阻止新 prepare/cancel 在“输出已切换、状态槽尚未替换”的间隙使候选失效，暂停/停止仍可立即打断。
 
 - 解码任务改为写各自有界 PCM 队列。
-- `audio_cycle_mixer` 成为 PortAudio 环缓唯一生产者。
+- `audio_cycle_output` 成为 PortAudio 环缓唯一生产者。
 - 提交在 PCM 样本域执行旧轨 `1→0`、新轨 `0→1` 的 30ms 等功率或线性 ramp；首版沿用已确认的线性 ramp。
 - 旧任务停止和 Join 移到状态锁外。
 - 删除双任务直接争用输出环缓的旧代码和未使用字段。
@@ -457,6 +457,8 @@ candidate_window_end_ms
 验收：切换无硬切、无双写、无候选 prime 背压；callback 路径保持无锁读取。
 
 ### Phase 3：统一绝对时间轴与循环校正
+
+实施状态（2026-08-20）：代码与单元测试已完成，实机漂移验收未完成。输出线程以 callback 已消费 frame、实际采样率和输出延迟维护可听绝对媒体时间；UI 展示 `av_offset_ms`，连续 3 次超过 80ms 后触发现有源同步路径，带 10 秒冷却。循环、跳转、换源和配置代际校验继续拒绝旧候选。
 
 - 引入 `loop_index + current_position` 的绝对媒体时间。
 - prepare/commit 使用统一时钟快照和实时覆盖窗口。
@@ -467,10 +469,12 @@ candidate_window_end_ms
 
 ### Phase 4：错误分类、UI 与清理
 
-- UI 展示“当前轮 / 下一轮 / 准备中 / 已就绪 / 延后原因”。
+实施状态（2026-08-20）：主体已完成。UI 已展示下一周期预设、状态、candidate ID、倒计时和 A/V 偏差；旧的 Web Audio PCM 写入 IPC、双任务直接写 PortAudio 和无调用者字段已删除。`sync_audio_output_source` 仍作为首次启动、拖动和偏差重对齐的兼容入口保留，不在未完成实机验证前删除。
+
+- UI 展示“当前轮 / 下一轮 / 预热请求中 / 已接收待切换校验 / 延后原因”。
 - 当前轮展示实际预设、seed、weights、提交时间和实际出口；下一轮展示候选预设、倒计时、candidate ID、预热耗时、ready 提前量和取消/失败原因。
 - 可恢复候选错误不再显示成“PortAudio 已回退 WebView”。
-- 删除旧 `sync_audio_output_source` 隐式等待、重复 ready 布尔值和已无调用者的辅助函数。
+- 收敛旧 `sync_audio_output_source` 隐式等待；仅保留首次启动、拖动和偏差重对齐入口，删除重复 ready 布尔值和已无调用者的辅助函数。
 - 更新架构、参数契约和原音频方案文档。
 
 验收：停止/暂停按钮立即生效；状态文案与实际输出一致；没有未使用代码、重复路径或遗留调试日志。
@@ -492,7 +496,7 @@ candidate_window_end_ms
 
 - 候选覆盖窗口而非一次性 ready 决定是否可提交。
 - 预计目标前 250ms、后 500ms 的窗口可容忍定时器抖动。
-- 剩余 99ms 时拒绝，100ms 时允许。
+- 总余量 129ms 时拒绝，130ms（30ms 淡化 + 100ms 淡化后尾部）时允许。
 - stale generation/loop/revision/candidate ID 全部拒绝且保留当前轨。
 - current + candidate 任务上限为 2；第三个 prepare 先取消并 Join 旧候选。
 - 停止、取消、FFmpeg 失败、队列断开均可 Join，无孤儿 PID。
@@ -520,16 +524,16 @@ candidate_window_end_ms
 
 ## 12. 验收门槛
 
-- [ ] 切换点前候选已存在，切换点日志无 FFmpeg spawn。
-- [ ] 活跃 FFmpeg PID 始终不超过 2，停止后 2 秒内归零。
-- [ ] 当前/候选解码任务始终不超过 2，PortAudio 流始终不超过 1。
-- [ ] 可恢复的候选未就绪不关闭当前轨、不回退 WebView。
+- [x] 代码路径保证切换点前候选已创建，commit 不启动 FFmpeg；实机日志抽查仍待长测。
+- [ ] 活跃 FFmpeg PID 始终不超过 2，停止后 2 秒内归零（代码有上限和 Join；仍需实机确认）。
+- [x] 当前/候选解码任务上限为 2，PortAudio 输出线程和流上限为 1。
+- [x] 可恢复的候选未就绪不关闭当前轨、不回退 WebView。
 - [ ] 正常周期切换无超过 100ms 的无声段；目标为 30ms 连续淡化。
 - [ ] 稳态 A/V 偏差目标 `|offset| <= 50ms`，连续 30 分钟不超过 80ms 且不持续增长。
 - [ ] 50 轮内无 `candidate_not_caught_up` 风暴、无环缓背压导致永久失声。
 - [ ] 暂停/停止时声音同步停止，恢复时不提交旧候选。
-- [ ] 1～4 支路仍执行等权 `amix` 和最终 -16 LUFS 管线。
-- [ ] 没有新增处理音频文件或 22 条完整 PCM 常驻缓存。
+- [x] 1～4 支路仍执行等权 `amix` 和最终 -16 LUFS 管线。
+- [x] 没有新增处理音频文件或 22 条完整 PCM 常驻缓存。
 
 验收阈值必须结合本地设备测量；若硬件固有输出延迟超过阈值，应单独记录实际 latency，不能把硬件延迟误判为调度漂移。
 
@@ -542,6 +546,7 @@ candidate_window_end_ms
 | `desktop/ui/src/audio-cycle-prewarm-coordinator.test.ts` | 新增可控时钟和周期竞态测试 |
 | `desktop/ui/src/App.tsx` | 装配 prepare/commit/cancel；只在提交成功后更新生效轮次 |
 | `desktop/src-tauri/src/audio_cycle_switch.rs` | 新增当前/候选生命周期和时间窗提交状态机 |
+| `desktop/src-tauri/src/audio_cycle_output.rs` | 唯一 PortAudio 所有者和生产者；执行初始 prime、正常供给、30ms crossfade、暂停/停止和 callback 时间轴 |
 | `desktop/src-tauri/src/audio_mixer.rs` | 解码任务改为有界 PCM 生产者；删除直接写共享输出职责 |
 | `desktop/src-tauri/src/commands.rs` | 新增明确 IPC，删除迁移后的隐式同步等待路径 |
 | `desktop/src-tauri/src/main.rs` | 注册新增 prepare/commit/cancel Tauri 命令 |

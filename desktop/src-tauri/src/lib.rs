@@ -1,3 +1,4 @@
+pub mod audio_cycle_output;
 pub mod audio_mixer;
 pub mod audio_processing;
 pub mod background_process;

@@ -751,10 +751,6 @@ pub struct PortAudioOutput {
     running: AtomicBool,
 }
 
-// SAFETY: stream、producer 和 consumer 的所有权只在控制线程管理；PortAudio
-// callback 独占 CallbackUserData 中的 consumer，跨线程共享的状态只有原子值。
-unsafe impl Send for PortAudioOutput {}
-
 impl std::fmt::Debug for PortAudioOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PortAudioOutput")
