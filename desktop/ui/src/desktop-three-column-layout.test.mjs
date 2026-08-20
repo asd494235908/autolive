@@ -3,9 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const appPath = new URL('./App.tsx', import.meta.url);
-const audioCapabilityPath = new URL('./audio-processing-capabilities.ts', import.meta.url);
 const layoutPath = new URL('./desktop-layout.css', import.meta.url);
-const mainPath = new URL('./main.tsx', import.meta.url);
 const tauriCommandsPath = new URL('../../src-tauri/src/commands.rs', import.meta.url);
 const tauriMainPath = new URL('../../src-tauri/src/main.rs', import.meta.url);
 const audioMixerPath = new URL('../../src-tauri/src/audio_mixer.rs', import.meta.url);
@@ -13,25 +11,13 @@ const audioCycleOutputPath = new URL('../../src-tauri/src/audio_cycle_output.rs'
 
 test('desktop page exposes the approved three-column layout contract', async () => {
   const app = await readFile(appPath, 'utf8');
-  const audioCapability = await readFile(audioCapabilityPath, 'utf8');
-  const main = await readFile(mainPath, 'utf8');
-  let css = '';
-  try {
-    css = await readFile(layoutPath, 'utf8');
-  } catch {
-    // Keep the failure an assertion failure until the layout stylesheet exists.
-  }
+  const css = await readFile(layoutPath, 'utf8');
 
-  assert.match(app, /desktop-workspace/);
-  assert.match(app, /desktop-column-source/);
-  assert.match(app, /desktop-column-audio/);
-  assert.match(app, /desktop-column-video/);
-  assert.doesNotMatch(app, /单源循环播放/);
-  assert.doesNotMatch(app, /不生成 N 个离线视频，不创建版本队列/);
-  const sourceIndex = app.indexOf('desktop-column-source');
-  const audioIndex = app.indexOf('desktop-column-audio');
-  const videoIndex = app.indexOf('desktop-column-video');
-  assert.ok(sourceIndex < audioIndex && audioIndex < videoIndex, 'desktop columns stay in source/audio/video order');
+  assert.match(app, /<DesktopShell>/);
+  const sourceIndex = app.indexOf('area="source"');
+  const videoIndex = app.indexOf('area="video"');
+  const audioIndex = app.indexOf('area="audio-output"');
+  assert.ok(sourceIndex < videoIndex && videoIndex < audioIndex, 'desktop columns stay in source/video/audio-output order');
   const hiddenVideoRef = app.indexOf('ref={pictureInPictureVideoRef}');
   const hiddenVideoStart = app.lastIndexOf('<video', hiddenVideoRef);
   assert.notEqual(hiddenVideoStart, -1, 'Picture-in-Picture media element remains available');
@@ -39,70 +25,72 @@ test('desktop page exposes the approved three-column layout contract', async () 
   const hiddenVideo = app.slice(hiddenVideoStart, hiddenVideoEnd);
   assert.match(hiddenVideo, /aria-hidden="true"/);
   assert.match(hiddenVideo, /position: 'fixed'/);
-  assert.match(app, /视频实时参数预览/);
-  assert.doesNotMatch(app, /title="视频实时预览"/);
-  assert.doesNotMatch(app, /className="desktop-preview-video"/);
+  assert.match(app, /视频处理 · 实时参数/);
+  assert.doesNotMatch(app.slice(app.indexOf('function DesktopApp()')), /实时话术幻化/);
   assert.match(app, /aria-label="声音处理"/);
-  assert.match(app, /aria-label="实时话术幻化"/);
   assert.match(app, /aria-label="视频处理"/);
-  assert.match(app, /应用视频参数/);
-  assert.match(app, /应用音频参数/);
-  assert.doesNotMatch(app, /应用当前处理参数/);
+  assert.match(app, /应用视频/);
+  assert.match(app, /应用声音参数/);
   assert.match(app, /video_processing_status/);
   assert.match(app, /audio_processing_status/);
   assert.match(app, /applyMediaProcessing\('video'\)/);
   assert.match(app, /applyMediaProcessing\('audio'\)/);
   assert.match(app, /applyMediaProcessing\('both'\)/);
-  assert.match(app, /<Descriptions\.Item label="声音处理状态">\{audioProcessingStatus\}<\/Descriptions\.Item>/);
-  assert.match(app, /视频状态：\{videoProcessingStatus\}/);
-  assert.match(app, /音频实时参数与生效状态/);
-  assert.doesNotMatch(app, /title="声音处理参数"/);
-  assert.doesNotMatch(app, /音频实时参数预览/);
-  assert.doesNotMatch(app, /音频处理能力与生效范围/);
-  assert.match(app, /audioCapabilityRows\.map/);
-  assert.doesNotMatch(app, /unavailableAudioCapabilityRows/);
-  assert.match(app, /基线/);
-  assert.match(app, /变化/);
-  for (const label of ['总增益', '输入增益', '输出增益', '响度调整', '低频 EQ', '中频 EQ', '高频 EQ', '音高', '变速', '淡入', '淡出', '轻混响', '采样率', '输出码率']) {
-    assert.match(audioCapability, new RegExp(label), `audio capability exposes ${label}`);
-  }
-  assert.doesNotMatch(audioCapability, /buildUnavailableAudioCapabilityRows/);
+  assert.match(app, /audioCapabilityRows/);
+  assert.match(app, /row\.key !== 'spectral_perturbation_percent'/);
   assert.match(app, /scope === 'video'[\s\S]*videoProcessingEnabled && !audioProcessingEnabled/);
   assert.match(app, /scope === 'audio'[\s\S]*audioProcessingEnabled && !videoProcessingEnabled/);
   assert.match(app, /scopeEnabled = scope === 'video'/);
   assert.match(app, /<ConfigProvider\b/);
   assert.match(app, /<AntApp>/);
-  assert.doesNotMatch(main, /darkAlgorithm|colorPrimary|colorBgBase/);
-  assert.match(css, /grid-template-columns:\s*minmax\(0,\s*28fr\)\s+minmax\(0,\s*38fr\)\s+minmax\(0,\s*34fr\)/);
-  assert.match(css, /@media\s*\(max-width:\s*800px\)/);
-  assert.match(css, /grid-template-columns:\s*1fr/);
+  assert.match(css, /grid-template-columns:\s*320px minmax\(0,\s*1fr\) 272px/);
+  assert.match(css, /@media\s*\(max-width:\s*900px\)/);
+  assert.match(css, /grid-template-columns:\s*minmax\(0,\s*1fr\)/);
 });
 
-test('PortAudio Host API selector only exposes available host APIs', async () => {
+test('PortAudio Host API selector shows ASIO and only enables it when an ASIO device is enumerated', async () => {
   const app = await readFile(appPath, 'utf8');
   const hostApiOptionsMatch = app.match(
     /aria-label="PortAudio Host API"[\s\S]*?options=\{\[([\s\S]*?)\]\}/,
   );
+  const deviceLoad = app.slice(
+    app.indexOf("invoke<AudioOutputDevice[]>('list_audio_output_devices')"),
+    app.indexOf("invoke<ResearchParams>('get_default_local_research_params')"),
+  );
+  const deviceOptions = app.slice(
+    app.indexOf('options={audioOutputDevices'),
+    app.indexOf('onChange={(value) => {', app.indexOf('options={audioOutputDevices')),
+  );
 
   assert.ok(hostApiOptionsMatch, 'PortAudio Host API options remain statically discoverable');
   const hostApiOptions = hostApiOptionsMatch[1];
-  assert.doesNotMatch(hostApiOptions, /\bASIO\b|value:\s*['"]asio['"]/i);
+  assert.match(hostApiOptions, /value:\s*['"]asio['"]/i);
+  assert.match(hostApiOptions, /label:\s*hasAsioOutputDevice\s*\?\s*['"]ASIO['"]\s*:\s*['"]ASIO（运行时未检测到设备）['"]/);
+  assert.match(hostApiOptions, /disabled:\s*!hasAsioOutputDevice/);
+  assert.match(
+    app,
+    /const hasAsioOutputDevice\s*=\s*audioOutputDevices\.some\(\s*\(device\)\s*=>\s*device\.host_api\.trim\(\)\.toLowerCase\(\)\s*===\s*['"]asio['"]\s*,?\s*\)/,
+  );
+  assert.match(deviceLoad, /setAudioOutputDevices\(\s*devices\.filter\(\(device\)\s*=>\s*typeof device\.host_api\s*===\s*['"]string['"]\)\s*,?\s*\)/);
+  assert.doesNotMatch(deviceLoad, /filter[\s\S]*asio/i);
+  assert.doesNotMatch(deviceOptions, /!==\s*['"]asio['"]/i);
+  assert.match(deviceOptions, /device\.host_api\.trim\(\)\.toLowerCase\(\)\s*===\s*audioOutputHostApiFilter/);
   for (const hostApi of ['wasapi', 'mme', 'dsound', 'wdmks']) {
-    assert.match(hostApiOptions, new RegExp(`value:\s*['"]${hostApi}['"]`), `${hostApi} remains available`);
+    assert.match(hostApiOptions, new RegExp(`value:\\s*['"]${hostApi}['"]`), `${hostApi} remains available`);
   }
 });
 
 test('PortAudio 内存缓冲默认 1024KiB 且允许手动输入到 2048KiB', async () => {
   const app = await readFile(appPath, 'utf8');
-  const bufferStart = app.indexOf('<InputNumber', app.indexOf('PortAudio Host API'));
-  const bufferEnd = app.indexOf('</Space>', bufferStart);
+  const bufferStart = app.indexOf('<FeatureDrawerField label="内存缓冲"', app.indexOf('PortAudio Host API'));
+  const bufferEnd = app.indexOf('</FeatureDrawerField>', bufferStart);
   const buffer = app.slice(bufferStart, bufferEnd);
 
   assert.match(app, /PORTAUDIO_DEFAULT_MEMORY_BUFFER_KIB\s*=\s*1_024/);
-  assert.match(buffer, /aria-label="PortAudio 内存缓冲区大小"/);
+  assert.match(buffer, /ariaLabel="PortAudio 内存缓冲区大小"/);
   assert.match(buffer, /min=\{PORTAUDIO_MIN_MEMORY_BUFFER_KIB\}/);
   assert.match(buffer, /max=\{PORTAUDIO_MAX_MEMORY_BUFFER_KIB\}/);
-  assert.match(buffer, /内存缓冲 128–2048 KiB，默认 1024 KiB/);
+  assert.match(buffer, /范围 128–2048 KiB，默认 1024 KiB/);
   assert.doesNotMatch(buffer, /<Select/);
 });
 
@@ -156,27 +144,29 @@ test('处理候选槽切换使用 30ms 双向 Gain ramp，并在失败时保留�
   assert.match(candidateEffect, /if \(!processedAudioPlayingRef\.current\) restoreDryAudioOutput\(\)/);
 });
 
-test('声音周期仅在提交成功后升级当前快照，且 PortAudio 正式路径不创建 ScriptProcessor', async () => {
+test('声音 N+1/N+2 只预选参数，提交成功后才升级当前快照，且 PortAudio 不创建 ScriptProcessor', async () => {
   const app = await readFile(appPath, 'utf8');
   const sampleCalls = [...app.matchAll(/sampleAudioCycle\(/g)];
-  assert.equal(sampleCalls.length, 2, 'App 只允许当前轮提交和下一轮规划直接抽样');
+  assert.equal(sampleCalls.length, 2, 'App 只允许当前轮提交和未来计划构建直接抽样');
   assert.match(app, /function sampleAndCommitAudioCycle\(/);
   const commitStart = app.indexOf('function commitAudioCycleSample');
   const commitEnd = app.indexOf('function sampleAndCommitAudioCycle', commitStart);
   const commit = app.slice(commitStart, commitEnd);
-  const planStart = app.indexOf('function planNextAudioCycle');
-  const planEnd = app.indexOf('function postAudioCycleCommand', planStart);
+  const planStart = app.indexOf('function buildAudioCycleSeed');
+  const planEnd = app.indexOf('function buildVideoCycleSeed', planStart);
   const plan = app.slice(planStart, planEnd);
   assert.ok(commitStart >= 0 && commitEnd > commitStart);
   assert.ok(planStart >= 0 && planEnd > planStart);
   assert.match(commit, /appendAudioCycleSnapshot\([\s\S]*at:\s*new Date\(\)\.toISOString\(\)/);
   assert.doesNotMatch(plan, /appendAudioCycleSnapshot|audioCycleSampleRef\.current\s*=/);
+  assert.match(app, /target_absolute_position_ms:\s*plan\.targetAbsolutePositionMs/);
+  assert.doesNotMatch(app, /target_at_ms|remainingWallMs/);
   assert.match(app, /invoke<PrepareAudioCycleCandidateResult>\('prepare_audio_cycle_candidate'/);
   assert.match(app, /invoke<CommitAudioCycleCandidateResult>\('commit_audio_cycle_candidate'/);
   assert.match(app, /'cancel_audio_cycle_candidate'/);
   assert.match(app, /Math\.round\(video\.currentTime \* 1_000\)/);
   const initialStart = app.indexOf("void invoke<ResearchParams>('get_default_local_research_params')");
-  const initialEnd = app.indexOf("void invoke<SpeechToSpeechWorkerCapabilities", initialStart);
+  const initialEnd = app.indexOf('return () => {', initialStart);
   const initial = app.slice(initialStart, initialEnd);
   const reset = app.slice(
     app.indexOf('async function resetResearchParams'),
@@ -194,10 +184,20 @@ test('声音周期仅在提交成功后升级当前快照，且 PortAudio 正式
   assert.doesNotMatch(app, /createScriptProcessor|write_portaudio_pcm/);
   assert.doesNotMatch(app, /portAudioTapRef|portAudioWriteBusyRef/);
   assert.match(app, /const nextActive\s*=\s*requested\s*&&\s*PORTAUDIO_FORMAL_SOURCE_SYNC_READY/);
-  assert.match(app, /invoke\(['"]sync_audio_output_source['"]\s*,\s*\{\s*request:\s*\{\s*position_ms/);
+  assert.match(app, /invoke\(['"]sync_audio_output_source['"]\s*,\s*\{\s*request:\s*\{[\s\S]*absolute_position_ms/);
+  assert.match(app, /playback_generation:[\s\S]*loop_index:[\s\S]*position_ms:[\s\S]*duration_ms:[\s\S]*absolute_position_ms:/);
+  assert.doesNotMatch(app, /recoverAudioCycleCandidate/);
   assert.match(app, /portAudioHardwareEnabled/);
   assert.match(app, /playback_generation:\s*snapshot\?\.playback_generation/);
   assert.match(app, /set_audio_output_backend/);
+  assert.match(app, /const AUTO_PORTAUDIO_ENABLED\s*=\s*true/);
+  assert.doesNotMatch(app, /aria-label="PortAudio 硬件出口"/);
+  assert.doesNotMatch(app, /applyAudioOutputBackend\(checked\)/);
+  assert.match(
+    app,
+    /audioOutputBackend\?\.preferred_portaudio[\s\S]*audioOutputBackend\.hardware_state === 'active'[\s\S]*clearRetryTimer\(\);[\s\S]*return;/,
+    '活动 PortAudio 的源同步只由最终效果窗负责，主窗不能并发抢占候选',
+  );
 });
 
 test('PortAudio 普通播放只有 audio_cycle_output 一个 PCM 生产者', async () => {
@@ -215,6 +215,36 @@ test('PortAudio 普通播放只有 audio_cycle_output 一个 PCM 生产者', asy
   assert.match(audioCycleOutput, /write_stereo_interleaved_available/);
   assert.match(audioCycleOutput, /prime_stereo_interleaved_available/);
   assert.match(audioCycleOutput, /linear_crossfade/);
+});
+
+test('候选版本先校验再替换，PCM 恢复先预热再停旧生产者', async () => {
+  const commands = await readFile(tauriCommandsPath, 'utf8');
+  const app = await readFile(appPath, 'utf8');
+  const prepareStart = commands.indexOf('pub async fn prepare_audio_cycle_candidate');
+  const prepareEnd = commands.indexOf('#[tauri::command]', prepareStart + 20);
+  const prepare = commands.slice(prepareStart, prepareEnd);
+  assert.ok(prepareStart >= 0 && prepareEnd > prepareStart);
+  assert.ok(
+    prepare.indexOf('validate_audio_cycle_candidate_request') < prepare.indexOf('begin_audio_mixer_prepare'),
+    '必须先验证播放代次/revision，再取消或替换 pending 候选',
+  );
+
+  const syncStart = commands.indexOf('fn sync_audio_output_source_blocking');
+  const syncEnd = commands.indexOf('\n#[tauri::command]', syncStart);
+  const sync = commands.slice(syncStart, syncEnd);
+  const recoveryStart = sync.indexOf('if request.recover_unhealthy');
+  const firstPrewarm = sync.indexOf('audio_mixer_task_from_snapshot', recoveryStart);
+  assert.ok(recoveryStart >= 0 && firstPrewarm > recoveryStart);
+  assert.doesNotMatch(sync.slice(recoveryStart, firstPrewarm), /pause_audio_output|stop_audio_mixer|\.clear\(\)/);
+  assert.match(app, /audio_candidate_not_due/);
+  assert.match(app, /audio_candidate_not_ready/);
+  assert.match(app, /audio_candidate_commit_busy/);
+  assert.match(app, /audio_candidate_recovery_in_progress/);
+  assert.match(app, /audio_mixer_candidate_superseded/);
+  assert.match(app, /classifyAudioOutputSync\(status\)/);
+  assert.match(app, /status\.reason_code/);
+  assert.doesNotMatch(app, /`PortAudio 源同步失败，已回退 WebView：\$\{latestFailure\}`/);
+  assert.match(app, /刷新最新声音快照失败[\s\S]*advanceIndependentAudioQueue/);
 });
 
 test('本周期声音预设可点击打开抽屉并展示完整参数值', async () => {
@@ -257,6 +287,6 @@ test('声音状态只展示快照实际支路数，并兼容旧快照与 PortAud
   assert.match(app, /实际混音：\{actualAudioMixLabel\}/);
   assert.match(app, /未上报（兼容旧快照）/);
   assert.match(app, /`\$\{actualAudioStreamVariantCount\} 条支路`/);
-  assert.match(app, /PortAudio 回退到 WebView；多轨当前未进入正式输出。/);
+  assert.match(app, /PortAudio 已回退 WebView/);
   assert.doesNotMatch(app, /const audioMixTrackCount/);
 });

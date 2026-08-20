@@ -17,22 +17,76 @@ test('accepts a valid media state and rejects malformed values', async () => {
     'isPlaybackMediaStateMessage',
   ]);
   assert.equal(isPlaybackMediaStateMessage({
-    version: 1,
+    version: 2,
     type: 'playback-media-state',
     current_time: 2,
     duration: 10,
     volume: 0.8,
     muted: false,
     paused: false,
+    playback_generation: 3,
+    source_revision: 3,
+    clock_epoch: 1,
+    clock_sequence: 7,
+    loop_index: 2,
+    position_ms: 2_000,
+    duration_ms: 10_000,
+    absolute_position_ms: 22_000,
+    playback_rate: 1,
   }), true);
   assert.equal(isPlaybackMediaStateMessage({
-    version: 1,
+    version: 2,
     type: 'playback-media-state',
     current_time: -1,
     duration: 10,
     volume: 0.8,
     muted: false,
     paused: false,
+    playback_generation: 3,
+    source_revision: 3,
+    clock_epoch: 1,
+    clock_sequence: 7,
+    loop_index: 2,
+    position_ms: 2_000,
+    duration_ms: 10_000,
+    absolute_position_ms: 22_000,
+    playback_rate: 1,
+  }), false);
+  assert.equal(isPlaybackMediaStateMessage({
+    version: 2,
+    type: 'playback-media-state',
+    current_time: 2,
+    duration: 10,
+    volume: 0.8,
+    muted: false,
+    paused: false,
+    playback_generation: 3,
+    source_revision: 3,
+    clock_epoch: 1,
+    clock_sequence: 7,
+    loop_index: 2,
+    position_ms: 2_000,
+    duration_ms: 10_000,
+    absolute_position_ms: 22_000,
+    playback_rate: Number.NaN,
+  }), false);
+  assert.equal(isPlaybackMediaStateMessage({
+    version: 2,
+    type: 'playback-media-state',
+    current_time: 2,
+    duration: 10,
+    volume: 0.8,
+    muted: false,
+    paused: false,
+    playback_generation: 3,
+    source_revision: 3,
+    clock_epoch: 1,
+    clock_sequence: 7,
+    loop_index: 2,
+    position_ms: 2_000,
+    duration_ms: 10_000,
+    absolute_position_ms: 12_000,
+    playback_rate: 1,
   }), false);
 });
 
@@ -56,19 +110,69 @@ test('validates control actions and clamps media values', async () => {
     action: 'seek',
     current_time: -1,
   }), false);
+  for (const playbackRate of [0.5, 1, 1.5, 2]) {
+    assert.equal(isPlaybackMediaControlMessage({
+      version: 1,
+      type: 'playback-media-control',
+      action: 'set-playback-rate',
+      playback_rate: playbackRate,
+    }), true);
+  }
+  for (const playbackRate of [0.49, 2.01, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(isPlaybackMediaControlMessage({
+      version: 1,
+      type: 'playback-media-control',
+      action: 'set-playback-rate',
+      playback_rate: playbackRate,
+    }), false);
+  }
   assert.equal(clampMediaTime(-1, 10), 0);
   assert.equal(clampMediaTime(20, 10), 10);
   assert.equal(clampVolume(2), 1);
   assert.equal(formatMediaTime(72.4), '01:12');
 });
 
-test('uses the Rust playback position when the player window state is unavailable', async () => {
-  const { resolvePlaybackPositionMs } = await loadTypeScriptModule('playback-control-message.ts', [
-    'resolvePlaybackPositionMs',
+test('creates an unwrapped playback clock for PortAudio IPC', async () => {
+  const { createAudioSyncClock } = await loadTypeScriptModule('playback-control-message.ts', [
+    'createAudioSyncClock',
   ]);
-  assert.equal(resolvePlaybackPositionMs(2.4, 1_000), 2_400);
-  assert.equal(resolvePlaybackPositionMs(null, 1_000), 1_000);
-  assert.equal(resolvePlaybackPositionMs(undefined, undefined), null);
+  assert.deepEqual(createAudioSyncClock({
+    playbackGeneration: 9,
+    loopIndex: 1,
+    positionMs: 2_700,
+    durationMs: 72_300,
+  }), {
+    playback_generation: 9,
+    loop_index: 1,
+    position_ms: 2_700,
+    duration_ms: 72_300,
+    absolute_position_ms: 75_000,
+  });
+  assert.throws(() => createAudioSyncClock({
+    playbackGeneration: 9,
+    loopIndex: 1,
+    positionMs: 72_301,
+    durationMs: 72_300,
+  }), RangeError);
+});
+
+test('does not reissue playback commands whose target state is already active', async () => {
+  const { shouldIssuePlaybackCommand } = await loadTypeScriptModule('playback-control-message.ts', [
+    'shouldIssuePlaybackCommand',
+  ]);
+  assert.equal(shouldIssuePlaybackCommand('start_playback', 'playing'), false);
+  assert.equal(shouldIssuePlaybackCommand('resume_playback', 'playing'), false);
+  assert.equal(shouldIssuePlaybackCommand('pause_playback', 'paused'), false);
+  assert.equal(shouldIssuePlaybackCommand('stop_playback', 'stopped'), false);
+  assert.equal(shouldIssuePlaybackCommand('pause_playback', 'playing'), true);
+  assert.equal(shouldIssuePlaybackCommand('start_playback', 'ready'), true);
+  assert.equal(shouldIssuePlaybackCommand('stop_playback', null), true);
+});
+
+test('playback actions preserve serialized Tauri command errors', async () => {
+  const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+  assert.match(source, /setError\(getDisplayErrorMessage\(cause, '更新播放状态失败'\)\)/);
+  assert.doesNotMatch(source, /setError\(cause instanceof Error \? cause\.message : '更新播放状态失败'\)/);
 });
 
 test('the final-effect video does not enable browser-native controls', async () => {
@@ -84,4 +188,6 @@ test('the home page exposes media controls through the existing UI', async () =>
   assert.match(source, /静音/);
   assert.match(source, /画中画/);
   assert.match(source, /pictureInPictureVideoRef/);
+  assert.match(source, /action: 'set-playback-rate'/);
+  assert.match(source, /video\.playbackRate = message\.playback_rate/);
 });

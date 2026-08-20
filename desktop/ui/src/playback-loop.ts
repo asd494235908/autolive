@@ -3,12 +3,23 @@ type 播放重启判断输入 = {
   lastRestartToken?: string | number | null;
   mediaGeneration?: number | null;
   lastRestartGeneration?: number | null;
+  syncInFlight?: boolean;
   ended: boolean;
   currentTime?: number;
   duration?: number;
 };
 
 const 接近结束阈值秒 = 0.05;
+
+export function shouldIgnoreLoopBoundaryPause({
+  suppressMediaEvent,
+  ended,
+}: {
+  suppressMediaEvent: boolean;
+  ended: boolean;
+}): boolean {
+  return suppressMediaEvent || ended;
+}
 
 function 读取当前重启令牌({
   restartToken,
@@ -39,10 +50,14 @@ export function shouldRestartPlayback({
   lastRestartToken,
   mediaGeneration,
   lastRestartGeneration,
+  syncInFlight,
   ended,
   currentTime,
   duration,
 }: 播放重启判断输入): boolean {
+  if (syncInFlight) {
+    return false;
+  }
   const currentRestartToken = 读取当前重启令牌({ restartToken, mediaGeneration });
   const previousRestartToken = 读取上次重启令牌({
     lastRestartToken,

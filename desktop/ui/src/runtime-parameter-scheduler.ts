@@ -719,6 +719,19 @@ export type SubtleVideoSample = {
   color_space_conversion_strength_percent: number;
 };
 
+export type VideoCycleSample = {
+  seed: number;
+  values: SubtleVideoSample;
+};
+
+export function sampleVideoCycle(seed = Math.floor(Math.random() * 0x7fffffff)): VideoCycleSample {
+  const normalizedSeed = Number.isFinite(seed) ? Math.floor(seed) >>> 0 : 0;
+  return {
+    seed: normalizedSeed,
+    values: sampleSubtleVideoParams(mulberry32(normalizedSeed)),
+  };
+}
+
 /** FFmpeg 已映射的视频微扰；未映射字段保持契约默认，避免 Worker 拒渲染。 */
 export function sampleSubtleVideoParams(random = Math.random): SubtleVideoSample {
   const inRange = (min: number, max: number) => min + random() * (max - min);

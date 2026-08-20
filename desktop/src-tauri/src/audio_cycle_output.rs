@@ -12,6 +12,9 @@ use crate::audio_mixer::{
     AudioMixerTrack, AUDIO_CANDIDATE_COMMIT_TAIL_MS, AUDIO_CROSSFADE_MS,
     AUDIO_POST_CROSSFADE_TAIL_MS,
 };
+use crate::audio_output_diagnostic::{
+    AudioLowFrequencyDiagnosticSnapshot, LowFrequencyDiagnosticAnalyzer,
+};
 
 const OUTPUT_CHANNELS: usize = 2;
 type CrossfadePair = (Vec<f32>, Vec<f32>);
@@ -22,7 +25,6 @@ const STARTUP_TIMEOUT: Duration = Duration::from_millis(5_000);
 const CROSSFADE_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 const RING_CLEAR_TIMEOUT: Duration = Duration::from_millis(500);
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
-const INITIAL_PRIME_MS: usize = 50;
 pub const AUDIO_CYCLE_CROSSFADE_MS: usize = AUDIO_CROSSFADE_MS;
 
 type ControlResponse = mpsc::Sender<Result<(), String>>;
@@ -44,6 +46,8 @@ pub struct AudioCycleOutputStatus {
     pub device_index: Option<i32>,
     pub memory_buffer_kib: u32,
     pub frames_per_buffer: u32,
+    /// 由采样率和硬件 callback 帧数计算的有效播放水位，不等于内存容量。
+    pub playback_watermark_ms: u64,
     pub callback_paused: bool,
     /// 依据 callback 已消费 frame 和实际硬件延迟估算的当前可听媒体绝对时间。
     pub timeline_media_position_ms: Option<u64>,
@@ -169,6 +173,7 @@ fn estimate_media_position_ms(
 pub struct AudioCycleOutputControl {
     commands: mpsc::SyncSender<OutputCommand>,
     status: Arc<Mutex<AudioCycleOutputStatus>>,
+    diagnostic: Arc<Mutex<AudioLowFrequencyDiagnosticSnapshot>>,
     failure: Arc<Mutex<Option<String>>>,
 }
 
@@ -181,10 +186,14 @@ pub struct AudioCycleOutputTask {
 impl AudioCycleOutputTask {
     pub fn start(config: AudioOutputConfig) -> Result<Self, String> {
         let status = Arc::new(Mutex::new(initial_status(config)));
+        let diagnostic = Arc::new(Mutex::new(AudioLowFrequencyDiagnosticSnapshot::empty(
+            config.sample_rate_hz,
+        )));
         let failure = Arc::new(Mutex::new(None));
         let (commands, receiver) = mpsc::sync_channel(8);
         let (startup, startup_receiver) = mpsc::channel();
         let worker_status = Arc::clone(&status);
+        let worker_diagnostic = Arc::clone(&diagnostic);
         let worker_failure = Arc::clone(&failure);
         let handle = thread::Builder::new()
             .name("autolive-audio-cycle-output".to_owned())
@@ -207,7 +216,13 @@ impl AudioCycleOutputTask {
                 }
                 update_status(&worker_status, &output, None);
                 let _ = startup.send(Ok(()));
-                output_loop(receiver, output, worker_status, worker_failure);
+                output_loop(
+                    receiver,
+                    output,
+                    worker_status,
+                    worker_diagnostic,
+                    worker_failure,
+                );
             })
             .map_err(|error| format!("启动音频周期输出线程失败：{error}"))?;
         match startup_receiver.recv_timeout(STARTUP_TIMEOUT) {
@@ -215,6 +230,7 @@ impl AudioCycleOutputTask {
                 control: AudioCycleOutputControl {
                     commands,
                     status,
+                    diagnostic,
                     failure,
                 },
                 handle: Some(handle),
@@ -319,6 +335,10 @@ impl AudioCycleOutputControl {
         self.failure.lock().ok().and_then(|failure| failure.clone())
     }
 
+    pub fn diagnostic(&self) -> Option<AudioLowFrequencyDiagnosticSnapshot> {
+        self.diagnostic.lock().ok().map(|diagnostic| *diagnostic)
+    }
+
     fn request(
         &self,
         command: impl FnOnce(ControlResponse) -> OutputCommand,
@@ -337,11 +357,17 @@ fn output_loop(
     commands: mpsc::Receiver<OutputCommand>,
     mut output: autolive_portaudio_output::PortAudioOutput,
     status: Arc<Mutex<AudioCycleOutputStatus>>,
+    diagnostic: Arc<Mutex<AudioLowFrequencyDiagnosticSnapshot>>,
     failure: Arc<Mutex<Option<String>>>,
 ) {
     let sample_rate_hz = output.sample_rate_hz();
     let output_chunk_samples = OUTPUT_CHUNK_FRAMES * OUTPUT_CHANNELS;
-    let initial_prime_samples = stereo_samples_for_ms(sample_rate_hz, INITIAL_PRIME_MS);
+    let initial_prime_samples = output.target_playback_watermark_samples();
+    let initial_prime_ms = stereo_samples_duration_ms(
+        initial_prime_samples,
+        sample_rate_hz,
+        usize::from(output.channels().max(1)),
+    );
     let crossfade_samples = stereo_samples_for_ms(sample_rate_hz, AUDIO_CYCLE_CROSSFADE_MS);
     let minimum_candidate_samples =
         stereo_samples_for_ms(sample_rate_hz, AUDIO_CANDIDATE_COMMIT_TAIL_MS);
@@ -350,6 +376,7 @@ fn output_loop(
     let mut pending_output = VecDeque::<f32>::new();
     let mut tone_state: Option<ToneState> = None;
     let mut timeline = OutputTimeline::default();
+    let mut diagnostic_analyzer = LowFrequencyDiagnosticAnalyzer::new(sample_rate_hz);
     let mut paused = output.is_callback_paused();
     let mut last_status_refresh = Instant::now();
 
@@ -364,9 +391,11 @@ fn output_loop(
                     fail_pending_switch(&mut pending_crossfade, "音频输出被新当前轨替换");
                     pending_output.clear();
                     tone_state = None;
+                    diagnostic_analyzer.reset();
+                    publish_diagnostic(&diagnostic, &mut diagnostic_analyzer);
                     if track.available_samples() < initial_prime_samples {
                         let _ = response.send(Err(format!(
-                            "当前音轨不足 {INITIAL_PRIME_MS}ms，不能启动单一输出混音器"
+                            "当前音轨不足 {initial_prime_ms}ms，不能启动单一输出混音器"
                         )));
                         continue;
                     }
@@ -381,6 +410,7 @@ fn output_loop(
                         Ok(Some(samples)) => {
                             match output.prime_stereo_interleaved_available(&samples) {
                                 Ok(written) if written == samples.len() => {
+                                    diagnostic_analyzer.observe_stereo_pcm(&samples);
                                     current = Some(track);
                                     let health = output.stream_health();
                                     timeline.active = Some(TimelineAnchor {
@@ -394,10 +424,9 @@ fn output_loop(
                                     let _ = response.send(Ok(()));
                                 }
                                 Ok(_) => {
-                                    let _ =
-                                        response
-                                            .send(Err("PortAudio 环缓无法原子接收初始 50ms PCM"
-                                                .to_owned()));
+                                    let _ = response.send(Err(format!(
+                                        "PortAudio 环缓无法原子接收初始 {initial_prime_ms}ms PCM"
+                                    )));
                                 }
                                 Err(error) => {
                                     let _ = response.send(Err(error));
@@ -406,7 +435,7 @@ fn output_loop(
                         }
                         Ok(None) => {
                             let _ = response.send(Err(format!(
-                                "当前音轨在提交期间意外不足 {INITIAL_PRIME_MS}ms"
+                                "当前音轨在提交期间意外不足 {initial_prime_ms}ms"
                             )));
                         }
                         Err(error) => {
@@ -468,13 +497,21 @@ fn output_loop(
                     fail_pending_switch(&mut pending_crossfade, "音频输出已暂停");
                     paused = true;
                     output.set_callback_paused(true);
+                    update_status(&status, &output, Some(&mut timeline));
                     let _ = response.send(Ok(()));
                 }
                 OutputCommand::Resume(response) => {
+                    if let Err(error) =
+                        validate_resume_request(current.is_some(), tone_state.is_some())
+                    {
+                        let _ = response.send(Err(error.to_owned()));
+                        continue;
+                    }
                     if tone_state.is_none() {
                         paused = false;
                         output.set_callback_paused(false);
                     }
+                    update_status(&status, &output, Some(&mut timeline));
                     let _ = response.send(Ok(()));
                 }
                 OutputCommand::Clear(response) => {
@@ -483,6 +520,8 @@ fn output_loop(
                     current = None;
                     tone_state = None;
                     timeline = OutputTimeline::default();
+                    diagnostic_analyzer.reset();
+                    publish_diagnostic(&diagnostic, &mut diagnostic_analyzer);
                     paused = true;
                     output.set_callback_paused(true);
                     let _ = response.send(clear_ring_synchronously(&mut output));
@@ -492,6 +531,8 @@ fn output_loop(
                     output.set_callback_paused(true);
                     output.clear_ring();
                     output.stop();
+                    diagnostic_analyzer.reset();
+                    publish_diagnostic(&diagnostic, &mut diagnostic_analyzer);
                     update_status(&status, &output, Some(&mut timeline));
                     let _ = response.send(Ok(()));
                     return;
@@ -501,10 +542,11 @@ fn output_loop(
 
         if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
             update_status(&status, &output, Some(&mut timeline));
+            publish_diagnostic(&diagnostic, &mut diagnostic_analyzer);
             last_status_refresh = Instant::now();
         }
 
-        // 初次 SetCurrent 需要在 callback 暂停时把固定 50ms PCM 填入环缓；
+        // 初次 SetCurrent 需要在 callback 暂停时填入完整有效水位；
         // 仅在没有待写数据时暂停继续消费当前轨。
         if tone_state.is_none() && paused && pending_output.is_empty() {
             thread::sleep(OUTPUT_RETRY_INTERVAL);
@@ -549,11 +591,18 @@ fn output_loop(
                     thread::sleep(OUTPUT_RETRY_INTERVAL);
                     continue;
                 }
-                match take_crossfade_pair(old, &switch.next, crossfade_samples) {
+                let fade_in_from_silence = output.ring_len_samples() == 0;
+                match take_crossfade_pair_or_fade_in(
+                    old,
+                    &switch.next,
+                    crossfade_samples,
+                    fade_in_from_silence,
+                ) {
                     Ok(Some((old_samples, next_samples))) => {
                         let mixed = linear_crossfade(&old_samples, &next_samples);
                         match output.prime_stereo_interleaved_available(&mixed) {
                             Ok(written) if written == mixed.len() => {
+                                diagnostic_analyzer.observe_stereo_pcm(&mixed);
                                 current = Some(switch.next);
                                 let health = output.stream_health();
                                 let ring_frames_before_fade = u64::try_from(
@@ -583,6 +632,17 @@ fn output_loop(
                         }
                     }
                     Ok(None) if Instant::now() < switch.deadline => {
+                        if let Err(error) = refill_pending_output_from_current(
+                            old,
+                            &mut pending_output,
+                            output_chunk_samples,
+                        ) {
+                            let _ = switch.response.send(Err(error.clone()));
+                            set_failure(&failure, error);
+                            output.stop();
+                            update_status(&status, &output, Some(&mut timeline));
+                            return;
+                        }
                         pending_crossfade = Some(switch);
                     }
                     Ok(None) => {
@@ -597,14 +657,15 @@ fn output_loop(
                     }
                 }
             } else if let Some(track) = current.as_ref() {
-                match track.take_up_to(output_chunk_samples) {
-                    Ok(samples) => pending_output.extend(samples),
-                    Err(error) => {
-                        set_failure(&failure, error);
-                        output.stop();
-                        update_status(&status, &output, Some(&mut timeline));
-                        return;
-                    }
+                if let Err(error) = refill_pending_output_from_current(
+                    track,
+                    &mut pending_output,
+                    output_chunk_samples,
+                ) {
+                    set_failure(&failure, error);
+                    output.stop();
+                    update_status(&status, &output, Some(&mut timeline));
+                    return;
                 }
             }
         }
@@ -622,7 +683,9 @@ fn output_loop(
         match output.write_stereo_interleaved_available(&write_chunk) {
             Ok(0) => thread::sleep(OUTPUT_RETRY_INTERVAL),
             Ok(written) => {
-                pending_output.drain(..written.min(pending_output.len()));
+                let observed = written.min(write_chunk.len());
+                diagnostic_analyzer.observe_stereo_pcm(&write_chunk[..observed]);
+                pending_output.drain(..observed.min(pending_output.len()));
             }
             Err(error) => {
                 fail_pending_switch(&mut pending_crossfade, &error);
@@ -633,6 +696,17 @@ fn output_loop(
             }
         }
     }
+}
+
+fn refill_pending_output_from_current(
+    current: &AudioMixerTrack,
+    pending_output: &mut VecDeque<f32>,
+    output_chunk_samples: usize,
+) -> Result<(), String> {
+    if pending_output.is_empty() {
+        pending_output.extend(current.take_up_to(output_chunk_samples)?);
+    }
+    Ok(())
 }
 
 fn take_crossfade_pair(
@@ -651,6 +725,24 @@ fn take_crossfade_pair(
         return Err("候选 PCM 在交叉淡化提交期间意外不足".to_owned());
     };
     Ok(Some((old_samples, next_samples)))
+}
+
+fn take_crossfade_pair_or_fade_in(
+    old: &AudioMixerTrack,
+    next: &AudioMixerTrack,
+    sample_count: usize,
+    fade_in_from_silence: bool,
+) -> Result<Option<CrossfadePair>, String> {
+    if old.available_samples() >= sample_count {
+        return take_crossfade_pair(old, next, sample_count);
+    }
+    if !fade_in_from_silence {
+        return Ok(None);
+    }
+    let Some(next_samples) = next.take_exact(sample_count)? else {
+        return Ok(None);
+    };
+    Ok(Some((vec![0.0; sample_count], next_samples)))
 }
 
 fn linear_crossfade(old: &[f32], next: &[f32]) -> Vec<f32> {
@@ -702,6 +794,13 @@ fn build_test_tone(sample_rate_hz: u32, tone: AudioTestTone) -> Vec<f32> {
     samples
 }
 
+fn validate_resume_request(has_current_track: bool, tone_active: bool) -> Result<(), &'static str> {
+    if !has_current_track && !tone_active {
+        return Err("当前音轨不存在，拒绝恢复空的 PortAudio 输出");
+    }
+    Ok(())
+}
+
 fn clear_ring_synchronously(
     output: &mut autolive_portaudio_output::PortAudioOutput,
 ) -> Result<(), String> {
@@ -727,6 +826,11 @@ fn status_from_output(
         device_index: output.device_index(),
         memory_buffer_kib: output.ring_capacity_kib(),
         frames_per_buffer: output.frames_per_buffer(),
+        playback_watermark_ms: stereo_samples_duration_ms(
+            output.target_playback_watermark_samples(),
+            output.sample_rate_hz(),
+            usize::from(output.channels().max(1)),
+        ),
         callback_paused: output.is_callback_paused(),
         timeline_media_position_ms,
     }
@@ -755,6 +859,15 @@ fn initial_status(config: AudioOutputConfig) -> AudioCycleOutputStatus {
         device_index: config.device_index,
         memory_buffer_kib: config.memory_buffer_kib,
         frames_per_buffer: config.frames_per_buffer,
+        playback_watermark_ms: stereo_samples_duration_ms(
+            autolive_portaudio_output::playback_watermark_samples(
+                config.sample_rate_hz,
+                config.channels,
+                config.frames_per_buffer,
+            ),
+            config.sample_rate_hz,
+            usize::from(config.channels.max(1)),
+        ),
         callback_paused: true,
         timeline_media_position_ms: None,
     }
@@ -769,6 +882,16 @@ fn update_status(
         timeline.and_then(|timeline| timeline.media_position_ms(output));
     if let Ok(mut status) = status.lock() {
         *status = status_from_output(output, timeline_media_position_ms);
+    }
+}
+
+fn publish_diagnostic(
+    diagnostic: &Arc<Mutex<AudioLowFrequencyDiagnosticSnapshot>>,
+    analyzer: &mut LowFrequencyDiagnosticAnalyzer,
+) {
+    let snapshot = analyzer.snapshot();
+    if let Ok(mut current) = diagnostic.lock() {
+        *current = snapshot;
     }
 }
 
@@ -796,12 +919,28 @@ fn stereo_samples_for_ms(sample_rate_hz: u32, duration_ms: usize) -> usize {
     .unwrap_or(usize::MAX)
 }
 
+fn stereo_samples_duration_ms(samples: usize, sample_rate_hz: u32, channels: usize) -> u64 {
+    (samples as u64 / channels.max(1) as u64)
+        .saturating_mul(1_000)
+        .saturating_div(u64::from(sample_rate_hz.max(1)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_test_tone, estimate_media_position_ms, linear_crossfade, stereo_samples_for_ms,
-        AudioTestTone, TimelineAnchor, AUDIO_CYCLE_CROSSFADE_MS,
+        build_test_tone, estimate_media_position_ms, linear_crossfade,
+        refill_pending_output_from_current, stereo_samples_for_ms, take_crossfade_pair_or_fade_in,
+        validate_resume_request, AudioMixerTrack, AudioTestTone, TimelineAnchor,
+        AUDIO_CYCLE_CROSSFADE_MS,
     };
+    use std::collections::VecDeque;
+
+    #[test]
+    fn resume_rejects_an_empty_output_track() {
+        assert!(validate_resume_request(false, false).is_err());
+        assert!(validate_resume_request(true, false).is_ok());
+        assert!(validate_resume_request(false, true).is_ok());
+    }
 
     #[test]
     fn crossfade_is_exactly_thirty_milliseconds_at_supported_rates() {
@@ -847,6 +986,32 @@ mod tests {
         assert_eq!(mixed[2], 0.25);
         assert_eq!(mixed[3], -0.25);
         assert!(mixed.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn silent_current_track_can_recover_from_a_preheated_candidate() {
+        let old = AudioMixerTrack::from_samples(VecDeque::new());
+        let next = AudioMixerTrack::from_samples(VecDeque::from([1.0, 1.0, 0.5, 0.5]));
+
+        assert!(take_crossfade_pair_or_fade_in(&old, &next, 4, false)
+            .unwrap()
+            .is_none());
+        let (old_samples, next_samples) = take_crossfade_pair_or_fade_in(&old, &next, 4, true)
+            .unwrap()
+            .expect("silent recovery must use the ready candidate");
+        assert_eq!(old_samples, vec![0.0; 4]);
+        assert_eq!(next_samples, vec![1.0, 1.0, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn current_track_keeps_feeding_output_while_crossfade_waits() {
+        let current = AudioMixerTrack::from_samples(VecDeque::from([0.1, 0.1, 0.2, 0.2]));
+        let mut pending_output = VecDeque::new();
+
+        refill_pending_output_from_current(&current, &mut pending_output, 2).unwrap();
+
+        assert_eq!(pending_output, VecDeque::from([0.1, 0.1]));
+        assert_eq!(current.available_samples(), 2);
     }
 
     #[test]

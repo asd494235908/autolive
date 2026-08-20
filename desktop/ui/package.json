@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "test": "node --test src/heartbeatOutbox.test.mjs src/runtimeResources.test.mjs src/runtime-parameter-scheduler.test.mjs src/audio-cycle-prewarm-coordinator.test.mjs src/audioCycleSnapshot.test.mjs src/audio-playback-sync.test.mjs src/playback-loop.test.mjs src/playback-control-message.test.mjs src/fixedSpeech.test.mjs src/fixedSpeechPresets.test.mjs src/desktop-three-column-layout.test.mjs src/interlude-player.test.mjs src/fixed-speech-playback.test.mjs src/startup-loader.test.mjs src/startup-entry.test.mjs src/startup-scheduler.test.mjs ../tools/prepare-ffmpeg-resources.test.mjs ../tools/start-desktop-dev.test.mjs ../tools/desktop-version.test.mjs ../tools/generate-runtime-resource-tree.test.mjs ../tools/lightweight-desktop-build.test.mjs",
+    "test": "node --test src/heartbeatOutbox.test.mjs src/runtimeResources.test.mjs src/runtime-parameter-scheduler.test.mjs src/media-cycle-planner.test.mjs src/audio-cycle-prewarm-coordinator.test.mjs src/audio-output-recovery.test.mjs src/audioCycleSnapshot.test.mjs src/audio-playback-sync.test.mjs src/playback-loop.test.mjs src/playback-control-message.test.mjs src/fixedSpeech.test.mjs src/fixedSpeechPresets.test.mjs src/desktop-layout-contract.test.mjs src/desktop-three-column-layout.test.mjs src/interlude-player.test.mjs src/fixed-speech-playback.test.mjs src/startup-loader.test.mjs src/startup-entry.test.mjs src/startup-scheduler.test.mjs ../tools/prepare-ffmpeg-resources.test.mjs ../tools/start-desktop-dev.test.mjs ../tools/desktop-version.test.mjs ../tools/generate-runtime-resource-tree.test.mjs ../tools/lightweight-desktop-build.test.mjs",
     "preview": "vite preview",
     "tauri:dev": "node ../tools/start-desktop-dev.mjs",
     "ffmpeg:prepare": "node ../tools/prepare-ffmpeg-resources.mjs",
@@ -15,6 +15,7 @@
     "tauri:build:prepared-resources": "node ../tools/prepare-ffmpeg-resources.mjs && node ../tools/generate-runtime-resource-tree.mjs && node ../tools/build-desktop-artifact.mjs"
   },
   "dependencies": {
+    "@ant-design/icons": "^5.6.1",
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-dialog": "^2.4.0",
     "@tauri-apps/plugin-http": "^2.5.9",

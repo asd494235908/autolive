@@ -5,7 +5,6 @@ use std::time::Instant;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AudioMixerSourceIdentity {
     pub(crate) playback_generation: u64,
-    pub(crate) loop_index: u64,
     pub(crate) source_path: Option<String>,
     pub(crate) current_video_reference: Option<String>,
     pub(crate) current_audio_source: Option<String>,
@@ -16,14 +15,9 @@ pub(crate) struct AudioMixerSourceIdentity {
 }
 
 impl AudioMixerSourceIdentity {
-    pub(crate) fn matches_playing(
-        &self,
-        snapshot: &PlaybackSnapshot,
-        expected_loop_index: u64,
-    ) -> bool {
+    pub(crate) fn matches_playing(&self, snapshot: &PlaybackSnapshot) -> bool {
         snapshot.playback_state == PlaybackState::Playing
             && snapshot.playback_generation == self.playback_generation
-            && snapshot.loop_index == expected_loop_index
             && snapshot
                 .source_media
                 .as_ref()
@@ -42,7 +36,6 @@ impl From<&PlaybackSnapshot> for AudioMixerSourceIdentity {
     fn from(snapshot: &PlaybackSnapshot) -> Self {
         Self {
             playback_generation: snapshot.playback_generation,
-            loop_index: snapshot.loop_index,
             source_path: snapshot
                 .source_media
                 .as_ref()
@@ -61,7 +54,6 @@ impl From<&PlaybackSnapshot> for AudioMixerSourceIdentity {
 pub(crate) struct AudioCycleCandidate {
     pub(crate) candidate_id: u64,
     pub(crate) configuration: ValidatedAudioStreamConfiguration,
-    pub(crate) target_loop_index: u64,
     pub(crate) target_absolute_position_ms: u64,
 }
 
@@ -77,8 +69,8 @@ pub(crate) struct PendingAudioMixerTask {
     pub(crate) task: AudioMixerTask,
     pub(crate) source_identity: AudioMixerSourceIdentity,
     pub(crate) sample_rate_hz: u32,
-    pub(crate) observed_position_ms: u64,
-    pub(crate) candidate_start_position_ms: u64,
+    pub(crate) observed_absolute_position_ms: u64,
+    pub(crate) candidate_start_absolute_position_ms: u64,
     pub(crate) preparation_started_at: Instant,
     pub(crate) playback_rate: f64,
     pub(crate) kind: PendingAudioMixerKind,
@@ -89,13 +81,6 @@ impl PendingAudioMixerTask {
         match &self.kind {
             PendingAudioMixerKind::SourceSync => None,
             PendingAudioMixerKind::AudioCycle(candidate) => Some(candidate.candidate_id),
-        }
-    }
-
-    pub(crate) fn expected_loop_index(&self) -> u64 {
-        match &self.kind {
-            PendingAudioMixerKind::SourceSync => self.source_identity.loop_index,
-            PendingAudioMixerKind::AudioCycle(candidate) => candidate.target_loop_index,
         }
     }
 

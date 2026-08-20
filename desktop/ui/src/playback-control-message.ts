@@ -1,17 +1,41 @@
 export type PlaybackMediaStateMessage = {
-  version: 1;
+  version: 2;
   type: 'playback-media-state';
   current_time: number;
   duration: number;
   volume: number;
   muted: boolean;
   paused: boolean;
+  playback_generation: number;
+  source_revision: number;
+  clock_epoch: number;
+  clock_sequence: number;
+  loop_index: number;
+  position_ms: number;
+  duration_ms: number;
+  absolute_position_ms: number;
+  playback_rate: number;
 };
 
 export type PlaybackMediaControlMessage =
   | { version: 1; type: 'playback-media-control'; action: 'seek'; current_time: number }
   | { version: 1; type: 'playback-media-control'; action: 'set-volume'; volume: number }
+  | { version: 1; type: 'playback-media-control'; action: 'set-playback-rate'; playback_rate: number }
   | { version: 1; type: 'playback-media-control'; action: 'toggle-muted' };
+
+export type AudioSyncClock = {
+  playback_generation: number;
+  loop_index: number;
+  position_ms: number;
+  duration_ms: number;
+  absolute_position_ms: number;
+};
+
+export type PlaybackCommand =
+  | 'pause_playback'
+  | 'resume_playback'
+  | 'stop_playback'
+  | 'start_playback';
 
 function isFiniteNonNegative(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
@@ -21,17 +45,53 @@ function isVolume(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
 }
 
+function isPlaybackRate(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0.5 && value <= 2;
+}
+
+function isSafeNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function hasConsistentAbsoluteClock(
+  loopIndex: number,
+  positionMs: number,
+  durationMs: number,
+  absolutePositionMs: number,
+): boolean {
+  if (positionMs > durationMs || (durationMs === 0 && loopIndex !== 0)) return false;
+  const expected = loopIndex * durationMs + positionMs;
+  return Number.isSafeInteger(expected) && expected === absolutePositionMs;
+}
+
 export function isPlaybackMediaStateMessage(value: unknown): value is PlaybackMediaStateMessage {
   if (!value || typeof value !== 'object') return false;
   const record = value as Record<string, unknown>;
   return (
-    record.version === 1 &&
+    record.version === 2 &&
     record.type === 'playback-media-state' &&
     isFiniteNonNegative(record.current_time) &&
     isFiniteNonNegative(record.duration) &&
     isVolume(record.volume) &&
     typeof record.muted === 'boolean' &&
-    typeof record.paused === 'boolean'
+    typeof record.paused === 'boolean' &&
+    isSafeNonNegativeInteger(record.playback_generation) &&
+    isSafeNonNegativeInteger(record.source_revision) &&
+    isSafeNonNegativeInteger(record.clock_epoch) &&
+    isSafeNonNegativeInteger(record.clock_sequence) &&
+    isSafeNonNegativeInteger(record.loop_index) &&
+    isSafeNonNegativeInteger(record.position_ms) &&
+    isSafeNonNegativeInteger(record.duration_ms) &&
+    isSafeNonNegativeInteger(record.absolute_position_ms) &&
+    hasConsistentAbsoluteClock(
+      record.loop_index,
+      record.position_ms,
+      record.duration_ms,
+      record.absolute_position_ms,
+    ) &&
+    typeof record.playback_rate === 'number' &&
+    Number.isFinite(record.playback_rate) &&
+    record.playback_rate > 0
   );
 }
 
@@ -41,6 +101,7 @@ export function isPlaybackMediaControlMessage(value: unknown): value is Playback
   if (record.version !== 1 || record.type !== 'playback-media-control') return false;
   if (record.action === 'seek') return isFiniteNonNegative(record.current_time);
   if (record.action === 'set-volume') return isVolume(record.volume);
+  if (record.action === 'set-playback-rate') return isPlaybackRate(record.playback_rate);
   return record.action === 'toggle-muted';
 }
 
@@ -62,14 +123,42 @@ export function formatMediaTime(seconds: number): string {
   return `${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`;
 }
 
-export function resolvePlaybackPositionMs(
-  currentTimeSeconds: number | null | undefined,
-  fallbackPositionMs: number | null | undefined,
-): number | null {
-  if (typeof currentTimeSeconds === 'number' && Number.isFinite(currentTimeSeconds) && currentTimeSeconds >= 0) {
-    return Math.round(currentTimeSeconds * 1000);
+export function shouldIssuePlaybackCommand(
+  command: PlaybackCommand,
+  playbackState: string | null | undefined,
+): boolean {
+  const state = playbackState?.toLowerCase();
+  if ((command === 'start_playback' || command === 'resume_playback') && state === 'playing') return false;
+  if (command === 'pause_playback' && state === 'paused') return false;
+  return command !== 'stop_playback' || state !== 'stopped';
+}
+
+export function createAudioSyncClock(input: {
+  playbackGeneration: number;
+  loopIndex: number;
+  positionMs: number;
+  durationMs: number;
+}): AudioSyncClock {
+  const { playbackGeneration, loopIndex, positionMs, durationMs } = input;
+  if (
+    !isSafeNonNegativeInteger(playbackGeneration)
+    || !isSafeNonNegativeInteger(loopIndex)
+    || !isSafeNonNegativeInteger(positionMs)
+    || !isSafeNonNegativeInteger(durationMs)
+    || durationMs <= 0
+    || positionMs > durationMs
+  ) {
+    throw new RangeError('播放绝对媒体时钟参数无效');
   }
-  return typeof fallbackPositionMs === 'number' && Number.isFinite(fallbackPositionMs) && fallbackPositionMs >= 0
-    ? fallbackPositionMs
-    : null;
+  const absolutePositionMs = loopIndex * durationMs + positionMs;
+  if (!Number.isSafeInteger(absolutePositionMs)) {
+    throw new RangeError('播放绝对媒体时钟超出安全整数范围');
+  }
+  return {
+    playback_generation: playbackGeneration,
+    loop_index: loopIndex,
+    position_ms: positionMs,
+    duration_ms: durationMs,
+    absolute_position_ms: absolutePositionMs,
+  };
 }

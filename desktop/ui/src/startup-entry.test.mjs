@@ -24,24 +24,40 @@ test('HTML 入口在 React 执行前提供静态启动反馈', async () => {
   assert.match(source, /animation/);
 });
 
-test('启动壳使用 Ant Design 默认浅色主题色', async () => {
+test('静态与 React 启动壳使用一致的深色主题色', async () => {
   const html = await readSource('../index.html');
   const loading = await readSource('startup-loader.tsx');
 
-  assert.match(html, /color-scheme:\s*light/);
-  assert.match(html, /background:\s*#fff/);
-  assert.match(html, /#1677ff/);
-  assert.match(html, /rgba\(0, 0, 0, 0\.88\)/);
-  assert.match(loading, /background: '#fff'/);
-  assert.match(loading, /color: 'rgba\(0, 0, 0, 0\.88\)'/);
-  assert.match(loading, /borderTopColor: '#1677ff'/);
+  for (const color of ['#0b0b0f', '#f7f7f8', '#9a9aa3', '#31d7aa']) {
+    assert.match(html, new RegExp(color));
+    assert.match(loading, new RegExp(color));
+  }
+  assert.match(html, /color-scheme:\s*dark/);
+  assert.doesNotMatch(html, /linear-gradient|radial-gradient/);
+  assert.doesNotMatch(loading, /linear-gradient|radial-gradient/);
 });
 
-test('主窗口允许页面纵向滚动，滚动锁仅由最终效果窗口使用', async () => {
+test('主窗口锁定 body 滚动，避免懒加载期间出现白闪和页面级滚动', async () => {
   const html = await readSource('../index.html');
 
-  assert.match(html, /body\s*\{[\s\S]*overflow-y:\s*auto;/);
-  assert.doesNotMatch(html, /body\s*\{[\s\S]*overflow:\s*hidden;/);
+  assert.match(html, /body\s*\{[^}]*overflow:\s*hidden;/);
+  assert.doesNotMatch(html, /body\s*\{[^}]*overflow-y:\s*auto;/);
+});
+
+test('Tauri 主窗口使用参考图尺寸、深色背景和无原生装饰', async () => {
+  const source = await readFile(new URL('../../src-tauri/tauri.conf.json', import.meta.url), 'utf8');
+  const config = JSON.parse(source);
+  const mainWindow = config.app.windows.find((window) => window.label === 'main');
+
+  assert.ok(mainWindow);
+  assert.equal(mainWindow.width, 1728);
+  assert.equal(mainWindow.height, 1044);
+  assert.equal(mainWindow.minWidth, 960);
+  assert.equal(mainWindow.minHeight, 680);
+  assert.equal(mainWindow.backgroundColor, '#0b0b0f');
+  assert.equal(mainWindow.decorations, false);
+  assert.equal(mainWindow.resizable, true);
+  assert.equal(mainWindow.center, true);
 });
 
 test('React 入口懒加载 App 并提供 Suspense 与错误恢复', async () => {
@@ -72,7 +88,7 @@ test('Ant Design 动态样式复用 Tauri 注入的 CSP nonce', async () => {
   const app = await readSource('App.tsx');
   const nonce = await readSource('cspNonce.ts');
 
-  assert.match(app, /<ConfigProvider\s+csp=\{\{\s*nonce:\s*getCspNonce\(\)\s*\}\}>/);
+  assert.match(app, /<ConfigProvider\s+csp=\{\{\s*nonce:\s*getCspNonce\(\)\s*\}\}/);
   assert.match(nonce, /querySelector<HTMLStyleElement>\('style\[nonce\]'\)/);
   assert.match(nonce, /style\?\.nonce/);
 });
@@ -218,19 +234,21 @@ test('导入文件选择器只开放确认的视频扩展名', async () => {
   assert.match(source, /filters: \[\{ name: '视频文件', extensions: \[\.\.\.SUPPORTED_VIDEO_EXTENSIONS\] \}\]/);
 });
 
-test('声音面板展示 FFmpeg 参数并保持实时话术独立', async () => {
+test('高级声音抽屉展示 FFmpeg 参数且主窗口不暴露实时话术', async () => {
   const source = await readSource('App.tsx');
+  const capability = await readSource('audio-processing-capabilities.ts');
   for (const field of ['input_gain_db', 'output_gain_db', 'loudness_adjustment_db', 'low_eq_db', 'mid_eq_db', 'high_eq_db', 'noise_reduction_percent', 'phase_perturbation_percent', 'vibrato_frequency_hz', 'environment_noise_percent', 'sample_rate_hz', 'output_bitrate_kbps']) {
-    assert.match(source, new RegExp(`researchParams\\.audio\\.${field}`), field);
+    assert.match(capability, new RegExp(field), field);
   }
-  assert.match(source, /音频实时参数与生效状态/);
-  assert.match(source, /配置字段：\{audioCapabilityRows\.length\} 项/);
-  assert.match(source, /应用音频参数/);
-  assert.match(source, /aria-label="实时话术幻化"/);
-  assert.match(source, /aria-label="声音周期最小秒"/);
-  assert.match(source, /aria-label="声音周期最大秒"/);
-  assert.match(source, /aria-label="视频周期最小秒"/);
-  assert.match(source, /aria-label="视频周期最大秒"/);
+  assert.match(source, /title="高级声音设置"/);
+  assert.match(source, /audioCapabilityRows/);
+  assert.match(source, /row\.key !== 'spectral_perturbation_percent'/);
+  assert.match(source, /应用声音参数/);
+  assert.doesNotMatch(source.slice(source.indexOf('function DesktopApp()')), /实时话术幻化/);
+  assert.match(source, /ariaLabel="声音周期最小秒"/);
+  assert.match(source, /ariaLabel="声音周期最大秒"/);
+  assert.match(source, /ariaLabel="视频周期最小秒"/);
+  assert.match(source, /ariaLabel="视频周期最大秒"/);
   assert.doesNotMatch(source, /title="声音处理参数"/);
   assert.doesNotMatch(source, /aria-label="音频 MFCC 维度"/);
   assert.doesNotMatch(source, /aria-label="音频音色库"/);
@@ -243,7 +261,7 @@ test('停止或暂停播放时停止实时参数调度', async () => {
   assert.match(source, /const runtimeActive = playbackActive && videoProcessingEnabled/);
   assert.match(source, /const audioPeriodActive = playbackActive && audioProcessingEnabled/);
   assert.match(source, /if \(!runtimeActive \|\| !runtimeBaseParameters\)/);
-  assert.match(source, /声音处理：\{audioPreviewStatus\}/);
+  assert.match(source, /getProcessingStatusLabel\(audioProcessingStatus\)/);
 });
 
 test('主界面不渲染运行资源区域，但保留自动准备和状态轮询', async () => {

@@ -113,7 +113,7 @@ Phase 2 改造前，每个 `AudioMixerTask` 都持有共享 PortAudio 输出槽�
 
 ### 3.5 音画同步必须使用统一的媒体时间轴
 
-源视频时长与音频流时长可能存在十几毫秒差异；视频元素循环和独立 `-stream_loop -1` 长期运行后会累积漂移。候选身份必须包含循环序号，时间比较必须使用未回绕的绝对媒体时间：
+源视频时长与音频流时长可能存在十几毫秒差异；视频元素循环与独立音频时钟长期运行后会累积漂移。当前实现不再依赖单个 `-stream_loop -1` 进程跨越媒体边界，而是在有限输入 EOF 后顺序重启 FFmpeg；候选身份仍必须包含循环序号，时间比较必须使用未回绕的绝对媒体时间：
 
 ```text
 absolute_media_ms = loop_index * source_duration_ms + current_position_ms
@@ -137,7 +137,7 @@ absolute_media_ms = loop_index * source_duration_ms + current_position_ms
 
 - 不实现完整 DAW，不提供 22 条可编辑物理轨道。
 - 不生成或保存 22 个处理后音频文件。
-- 不恢复 ASIO UI。
+- 恢复 ASIO 的可见筛选入口，但只有 PortAudio 运行时真实枚举到 ASIO 输出设备时才启用；当前随包 DLL 未启用 ASIO，不扩展为 ASIO 运行库构建任务。
 - 不改变 p21/p22 的产品规则。
 - 不加入实时话术幻化、VAD/ASR/LLM/TTS。
 - 本次不新增第三方依赖；复用现有 FFmpeg、`ringbuf`、PortAudio 和取消机制。
@@ -231,7 +231,7 @@ candidate_id
 | `candidate_prepare_timeout_ms` | 5000ms | 只约束准备结果，不关闭当前轨 |
 | `decoder_queue_blocks` | 8 | 复用现有有界队列原则 |
 
-候选提交总余量为 `30ms crossfade + 100ms post-fade tail = 130ms`。上述值必须通过真实设备长测调整，不暴露为第一版 UI 配置。候选 PCM 上限按时间窗计算，不使用 1024KiB PortAudio 环缓容量充当候选缓存上限。
+候选提交基础余量为 `30ms crossfade + 100ms post-fade tail = 130ms`，实际提交要求取 `max(130ms, 当前动态播放水位)`，最高不超过 750ms Scheduled 时间窗。上述值必须通过真实设备长测调整，不暴露为第一版 UI 配置。候选 PCM 上限按时间窗计算，不使用 1024KiB PortAudio 环缓容量充当候选缓存上限。
 
 ## 7. 调度时序
 
@@ -252,7 +252,7 @@ candidate_id
 1. N 提交成功时立即确定 N+1 的 `seed/preset_ids/weights/参数快照`。
 2. 根据视频绝对媒体时间、P 和 `playback_rate` 计算预计切换点。
 3. 本地计时到“预计切换前 4 秒”时启动 prepare；周期不足 4 秒则立即 prepare。这个提前量先作为可测量默认值，后续只能依据真实预热 P95 调整。
-4. FFmpeg 直接 seek 到 `预计切换点 - 250ms`，使用 `-re` 生成约 750ms 的候选 PCM。
+4. FFmpeg 直接 seek 到 `预计切换点 - 250ms`，使用 `-readrate playback_speed × 1.1` 生成约 750ms 的候选 PCM；填满后由有界队列反压。
 5. 候选缓冲达到目标窗口后由有界队列自然背压，不继续增长。
 6. 到期时最终效果窗口只发送 `commit(candidate_id, live_position)`。
 7. Rust 用同一份时钟快照计算实际可听目标，验证候选覆盖范围。
@@ -420,7 +420,7 @@ candidate_window_end_ms
 
 ### Phase 0：回归测试与观测基线
 
-实施状态（2026-08-20）：已完成固定时间窗 readiness、30ms 淡化加 100ms 淡化后尾部（总计 130ms）、绝对媒体时间和配置 revision 原子提交测试；运行态继续复用 current/pending PID 与任务数。真实 CPU、内存、xrun 和 A/V 偏差基线仍需目标 Windows 设备长测，未以单元测试替代。
+实施状态（2026-08-20）：已完成固定时间窗 readiness、30ms 淡化加 100ms 淡化后尾部，并按动态播放水位将总提交余量提高到 130–500ms（极端值封顶 750ms）；已覆盖绝对媒体时间和配置 revision 原子提交测试。运行态继续复用 current/pending PID 与任务数。真实 CPU、内存、xrun 和 A/V 偏差基线仍需目标 Windows 设备长测，未以单元测试替代。
 
 先写失败测试并补齐状态字段，不改变播放行为。
 
@@ -433,7 +433,7 @@ candidate_window_end_ms
 
 ### Phase 1：下一周期提前抽样和未来时间窗预热
 
-实施状态（2026-08-20）：已完成。React 使用独立 coordinator 保存 current/next，默认提前 4 秒通过最终效果窗口发起 prepare；Rust 新增 `prepare_audio_cycle_candidate`、`commit_audio_cycle_candidate`、`cancel_audio_cycle_candidate`，Scheduled 候选使用 `-re` 和固定 750ms 时间窗，prepare 不修改当前参数/revision，commit 成功后才提交已验证配置并递增一次 revision。首次启动的 CatchUp 路径暂时保留，且通过 pending token 防止旧等待误取新候选。
+实施状态（2026-08-20）：已完成。React 使用独立 coordinator 保存 current/next，N+1 预选后立即通过最终效果窗口发起 prepare；Rust 新增 `prepare_audio_cycle_candidate`、`commit_audio_cycle_candidate`、`cancel_audio_cycle_candidate`，Scheduled 候选使用 `-readrate playback_speed × 1.1` 和固定 750ms 时间窗，prepare 不修改当前参数/revision，commit 成功后才提交已验证配置并递增一次 revision。首次启动的 CatchUp 路径保留，且通过 pending token 防止旧等待误取新候选。
 
 - 引入前端 coordinator。
 - 当前周期提交后立即生成 N+1，但不改当前 UI 参数事实源。
@@ -446,7 +446,7 @@ candidate_window_end_ms
 
 ### Phase 2：单一混音线程与真实 30ms 交叉淡化
 
-实施状态（2026-08-20）：已完成。`AudioMixerTask` 只向各自有界 PCM 队列生产数据；`audio_cycle_output` 按值持有唯一 `PortAudioOutput`，是 SPSC 环缓唯一生产者。提交需要 130ms 连续候选 PCM，原子追加 30ms 线性交叉淡化，成功后才切换 current，并在状态锁外停止、Join 旧任务。普通切换不清空旧环缓；短暂 commit 原子门禁阻止新 prepare/cancel 在“输出已切换、状态槽尚未替换”的间隙使候选失效，暂停/停止仍可立即打断。
+实施状态（2026-08-20）：已完成。`AudioMixerTask` 只向各自有界 PCM 队列生产数据；`audio_cycle_output` 按值持有唯一 `PortAudioOutput`，是 SPSC 环缓唯一生产者。提交需要 `max(130ms, 当前动态播放水位)` 的连续候选 PCM，原子追加 30ms 线性交叉淡化，成功后才切换 current，并在状态锁外停止、Join 旧任务。普通切换不清空旧环缓；短暂 commit 原子门禁阻止新 prepare/cancel 在“输出已切换、状态槽尚未替换”的间隙使候选失效，暂停/停止仍可立即打断。
 
 - 解码任务改为写各自有界 PCM 队列。
 - `audio_cycle_output` 成为 PortAudio 环缓唯一生产者。
@@ -496,7 +496,7 @@ candidate_window_end_ms
 
 - 候选覆盖窗口而非一次性 ready 决定是否可提交。
 - 预计目标前 250ms、后 500ms 的窗口可容忍定时器抖动。
-- 总余量 129ms 时拒绝，130ms（30ms 淡化 + 100ms 淡化后尾部）时允许。
+- 总余量低于 `max(130ms, 当前动态播放水位)` 时拒绝，达到该阈值时允许。
 - stale generation/loop/revision/candidate ID 全部拒绝且保留当前轨。
 - current + candidate 任务上限为 2；第三个 prepare 先取消并 Join 旧候选。
 - 停止、取消、FFmpeg 失败、队列断开均可 Join，无孤儿 PID。
@@ -512,7 +512,7 @@ candidate_window_end_ms
 - 支路数：1、2、4。
 - 周期：固定 5 秒、5～10 秒随机。
 - 控制：播放、暂停、继续、停止、拖动、换源、开关 PortAudio。
-- 设备：默认 MME/WASAPI 可用设备；ASIO 不在范围。
+- 设备：默认 MME/WASAPI 可用设备；ASIO 入口可见，只有运行时真实枚举到设备时才纳入输出验收。
 
 至少执行：
 

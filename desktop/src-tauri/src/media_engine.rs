@@ -1491,8 +1491,8 @@ fn audio_filter(
             audio.fade_in_ms as f64 / 1_000.0
         ));
     }
-    // 实时输入由 -stream_loop -1 提供，无法知道有限音频的结束位置。
-    // 跳过需要缓存完整输入的反向淡出，保证 PCM 持续输出；离线有限输入仍保留原链。
+    // 实时解码会在 EOF 后顺序重启 FFmpeg；反向滤镜仍会先缓存整轮输入，造成启动静音。
+    // 因此实时链跳过反向淡出以持续输出 PCM；离线有限输入仍保留原链。
     if audio.fade_out_ms > 0 && !realtime {
         filters.push(format!(
             "areverse,afade=t=in:st=0:d={:.6},areverse",
@@ -1639,9 +1639,11 @@ mod tests {
     }
 
     #[test]
-    fn realtime_fade_out_does_not_reverse_an_infinite_stream() {
-        let mut audio = AudioResearchParams::default();
-        audio.fade_out_ms = 1_000;
+    fn realtime_fade_out_does_not_buffer_a_full_source_pass() {
+        let audio = AudioResearchParams {
+            fade_out_ms: 1_000,
+            ..Default::default()
+        };
 
         let realtime_graph = build_audio_stream_filter_graph(&audio, &[], Some(48_000), 48_000)
             .expect("realtime fade-out configuration should still build");

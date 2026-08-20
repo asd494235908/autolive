@@ -59,8 +59,10 @@ pub const MIN_FRAMES_PER_BUFFER: u32 = 128;
 pub const MAX_FRAMES_PER_BUFFER: u32 = 2_048;
 // 硬件回调帧数与应用内存环缓是两个独立参数，不由 UI 的内存缓冲输入控制。
 pub const DEFAULT_FRAMES_PER_BUFFER: u32 = 256;
-// 普通播放只维持换轨预缓冲所需的目标水位；环缓容量仍由用户的 KiB 配置决定。
-const TARGET_PLAYBACK_WATERMARK_MS: u32 = 50;
+// 有效水位覆盖常见 Windows 调度抖动和至少 8 次硬件回调；环缓 KiB 仍只决定容量上限。
+const MIN_PLAYBACK_WATERMARK_MS: u32 = 200;
+const MAX_PLAYBACK_WATERMARK_MS: u32 = 500;
+const PLAYBACK_WATERMARK_CALLBACK_COUNT: u32 = 8;
 
 pub fn validate_ring_capacity_kib(capacity_kib: u32) -> Result<(), String> {
     if (MIN_RING_CAPACITY_KIB..=MAX_RING_CAPACITY_KIB).contains(&capacity_kib) {
@@ -170,15 +172,22 @@ pub fn ring_capacity_samples(capacity_kib: u32, channels: u16) -> usize {
     samples.saturating_sub(samples % channels).max(channels)
 }
 
-fn playback_watermark_samples(sample_rate_hz: u32, channels: u16) -> usize {
+pub fn playback_watermark_samples(
+    sample_rate_hz: u32,
+    channels: u16,
+    frames_per_buffer: u32,
+) -> usize {
     let channels = usize::from(channels.max(1));
-    let samples = usize::try_from(
-        u64::from(sample_rate_hz)
-            .saturating_mul(u64::from(TARGET_PLAYBACK_WATERMARK_MS))
-            .saturating_mul(channels as u64)
-            / 1_000,
-    )
-    .unwrap_or(usize::MAX);
+    let sample_rate_hz = sample_rate_hz.max(1);
+    let minimum_frames =
+        u64::from(sample_rate_hz).saturating_mul(u64::from(MIN_PLAYBACK_WATERMARK_MS)) / 1_000;
+    let callback_frames =
+        u64::from(frames_per_buffer).saturating_mul(u64::from(PLAYBACK_WATERMARK_CALLBACK_COUNT));
+    let maximum_frames =
+        u64::from(sample_rate_hz).saturating_mul(u64::from(MAX_PLAYBACK_WATERMARK_MS)) / 1_000;
+    let target_frames = minimum_frames.max(callback_frames).min(maximum_frames);
+    let samples =
+        usize::try_from(target_frames.saturating_mul(channels as u64)).unwrap_or(usize::MAX);
     samples.saturating_sub(samples % channels).max(channels)
 }
 
@@ -827,8 +836,8 @@ impl PortAudioOutput {
         self.producer.capacity().get()
     }
 
-    fn target_playback_watermark_samples(&self) -> usize {
-        playback_watermark_samples(self.sample_rate_hz, self.channels())
+    pub fn target_playback_watermark_samples(&self) -> usize {
+        playback_watermark_samples(self.sample_rate_hz, self.channels(), self.frames_per_buffer)
             .min(self.ring_capacity_samples())
     }
 
@@ -1267,11 +1276,11 @@ mod tests {
     }
 
     #[test]
-    fn streaming_writes_stop_at_50ms_without_changing_configured_capacity() {
+    fn streaming_watermark_covers_scheduler_jitter_without_changing_configured_capacity() {
         let mut output = PortAudioOutput::new(44_100, DEFAULT_RING_CAPACITY_KIB, 2);
         output.set_prestart_writes_enabled(true);
-        let target = playback_watermark_samples(44_100, 2);
-        assert_eq!(target, 4_410);
+        let target = playback_watermark_samples(44_100, 2, DEFAULT_FRAMES_PER_BUFFER);
+        assert_eq!(target, 17_640);
         assert_eq!(output.target_playback_watermark_samples(), target);
         assert!(target < output.ring_capacity_samples());
 
@@ -1289,6 +1298,12 @@ mod tests {
         );
         assert_eq!(output.ring_capacity_kib(), DEFAULT_RING_CAPACITY_KIB);
         assert_eq!(output.ring_capacity_samples(), 262_144);
+    }
+
+    #[test]
+    fn streaming_watermark_scales_with_hardware_callback_jitter() {
+        assert_eq!(playback_watermark_samples(44_100, 2, 256), 17_640);
+        assert_eq!(playback_watermark_samples(44_100, 2, 2_048), 32_768);
     }
 
     #[test]

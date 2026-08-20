@@ -24,7 +24,8 @@ const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 const TRUE_PEAK_DBTP: f32 = -1.5;
 const PCM_FRAME_BYTES: usize = std::mem::size_of::<f32>() * OUTPUT_CHANNELS;
 const MAX_DECODER_STDERR_BYTES: usize = 16 * 1024;
-const REALTIME_FFMPEG_RATE_ARGS: [&str; 1] = ["-re"];
+// atempo=s 会把 s 秒输入压成 1 秒输出；按 s×1.1 读取可在任意合法倍速保留 10% PCM 余量。
+const REALTIME_READ_RATE_HEADROOM_RATIO: f64 = 1.1;
 // 候选需要在有限预算内领先正在播放的画面时钟，但不能无界突发读取。
 // 最低 2x；显式变速超过 1x 时再增加 1x 源时间余量，保证经过 atempo 后仍能追赶。
 // 500ms 初始突发、有界 channel 和预缓冲上限继续限制内存与 CPU。
@@ -37,7 +38,7 @@ const SWITCH_CATCH_UP_MAX_MS: usize = 5_000;
 
 #[derive(Debug, Clone, Copy)]
 enum CandidatePrebufferPolicy {
-    CatchUp,
+    CatchUp { minimum_ready_ms: usize },
     FixedWindow { buffer_ms: usize },
 }
 
@@ -65,6 +66,13 @@ pub struct AudioMixerTrack {
 }
 
 impl AudioMixerTrack {
+    #[cfg(test)]
+    pub(crate) fn from_samples(samples: VecDeque<f32>) -> Self {
+        Self {
+            samples: Arc::new(Mutex::new(samples)),
+        }
+    }
+
     pub(crate) fn available_samples(&self) -> usize {
         self.samples
             .lock()
@@ -94,75 +102,9 @@ impl AudioMixerTrack {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioMixerConfigContext {
-    pub sample_rate_hz: u32,
-    pub prebuffer_ms: usize,
-    pub audio_stream_variant_count: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AudioMixerReadinessError {
-    PreheatTimeout {
-        waited_ms: u64,
-        timeout_ms: u64,
-        config: AudioMixerConfigContext,
-    },
-    Ffmpeg {
-        waited_ms: u64,
-        config: AudioMixerConfigContext,
-        reason: String,
-    },
-    Runtime {
-        waited_ms: u64,
-        config: AudioMixerConfigContext,
-        reason: String,
-    },
-}
-
-impl std::fmt::Display for AudioMixerReadinessError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (kind, waited_ms, config, detail) = match self {
-            Self::PreheatTimeout {
-                waited_ms,
-                timeout_ms,
-                config,
-            } => (
-                format!("音轨预热超时，无有效 PCM（预算 {timeout_ms}ms）"),
-                *waited_ms,
-                *config,
-                None,
-            ),
-            Self::Ffmpeg {
-                waited_ms,
-                config,
-                reason,
-            } => (
-                "FFmpeg 真实错误".to_owned(),
-                *waited_ms,
-                *config,
-                Some(reason),
-            ),
-            Self::Runtime {
-                waited_ms,
-                config,
-                reason,
-            } => (
-                "音频运行时错误".to_owned(),
-                *waited_ms,
-                *config,
-                Some(reason),
-            ),
-        };
-        write!(
-            formatter,
-            "{kind}；已等待 {waited_ms}ms；配置：采样率 {}Hz、预缓冲 {}ms、音频支路 {} 条",
-            config.sample_rate_hz, config.prebuffer_ms, config.audio_stream_variant_count,
-        )?;
-        if let Some(detail) = detail {
-            write!(formatter, "：{detail}")?;
-        }
-        Ok(())
-    }
+struct AudioMixerConfig {
+    sample_rate_hz: u32,
+    prebuffer_ms: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -186,7 +128,7 @@ pub struct AudioMixerTask {
     mixer_handle: Option<JoinHandle<()>>,
     decoder_process: DecoderProcessSlot,
     failure: Arc<Mutex<Option<AudioMixerFailure>>>,
-    config: AudioMixerConfigContext,
+    config: AudioMixerConfig,
     ready: Arc<AtomicBool>,
     prebuffer: Arc<Mutex<VecDeque<f32>>>,
     start_position_ms: u64,
@@ -201,23 +143,26 @@ impl AudioMixerTask {
         ffmpeg_path: PathBuf,
         source_path: PathBuf,
         sample_rate_hz: u32,
-        start_position_ms: u64,
+        seek_position_ms: u64,
+        timeline_start_position_ms: u64,
         filter_graph: Option<String>,
-        audio_stream_variant_count: usize,
         playback_rate: f64,
+        minimum_ready_ms: usize,
+        prebuffer_started_at: Instant,
     ) -> Result<Self, String> {
+        let minimum_ready_ms = minimum_ready_ms.max(AUDIO_CANDIDATE_COMMIT_TAIL_MS);
         Self::start_internal(
             ffmpeg_path,
             source_path,
             sample_rate_hz,
-            start_position_ms,
-            start_position_ms,
+            seek_position_ms,
+            timeline_start_position_ms,
             filter_graph,
-            audio_stream_variant_count,
             DecoderPacing::CatchUp,
             playback_rate,
-            CandidatePrebufferPolicy::CatchUp,
-            AUDIO_CANDIDATE_COMMIT_TAIL_MS,
+            CandidatePrebufferPolicy::CatchUp { minimum_ready_ms },
+            minimum_ready_ms,
+            prebuffer_started_at,
         )
     }
 
@@ -231,10 +176,10 @@ impl AudioMixerTask {
         seek_position_ms: u64,
         timeline_start_position_ms: u64,
         filter_graph: Option<String>,
-        audio_stream_variant_count: usize,
         playback_rate: f64,
         buffer_ms: usize,
         minimum_commit_tail_ms: usize,
+        prebuffer_started_at: Instant,
     ) -> Result<Self, String> {
         Self::start_internal(
             ffmpeg_path,
@@ -243,11 +188,11 @@ impl AudioMixerTask {
             seek_position_ms,
             timeline_start_position_ms,
             filter_graph,
-            audio_stream_variant_count,
             DecoderPacing::RealTime,
             playback_rate,
             CandidatePrebufferPolicy::FixedWindow { buffer_ms },
             minimum_commit_tail_ms,
+            prebuffer_started_at,
         )
     }
 
@@ -260,11 +205,11 @@ impl AudioMixerTask {
         seek_position_ms: u64,
         timeline_start_position_ms: u64,
         filter_graph: Option<String>,
-        audio_stream_variant_count: usize,
         decoder_pacing: DecoderPacing,
         playback_rate: f64,
         candidate_prebuffer_policy: CandidatePrebufferPolicy,
         minimum_commit_tail_ms: usize,
+        prebuffer_started_at: Instant,
     ) -> Result<Self, String> {
         validate_audio_source(&ffmpeg_path, &source_path)?;
         let sample_rate_hz = match sample_rate_hz {
@@ -276,22 +221,15 @@ impl AudioMixerTask {
         let decoder_process = Arc::new(Mutex::new(None));
         let ready = Arc::new(AtomicBool::new(false));
         let prebuffer = Arc::new(Mutex::new(VecDeque::new()));
-        let prebuffer_limit_ms = match candidate_prebuffer_policy {
-            CandidatePrebufferPolicy::CatchUp => {
-                SWITCH_CATCH_UP_MAX_MS + AUDIO_CANDIDATE_COMMIT_TAIL_MS
-            }
-            CandidatePrebufferPolicy::FixedWindow { buffer_ms } => buffer_ms,
-        };
+        let prebuffer_limit_ms = candidate_prebuffer_limit_ms(candidate_prebuffer_policy);
         let prebuffer_limit_samples = sample_rate_hz
             .saturating_mul(prebuffer_limit_ms as u32)
             .saturating_div(1_000)
             .saturating_mul(OUTPUT_CHANNELS as u32)
             .max(PCM_FRAME_BYTES as u32) as usize;
-        let prebuffer_started_at = Instant::now();
-        let config = AudioMixerConfigContext {
+        let config = AudioMixerConfig {
             sample_rate_hz,
             prebuffer_ms: minimum_commit_tail_ms,
-            audio_stream_variant_count,
         };
         let (sender, receiver) = mpsc::sync_channel(MIX_QUEUE_CAPACITY);
 
@@ -378,37 +316,6 @@ impl AudioMixerTask {
         }
     }
 
-    pub fn wait_until_ready_with_reason(
-        &self,
-        timeout: Duration,
-    ) -> Result<(), AudioMixerReadinessError> {
-        let started = Instant::now();
-        while !self.ready.load(Ordering::Acquire) && started.elapsed() < timeout {
-            if self.cancellation.is_cancelled() {
-                return Err(AudioMixerReadinessError::Runtime {
-                    waited_ms: elapsed_ms(started),
-                    config: self.config,
-                    reason: "音频混音任务已取消".to_owned(),
-                });
-            }
-            if let Some(failure) = self.failure_snapshot() {
-                return Err(self.readiness_error(elapsed_ms(started), failure));
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        if self.ready.load(Ordering::Acquire) && !self.cancellation.is_cancelled() {
-            return Ok(());
-        }
-        if let Some(failure) = self.failure_snapshot() {
-            return Err(self.readiness_error(elapsed_ms(started), failure));
-        }
-        Err(AudioMixerReadinessError::PreheatTimeout {
-            waited_ms: elapsed_ms(started),
-            timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
-            config: self.config,
-        })
-    }
-
     /// 丢弃目标位置之前的 PCM，并保留 30ms 淡化与其后 100ms 连续尾部。
     /// 本任务不直接写 PortAudio；真正的首次预填或交叉淡化由输出线程完成。
     pub fn commit_at_position(&self, position_ms: u64) -> Result<(), String> {
@@ -483,25 +390,6 @@ impl AudioMixerTask {
     fn failure_snapshot(&self) -> Option<AudioMixerFailure> {
         self.failure.lock().ok().and_then(|failure| failure.clone())
     }
-
-    fn readiness_error(
-        &self,
-        waited_ms: u64,
-        failure: AudioMixerFailure,
-    ) -> AudioMixerReadinessError {
-        match failure {
-            AudioMixerFailure::Ffmpeg(reason) => AudioMixerReadinessError::Ffmpeg {
-                waited_ms,
-                config: self.config,
-                reason,
-            },
-            AudioMixerFailure::Runtime(reason) => AudioMixerReadinessError::Runtime {
-                waited_ms,
-                config: self.config,
-                reason,
-            },
-        }
-    }
 }
 
 impl Drop for AudioMixerTask {
@@ -546,7 +434,8 @@ fn decode_audio_loop(
         command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
         match decoder_pacing {
             DecoderPacing::RealTime => {
-                command.args(REALTIME_FFMPEG_RATE_ARGS);
+                let read_rate = format!("{:.3}", realtime_ffmpeg_read_rate(playback_rate));
+                command.args(["-readrate", &read_rate, "-readrate_initial_burst", "0.5"]);
             }
             DecoderPacing::CatchUp => {
                 let read_rate = format!("{:.3}", candidate_ffmpeg_read_rate(playback_rate));
@@ -554,7 +443,7 @@ fn decode_audio_loop(
             }
         }
         command
-            .args(["-ss", &start_seconds, "-stream_loop", "-1", "-i"])
+            .args(decoder_input_seek_args(&start_seconds))
             .arg(source_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -711,6 +600,19 @@ fn candidate_ffmpeg_read_rate(playback_rate: f64) -> f64 {
     CANDIDATE_MIN_READ_RATE.max(playback_rate + 1.0)
 }
 
+fn decoder_input_seek_args(start_seconds: &str) -> [&str; 3] {
+    ["-ss", start_seconds, "-i"]
+}
+
+fn realtime_ffmpeg_read_rate(playback_rate: f64) -> f64 {
+    let playback_rate = if playback_rate.is_finite() && playback_rate > 0.0 {
+        playback_rate
+    } else {
+        1.0
+    };
+    playback_rate * REALTIME_READ_RATE_HEADROOM_RATIO
+}
+
 fn terminate_decoder_process(decoder_process: &DecoderProcessSlot) {
     let mut child = decoder_process
         .lock()
@@ -824,14 +726,24 @@ fn append_prebuffer(buffered: &mut VecDeque<f32>, samples: &[f32], limit_samples
 fn candidate_required_prebuffer_samples(
     sample_rate_hz: u32,
     elapsed_ms: usize,
+    minimum_ready_ms: usize,
     max_samples: usize,
 ) -> usize {
-    let required_ms = elapsed_ms.saturating_add(AUDIO_CANDIDATE_COMMIT_TAIL_MS);
+    let required_ms = elapsed_ms.saturating_add(minimum_ready_ms);
     let required_samples = u64::from(sample_rate_hz)
         .saturating_mul(required_ms as u64)
         .saturating_div(1_000)
         .saturating_mul(OUTPUT_CHANNELS as u64);
     required_samples.min(max_samples as u64) as usize
+}
+
+fn candidate_prebuffer_limit_ms(policy: CandidatePrebufferPolicy) -> usize {
+    match policy {
+        CandidatePrebufferPolicy::CatchUp { minimum_ready_ms } => {
+            SWITCH_CATCH_UP_MAX_MS.saturating_add(minimum_ready_ms)
+        }
+        CandidatePrebufferPolicy::FixedWindow { buffer_ms } => buffer_ms,
+    }
 }
 
 fn candidate_readiness_samples(
@@ -841,8 +753,13 @@ fn candidate_readiness_samples(
     policy: CandidatePrebufferPolicy,
 ) -> usize {
     match policy {
-        CandidatePrebufferPolicy::CatchUp => {
-            candidate_required_prebuffer_samples(sample_rate_hz, elapsed_ms, max_samples)
+        CandidatePrebufferPolicy::CatchUp { minimum_ready_ms } => {
+            candidate_required_prebuffer_samples(
+                sample_rate_hz,
+                elapsed_ms,
+                minimum_ready_ms,
+                max_samples,
+            )
         }
         CandidatePrebufferPolicy::FixedWindow { buffer_ms } => {
             stereo_samples_for_ms(sample_rate_hz, buffer_ms).min(max_samples)
@@ -899,8 +816,10 @@ fn prebuffer_skip_samples(
             .saturating_mul(1_000)
             .saturating_div(u64::from(sample_rate_hz.max(1)))
             .saturating_div(OUTPUT_CHANNELS as u64);
+        let required_ms = elapsed_ms.saturating_add(minimum_remaining_ms as u64);
+        let missing_ms = required_ms.saturating_sub(buffered_ms);
         return Err(format!(
-            "候选音轨尚未追上画面：起始位置 {start_position_ms}ms，目标位置 {position_ms}ms，当前仅缓冲 {buffered_ms}ms"
+            "候选音轨尚未追上画面：起始位置 {start_position_ms}ms，目标位置 {position_ms}ms；需要缓冲 {required_ms}ms（含安全水位 {minimum_remaining_ms}ms），实际缓冲 {buffered_ms}ms，缺少 {missing_ms}ms"
         ));
     }
     Ok(skip_samples)
@@ -1055,17 +974,25 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        append_prebuffer, candidate_ffmpeg_read_rate, candidate_readiness_samples,
-        candidate_required_prebuffer_samples, prebuffer_skip_samples, process_audio_bus,
+        append_prebuffer, candidate_ffmpeg_read_rate, candidate_prebuffer_limit_ms,
+        candidate_readiness_samples, candidate_required_prebuffer_samples, decoder_input_seek_args,
+        prebuffer_skip_samples, process_audio_bus, realtime_ffmpeg_read_rate,
         sanitize_error_detail, send_samples_with_cancellation, take_complete_stereo_samples,
-        trim_prebuffer_to_position, AudioMixerConfigContext, AudioMixerReadinessError,
-        AudioMixerTrack, CandidatePrebufferPolicy,
+        trim_prebuffer_to_position, AudioMixerTrack, CandidatePrebufferPolicy,
     };
     use crate::cancellation::CancellationToken;
 
     #[test]
-    fn realtime_ffmpeg_input_uses_real_time_rate_limit() {
-        assert_eq!(super::REALTIME_FFMPEG_RATE_ARGS, ["-re"]);
+    fn realtime_producer_keeps_bounded_headroom_across_playback_rates() {
+        assert_eq!(realtime_ffmpeg_read_rate(1.0), 1.1);
+        assert_eq!(realtime_ffmpeg_read_rate(2.0), 2.2);
+        assert_eq!(realtime_ffmpeg_read_rate(0.5), 0.55);
+        assert_eq!(realtime_ffmpeg_read_rate(f64::NAN), 1.1);
+    }
+
+    #[test]
+    fn decoder_restarts_at_eof_instead_of_hiding_the_boundary_in_stream_loop() {
+        assert_eq!(decoder_input_seek_args("12.345"), ["-ss", "12.345", "-i"]);
     }
 
     #[test]
@@ -1147,7 +1074,7 @@ mod tests {
         // 1kHz 双声道、滤镜启动耗时 2 秒时，候选必须保留 2.13 秒 PCM，
         // 覆盖 30ms 交叉淡化和其后的 100ms 连续尾部。
         assert_eq!(
-            candidate_required_prebuffer_samples(1_000, 2_000, 10_100),
+            candidate_required_prebuffer_samples(1_000, 2_000, 130, 10_100),
             4_260
         );
     }
@@ -1168,6 +1095,29 @@ mod tests {
     }
 
     #[test]
+    fn catch_up_candidate_readiness_uses_the_dynamic_playback_watermark() {
+        let policy = CandidatePrebufferPolicy::CatchUp {
+            minimum_ready_ms: 200,
+        };
+
+        // 1kHz 双声道，已等待 2599ms：应覆盖等待时间加 200ms 动态水位。
+        assert_eq!(
+            candidate_readiness_samples(1_000, 2_599, 20_000, policy),
+            5_598
+        );
+    }
+
+    #[test]
+    fn catch_up_capacity_covers_the_full_timeout_and_dynamic_watermark() {
+        assert_eq!(
+            candidate_prebuffer_limit_ms(CandidatePrebufferPolicy::CatchUp {
+                minimum_ready_ms: 500,
+            }),
+            5_500
+        );
+    }
+
+    #[test]
     fn scheduled_candidate_requires_the_full_commit_tail() {
         let buffered_samples = 700 * 2;
 
@@ -1176,6 +1126,16 @@ mod tests {
             Ok(1_200)
         );
         assert!(prebuffer_skip_samples(buffered_samples, 0, 601, 1_000, 100).is_err());
+    }
+
+    #[test]
+    fn candidate_coverage_error_reports_required_actual_and_missing_duration() {
+        let error = prebuffer_skip_samples(2_799 * 2, 33_054, 35_721, 1_000, 200)
+            .expect_err("候选只剩 132ms，低于 200ms 水位时必须继续预热");
+
+        assert!(error.contains("需要缓冲 2867ms"));
+        assert!(error.contains("实际缓冲 2799ms"));
+        assert!(error.contains("缺少 68ms"));
     }
 
     #[test]
@@ -1191,22 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_errors_distinguish_timeout_from_ffmpeg_and_redact_paths() {
-        let config = AudioMixerConfigContext {
-            sample_rate_hz: 44_100,
-            prebuffer_ms: 50,
-            audio_stream_variant_count: 3,
-        };
-        let timeout = AudioMixerReadinessError::PreheatTimeout {
-            waited_ms: 5_000,
-            timeout_ms: 5_000,
-            config,
-        }
-        .to_string();
-        assert!(timeout.contains("预热超时"));
-        assert!(timeout.contains("已等待 5000ms"));
-        assert!(timeout.contains("音频支路 3 条"));
-
+    fn decoder_errors_redact_source_paths() {
         let path = Path::new(r"C:\Users\private\source.mp4");
         let detail = sanitize_error_detail(
             "Error opening input C:\\Users\\private\\source.mp4: invalid data",
@@ -1214,15 +1159,5 @@ mod tests {
         );
         assert!(!detail.contains("private"));
         assert!(detail.contains("<path>"));
-
-        let ffmpeg = AudioMixerReadinessError::Ffmpeg {
-            waited_ms: 42,
-            config,
-            reason: detail,
-        }
-        .to_string();
-        assert!(ffmpeg.contains("FFmpeg 真实错误"));
-        assert!(ffmpeg.contains("已等待 42ms"));
-        assert!(!ffmpeg.contains("private"));
     }
 }

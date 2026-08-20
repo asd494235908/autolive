@@ -1,4 +1,3 @@
-export const AUDIO_CYCLE_PREPARE_LEAD_MS = 4_000;
 export const AUDIO_CYCLE_COMMIT_GRACE_MS = 500;
 
 export type AudioCycleCandidateStatus = 'planned' | 'preparing' | 'prepared' | 'committing';
@@ -6,8 +5,7 @@ export type AudioCycleCandidateStatus = 'planned' | 'preparing' | 'prepared' | '
 export type AudioCycleCandidatePlan<T> = {
   candidateId: number;
   sample: T;
-  targetAtMs: number;
-  prepareAtMs: number;
+  targetAbsolutePositionMs: number;
   status: AudioCycleCandidateStatus;
 };
 
@@ -16,28 +14,36 @@ export type AudioCycleCoordinatorAction = 'prepare' | 'commit' | 'expire' | null
 export function createAudioCycleCandidatePlan<T>(
   candidateId: number,
   sample: T,
-  committedAtMs: number,
-  periodMs: number,
+  baseAbsolutePositionMs: number,
+  periodMediaMs: number,
 ): AudioCycleCandidatePlan<T> {
-  const safePeriodMs = Math.max(1, Math.round(periodMs));
-  const targetAtMs = committedAtMs + safePeriodMs;
+  const safeBaseMs = Math.max(0, Math.round(baseAbsolutePositionMs));
+  const safePeriodMs = Math.max(1, Math.round(periodMediaMs));
   return {
     candidateId,
     sample,
-    targetAtMs,
-    prepareAtMs: Math.max(committedAtMs, targetAtMs - AUDIO_CYCLE_PREPARE_LEAD_MS),
+    targetAbsolutePositionMs: safeBaseMs + safePeriodMs,
     status: 'planned',
   };
 }
 
 export function getAudioCycleCoordinatorAction<T>(
   plan: AudioCycleCandidatePlan<T> | null,
-  nowMs: number,
+  currentAbsolutePositionMs: number,
+  playbackRate: number,
+  queuedPlaybackMs = 0,
 ): AudioCycleCoordinatorAction {
   if (!plan) return null;
-  if (nowMs > plan.targetAtMs + AUDIO_CYCLE_COMMIT_GRACE_MS) return 'expire';
-  if (plan.status === 'planned' && nowMs >= plan.prepareAtMs) return 'prepare';
-  if (plan.status === 'prepared' && nowMs >= plan.targetAtMs) return 'commit';
+  const safePlaybackRate = Number.isFinite(playbackRate) && playbackRate > 0 ? playbackRate : 1;
+  const safeQueuedPlaybackMs = Number.isFinite(queuedPlaybackMs) && queuedPlaybackMs > 0
+    ? queuedPlaybackMs
+    : 0;
+  const graceMediaMs = Math.round(AUDIO_CYCLE_COMMIT_GRACE_MS * safePlaybackRate);
+  if (currentAbsolutePositionMs > plan.targetAbsolutePositionMs + graceMediaMs) return 'expire';
+  const mediaLeadMs = plan.targetAbsolutePositionMs - currentAbsolutePositionMs;
+  if (plan.status === 'planned') return 'prepare';
+  const commitLeadMediaMs = Math.round(safeQueuedPlaybackMs * safePlaybackRate);
+  if (plan.status === 'prepared' && mediaLeadMs <= commitLeadMediaMs) return 'commit';
   return null;
 }
 
@@ -48,18 +54,6 @@ export function updateAudioCycleCandidateStatus<T>(
   return { ...plan, status };
 }
 
-export function recoverAudioCycleCandidate<T>(
-  plan: AudioCycleCandidatePlan<T>,
-  operation: 'prepare' | 'commit',
-  nowMs: number,
-): AudioCycleCandidatePlan<T> | null {
-  if (nowMs > plan.targetAtMs + AUDIO_CYCLE_COMMIT_GRACE_MS) return null;
-  return {
-    ...plan,
-    status: operation === 'prepare' ? 'planned' : 'prepared',
-  };
-}
-
 export type AudioCycleCommandMessage = {
   version: 1;
   type: 'audio-cycle-command';
@@ -67,7 +61,7 @@ export type AudioCycleCommandMessage = {
   candidate_id: number;
   playback_generation: number;
   base_audio_stream_revision?: number;
-  target_at_ms?: number;
+  target_absolute_position_ms?: number;
   audio?: Record<string, unknown>;
   audio_variants?: Record<string, unknown>[];
 };
@@ -80,18 +74,26 @@ export type AudioCycleResultMessage = {
   accepted: boolean;
   committed: boolean;
   reason: string | null;
+  error_code?: string | null;
   snapshot?: unknown;
 };
 
 export function isAudioCycleCommandMessage(value: unknown): value is AudioCycleCommandMessage {
   if (!value || typeof value !== 'object') return false;
   const message = value as Partial<AudioCycleCommandMessage>;
-  return message.version === 1
+  const validEnvelope = message.version === 1
     && message.type === 'audio-cycle-command'
     && ['prepare', 'commit', 'cancel'].includes(message.action ?? '')
     && Number.isSafeInteger(message.candidate_id)
     && Number(message.candidate_id) > 0
     && Number.isSafeInteger(message.playback_generation);
+  if (!validEnvelope || message.action !== 'prepare') return validEnvelope;
+  return Number.isSafeInteger(message.base_audio_stream_revision)
+    && Number.isSafeInteger(message.target_absolute_position_ms)
+    && Number(message.target_absolute_position_ms) >= 0
+    && Boolean(message.audio)
+    && typeof message.audio === 'object'
+    && Array.isArray(message.audio_variants);
 }
 
 export function isAudioCycleResultMessage(value: unknown): value is AudioCycleResultMessage {

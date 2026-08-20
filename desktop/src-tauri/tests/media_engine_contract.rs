@@ -415,10 +415,14 @@ fn render_generates_environment_noise_inside_each_audio_variant_branch() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    let mut branch_a = AudioResearchParams::default();
-    branch_a.environment_noise_percent = 8.0;
-    let mut branch_b = AudioResearchParams::default();
-    branch_b.environment_noise_percent = 12.0;
+    let branch_a = AudioResearchParams {
+        environment_noise_percent: 8.0,
+        ..Default::default()
+    };
+    let branch_b = AudioResearchParams {
+        environment_noise_percent: 12.0,
+        ..Default::default()
+    };
     input.audio_variants = vec![branch_a, branch_b];
 
     let args = build_media_render_args(&input).expect("branch noise should be mapped");
@@ -454,8 +458,10 @@ fn render_validates_each_audio_variant_range_and_finite_value() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    let mut invalid = AudioResearchParams::default();
-    invalid.pitch_shift_semitones = f64::NAN;
+    let invalid = AudioResearchParams {
+        pitch_shift_semitones: f64::NAN,
+        ..Default::default()
+    };
     input.audio_variants = vec![invalid];
 
     let error = build_media_render_args(&input).expect_err("non-finite variant must be rejected");
@@ -471,8 +477,10 @@ fn render_rejects_unmapped_parameter_inside_audio_variant() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    let mut invalid = AudioResearchParams::default();
-    invalid.dry_wet_percent = 1.0;
+    let invalid = AudioResearchParams {
+        dry_wet_percent: 1.0,
+        ..Default::default()
+    };
     input.audio_variants = vec![invalid];
 
     let error = build_media_render_args(&input).expect_err("unmapped variant field must fail");
@@ -489,8 +497,10 @@ fn render_rejects_unmapped_audio_variant_when_processing_is_disabled() {
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
     input.audio_processing_enabled = false;
-    let mut invalid = AudioResearchParams::default();
-    invalid.dry_wet_percent = 1.0;
+    let invalid = AudioResearchParams {
+        dry_wet_percent: 1.0,
+        ..Default::default()
+    };
     input.audio_variants = vec![invalid];
 
     let error = build_media_render_args(&input)
@@ -507,10 +517,14 @@ fn render_mixes_audio_variants_to_single_bus_with_equal_weights() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    let mut branch_a = AudioResearchParams::default();
-    branch_a.low_eq_db = 0.4;
-    let mut branch_b = AudioResearchParams::default();
-    branch_b.high_eq_db = 0.5;
+    let branch_a = AudioResearchParams {
+        low_eq_db: 0.4,
+        ..Default::default()
+    };
+    let branch_b = AudioResearchParams {
+        high_eq_db: 0.5,
+        ..Default::default()
+    };
     input.audio_variants = vec![branch_a, branch_b];
 
     let args = build_media_render_args(&input).expect("multi-variant mix should be valid");
@@ -540,8 +554,10 @@ fn render_uses_final_loudness_chain_for_single_audio_variant() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    let mut only = AudioResearchParams::default();
-    only.mid_eq_db = 0.3;
+    let only = AudioResearchParams {
+        mid_eq_db: 0.3,
+        ..Default::default()
+    };
     input.audio_variants = vec![only];
 
     let args = build_media_render_args(&input).expect("single variant should stay on -af");

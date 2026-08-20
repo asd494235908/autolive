@@ -1,5 +1,7 @@
 pub mod audio_cycle_output;
 pub mod audio_mixer;
+pub mod audio_output_diagnostic;
+pub mod audio_output_health;
 pub mod audio_processing;
 pub mod background_process;
 pub mod cancellation;
@@ -390,7 +392,11 @@ impl PlaybackCore {
         profile: AudioProcessingProfile,
     ) -> Result<(), Vec<crate::research_params::ParameterValidationError>> {
         profile.validate()?;
+        let changed = self.audio_processing_profile != profile;
         self.audio_processing_profile = profile;
+        if changed {
+            self.audio_stream_revision = self.audio_stream_revision.wrapping_add(1);
+        }
         // 处理中只更新配置，不改状态；避免把 processing 冲掉或伪装成 unavailable。
         if self.audio_processing_status != "processing" {
             self.audio_processing_status = self.audio_processing_status_for("configured");
@@ -880,6 +886,27 @@ mod tests {
 
         assert_eq!(core.snapshot().audio_stream_revision, revision);
         core.commit_validated_audio_stream_configuration(configuration);
+        assert_eq!(core.snapshot().audio_stream_revision, revision + 1);
+    }
+
+    #[test]
+    fn changed_audio_processing_profile_invalidates_stream_revision() {
+        let mut core = PlaybackCore::default();
+        let revision = core.snapshot().audio_stream_revision;
+        let profile = AudioProcessingProfile {
+            params: AudioResearchParams {
+                input_gain_db: 1.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        core.set_audio_processing_profile(profile.clone())
+            .expect("changed profile should be valid");
+        assert_eq!(core.snapshot().audio_stream_revision, revision + 1);
+
+        core.set_audio_processing_profile(profile)
+            .expect("unchanged profile should remain valid");
         assert_eq!(core.snapshot().audio_stream_revision, revision + 1);
     }
 

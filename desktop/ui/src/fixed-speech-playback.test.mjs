@@ -11,7 +11,7 @@ test('固定话术从主窗口通过 BroadcastChannel 发送给最终效果窗�
     source.indexOf('function cancelCurrentFixedSpeech'),
   );
 
-  assert.match(source, /<Card title="固定话术播放">/);
+  assert.match(source, /<FeatureDrawer[\s\S]*title="固定话术"/);
   assert.match(play, /type: 'fixed-speech-command'/);
   assert.match(play, /action: 'speak'/);
   assert.match(play, /operation_id: operationId/);
@@ -88,7 +88,7 @@ test('固定话术 UI 保留预设增删改与 1–500 字输入，不含旧克�
   assert.match(source, /selectedFixedSpeechPreset \? '更新文案' : '添加文案'/);
   assert.match(source, /deleteSelectedFixedSpeechPreset/);
   assert.match(source, /aria-label="固定话术文本"/);
-  assert.match(source, /文本字数：\{fixedSpeechTextCount\} \/ 500/);
+  assert.match(source, /aria-label="固定话术文本"[\s\S]*maxLength=\{500\}[\s\S]*showCount/);
   assert.doesNotMatch(source, /voice[_A-Z]?clone/i);
   assert.doesNotMatch(source, /XTTS|Demucs|Whisper|预生成|参考人声/);
 });

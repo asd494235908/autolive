@@ -34,9 +34,15 @@ const {
   AUDIO_MIX_SESSION_STORAGE_KEY,
   sampleSubtleAudioParams,
   sampleSubtleVideoParams,
+  sampleVideoCycle,
   sampleSubtleResearchParams,
   sanitizeAudioPresetValues,
 } = runtimeModule;
+
+test('视频周期 seed 可复现完整 N+1/N+2 参数快照', () => {
+  assert.deepEqual(sampleVideoCycle(123), sampleVideoCycle(123));
+  assert.notDeepEqual(sampleVideoCycle(123), sampleVideoCycle(124));
+});
 
 const baseParameters = {
   audio_gain_db: 0,

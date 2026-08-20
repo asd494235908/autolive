@@ -2,8 +2,9 @@ import { Component, type CSSProperties, type ReactNode } from 'react';
 
 const shellStyle: CSSProperties = {
   alignItems: 'center',
-  background: '#fff',
-  color: 'rgba(0, 0, 0, 0.88)',
+  background: '#0b0b0f',
+  boxSizing: 'border-box',
+  color: '#f7f7f8',
   display: 'flex',
   flexDirection: 'column',
   fontFamily: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
@@ -18,11 +19,15 @@ const shellStyle: CSSProperties = {
 
 const spinnerStyle: CSSProperties = {
   animation: 'startup-loading-spin 0.8s linear infinite',
-  border: '3px solid rgba(0, 0, 0, 0.06)',
+  border: '3px solid rgba(247, 247, 248, 0.14)',
   borderRadius: '50%',
-  borderTopColor: '#1677ff',
+  borderTopColor: '#31d7aa',
   height: 28,
   width: 28,
+};
+
+const secondaryTextStyle: CSSProperties = {
+  color: '#9a9aa3',
 };
 
 export function StartupLoading({ message = '正在启动桌面端…' }: { message?: string }) {
@@ -30,7 +35,7 @@ export function StartupLoading({ message = '正在启动桌面端…' }: { messa
     <main aria-live="polite" role="status" style={shellStyle}>
       <style>{'@keyframes startup-loading-spin { to { transform: rotate(360deg); } }'}</style>
       <span aria-hidden="true" style={spinnerStyle} />
-      <span>{message}</span>
+      <span style={secondaryTextStyle}>{message}</span>
     </main>
   );
 }
@@ -62,14 +67,14 @@ export class StartupErrorBoundary extends Component<StartupErrorBoundaryProps, S
     return (
       <main role="alert" style={shellStyle}>
         <h1 style={{ fontSize: 20, margin: 0 }}>启动失败</h1>
-        <p style={{ color: 'rgba(0, 0, 0, 0.65)', margin: 0, maxWidth: 520 }}>{this.state.error.message}</p>
+        <p style={{ ...secondaryTextStyle, margin: 0, maxWidth: 520 }}>{this.state.error.message}</p>
         <button
           onClick={this.handleReload}
           style={{
-            background: '#1677ff',
-            border: '1px solid #1677ff',
+            background: '#31d7aa',
+            border: '1px solid #31d7aa',
             borderRadius: 6,
-            color: '#fff',
+            color: '#0b0b0f',
             cursor: 'pointer',
             padding: '8px 16px',
           }}
