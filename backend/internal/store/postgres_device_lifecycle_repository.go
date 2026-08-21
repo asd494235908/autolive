@@ -60,14 +60,20 @@ func (s *PostgresRepository) mutateDeviceLifecycle(ctx context.Context, record D
 		return controlplane.DeviceSummary{}, err
 	}
 
-	device, exists, err := s.loadDeviceForUpdate(operationCtx, tx, record.DeviceID)
+	var device controlplane.DeviceSummary
+	var exists bool
+	if explicitProduct {
+		device, exists, err = s.loadDeviceForUpdateWithProduct(operationCtx, tx, record.DeviceID, record.Product)
+	} else {
+		device, exists, err = s.loadDeviceForUpdate(operationCtx, tx, record.DeviceID)
+	}
 	if err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
 	if !exists {
 		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
 	}
-	if device.Product != record.Product {
+	if !explicitProduct && device.Product != record.Product {
 		return controlplane.DeviceSummary{}, controlplane.ErrForbidden
 	}
 	var storedFingerprint, storedResourceID string
@@ -85,15 +91,19 @@ func (s *PostgresRepository) mutateDeviceLifecycle(ctx context.Context, record D
 			return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyConflict
 		}
 		if unbind {
-			device, err = s.loadDeviceSummary(operationCtx, tx, storedResourceID)
+			if explicitProduct {
+				device, err = s.loadDeviceSummaryWithProduct(operationCtx, tx, storedResourceID, record.Product)
+			} else {
+				device, err = s.loadDeviceSummary(operationCtx, tx, storedResourceID)
+			}
 			if err != nil {
 				return controlplane.DeviceSummary{}, err
 			}
 		}
-		if err := releaseDeviceLeases(operationCtx, tx, record.DeviceID, s.Now(), productReadArgs(explicitProduct, record.Product)...); err != nil {
+		if err := releaseDeviceLeasesForRecord(operationCtx, tx, record.DeviceID, s.Now(), record.Product, explicitProduct); err != nil {
 			return controlplane.DeviceSummary{}, err
 		}
-		if err := revokeDeviceSessions(operationCtx, tx, record.DeviceID); err != nil {
+		if err := revokeDeviceSessionsForRecord(operationCtx, tx, record.DeviceID, record.Product, explicitProduct); err != nil {
 			return controlplane.DeviceSummary{}, err
 		}
 		if strings.TrimSpace(record.Audit.Action) != "" {
@@ -108,10 +118,10 @@ func (s *PostgresRepository) mutateDeviceLifecycle(ctx context.Context, record D
 	}
 
 	now := s.Now()
-	if err := releaseDeviceLeases(operationCtx, tx, record.DeviceID, now, productReadArgs(explicitProduct, record.Product)...); err != nil {
+	if err := releaseDeviceLeasesForRecord(operationCtx, tx, record.DeviceID, now, record.Product, explicitProduct); err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
-	if err := revokeDeviceSessions(operationCtx, tx, record.DeviceID); err != nil {
+	if err := revokeDeviceSessionsForRecord(operationCtx, tx, record.DeviceID, record.Product, explicitProduct); err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
 	if unbind {
@@ -149,17 +159,13 @@ func (s *PostgresRepository) mutateDeviceLifecycle(ctx context.Context, record D
 	return device, nil
 }
 
-func releaseDeviceLeases(ctx context.Context, tx *sql.Tx, deviceID string, now time.Time, products ...controlplane.ProductCode) error {
+func releaseDeviceLeases(ctx context.Context, tx *sql.Tx, deviceID string, now time.Time) error {
 	query := `
 		UPDATE model_leases
 		SET status = $2, released_at = $3
 		WHERE device_id = $1 AND status = $4
 	`
 	args := []any{deviceID, controlplane.ModelLeaseStatusReleased, now, controlplane.ModelLeaseStatusActive}
-	if len(products) > 0 && products[0] != "" {
-		query += " AND product = $5"
-		args = append(args, products[0])
-	}
 	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 		return postgresOperationError(ctx, fmt.Errorf("release normalized device leases: %w", err))
 	}
@@ -173,6 +179,38 @@ func revokeDeviceSessions(ctx context.Context, tx *sql.Tx, deviceID string) erro
 		WHERE device_id = $1 AND revoked_at IS NULL
 	`, deviceID); err != nil {
 		return postgresOperationError(ctx, fmt.Errorf("revoke normalized device sessions: %w", err))
+	}
+	return nil
+}
+
+func releaseDeviceLeasesForRecord(ctx context.Context, tx *sql.Tx, deviceID string, now time.Time, product controlplane.ProductCode, strict bool) error {
+	if !strict {
+		return releaseDeviceLeases(ctx, tx, deviceID, now)
+	}
+	condition, productArgs := normalizedProductFilter("product", product, 5)
+	query := `
+		UPDATE model_leases
+		SET status = $2, released_at = $3
+		WHERE device_id = $1 AND status = $4 AND ` + condition
+	args := append([]any{deviceID, controlplane.ModelLeaseStatusReleased, now, controlplane.ModelLeaseStatusActive}, productArgs...)
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return postgresOperationError(ctx, fmt.Errorf("release normalized product device leases: %w", err))
+	}
+	return nil
+}
+
+func revokeDeviceSessionsForRecord(ctx context.Context, tx *sql.Tx, deviceID string, product controlplane.ProductCode, strict bool) error {
+	if !strict {
+		return revokeDeviceSessions(ctx, tx, deviceID)
+	}
+	condition, productArgs := normalizedProductFilter("product", product, 2)
+	query := `
+		UPDATE auth_sessions
+		SET revoked_at = CURRENT_TIMESTAMP
+		WHERE device_id = $1 AND revoked_at IS NULL AND ` + condition
+	args := append([]any{deviceID}, productArgs...)
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return postgresOperationError(ctx, fmt.Errorf("revoke normalized product device sessions: %w", err))
 	}
 	return nil
 }

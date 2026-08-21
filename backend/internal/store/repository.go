@@ -118,6 +118,13 @@ type ModelPoolSecretRotationPreparer interface {
 	PrepareModelPoolAccountSecretRotation(ctx context.Context, scope, idempotencyKey, fingerprint, accountID string) (ModelPoolSecretRotationPreparation, error)
 }
 
+// ProductModelPoolSecretRotationPreparer is the strict product-bound variant.
+// It is separate from the compatibility entry point so a missing product can
+// never silently widen a normalized account lookup.
+type ProductModelPoolSecretRotationPreparer interface {
+	PrepareModelPoolAccountSecretRotationForProduct(ctx context.Context, scope, idempotencyKey, fingerprint, accountID string, product controlplane.ProductCode) (ModelPoolSecretRotationPreparation, error)
+}
+
 type ModelPoolSecretRotationPreparation struct {
 	Account  controlplane.ModelPoolAccountSummary
 	Existing *controlplane.ModelPoolAccountSummary
@@ -130,6 +137,13 @@ type ModelPoolSecretRotationPreparation struct {
 type ModelPoolTestRepository interface {
 	PrepareModelPoolAccountTest(ctx context.Context, record ModelPoolTestPrepareRecord) (ModelPoolTestPreparation, error)
 	RecordModelPoolAccountTest(ctx context.Context, record ModelPoolTestRecord) (controlplane.ModelPoolConnectivityTestResult, error)
+}
+
+// ProductModelPoolTestRepository keeps normalized preparation and completion
+// reads inside the authenticated product boundary.
+type ProductModelPoolTestRepository interface {
+	PrepareModelPoolAccountTestForProduct(ctx context.Context, record ModelPoolTestPrepareRecord) (ModelPoolTestPreparation, error)
+	RecordModelPoolAccountTestForProduct(ctx context.Context, record ModelPoolTestRecord) (controlplane.ModelPoolConnectivityTestResult, error)
 }
 
 // AuditRepository appends redacted audit facts directly to the normalized
@@ -376,10 +390,20 @@ type DeviceReader interface {
 	GetOwnedDevice(ctx context.Context, userID, deviceID string) (controlplane.DeviceSummary, error)
 }
 
+// ProductDeviceReader is the strict normalized profile read. Product is a
+// fixed SQL predicate, not a post-read comparison against an arbitrary row.
+type ProductDeviceReader interface {
+	GetOwnedDeviceForProduct(ctx context.Context, userID, deviceID string, product controlplane.ProductCode) (controlplane.DeviceSummary, error)
+}
+
 // ActivationExpiryReader reads the effective expiry of the activation bound
 // to one device. It is supplementary profile data and never returns the code.
 type ActivationExpiryReader interface {
 	GetActivationExpiry(ctx context.Context, userID, deviceID string) (*time.Time, error)
+}
+
+type ProductActivationExpiryReader interface {
+	GetActivationExpiryForProduct(ctx context.Context, userID, deviceID string, product controlplane.ProductCode) (*time.Time, error)
 }
 
 // AdminCredentialRepository owns bootstrap/readiness/password-rotation facts

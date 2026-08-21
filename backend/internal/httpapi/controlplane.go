@@ -338,7 +338,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 
 	mux.Handle("POST /api/v1/admin/devices/{device_id}/disable", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		deviceID := r.PathValue("device_id")
-		device, err := svc.DisableDeviceWithAudit(r.Context(), r.Header.Get("Idempotency-Key"), deviceID, successAuditForDevice(r, actor, deviceID))
+		device, err := svc.DisableDeviceForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), deviceID, successAuditForDevice(r, actor, deviceID))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -357,7 +357,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 
 	mux.Handle("POST /api/v1/admin/devices/{device_id}/unbind", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		deviceID := r.PathValue("device_id")
-		device, err := svc.UnbindDeviceWithAudit(r.Context(), r.Header.Get("Idempotency-Key"), deviceID, successAuditForDevice(r, actor, deviceID))
+		device, err := svc.UnbindDeviceForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), deviceID, successAuditForDevice(r, actor, deviceID))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -461,7 +461,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
 			return
 		}
-		account, err := svc.CreateModelPoolAccountWithAudit(r.Context(), r.Header.Get("Idempotency-Key"), input, successAuditForTarget(r, actor, "model_account", "", ""))
+		account, err := svc.CreateModelPoolAccountForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), input, successAuditForTarget(r, actor, "model_account", "", ""))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -474,7 +474,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 
 	mux.Handle("POST /api/v1/admin/model-pool/{account_id}/disable", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		accountID := r.PathValue("account_id")
-		account, err := svc.DisableModelPoolAccountWithAudit(r.Context(), r.Header.Get("Idempotency-Key"), accountID, successAuditForTarget(r, actor, "model_account", accountID, ""))
+		account, err := svc.DisableModelPoolAccountForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), accountID, successAuditForTarget(r, actor, "model_account", accountID, ""))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -492,7 +492,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			return
 		}
 		accountID := r.PathValue("account_id")
-		account, err := svc.UpdateModelPoolAccountWithAudit(r.Context(), r.Header.Get("Idempotency-Key"), accountID, input, successAuditForTarget(r, actor, "model_account", accountID, ""))
+		account, err := svc.UpdateModelPoolAccountForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), accountID, input, successAuditForTarget(r, actor, "model_account", accountID, ""))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -510,7 +510,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			return
 		}
 		accountID := r.PathValue("account_id")
-		account, err := svc.RotateModelPoolAccountSecretWithAudit(r.Context(), r.Header.Get("Idempotency-Key"), accountID, input, successAuditForTarget(r, actor, "model_account", accountID, ""))
+		account, err := svc.RotateModelPoolAccountSecretForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), accountID, input, successAuditForTarget(r, actor, "model_account", accountID, ""))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -528,7 +528,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			return
 		}
 		accountID := r.PathValue("account_id")
-		result, err := svc.TestModelPoolAccountWithAudit(r.Context(), r.Header.Get("Idempotency-Key"), accountID, input, successAuditForTarget(r, actor, "model_account", accountID, ""))
+		result, err := svc.TestModelPoolAccountForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), accountID, input, successAuditForTarget(r, actor, "model_account", accountID, ""))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -673,7 +673,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
 			return
 		}
-		lease, err := svc.CreateModelLeaseWithAudit(r.Context(), r.Header.Get("Idempotency-Key"), actor.UserID, deviceID, input, successAuditForTarget(r, actor, "model_lease", "", deviceID))
+		lease, err := svc.CreateModelLeaseForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), actor.UserID, deviceID, input, successAuditForTarget(r, actor, "model_lease", "", deviceID))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -696,7 +696,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			return
 		}
 		leaseID := r.PathValue("lease_id")
-		lease, err := svc.RenewModelLeaseWithAudit(r.Context(), r.Header.Get("Idempotency-Key"), actor.UserID, deviceID, leaseID, input, successAuditForTarget(r, actor, "model_lease", leaseID, deviceID))
+		lease, err := svc.RenewModelLeaseForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), actor.UserID, deviceID, leaseID, input, successAuditForTarget(r, actor, "model_lease", leaseID, deviceID))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -719,7 +719,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			return
 		}
 		leaseID := r.PathValue("lease_id")
-		result, err := svc.ReleaseModelLeaseWithAudit(r.Context(), r.Header.Get("Idempotency-Key"), actor.UserID, deviceID, leaseID, input, successAuditForTarget(r, actor, "model_lease", leaseID, deviceID))
+		result, err := svc.ReleaseModelLeaseForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), actor.UserID, deviceID, leaseID, input, successAuditForTarget(r, actor, "model_lease", leaseID, deviceID))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -742,7 +742,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
 			return
 		}
-		_, err := svc.RecordDirectLLMCallWithAudit(r.Context(), r.Header.Get("Idempotency-Key"), actor.UserID, deviceID, RequestIDFromContext(r.Context()), input, successAuditForTarget(r, actor, "model_usage", "", deviceID))
+		_, err := svc.RecordDirectLLMCallForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), actor.UserID, deviceID, RequestIDFromContext(r.Context()), input, successAuditForTarget(r, actor, "model_usage", "", deviceID))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -808,7 +808,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			return
 		}
 		leaseID := r.PathValue("lease_id")
-		result, err := svc.ReclaimModelLeaseWithAudit(r.Context(), r.Header.Get("Idempotency-Key"), leaseID, input, successAuditForTarget(r, actor, "model_lease", leaseID, ""))
+		result, err := svc.ReclaimModelLeaseForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), leaseID, input, successAuditForTarget(r, actor, "model_lease", leaseID, ""))
 		if err != nil {
 			writeAppError(w, r, err)
 			return

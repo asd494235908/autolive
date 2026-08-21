@@ -688,6 +688,8 @@ export interface components {
         /** @enum {string} */
         ActorRole: "admin" | "user";
         /** @enum {string} */
+        ProductCode: "autolive" | "douyin_desktop";
+        /** @enum {string} */
         UserStatus: "active" | "disabled";
         /** @enum {string} */
         DeviceStatus: "pending_activation" | "active" | "disabled" | "revoked";
@@ -737,6 +739,7 @@ export interface components {
         DeviceSummary: {
             id: components["schemas"]["Id"];
             user_id: components["schemas"]["Id"];
+            product: components["schemas"]["ProductCode"];
             device_name: string;
             platform: string;
             app_version: string;
@@ -760,6 +763,7 @@ export interface components {
         LoginRequest: {
             username: string;
             password: string;
+            product: components["schemas"]["ProductCode"];
         };
         LoginResponse: {
             request_id: string;
@@ -787,6 +791,7 @@ export interface components {
             device: components["schemas"]["DeviceRegistration"];
         };
         DeviceRegistration: {
+            product: components["schemas"]["ProductCode"];
             device_id: components["schemas"]["Id"];
             device_name: string;
             platform: string;
@@ -798,6 +803,7 @@ export interface components {
             device: components["schemas"]["DeviceSummary"];
         };
         HeartbeatRequest: {
+            product: components["schemas"]["ProductCode"];
             device_id: components["schemas"]["Id"];
             sent_at: components["schemas"]["Timestamp"];
             status: {
@@ -820,6 +826,7 @@ export interface components {
         };
         ClientProfileResponse: {
             request_id: string;
+            product: components["schemas"]["ProductCode"];
             user: components["schemas"]["UserSummary"];
             device: components["schemas"]["DeviceSummary"];
             permissions: string[];
@@ -894,6 +901,7 @@ export interface components {
         };
         ModelLease: {
             id: components["schemas"]["Id"];
+            product?: components["schemas"]["ProductCode"];
             provider: string;
             model: string;
             status: components["schemas"]["ModelLeaseStatus"];
@@ -911,6 +919,7 @@ export interface components {
         };
         ModelLeaseAdminSummary: {
             id: components["schemas"]["Id"];
+            product?: components["schemas"]["ProductCode"];
             account_id: components["schemas"]["Id"];
             user_id: components["schemas"]["Id"];
             device_id: components["schemas"]["Id"];
@@ -930,6 +939,7 @@ export interface components {
         };
         ModelLeaseAdminDetail: {
             id: components["schemas"]["Id"];
+            product?: components["schemas"]["ProductCode"];
             account_id: components["schemas"]["Id"];
             user_id: components["schemas"]["Id"];
             device_id: components["schemas"]["Id"];
@@ -1047,9 +1057,12 @@ export interface components {
         };
         ActivationCode: {
             id: components["schemas"]["Id"];
+            product?: components["schemas"]["ProductCode"];
             status: components["schemas"]["ActivationCodeStatus"];
             expires_at: components["schemas"]["Timestamp"];
             max_devices: number;
+            /** @description 已成功绑定的设备数量，不超过 max_devices */
+            bound_devices: number;
             /** @description 脱敏后的激活码前缀，不包含完整明文 */
             code_prefix?: string;
             /** @description 核销设备所属用户；仅核销后返回 */
@@ -1076,6 +1089,7 @@ export interface components {
         };
         ModelPoolAccountSummary: {
             id: components["schemas"]["Id"];
+            product?: components["schemas"]["ProductCode"];
             provider: string;
             model: string;
             /** Format: uri */
@@ -1099,6 +1113,7 @@ export interface components {
         };
         ModelUsageRecord: {
             id: components["schemas"]["Id"];
+            product?: components["schemas"]["ProductCode"];
             lease_id: components["schemas"]["Id"];
             request_id: components["schemas"]["Id"];
             client_call_id: components["schemas"]["Id"];
@@ -1122,6 +1137,7 @@ export interface components {
         };
         AuditLog: {
             id: components["schemas"]["Id"];
+            product: components["schemas"]["ProductCode"];
             actor_user_id?: string | null;
             device_id?: string | null;
             action: string;
@@ -1273,6 +1289,8 @@ export interface components {
         };
     };
     parameters: {
+        /** @description 缺省 product 时仅允许取值 `legacy`，此时映射为 `autolive`；普通缺省登录请求返回 400，不从 User-Agent、版本、query 或其他 header 推断产品。 */
+        LegacyClientCompatibilityHeader: "legacy";
         /** @description 写接口必填。相同认证主体、相同资源语义和相同幂等键的重复请求必须返回同一结果，不能重复产生副作用。 */
         IdempotencyKeyHeader: string;
         LeaseId: components["schemas"]["Id"];
@@ -1291,7 +1309,10 @@ export interface operations {
     authLogin: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description 缺省 product 时仅允许取值 `legacy`，此时映射为 `autolive`；普通缺省登录请求返回 400，不从 User-Agent、版本、query 或其他 header 推断产品。 */
+                "X-Client-Compatibility"?: components["parameters"]["LegacyClientCompatibilityHeader"];
+            };
             path?: never;
             cookie?: never;
         };

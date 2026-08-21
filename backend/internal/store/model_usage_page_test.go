@@ -56,11 +56,11 @@ func TestPostgresModelUsagePageWithOptionsBindsFiltersAndTimeRange(t *testing.T)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM model_usage_records WHERE provider = $1 AND user_id = $2 AND created_at >= $3")).
 		WithArgs("openai", "user-a", after).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, lease_id, client_call_id, request_id, provider, model")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, lease_id, client_call_id, request_id, provider, model")).
 		WithArgs("openai", "user-a", after, 20, 0).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "lease_id", "client_call_id", "request_id", "provider", "model", "prompt_tokens", "completion_tokens", "total_tokens", "latency_ms", "status", "usage_source", "error_code", "created_at",
-		}).AddRow("usage-a", "lease-a", "call-a", "request-a", "openai", "rewrite", 1, 2, 3, int64(10), "succeeded", "client_reported", nil, after))
+			"id", "product", "lease_id", "client_call_id", "request_id", "provider", "model", "prompt_tokens", "completion_tokens", "total_tokens", "latency_ms", "status", "usage_source", "error_code", "created_at",
+		}).AddRow("usage-a", string(controlplane.ProductAutoLive), "lease-a", "call-a", "request-a", "openai", "rewrite", 1, 2, 3, int64(10), "succeeded", "client_reported", nil, after))
 	mock.ExpectCommit()
 
 	page, err := repository.ListModelUsagePageWithOptions(context.Background(), ModelUsagePageOptions{

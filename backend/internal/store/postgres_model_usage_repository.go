@@ -75,7 +75,13 @@ func (s *PostgresRepository) RecordDirectLLMCall(ctx context.Context, record Mod
 	if user.Status != controlplane.UserStatusActive {
 		return controlplane.ModelUsageRecord{}, controlplane.ErrUserDisabled
 	}
-	device, exists, err := s.loadDeviceForUpdate(operationCtx, tx, record.DeviceID)
+	var device controlplane.DeviceSummary
+	var exists bool
+	if explicitProduct {
+		device, exists, err = s.loadDeviceForUpdateWithProduct(operationCtx, tx, record.DeviceID, record.Product)
+	} else {
+		device, exists, err = s.loadDeviceForUpdate(operationCtx, tx, record.DeviceID)
+	}
 	if err != nil {
 		return controlplane.ModelUsageRecord{}, err
 	}
@@ -85,7 +91,12 @@ func (s *PostgresRepository) RecordDirectLLMCall(ctx context.Context, record Mod
 	if device.Product != record.Product {
 		return controlplane.ModelUsageRecord{}, controlplane.ErrForbidden
 	}
-	lease, err := s.loadModelLeaseForUpdate(operationCtx, tx, record.Input.LeaseID, productReadArgs(explicitProduct, record.Product)...)
+	var lease controlplane.ModelLease
+	if explicitProduct {
+		lease, err = s.loadModelLeaseForUpdateWithProduct(operationCtx, tx, record.Input.LeaseID, record.Product)
+	} else {
+		lease, err = s.loadModelLeaseForUpdate(operationCtx, tx, record.Input.LeaseID)
+	}
 	if err != nil {
 		return controlplane.ModelUsageRecord{}, err
 	}
@@ -112,7 +123,12 @@ func (s *PostgresRepository) RecordDirectLLMCall(ctx context.Context, record Mod
 		if storedFingerprint != record.Fingerprint {
 			return controlplane.ModelUsageRecord{}, controlplane.ErrIdempotencyConflict
 		}
-		usage, err := s.loadModelUsageByID(operationCtx, tx, storedResourceID, productReadArgs(explicitProduct, record.Product)...)
+		var usage controlplane.ModelUsageRecord
+		if explicitProduct {
+			usage, err = s.loadModelUsageByIDWithProduct(operationCtx, tx, storedResourceID, record.Product)
+		} else {
+			usage, err = s.loadModelUsageByID(operationCtx, tx, storedResourceID)
+		}
 		if err != nil {
 			return controlplane.ModelUsageRecord{}, err
 		}
@@ -133,7 +149,13 @@ func (s *PostgresRepository) RecordDirectLLMCall(ctx context.Context, record Mod
 		}
 		return usage, nil
 	}
-	existing, found, err := s.loadModelUsageByClientCall(operationCtx, tx, record.Input.LeaseID, record.Input.ClientCallID, productReadArgs(explicitProduct, record.Product)...)
+	var existing controlplane.ModelUsageRecord
+	var found bool
+	if explicitProduct {
+		existing, found, err = s.loadModelUsageByClientCallWithProduct(operationCtx, tx, record.Input.LeaseID, record.Input.ClientCallID, record.Product)
+	} else {
+		existing, found, err = s.loadModelUsageByClientCall(operationCtx, tx, record.Input.LeaseID, record.Input.ClientCallID)
+	}
 	if err != nil {
 		return controlplane.ModelUsageRecord{}, err
 	}
@@ -164,7 +186,10 @@ func (s *PostgresRepository) RecordDirectLLMCall(ctx context.Context, record Mod
 		}
 		return existing, nil
 	}
-	products := productReadArgs(explicitProduct, record.Product)
+	products := []controlplane.ProductCode(nil)
+	if explicitProduct {
+		products = []controlplane.ProductCode{record.Product}
+	}
 	policyLimit, policyConfigured, err := s.loadUserDailyTokenLimit(operationCtx, tx, record.UserID, products...)
 	if err != nil {
 		return controlplane.ModelUsageRecord{}, err
@@ -178,7 +203,12 @@ func (s *PostgresRepository) RecordDirectLLMCall(ctx context.Context, record Mod
 			return controlplane.ModelUsageRecord{}, controlplane.ErrUserRecordedQuotaExceeded
 		}
 	}
-	account, err := s.loadModelAccountForUpdate(operationCtx, tx, lease.AccountID, products...)
+	var account normalizedModelAccount
+	if explicitProduct {
+		account, err = s.loadModelAccountForUpdateWithProduct(operationCtx, tx, lease.AccountID, record.Product)
+	} else {
+		account, err = s.loadModelAccountForUpdate(operationCtx, tx, lease.AccountID)
+	}
 	if err != nil {
 		return controlplane.ModelUsageRecord{}, err
 	}
@@ -256,10 +286,9 @@ func (s *PostgresRepository) RecordDirectLLMCall(ctx context.Context, record Mod
 	}, nil
 }
 
-func (s *PostgresRepository) loadModelUsageByID(ctx context.Context, tx *sql.Tx, usageID string, products ...controlplane.ProductCode) (controlplane.ModelUsageRecord, error) {
+func (s *PostgresRepository) loadModelUsageByID(ctx context.Context, tx *sql.Tx, usageID string) (controlplane.ModelUsageRecord, error) {
 	var usage controlplane.ModelUsageRecord
 	var leaseID, errorCode sql.NullString
-	var product sql.NullString
 	var createdAt time.Time
 	query := `
 		SELECT id, lease_id, client_call_id, request_id, provider, model,
@@ -270,10 +299,6 @@ func (s *PostgresRepository) loadModelUsageByID(ctx context.Context, tx *sql.Tx,
 		FOR UPDATE
 	`
 	dest := []any{&usage.ID, &leaseID, &usage.ClientCallID, &usage.RequestID, &usage.Provider, &usage.Model, &usage.InputTokens, &usage.OutputTokens, &usage.TotalTokens, &usage.LatencyMS, &usage.Status, &usage.UsageSource, &errorCode, &createdAt}
-	if len(products) > 0 && products[0] != "" {
-		query = strings.Replace(query, "SELECT id, lease_id", "SELECT id, product, lease_id", 1)
-		dest = []any{&usage.ID, &product, &leaseID, &usage.ClientCallID, &usage.RequestID, &usage.Provider, &usage.Model, &usage.InputTokens, &usage.OutputTokens, &usage.TotalTokens, &usage.LatencyMS, &usage.Status, &usage.UsageSource, &errorCode, &createdAt}
-	}
 	if err := tx.QueryRowContext(ctx, query, usageID).Scan(dest...); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return controlplane.ModelUsageRecord{}, controlplane.ErrInvalidRequest
@@ -282,23 +307,14 @@ func (s *PostgresRepository) loadModelUsageByID(ctx context.Context, tx *sql.Tx,
 	}
 	usage.LeaseID = leaseID.String
 	usage.ErrorCode = errorCode.String
-	if product.Valid {
-		parsed, err := normalizedStoredProduct(product)
-		if err != nil {
-			return controlplane.ModelUsageRecord{}, err
-		}
-		usage.Product = parsed
-	} else {
-		usage.Product = controlplane.ProductAutoLive
-	}
+	usage.Product = controlplane.ProductAutoLive
 	usage.CreatedAt = createdAt.UTC().Format(time.RFC3339)
 	return usage, nil
 }
 
-func (s *PostgresRepository) loadModelUsageByClientCall(ctx context.Context, tx *sql.Tx, leaseID, clientCallID string, products ...controlplane.ProductCode) (controlplane.ModelUsageRecord, bool, error) {
+func (s *PostgresRepository) loadModelUsageByClientCall(ctx context.Context, tx *sql.Tx, leaseID, clientCallID string) (controlplane.ModelUsageRecord, bool, error) {
 	var usage controlplane.ModelUsageRecord
 	var storedLeaseID, errorCode sql.NullString
-	var product sql.NullString
 	var createdAt time.Time
 	query := `
 		SELECT id, lease_id, client_call_id, request_id, provider, model,
@@ -309,10 +325,6 @@ func (s *PostgresRepository) loadModelUsageByClientCall(ctx context.Context, tx 
 		FOR UPDATE
 	`
 	dest := []any{&usage.ID, &storedLeaseID, &usage.ClientCallID, &usage.RequestID, &usage.Provider, &usage.Model, &usage.InputTokens, &usage.OutputTokens, &usage.TotalTokens, &usage.LatencyMS, &usage.Status, &usage.UsageSource, &errorCode, &createdAt}
-	if len(products) > 0 && products[0] != "" {
-		query = strings.Replace(query, "SELECT id, lease_id", "SELECT id, product, lease_id", 1)
-		dest = []any{&usage.ID, &product, &storedLeaseID, &usage.ClientCallID, &usage.RequestID, &usage.Provider, &usage.Model, &usage.InputTokens, &usage.OutputTokens, &usage.TotalTokens, &usage.LatencyMS, &usage.Status, &usage.UsageSource, &errorCode, &createdAt}
-	}
 	err := tx.QueryRowContext(ctx, query, leaseID, clientCallID).Scan(dest...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return controlplane.ModelUsageRecord{}, false, nil
@@ -322,15 +334,67 @@ func (s *PostgresRepository) loadModelUsageByClientCall(ctx context.Context, tx 
 	}
 	usage.LeaseID = storedLeaseID.String
 	usage.ErrorCode = errorCode.String
-	if product.Valid {
-		parsed, err := normalizedStoredProduct(product)
-		if err != nil {
-			return controlplane.ModelUsageRecord{}, false, err
+	usage.Product = controlplane.ProductAutoLive
+	usage.CreatedAt = createdAt.UTC().Format(time.RFC3339)
+	return usage, true, nil
+}
+
+func (s *PostgresRepository) loadModelUsageByIDWithProduct(ctx context.Context, tx *sql.Tx, usageID string, product controlplane.ProductCode) (controlplane.ModelUsageRecord, error) {
+	var usage controlplane.ModelUsageRecord
+	var storedProduct, leaseID, errorCode sql.NullString
+	var createdAt time.Time
+	condition, productArgs := normalizedProductFilter("product", product, 2)
+	query := `
+		SELECT id, product, lease_id, client_call_id, request_id, provider, model,
+		       prompt_tokens, completion_tokens, total_tokens, latency_ms,
+		       status, usage_source, error_code, created_at
+		FROM model_usage_records
+		WHERE id = $1 AND ` + condition + `
+		FOR UPDATE`
+	args := append([]any{usageID}, productArgs...)
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&usage.ID, &storedProduct, &leaseID, &usage.ClientCallID, &usage.RequestID, &usage.Provider, &usage.Model, &usage.InputTokens, &usage.OutputTokens, &usage.TotalTokens, &usage.LatencyMS, &usage.Status, &usage.UsageSource, &errorCode, &createdAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return controlplane.ModelUsageRecord{}, controlplane.ErrInvalidRequest
 		}
-		usage.Product = parsed
-	} else {
-		usage.Product = controlplane.ProductAutoLive
+		return controlplane.ModelUsageRecord{}, postgresOperationError(ctx, fmt.Errorf("load product normalized model usage: %w", err))
 	}
+	var err error
+	usage.Product, err = normalizedStoredProduct(storedProduct)
+	if err != nil {
+		return controlplane.ModelUsageRecord{}, err
+	}
+	usage.LeaseID = leaseID.String
+	usage.ErrorCode = errorCode.String
+	usage.CreatedAt = createdAt.UTC().Format(time.RFC3339)
+	return usage, nil
+}
+
+func (s *PostgresRepository) loadModelUsageByClientCallWithProduct(ctx context.Context, tx *sql.Tx, leaseID, clientCallID string, product controlplane.ProductCode) (controlplane.ModelUsageRecord, bool, error) {
+	var usage controlplane.ModelUsageRecord
+	var storedProduct, storedLeaseID, errorCode sql.NullString
+	var createdAt time.Time
+	condition, productArgs := normalizedProductFilter("product", product, 3)
+	query := `
+		SELECT id, product, lease_id, client_call_id, request_id, provider, model,
+		       prompt_tokens, completion_tokens, total_tokens, latency_ms,
+		       status, usage_source, error_code, created_at
+		FROM model_usage_records
+		WHERE lease_id = $1 AND client_call_id = $2 AND ` + condition + `
+		FOR UPDATE`
+	args := append([]any{leaseID, clientCallID}, productArgs...)
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&usage.ID, &storedProduct, &storedLeaseID, &usage.ClientCallID, &usage.RequestID, &usage.Provider, &usage.Model, &usage.InputTokens, &usage.OutputTokens, &usage.TotalTokens, &usage.LatencyMS, &usage.Status, &usage.UsageSource, &errorCode, &createdAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return controlplane.ModelUsageRecord{}, false, nil
+		}
+		return controlplane.ModelUsageRecord{}, false, postgresOperationError(ctx, fmt.Errorf("load duplicate product normalized model usage: %w", err))
+	}
+	var err error
+	usage.Product, err = normalizedStoredProduct(storedProduct)
+	if err != nil {
+		return controlplane.ModelUsageRecord{}, false, err
+	}
+	usage.LeaseID = storedLeaseID.String
+	usage.ErrorCode = errorCode.String
 	usage.CreatedAt = createdAt.UTC().Format(time.RFC3339)
 	return usage, true, nil
 }

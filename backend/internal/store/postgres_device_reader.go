@@ -10,6 +10,7 @@ import (
 )
 
 var _ DeviceReader = (*PostgresRepository)(nil)
+var _ ProductDeviceReader = (*PostgresRepository)(nil)
 
 var ErrNormalizedDeviceReaderRequired = errors.New("normalized device reader is required")
 
@@ -58,6 +59,28 @@ func (s *PostgresRepository) GetOwnedDevice(ctx context.Context, userID, deviceI
 			query = devicePageQuery + ` WHERE user_id = $1 AND id = $2`
 			args = []any{userID, deviceID}
 		}
+		row := tx.QueryRowContext(ctx, query, args...)
+		device, err := scanDeviceSummary(row)
+		if errors.Is(err, sql.ErrNoRows) {
+			return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
+		}
+		return device, err
+	})
+}
+
+func (s *PostgresRepository) GetOwnedDeviceForProduct(ctx context.Context, userID, deviceID string, product controlplane.ProductCode) (controlplane.DeviceSummary, error) {
+	if s.modelReadSource != ModelReadSourceNormalized || !product.Valid() {
+		return controlplane.DeviceSummary{}, ErrNormalizedDeviceReaderRequired
+	}
+	userID = strings.TrimSpace(userID)
+	deviceID = strings.TrimSpace(deviceID)
+	if userID == "" || deviceID == "" {
+		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
+	}
+	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (controlplane.DeviceSummary, error) {
+		condition, productArgs := normalizedProductFilter("product", product, 3)
+		query := devicePageQuery + ` WHERE user_id = $1 AND id = $2 AND ` + condition
+		args := append([]any{userID, deviceID}, productArgs...)
 		row := tx.QueryRowContext(ctx, query, args...)
 		device, err := scanDeviceSummary(row)
 		if errors.Is(err, sql.ErrNoRows) {

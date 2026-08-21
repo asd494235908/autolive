@@ -17,6 +17,7 @@ var _ ModelPoolAccountCreator = (*PostgresRepository)(nil)
 
 type normalizedModelPoolAccount struct {
 	id               string
+	product          controlplane.ProductCode
 	provider         string
 	model            string
 	baseURL          string
@@ -57,7 +58,13 @@ func (s *PostgresRepository) CreateModelPoolAccount(ctx context.Context, record 
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, postgresOperationError(operationCtx, fmt.Errorf("generate normalized model account id: %w", err))
 	}
-	storedFingerprint, storedResourceID, inserted, err := s.reserveUserIdempotency(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, accountID, s.Now())
+	var storedFingerprint, storedResourceID string
+	var inserted bool
+	if record.Product != "" {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotencyForProduct(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, accountID, s.Now(), record.Product)
+	} else {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotency(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, accountID, s.Now())
+	}
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -65,7 +72,12 @@ func (s *PostgresRepository) CreateModelPoolAccount(ctx context.Context, record 
 		if storedFingerprint != record.Fingerprint {
 			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrIdempotencyConflict
 		}
-		account, err := s.loadNormalizedModelPoolAccount(operationCtx, tx, storedResourceID)
+		var account normalizedModelPoolAccount
+		if record.Product != "" {
+			account, err = s.loadNormalizedModelPoolAccountWithProduct(operationCtx, tx, storedResourceID, record.Product)
+		} else {
+			account, err = s.loadNormalizedModelPoolAccount(operationCtx, tx, storedResourceID)
+		}
 		if err != nil {
 			return controlplane.ModelPoolAccountSummary{}, err
 		}
@@ -93,17 +105,29 @@ func (s *PostgresRepository) CreateModelPoolAccount(ctx context.Context, record 
 	}
 	secretRef := "model-account/" + accountID
 	now := s.Now()
-	if _, err := tx.ExecContext(operationCtx, `
-		INSERT INTO model_accounts (id, provider, model, base_url, secret_ref, status, priority, concurrency_limit, daily_token_limit, active_requests, daily_reserved_tokens, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, 0, $10, $10)
-	`, accountID, record.Provider, record.Model, record.BaseURL, secretRef, record.Status, record.Priority, record.ConcurrencyLimit, record.DailyLimit, now); err != nil {
-		return controlplane.ModelPoolAccountSummary{}, postgresOperationError(operationCtx, fmt.Errorf("create normalized model account: %w", err))
+	var insertErr error
+	if record.Product != "" {
+		if !record.Product.Valid() {
+			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrInvalidRequest
+		}
+		_, insertErr = tx.ExecContext(operationCtx, `
+			INSERT INTO model_accounts (id, product, provider, model, base_url, secret_ref, status, priority, concurrency_limit, daily_token_limit, active_requests, daily_reserved_tokens, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0, $11, $11)
+		`, accountID, record.Product, record.Provider, record.Model, record.BaseURL, secretRef, record.Status, record.Priority, record.ConcurrencyLimit, record.DailyLimit, now)
+	} else {
+		_, insertErr = tx.ExecContext(operationCtx, `
+			INSERT INTO model_accounts (id, provider, model, base_url, secret_ref, status, priority, concurrency_limit, daily_token_limit, active_requests, daily_reserved_tokens, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, 0, $10, $10)
+		`, accountID, record.Provider, record.Model, record.BaseURL, secretRef, record.Status, record.Priority, record.ConcurrencyLimit, record.DailyLimit, now)
+	}
+	if insertErr != nil {
+		return controlplane.ModelPoolAccountSummary{}, postgresOperationError(operationCtx, fmt.Errorf("create normalized model account: %w", insertErr))
 	}
 	if err := secretWriter.PutTx(operationCtx, tx, secretRef, record.APIKey); err != nil {
 		return controlplane.ModelPoolAccountSummary{}, postgresOperationError(operationCtx, fmt.Errorf("store normalized model account secret: %w", err))
 	}
 	account := normalizedModelPoolAccount{
-		id: accountID, provider: record.Provider, model: record.Model, baseURL: record.BaseURL,
+		id: accountID, product: record.Product, provider: record.Provider, model: record.Model, baseURL: record.BaseURL,
 		secretRef: secretRef, status: record.Status, priority: record.Priority,
 		concurrencyLimit: record.ConcurrencyLimit, dailyLimit: record.DailyLimit,
 	}
@@ -132,6 +156,9 @@ func validateModelPoolAccountCreateRecord(ctx context.Context, record ModelPoolA
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if record.Product != "" && !record.Product.Valid() {
+		return controlplane.ErrInvalidRequest
 	}
 	if len(strings.TrimSpace(record.Provider)) == 0 || len(strings.TrimSpace(record.Provider)) > 64 || len(strings.TrimSpace(record.Model)) == 0 || len(strings.TrimSpace(record.Model)) > 128 {
 		return controlplane.ErrInvalidRequest
@@ -184,6 +211,9 @@ func validateModelPoolMutationRecord(ctx context.Context, record ModelPoolAccoun
 	if strings.TrimSpace(record.Scope) == "" || strings.TrimSpace(record.IdempotencyKey) == "" || strings.TrimSpace(record.Fingerprint) == "" || strings.TrimSpace(record.AccountID) == "" {
 		return controlplane.ErrInvalidRequest
 	}
+	if record.Product != "" && !record.Product.Valid() {
+		return controlplane.ErrInvalidRequest
+	}
 	return ctx.Err()
 }
 
@@ -211,11 +241,22 @@ func (s *PostgresRepository) mutateNormalizedModelPoolAccount(ctx context.Contex
 	if err := lockNormalizedControlPlaneMutation(operationCtx, tx); err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
-	account, err := s.loadNormalizedModelPoolAccount(operationCtx, tx, record.AccountID)
+	var account normalizedModelPoolAccount
+	if record.Product != "" {
+		account, err = s.loadNormalizedModelPoolAccountWithProduct(operationCtx, tx, record.AccountID, record.Product)
+	} else {
+		account, err = s.loadNormalizedModelPoolAccount(operationCtx, tx, record.AccountID)
+	}
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
-	storedFingerprint, storedResourceID, inserted, err := s.reserveUserIdempotency(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, record.AccountID, s.Now())
+	var storedFingerprint, storedResourceID string
+	var inserted bool
+	if record.Product != "" {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotencyForProduct(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, record.AccountID, s.Now(), record.Product)
+	} else {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotency(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, record.AccountID, s.Now())
+	}
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -241,10 +282,21 @@ func (s *PostgresRepository) mutateNormalizedModelPoolAccount(ctx context.Contex
 		}
 		return summary, nil
 	}
-	if err := expireNormalizedModelPoolLeases(operationCtx, tx, record.AccountID, s.Now()); err != nil {
-		return controlplane.ModelPoolAccountSummary{}, err
+	var expireErr error
+	if record.Product != "" {
+		expireErr = expireNormalizedModelPoolLeasesForProduct(operationCtx, tx, record.AccountID, s.Now(), record.Product)
+	} else {
+		expireErr = expireNormalizedModelPoolLeases(operationCtx, tx, record.AccountID, s.Now())
 	}
-	activeLeases, err := countNormalizedActiveModelPoolLeases(operationCtx, tx, record.AccountID, s.Now())
+	if expireErr != nil {
+		return controlplane.ModelPoolAccountSummary{}, expireErr
+	}
+	var activeLeases int
+	if record.Product != "" {
+		activeLeases, err = countNormalizedActiveModelPoolLeasesForProduct(operationCtx, tx, record.AccountID, s.Now(), record.Product)
+	} else {
+		activeLeases, err = countNormalizedActiveModelPoolLeases(operationCtx, tx, record.AccountID, s.Now())
+	}
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -252,7 +304,14 @@ func (s *PostgresRepository) mutateNormalizedModelPoolAccount(ctx context.Contex
 		if activeLeases > 0 {
 			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolAccountInUse
 		}
-		if _, err := tx.ExecContext(operationCtx, `UPDATE model_accounts SET status = $2, updated_at = $3 WHERE id = $1`, record.AccountID, controlplane.ModelAccountStatusDisabled, s.Now()); err != nil {
+		query := `UPDATE model_accounts SET status = $2, updated_at = $3 WHERE id = $1`
+		args := []any{record.AccountID, controlplane.ModelAccountStatusDisabled, s.Now()}
+		if record.Product != "" {
+			filter, filterArgs := normalizedProductFilter("product", record.Product, len(args)+1)
+			query += " AND " + filter
+			args = append(args, filterArgs...)
+		}
+		if _, err := tx.ExecContext(operationCtx, query, args...); err != nil {
 			return controlplane.ModelPoolAccountSummary{}, postgresOperationError(operationCtx, fmt.Errorf("disable normalized model account: %w", err))
 		}
 		account.status = controlplane.ModelAccountStatusDisabled
@@ -290,6 +349,11 @@ func (s *PostgresRepository) mutateNormalizedModelPoolAccount(ctx context.Contex
 		assignments = append(assignments, fmt.Sprintf("updated_at = $%d", len(args)+1))
 		args = append(args, s.Now())
 		query := fmt.Sprintf("UPDATE model_accounts SET %s WHERE id = $1", strings.Join(assignments, ", "))
+		if record.Product != "" {
+			filter, filterArgs := normalizedProductFilter("product", record.Product, len(args)+1)
+			query += " AND " + filter
+			args = append(args, filterArgs...)
+		}
 		if _, err := tx.ExecContext(operationCtx, query, args...); err != nil {
 			return controlplane.ModelPoolAccountSummary{}, postgresOperationError(operationCtx, fmt.Errorf("update normalized model account: %w", err))
 		}
@@ -352,6 +416,31 @@ func (s *PostgresRepository) loadNormalizedModelPoolAccount(ctx context.Context,
 	return account, nil
 }
 
+func (s *PostgresRepository) loadNormalizedModelPoolAccountWithProduct(ctx context.Context, tx *sql.Tx, accountID string, product controlplane.ProductCode) (normalizedModelPoolAccount, error) {
+	var account normalizedModelPoolAccount
+	var cooldownUntil sql.NullTime
+	productFilter, productArgs := normalizedProductFilter("product", product, 2)
+	args := []any{accountID}
+	args = append(args, productArgs...)
+	query := fmt.Sprintf(`
+		SELECT id, product, provider, model, base_url, secret_ref, status, priority,
+		       concurrency_limit, daily_token_limit, cooldown_until
+		FROM model_accounts
+		WHERE id = $1 AND %s
+		FOR UPDATE
+	`, productFilter)
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&account.id, &account.product, &account.provider, &account.model, &account.baseURL, &account.secretRef, &account.status, &account.priority, &account.concurrencyLimit, &account.dailyLimit, &cooldownUntil); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return normalizedModelPoolAccount{}, controlplane.ErrModelPoolAccountNotFound
+		}
+		return normalizedModelPoolAccount{}, postgresOperationError(ctx, fmt.Errorf("lock normalized model account for product: %w", err))
+	}
+	if cooldownUntil.Valid {
+		account.cooldownUntil = cooldownUntil.Time.UTC().Format(time.RFC3339)
+	}
+	return account, nil
+}
+
 func expireNormalizedModelPoolLeases(ctx context.Context, tx *sql.Tx, accountID string, now time.Time) error {
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE model_leases
@@ -359,6 +448,21 @@ func expireNormalizedModelPoolLeases(ctx context.Context, tx *sql.Tx, accountID 
 		WHERE account_id = $1 AND status = $4 AND expires_at <= $3
 	`, accountID, controlplane.ModelLeaseStatusExpired, now, controlplane.ModelLeaseStatusActive); err != nil {
 		return postgresOperationError(ctx, fmt.Errorf("expire normalized model account leases: %w", err))
+	}
+	return nil
+}
+
+func expireNormalizedModelPoolLeasesForProduct(ctx context.Context, tx *sql.Tx, accountID string, now time.Time, product controlplane.ProductCode) error {
+	productFilter, productArgs := normalizedProductFilter("product", product, 5)
+	args := []any{accountID, controlplane.ModelLeaseStatusExpired, now, controlplane.ModelLeaseStatusActive}
+	args = append(args, productArgs...)
+	query := fmt.Sprintf(`
+		UPDATE model_leases
+		SET status = $2, released_at = COALESCE(released_at, $3)
+		WHERE account_id = $1 AND status = $4 AND expires_at <= $3 AND %s
+	`, productFilter)
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return postgresOperationError(ctx, fmt.Errorf("expire normalized model account leases for product: %w", err))
 	}
 	return nil
 }
@@ -374,36 +478,59 @@ func countNormalizedActiveModelPoolLeases(ctx context.Context, tx *sql.Tx, accou
 	return count, nil
 }
 
+func countNormalizedActiveModelPoolLeasesForProduct(ctx context.Context, tx *sql.Tx, accountID string, now time.Time, product controlplane.ProductCode) (int, error) {
+	productFilter, productArgs := normalizedProductFilter("product", product, 4)
+	args := []any{accountID, controlplane.ModelLeaseStatusActive, now}
+	args = append(args, productArgs...)
+	query := fmt.Sprintf(`
+		SELECT COUNT(*) FROM model_leases
+		WHERE account_id = $1 AND status = $2 AND expires_at > $3 AND %s
+	`, productFilter)
+	var count int
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+		return 0, postgresOperationError(ctx, fmt.Errorf("count normalized model account leases for product: %w", err))
+	}
+	return count, nil
+}
+
 func (s *PostgresRepository) loadNormalizedModelPoolAccountSummary(ctx context.Context, tx *sql.Tx, account normalizedModelPoolAccount, now time.Time) (controlplane.ModelPoolAccountSummary, error) {
 	dayStart := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 0, 0, 0, 0, time.UTC)
 	dayEnd := dayStart.Add(24 * time.Hour)
 	var activeLeases, dailyUsedTokens int
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM model_leases
-		WHERE account_id = $1 AND status = $2 AND expires_at > $3
-	`, account.id, controlplane.ModelLeaseStatusActive, now).Scan(&activeLeases); err != nil {
+	activeLeases, err := s.countNormalizedActiveModelPoolLeases(ctx, tx, account, now)
+	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, postgresOperationError(ctx, fmt.Errorf("load normalized account active leases: %w", err))
 	}
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COALESCE(SUM(total_tokens), 0)
-		FROM model_usage_records
-		WHERE account_id = $1 AND created_at >= $2 AND created_at < $3
-	`, account.id, dayStart, dayEnd).Scan(&dailyUsedTokens); err != nil {
+	dailyUsedTokens, err = s.sumNormalizedDailyModelUsage(ctx, tx, account, dayStart, dayEnd)
+	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, postgresOperationError(ctx, fmt.Errorf("load normalized account daily usage: %w", err))
 	}
 	var payload []byte
 	var testedAt sql.NullTime
-	if err := tx.QueryRowContext(ctx, `
+	testQuery := `
 		SELECT payload, created_at
 		FROM model_pool_test_results
 		WHERE account_id = $1
 		ORDER BY created_at DESC, id DESC
 		LIMIT 1
-	`, account.id).Scan(&payload, &testedAt); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	`
+	testArgs := []any{account.id}
+	if account.product != "" {
+		filter, filterArgs := normalizedProductFilter("product", account.product, 2)
+		testQuery = fmt.Sprintf(`
+			SELECT payload, created_at
+			FROM model_pool_test_results
+			WHERE account_id = $1 AND %s
+			ORDER BY created_at DESC, id DESC
+			LIMIT 1
+		`, filter)
+		testArgs = append(testArgs, filterArgs...)
+	}
+	if err := tx.QueryRowContext(ctx, testQuery, testArgs...).Scan(&payload, &testedAt); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return controlplane.ModelPoolAccountSummary{}, postgresOperationError(ctx, fmt.Errorf("load normalized account test result: %w", err))
 	}
 	summary := controlplane.ModelPoolAccountSummary{
-		ID: account.id, Provider: account.provider, Model: account.model, BaseURL: account.baseURL, Status: account.status,
+		ID: account.id, Product: effectiveModelAccountProduct(account.product), Provider: account.provider, Model: account.model, BaseURL: account.baseURL, Status: account.status,
 		Priority: account.priority, DailyLimit: account.dailyLimit, ConcurrencyLimit: account.concurrencyLimit,
 		SecretConfigured: account.secretRef != "", ActiveLeases: activeLeases, DailyUsedTokens: dailyUsedTokens, CooldownUntil: account.cooldownUntil,
 	}
@@ -421,4 +548,44 @@ func (s *PostgresRepository) loadNormalizedModelPoolAccountSummary(ctx context.C
 		}
 	}
 	return summary, nil
+}
+
+func effectiveModelAccountProduct(product controlplane.ProductCode) controlplane.ProductCode {
+	if product == "" {
+		return controlplane.ProductAutoLive
+	}
+	return product
+}
+
+func (s *PostgresRepository) countNormalizedActiveModelPoolLeases(ctx context.Context, tx *sql.Tx, account normalizedModelPoolAccount, now time.Time) (int, error) {
+	if account.product == "" {
+		return countNormalizedActiveModelPoolLeases(ctx, tx, account.id, now)
+	}
+	return countNormalizedActiveModelPoolLeasesForProduct(ctx, tx, account.id, now, account.product)
+}
+
+func (s *PostgresRepository) sumNormalizedDailyModelUsage(ctx context.Context, tx *sql.Tx, account normalizedModelPoolAccount, dayStart, dayEnd time.Time) (int, error) {
+	var total int
+	if account.product == "" {
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(SUM(total_tokens), 0)
+			FROM model_usage_records
+			WHERE account_id = $1 AND created_at >= $2 AND created_at < $3
+		`, account.id, dayStart, dayEnd).Scan(&total); err != nil {
+			return 0, err
+		}
+		return total, nil
+	}
+	filter, filterArgs := normalizedProductFilter("product", account.product, 4)
+	args := []any{account.id, dayStart, dayEnd}
+	args = append(args, filterArgs...)
+	query := fmt.Sprintf(`
+		SELECT COALESCE(SUM(total_tokens), 0)
+		FROM model_usage_records
+		WHERE account_id = $1 AND created_at >= $2 AND created_at < $3 AND %s
+	`, filter)
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&total); err != nil {
+		return 0, err
+	}
+	return total, nil
 }

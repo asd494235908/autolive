@@ -219,3 +219,149 @@ func TestTask4ProductFilteredPagesDoNotMixProducts(t *testing.T) {
 		t.Fatalf("product audit page = %+v, error = %v", auditPage, err)
 	}
 }
+
+func TestTask4ProductBoundLeaseRejectsAuditProductSpoof(t *testing.T) {
+	now := time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
+	repository := store.NewMemoryStore(func() time.Time { return now })
+	secretStore := store.NewMemorySecretStore()
+	if err := secretStore.Put(context.Background(), "model-account/douyin", "secret-value"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Users["usr_bound01"] = controlplane.UserSummary{ID: "usr_bound01", Status: controlplane.UserStatusActive}
+		state.Devices["dev_bound01"] = controlplane.DeviceSummary{ID: "dev_bound01", UserID: "usr_bound01", Product: controlplane.ProductDouyinDesktop, Status: controlplane.DeviceStatusActive}
+		state.ModelPoolAccounts["mpa_douyin"] = controlplane.ModelPoolAccountSummary{
+			ID: "mpa_douyin", Product: controlplane.ProductDouyinDesktop, Provider: "openai", Model: "gpt",
+			Status: controlplane.ModelAccountStatusActive, SecretConfigured: true, SecretRef: "model-account/douyin", ConcurrencyLimit: 1,
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := NewControlPlaneWithRepositoryAndSecretStore(repository, nil, secretStore).CreateModelLeaseForProduct(
+		context.Background(), controlplane.ProductDouyinDesktop, "lease-bound01", "usr_bound01", "dev_bound01",
+		controlplane.CreateModelLeaseInput{Provider: "openai", Model: "gpt", Purpose: "chat"},
+		controlplane.AuditLogInput{Product: controlplane.ProductAutoLive, Action: "POST /lease", TargetType: "model_lease", Outcome: "success", StatusCode: 200},
+	)
+	if !errors.Is(err, controlplane.ErrForbidden) {
+		t.Fatalf("CreateModelLeaseForProduct() error = %v, want forbidden", err)
+	}
+}
+
+func TestTask4ProductBoundModelSelectionAndSweepStayInProduct(t *testing.T) {
+	now := time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
+	repository := store.NewMemoryStore(func() time.Time { return now })
+	secretStore := store.NewMemorySecretStore()
+	for _, ref := range []string{"model-account/auto", "model-account/douyin"} {
+		if err := secretStore.Put(context.Background(), ref, "secret-value"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Users["usr_bound02"] = controlplane.UserSummary{ID: "usr_bound02", Status: controlplane.UserStatusActive}
+		state.Devices["dev_bound02"] = controlplane.DeviceSummary{ID: "dev_bound02", UserID: "usr_bound02", Product: controlplane.ProductDouyinDesktop, Status: controlplane.DeviceStatusActive}
+		state.ModelPoolAccounts["mpa_auto"] = controlplane.ModelPoolAccountSummary{ID: "mpa_auto", Product: controlplane.ProductAutoLive, Provider: "openai", Model: "gpt", Status: controlplane.ModelAccountStatusActive, SecretConfigured: true, SecretRef: "model-account/auto", ConcurrencyLimit: 1}
+		state.ModelPoolAccounts["mpa_douyin"] = controlplane.ModelPoolAccountSummary{ID: "mpa_douyin", Product: controlplane.ProductDouyinDesktop, Provider: "openai", Model: "gpt", Status: controlplane.ModelAccountStatusActive, SecretConfigured: true, SecretRef: "model-account/douyin", ConcurrencyLimit: 1}
+		state.ModelLeases["lease_auto_expired"] = controlplane.ModelLease{ID: "lease_auto_expired", Product: controlplane.ProductAutoLive, AccountID: "mpa_auto", Status: controlplane.ModelLeaseStatusActive, ExpiresAt: now.Add(-time.Minute).Format(time.RFC3339)}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	lease, err := NewControlPlaneWithRepositoryAndSecretStore(repository, nil, secretStore).CreateModelLeaseForProduct(
+		context.Background(), controlplane.ProductDouyinDesktop, "lease-bound02", "usr_bound02", "dev_bound02",
+		controlplane.CreateModelLeaseInput{Provider: "openai", Model: "gpt", Purpose: "chat"}, controlplane.AuditLogInput{},
+	)
+	if err != nil {
+		t.Fatalf("CreateModelLeaseForProduct() error = %v", err)
+	}
+	if lease.AccountID != "mpa_douyin" || lease.Product != controlplane.ProductDouyinDesktop {
+		t.Fatalf("lease = %+v, want douyin account/product", lease)
+	}
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		if state.ModelLeases["lease_auto_expired"].Status != controlplane.ModelLeaseStatusActive {
+			t.Fatalf("autolive lease was swept by douyin operation: %+v", state.ModelLeases["lease_auto_expired"])
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTask4ProductBoundDeviceLifecycleKeepsOtherProductLeases(t *testing.T) {
+	now := time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
+	repository := store.NewMemoryStore(func() time.Time { return now })
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Devices["device_auto_lifecycle"] = controlplane.DeviceSummary{ID: "device_auto_lifecycle", UserID: "user_lifecycle", Product: controlplane.ProductAutoLive, Status: controlplane.DeviceStatusActive}
+		state.Devices["device_douyin_lifecycle"] = controlplane.DeviceSummary{ID: "device_douyin_lifecycle", UserID: "user_lifecycle", Product: controlplane.ProductDouyinDesktop, Status: controlplane.DeviceStatusActive}
+		state.ModelLeases["lease_auto_lifecycle"] = controlplane.ModelLease{ID: "lease_auto_lifecycle", Product: controlplane.ProductAutoLive, DeviceID: "device_auto_lifecycle", Status: controlplane.ModelLeaseStatusActive, ExpiresAt: now.Add(time.Hour).Format(time.RFC3339)}
+		state.ModelLeases["lease_douyin_lifecycle"] = controlplane.ModelLease{ID: "lease_douyin_lifecycle", Product: controlplane.ProductDouyinDesktop, DeviceID: "device_douyin_lifecycle", Status: controlplane.ModelLeaseStatusActive, ExpiresAt: now.Add(time.Hour).Format(time.RFC3339)}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewControlPlane(repository)
+	if _, err := svc.DisableDeviceForProduct(context.Background(), controlplane.ProductDouyinDesktop, "disable-douyin-lifecycle", "device_douyin_lifecycle", controlplane.AuditLogInput{}); err != nil {
+		t.Fatalf("DisableDeviceForProduct() error = %v", err)
+	}
+	if _, err := svc.UnbindDeviceForProduct(context.Background(), controlplane.ProductDouyinDesktop, "unbind-douyin-lifecycle", "device_douyin_lifecycle", controlplane.AuditLogInput{}); err != nil {
+		t.Fatalf("UnbindDeviceForProduct() error = %v", err)
+	}
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		if state.ModelLeases["lease_auto_lifecycle"].Status != controlplane.ModelLeaseStatusActive {
+			return errors.New("autolive lease was changed by douyin lifecycle")
+		}
+		if state.ModelLeases["lease_douyin_lifecycle"].Status != controlplane.ModelLeaseStatusReleased {
+			return errors.New("douyin lease was not released")
+		}
+		if state.Devices["device_auto_lifecycle"].Status != controlplane.DeviceStatusActive {
+			return errors.New("autolive device was changed by douyin lifecycle")
+		}
+		if state.Devices["device_douyin_lifecycle"].Status != controlplane.DeviceStatusPendingActivation {
+			return errors.New("douyin device was not unbound")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTask4ProductBoundDeviceLifecycleDoesNotReleaseOtherProductLease(t *testing.T) {
+	now := time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
+	repository := store.NewMemoryStore(func() time.Time { return now })
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Devices["dev_bound03"] = controlplane.DeviceSummary{ID: "dev_bound03", Product: controlplane.ProductDouyinDesktop, Status: controlplane.DeviceStatusActive}
+		state.ModelLeases["lease_auto_bound03"] = controlplane.ModelLease{ID: "lease_auto_bound03", Product: controlplane.ProductAutoLive, DeviceID: "dev_bound03", Status: controlplane.ModelLeaseStatusActive}
+		state.ModelLeases["lease_douyin_bound03"] = controlplane.ModelLease{ID: "lease_douyin_bound03", Product: controlplane.ProductDouyinDesktop, DeviceID: "dev_bound03", Status: controlplane.ModelLeaseStatusActive}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := NewControlPlane(repository).DisableDeviceForProduct(context.Background(), controlplane.ProductDouyinDesktop, "disable-bound03", "dev_bound03", controlplane.AuditLogInput{}); err != nil {
+		t.Fatalf("DisableDeviceForProduct() error = %v", err)
+	}
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		if state.ModelLeases["lease_auto_bound03"].Status != controlplane.ModelLeaseStatusActive {
+			t.Fatalf("autolive lease was released by douyin lifecycle: %+v", state.ModelLeases["lease_auto_bound03"])
+		}
+		if state.ModelLeases["lease_douyin_bound03"].Status != controlplane.ModelLeaseStatusReleased {
+			t.Fatalf("douyin lease was not released: %+v", state.ModelLeases["lease_douyin_bound03"])
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTask4ProductBoundAuditValidatesExplicitProduct(t *testing.T) {
+	repository := store.NewMemoryStore(time.Now)
+	svc := NewControlPlane(repository)
+	err := svc.RecordAuditForProduct(context.Background(), controlplane.ProductAutoLive, controlplane.AuditLogInput{
+		Product: controlplane.ProductDouyinDesktop, Action: "POST /audit", TargetType: "audit", Outcome: "success", StatusCode: 200,
+	})
+	if !errors.Is(err, controlplane.ErrForbidden) {
+		t.Fatalf("RecordAuditForProduct() error = %v, want forbidden", err)
+	}
+}

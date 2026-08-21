@@ -562,19 +562,19 @@ func TestPostgresRepositoryNormalizedUsagePageUsesStableOrdering(t *testing.T) {
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM model_usage_records")).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, lease_id, client_call_id, request_id, provider, model")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, lease_id, client_call_id, request_id, provider, model")).
 		WithArgs(20, 0).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "lease_id", "client_call_id", "request_id", "provider", "model",
+			"id", "product", "lease_id", "client_call_id", "request_id", "provider", "model",
 			"prompt_tokens", "completion_tokens", "total_tokens", "latency_ms", "status", "usage_source", "error_code", "created_at",
-		}).AddRow("usage_00000001", "lease_00000001", "call_00000001", "req_00000001", "openai", "rewrite", 4, 6, 10, int64(25), "succeeded", "client_reported", nil, time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)))
+		}).AddRow("usage_00000001", string(controlplane.ProductDouyinDesktop), "lease_00000001", "call_00000001", "req_00000001", "openai", "rewrite", 4, 6, 10, int64(25), "succeeded", "client_reported", nil, time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)))
 	mock.ExpectCommit()
 
 	page, err := repository.ListModelUsagePage(context.Background(), 0, 20)
 	if err != nil {
 		t.Fatalf("ListModelUsagePage() error = %v", err)
 	}
-	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].TotalTokens != 10 || page.Items[0].UsageSource != "client_reported" {
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].TotalTokens != 10 || page.Items[0].UsageSource != "client_reported" || page.Items[0].Product != controlplane.ProductDouyinDesktop {
 		t.Fatalf("usage page = %+v", page)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -671,12 +671,12 @@ func TestPostgresRepositoryNormalizedModelPoolPageUsesBoundedDerivedQuery(t *tes
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM model_accounts")).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT a.id, a.provider, a.model, a.base_url, a.secret_ref, a.status")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT a.id, a.product, a.provider, a.model, a.base_url, a.secret_ref, a.status")).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), 20, 0).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "provider", "model", "base_url", "secret_ref", "status", "priority", "concurrency_limit", "daily_token_limit", "cooldown_until",
+			"id", "product", "provider", "model", "base_url", "secret_ref", "status", "priority", "concurrency_limit", "daily_token_limit", "cooldown_until",
 			"active_leases", "daily_used_tokens", "payload", "created_at",
-		}).AddRow("mpa_00000001", "openai", "rewrite", "https://example.com/v1", "model-account/1", "active", 10, 2, 1000, nil, 1, 42, payload, now.Add(-time.Minute)))
+		}).AddRow("mpa_00000001", string(controlplane.ProductDouyinDesktop), "openai", "rewrite", "https://example.com/v1", "model-account/1", "active", 10, 2, 1000, nil, 1, 42, payload, now.Add(-time.Minute)))
 	mock.ExpectCommit()
 
 	page, err := repository.ListModelPoolAccountsPage(context.Background(), 0, 20)
@@ -687,7 +687,7 @@ func TestPostgresRepositoryNormalizedModelPoolPageUsesBoundedDerivedQuery(t *tes
 		t.Fatalf("model pool page = %+v", page)
 	}
 	item := page.Items[0]
-	if item.ID != "mpa_00000001" || !item.SecretConfigured || item.ActiveLeases != 1 || item.DailyUsedTokens != 42 || item.LastTestStatus != "failed" || item.LastTestedAt != "2026-08-19T23:59:00Z" {
+	if item.ID != "mpa_00000001" || item.Product != controlplane.ProductDouyinDesktop || !item.SecretConfigured || item.ActiveLeases != 1 || item.DailyUsedTokens != 42 || item.LastTestStatus != "failed" || item.LastTestedAt != "2026-08-19T23:59:00Z" {
 		t.Fatalf("model pool item = %+v", item)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -710,12 +710,12 @@ func TestPostgresRepositoryNormalizedModelPoolHealthPageFiltersBeforeLimit(t *te
 
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT a.id, a.provider, a.model, a.base_url, a.secret_ref, a.status")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT a.id, a.product, a.provider, a.model, a.base_url, a.secret_ref, a.status")).
 		WithArgs(now, dayStart, dayStart.Add(24*time.Hour), 1).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "provider", "model", "base_url", "secret_ref", "status", "priority", "concurrency_limit", "daily_token_limit", "cooldown_until",
+			"id", "product", "provider", "model", "base_url", "secret_ref", "status", "priority", "concurrency_limit", "daily_token_limit", "cooldown_until",
 			"active_leases", "daily_used_tokens", "payload", "created_at",
-		}).AddRow("mpa_ready", "openai", "rewrite", "https://example.com/v1", "model-account/ready", "active", 10, 2, 1000, nil, 0, 42, nil, now))
+		}).AddRow("mpa_ready", string(controlplane.ProductAutoLive), "openai", "rewrite", "https://example.com/v1", "model-account/ready", "active", 10, 2, 1000, nil, 0, 42, nil, now))
 	mock.ExpectCommit()
 
 	items, err := repository.ListModelPoolHealthAccounts(context.Background(), 1)
@@ -744,18 +744,18 @@ func TestPostgresRepositoryNormalizedModelLeasePageUsesBoundedQuery(t *testing.T
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM model_leases")).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, account_id, user_id, device_id, purpose, status, expires_at")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, account_id, user_id, device_id, purpose, status, expires_at")).
 		WithArgs(20, 0).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "account_id", "user_id", "device_id", "purpose", "status", "expires_at", "provider", "model", "proxy_mode", "concurrency_limit",
-		}).AddRow("lease_00000001", "mpa_00000001", "usr_00000001", "dev_00000001", "client", "active", expiresAt, "openai", "rewrite", controlplane.ModelLeaseProxyModeDirectLease, 2))
+			"id", "product", "account_id", "user_id", "device_id", "purpose", "status", "expires_at", "provider", "model", "proxy_mode", "concurrency_limit",
+		}).AddRow("lease_00000001", string(controlplane.ProductDouyinDesktop), "mpa_00000001", "usr_00000001", "dev_00000001", "client", "active", expiresAt, "openai", "rewrite", controlplane.ModelLeaseProxyModeDirectLease, 2))
 	mock.ExpectCommit()
 
 	page, err := repository.ListModelLeasesPage(context.Background(), 0, 20)
 	if err != nil {
 		t.Fatalf("ListModelLeasesPage() error = %v", err)
 	}
-	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].AccountID != "mpa_00000001" || page.Items[0].ProxyMode != controlplane.ModelLeaseProxyModeDirectLease {
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].Product != controlplane.ProductDouyinDesktop || page.Items[0].AccountID != "mpa_00000001" || page.Items[0].ProxyMode != controlplane.ModelLeaseProxyModeDirectLease {
 		t.Fatalf("model lease page = %+v", page)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -777,10 +777,10 @@ func TestPostgresRepositoryNormalizedModelLeaseFilteredPageUsesWhitelist(t *test
 	expectNormalizedPageCoverage(mock)
 	countExpectation := mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM model_leases WHERE status = 'active' AND expires_at > $1 AND provider = $2"))
 	countExpectation.WithArgs(sqlmock.AnyArg(), "openai").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	pageExpectation := mock.ExpectQuery(regexp.QuoteMeta("SELECT id, account_id, user_id, device_id, purpose, status, expires_at"))
+	pageExpectation := mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, account_id, user_id, device_id, purpose, status, expires_at"))
 	pageExpectation.WithArgs(sqlmock.AnyArg(), "openai", 5, 2).WillReturnRows(sqlmock.NewRows([]string{
-		"id", "account_id", "user_id", "device_id", "purpose", "status", "expires_at", "provider", "model", "proxy_mode", "concurrency_limit",
-	}).AddRow("lease_00000001", "mpa_00000001", "usr_00000001", "dev_00000001", "client", "active", time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC), "openai", "rewrite", controlplane.ModelLeaseProxyModeDirectLease, 2))
+		"id", "product", "account_id", "user_id", "device_id", "purpose", "status", "expires_at", "provider", "model", "proxy_mode", "concurrency_limit",
+	}).AddRow("lease_00000001", string(controlplane.ProductDouyinDesktop), "mpa_00000001", "usr_00000001", "dev_00000001", "client", "active", time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC), "openai", "rewrite", controlplane.ModelLeaseProxyModeDirectLease, 2))
 	mock.ExpectCommit()
 
 	page, err := repository.ListModelLeasesPageWithOptions(context.Background(), ModelLeasePageOptions{
@@ -789,7 +789,7 @@ func TestPostgresRepositoryNormalizedModelLeaseFilteredPageUsesWhitelist(t *test
 	if err != nil {
 		t.Fatalf("ListModelLeasesPageWithOptions() error = %v", err)
 	}
-	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].Provider != "openai" {
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].Product != controlplane.ProductDouyinDesktop || page.Items[0].Provider != "openai" {
 		t.Fatalf("filtered model lease page = %+v", page)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

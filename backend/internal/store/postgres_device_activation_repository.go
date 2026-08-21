@@ -77,7 +77,7 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 		return controlplane.DeviceSummary{}, ErrSessionDeviceBindingConflict
 	}
 
-	existingDevice, exists, err := s.loadDeviceForUpdate(operationCtx, tx, record.Device.DeviceID)
+	existingDevice, exists, err := s.loadDeviceForUpdateWithProduct(operationCtx, tx, record.Device.DeviceID, record.Product)
 	if err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
@@ -89,12 +89,14 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 	var codeProduct sql.NullString
 	var expiresAt sql.NullTime
 	var maxDevices, boundDevices int
-	if err := tx.QueryRowContext(operationCtx, `
+	codeQuery := `
 		SELECT id, product, status, expires_at, max_devices, bound_devices
 		FROM activation_codes
-		WHERE code_hash = $1
-		FOR UPDATE
-	`, record.ActivationCodeHash).Scan(&codeID, &codeProduct, &codeStatus, &expiresAt, &maxDevices, &boundDevices); err != nil {
+		WHERE code_hash = $1 AND `
+	productCondition, productArgs := normalizedProductFilter("product", record.Product, 2)
+	codeQuery += productCondition + "\n\t\tFOR UPDATE\n\t"
+	codeArgs := append([]any{record.ActivationCodeHash}, productArgs...)
+	if err := tx.QueryRowContext(operationCtx, codeQuery, codeArgs...).Scan(&codeID, &codeProduct, &codeStatus, &expiresAt, &maxDevices, &boundDevices); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeNotFound
 		}
@@ -123,7 +125,7 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 		if storedFingerprint != record.Fingerprint {
 			return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyConflict
 		}
-		device, err := s.loadDeviceSummary(operationCtx, tx, storedResourceID)
+		device, err := s.loadDeviceSummaryWithProduct(operationCtx, tx, storedResourceID, record.Product)
 		if err != nil {
 			return controlplane.DeviceSummary{}, err
 		}
@@ -304,6 +306,37 @@ func (s *PostgresRepository) loadDeviceForUpdate(ctx context.Context, tx *sql.Tx
 	return device, true, nil
 }
 
+func (s *PostgresRepository) loadDeviceForUpdateWithProduct(ctx context.Context, tx *sql.Tx, deviceID string, product controlplane.ProductCode) (controlplane.DeviceSummary, bool, error) {
+	var device controlplane.DeviceSummary
+	var userID sql.NullString
+	var storedProduct sql.NullString
+	var lastSeenAt sql.NullTime
+	condition, productArgs := normalizedProductFilter("product", product, 2)
+	query := `
+		SELECT id, user_id, product, device_name, platform, client_version, status, last_heartbeat_at
+		FROM devices
+		WHERE id = $1 AND ` + condition + `
+		FOR UPDATE
+	`
+	args := append([]any{deviceID}, productArgs...)
+	err := tx.QueryRowContext(ctx, query, args...).Scan(&device.ID, &userID, &storedProduct, &device.DeviceName, &device.Platform, &device.AppVersion, &device.Status, &lastSeenAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return controlplane.DeviceSummary{}, false, nil
+	}
+	if err != nil {
+		return controlplane.DeviceSummary{}, false, postgresOperationError(ctx, fmt.Errorf("lock normalized product device: %w", err))
+	}
+	device.UserID = userID.String
+	device.Product, err = normalizedStoredProduct(storedProduct)
+	if err != nil {
+		return controlplane.DeviceSummary{}, false, err
+	}
+	if lastSeenAt.Valid {
+		device.LastSeenAt = lastSeenAt.Time.UTC().Format(time.RFC3339)
+	}
+	return device, true, nil
+}
+
 func normalizedStoredProduct(raw sql.NullString) (controlplane.ProductCode, error) {
 	if !raw.Valid {
 		return "", controlplane.ErrForbidden
@@ -328,6 +361,17 @@ func normalizedAuditProduct(raw sql.NullString) (controlplane.ProductCode, error
 
 func (s *PostgresRepository) loadDeviceSummary(ctx context.Context, tx *sql.Tx, deviceID string) (controlplane.DeviceSummary, error) {
 	device, exists, err := s.loadDeviceForUpdate(ctx, tx, deviceID)
+	if err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
+	if !exists {
+		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
+	}
+	return device, nil
+}
+
+func (s *PostgresRepository) loadDeviceSummaryWithProduct(ctx context.Context, tx *sql.Tx, deviceID string, product controlplane.ProductCode) (controlplane.DeviceSummary, error) {
+	device, exists, err := s.loadDeviceForUpdateWithProduct(ctx, tx, deviceID, product)
 	if err != nil {
 		return controlplane.DeviceSummary{}, err
 	}

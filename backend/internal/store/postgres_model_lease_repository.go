@@ -64,7 +64,13 @@ func (s *PostgresRepository) CreateModelLease(ctx context.Context, record ModelL
 	if user.Status != controlplane.UserStatusActive {
 		return controlplane.ModelLease{}, controlplane.ErrUserDisabled
 	}
-	device, exists, err := s.loadDeviceForUpdate(operationCtx, tx, record.DeviceID)
+	var device controlplane.DeviceSummary
+	var exists bool
+	if explicitProduct {
+		device, exists, err = s.loadDeviceForUpdateWithProduct(operationCtx, tx, record.DeviceID, record.Product)
+	} else {
+		device, exists, err = s.loadDeviceForUpdate(operationCtx, tx, record.DeviceID)
+	}
 	if err != nil {
 		return controlplane.ModelLease{}, err
 	}
@@ -91,7 +97,7 @@ func (s *PostgresRepository) CreateModelLease(ctx context.Context, record ModelL
 			if storedFingerprint != record.Fingerprint {
 				return controlplane.ModelLease{}, controlplane.ErrIdempotencyConflict
 			}
-			lease, err := s.loadModelLeaseForUpdate(operationCtx, tx, storedResourceID, record.Product)
+			lease, err := s.loadModelLeaseForUpdateWithProduct(operationCtx, tx, storedResourceID, record.Product)
 			if err != nil {
 				return controlplane.ModelLease{}, err
 			}
@@ -134,11 +140,17 @@ func (s *PostgresRepository) CreateModelLease(ctx context.Context, record ModelL
 	}
 
 	now := s.Now().UTC()
-	if _, err := tx.ExecContext(operationCtx, `
+	expireQuery := `
 		UPDATE model_leases
 		SET status = $1, released_at = COALESCE(released_at, $2)
-		WHERE status = $3 AND expires_at <= $2
-	`, controlplane.ModelLeaseStatusExpired, now, controlplane.ModelLeaseStatusActive); err != nil {
+		WHERE status = $3 AND expires_at <= $2`
+	expireArgs := []any{controlplane.ModelLeaseStatusExpired, now, controlplane.ModelLeaseStatusActive}
+	if explicitProduct {
+		condition, productArgs := normalizedProductFilter("product", record.Product, 4)
+		expireQuery += " AND " + condition
+		expireArgs = append(expireArgs, productArgs...)
+	}
+	if _, err := tx.ExecContext(operationCtx, expireQuery, expireArgs...); err != nil {
 		return controlplane.ModelLease{}, postgresOperationError(operationCtx, fmt.Errorf("expire normalized model leases before creation: %w", err))
 	}
 	var products []controlplane.ProductCode
@@ -200,7 +212,12 @@ func (s *PostgresRepository) CreateModelLease(ctx context.Context, record ModelL
 		}
 		return controlplane.ModelLease{}, postgresOperationError(operationCtx, fmt.Errorf("select normalized model account for lease: %w", err))
 	}
-	account, err := s.loadNormalizedModelPoolAccount(operationCtx, tx, accountID)
+	var account normalizedModelPoolAccount
+	if explicitProduct {
+		account, err = s.loadNormalizedModelPoolAccountWithProduct(operationCtx, tx, accountID, record.Product)
+	} else {
+		account, err = s.loadNormalizedModelPoolAccount(operationCtx, tx, accountID)
+	}
 	if err != nil {
 		return controlplane.ModelLease{}, err
 	}
@@ -389,7 +406,13 @@ func (s *PostgresRepository) RenewModelLease(ctx context.Context, record ModelLe
 	if user.Status != controlplane.UserStatusActive {
 		return controlplane.ModelLease{}, controlplane.ErrUserDisabled
 	}
-	device, exists, err := s.loadDeviceForUpdate(operationCtx, tx, record.DeviceID)
+	var device controlplane.DeviceSummary
+	var exists bool
+	if explicitProduct {
+		device, exists, err = s.loadDeviceForUpdateWithProduct(operationCtx, tx, record.DeviceID, record.Product)
+	} else {
+		device, exists, err = s.loadDeviceForUpdate(operationCtx, tx, record.DeviceID)
+	}
 	if err != nil {
 		return controlplane.ModelLease{}, err
 	}
@@ -402,7 +425,12 @@ func (s *PostgresRepository) RenewModelLease(ctx context.Context, record ModelLe
 	if device.Status != controlplane.DeviceStatusActive {
 		return controlplane.ModelLease{}, controlplane.ErrDeviceDisabled
 	}
-	lease, err := s.loadModelLeaseForUpdate(operationCtx, tx, record.LeaseID, productReadArgs(explicitProduct, record.Product)...)
+	var lease controlplane.ModelLease
+	if explicitProduct {
+		lease, err = s.loadModelLeaseForUpdateWithProduct(operationCtx, tx, record.LeaseID, record.Product)
+	} else {
+		lease, err = s.loadModelLeaseForUpdate(operationCtx, tx, record.LeaseID)
+	}
 	if err != nil {
 		return controlplane.ModelLease{}, err
 	}
@@ -412,7 +440,11 @@ func (s *PostgresRepository) RenewModelLease(ctx context.Context, record ModelLe
 	if lease.UserID != record.UserID || lease.DeviceID != device.ID {
 		return controlplane.ModelLease{}, controlplane.ErrForbidden
 	}
-	if err := sweepNormalizedModelLease(operationCtx, tx, &lease, s.Now()); err != nil {
+	if explicitProduct {
+		if err := sweepNormalizedModelLeaseForProduct(operationCtx, tx, &lease, s.Now(), record.Product); err != nil {
+			return controlplane.ModelLease{}, err
+		}
+	} else if err := sweepNormalizedModelLease(operationCtx, tx, &lease, s.Now()); err != nil {
 		return controlplane.ModelLease{}, err
 	}
 	var storedFingerprint, storedResourceID string
@@ -442,7 +474,12 @@ func (s *PostgresRepository) RenewModelLease(ctx context.Context, record ModelLe
 	if lease.Status != controlplane.ModelLeaseStatusActive {
 		return controlplane.ModelLease{}, controlplane.ErrModelLeaseStateConflict
 	}
-	account, err := s.loadModelAccountForUpdate(operationCtx, tx, lease.AccountID, productReadArgs(explicitProduct, record.Product)...)
+	var account normalizedModelAccount
+	if explicitProduct {
+		account, err = s.loadModelAccountForUpdateWithProduct(operationCtx, tx, lease.AccountID, record.Product)
+	} else {
+		account, err = s.loadModelAccountForUpdate(operationCtx, tx, lease.AccountID)
+	}
 	if err != nil {
 		return controlplane.ModelLease{}, err
 	}
@@ -563,18 +600,32 @@ func (s *PostgresRepository) releaseModelLease(ctx context.Context, leaseID, use
 		if user.Status != controlplane.UserStatusActive {
 			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrUserDisabled
 		}
-		device, exists, err := s.loadDeviceForUpdate(operationCtx, tx, deviceID)
+		var device controlplane.DeviceSummary
+		var exists bool
+		if explicitProduct {
+			device, exists, err = s.loadDeviceForUpdateWithProduct(operationCtx, tx, deviceID, product)
+		} else {
+			device, exists, err = s.loadDeviceForUpdate(operationCtx, tx, deviceID)
+		}
 		if err != nil {
 			return controlplane.ReleaseModelLeaseResult{}, err
 		}
 		if !exists || device.UserID != userID {
 			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrDeviceNotFound
 		}
+		if explicitProduct && device.Product != product {
+			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrForbidden
+		}
 		if device.Status != controlplane.DeviceStatusActive {
 			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrDeviceDisabled
 		}
 	}
-	lease, err := s.loadModelLeaseForUpdate(operationCtx, tx, leaseID, productReadArgs(explicitProduct, product)...)
+	var lease controlplane.ModelLease
+	if explicitProduct {
+		lease, err = s.loadModelLeaseForUpdateWithProduct(operationCtx, tx, leaseID, product)
+	} else {
+		lease, err = s.loadModelLeaseForUpdate(operationCtx, tx, leaseID)
+	}
 	if err != nil {
 		return controlplane.ReleaseModelLeaseResult{}, err
 	}
@@ -584,7 +635,11 @@ func (s *PostgresRepository) releaseModelLease(ctx context.Context, leaseID, use
 	if !reclaim && (lease.UserID != userID || lease.DeviceID != deviceID) {
 		return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrForbidden
 	}
-	if err := sweepNormalizedModelLease(operationCtx, tx, &lease, s.Now()); err != nil {
+	if explicitProduct {
+		if err := sweepNormalizedModelLeaseForProduct(operationCtx, tx, &lease, s.Now(), product); err != nil {
+			return controlplane.ReleaseModelLeaseResult{}, err
+		}
+	} else if err := sweepNormalizedModelLease(operationCtx, tx, &lease, s.Now()); err != nil {
 		return controlplane.ReleaseModelLeaseResult{}, err
 	}
 	var storedFingerprint, storedResourceID string
@@ -647,27 +702,14 @@ type normalizedModelAccount struct {
 	dailyLimit       int
 }
 
-func (s *PostgresRepository) loadModelAccountForUpdate(ctx context.Context, tx *sql.Tx, accountID string, products ...controlplane.ProductCode) (normalizedModelAccount, error) {
+func (s *PostgresRepository) loadModelAccountForUpdate(ctx context.Context, tx *sql.Tx, accountID string) (normalizedModelAccount, error) {
 	var account normalizedModelAccount
 	query := `
 		SELECT provider, model, base_url, status, concurrency_limit, daily_token_limit
 		FROM model_accounts
 		WHERE id = $1
 		FOR UPDATE`
-	args := []any{accountID}
-	if len(products) > 0 && products[0] != "" {
-		query = strings.Replace(query, "SELECT provider,", "SELECT product, provider,", 1)
-		query = strings.Replace(query, "WHERE id = $1", "WHERE id = $1 AND product = $2", 1)
-		args = append(args, products[0])
-		if err := tx.QueryRowContext(ctx, query, args...).Scan(&account.product, &account.provider, &account.model, &account.baseURL, &account.status, &account.concurrencyLimit, &account.dailyLimit); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return normalizedModelAccount{}, controlplane.ErrModelPoolUnavailable
-			}
-			return normalizedModelAccount{}, postgresOperationError(ctx, fmt.Errorf("lock normalized model account: %w", err))
-		}
-		return account, nil
-	}
-	if err := tx.QueryRowContext(ctx, query, args...).Scan(&account.provider, &account.model, &account.baseURL, &account.status, &account.concurrencyLimit, &account.dailyLimit); err != nil {
+	if err := tx.QueryRowContext(ctx, query, accountID).Scan(&account.provider, &account.model, &account.baseURL, &account.status, &account.concurrencyLimit, &account.dailyLimit); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return normalizedModelAccount{}, controlplane.ErrModelPoolUnavailable
 		}
@@ -676,14 +718,25 @@ func (s *PostgresRepository) loadModelAccountForUpdate(ctx context.Context, tx *
 	return account, nil
 }
 
-func productReadArgs(explicit bool, product controlplane.ProductCode) []controlplane.ProductCode {
-	if explicit {
-		return []controlplane.ProductCode{product}
+func (s *PostgresRepository) loadModelAccountForUpdateWithProduct(ctx context.Context, tx *sql.Tx, accountID string, product controlplane.ProductCode) (normalizedModelAccount, error) {
+	var account normalizedModelAccount
+	condition, productArgs := normalizedProductFilter("product", product, 2)
+	query := `
+		SELECT product, provider, model, base_url, status, concurrency_limit, daily_token_limit
+		FROM model_accounts
+		WHERE id = $1 AND ` + condition + `
+		FOR UPDATE`
+	args := append([]any{accountID}, productArgs...)
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&account.product, &account.provider, &account.model, &account.baseURL, &account.status, &account.concurrencyLimit, &account.dailyLimit); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return normalizedModelAccount{}, controlplane.ErrModelPoolUnavailable
+		}
+		return normalizedModelAccount{}, postgresOperationError(ctx, fmt.Errorf("lock normalized product model account: %w", err))
 	}
-	return nil
+	return account, nil
 }
 
-func (s *PostgresRepository) loadModelLeaseForUpdate(ctx context.Context, tx *sql.Tx, leaseID string, products ...controlplane.ProductCode) (controlplane.ModelLease, error) {
+func (s *PostgresRepository) loadModelLeaseForUpdate(ctx context.Context, tx *sql.Tx, leaseID string) (controlplane.ModelLease, error) {
 	var lease controlplane.ModelLease
 	var expiresAt, createdAt time.Time
 	var releasedAt sql.NullTime
@@ -694,16 +747,9 @@ func (s *PostgresRepository) loadModelLeaseForUpdate(ctx context.Context, tx *sq
 		WHERE id = $1
 		FOR UPDATE
 	`
-	args := []any{leaseID}
 	var product sql.NullString
-	if len(products) > 0 && products[0] != "" {
-		query = strings.Replace(query, "SELECT id, account_id", "SELECT id, product, account_id", 1)
-	}
 	dest := []any{&lease.ID, &lease.AccountID, &lease.UserID, &lease.DeviceID, &lease.Purpose, &lease.Status, &expiresAt, &createdAt, &releasedAt, &lease.Provider, &lease.Model, &lease.ProxyMode, &lease.ConcurrencyLimit}
-	if len(products) > 0 && products[0] != "" {
-		dest = []any{&lease.ID, &product, &lease.AccountID, &lease.UserID, &lease.DeviceID, &lease.Purpose, &lease.Status, &expiresAt, &createdAt, &releasedAt, &lease.Provider, &lease.Model, &lease.ProxyMode, &lease.ConcurrencyLimit}
-	}
-	if err := tx.QueryRowContext(ctx, query, args...).Scan(dest...); err != nil {
+	if err := tx.QueryRowContext(ctx, query, leaseID).Scan(dest...); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return controlplane.ModelLease{}, controlplane.ErrModelLeaseNotFound
 		}
@@ -726,7 +772,43 @@ func (s *PostgresRepository) loadModelLeaseForUpdate(ctx context.Context, tx *sq
 	return lease, nil
 }
 
+func (s *PostgresRepository) loadModelLeaseForUpdateWithProduct(ctx context.Context, tx *sql.Tx, leaseID string, product controlplane.ProductCode) (controlplane.ModelLease, error) {
+	var lease controlplane.ModelLease
+	var storedProduct sql.NullString
+	var expiresAt, createdAt time.Time
+	var releasedAt sql.NullTime
+	condition, productArgs := normalizedProductFilter("product", product, 2)
+	query := `
+		SELECT id, product, account_id, user_id, device_id, purpose, status, expires_at,
+		       created_at, released_at, provider, model, proxy_mode, concurrency_limit
+		FROM model_leases
+		WHERE id = $1 AND ` + condition + `
+		FOR UPDATE`
+	args := append([]any{leaseID}, productArgs...)
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&lease.ID, &storedProduct, &lease.AccountID, &lease.UserID, &lease.DeviceID, &lease.Purpose, &lease.Status, &expiresAt, &createdAt, &releasedAt, &lease.Provider, &lease.Model, &lease.ProxyMode, &lease.ConcurrencyLimit); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return controlplane.ModelLease{}, controlplane.ErrModelLeaseNotFound
+		}
+		return controlplane.ModelLease{}, postgresOperationError(ctx, fmt.Errorf("lock normalized product model lease: %w", err))
+	}
+	var err error
+	lease.Product, err = normalizedStoredProduct(storedProduct)
+	if err != nil {
+		return controlplane.ModelLease{}, err
+	}
+	lease.CreatedAt = createdAt.UTC().Format(time.RFC3339)
+	lease.ExpiresAt = expiresAt.UTC().Format(time.RFC3339)
+	if releasedAt.Valid {
+		lease.ReleasedAt = releasedAt.Time.UTC().Format(time.RFC3339)
+	}
+	return lease, nil
+}
+
 func sweepNormalizedModelLease(ctx context.Context, tx *sql.Tx, lease *controlplane.ModelLease, now time.Time) error {
+	return sweepNormalizedModelLeaseForProduct(ctx, tx, lease, now, "")
+}
+
+func sweepNormalizedModelLeaseForProduct(ctx context.Context, tx *sql.Tx, lease *controlplane.ModelLease, now time.Time, product controlplane.ProductCode) error {
 	if lease == nil || lease.Status != controlplane.ModelLeaseStatusActive {
 		return nil
 	}
@@ -737,9 +819,16 @@ func sweepNormalizedModelLease(ctx context.Context, tx *sql.Tx, lease *controlpl
 	if now.Before(expiresAt) {
 		return nil
 	}
-	if _, err := tx.ExecContext(ctx, `
+	query := `
 		UPDATE model_leases SET status = $2, released_at = COALESCE(released_at, $3) WHERE id = $1 AND status = $4
-	`, lease.ID, controlplane.ModelLeaseStatusExpired, now, controlplane.ModelLeaseStatusActive); err != nil {
+	`
+	args := []any{lease.ID, controlplane.ModelLeaseStatusExpired, now, controlplane.ModelLeaseStatusActive}
+	if product != "" {
+		condition, productArgs := normalizedProductFilter("product", product, 5)
+		query += " AND " + condition
+		args = append(args, productArgs...)
+	}
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 		return postgresOperationError(ctx, fmt.Errorf("expire normalized model lease: %w", err))
 	}
 	lease.Status = controlplane.ModelLeaseStatusExpired

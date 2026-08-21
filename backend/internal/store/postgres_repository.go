@@ -366,18 +366,14 @@ func (s *PostgresRepository) ListModelUsagePageWithOptions(ctx context.Context, 
 		}
 		limitPlaceholder := addArg(options.Limit)
 		offsetPlaceholder := addArg(options.Offset)
-		selectProduct := ""
-		if options.Product != "" {
-			selectProduct = "product, "
-		}
 		query := fmt.Sprintf(`
-			SELECT id, %slease_id, client_call_id, request_id, provider, model,
+			SELECT id, product, lease_id, client_call_id, request_id, provider, model,
 			       prompt_tokens, completion_tokens, total_tokens, latency_ms,
 			       status, usage_source, error_code, created_at
 			FROM model_usage_records%s
 			ORDER BY %s
 			LIMIT %s OFFSET %s
-		`, selectProduct, whereSQL, orderBy, limitPlaceholder, offsetPlaceholder)
+		`, whereSQL, orderBy, limitPlaceholder, offsetPlaceholder)
 		rows, err := tx.QueryContext(ctx, query, filterArgs...)
 		if err != nil {
 			return ModelUsagePage{}, err
@@ -390,26 +386,17 @@ func (s *PostgresRepository) ListModelUsagePageWithOptions(ctx context.Context, 
 				product            sql.NullString
 				createdAt          time.Time
 			)
-			dest := []any{&item.ID, &leaseID, &item.ClientCallID, &item.RequestID, &item.Provider, &item.Model,
+			dest := []any{&item.ID, &product, &leaseID, &item.ClientCallID, &item.RequestID, &item.Provider, &item.Model,
 				&item.InputTokens, &item.OutputTokens, &item.TotalTokens, &item.LatencyMS,
 				&item.Status, &item.UsageSource, &errorCode, &createdAt}
-			if options.Product != "" {
-				dest = []any{&item.ID, &product, &leaseID, &item.ClientCallID, &item.RequestID, &item.Provider, &item.Model,
-					&item.InputTokens, &item.OutputTokens, &item.TotalTokens, &item.LatencyMS,
-					&item.Status, &item.UsageSource, &errorCode, &createdAt}
-			}
 			if err := rows.Scan(dest...); err != nil {
 				return ModelUsagePage{}, err
 			}
 			item.LeaseID = leaseID.String
 			item.ErrorCode = errorCode.String
-			if options.Product != "" {
-				item.Product, err = normalizedAuditProduct(product)
-				if err != nil {
-					return ModelUsagePage{}, err
-				}
-			} else {
-				item.Product = controlplane.ProductAutoLive
+			item.Product, err = normalizedAuditProduct(product)
+			if err != nil {
+				return ModelUsagePage{}, err
 			}
 			item.CreatedAt = createdAt.UTC().Format(time.RFC3339)
 			page.Items = append(page.Items, item)
@@ -568,16 +555,18 @@ func (s *PostgresRepository) ListModelPoolAccountsPage(ctx context.Context, offs
 		dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 		dayEnd := dayStart.Add(24 * time.Hour)
 		rows, err := tx.QueryContext(ctx, `
-			SELECT a.id, a.provider, a.model, a.base_url, a.secret_ref, a.status,
+			SELECT a.id, a.product, a.provider, a.model, a.base_url, a.secret_ref, a.status,
 			       a.priority, a.concurrency_limit, a.daily_token_limit, a.cooldown_until,
 			       (SELECT COUNT(*)
 			          FROM model_leases l
 			         WHERE l.account_id = a.id
+			           AND l.product = a.product
 			           AND l.status = 'active'
 			           AND l.expires_at > $1) AS active_leases,
 			       COALESCE((SELECT SUM(u.total_tokens)
 			                   FROM model_usage_records u
 			                  WHERE u.account_id = a.id
+			                    AND u.product = a.product
 			                    AND u.created_at >= $2
 			                    AND u.created_at < $3), 0) AS daily_used_tokens,
 			       t.payload, t.created_at
@@ -586,6 +575,7 @@ func (s *PostgresRepository) ListModelPoolAccountsPage(ctx context.Context, offs
 				SELECT payload, created_at
 				  FROM model_pool_test_results
 				 WHERE account_id = a.id
+				   AND product = a.product
 				 ORDER BY created_at DESC, id DESC
 				 LIMIT 1
 			  ) t ON TRUE
@@ -619,16 +609,18 @@ func (s *PostgresRepository) ListModelPoolHealthAccounts(ctx context.Context, li
 		dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 		dayEnd := dayStart.Add(24 * time.Hour)
 		rows, err := tx.QueryContext(ctx, `
-			SELECT a.id, a.provider, a.model, a.base_url, a.secret_ref, a.status,
+			SELECT a.id, a.product, a.provider, a.model, a.base_url, a.secret_ref, a.status,
 			       a.priority, a.concurrency_limit, a.daily_token_limit, a.cooldown_until,
 			       (SELECT COUNT(*)
 			          FROM model_leases l
 			         WHERE l.account_id = a.id
+			           AND l.product = a.product
 			           AND l.status = 'active'
 			           AND l.expires_at > $1) AS active_leases,
 			       COALESCE((SELECT SUM(u.total_tokens)
 			                   FROM model_usage_records u
 			                  WHERE u.account_id = a.id
+			                    AND u.product = a.product
 			                    AND u.created_at >= $2
 			                    AND u.created_at < $3), 0) AS daily_used_tokens,
 			       t.payload, t.created_at
@@ -637,6 +629,7 @@ func (s *PostgresRepository) ListModelPoolHealthAccounts(ctx context.Context, li
 				SELECT payload, created_at
 				  FROM model_pool_test_results
 				 WHERE account_id = a.id
+				   AND product = a.product
 				 ORDER BY created_at DESC, id DESC
 				 LIMIT 1
 			  ) t ON TRUE
@@ -644,9 +637,10 @@ func (s *PostgresRepository) ListModelPoolHealthAccounts(ctx context.Context, li
 			   AND a.secret_ref <> ''
 			   AND (a.cooldown_until IS NULL OR a.cooldown_until <= $1)
 			   AND (a.daily_token_limit <= 0 OR COALESCE((SELECT SUM(u.total_tokens)
-			                                                FROM model_usage_records u
-			                                               WHERE u.account_id = a.id
-			                                                 AND u.created_at >= $2
+				                                               FROM model_usage_records u
+				                                              WHERE u.account_id = a.id
+				                                                AND u.product = a.product
+				                                                AND u.created_at >= $2
 			                                                 AND u.created_at < $3), 0) < a.daily_token_limit)
 			 ORDER BY a.id
 			 LIMIT $4
@@ -672,13 +666,19 @@ func scanModelPoolAccountRows(rows *sql.Rows) ([]controlplane.ModelPoolAccountSu
 	for rows.Next() {
 		var (
 			item                          controlplane.ModelPoolAccountSummary
+			product                       sql.NullString
 			cooldownUntil, testedAt       sql.NullTime
 			activeLeases, dailyUsedTokens int
 			payload                       []byte
 		)
-		if err := rows.Scan(&item.ID, &item.Provider, &item.Model, &item.BaseURL, &item.SecretRef, &item.Status,
+		if err := rows.Scan(&item.ID, &product, &item.Provider, &item.Model, &item.BaseURL, &item.SecretRef, &item.Status,
 			&item.Priority, &item.ConcurrencyLimit, &item.DailyLimit, &cooldownUntil,
 			&activeLeases, &dailyUsedTokens, &payload, &testedAt); err != nil {
+			return nil, err
+		}
+		var err error
+		item.Product, err = normalizedAuditProduct(product)
+		if err != nil {
 			return nil, err
 		}
 		item.SecretConfigured = item.SecretRef != ""
@@ -788,17 +788,13 @@ func (s *PostgresRepository) ListModelLeasesPageWithOptions(ctx context.Context,
 		}
 		limitPlaceholder := addArg(options.Limit)
 		offsetPlaceholder := addArg(options.Offset)
-		selectProduct := ""
-		if options.Product != "" {
-			selectProduct = "product, "
-		}
 		query := fmt.Sprintf(`
-			SELECT id, %saccount_id, user_id, device_id, purpose, status, expires_at,
+			SELECT id, product, account_id, user_id, device_id, purpose, status, expires_at,
 			       provider, model, proxy_mode, concurrency_limit
 			  FROM model_leases%s
 			 ORDER BY %s
 			 LIMIT %s OFFSET %s
-		`, selectProduct, whereSQL, orderBy, limitPlaceholder, offsetPlaceholder)
+		`, whereSQL, orderBy, limitPlaceholder, offsetPlaceholder)
 		rows, err := tx.QueryContext(ctx, query, filterArgs...)
 		if err != nil {
 			return ModelLeasePage{}, err
@@ -810,22 +806,14 @@ func (s *PostgresRepository) ListModelLeasesPageWithOptions(ctx context.Context,
 				product   sql.NullString
 				expiresAt time.Time
 			)
-			dest := []any{&item.ID, &item.AccountID, &item.UserID, &item.DeviceID, &item.Purpose, &item.Status,
+			dest := []any{&item.ID, &product, &item.AccountID, &item.UserID, &item.DeviceID, &item.Purpose, &item.Status,
 				&expiresAt, &item.Provider, &item.Model, &item.ProxyMode, &item.ConcurrencyLimit}
-			if options.Product != "" {
-				dest = []any{&item.ID, &product, &item.AccountID, &item.UserID, &item.DeviceID, &item.Purpose, &item.Status,
-					&expiresAt, &item.Provider, &item.Model, &item.ProxyMode, &item.ConcurrencyLimit}
-			}
 			if err := rows.Scan(dest...); err != nil {
 				return ModelLeasePage{}, err
 			}
-			if options.Product != "" {
-				item.Product, err = normalizedAuditProduct(product)
-				if err != nil {
-					return ModelLeasePage{}, err
-				}
-			} else {
-				item.Product = controlplane.ProductAutoLive
+			item.Product, err = normalizedAuditProduct(product)
+			if err != nil {
+				return ModelLeasePage{}, err
 			}
 			item.ExpiresAt = expiresAt.UTC().Format(time.RFC3339)
 			page.Items = append(page.Items, item)
@@ -944,6 +932,16 @@ func scanDeviceSummary(scanner deviceRowScanner) (controlplane.DeviceSummary, er
 		item.LastSeenAt = lastHeartbeatAt.Time.UTC().Format(time.RFC3339)
 	}
 	return item, nil
+}
+
+// normalizedProductFilter keeps strict product lookups parameterized for
+// non-default products while preserving the legacy autolive SQL shape used by
+// the compatibility readers and their existing contracts.
+func normalizedProductFilter(column string, product controlplane.ProductCode, placeholder int) (string, []any) {
+	if product == controlplane.ProductAutoLive {
+		return column + " = 'autolive'", nil
+	}
+	return fmt.Sprintf("%s = $%d", column, placeholder), []any{product}
 }
 
 func (s *PostgresRepository) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {

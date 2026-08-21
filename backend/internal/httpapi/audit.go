@@ -52,9 +52,16 @@ func auditMiddlewareWithOptions(controlPlane *service.ControlPlane, logger *slog
 		}
 		// 审计只记录方法、路由和目标上下文，不读取请求体，避免把密码/Token/API Key 写入日志。
 		auditCtx := context.WithoutCancel(r.Context())
-		if err := controlPlane.RecordAudit(auditCtx, controlplane.AuditLogInput{
+		auditProduct := principal.actor.Product
+		if !auditProduct.Valid() {
+			// Login failures have no authenticated actor yet; legacy login
+			// requests are bound to the default product until authentication
+			// succeeds and a session product is available.
+			auditProduct = controlplane.ProductAutoLive
+		}
+		if err := controlPlane.RecordAuditForProduct(auditCtx, auditProduct, controlplane.AuditLogInput{
 			ActorUserID: principal.actor.UserID,
-			Product:     principal.actor.Product,
+			Product:     auditProduct,
 			DeviceID:    principal.deviceID,
 			Action:      r.Method + " " + r.URL.Path,
 			TargetType:  targetType,

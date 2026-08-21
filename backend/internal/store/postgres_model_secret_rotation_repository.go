@@ -34,6 +34,9 @@ func (s *PostgresRepository) RotateModelPoolAccountSecret(ctx context.Context, r
 	if record.Scope == "" || record.IdempotencyKey == "" || record.Fingerprint == "" || record.AccountID == "" || len(record.APIKey) < 8 || len(record.APIKey) > 4096 {
 		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrInvalidRequest
 	}
+	if record.Product != "" && !record.Product.Valid() {
+		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrInvalidRequest
+	}
 	if record.Probe.Status != "succeeded" || (strings.TrimSpace(record.Probe.AccountID) != "" && strings.TrimSpace(record.Probe.AccountID) != record.AccountID) {
 		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrInvalidRequest
 	}
@@ -51,11 +54,22 @@ func (s *PostgresRepository) RotateModelPoolAccountSecret(ctx context.Context, r
 	if err := lockNormalizedControlPlaneMutation(operationCtx, tx); err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
-	account, err := s.loadNormalizedModelPoolAccount(operationCtx, tx, record.AccountID)
+	var account normalizedModelPoolAccount
+	if record.Product != "" {
+		account, err = s.loadNormalizedModelPoolAccountWithProduct(operationCtx, tx, record.AccountID, record.Product)
+	} else {
+		account, err = s.loadNormalizedModelPoolAccount(operationCtx, tx, record.AccountID)
+	}
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
-	storedFingerprint, storedResourceID, inserted, err := s.reserveUserIdempotency(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, record.AccountID, s.Now())
+	var storedFingerprint, storedResourceID string
+	var inserted bool
+	if record.Product != "" {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotencyForProduct(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, record.AccountID, s.Now(), record.Product)
+	} else {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotency(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, record.AccountID, s.Now())
+	}
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -112,11 +126,18 @@ func (s *PostgresRepository) RotateModelPoolAccountSecret(ctx context.Context, r
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, postgresOperationError(operationCtx, fmt.Errorf("marshal normalized model secret probe: %w", err))
 	}
-	updateResult, err := tx.ExecContext(operationCtx, `
+	updateQuery := `
 		UPDATE model_accounts
 		SET secret_ref = $2, updated_at = $3
 		WHERE id = $1 AND secret_ref = $4
-	`, account.id, stagedSecretRef, now, account.secretRef)
+	`
+	updateArgs := []any{account.id, stagedSecretRef, now, account.secretRef}
+	if record.Product != "" {
+		filter, filterArgs := normalizedProductFilter("product", record.Product, len(updateArgs)+1)
+		updateQuery = strings.TrimSpace(updateQuery) + " AND " + filter
+		updateArgs = append(updateArgs, filterArgs...)
+	}
+	updateResult, err := tx.ExecContext(operationCtx, updateQuery, updateArgs...)
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, postgresOperationError(operationCtx, fmt.Errorf("switch normalized model secret reference: %w", err))
 	}
@@ -129,11 +150,20 @@ func (s *PostgresRepository) RotateModelPoolAccountSecret(ctx context.Context, r
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, postgresOperationError(operationCtx, fmt.Errorf("generate normalized model secret test id: %w", err))
 	}
-	if _, err := tx.ExecContext(operationCtx, `
-		INSERT INTO model_pool_test_results (id, account_id, payload, created_at)
-		VALUES ($1, $2, $3, $4)
-	`, testID, account.id, payload, testedAt); err != nil {
-		return controlplane.ModelPoolAccountSummary{}, postgresOperationError(operationCtx, fmt.Errorf("store normalized model secret test result: %w", err))
+	var testErr error
+	if record.Product != "" {
+		_, testErr = tx.ExecContext(operationCtx, `
+			INSERT INTO model_pool_test_results (id, product, account_id, payload, created_at)
+			VALUES ($1, $2, $3, $4, $5)
+		`, testID, record.Product, account.id, payload, testedAt)
+	} else {
+		_, testErr = tx.ExecContext(operationCtx, `
+			INSERT INTO model_pool_test_results (id, account_id, payload, created_at)
+			VALUES ($1, $2, $3, $4)
+		`, testID, account.id, payload, testedAt)
+	}
+	if testErr != nil {
+		return controlplane.ModelPoolAccountSummary{}, postgresOperationError(operationCtx, fmt.Errorf("store normalized model secret test result: %w", testErr))
 	}
 	deleteResult, err := tx.ExecContext(operationCtx, `
 		DELETE FROM model_account_secrets

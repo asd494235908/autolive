@@ -390,16 +390,23 @@ func runDeviceState(run func(store.StateOperation) error, fn func(*store.State) 
 	return result, err
 }
 
-func operationProduct(input controlplane.AuditLogInput) (controlplane.ProductCode, error) {
-	product := controlplane.ProductCode(strings.TrimSpace(string(input.Product)))
-	if product == "" {
-		// Existing non-HTTP service callers are the explicit compatibility
-		// boundary. Normalized HTTP callers always provide the session product
-		// through the success audit input.
-		return controlplane.ProductAutoLive, nil
-	}
+// validateOperationProduct is the service authorization boundary for
+// product-scoped mutations. The caller supplies product from the authenticated
+// actor; an audit event may describe that product but can never choose it.
+func validateOperationProduct(product controlplane.ProductCode, audit controlplane.AuditLogInput) (controlplane.ProductCode, error) {
+	product = controlplane.ProductCode(strings.TrimSpace(string(product)))
 	if !product.Valid() {
 		return "", controlplane.ErrInvalidRequest
+	}
+	if audit.Product == "" {
+		return product, nil
+	}
+	auditProduct, err := controlplane.ParseProductCode(strings.TrimSpace(string(audit.Product)))
+	if err != nil {
+		return "", controlplane.ErrInvalidRequest
+	}
+	if auditProduct != product {
+		return "", controlplane.ErrForbidden
 	}
 	return product, nil
 }
@@ -455,6 +462,16 @@ func validateAuditTargetProduct(state *store.State, input controlplane.AuditLogI
 }
 
 func (s *ControlPlane) RecordAudit(ctx context.Context, input controlplane.AuditLogInput) error {
+	return s.recordAuditForProduct(ctx, controlplane.ProductAutoLive, input)
+}
+
+// RecordAuditForProduct accepts the product only from an authenticated service
+// boundary. The audit input is checked for consistency and cannot override it.
+func (s *ControlPlane) RecordAuditForProduct(ctx context.Context, product controlplane.ProductCode, input controlplane.AuditLogInput) error {
+	return s.recordAuditForProduct(ctx, product, input)
+}
+
+func (s *ControlPlane) recordAuditForProduct(ctx context.Context, product controlplane.ProductCode, input controlplane.AuditLogInput) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -466,7 +483,7 @@ func (s *ControlPlane) RecordAudit(ctx context.Context, input controlplane.Audit
 	input.Outcome = strings.TrimSpace(input.Outcome)
 	input.ErrorCode = strings.TrimSpace(input.ErrorCode)
 	input.RequestID = strings.TrimSpace(input.RequestID)
-	product, err := operationProduct(input)
+	product, err := validateOperationProduct(product, input)
 	if err != nil {
 		return err
 	}
@@ -1362,9 +1379,19 @@ func (s *ControlPlane) getClientProfile(ctx context.Context, userID, deviceID st
 		if user.Status != controlplane.UserStatusActive {
 			return controlplane.ClientProfile{}, controlplane.ErrUserDisabled
 		}
-		device, err := deviceReader.GetOwnedDevice(ctx, user.ID, strings.TrimSpace(deviceID))
-		if err != nil {
-			return controlplane.ClientProfile{}, err
+		var device controlplane.DeviceSummary
+		var deviceErr error
+		if product != "" {
+			if productReader, ok := s.repository.(store.ProductDeviceReader); ok {
+				device, deviceErr = productReader.GetOwnedDeviceForProduct(ctx, user.ID, strings.TrimSpace(deviceID), product)
+			} else {
+				device, deviceErr = deviceReader.GetOwnedDevice(ctx, user.ID, strings.TrimSpace(deviceID))
+			}
+		} else {
+			device, deviceErr = deviceReader.GetOwnedDevice(ctx, user.ID, strings.TrimSpace(deviceID))
+		}
+		if deviceErr != nil {
+			return controlplane.ClientProfile{}, deviceErr
 		}
 		if product != "" && device.Product != product {
 			return controlplane.ClientProfile{}, controlplane.ErrForbidden
@@ -1379,7 +1406,17 @@ func (s *ControlPlane) getClientProfile(ctx context.Context, userID, deviceID st
 			Permissions: permissionsForRole(user.Role),
 		}
 		if reader, ok := s.repository.(store.ActivationExpiryReader); ok {
-			expiresAt, err := reader.GetActivationExpiry(ctx, user.ID, device.ID)
+			var expiresAt *time.Time
+			var err error
+			if product != "" {
+				if productReader, ok := s.repository.(store.ProductActivationExpiryReader); ok {
+					expiresAt, err = productReader.GetActivationExpiryForProduct(ctx, user.ID, device.ID, product)
+				} else {
+					expiresAt, err = reader.GetActivationExpiry(ctx, user.ID, device.ID)
+				}
+			} else {
+				expiresAt, err = reader.GetActivationExpiry(ctx, user.ID, device.ID)
+			}
 			if err != nil {
 				return controlplane.ClientProfile{}, err
 			}
@@ -1817,16 +1854,20 @@ func (s *ControlPlane) GetModelLeaseAdminDetail(ctx context.Context, leaseID str
 // for stale or misconfigured leases. It does not require a client device
 // binding and never returns the lease credential.
 func (s *ControlPlane) ReclaimModelLease(ctx context.Context, idempotencyKey, leaseID string, input controlplane.ReleaseModelLeaseInput) (controlplane.ReleaseModelLeaseResult, error) {
-	return s.reclaimModelLease(ctx, idempotencyKey, leaseID, input, controlplane.AuditLogInput{})
+	return s.reclaimModelLease(ctx, controlplane.ProductAutoLive, idempotencyKey, leaseID, input, controlplane.AuditLogInput{})
 }
 
 // ReclaimModelLeaseWithAudit is the normalized administrative HTTP path. The
 // success event is committed with the lease release transaction.
 func (s *ControlPlane) ReclaimModelLeaseWithAudit(ctx context.Context, idempotencyKey, leaseID string, input controlplane.ReleaseModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ReleaseModelLeaseResult, error) {
-	return s.reclaimModelLease(ctx, idempotencyKey, leaseID, input, audit)
+	return s.reclaimModelLease(ctx, controlplane.ProductAutoLive, idempotencyKey, leaseID, input, audit)
 }
 
-func (s *ControlPlane) reclaimModelLease(ctx context.Context, idempotencyKey, leaseID string, input controlplane.ReleaseModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ReleaseModelLeaseResult, error) {
+func (s *ControlPlane) ReclaimModelLeaseForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey, leaseID string, input controlplane.ReleaseModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ReleaseModelLeaseResult, error) {
+	return s.reclaimModelLease(ctx, product, idempotencyKey, leaseID, input, audit)
+}
+
+func (s *ControlPlane) reclaimModelLease(ctx context.Context, product controlplane.ProductCode, idempotencyKey, leaseID string, input controlplane.ReleaseModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ReleaseModelLeaseResult, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ReleaseModelLeaseResult{}, err
 	}
@@ -1838,7 +1879,7 @@ func (s *ControlPlane) reclaimModelLease(ctx context.Context, idempotencyKey, le
 	if leaseID == "" || len(input.Reason) > 255 {
 		return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrInvalidRequest
 	}
-	product, err := operationProduct(audit)
+	product, err := validateOperationProduct(product, audit)
 	if err != nil {
 		return controlplane.ReleaseModelLeaseResult{}, err
 	}
@@ -1900,17 +1941,21 @@ func (s *ControlPlane) reclaimModelLease(ctx context.Context, idempotencyKey, le
 }
 
 func (s *ControlPlane) CreateModelPoolAccount(ctx context.Context, idempotencyKey string, input controlplane.CreateModelPoolAccountInput) (controlplane.ModelPoolAccountSummary, error) {
-	return s.createModelPoolAccount(ctx, idempotencyKey, input, controlplane.AuditLogInput{})
+	return s.createModelPoolAccount(ctx, controlplane.ProductAutoLive, idempotencyKey, input, controlplane.AuditLogInput{})
 }
 
 // CreateModelPoolAccountWithAudit is the normalized administrative HTTP path.
 // The optional success event is committed with the account row, encrypted
 // secret and idempotency record when the repository supports that boundary.
 func (s *ControlPlane) CreateModelPoolAccountWithAudit(ctx context.Context, idempotencyKey string, input controlplane.CreateModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
-	return s.createModelPoolAccount(ctx, idempotencyKey, input, audit)
+	return s.createModelPoolAccount(ctx, controlplane.ProductAutoLive, idempotencyKey, input, audit)
 }
 
-func (s *ControlPlane) createModelPoolAccount(ctx context.Context, idempotencyKey string, input controlplane.CreateModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+func (s *ControlPlane) CreateModelPoolAccountForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey string, input controlplane.CreateModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+	return s.createModelPoolAccount(ctx, product, idempotencyKey, input, audit)
+}
+
+func (s *ControlPlane) createModelPoolAccount(ctx context.Context, product controlplane.ProductCode, idempotencyKey string, input controlplane.CreateModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -1920,7 +1965,14 @@ func (s *ControlPlane) createModelPoolAccount(ctx context.Context, idempotencyKe
 	if err := validateCreateModelPoolAccountInput(&input); err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
-	fingerprint, err := fingerprintValue(input)
+	product, err := validateOperationProduct(product, audit)
+	if err != nil {
+		return controlplane.ModelPoolAccountSummary{}, err
+	}
+	fingerprint, err := fingerprintValue(struct {
+		Product controlplane.ProductCode                 `json:"product"`
+		Input   controlplane.CreateModelPoolAccountInput `json:"input"`
+	}{Product: product, Input: input})
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -1933,6 +1985,7 @@ func (s *ControlPlane) createModelPoolAccount(ctx context.Context, idempotencyKe
 			Scope:            "control-plane-state",
 			IdempotencyKey:   "create-model-account:" + idempotencyKey,
 			Fingerprint:      fingerprint,
+			Product:          product,
 			Provider:         input.Provider,
 			Model:            input.Model,
 			BaseURL:          input.BaseURL,
@@ -1964,6 +2017,7 @@ func (s *ControlPlane) createModelPoolAccount(ctx context.Context, idempotencyKe
 
 		account := controlplane.ModelPoolAccountSummary{
 			ID:               nextID(state, "mpa"),
+			Product:          product,
 			Provider:         input.Provider,
 			Model:            input.Model,
 			BaseURL:          input.BaseURL,
@@ -1988,16 +2042,20 @@ func (s *ControlPlane) createModelPoolAccount(ctx context.Context, idempotencyKe
 }
 
 func (s *ControlPlane) DisableModelPoolAccount(ctx context.Context, idempotencyKey, accountID string) (controlplane.ModelPoolAccountSummary, error) {
-	return s.disableModelPoolAccount(ctx, idempotencyKey, accountID, controlplane.AuditLogInput{})
+	return s.disableModelPoolAccount(ctx, controlplane.ProductAutoLive, idempotencyKey, accountID, controlplane.AuditLogInput{})
 }
 
 // DisableModelPoolAccountWithAudit is the normalized administrative HTTP
 // path. The success event shares the account mutation transaction.
 func (s *ControlPlane) DisableModelPoolAccountWithAudit(ctx context.Context, idempotencyKey, accountID string, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
-	return s.disableModelPoolAccount(ctx, idempotencyKey, accountID, audit)
+	return s.disableModelPoolAccount(ctx, controlplane.ProductAutoLive, idempotencyKey, accountID, audit)
 }
 
-func (s *ControlPlane) disableModelPoolAccount(ctx context.Context, idempotencyKey, accountID string, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+func (s *ControlPlane) DisableModelPoolAccountForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey, accountID string, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+	return s.disableModelPoolAccount(ctx, product, idempotencyKey, accountID, audit)
+}
+
+func (s *ControlPlane) disableModelPoolAccount(ctx context.Context, product controlplane.ProductCode, idempotencyKey, accountID string, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -2008,9 +2066,14 @@ func (s *ControlPlane) disableModelPoolAccount(ctx context.Context, idempotencyK
 	if accountID == "" {
 		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolAccountNotFound
 	}
+	product, err := validateOperationProduct(product, audit)
+	if err != nil {
+		return controlplane.ModelPoolAccountSummary{}, err
+	}
 	fingerprint, err := fingerprintValue(struct {
-		AccountID string `json:"account_id"`
-	}{AccountID: accountID})
+		AccountID string                   `json:"account_id"`
+		Product   controlplane.ProductCode `json:"product"`
+	}{AccountID: accountID, Product: product})
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -2020,7 +2083,7 @@ func (s *ControlPlane) disableModelPoolAccount(ctx context.Context, idempotencyK
 			return controlplane.ModelPoolAccountSummary{}, store.ErrNormalizedModelPoolRepositoryRequired
 		}
 		return writer.DisableModelPoolAccount(ctx, store.ModelPoolAccountMutationRecord{
-			Scope: "control-plane-state", IdempotencyKey: "disable-model-account:" + idempotencyKey, Fingerprint: fingerprint, AccountID: accountID, Audit: audit,
+			Scope: "control-plane-state", IdempotencyKey: "disable-model-account:" + idempotencyKey, Fingerprint: fingerprint, AccountID: accountID, Product: product, Audit: audit,
 		})
 	}
 
@@ -2037,10 +2100,13 @@ func (s *ControlPlane) disableModelPoolAccount(ctx context.Context, idempotencyK
 			return decorateModelPoolAccount(state, account, s.repository.Now()), nil
 		}
 
-		sweepExpiredModelLeases(state, s.repository.Now())
+		sweepExpiredModelLeasesForProduct(state, s.repository.Now(), product)
 		account, ok := state.ModelPoolAccounts[accountID]
 		if !ok {
 			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolAccountNotFound
+		}
+		if effectiveStoredProduct(account.Product) != product {
+			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrForbidden
 		}
 		if activeLeaseCountForAccount(state, account.ID) > 0 {
 			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolAccountInUse
@@ -2056,16 +2122,20 @@ func (s *ControlPlane) disableModelPoolAccount(ctx context.Context, idempotencyK
 }
 
 func (s *ControlPlane) UpdateModelPoolAccount(ctx context.Context, idempotencyKey, accountID string, input controlplane.UpdateModelPoolAccountInput) (controlplane.ModelPoolAccountSummary, error) {
-	return s.updateModelPoolAccount(ctx, idempotencyKey, accountID, input, controlplane.AuditLogInput{})
+	return s.updateModelPoolAccount(ctx, controlplane.ProductAutoLive, idempotencyKey, accountID, input, controlplane.AuditLogInput{})
 }
 
 // UpdateModelPoolAccountWithAudit is the normalized administrative HTTP path.
 // The success event shares the account mutation transaction.
 func (s *ControlPlane) UpdateModelPoolAccountWithAudit(ctx context.Context, idempotencyKey, accountID string, input controlplane.UpdateModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
-	return s.updateModelPoolAccount(ctx, idempotencyKey, accountID, input, audit)
+	return s.updateModelPoolAccount(ctx, controlplane.ProductAutoLive, idempotencyKey, accountID, input, audit)
 }
 
-func (s *ControlPlane) updateModelPoolAccount(ctx context.Context, idempotencyKey, accountID string, input controlplane.UpdateModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+func (s *ControlPlane) UpdateModelPoolAccountForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey, accountID string, input controlplane.UpdateModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+	return s.updateModelPoolAccount(ctx, product, idempotencyKey, accountID, input, audit)
+}
+
+func (s *ControlPlane) updateModelPoolAccount(ctx context.Context, product controlplane.ProductCode, idempotencyKey, accountID string, input controlplane.UpdateModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -2078,6 +2148,10 @@ func (s *ControlPlane) updateModelPoolAccount(ctx context.Context, idempotencyKe
 	}
 	if input.BaseURL == nil && input.Priority == nil && input.DailyLimit == nil && input.ConcurrencyLimit == nil && input.Status == nil {
 		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrInvalidRequest
+	}
+	product, err := validateOperationProduct(product, audit)
+	if err != nil {
+		return controlplane.ModelPoolAccountSummary{}, err
 	}
 	if input.BaseURL != nil {
 		value := strings.TrimRight(strings.TrimSpace(*input.BaseURL), "/")
@@ -2100,8 +2174,9 @@ func (s *ControlPlane) updateModelPoolAccount(ctx context.Context, idempotencyKe
 	}
 	fingerprint, err := fingerprintValue(struct {
 		AccountID string                                   `json:"account_id"`
+		Product   controlplane.ProductCode                 `json:"product"`
 		Input     controlplane.UpdateModelPoolAccountInput `json:"input"`
-	}{AccountID: accountID, Input: input})
+	}{AccountID: accountID, Product: product, Input: input})
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -2112,7 +2187,7 @@ func (s *ControlPlane) updateModelPoolAccount(ctx context.Context, idempotencyKe
 		}
 		return writer.UpdateModelPoolAccount(ctx, store.ModelPoolAccountUpdateRecord{
 			ModelPoolAccountMutationRecord: store.ModelPoolAccountMutationRecord{
-				Scope: "control-plane-state", IdempotencyKey: "update-model-account:" + idempotencyKey, Fingerprint: fingerprint, AccountID: accountID, Audit: audit,
+				Scope: "control-plane-state", IdempotencyKey: "update-model-account:" + idempotencyKey, Fingerprint: fingerprint, AccountID: accountID, Product: product, Audit: audit,
 			}, Input: input,
 		})
 	}
@@ -2134,7 +2209,10 @@ func (s *ControlPlane) updateModelPoolAccount(ctx context.Context, idempotencyKe
 		if !ok {
 			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolAccountNotFound
 		}
-		sweepExpiredModelLeases(state, s.repository.Now())
+		sweepExpiredModelLeasesForProduct(state, s.repository.Now(), product)
+		if effectiveStoredProduct(account.Product) != product {
+			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrForbidden
+		}
 		if input.Status != nil && *input.Status == controlplane.ModelAccountStatusDisabled && activeLeaseCountForAccount(state, account.ID) > 0 {
 			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolAccountInUse
 		}
@@ -2166,17 +2244,21 @@ func (s *ControlPlane) updateModelPoolAccount(ctx context.Context, idempotencyKe
 }
 
 func (s *ControlPlane) RotateModelPoolAccountSecret(ctx context.Context, idempotencyKey, accountID string, input controlplane.RotateModelPoolAccountSecretInput) (controlplane.ModelPoolAccountSummary, error) {
-	return s.rotateModelPoolAccountSecret(ctx, idempotencyKey, accountID, input, controlplane.AuditLogInput{})
+	return s.rotateModelPoolAccountSecret(ctx, controlplane.ProductAutoLive, false, idempotencyKey, accountID, input, controlplane.AuditLogInput{})
 }
 
 // RotateModelPoolAccountSecretWithAudit uses the normalized transactional
 // SecretStore boundary when available. Compatibility stores retain the staged
 // fallback and the regular post-request audit path.
 func (s *ControlPlane) RotateModelPoolAccountSecretWithAudit(ctx context.Context, idempotencyKey, accountID string, input controlplane.RotateModelPoolAccountSecretInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
-	return s.rotateModelPoolAccountSecret(ctx, idempotencyKey, accountID, input, audit)
+	return s.rotateModelPoolAccountSecret(ctx, controlplane.ProductAutoLive, false, idempotencyKey, accountID, input, audit)
 }
 
-func (s *ControlPlane) rotateModelPoolAccountSecret(ctx context.Context, idempotencyKey, accountID string, input controlplane.RotateModelPoolAccountSecretInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+func (s *ControlPlane) RotateModelPoolAccountSecretForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey, accountID string, input controlplane.RotateModelPoolAccountSecretInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+	return s.rotateModelPoolAccountSecret(ctx, product, true, idempotencyKey, accountID, input, audit)
+}
+
+func (s *ControlPlane) rotateModelPoolAccountSecret(ctx context.Context, product controlplane.ProductCode, strictProduct bool, idempotencyKey, accountID string, input controlplane.RotateModelPoolAccountSecretInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -2187,6 +2269,11 @@ func (s *ControlPlane) rotateModelPoolAccountSecret(ctx context.Context, idempot
 	if accountID == "" || validateRotateModelPoolAccountSecretInput(&input) != nil {
 		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrInvalidRequest
 	}
+	validatedProduct, err := validateOperationProduct(product, audit)
+	if err != nil {
+		return controlplane.ModelPoolAccountSummary{}, err
+	}
+	product = validatedProduct
 	type rotationContext struct {
 		account     controlplane.ModelPoolAccountSummary
 		fingerprint string
@@ -2194,8 +2281,9 @@ func (s *ControlPlane) rotateModelPoolAccountSecret(ctx context.Context, idempot
 	}
 	fingerprint, err := fingerprintValue(struct {
 		AccountID string                                         `json:"account_id"`
+		Product   controlplane.ProductCode                       `json:"product"`
 		Input     controlplane.RotateModelPoolAccountSecretInput `json:"input"`
-	}{AccountID: accountID, Input: input})
+	}{AccountID: accountID, Product: product, Input: input})
 	if err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -2206,15 +2294,25 @@ func (s *ControlPlane) rotateModelPoolAccountSecret(ctx context.Context, idempot
 	}
 	var rotation rotationContext
 	if normalized {
-		preparer, ok := s.repository.(store.ModelPoolSecretRotationPreparer)
-		if !ok {
-			return controlplane.ModelPoolAccountSummary{}, store.ErrNormalizedModelPoolSecretRotationPreparerRequired
+		var preparation store.ModelPoolSecretRotationPreparation
+		var prepareErr error
+		if strictProduct {
+			preparer, ok := s.repository.(store.ProductModelPoolSecretRotationPreparer)
+			if !ok {
+				return controlplane.ModelPoolAccountSummary{}, store.ErrNormalizedModelPoolSecretRotationPreparerRequired
+			}
+			preparation, prepareErr = preparer.PrepareModelPoolAccountSecretRotationForProduct(ctx, "control-plane-state", scope, fingerprint, accountID, product)
+		} else {
+			preparer, ok := s.repository.(store.ModelPoolSecretRotationPreparer)
+			if !ok {
+				return controlplane.ModelPoolAccountSummary{}, store.ErrNormalizedModelPoolSecretRotationPreparerRequired
+			}
+			preparation, prepareErr = preparer.PrepareModelPoolAccountSecretRotation(ctx, "control-plane-state", scope, fingerprint, accountID)
 		}
 		rotator, ok := s.repository.(store.ModelPoolSecretRotator)
 		if !ok {
 			return controlplane.ModelPoolAccountSummary{}, store.ErrNormalizedModelPoolSecretRotatorRequired
 		}
-		preparation, prepareErr := preparer.PrepareModelPoolAccountSecretRotation(ctx, "control-plane-state", scope, fingerprint, accountID)
 		if prepareErr != nil {
 			return controlplane.ModelPoolAccountSummary{}, prepareErr
 		}
@@ -2228,7 +2326,12 @@ func (s *ControlPlane) rotateModelPoolAccountSecret(ctx context.Context, idempot
 		}
 		rotated, rotateErr := rotator.RotateModelPoolAccountSecret(ctx, store.ModelPoolSecretRotationRecord{
 			Scope: "control-plane-state", IdempotencyKey: scope,
-			Fingerprint: fingerprint, AccountID: accountID, ExpectedSecretRef: rotation.account.SecretRef,
+			Fingerprint: fingerprint, AccountID: accountID, Product: func() controlplane.ProductCode {
+				if strictProduct {
+					return product
+				}
+				return ""
+			}(), ExpectedSecretRef: rotation.account.SecretRef,
 			APIKey: input.APIKey, Probe: probe, Audit: audit,
 		})
 		if errors.Is(rotateErr, store.ErrTransactionalSecretStoreRequired) {
@@ -2240,6 +2343,9 @@ func (s *ControlPlane) rotateModelPoolAccountSecret(ctx context.Context, idempot
 		account, ok := state.ModelPoolAccounts[accountID]
 		if !ok {
 			return rotationContext{}, controlplane.ErrModelPoolAccountNotFound
+		}
+		if effectiveStoredProduct(account.Product) != product {
+			return rotationContext{}, controlplane.ErrForbidden
 		}
 		if existing, exists := state.IdempotencyRecords[scope]; exists {
 			if existing.Fingerprint != fingerprint {
@@ -2357,16 +2463,20 @@ func (s *ControlPlane) rotateModelPoolAccountSecret(ctx context.Context, idempot
 	})
 }
 func (s *ControlPlane) CreateModelLease(ctx context.Context, idempotencyKey, userID, deviceID string, input controlplane.CreateModelLeaseInput) (controlplane.ModelLease, error) {
-	return s.createModelLease(ctx, idempotencyKey, userID, deviceID, input, controlplane.AuditLogInput{})
+	return s.createModelLease(ctx, controlplane.ProductAutoLive, idempotencyKey, userID, deviceID, input, controlplane.AuditLogInput{})
 }
 
 // CreateModelLeaseWithAudit is the normalized client HTTP path. The success
 // event is committed with the lease creation transaction.
 func (s *ControlPlane) CreateModelLeaseWithAudit(ctx context.Context, idempotencyKey, userID, deviceID string, input controlplane.CreateModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ModelLease, error) {
-	return s.createModelLease(ctx, idempotencyKey, userID, deviceID, input, audit)
+	return s.createModelLease(ctx, controlplane.ProductAutoLive, idempotencyKey, userID, deviceID, input, audit)
 }
 
-func (s *ControlPlane) createModelLease(ctx context.Context, idempotencyKey, userID, deviceID string, input controlplane.CreateModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ModelLease, error) {
+func (s *ControlPlane) CreateModelLeaseForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey, userID, deviceID string, input controlplane.CreateModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ModelLease, error) {
+	return s.createModelLease(ctx, product, idempotencyKey, userID, deviceID, input, audit)
+}
+
+func (s *ControlPlane) createModelLease(ctx context.Context, product controlplane.ProductCode, idempotencyKey, userID, deviceID string, input controlplane.CreateModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ModelLease, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelLease{}, err
 	}
@@ -2376,7 +2486,7 @@ func (s *ControlPlane) createModelLease(ctx context.Context, idempotencyKey, use
 	if err := validateCreateModelLeaseInput(&input); err != nil {
 		return controlplane.ModelLease{}, err
 	}
-	product, err := operationProduct(audit)
+	product, err := validateOperationProduct(product, audit)
 	if err != nil {
 		return controlplane.ModelLease{}, err
 	}
@@ -2422,7 +2532,7 @@ func (s *ControlPlane) createModelLease(ctx context.Context, idempotencyKey, use
 			return controlplane.ModelLease{}, controlplane.ErrForbidden
 		}
 
-		sweepExpiredModelLeases(state, s.repository.Now())
+		sweepExpiredModelLeasesForProduct(state, s.repository.Now(), product)
 
 		scope := productScopedScope("create-model-lease:"+userID+":"+device.ID+":"+idempotencyKey, product)
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
@@ -2444,7 +2554,7 @@ func (s *ControlPlane) createModelLease(ctx context.Context, idempotencyKey, use
 			}
 		}
 
-		account, ok := selectModelPoolAccount(state, input.Provider, input.Model, s.repository.Now())
+		account, ok := selectModelPoolAccountForProduct(state, product, input.Provider, input.Model, s.repository.Now())
 		if !ok {
 			return controlplane.ModelLease{}, controlplane.ErrModelPoolUnavailable
 		}
@@ -2479,16 +2589,20 @@ func (s *ControlPlane) createModelLease(ctx context.Context, idempotencyKey, use
 }
 
 func (s *ControlPlane) RenewModelLease(ctx context.Context, idempotencyKey, userID, deviceID, leaseID string, input controlplane.RenewModelLeaseInput) (controlplane.ModelLease, error) {
-	return s.renewModelLease(ctx, idempotencyKey, userID, deviceID, leaseID, input, controlplane.AuditLogInput{})
+	return s.renewModelLease(ctx, controlplane.ProductAutoLive, idempotencyKey, userID, deviceID, leaseID, input, controlplane.AuditLogInput{})
 }
 
 // RenewModelLeaseWithAudit is the normalized client HTTP path. The success
 // event is committed with the lease renewal transaction.
 func (s *ControlPlane) RenewModelLeaseWithAudit(ctx context.Context, idempotencyKey, userID, deviceID, leaseID string, input controlplane.RenewModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ModelLease, error) {
-	return s.renewModelLease(ctx, idempotencyKey, userID, deviceID, leaseID, input, audit)
+	return s.renewModelLease(ctx, controlplane.ProductAutoLive, idempotencyKey, userID, deviceID, leaseID, input, audit)
 }
 
-func (s *ControlPlane) renewModelLease(ctx context.Context, idempotencyKey, userID, deviceID, leaseID string, input controlplane.RenewModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ModelLease, error) {
+func (s *ControlPlane) RenewModelLeaseForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey, userID, deviceID, leaseID string, input controlplane.RenewModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ModelLease, error) {
+	return s.renewModelLease(ctx, product, idempotencyKey, userID, deviceID, leaseID, input, audit)
+}
+
+func (s *ControlPlane) renewModelLease(ctx context.Context, product controlplane.ProductCode, idempotencyKey, userID, deviceID, leaseID string, input controlplane.RenewModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ModelLease, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelLease{}, err
 	}
@@ -2498,7 +2612,7 @@ func (s *ControlPlane) renewModelLease(ctx context.Context, idempotencyKey, user
 	if err := validateRenewModelLeaseInput(&input); err != nil {
 		return controlplane.ModelLease{}, err
 	}
-	product, err := operationProduct(audit)
+	product, err := validateOperationProduct(product, audit)
 	if err != nil {
 		return controlplane.ModelLease{}, err
 	}
@@ -2542,7 +2656,7 @@ func (s *ControlPlane) renewModelLease(ctx context.Context, idempotencyKey, user
 			return controlplane.ModelLease{}, controlplane.ErrForbidden
 		}
 
-		sweepExpiredModelLeases(state, s.repository.Now())
+		sweepExpiredModelLeasesForProduct(state, s.repository.Now(), product)
 
 		lease, ok := state.ModelLeases[leaseID]
 		if !ok {
@@ -2601,16 +2715,20 @@ func (s *ControlPlane) renewModelLease(ctx context.Context, idempotencyKey, user
 }
 
 func (s *ControlPlane) ReleaseModelLease(ctx context.Context, idempotencyKey, userID, deviceID, leaseID string, input controlplane.ReleaseModelLeaseInput) (controlplane.ReleaseModelLeaseResult, error) {
-	return s.releaseModelLease(ctx, idempotencyKey, userID, deviceID, leaseID, input, controlplane.AuditLogInput{})
+	return s.releaseModelLease(ctx, controlplane.ProductAutoLive, idempotencyKey, userID, deviceID, leaseID, input, controlplane.AuditLogInput{})
 }
 
 // ReleaseModelLeaseWithAudit is the normalized client HTTP path. The success
 // event is committed with the lease release transaction.
 func (s *ControlPlane) ReleaseModelLeaseWithAudit(ctx context.Context, idempotencyKey, userID, deviceID, leaseID string, input controlplane.ReleaseModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ReleaseModelLeaseResult, error) {
-	return s.releaseModelLease(ctx, idempotencyKey, userID, deviceID, leaseID, input, audit)
+	return s.releaseModelLease(ctx, controlplane.ProductAutoLive, idempotencyKey, userID, deviceID, leaseID, input, audit)
 }
 
-func (s *ControlPlane) releaseModelLease(ctx context.Context, idempotencyKey, userID, deviceID, leaseID string, input controlplane.ReleaseModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ReleaseModelLeaseResult, error) {
+func (s *ControlPlane) ReleaseModelLeaseForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey, userID, deviceID, leaseID string, input controlplane.ReleaseModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ReleaseModelLeaseResult, error) {
+	return s.releaseModelLease(ctx, product, idempotencyKey, userID, deviceID, leaseID, input, audit)
+}
+
+func (s *ControlPlane) releaseModelLease(ctx context.Context, product controlplane.ProductCode, idempotencyKey, userID, deviceID, leaseID string, input controlplane.ReleaseModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ReleaseModelLeaseResult, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ReleaseModelLeaseResult{}, err
 	}
@@ -2621,7 +2739,7 @@ func (s *ControlPlane) releaseModelLease(ctx context.Context, idempotencyKey, us
 		return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrInvalidRequest
 	}
 	input.Reason = strings.TrimSpace(input.Reason)
-	product, err := operationProduct(audit)
+	product, err := validateOperationProduct(product, audit)
 	if err != nil {
 		return controlplane.ReleaseModelLeaseResult{}, err
 	}
@@ -2665,7 +2783,7 @@ func (s *ControlPlane) releaseModelLease(ctx context.Context, idempotencyKey, us
 			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrForbidden
 		}
 
-		sweepExpiredModelLeases(state, s.repository.Now())
+		sweepExpiredModelLeasesForProduct(state, s.repository.Now(), product)
 
 		lease, ok := state.ModelLeases[leaseID]
 		if !ok {
@@ -2715,16 +2833,20 @@ func (s *ControlPlane) releaseModelLease(ctx context.Context, idempotencyKey, us
 }
 
 func (s *ControlPlane) TestModelPoolAccount(ctx context.Context, idempotencyKey, accountID string, input controlplane.TestModelPoolAccountInput) (controlplane.ModelPoolConnectivityTestResult, error) {
-	return s.testModelPoolAccount(ctx, idempotencyKey, accountID, input, controlplane.AuditLogInput{})
+	return s.testModelPoolAccount(ctx, controlplane.ProductAutoLive, false, idempotencyKey, accountID, input, controlplane.AuditLogInput{})
 }
 
 // TestModelPoolAccountWithAudit is the normalized administrative HTTP path.
 // The success event is committed with the test result and cooldown transition.
 func (s *ControlPlane) TestModelPoolAccountWithAudit(ctx context.Context, idempotencyKey, accountID string, input controlplane.TestModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolConnectivityTestResult, error) {
-	return s.testModelPoolAccount(ctx, idempotencyKey, accountID, input, audit)
+	return s.testModelPoolAccount(ctx, controlplane.ProductAutoLive, false, idempotencyKey, accountID, input, audit)
 }
 
-func (s *ControlPlane) testModelPoolAccount(ctx context.Context, idempotencyKey, accountID string, input controlplane.TestModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolConnectivityTestResult, error) {
+func (s *ControlPlane) TestModelPoolAccountForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey, accountID string, input controlplane.TestModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolConnectivityTestResult, error) {
+	return s.testModelPoolAccount(ctx, product, true, idempotencyKey, accountID, input, audit)
+}
+
+func (s *ControlPlane) testModelPoolAccount(ctx context.Context, product controlplane.ProductCode, strictProduct bool, idempotencyKey, accountID string, input controlplane.TestModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolConnectivityTestResult, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelPoolConnectivityTestResult{}, err
 	}
@@ -2735,36 +2857,60 @@ func (s *ControlPlane) testModelPoolAccount(ctx context.Context, idempotencyKey,
 	if accountID == "" || validateTestModelPoolAccountInput(&input) != nil {
 		return controlplane.ModelPoolConnectivityTestResult{}, controlplane.ErrInvalidRequest
 	}
+	validatedProduct, err := validateOperationProduct(product, audit)
+	if err != nil {
+		return controlplane.ModelPoolConnectivityTestResult{}, err
+	}
+	product = validatedProduct
 	fingerprint, err := fingerprintValue(struct {
 		AccountID string                                 `json:"account_id"`
+		Product   controlplane.ProductCode               `json:"product"`
 		Input     controlplane.TestModelPoolAccountInput `json:"input"`
-	}{AccountID: accountID, Input: input})
+	}{AccountID: accountID, Product: product, Input: input})
 	if err != nil {
 		return controlplane.ModelPoolConnectivityTestResult{}, err
 	}
 	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
-		if tester, ok := s.repository.(store.ModelPoolTestRepository); ok {
-			preparation, prepareErr := tester.PrepareModelPoolAccountTest(ctx, store.ModelPoolTestPrepareRecord{
+		var preparation store.ModelPoolTestPreparation
+		var prepareErr error
+		var tester store.ModelPoolTestRepository
+		if strictProduct {
+			productTester, ok := s.repository.(store.ProductModelPoolTestRepository)
+			if !ok {
+				return controlplane.ModelPoolConnectivityTestResult{}, store.ErrNormalizedModelPoolTestRepositoryRequired
+			}
+			preparation, prepareErr = productTester.PrepareModelPoolAccountTestForProduct(ctx, store.ModelPoolTestPrepareRecord{
+				Scope: "control-plane-state", IdempotencyKey: "test-model-account:" + accountID + ":" + idempotencyKey,
+				Fingerprint: fingerprint, AccountID: accountID, Product: product,
+			})
+		} else if compatibilityTester, ok := s.repository.(store.ModelPoolTestRepository); ok {
+			tester = compatibilityTester
+			preparation, prepareErr = tester.PrepareModelPoolAccountTest(ctx, store.ModelPoolTestPrepareRecord{
 				Scope: "control-plane-state", IdempotencyKey: "test-model-account:" + accountID + ":" + idempotencyKey,
 				Fingerprint: fingerprint, AccountID: accountID,
 			})
-			if prepareErr != nil {
-				return controlplane.ModelPoolConnectivityTestResult{}, prepareErr
-			}
-			if preparation.Cached != nil {
-				return *preparation.Cached, nil
-			}
-			secret, secretErr := s.secretStore.Get(ctx, preparation.Account.SecretRef)
-			if secretErr != nil {
-				return controlplane.ModelPoolConnectivityTestResult{}, controlplane.ErrSecretStoreUnavailable
-			}
-			result := s.probeModelPoolAccount(ctx, preparation.Account, input, secret)
-			return tester.RecordModelPoolAccountTest(ctx, store.ModelPoolTestRecord{
-				Scope: "control-plane-state", IdempotencyKey: "test-model-account:" + accountID + ":" + idempotencyKey,
-				Fingerprint: fingerprint, AccountID: accountID, Result: result, Audit: audit,
-			})
+		} else {
+			return controlplane.ModelPoolConnectivityTestResult{}, store.ErrNormalizedModelPoolTestRepositoryRequired
 		}
-		return controlplane.ModelPoolConnectivityTestResult{}, store.ErrNormalizedModelPoolTestRepositoryRequired
+		if prepareErr != nil {
+			return controlplane.ModelPoolConnectivityTestResult{}, prepareErr
+		}
+		if preparation.Cached != nil {
+			return *preparation.Cached, nil
+		}
+		secret, secretErr := s.secretStore.Get(ctx, preparation.Account.SecretRef)
+		if secretErr != nil {
+			return controlplane.ModelPoolConnectivityTestResult{}, controlplane.ErrSecretStoreUnavailable
+		}
+		result := s.probeModelPoolAccount(ctx, preparation.Account, input, secret)
+		record := store.ModelPoolTestRecord{
+			Scope: "control-plane-state", IdempotencyKey: "test-model-account:" + accountID + ":" + idempotencyKey,
+			Fingerprint: fingerprint, AccountID: accountID, Product: product, Result: result, Audit: audit,
+		}
+		if strictProduct {
+			return s.repository.(store.ProductModelPoolTestRepository).RecordModelPoolAccountTestForProduct(ctx, record)
+		}
+		return tester.RecordModelPoolAccountTest(ctx, record)
 	}
 	type modelPoolTestContext struct {
 		account controlplane.ModelPoolAccountSummary
@@ -2774,6 +2920,9 @@ func (s *ControlPlane) testModelPoolAccount(ctx context.Context, idempotencyKey,
 		account, ok := state.ModelPoolAccounts[accountID]
 		if !ok {
 			return modelPoolTestContext{}, controlplane.ErrModelPoolAccountNotFound
+		}
+		if effectiveStoredProduct(account.Product) != product {
+			return modelPoolTestContext{}, controlplane.ErrForbidden
 		}
 		if existing, ok := state.IdempotencyRecords["test-model-account:"+accountID+":"+idempotencyKey]; ok {
 			if existing.Fingerprint != fingerprint {
@@ -2835,7 +2984,7 @@ func (s *ControlPlane) testModelPoolAccount(ctx context.Context, idempotencyKey,
 }
 
 func (s *ControlPlane) RecordDirectLLMCall(ctx context.Context, idempotencyKey, userID, deviceID, requestID string, input controlplane.CreateDirectLLMCallRecordInput) (controlplane.ModelUsageRecord, error) {
-	return s.recordDirectLLMCall(ctx, idempotencyKey, userID, deviceID, requestID, input, controlplane.AuditLogInput{})
+	return s.recordDirectLLMCall(ctx, controlplane.ProductAutoLive, idempotencyKey, userID, deviceID, requestID, input, controlplane.AuditLogInput{})
 }
 
 // RecordDirectLLMCallWithAudit is the normalized HTTP path. The optional
@@ -2843,10 +2992,14 @@ func (s *ControlPlane) RecordDirectLLMCall(ctx context.Context, idempotencyKey, 
 // quota transition and idempotency record; compatibility stores retain the
 // existing post-request audit path.
 func (s *ControlPlane) RecordDirectLLMCallWithAudit(ctx context.Context, idempotencyKey, userID, deviceID, requestID string, input controlplane.CreateDirectLLMCallRecordInput, audit controlplane.AuditLogInput) (controlplane.ModelUsageRecord, error) {
-	return s.recordDirectLLMCall(ctx, idempotencyKey, userID, deviceID, requestID, input, audit)
+	return s.recordDirectLLMCall(ctx, controlplane.ProductAutoLive, idempotencyKey, userID, deviceID, requestID, input, audit)
 }
 
-func (s *ControlPlane) recordDirectLLMCall(ctx context.Context, idempotencyKey, userID, deviceID, requestID string, input controlplane.CreateDirectLLMCallRecordInput, audit controlplane.AuditLogInput) (controlplane.ModelUsageRecord, error) {
+func (s *ControlPlane) RecordDirectLLMCallForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey, userID, deviceID, requestID string, input controlplane.CreateDirectLLMCallRecordInput, audit controlplane.AuditLogInput) (controlplane.ModelUsageRecord, error) {
+	return s.recordDirectLLMCall(ctx, product, idempotencyKey, userID, deviceID, requestID, input, audit)
+}
+
+func (s *ControlPlane) recordDirectLLMCall(ctx context.Context, product controlplane.ProductCode, idempotencyKey, userID, deviceID, requestID string, input controlplane.CreateDirectLLMCallRecordInput, audit controlplane.AuditLogInput) (controlplane.ModelUsageRecord, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelUsageRecord{}, err
 	}
@@ -2862,7 +3015,7 @@ func (s *ControlPlane) recordDirectLLMCall(ctx context.Context, idempotencyKey, 
 	if input.TotalTokens < input.InputTokens+input.OutputTokens {
 		return controlplane.ModelUsageRecord{}, controlplane.ErrInvalidRequest
 	}
-	product, err := operationProduct(audit)
+	product, err := validateOperationProduct(product, audit)
 	if err != nil {
 		return controlplane.ModelUsageRecord{}, err
 	}
@@ -3552,17 +3705,21 @@ func (s *ControlPlane) activateDeviceWithRunner(ctx context.Context, idempotency
 }
 
 func (s *ControlPlane) DisableDevice(ctx context.Context, idempotencyKey, deviceID string) (controlplane.DeviceSummary, error) {
-	return s.disableDevice(ctx, idempotencyKey, deviceID, controlplane.AuditLogInput{})
+	return s.disableDevice(ctx, controlplane.ProductAutoLive, idempotencyKey, deviceID, controlplane.AuditLogInput{})
 }
 
 // DisableDeviceWithAudit is the normalized administrative HTTP path. The
 // success event is committed with the device lifecycle mutation when the
 // repository supports the transaction boundary.
 func (s *ControlPlane) DisableDeviceWithAudit(ctx context.Context, idempotencyKey, deviceID string, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
-	return s.disableDevice(ctx, idempotencyKey, deviceID, audit)
+	return s.disableDevice(ctx, controlplane.ProductAutoLive, idempotencyKey, deviceID, audit)
 }
 
-func (s *ControlPlane) disableDevice(ctx context.Context, idempotencyKey, deviceID string, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
+func (s *ControlPlane) DisableDeviceForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey, deviceID string, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
+	return s.disableDevice(ctx, product, idempotencyKey, deviceID, audit)
+}
+
+func (s *ControlPlane) disableDevice(ctx context.Context, product controlplane.ProductCode, idempotencyKey, deviceID string, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
@@ -3573,7 +3730,7 @@ func (s *ControlPlane) disableDevice(ctx context.Context, idempotencyKey, device
 	if deviceID == "" {
 		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
 	}
-	product, err := operationProduct(audit)
+	product, err := validateOperationProduct(product, audit)
 	if err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
@@ -3618,16 +3775,16 @@ func (s *ControlPlane) disableDevice(ctx context.Context, idempotencyKey, device
 			if existing.Fingerprint != fingerprint {
 				return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyConflict
 			}
-			releaseActiveModelLeasesForDevice(state, deviceID, s.repository.Now())
+			releaseActiveModelLeasesForDeviceForProduct(state, deviceID, s.repository.Now(), product)
 			return device, nil
 		}
 		if device.Status == controlplane.DeviceStatusDisabled {
-			releaseActiveModelLeasesForDevice(state, deviceID, s.repository.Now())
+			releaseActiveModelLeasesForDeviceForProduct(state, deviceID, s.repository.Now(), product)
 			state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: deviceID}
 			return device, nil
 		}
 		device.Status = controlplane.DeviceStatusDisabled
-		releaseActiveModelLeasesForDevice(state, deviceID, s.repository.Now())
+		releaseActiveModelLeasesForDeviceForProduct(state, deviceID, s.repository.Now(), product)
 		state.Devices[device.ID] = device
 		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: deviceID}
 		return device, nil
@@ -3639,16 +3796,20 @@ func (s *ControlPlane) disableDevice(ctx context.Context, idempotencyKey, device
 }
 
 func (s *ControlPlane) UnbindDevice(ctx context.Context, idempotencyKey, deviceID string) (controlplane.DeviceSummary, error) {
-	return s.unbindDevice(ctx, idempotencyKey, deviceID, controlplane.AuditLogInput{})
+	return s.unbindDevice(ctx, controlplane.ProductAutoLive, idempotencyKey, deviceID, controlplane.AuditLogInput{})
 }
 
 // UnbindDeviceWithAudit is the normalized administrative HTTP path. The
 // success event is committed with the device lifecycle mutation.
 func (s *ControlPlane) UnbindDeviceWithAudit(ctx context.Context, idempotencyKey, deviceID string, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
-	return s.unbindDevice(ctx, idempotencyKey, deviceID, audit)
+	return s.unbindDevice(ctx, controlplane.ProductAutoLive, idempotencyKey, deviceID, audit)
 }
 
-func (s *ControlPlane) unbindDevice(ctx context.Context, idempotencyKey, deviceID string, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
+func (s *ControlPlane) UnbindDeviceForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey, deviceID string, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
+	return s.unbindDevice(ctx, product, idempotencyKey, deviceID, audit)
+}
+
+func (s *ControlPlane) unbindDevice(ctx context.Context, product controlplane.ProductCode, idempotencyKey, deviceID string, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
@@ -3659,7 +3820,7 @@ func (s *ControlPlane) unbindDevice(ctx context.Context, idempotencyKey, deviceI
 	if deviceID == "" {
 		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
 	}
-	product, err := operationProduct(audit)
+	product, err := validateOperationProduct(product, audit)
 	if err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
@@ -3704,10 +3865,10 @@ func (s *ControlPlane) unbindDevice(ctx context.Context, idempotencyKey, deviceI
 			if existing.Fingerprint != fingerprint {
 				return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyConflict
 			}
-			releaseActiveModelLeasesForDevice(state, deviceID, s.repository.Now())
+			releaseActiveModelLeasesForDeviceForProduct(state, deviceID, s.repository.Now(), product)
 			return state.Devices[existing.ResourceID], nil
 		}
-		releaseActiveModelLeasesForDevice(state, deviceID, s.repository.Now())
+		releaseActiveModelLeasesForDeviceForProduct(state, deviceID, s.repository.Now(), product)
 		device.UserID = ""
 		device.Status = controlplane.DeviceStatusPendingActivation
 		state.Devices[device.ID] = device
@@ -3939,7 +4100,14 @@ func resolveBoundOwnedDevice(state *store.State, userID, deviceID string) (contr
 }
 
 func sweepExpiredModelLeases(state *store.State, now time.Time) {
+	sweepExpiredModelLeasesForProduct(state, now, "")
+}
+
+func sweepExpiredModelLeasesForProduct(state *store.State, now time.Time, product controlplane.ProductCode) {
 	for id, lease := range state.ModelLeases {
+		if product != "" && effectiveStoredProduct(lease.Product) != product {
+			continue
+		}
 		if lease.Status != controlplane.ModelLeaseStatusActive {
 			continue
 		}
@@ -3957,8 +4125,11 @@ func sweepExpiredModelLeases(state *store.State, now time.Time) {
 	}
 }
 
-func releaseActiveModelLeasesForDevice(state *store.State, deviceID string, now time.Time) {
+func releaseActiveModelLeasesForDeviceForProduct(state *store.State, deviceID string, now time.Time, product controlplane.ProductCode) {
 	for id, lease := range state.ModelLeases {
+		if product != "" && effectiveStoredProduct(lease.Product) != product {
+			continue
+		}
 		if lease.DeviceID == deviceID && lease.Status == controlplane.ModelLeaseStatusActive {
 			lease.Status = controlplane.ModelLeaseStatusReleased
 			lease.ReleasedAt = now.UTC().Format(time.RFC3339)
@@ -3967,10 +4138,13 @@ func releaseActiveModelLeasesForDevice(state *store.State, deviceID string, now 
 	}
 }
 
-func selectModelPoolAccount(state *store.State, provider, model string, now time.Time) (controlplane.ModelPoolAccountSummary, bool) {
+func selectModelPoolAccountForProduct(state *store.State, product controlplane.ProductCode, provider, model string, now time.Time) (controlplane.ModelPoolAccountSummary, bool) {
 	refreshModelAccountStatuses(state, now)
 	candidates := make([]controlplane.ModelPoolAccountSummary, 0, len(state.ModelPoolAccounts))
 	for _, account := range state.ModelPoolAccounts {
+		if product != "" && effectiveStoredProduct(account.Product) != product {
+			continue
+		}
 		if account.Provider != provider || account.Model != model || account.Status != controlplane.ModelAccountStatusActive {
 			continue
 		}

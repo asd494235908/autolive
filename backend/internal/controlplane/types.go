@@ -181,21 +181,22 @@ type ActivationCode struct {
 }
 
 type ModelPoolAccountSummary struct {
-	ID               string `json:"id"`
-	Provider         string `json:"provider"`
-	Model            string `json:"model"`
-	BaseURL          string `json:"base_url,omitempty"`
-	Status           string `json:"status"`
-	Priority         int    `json:"priority"`
-	DailyLimit       int    `json:"daily_limit"`
-	ConcurrencyLimit int    `json:"concurrency_limit"`
-	SecretConfigured bool   `json:"secret_configured"`
-	ActiveLeases     int    `json:"active_leases"`
-	DailyUsedTokens  int    `json:"daily_used_tokens"`
-	CooldownUntil    string `json:"cooldown_until,omitempty"`
-	LastTestStatus   string `json:"last_test_status,omitempty"`
-	LastTestedAt     string `json:"last_tested_at,omitempty"`
-	SecretRef        string `json:"-"`
+	ID               string      `json:"id"`
+	Product          ProductCode `json:"product,omitempty"`
+	Provider         string      `json:"provider"`
+	Model            string      `json:"model"`
+	BaseURL          string      `json:"base_url,omitempty"`
+	Status           string      `json:"status"`
+	Priority         int         `json:"priority"`
+	DailyLimit       int         `json:"daily_limit"`
+	ConcurrencyLimit int         `json:"concurrency_limit"`
+	SecretConfigured bool        `json:"secret_configured"`
+	ActiveLeases     int         `json:"active_leases"`
+	DailyUsedTokens  int         `json:"daily_used_tokens"`
+	CooldownUntil    string      `json:"cooldown_until,omitempty"`
+	LastTestStatus   string      `json:"last_test_status,omitempty"`
+	LastTestedAt     string      `json:"last_tested_at,omitempty"`
+	SecretRef        string      `json:"-"`
 }
 
 type CreateModelPoolAccountInput struct {

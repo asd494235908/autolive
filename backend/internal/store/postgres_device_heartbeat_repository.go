@@ -80,15 +80,12 @@ func (s *PostgresRepository) RecordHeartbeatWithSessionBinding(ctx context.Conte
 	if user.Status != controlplane.UserStatusActive {
 		return controlplane.HeartbeatResult{}, controlplane.ErrUserDisabled
 	}
-	device, exists, err := s.loadDeviceForUpdate(operationCtx, tx, record.Input.DeviceID)
+	device, exists, err := s.loadDeviceForUpdateWithProduct(operationCtx, tx, record.Input.DeviceID, record.Product)
 	if err != nil {
 		return controlplane.HeartbeatResult{}, err
 	}
 	if !exists || device.UserID != record.UserID {
 		return controlplane.HeartbeatResult{}, controlplane.ErrDeviceNotFound
-	}
-	if device.Product != record.Product {
-		return controlplane.HeartbeatResult{}, controlplane.ErrForbidden
 	}
 	if device.Status != controlplane.DeviceStatusActive {
 		return controlplane.HeartbeatResult{}, controlplane.ErrDeviceDisabled

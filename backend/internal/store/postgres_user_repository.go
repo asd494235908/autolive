@@ -421,9 +421,12 @@ func (s *PostgresRepository) reserveUserIdempotencyForProduct(ctx context.Contex
 	if err := tx.QueryRowContext(ctx, `
 		SELECT fingerprint, resource_id, product
 		FROM idempotency_records
-		WHERE scope = $1 AND idempotency_key = $2
+		WHERE scope = $1 AND idempotency_key = $2 AND product = $3
 		FOR UPDATE
-	`, scope, idempotencyKey).Scan(&storedFingerprint, &storedResourceID, &storedProduct); err != nil {
+	`, scope, idempotencyKey, product).Scan(&storedFingerprint, &storedResourceID, &storedProduct); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", false, controlplane.ErrForbidden
+		}
 		return "", "", false, postgresOperationError(ctx, fmt.Errorf("load existing product-scoped idempotency record: %w", err))
 	}
 	if storedProduct != product {

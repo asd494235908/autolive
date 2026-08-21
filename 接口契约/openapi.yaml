@@ -2845,6 +2845,8 @@ components:
       properties:
         id:
           $ref: '#/components/schemas/Id'
+        product:
+          $ref: '#/components/schemas/ProductCode'
         provider:
           type: string
         model:
