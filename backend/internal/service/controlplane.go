@@ -1277,11 +1277,19 @@ func (s *ControlPlane) GetClientProfile(ctx context.Context, userID, deviceID st
 		if device.Status != controlplane.DeviceStatusActive {
 			return controlplane.ClientProfile{}, controlplane.ErrDeviceDisabled
 		}
-		return controlplane.ClientProfile{
+		profile := controlplane.ClientProfile{
 			User:        user,
 			Device:      decorateDeviceSummary(device, s.repository.Now()),
 			Permissions: permissionsForRole(user.Role),
-		}, nil
+		}
+		if reader, ok := s.repository.(store.ActivationExpiryReader); ok {
+			expiresAt, err := reader.GetActivationExpiry(ctx, user.ID, device.ID)
+			if err != nil {
+				return controlplane.ClientProfile{}, err
+			}
+			profile.Device.ActivationExpiresAt = formatActivationExpiry(expiresAt)
+		}
+		return profile, nil
 	}
 	profile, err := withState(ctx, s.repository, func(state *store.State) (controlplane.ClientProfile, error) {
 		user, ok := state.Users[userID]
@@ -1298,11 +1306,13 @@ func (s *ControlPlane) GetClientProfile(ctx context.Context, userID, deviceID st
 		if device.Status != controlplane.DeviceStatusActive {
 			return controlplane.ClientProfile{}, controlplane.ErrDeviceDisabled
 		}
-		return controlplane.ClientProfile{
+		profile := controlplane.ClientProfile{
 			User:        user,
 			Device:      device,
 			Permissions: permissionsForRole(user.Role),
-		}, nil
+		}
+		profile.Device.ActivationExpiresAt = activationExpiryForDevice(state, user.ID, device.ID)
+		return profile, nil
 	})
 	if err != nil {
 		return controlplane.ClientProfile{}, err
@@ -3325,13 +3335,14 @@ func (s *ControlPlane) activateDeviceWithRunner(ctx context.Context, idempotency
 
 		now := s.repository.Now().Format(time.RFC3339)
 		device := controlplane.DeviceSummary{
-			ID:         input.Device.DeviceID,
-			UserID:     userID,
-			DeviceName: strings.TrimSpace(input.Device.DeviceName),
-			Platform:   strings.TrimSpace(input.Device.Platform),
-			AppVersion: strings.TrimSpace(input.Device.AppVersion),
-			Status:     controlplane.DeviceStatusActive,
-			LastSeenAt: now,
+			ID:                  input.Device.DeviceID,
+			UserID:              userID,
+			DeviceName:          strings.TrimSpace(input.Device.DeviceName),
+			Platform:            strings.TrimSpace(input.Device.Platform),
+			AppVersion:          strings.TrimSpace(input.Device.AppVersion),
+			Status:              controlplane.DeviceStatusActive,
+			LastSeenAt:          now,
+			ActivationExpiresAt: formatActivationExpiryString(record.ActivationCode.ExpiresAt),
 		}
 		state.Devices[device.ID] = device
 		record.ActivationCode.Status = controlplane.ActivationCodeStatusUsed
@@ -3516,6 +3527,31 @@ func decorateDeviceSummary(device controlplane.DeviceSummary, now time.Time) con
 	}
 	device.Online = !lastSeen.After(now.Add(5*time.Second)) && now.Sub(lastSeen) <= deviceOnlineThreshold
 	return device
+}
+
+func activationExpiryForDevice(state *store.State, userID, deviceID string) *string {
+	for _, record := range state.ActivationCodes {
+		if record.UsedByUserID == userID && record.UsedByDeviceID == deviceID {
+			return formatActivationExpiryString(record.ActivationCode.ExpiresAt)
+		}
+	}
+	return nil
+}
+
+func formatActivationExpiry(expiresAt *time.Time) *string {
+	if expiresAt == nil {
+		return nil
+	}
+	value := expiresAt.UTC().Format(time.RFC3339)
+	return &value
+}
+
+func formatActivationExpiryString(expiresAt string) *string {
+	parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(expiresAt))
+	if err != nil {
+		return nil
+	}
+	return formatActivationExpiry(&parsed)
 }
 
 func validateCreateUserInput(input controlplane.CreateUserInput) error {

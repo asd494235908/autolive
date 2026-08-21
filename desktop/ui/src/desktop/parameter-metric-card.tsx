@@ -10,6 +10,7 @@ export type ParameterMetricCardProps = {
   unit: string;
   digits?: number;
   tone: 'blue' | 'green' | 'pink' | 'yellow';
+  flashToken?: number;
   disabled?: boolean;
   onChange: (value: number) => void;
 };
@@ -24,6 +25,7 @@ export function ParameterMetricCard({
   unit,
   digits = 2,
   tone,
+  flashToken,
   disabled,
   onChange,
 }: ParameterMetricCardProps) {
@@ -36,7 +38,7 @@ export function ParameterMetricCard({
   } as const;
   return (
     <Card
-      className="parameter-metric-card"
+      className={getMetricCardClassName(flashToken)}
       size="small"
       styles={{ body: { height: 80, overflow: 'hidden', padding: '5px 10px 4px' } }}
     >
@@ -64,9 +66,16 @@ export type ReadOnlyMetricCardProps = {
   meta: string;
   tone: 'blue' | 'green' | 'pink' | 'yellow';
   percent: number;
+  flashToken?: number;
 };
 
-export function ReadOnlyMetricCard({ label, value, meta, tone, percent }: ReadOnlyMetricCardProps) {
+function getMetricCardClassName(flashToken: number | undefined): string {
+  return flashToken === undefined
+    ? 'parameter-metric-card'
+    : `parameter-metric-card parameter-metric-card-flash-${flashToken % 2}`;
+}
+
+export function ReadOnlyMetricCard({ label, value, meta, tone, percent, flashToken }: ReadOnlyMetricCardProps) {
   const colors = {
     blue: '#5ea2ff',
     green: '#31d7aa',
@@ -75,7 +84,7 @@ export function ReadOnlyMetricCard({ label, value, meta, tone, percent }: ReadOn
   } as const;
   return (
     <Card
-      className="parameter-metric-card"
+      className={getMetricCardClassName(flashToken)}
       size="small"
       styles={{ body: { height: 80, overflow: 'hidden', padding: '5px 10px 4px' } }}
     >

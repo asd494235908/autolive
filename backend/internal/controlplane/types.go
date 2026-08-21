@@ -101,23 +101,24 @@ type UserAuthorizationSummary struct {
 }
 
 type DeviceSummary struct {
-	ID                   string `json:"id"`
-	UserID               string `json:"user_id"`
-	DeviceName           string `json:"device_name"`
-	Platform             string `json:"platform"`
-	AppVersion           string `json:"app_version"`
-	Status               string `json:"status"`
-	DiskFreeBytes        int64  `json:"disk_free_bytes,omitempty"`
-	MemoryTotalBytes     int64  `json:"memory_total_bytes,omitempty"`
-	MemoryAvailableBytes int64  `json:"memory_available_bytes,omitempty"`
-	CPULogicalCores      int    `json:"cpu_logical_cores,omitempty"`
-	RuntimeOSName        string `json:"runtime_os_name,omitempty"`
-	RuntimeOSVersion     string `json:"runtime_os_version,omitempty"`
-	KernelVersion        string `json:"kernel_version,omitempty"`
-	CurrentMediaName     string `json:"current_media_name,omitempty"`
-	PlaybackState        string `json:"playback_state,omitempty"`
-	Online               bool   `json:"online"`
-	LastSeenAt           string `json:"last_seen_at"`
+	ID                   string  `json:"id"`
+	UserID               string  `json:"user_id"`
+	DeviceName           string  `json:"device_name"`
+	Platform             string  `json:"platform"`
+	AppVersion           string  `json:"app_version"`
+	Status               string  `json:"status"`
+	DiskFreeBytes        int64   `json:"disk_free_bytes,omitempty"`
+	MemoryTotalBytes     int64   `json:"memory_total_bytes,omitempty"`
+	MemoryAvailableBytes int64   `json:"memory_available_bytes,omitempty"`
+	CPULogicalCores      int     `json:"cpu_logical_cores,omitempty"`
+	RuntimeOSName        string  `json:"runtime_os_name,omitempty"`
+	RuntimeOSVersion     string  `json:"runtime_os_version,omitempty"`
+	KernelVersion        string  `json:"kernel_version,omitempty"`
+	CurrentMediaName     string  `json:"current_media_name,omitempty"`
+	PlaybackState        string  `json:"playback_state,omitempty"`
+	Online               bool    `json:"online"`
+	LastSeenAt           string  `json:"last_seen_at"`
+	ActivationExpiresAt  *string `json:"activation_expires_at,omitempty"`
 }
 
 type HeartbeatStatus struct {

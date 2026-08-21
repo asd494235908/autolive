@@ -20,7 +20,7 @@ import {
 import { App as AntApp, Alert, Button, Card, Checkbox, ConfigProvider, Descriptions, Drawer, Input, InputNumber, Layout, Popconfirm, Progress, Select, Slider, Space, Steps, Switch, Tag, Typography, theme as antdTheme } from 'antd';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { SyntheticEvent } from 'react';
-import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
+import { HashRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { buildInterludeScheduleKey, chooseInterludeIndex, INTERLUDE_LIMITS, nextInterludeAtMs, resolvePlaybackAudioSource, shouldPauseInterlude } from './interlude-player';
 import type { BaseAudioSource } from './interlude-player';
 import {
@@ -124,6 +124,8 @@ import { CompactNumberField } from './desktop/compact-number-field';
 import { ControlPlaneGate } from './desktop/control-plane-gate';
 import { DesktopPanel } from './desktop/desktop-panel';
 import { FeatureDrawer, FeatureDrawerField, FeatureDrawerSection } from './desktop/feature-drawer';
+import { advanceMetricFlashTokens, getChangedMetricKeys, getNewlyActivePresetIds } from './desktop/metric-change-flash';
+import type { MetricValueSnapshot } from './desktop/metric-change-flash';
 import { ParameterMetricCard, ReadOnlyMetricCard } from './desktop/parameter-metric-card';
 import { DesktopColumn, DesktopShell } from './desktop/desktop-shell';
 import { DesktopStatusStrip } from './desktop/status-strip';
@@ -914,6 +916,9 @@ function FinalEffectWindow() {
     startTimer: number | null;
   } | null>(null);
   const interludeAudioUrlRef = useRef<string | null>(null);
+  const interludePortAudioRef = useRef(false);
+  const interludeStartingRef = useRef(false);
+  const interludeOperationRef = useRef(0);
   const audioDiagnosticsReadyRef = useRef(false);
   const realtimeAudioPlayingRef = useRef(false);
   const loopSourceKeyRef = useRef<string | null>(null);
@@ -1147,9 +1152,9 @@ function FinalEffectWindow() {
       el.muted = hardwareOut ? false : muted;
     }
     if (interludeAudio) {
-      // 插话自身用电平；主轨 duck 已在 videoFxGain。PA 模式下元素仍出声进 tap。
+      // WebView 模式由媒体元素出声；PortAudio 模式只把它当结束时钟，避免双播。
       interludeAudio.volume = clampVolume(volume * interludeGainLevelRef.current);
-      interludeAudio.muted = hardwareOut ? false : muted;
+      interludeAudio.muted = interludePortAudioRef.current || muted;
     }
     applyRealtimeVideoFx(
       runtimeAudioParamsRef.current,
@@ -1159,9 +1164,17 @@ function FinalEffectWindow() {
 
   function setPortAudioHardwareActive(requested: boolean) {
     const nextActive = requested && PORTAUDIO_FORMAL_SOURCE_SYNC_READY;
+    const previousActive = portAudioHardwareRef.current;
     if (portAudioHardwareRef.current === nextActive) {
       syncUserAudioSettings();
       return;
+    }
+    if (nextActive && !previousActive && interludeActiveRef.current && !interludePortAudioRef.current) {
+      clearInterludePlayback({ releaseMs: 0, resetSchedule: false });
+      nextInterludeAtMsRef.current = performance.now();
+    }
+    if (!nextActive && previousActive && interludePortAudioRef.current) {
+      interludePortAudioRef.current = false;
     }
     portAudioHardwareRef.current = nextActive;
     setPortAudioHardwareEnabled(nextActive);
@@ -1185,12 +1198,19 @@ function FinalEffectWindow() {
     const resetSchedule = options?.resetSchedule ?? true;
     const resetIndex = options?.resetIndex ?? false;
     const clearSource = options?.clearSource ?? true;
+    const shouldStopPortAudio = interludePortAudioRef.current || interludeStartingRef.current;
+    interludeOperationRef.current += 1;
+    interludeStartingRef.current = false;
+    interludePortAudioRef.current = false;
     clearInterludeStopTimer();
     interludeActiveRef.current = false;
     interludePausedRef.current = false;
     interludeGainLevelRef.current = 0;
     duckGainLevelRef.current = 1;
     syncUserAudioSettings();
+    if (shouldStopPortAudio) {
+      void invoke<void>('stop_portaudio_interlude').catch(() => undefined);
+    }
     if (resetSchedule) nextInterludeAtMsRef.current = null;
     if (resetIndex) lastInterludeIndexRef.current = null;
     const finalize = () => {
@@ -1220,13 +1240,26 @@ function FinalEffectWindow() {
     if (!interludeActiveRef.current) return;
     interludePausedRef.current = true;
     interludeAudioRef.current?.pause();
+    if (interludePortAudioRef.current) {
+      void invoke<void>('pause_portaudio_interlude').catch((cause) => {
+        setPlaybackError(getDisplayErrorMessage(cause, 'PortAudio 插话暂停失败'));
+      });
+    }
   }
 
   function resumeInterludePlayback() {
     if (snapshotRef.current?.playback_state !== 'playing') return;
     if (!interludeActiveRef.current || !interludePausedRef.current || !interludeAudioUrlRef.current) return;
     interludePausedRef.current = false;
-    void interludeAudioRef.current?.play().catch(() => undefined);
+    if (interludePortAudioRef.current) {
+      void invoke<void>('resume_portaudio_interlude').catch((cause) => {
+        setPlaybackError(getDisplayErrorMessage(cause, 'PortAudio 插话恢复失败'));
+      });
+    }
+    void interludeAudioRef.current?.play().catch((cause) => {
+      setPlaybackError(getDisplayErrorMessage(cause, '插话结束时钟恢复失败'));
+      clearInterludePlayback({ resetSchedule: false });
+    });
   }
 
   function publishFixedSpeechStatus(
@@ -1375,33 +1408,53 @@ function FinalEffectWindow() {
   }
 
   function handleInterludeEnded() {
-    clearInterludeStopTimer();
-    interludeActiveRef.current = false;
-    interludePausedRef.current = false;
-    interludeAudioUrlRef.current = null;
-    setInterludeAudioUrl(null);
-    interludeGainLevelRef.current = 0;
-    duckGainLevelRef.current = 1;
-    syncUserAudioSettings();
-    nextInterludeAtMsRef.current = null;
+    clearInterludePlayback({
+      releaseMs: snapshotRef.current?.interlude?.ducking_release_ms ?? 0,
+      resetSchedule: true,
+    });
   }
 
   function handleInterludeError(event: SyntheticEvent<HTMLAudioElement>) {
     if (!interludeActiveRef.current) return;
     const detail = event.currentTarget.error?.message;
     setPlaybackError(detail ? `插话音频播放失败：${detail}` : '插话音频播放失败，请检查文件格式和文件权限。');
-    handleInterludeEnded();
+    clearInterludePlayback({ resetSchedule: true });
   }
 
-  function startInterludePlayback(interlude: InterludeSnapshot) {
+  async function startInterludePlayback(interlude: InterludeSnapshot) {
+    if (interludeActiveRef.current || interludeStartingRef.current) return;
     const count = interlude.audio_files.length;
     const nextIndex = chooseInterludeIndex(count, lastInterludeIndexRef.current);
     if (nextIndex === null) return;
-    const selectedUrl = toAssetUrl(interlude.audio_files[nextIndex]);
+    const selectedPath = interlude.audio_files[nextIndex];
+    const selectedUrl = toAssetUrl(selectedPath);
     if (!selectedUrl) return;
+    const operation = interludeOperationRef.current + 1;
+    interludeOperationRef.current = operation;
+    interludeStartingRef.current = true;
     clearInterludeStopTimer();
     lastInterludeIndexRef.current = nextIndex;
     nextInterludeAtMsRef.current = null;
+    const usePortAudio = portAudioHardwareRef.current;
+    if (usePortAudio) {
+      try {
+        await invoke<void>('start_portaudio_interlude', { request: { path: selectedPath } });
+      } catch (cause) {
+        if (operation === interludeOperationRef.current) {
+          interludeStartingRef.current = false;
+          setPlaybackError(
+            `${getDisplayErrorMessage(cause, 'PortAudio 插话解码或混音失败')}；主音轨保持播放。`,
+          );
+        }
+        return;
+      }
+    }
+    if (operation !== interludeOperationRef.current) {
+      if (usePortAudio) void invoke<void>('stop_portaudio_interlude').catch(() => undefined);
+      return;
+    }
+    interludeStartingRef.current = false;
+    interludePortAudioRef.current = usePortAudio;
     interludeActiveRef.current = true;
     interludePausedRef.current = false;
     interludeGainLevelRef.current = toGainValue(interlude.volume_db);
@@ -1685,6 +1738,12 @@ function FinalEffectWindow() {
     const handlePageHide = () => {
       const operationId = fixedSpeechOperationRef.current?.operationId;
       if (operationId) cancelFixedSpeech(operationId);
+      interludeOperationRef.current += 1;
+      if (interludePortAudioRef.current || interludeStartingRef.current) {
+        void invoke<void>('stop_portaudio_interlude').catch(() => undefined);
+      }
+      interludePortAudioRef.current = false;
+      interludeStartingRef.current = false;
       setPortAudioHardwareActive(false);
       try {
         channel.postMessage({
@@ -2642,7 +2701,7 @@ function FinalEffectWindow() {
       syncUserAudioSettings();
       return;
     }
-    if (!audioDiagnosticsReady) {
+    if (!audioDiagnosticsReady && !interludePortAudioRef.current) {
       interludeAudio.pause();
       syncUserAudioSettings();
       return;
@@ -2657,7 +2716,10 @@ function FinalEffectWindow() {
         fixedSpeechActive: fixedSpeechActiveRef.current,
       })
     ) {
-      void interludeAudio.play().catch(() => undefined);
+      void interludeAudio.play().catch((cause) => {
+        setPlaybackError(getDisplayErrorMessage(cause, '插话音频无法开始播放'));
+        clearInterludePlayback({ resetSchedule: true });
+      });
     }
   }, [audioDiagnosticsReady, interludeAudioUrl]);
 
@@ -2714,7 +2776,11 @@ function FinalEffectWindow() {
       const video = videoRef.current;
       const currentSnapshot = snapshotRef.current;
       const interlude = currentSnapshot?.interlude ?? null;
-      if (!video || !currentSnapshot || !audioDiagnosticsReadyRef.current) return;
+      if (
+        !video
+        || !currentSnapshot
+        || (!audioDiagnosticsReadyRef.current && !portAudioHardwareRef.current)
+      ) return;
 
       const sourceKey =
         currentSnapshot.current_video_reference ??
@@ -2756,7 +2822,7 @@ function FinalEffectWindow() {
         resumeInterludePlayback();
       }
 
-      if (interludeActiveRef.current) return;
+      if (interludeActiveRef.current || interludeStartingRef.current) return;
 
       const currentClockMs = performance.now();
       if (nextInterludeAtMsRef.current === null) {
@@ -2768,7 +2834,7 @@ function FinalEffectWindow() {
         );
       }
       if (currentClockMs < nextInterludeAtMsRef.current) return;
-      startInterludePlayback(interlude);
+      void startInterludePlayback(interlude);
     }, 250);
     return () => window.clearInterval(timer);
   }, [sourceUrl]);
@@ -3069,7 +3135,7 @@ function FinalEffectWindow() {
                 crossOrigin="anonymous"
                 src={interludeAudioUrl ?? undefined}
                 preload="auto"
-                muted={userMuted}
+                muted={userMuted || portAudioHardwareEnabled}
                 onEnded={handleInterludeEnded}
                 onError={handleInterludeError}
                 hidden
@@ -3223,6 +3289,11 @@ function DesktopApp() {
   const pendingAudioApplyRef = useRef<{
     params: ResearchParams;
     cycle: AudioCycleSample | null;
+  } | null>(null);
+  const pendingAudioOutputPresetRef = useRef<{
+    presetIds: string[];
+    audioStreamRevision: number;
+    parametersVersion: string;
   } | null>(null);
   const mediaApplyInFlightRef = useRef(false);
   const researchParamsRef = useRef<ResearchParams | null>(null);
@@ -3410,6 +3481,7 @@ function DesktopApp() {
     normalizeAudioMixPickMax(loadAudioMixSession()?.pickMax ?? DEFAULT_AUDIO_MIX_PICK_MAX),
   );
   const [audioActivePresetIds, setAudioActivePresetIds] = useState<string[]>([]);
+  const [actualAudioPresetIds, setActualAudioPresetIds] = useState<string[]>([]);
   const [audioPresetDrawerOpen, setAudioPresetDrawerOpen] = useState(false);
   const [audioSettingsDrawerOpen, setAudioSettingsDrawerOpen] = useState(false);
   const [interludeDrawerOpen, setInterludeDrawerOpen] = useState(false);
@@ -3833,6 +3905,7 @@ function DesktopApp() {
     if (plan) postAudioCycleCommand(plan, 'cancel');
   }
   const [runtimePreview, setRuntimePreview] = useState<RuntimePreviewParameters | null>(null);
+  const [metricFlashTokens, setMetricFlashTokens] = useState<Record<string, number>>({});
   const [runtimeChannelError, setRuntimeChannelError] = useState<string | null>(null);
   const [diagnosticMessage, setDiagnosticMessage] = useState<DiagnosticMessage | null>(null);
   const [diagnosticNow, setDiagnosticNow] = useState(() => Date.now());
@@ -4006,6 +4079,8 @@ function DesktopApp() {
         }
         snapshotRefHome.current = committedSnapshot;
         setSnapshot(committedSnapshot);
+        pendingAudioOutputPresetRef.current = null;
+        setActualAudioPresetIds(plan.sample.sample.presetIds);
         const futureAudioPlan = audioFuturePlansRef.current?.[0];
         const committedPlan: MediaCyclePlan<PlannedAudioCyclePayload> =
           futureAudioPlan?.planId === plan.sample.planId
@@ -4304,6 +4379,35 @@ function DesktopApp() {
     setVideoProcessingEnabled(snapshot.video_processing_enabled);
     setAudioProcessingEnabled(snapshot.audio_processing_enabled);
   }, [snapshot?.audio_processing_enabled, snapshot?.video_processing_enabled]);
+
+  useEffect(() => {
+    const pending = pendingAudioOutputPresetRef.current;
+    if (!pending || !snapshot) return;
+    if (snapshot.audio_processing_status === 'failed') {
+      pendingAudioOutputPresetRef.current = null;
+      return;
+    }
+    if (
+      !snapshot.audio_processing_runtime
+      || (
+        snapshot.audio_stream_revision === pending.audioStreamRevision
+        && snapshot.audio_processing_parameters_version === pending.parametersVersion
+      )
+    ) return;
+    pendingAudioOutputPresetRef.current = null;
+    setActualAudioPresetIds(pending.presetIds);
+  }, [
+    snapshot?.audio_processing_parameters_version,
+    snapshot?.audio_processing_runtime,
+    snapshot?.audio_processing_status,
+    snapshot?.audio_stream_revision,
+  ]);
+
+  useEffect(() => {
+    if (audioProcessingEnabled) return;
+    pendingAudioOutputPresetRef.current = null;
+    setActualAudioPresetIds([]);
+  }, [audioProcessingEnabled]);
 
   useEffect(() => {
     if (!interludeDirty) {
@@ -5246,9 +5350,26 @@ function DesktopApp() {
             audioMixEnabledRef.current && cycle && cycle.variants.length > 1
               ? buildAudioVariantsFromCycle(params.audio, cycle)
               : undefined;
-          const nextSnapshot = await invoke<PlaybackSnapshot>('start_media_processing', {
-            request: { params, audio_variants },
-          });
+          const currentSnapshot = snapshotRefHome.current ?? snapshot;
+          const pendingOutputPreset = scope !== 'video' && cycle
+            ? {
+                presetIds: [...cycle.presetIds],
+                audioStreamRevision: currentSnapshot.audio_stream_revision,
+                parametersVersion: currentSnapshot.audio_processing_parameters_version,
+              }
+            : null;
+          if (pendingOutputPreset) pendingAudioOutputPresetRef.current = pendingOutputPreset;
+          let nextSnapshot: PlaybackSnapshot;
+          try {
+            nextSnapshot = await invoke<PlaybackSnapshot>('start_media_processing', {
+              request: { params, audio_variants },
+            });
+          } catch (cause) {
+            if (pendingAudioOutputPresetRef.current === pendingOutputPreset) {
+              pendingAudioOutputPresetRef.current = null;
+            }
+            throw cause;
+          }
           setSnapshot(nextSnapshot);
           if (
             nextSnapshot.fallback_reason &&
@@ -5455,7 +5576,7 @@ function DesktopApp() {
     [audioProcessingEnabled, audioProcessingStatus, researchParams?.audio],
   );
 
-  const videoMetricDefinitions = [
+  const videoMetricDefinitions = useMemo(() => [
     { field: 'brightness_percent', runtimeField: 'video_brightness_percent', label: '亮度', min: -100, max: 100, step: 0.1, baseline: 0, unit: '%', tone: 'blue' },
     { field: 'contrast_percent', runtimeField: 'video_contrast_percent', label: '对比度', min: 0, max: 200, step: 0.1, baseline: 100, unit: '%', tone: 'blue' },
     { field: 'saturation_percent', runtimeField: 'video_saturation_percent', label: '饱和度', min: 0, max: 200, step: 0.1, baseline: 100, unit: '%', tone: 'blue' },
@@ -5468,7 +5589,82 @@ function DesktopApp() {
     { field: 'dynamic_crop_percent', label: '动态裁剪', min: 0, max: 4, step: 0.01, baseline: 0, unit: '%', tone: 'yellow' },
     { field: 'space_x_offset_px', runtimeField: 'video_space_x_offset_px', label: '水平偏移', min: -4, max: 4, step: 0.01, baseline: 0, unit: 'px', tone: 'pink' },
     { field: 'space_y_offset_px', runtimeField: 'video_space_y_offset_px', label: '垂直偏移', min: -4, max: 4, step: 0.01, baseline: 0, unit: 'px', tone: 'pink' },
-  ] as const;
+  ] as const, []);
+  const videoMetricValues = useMemo(() => Object.fromEntries(
+    videoMetricDefinitions.map((metric) => {
+      const runtimeField = 'runtimeField' in metric ? metric.runtimeField : null;
+      const liveValue = runtimeField && runtimePreview ? runtimePreview[runtimeField] : null;
+      return [
+        metric.field,
+        runtimeActive && typeof liveValue === 'number'
+          ? liveValue
+          : researchParams?.video[metric.field] ?? metric.baseline,
+      ];
+    }),
+  ) as Record<string, number>, [researchParams?.video, runtimeActive, runtimePreview, videoMetricDefinitions]);
+  const videoMetricSnapshot: MetricValueSnapshot = videoMetricValues;
+  const previousVideoMetricSnapshotRef = useRef<MetricValueSnapshot | null>(null);
+  useEffect(() => {
+    if (!runtimeActive) {
+      previousVideoMetricSnapshotRef.current = null;
+      return;
+    }
+    const changed = getChangedMetricKeys(previousVideoMetricSnapshotRef.current, videoMetricSnapshot);
+    previousVideoMetricSnapshotRef.current = videoMetricSnapshot;
+    if (changed.length > 0) {
+      setMetricFlashTokens((current) => advanceMetricFlashTokens(
+        current,
+        changed.map((key) => `video:${key}`),
+      ));
+    }
+  }, [runtimeActive, videoMetricSnapshot]);
+
+  const audioMetricSnapshot = useMemo(() => Object.fromEntries(
+    audioCapabilityRows
+      .filter((row) => row.key !== 'spectral_perturbation_percent')
+      .map((row) => [row.key, row.value]),
+  ) as MetricValueSnapshot, [audioCapabilityRows]);
+  const audioMetricSnapshotIdentity = audioProcessingEnabled && snapshot?.audio_processing_runtime
+    ? `${snapshot.playback_generation}:${snapshot.audio_stream_revision}:${snapshot.audio_processing_parameters_version}`
+    : null;
+  const previousAudioMetricSnapshotRef = useRef<MetricValueSnapshot | null>(null);
+  const previousAudioMetricIdentityRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (audioMetricSnapshotIdentity === null) {
+      previousAudioMetricSnapshotRef.current = null;
+      previousAudioMetricIdentityRef.current = null;
+      return;
+    }
+    if (previousAudioMetricIdentityRef.current === audioMetricSnapshotIdentity) return;
+    previousAudioMetricIdentityRef.current = audioMetricSnapshotIdentity;
+    const changed = getChangedMetricKeys(previousAudioMetricSnapshotRef.current, audioMetricSnapshot);
+    previousAudioMetricSnapshotRef.current = audioMetricSnapshot;
+    if (changed.length > 0) {
+      setMetricFlashTokens((current) => advanceMetricFlashTokens(
+        current,
+        changed.map((key) => `audio:${key}`),
+      ));
+    }
+  }, [audioMetricSnapshot, audioMetricSnapshotIdentity]);
+
+  const previousActualAudioPresetIdsRef = useRef<readonly string[] | null>(null);
+  useEffect(() => {
+    if (!audioProcessingEnabled) {
+      previousActualAudioPresetIdsRef.current = null;
+      return;
+    }
+    const newlyActive = getNewlyActivePresetIds(
+      previousActualAudioPresetIdsRef.current,
+      actualAudioPresetIds,
+    );
+    previousActualAudioPresetIdsRef.current = actualAudioPresetIds;
+    if (newlyActive.length > 0) {
+      setMetricFlashTokens((current) => advanceMetricFlashTokens(
+        current,
+        newlyActive.map((id) => `preset:${id}`),
+      ));
+    }
+  }, [actualAudioPresetIds, audioProcessingEnabled]);
   const playbackProgressPercent = mediaDuration > 0 ? (mediaCurrentTime / mediaDuration) * 100 : 0;
   const sourceSpecification = currentSource
     ? `${currentSource.width ?? '-'}×${currentSource.height ?? '-'} · ${currentSource.frame_rate_fps?.toFixed(0) ?? '-'}fps`
@@ -5793,11 +5989,7 @@ function DesktopApp() {
             {!mediaEngineCapabilities?.available ? <Alert type="warning" showIcon message={mediaEngineCapabilities?.reason ?? '本地媒体引擎不可用'} style={{ marginBottom: 10 }} /> : null}
             <div className="desktop-parameter-grid">
               {videoMetricDefinitions.map((metric) => {
-                const runtimeField = 'runtimeField' in metric ? metric.runtimeField : null;
-                const liveValue = runtimeField && runtimePreview ? runtimePreview[runtimeField] : null;
-                const value = runtimeActive && typeof liveValue === 'number'
-                  ? liveValue
-                  : researchParams?.video[metric.field] ?? metric.baseline;
+                const value = videoMetricValues[metric.field] ?? metric.baseline;
                 return (
                   <ParameterMetricCard
                     key={metric.field}
@@ -5810,6 +6002,7 @@ function DesktopApp() {
                     unit={metric.unit}
                     digits={metric.step < 0.1 ? 3 : 2}
                     tone={metric.tone}
+                    flashToken={metricFlashTokens[`video:${metric.field}`]}
                     disabled={!researchParams || !videoProcessingEnabled}
                     onChange={(next) => updateResearchParam('video', metric.field, next)}
                   />
@@ -5826,6 +6019,7 @@ function DesktopApp() {
                     meta={getProcessingStatusLabel(row.status)}
                     tone={(['blue', 'green', 'pink', 'yellow'] as const)[index % 4]}
                     percent={row.status === 'ready' || row.status === 'runtime' ? 100 : row.status === 'configured' ? 62 : row.status === 'unsupported' ? 14 : 0}
+                    flashToken={metricFlashTokens[`audio:${row.key}`]}
                   />
                 ))}
               <div className="desktop-metric-section-title">声音预设池 · 当前选择</div>
@@ -5841,6 +6035,7 @@ function DesktopApp() {
                       meta="普通声音预设"
                       tone={(['yellow', 'pink', 'blue', 'green'] as const)[index % 4]}
                       percent={selected ? 100 : 8}
+                      flashToken={metricFlashTokens[`preset:${preset.id}`]}
                     />
                   );
                 })}

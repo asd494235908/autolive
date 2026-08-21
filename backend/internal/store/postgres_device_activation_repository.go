@@ -142,6 +142,8 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 		Status:     controlplane.DeviceStatusActive,
 		LastSeenAt: now.Format(time.RFC3339),
 	}
+	activationExpiresAt := expiresAt.Time.UTC().Format(time.RFC3339)
+	device.ActivationExpiresAt = &activationExpiresAt
 	if exists {
 		if _, err := tx.ExecContext(operationCtx, `
 			UPDATE devices

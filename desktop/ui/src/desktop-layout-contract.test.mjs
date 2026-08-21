@@ -1,9 +1,18 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import * as ts from 'typescript';
 
 async function readSource(path) {
   return readFile(new URL(path, import.meta.url), 'utf8');
+}
+
+async function loadTypeScriptModule(path) {
+  const source = await readSource(path);
+  const compiled = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2021 },
+  }).outputText;
+  return import(`data:text/javascript;charset=utf-8,${encodeURIComponent(compiled)}`);
 }
 
 test('主窗口保持参考图的三栏尺寸、顺序和独立滚动', async () => {
@@ -53,6 +62,53 @@ test('状态条和参数网格使用 Ant Design 公开组件', async () => {
   assert.match(app, /普通声音 · 参数状态/);
   assert.match(app, /声音预设池 · 当前选择/);
   assert.doesNotMatch(app, /addonBefore|addonAfter/);
+  assert.doesNotMatch(css, /\.ant-/);
+});
+
+test('参数卡只在真实值或实际预设参与集合变化时生成新闪动 token', async () => {
+  const {
+    advanceMetricFlashTokens,
+    getChangedMetricKeys,
+    getNewlyActivePresetIds,
+  } = await loadTypeScriptModule('./desktop/metric-change-flash.ts');
+  const first = { brightness: 0, contrast: 100, gain: 0 };
+
+  assert.deepEqual(getChangedMetricKeys(null, first), []);
+  assert.deepEqual(getChangedMetricKeys(first, { ...first }), []);
+  assert.deepEqual(
+    getChangedMetricKeys(first, { brightness: 0.25, contrast: 100, gain: -1 }),
+    ['brightness', 'gain'],
+  );
+
+  const initialTokens = {};
+  assert.equal(advanceMetricFlashTokens(initialTokens, []), initialTokens);
+  const changedTokens = advanceMetricFlashTokens(initialTokens, ['brightness', 'gain']);
+  assert.deepEqual(changedTokens, { brightness: 1, gain: 1 });
+  assert.deepEqual(advanceMetricFlashTokens(changedTokens, ['brightness']), { brightness: 2, gain: 1 });
+
+  assert.deepEqual(getNewlyActivePresetIds(null, ['p1']), []);
+  assert.deepEqual(getNewlyActivePresetIds(['p1', 'p2'], ['p2', 'p1']), []);
+  assert.deepEqual(getNewlyActivePresetIds(['p1', 'p2'], ['p2']), []);
+  assert.deepEqual(getNewlyActivePresetIds(['p1'], ['p1', 'p3', 'p3']), ['p3']);
+});
+
+test('参数卡闪动轻量、单次且尊重减少动态效果偏好', async () => {
+  const [app, card, css] = await Promise.all([
+    readSource('./App.tsx'),
+    readSource('./desktop/parameter-metric-card.tsx'),
+    readSource('./desktop-layout.css'),
+  ]);
+
+  assert.match(app, /audio_processing_runtime/);
+  assert.match(app, /setActualAudioPresetIds\(plan\.sample\.sample\.presetIds\)/);
+  assert.match(app, /flashToken=\{metricFlashTokens\[`video:\$\{metric\.field\}`\]\}/);
+  assert.match(app, /flashToken=\{metricFlashTokens\[`audio:\$\{row\.key\}`\]\}/);
+  assert.match(app, /flashToken=\{metricFlashTokens\[`preset:\$\{preset\.id\}`\]\}/);
+  assert.match(card, /parameter-metric-card-flash-\$\{flashToken % 2\}/);
+  assert.match(css, /parameter-metric-card-flash-0[^}]*220ms ease-out/);
+  assert.match(css, /parameter-metric-card-flash-1[^}]*220ms ease-out/);
+  assert.match(css, /@media\s*\(prefers-reduced-motion:\s*reduce\)/);
+  assert.match(css, /parameter-metric-card-flash-0,\s*\.parameter-metric-card-flash-1\s*\{\s*animation:\s*none/);
   assert.doesNotMatch(css, /\.ant-/);
 });
 

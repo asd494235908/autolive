@@ -351,6 +351,12 @@ type DeviceReader interface {
 	GetOwnedDevice(ctx context.Context, userID, deviceID string) (controlplane.DeviceSummary, error)
 }
 
+// ActivationExpiryReader reads the effective expiry of the activation bound
+// to one device. It is supplementary profile data and never returns the code.
+type ActivationExpiryReader interface {
+	GetActivationExpiry(ctx context.Context, userID, deviceID string) (*time.Time, error)
+}
+
 // AdminCredentialRepository owns bootstrap/readiness/password-rotation facts
 // for the fixed local administrator in normalized PostgreSQL mode.
 type AdminCredentialRepository interface {

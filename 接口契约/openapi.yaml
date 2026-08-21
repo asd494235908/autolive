@@ -2053,6 +2053,11 @@ components:
           enum: [idle, playing, paused, error]
         last_seen_at:
           $ref: '#/components/schemas/Timestamp'
+        activation_expires_at:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          nullable: true
+          description: 当前设备绑定的激活码到期时间；未绑定或历史数据缺失时省略
     LoginRequest:
       type: object
       additionalProperties: false

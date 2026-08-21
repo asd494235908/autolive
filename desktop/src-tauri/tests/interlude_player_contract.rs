@@ -272,3 +272,22 @@ fn playback_snapshot_reports_effective_audio_source_priority_without_mutating_ba
     );
     assert_eq!(snapshot.effective_audio_source, "realtime_variant");
 }
+
+#[test]
+fn portaudio_interlude_commands_are_registered_on_the_single_output_path() {
+    let main = std::fs::read_to_string("src/main.rs").expect("main.rs should be readable");
+    let commands =
+        std::fs::read_to_string("src/commands.rs").expect("commands.rs should be readable");
+
+    for command in [
+        "start_portaudio_interlude",
+        "pause_portaudio_interlude",
+        "resume_portaudio_interlude",
+        "stop_portaudio_interlude",
+    ] {
+        assert!(main.contains(command), "{command} must be registered");
+        assert!(commands.contains(command), "{command} must be implemented");
+    }
+    assert!(commands.contains("output_control.start_interlude("));
+    assert!(!commands.contains("PortAudioOutput::new(\n        output_status.sample_rate_hz"));
+}

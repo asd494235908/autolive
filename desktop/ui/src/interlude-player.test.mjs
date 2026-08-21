@@ -176,10 +176,22 @@ test('插话音频预加载，正常播放到结束后才切换，并显示加�
   const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
 
   assert.match(appSource, /preload="auto"/);
-  assert.match(appSource, /if \(interludeActiveRef\.current\) return;/);
+  assert.match(appSource, /if \(interludeActiveRef\.current \|\| interludeStartingRef\.current\) return;/);
   assert.match(appSource, /onEnded=\{handleInterludeEnded\}/);
   assert.match(appSource, /onError=\{handleInterludeError\}/);
   assert.match(appSource, /插话音频播放失败/);
+});
+
+test('PortAudio 接管时插话进入唯一输出流且 WebView 元素只保留结束时钟', async () => {
+  const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
+
+  assert.match(appSource, /invoke<void>\('start_portaudio_interlude'/);
+  assert.match(appSource, /invoke<void>\('pause_portaudio_interlude'/);
+  assert.match(appSource, /invoke<void>\('resume_portaudio_interlude'/);
+  assert.match(appSource, /invoke<void>\('stop_portaudio_interlude'/);
+  assert.match(appSource, /interludeAudio\.muted = interludePortAudioRef\.current \|\| muted/);
+  assert.match(appSource, /muted=\{userMuted \|\| portAudioHardwareEnabled\}/);
+  assert.match(appSource, /主音轨保持播放/);
 });
 
 test('视频进入下一轮时不重置插话，插话调度使用独立时钟', async () => {

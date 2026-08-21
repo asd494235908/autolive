@@ -754,6 +754,8 @@ export interface components {
             /** @enum {string} */
             playback_state?: "idle" | "playing" | "paused" | "error";
             last_seen_at: components["schemas"]["Timestamp"];
+            /** @description 当前设备绑定的激活码到期时间；未绑定或历史数据缺失时省略 */
+            activation_expires_at?: components["schemas"]["Timestamp"] | null;
         };
         LoginRequest: {
             username: string;

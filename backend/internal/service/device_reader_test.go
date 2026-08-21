@@ -11,8 +11,9 @@ import (
 
 type normalizedDeviceReaderRepository struct {
 	*store.MemoryStore
-	user   controlplane.UserSummary
-	device controlplane.DeviceSummary
+	user      controlplane.UserSummary
+	device    controlplane.DeviceSummary
+	expiresAt time.Time
 }
 
 type normalizedReadOnlyRepository struct{ *store.MemoryStore }
@@ -33,6 +34,10 @@ func (r *normalizedDeviceReaderRepository) GetOwnedDevice(context.Context, strin
 	return r.device, nil
 }
 
+func (r *normalizedDeviceReaderRepository) GetActivationExpiry(context.Context, string, string) (*time.Time, error) {
+	return &r.expiresAt, nil
+}
+
 func TestGetClientProfileUsesNormalizedUserAndDeviceReaders(t *testing.T) {
 	now := time.Date(2026, 8, 21, 15, 0, 0, 0, time.UTC)
 	repository := &normalizedDeviceReaderRepository{
@@ -45,12 +50,13 @@ func TestGetClientProfileUsesNormalizedUserAndDeviceReaders(t *testing.T) {
 			ID: "dev_1", UserID: "usr_1", DeviceName: "Studio", Platform: "windows",
 			AppVersion: "1.2.3", Status: controlplane.DeviceStatusActive, LastSeenAt: now.Format(time.RFC3339),
 		},
+		expiresAt: now.Add(24 * time.Hour),
 	}
 	profile, err := NewControlPlaneWithRepository(repository).GetClientProfile(context.Background(), "usr_1", "dev_1")
 	if err != nil {
 		t.Fatalf("GetClientProfile() error = %v", err)
 	}
-	if profile.User.ID != "usr_1" || profile.Device.ID != "dev_1" || len(profile.Permissions) != 1 || profile.Permissions[0] != "client" || !profile.Device.Online {
+	if profile.User.ID != "usr_1" || profile.Device.ID != "dev_1" || profile.Device.ActivationExpiresAt == nil || *profile.Device.ActivationExpiresAt != now.Add(24*time.Hour).Format(time.RFC3339) || len(profile.Permissions) != 1 || profile.Permissions[0] != "client" || !profile.Device.Online {
 		t.Fatalf("profile = %+v", profile)
 	}
 }

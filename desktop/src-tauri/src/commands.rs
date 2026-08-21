@@ -2,8 +2,8 @@ use crate::audio_cycle_switch::{
     AudioCycleCandidate, AudioMixerSourceIdentity, PendingAudioMixerKind, PendingAudioMixerTask,
 };
 use autolive_desktop_core::audio_cycle_output::{
-    AudioCycleOutputControl, AudioCycleOutputTask, AudioOutputConfig, AudioTestTone,
-    AudioTrackTimeline,
+    AudioCycleOutputControl, AudioCycleOutputTask, AudioInterludeMixConfig, AudioOutputConfig,
+    AudioTestTone, AudioTrackTimeline,
 };
 use autolive_desktop_core::audio_mixer::{AudioMixerTask, AUDIO_CANDIDATE_COMMIT_TAIL_MS};
 use autolive_desktop_core::audio_output_diagnostic::AudioLowFrequencyDiagnosticSnapshot;
@@ -245,6 +245,10 @@ pub struct AppState {
     audio_cycle_output: Arc<Mutex<Option<AudioCycleOutputTask>>>,
     /// FFmpeg 解码线程 → 音频混音线程；PortAudio 失败时整体停止并回退 WebView。
     audio_mixer: Arc<Mutex<Option<AudioMixerTask>>>,
+    /// 随机插话只生产 PCM；实际叠加和 duck 仍由唯一 audio_cycle_output 完成。
+    interlude_mixer: Arc<Mutex<Option<AudioMixerTask>>>,
+    /// 串行化插话的创建/停止，避免并发 IPC 短暂生成多个 FFmpeg 解码器。
+    interlude_prepare_lock: Arc<Mutex<()>>,
     /// 尚未提交的候选音轨；预热期间不占用当前音轨槽位，停止/暂停可取消并 Join。
     audio_mixer_pending: Arc<Mutex<Option<PendingAudioMixerTask>>>,
     /// 所有音轨生命周期操作共享的代次；停止、暂停、重新同步或新预热会使旧操作失效。
@@ -917,6 +921,8 @@ impl Default for AppState {
             runtime_resource_task: Arc::new(RuntimeResourceTask::default()),
             audio_cycle_output: Arc::new(Mutex::new(None)),
             audio_mixer: Arc::new(Mutex::new(None)),
+            interlude_mixer: Arc::new(Mutex::new(None)),
+            interlude_prepare_lock: Arc::new(Mutex::new(())),
             audio_mixer_pending: Arc::new(Mutex::new(None)),
             audio_mixer_pending_token: Arc::new(AtomicU64::new(0)),
             audio_mixer_switch_lock: Arc::new(Mutex::new(())),
@@ -1053,7 +1059,35 @@ impl AppState {
             .map(|mut output| output.take())
     }
 
+    fn take_interlude_mixer_task(&self) -> Result<Option<AudioMixerTask>, CommandErrorDto> {
+        self.interlude_mixer
+            .lock()
+            .map_err(|_| {
+                CommandErrorDto::new(
+                    "interlude_mixer_lock_failed",
+                    "PortAudio 插话混音状态锁已损坏",
+                )
+            })
+            .map(|mut task| task.take())
+    }
+
+    fn stop_interlude_mixer(&self) -> Result<(), CommandErrorDto> {
+        let stop_result = self.audio_output_control().ok().map(|control| {
+            control
+                .stop_interlude()
+                .map_err(|error| CommandErrorDto::new("interlude_output_stop_failed", error))
+        });
+        if let Some(mut task) = self.take_interlude_mixer_task()? {
+            task.stop_preserving_output();
+        }
+        if let Some(result) = stop_result {
+            result?;
+        }
+        Ok(())
+    }
+
     fn stop_audio_cycle_output(&self) -> Result<(), CommandErrorDto> {
+        self.stop_interlude_mixer()?;
         if let Some(task) = self.take_audio_cycle_output_task()? {
             task.shutdown()
                 .map_err(|error| CommandErrorDto::new("audio_cycle_output_stop_failed", error))?;
@@ -1110,6 +1144,9 @@ impl AppState {
             control
                 .clear()
                 .map_err(|error| CommandErrorDto::new("audio_output_clear_failed", error))?;
+        }
+        if let Some(mut task) = self.take_interlude_mixer_task()? {
+            task.stop_preserving_output();
         }
         self.stop_audio_mixer()
     }
@@ -2158,6 +2195,11 @@ pub struct SetInterludeConfigRequestDto {
     pub ducking_depth_db: f64,
     pub ducking_attack_ms: u64,
     pub ducking_release_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartPortAudioInterludeRequestDto {
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5332,6 +5374,7 @@ pub fn set_audio_processing_profile(
 #[tauri::command]
 pub fn set_interlude_config(
     window: Window,
+    app: AppHandle,
     state: State<'_, AppState>,
     request: SetInterludeConfigRequestDto,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
@@ -5347,10 +5390,226 @@ pub fn set_interlude_config(
         ducking_release_ms: request.ducking_release_ms,
     })
     .map_err(command_error_from_interlude)?;
+    for audio_path in &snapshot.audio_files {
+        allow_local_playback_asset_file(
+            &app,
+            Path::new(audio_path),
+            "interlude_asset_scope_failed",
+            "插话音频",
+        )?;
+    }
+    let _prepare_guard = state.interlude_prepare_lock.lock().map_err(|_| {
+        CommandErrorDto::new(
+            "interlude_prepare_lock_failed",
+            "PortAudio 插话创建锁已损坏",
+        )
+    })?;
+    state.stop_interlude_mixer()?;
     state.with_playback(&window, move |playback| {
         playback.set_interlude_snapshot(snapshot.clone());
         Ok(PlaybackSnapshotDto::from(playback.snapshot()))
     })
+}
+
+#[tauri::command]
+pub async fn start_portaudio_interlude(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: StartPortAudioInterludeRequestDto,
+) -> Result<(), CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        start_portaudio_interlude_blocking(app, state, request)
+    })
+    .await
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "interlude_start_task_failed",
+            format!("PortAudio 插话后台启动任务失败：{error}"),
+        )
+    })?
+}
+
+fn start_portaudio_interlude_blocking(
+    app: AppHandle,
+    state: AppState,
+    request: StartPortAudioInterludeRequestDto,
+) -> Result<(), CommandErrorDto> {
+    let _prepare_guard = state.interlude_prepare_lock.lock().map_err(|_| {
+        CommandErrorDto::new(
+            "interlude_prepare_lock_failed",
+            "PortAudio 插话创建锁已损坏",
+        )
+    })?;
+    let snapshot = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot();
+    if snapshot.playback_state != PlaybackState::Playing {
+        return Err(CommandErrorDto::new(
+            "interlude_playback_not_running",
+            "视频未处于播放状态，不能启动随机插话",
+        ));
+    }
+    let interlude = &snapshot.interlude;
+    if !interlude.enabled || interlude.audio_files.is_empty() {
+        return Err(CommandErrorDto::new(
+            "interlude_not_ready",
+            "随机插话尚未启用或目录内没有可用音频",
+        ));
+    }
+    let canonical_path = std::fs::canonicalize(request.path.trim()).map_err(|error| {
+        CommandErrorDto::new(
+            "interlude_audio_file_unavailable",
+            format!("插话音频路径无法规范化：{error}"),
+        )
+    })?;
+    let allowed = interlude
+        .audio_files
+        .iter()
+        .any(|path| Path::new(path) == canonical_path.as_path());
+    if !allowed {
+        return Err(CommandErrorDto::new(
+            "interlude_audio_file_not_allowed",
+            "请求的插话音频不在当前已校验目录中",
+        ));
+    }
+
+    let output_control = state.audio_output_control()?;
+    let output_status = output_control
+        .status()
+        .filter(|status| {
+            status.health.application_running
+                && matches!(
+                    status.health.hardware_state,
+                    autolive_portaudio_output::PortAudioHardwareState::Active
+                )
+                && !status.callback_paused
+        })
+        .ok_or_else(|| {
+            CommandErrorDto::new(
+                "interlude_portaudio_inactive",
+                "PortAudio 实际出口未处于活动状态，随机插话保持 WebView 回退",
+            )
+        })?;
+
+    state.stop_interlude_mixer()?;
+    let target_root = runtime_resource_target_root(&app)
+        .map_err(|error| CommandErrorDto::new("media_resource_dir_failed", error))?;
+    let (ffmpeg_path, _) = configured_media_engine_paths_with_resource_dir(&target_root)
+        .map_err(|error| CommandErrorDto::new("media_engine_unavailable", error.to_string()))?;
+    let minimum_ready_ms = usize::try_from(output_status.playback_watermark_ms)
+        .unwrap_or(AUDIO_CANDIDATE_COMMIT_TAIL_MS)
+        .max(AUDIO_CANDIDATE_COMMIT_TAIL_MS);
+    // 插话是立即叠加，不是远期候选；只预热硬件水位即可，避免固定等待 1 秒。
+    let buffer_ms = minimum_ready_ms;
+    let started_at = Instant::now();
+    let mut task = AudioMixerTask::start_scheduled_candidate_with_filter_and_variant_count(
+        ffmpeg_path,
+        canonical_path,
+        output_status.sample_rate_hz,
+        0,
+        0,
+        None,
+        1.0,
+        buffer_ms,
+        minimum_ready_ms,
+        started_at,
+    )
+    .map_err(|error| CommandErrorDto::new("interlude_decoder_start_failed", error))?;
+    while !task.is_ready() {
+        if let Some(error) = task.failure() {
+            task.stop_preserving_output();
+            return Err(CommandErrorDto::new(
+                "interlude_decode_failed",
+                format!("插话音频解码失败：{error}"),
+            ));
+        }
+        if started_at.elapsed() >= Duration::from_millis(PORTAUDIO_SWITCH_READY_TIMEOUT_MS) {
+            task.stop_preserving_output();
+            return Err(CommandErrorDto::new(
+                "interlude_decode_timeout",
+                "插话音频未在 5000ms 内达到 PortAudio 安全水位",
+            ));
+        }
+        thread::sleep(Duration::from_millis(PORTAUDIO_SWITCH_READY_POLL_MS));
+    }
+    if let Err(error) = output_control.start_interlude(
+        task.output_track(),
+        AudioInterludeMixConfig {
+            volume_gain: db_to_linear_gain(interlude.volume_db, 4.0),
+            duck_gain: db_to_linear_gain(interlude.ducking_depth_db, 1.0),
+            attack_ms: interlude.ducking_attack_ms,
+            release_ms: interlude.ducking_release_ms,
+        },
+    ) {
+        task.stop_preserving_output();
+        return Err(CommandErrorDto::new("interlude_output_start_failed", error));
+    }
+    let replaced = match state.interlude_mixer.lock() {
+        Ok(mut current) => current.replace(task),
+        Err(_) => {
+            let _ = output_control.stop_interlude();
+            task.stop_preserving_output();
+            return Err(CommandErrorDto::new(
+                "interlude_mixer_lock_failed",
+                "PortAudio 插话混音状态锁已损坏",
+            ));
+        }
+    };
+    if let Some(mut replaced) = replaced {
+        replaced.stop_preserving_output();
+    }
+    Ok(())
+}
+
+fn db_to_linear_gain(db: f64, maximum: f32) -> f32 {
+    if !db.is_finite() {
+        return 0.0;
+    }
+    (10_f64.powf(db / 20.0) as f32).clamp(0.0, maximum)
+}
+
+#[tauri::command]
+pub fn pause_portaudio_interlude(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<(), CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    state
+        .audio_output_control()?
+        .pause_interlude()
+        .map_err(|error| CommandErrorDto::new("interlude_output_pause_failed", error))
+}
+
+#[tauri::command]
+pub fn resume_portaudio_interlude(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<(), CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    state
+        .audio_output_control()?
+        .resume_interlude()
+        .map_err(|error| CommandErrorDto::new("interlude_output_resume_failed", error))
+}
+
+#[tauri::command]
+pub fn stop_portaudio_interlude(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<(), CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let _prepare_guard = state.interlude_prepare_lock.lock().map_err(|_| {
+        CommandErrorDto::new(
+            "interlude_prepare_lock_failed",
+            "PortAudio 插话创建锁已损坏",
+        )
+    })?;
+    state.stop_interlude_mixer()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5887,12 +6146,12 @@ mod tests {
     use super::development_executable_ready;
     use super::{
         absolute_media_position_ms, add_wall_clock_delay_to_media_position_ms,
-        audio_cycle_cancel_matches_pending, audio_cycle_commit_due, is_retryable_audio_mixer_error,
-        resolve_audio_candidate_pcm_position_ms, resolve_audio_commit_position_ms,
-        resolve_audio_output_latency_ms, resolve_audio_sync_clock,
-        scheduled_candidate_commit_tail_ms, should_complete_playback_loop,
-        should_defer_source_sync_for_pending_candidate, signed_millis_delta,
-        take_pending_audio_mixer, AppState, AudioSyncClock,
+        audio_cycle_cancel_matches_pending, audio_cycle_commit_due, db_to_linear_gain,
+        is_retryable_audio_mixer_error, resolve_audio_candidate_pcm_position_ms,
+        resolve_audio_commit_position_ms, resolve_audio_output_latency_ms,
+        resolve_audio_sync_clock, scheduled_candidate_commit_tail_ms,
+        should_complete_playback_loop, should_defer_source_sync_for_pending_candidate,
+        signed_millis_delta, take_pending_audio_mixer, AppState, AudioSyncClock,
     };
     use std::sync::atomic::Ordering;
 
@@ -5956,6 +6215,14 @@ mod tests {
             72_300,
         )
         .is_err());
+    }
+
+    #[test]
+    fn interlude_decibel_values_are_bounded_for_the_portaudio_bus() {
+        assert!((db_to_linear_gain(0.0, 4.0) - 1.0).abs() < f32::EPSILON);
+        assert!((db_to_linear_gain(-12.0, 1.0) - 0.251_188_64).abs() < 1e-6);
+        assert_eq!(db_to_linear_gain(12.0, 1.0), 1.0);
+        assert_eq!(db_to_linear_gain(f64::NAN, 1.0), 0.0);
     }
 
     #[test]

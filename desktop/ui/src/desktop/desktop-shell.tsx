@@ -18,30 +18,36 @@ export function DesktopTopbar() {
         <span className="desktop-brand-name" data-tauri-drag-region>autoLive</span>
         <span className="desktop-brand-subtitle" data-tauri-drag-region>本地单视频循环引擎</span>
       </div>
-      <div className="desktop-window-controls">
-        <Button
-          aria-label="最小化窗口"
-          className="desktop-window-button"
-          icon={<MinusOutlined />}
-          onClick={() => runWindowAction('minimize')}
-          type="text"
-        />
-        <Button
-          aria-label="最大化或还原窗口"
-          className="desktop-window-button"
-          icon={<BorderOutlined />}
-          onClick={() => runWindowAction('toggleMaximize')}
-          type="text"
-        />
-        <Button
-          aria-label="关闭窗口"
-          className="desktop-window-button desktop-window-button-close"
-          icon={<CloseOutlined />}
-          onClick={() => runWindowAction('close')}
-          type="text"
-        />
-      </div>
+      <DesktopWindowControls />
     </header>
+  );
+}
+
+export function DesktopWindowControls() {
+  return (
+    <div className="desktop-window-controls">
+      <Button
+        aria-label="最小化窗口"
+        className="desktop-window-button"
+        icon={<MinusOutlined />}
+        onClick={() => runWindowAction('minimize')}
+        type="text"
+      />
+      <Button
+        aria-label="最大化或还原窗口"
+        className="desktop-window-button"
+        icon={<BorderOutlined />}
+        onClick={() => runWindowAction('toggleMaximize')}
+        type="text"
+      />
+      <Button
+        aria-label="关闭窗口"
+        className="desktop-window-button desktop-window-button-close"
+        icon={<CloseOutlined />}
+        onClick={() => runWindowAction('close')}
+        type="text"
+      />
+    </div>
   );
 }
 

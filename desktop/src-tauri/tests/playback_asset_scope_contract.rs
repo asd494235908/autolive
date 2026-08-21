@@ -52,3 +52,26 @@ fn processed_video_is_registered_before_it_becomes_pending_playback() {
         "scope registration must succeed before processed playback is exposed"
     );
 }
+
+#[test]
+fn interlude_audio_files_are_registered_before_the_catalog_is_exposed() {
+    let source = std::fs::read_to_string("src/commands.rs")
+        .expect("commands.rs should be readable from the crate root");
+    let command = command_body(
+        &source,
+        "pub fn set_interlude_config(",
+        "#[tauri::command]\npub async fn start_portaudio_interlude(",
+    );
+
+    let registration = command
+        .find("allow_local_playback_asset_file(")
+        .expect("validated interlude files should enter the asset scope");
+    let state_commit = command
+        .find("playback.set_interlude_snapshot(snapshot.clone())")
+        .expect("the interlude catalog should be committed");
+
+    assert!(
+        registration < state_commit,
+        "asset scope registration must succeed before interlude files reach the WebView"
+    );
+}
