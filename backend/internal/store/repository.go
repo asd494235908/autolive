@@ -141,6 +141,7 @@ type DeviceActivationRecord struct {
 	Fingerprint        string
 	AccessTokenHash    string
 	UserID             string
+	Product            controlplane.ProductCode
 	ActivationCodeHash string
 	Device             controlplane.DeviceRegistration
 	// Audit is optional for compatibility callers. Normalized HTTP activation
@@ -155,6 +156,7 @@ type DeviceHeartbeatRecord struct {
 	Fingerprint     string
 	AccessTokenHash string
 	UserID          string
+	Product         controlplane.ProductCode
 	Input           controlplane.HeartbeatInput
 	// Audit is optional for compatibility callers. Normalized HTTP heartbeat
 	// supplies the prevalidated success event for the same transaction.
@@ -166,6 +168,7 @@ type DeviceMutationRecord struct {
 	IdempotencyKey string
 	Fingerprint    string
 	DeviceID       string
+	Product        controlplane.ProductCode
 	// Audit is optional for compatibility callers and is enqueued in the
 	// same normalized device lifecycle transaction when supplied.
 	Audit controlplane.AuditLogInput
@@ -177,6 +180,7 @@ type ModelLeaseRenewRecord struct {
 	Fingerprint    string
 	UserID         string
 	DeviceID       string
+	Product        controlplane.ProductCode
 	LeaseID        string
 	ExtendSeconds  int
 	Audit          controlplane.AuditLogInput
@@ -188,6 +192,7 @@ type ModelLeaseReleaseRecord struct {
 	Fingerprint    string
 	UserID         string
 	DeviceID       string
+	Product        controlplane.ProductCode
 	LeaseID        string
 	Reason         string
 	Audit          controlplane.AuditLogInput
@@ -198,6 +203,7 @@ type ModelLeaseReclaimRecord struct {
 	IdempotencyKey string
 	Fingerprint    string
 	LeaseID        string
+	Product        controlplane.ProductCode
 	Reason         string
 	Audit          controlplane.AuditLogInput
 }
@@ -208,6 +214,7 @@ type ModelLeaseCreateRecord struct {
 	Fingerprint        string
 	UserID             string
 	DeviceID           string
+	Product            controlplane.ProductCode
 	Provider           string
 	Model              string
 	Purpose            string
@@ -221,6 +228,7 @@ type ModelUsageWriteRecord struct {
 	Fingerprint    string
 	UserID         string
 	DeviceID       string
+	Product        controlplane.ProductCode
 	RequestID      string
 	Input          controlplane.CreateDirectLLMCallRecordInput
 	// Audit is optional for compatibility callers. Normalized client call
@@ -234,6 +242,7 @@ type ModelPoolAccountMutationRecord struct {
 	IdempotencyKey string
 	Fingerprint    string
 	AccountID      string
+	Product        controlplane.ProductCode
 	// Audit is optional for compatibility callers. Normalized model-account
 	// mutations enqueue the success event in the same transaction as the
 	// account state and idempotency record.
@@ -244,6 +253,7 @@ type ModelPoolAccountCreateRecord struct {
 	Scope            string
 	IdempotencyKey   string
 	Fingerprint      string
+	Product          controlplane.ProductCode
 	Provider         string
 	Model            string
 	BaseURL          string
@@ -267,6 +277,7 @@ type ModelPoolSecretRotationRecord struct {
 	IdempotencyKey    string
 	Fingerprint       string
 	AccountID         string
+	Product           controlplane.ProductCode
 	ExpectedSecretRef string
 	APIKey            string
 	Probe             controlplane.ModelPoolConnectivityTestResult
@@ -278,6 +289,7 @@ type ModelPoolTestPrepareRecord struct {
 	IdempotencyKey string
 	Fingerprint    string
 	AccountID      string
+	Product        controlplane.ProductCode
 }
 
 type ModelPoolTestPreparation struct {
@@ -290,6 +302,7 @@ type ModelPoolTestRecord struct {
 	IdempotencyKey string
 	Fingerprint    string
 	AccountID      string
+	Product        controlplane.ProductCode
 	Result         controlplane.ModelPoolConnectivityTestResult
 	Audit          controlplane.AuditLogInput
 }
@@ -408,6 +421,7 @@ type UserUpdateRecord struct {
 }
 
 type ActivationCodeCreateRecord struct {
+	Product    controlplane.ProductCode
 	PlainCode  string
 	CodeHash   string
 	CodePrefix string

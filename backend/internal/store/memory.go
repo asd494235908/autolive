@@ -18,6 +18,8 @@ type MemoryStore struct {
 }
 
 type State struct {
+	Products                  map[string]controlplane.ProductSummary
+	UserProducts              map[string]controlplane.UserProductMembership
 	Users                     map[string]controlplane.UserSummary
 	UserAuthorizationPolicies map[string]controlplane.UserAuthorizationPolicy
 	UserCredentialHashes      map[string][]byte
@@ -62,6 +64,8 @@ func NewMemoryStore(now func() time.Time) *MemoryStore {
 
 func NewState() *State {
 	return &State{
+		Products:                  map[string]controlplane.ProductSummary{},
+		UserProducts:              map[string]controlplane.UserProductMembership{},
 		Users:                     map[string]controlplane.UserSummary{},
 		UserAuthorizationPolicies: map[string]controlplane.UserAuthorizationPolicy{},
 		UserCredentialHashes:      map[string][]byte{},
@@ -84,6 +88,12 @@ func ensureStateMaps(state *State) *State {
 		return NewState()
 	}
 	defaults := NewState()
+	if state.Products == nil {
+		state.Products = defaults.Products
+	}
+	if state.UserProducts == nil {
+		state.UserProducts = defaults.UserProducts
+	}
 	if state.Users == nil {
 		state.Users = defaults.Users
 	}

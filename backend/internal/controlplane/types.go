@@ -18,7 +18,7 @@ const (
 	ActivationCodeStatusUsed    = "used"
 	ActivationCodeStatusExpired = "expired"
 	ActivationCodeStatusRevoked = "revoked"
-	MaxActivationCodeDevices   = 100
+	MaxActivationCodeDevices    = 100
 
 	ModelAccountStatusActive    = "active"
 	ModelAccountStatusCooldown  = "cooldown"
@@ -34,26 +34,29 @@ const (
 )
 
 type Actor struct {
-	UserID string
-	Role   string
+	UserID  string
+	Role    string
+	Product ProductCode
 }
 
 type AuditLog struct {
-	ID          string `json:"id"`
-	ActorUserID string `json:"actor_user_id,omitempty"`
-	DeviceID    string `json:"device_id,omitempty"`
-	Action      string `json:"action"`
-	TargetType  string `json:"target_type"`
-	TargetID    string `json:"target_id,omitempty"`
-	Outcome     string `json:"outcome"`
-	StatusCode  int    `json:"status_code"`
-	ErrorCode   string `json:"error_code,omitempty"`
-	RequestID   string `json:"request_id,omitempty"`
-	CreatedAt   string `json:"created_at"`
+	ID          string      `json:"id"`
+	Product     ProductCode `json:"product"`
+	ActorUserID string      `json:"actor_user_id,omitempty"`
+	DeviceID    string      `json:"device_id,omitempty"`
+	Action      string      `json:"action"`
+	TargetType  string      `json:"target_type"`
+	TargetID    string      `json:"target_id,omitempty"`
+	Outcome     string      `json:"outcome"`
+	StatusCode  int         `json:"status_code"`
+	ErrorCode   string      `json:"error_code,omitempty"`
+	RequestID   string      `json:"request_id,omitempty"`
+	CreatedAt   string      `json:"created_at"`
 }
 
 type AuditLogInput struct {
 	ActorUserID string
+	Product     ProductCode
 	DeviceID    string
 	Action      string
 	TargetType  string
@@ -102,24 +105,25 @@ type UserAuthorizationSummary struct {
 }
 
 type DeviceSummary struct {
-	ID                   string  `json:"id"`
-	UserID               string  `json:"user_id"`
-	DeviceName           string  `json:"device_name"`
-	Platform             string  `json:"platform"`
-	AppVersion           string  `json:"app_version"`
-	Status               string  `json:"status"`
-	DiskFreeBytes        int64   `json:"disk_free_bytes,omitempty"`
-	MemoryTotalBytes     int64   `json:"memory_total_bytes,omitempty"`
-	MemoryAvailableBytes int64   `json:"memory_available_bytes,omitempty"`
-	CPULogicalCores      int     `json:"cpu_logical_cores,omitempty"`
-	RuntimeOSName        string  `json:"runtime_os_name,omitempty"`
-	RuntimeOSVersion     string  `json:"runtime_os_version,omitempty"`
-	KernelVersion        string  `json:"kernel_version,omitempty"`
-	CurrentMediaName     string  `json:"current_media_name,omitempty"`
-	PlaybackState        string  `json:"playback_state,omitempty"`
-	Online               bool    `json:"online"`
-	LastSeenAt           string  `json:"last_seen_at"`
-	ActivationExpiresAt  *string `json:"activation_expires_at,omitempty"`
+	ID                   string      `json:"id"`
+	UserID               string      `json:"user_id"`
+	Product              ProductCode `json:"product"`
+	DeviceName           string      `json:"device_name"`
+	Platform             string      `json:"platform"`
+	AppVersion           string      `json:"app_version"`
+	Status               string      `json:"status"`
+	DiskFreeBytes        int64       `json:"disk_free_bytes,omitempty"`
+	MemoryTotalBytes     int64       `json:"memory_total_bytes,omitempty"`
+	MemoryAvailableBytes int64       `json:"memory_available_bytes,omitempty"`
+	CPULogicalCores      int         `json:"cpu_logical_cores,omitempty"`
+	RuntimeOSName        string      `json:"runtime_os_name,omitempty"`
+	RuntimeOSVersion     string      `json:"runtime_os_version,omitempty"`
+	KernelVersion        string      `json:"kernel_version,omitempty"`
+	CurrentMediaName     string      `json:"current_media_name,omitempty"`
+	PlaybackState        string      `json:"playback_state,omitempty"`
+	Online               bool        `json:"online"`
+	LastSeenAt           string      `json:"last_seen_at"`
+	ActivationExpiresAt  *string     `json:"activation_expires_at,omitempty"`
 }
 
 type HeartbeatStatus struct {
@@ -146,30 +150,33 @@ type HeartbeatResult struct {
 }
 
 type ClientProfile struct {
+	Product     ProductCode   `json:"product"`
 	User        UserSummary   `json:"user"`
 	Device      DeviceSummary `json:"device"`
 	Permissions []string      `json:"permissions"`
 }
 
 type DeviceRegistration struct {
-	DeviceID   string `json:"device_id"`
-	DeviceName string `json:"device_name"`
-	Platform   string `json:"platform"`
-	AppVersion string `json:"app_version"`
-	OSVersion  string `json:"os_version,omitempty"`
+	Product    ProductCode `json:"product"`
+	DeviceID   string      `json:"device_id"`
+	DeviceName string      `json:"device_name"`
+	Platform   string      `json:"platform"`
+	AppVersion string      `json:"app_version"`
+	OSVersion  string      `json:"os_version,omitempty"`
 }
 
 type ActivationCode struct {
-	ID             string  `json:"id"`
-	Status         string  `json:"status"`
-	ExpiresAt      string  `json:"expires_at"`
-	MaxDevices     int     `json:"max_devices"`
-	BoundDevices   int     `json:"bound_devices"`
-	CodePrefix     string  `json:"code_prefix,omitempty"`
-	UsedByUserID   string  `json:"used_by_user_id,omitempty"`
-	UsedByDeviceID string  `json:"used_by_device_id,omitempty"`
-	UsedAt         string  `json:"used_at,omitempty"`
-	PlainCode      *string `json:"plain_code"`
+	ID             string      `json:"id"`
+	Product        ProductCode `json:"product"`
+	Status         string      `json:"status"`
+	ExpiresAt      string      `json:"expires_at"`
+	MaxDevices     int         `json:"max_devices"`
+	BoundDevices   int         `json:"bound_devices"`
+	CodePrefix     string      `json:"code_prefix,omitempty"`
+	UsedByUserID   string      `json:"used_by_user_id,omitempty"`
+	UsedByDeviceID string      `json:"used_by_device_id,omitempty"`
+	UsedAt         string      `json:"used_at,omitempty"`
+	PlainCode      *string     `json:"plain_code"`
 }
 
 type ModelPoolAccountSummary struct {
@@ -246,56 +253,59 @@ type ReleaseModelLeaseInput struct {
 }
 
 type ModelLease struct {
-	ID               string `json:"id"`
-	UserID           string `json:"-"`
-	DeviceID         string `json:"-"`
-	AccountID        string `json:"-"`
-	Purpose          string `json:"-"`
-	Provider         string `json:"provider"`
-	Model            string `json:"model"`
-	Status           string `json:"status"`
-	CreatedAt        string `json:"created_at,omitempty"`
-	ExpiresAt        string `json:"expires_at"`
-	ReleasedAt       string `json:"released_at,omitempty"`
-	ProxyMode        string `json:"proxy_mode"`
-	DirectBaseURL    string `json:"direct_base_url,omitempty"`
-	ConcurrencyLimit int    `json:"concurrency_limit"`
+	ID               string      `json:"id"`
+	Product          ProductCode `json:"product"`
+	UserID           string      `json:"-"`
+	DeviceID         string      `json:"-"`
+	AccountID        string      `json:"-"`
+	Purpose          string      `json:"-"`
+	Provider         string      `json:"provider"`
+	Model            string      `json:"model"`
+	Status           string      `json:"status"`
+	CreatedAt        string      `json:"created_at,omitempty"`
+	ExpiresAt        string      `json:"expires_at"`
+	ReleasedAt       string      `json:"released_at,omitempty"`
+	ProxyMode        string      `json:"proxy_mode"`
+	DirectBaseURL    string      `json:"direct_base_url,omitempty"`
+	ConcurrencyLimit int         `json:"concurrency_limit"`
 }
 
 // ModelLeaseAdminSummary is the redacted control-plane view of a lease.
 // It exposes ownership and lifecycle metadata to administrators without any
 // lease credential or provider secret.
 type ModelLeaseAdminSummary struct {
-	ID               string `json:"id"`
-	AccountID        string `json:"account_id"`
-	UserID           string `json:"user_id"`
-	DeviceID         string `json:"device_id"`
-	Purpose          string `json:"purpose"`
-	Provider         string `json:"provider"`
-	Model            string `json:"model"`
-	Status           string `json:"status"`
-	ExpiresAt        string `json:"expires_at"`
-	ProxyMode        string `json:"proxy_mode"`
-	ConcurrencyLimit int    `json:"concurrency_limit"`
+	ID               string      `json:"id"`
+	Product          ProductCode `json:"product"`
+	AccountID        string      `json:"account_id"`
+	UserID           string      `json:"user_id"`
+	DeviceID         string      `json:"device_id"`
+	Purpose          string      `json:"purpose"`
+	Provider         string      `json:"provider"`
+	Model            string      `json:"model"`
+	Status           string      `json:"status"`
+	ExpiresAt        string      `json:"expires_at"`
+	ProxyMode        string      `json:"proxy_mode"`
+	ConcurrencyLimit int         `json:"concurrency_limit"`
 }
 
 // ModelLeaseAdminDetail is a redacted single-lease view. It deliberately
 // excludes direct credentials and provider secrets while exposing lifecycle
 // timestamps needed for safe administrative recovery.
 type ModelLeaseAdminDetail struct {
-	ID               string `json:"id"`
-	AccountID        string `json:"account_id"`
-	UserID           string `json:"user_id"`
-	DeviceID         string `json:"device_id"`
-	Purpose          string `json:"purpose"`
-	Provider         string `json:"provider"`
-	Model            string `json:"model"`
-	Status           string `json:"status"`
-	CreatedAt        string `json:"created_at,omitempty"`
-	ExpiresAt        string `json:"expires_at"`
-	ReleasedAt       string `json:"released_at,omitempty"`
-	ProxyMode        string `json:"proxy_mode"`
-	ConcurrencyLimit int    `json:"concurrency_limit"`
+	ID               string      `json:"id"`
+	Product          ProductCode `json:"product"`
+	AccountID        string      `json:"account_id"`
+	UserID           string      `json:"user_id"`
+	DeviceID         string      `json:"device_id"`
+	Purpose          string      `json:"purpose"`
+	Provider         string      `json:"provider"`
+	Model            string      `json:"model"`
+	Status           string      `json:"status"`
+	CreatedAt        string      `json:"created_at,omitempty"`
+	ExpiresAt        string      `json:"expires_at"`
+	ReleasedAt       string      `json:"released_at,omitempty"`
+	ProxyMode        string      `json:"proxy_mode"`
+	ConcurrencyLimit int         `json:"concurrency_limit"`
 }
 
 type ReleaseModelLeaseResult struct {
@@ -304,20 +314,21 @@ type ReleaseModelLeaseResult struct {
 }
 
 type ModelUsageRecord struct {
-	ID           string `json:"id"`
-	LeaseID      string `json:"lease_id"`
-	ClientCallID string `json:"client_call_id"`
-	RequestID    string `json:"request_id"`
-	Provider     string `json:"provider"`
-	Model        string `json:"model"`
-	InputTokens  int    `json:"input_tokens"`
-	OutputTokens int    `json:"output_tokens"`
-	TotalTokens  int    `json:"total_tokens"`
-	LatencyMS    int64  `json:"latency_ms"`
-	Status       string `json:"status"`
-	UsageSource  string `json:"usage_source"`
-	ErrorCode    string `json:"error_code,omitempty"`
-	CreatedAt    string `json:"created_at"`
+	ID           string      `json:"id"`
+	Product      ProductCode `json:"product"`
+	LeaseID      string      `json:"lease_id"`
+	ClientCallID string      `json:"client_call_id"`
+	RequestID    string      `json:"request_id"`
+	Provider     string      `json:"provider"`
+	Model        string      `json:"model"`
+	InputTokens  int         `json:"input_tokens"`
+	OutputTokens int         `json:"output_tokens"`
+	TotalTokens  int         `json:"total_tokens"`
+	LatencyMS    int64       `json:"latency_ms"`
+	Status       string      `json:"status"`
+	UsageSource  string      `json:"usage_source"`
+	ErrorCode    string      `json:"error_code,omitempty"`
+	CreatedAt    string      `json:"created_at"`
 }
 
 type CreateDirectLLMCallRecordInput struct {

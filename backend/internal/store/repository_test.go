@@ -131,6 +131,19 @@ func TestCompareAuditLogCreatedAtUsesTimeInstant(t *testing.T) {
 	}
 }
 
+func TestNewStateInitializesProductRegistries(t *testing.T) {
+	state := NewState()
+	if state.Products == nil || state.UserProducts == nil {
+		t.Fatal("NewState() did not initialize product registries")
+	}
+
+	state.Products = nil
+	state.UserProducts = nil
+	if got := ensureStateMaps(state); got.Products == nil || got.UserProducts == nil {
+		t.Fatal("ensureStateMaps() did not restore product registries")
+	}
+}
+
 func mustAuditTime(t *testing.T, value string) *time.Time {
 	t.Helper()
 	parsed, err := time.Parse(time.RFC3339, value)
