@@ -2738,12 +2738,12 @@ components:
         max_devices:
           type: integer
           minimum: 1
-          maximum: 1
+          maximum: 100
           default: 1
     ActivationCode:
       type: object
       additionalProperties: false
-      required: [id, status, expires_at, max_devices]
+      required: [id, status, expires_at, max_devices, bound_devices]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -2753,6 +2753,12 @@ components:
           $ref: '#/components/schemas/Timestamp'
         max_devices:
           type: integer
+          minimum: 1
+          maximum: 100
+        bound_devices:
+          type: integer
+          minimum: 0
+          description: 已成功绑定的设备数量，不超过 max_devices
         code_prefix:
           type: string
           description: 脱敏后的激活码前缀，不包含完整明文

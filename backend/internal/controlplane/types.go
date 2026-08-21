@@ -18,6 +18,7 @@ const (
 	ActivationCodeStatusUsed    = "used"
 	ActivationCodeStatusExpired = "expired"
 	ActivationCodeStatusRevoked = "revoked"
+	MaxActivationCodeDevices   = 100
 
 	ModelAccountStatusActive    = "active"
 	ModelAccountStatusCooldown  = "cooldown"
@@ -163,6 +164,7 @@ type ActivationCode struct {
 	Status         string  `json:"status"`
 	ExpiresAt      string  `json:"expires_at"`
 	MaxDevices     int     `json:"max_devices"`
+	BoundDevices   int     `json:"bound_devices"`
 	CodePrefix     string  `json:"code_prefix,omitempty"`
 	UsedByUserID   string  `json:"used_by_user_id,omitempty"`
 	UsedByDeviceID string  `json:"used_by_device_id,omitempty"`

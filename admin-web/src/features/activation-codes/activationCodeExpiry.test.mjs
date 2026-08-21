@@ -51,3 +51,9 @@ test('uses an Ant Design DatePicker and serializes its value at the request boun
   assert.doesNotMatch(pageSource, /\bInput\b/);
   assert.doesNotMatch(pageSource, /请输入 RFC3339 时间/);
 });
+
+test('allows choosing activation capacity and shows binding progress', () => {
+  assert.match(pageSource, /InputNumber/);
+  assert.match(pageSource, /max_devices:\s*values\.max_devices/);
+  assert.match(pageSource, /bound_devices/);
+});

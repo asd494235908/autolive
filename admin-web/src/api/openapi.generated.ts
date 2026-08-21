@@ -1050,6 +1050,8 @@ export interface components {
             status: components["schemas"]["ActivationCodeStatus"];
             expires_at: components["schemas"]["Timestamp"];
             max_devices: number;
+            /** @description 已成功绑定的设备数量，不超过 max_devices */
+            bound_devices: number;
             /** @description 脱敏后的激活码前缀，不包含完整明文 */
             code_prefix?: string;
             /** @description 核销设备所属用户；仅核销后返回 */
