@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -95,6 +96,76 @@ func TestLoginRejectsInvalidCredentials(t *testing.T) {
 	}
 }
 
+func TestConfiguredAdminPasswordIsPersistedAcrossRouterRecreation(t *testing.T) {
+	repository := store.NewMemoryStore(time.Now)
+	first := NewRouterWithRepository("v1.0.0", nil, AuthConfig{Username: "admin", Password: "first-password"}, repository)
+	if response := doLoginRequest(t, first, "admin", "first-password"); response.Code != http.StatusOK {
+		t.Fatalf("first login status = %d; body=%s", response.Code, response.Body.String())
+	}
+
+	second := NewRouterWithRepository("v1.0.0", nil, AuthConfig{Username: "admin", Password: "second-password"}, repository)
+	if response := doLoginRequest(t, second, "admin", "first-password"); response.Code != http.StatusOK {
+		t.Fatalf("persisted password login status = %d; body=%s", response.Code, response.Body.String())
+	}
+	if response := doLoginRequest(t, second, "admin", "second-password"); response.Code != http.StatusUnauthorized {
+		t.Fatalf("replacement password status = %d; body=%s", response.Code, response.Body.String())
+	}
+
+	persisted := NewRouterWithRepository("v1.0.0", nil, AuthConfig{UsePersistedAdmin: true}, repository)
+	if response := doLoginRequest(t, persisted, "admin", "first-password"); response.Code != http.StatusOK {
+		t.Fatalf("persisted-admin-only login status = %d; body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestLocalAdminPasswordChangeRevokesSessionsAndSupportsIdempotentRetry(t *testing.T) {
+	handler := NewRouterWithAuth("v1.0.0", nil, AuthConfig{
+		Username: "admin",
+		Password: "first-password",
+	})
+	oldToken := loginWithCredentialsForTest(t, handler, `{"username":"admin","password":"first-password"}`)
+	changeRequest := httptest.NewRequest(http.MethodPost, "/api/v1/admin/auth/change-password", strings.NewReader(`{"password":"rotated-password"}`))
+	changeRequest.Header.Set("Authorization", "Bearer "+oldToken)
+	changeRequest.Header.Set("Idempotency-Key", "rotate-local-admin")
+	changeRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(changeRecorder, changeRequest)
+	if changeRecorder.Code != http.StatusOK {
+		t.Fatalf("change password status = %d, want %d; body=%s", changeRecorder.Code, http.StatusOK, changeRecorder.Body.String())
+	}
+
+	oldSessionRequest := httptest.NewRequest(http.MethodGet, "/api/v1/admin/users", nil)
+	oldSessionRequest.Header.Set("Authorization", "Bearer "+oldToken)
+	oldSessionRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(oldSessionRecorder, oldSessionRequest)
+	if oldSessionRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("old local admin session status = %d, want %d", oldSessionRecorder.Code, http.StatusUnauthorized)
+	}
+	if response := doLoginRequest(t, handler, "admin", "first-password"); response.Code != http.StatusUnauthorized {
+		t.Fatalf("old local admin password status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+	newToken := loginWithCredentialsForTest(t, handler, `{"username":"admin","password":"rotated-password"}`)
+	if newToken == "" {
+		t.Fatal("rotated local admin password did not create a session")
+	}
+
+	retryRequest := httptest.NewRequest(http.MethodPost, "/api/v1/admin/auth/change-password", strings.NewReader(`{"password":"rotated-password"}`))
+	retryRequest.Header.Set("Authorization", "Bearer "+newToken)
+	retryRequest.Header.Set("Idempotency-Key", "rotate-local-admin")
+	retryRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(retryRecorder, retryRequest)
+	if retryRecorder.Code != http.StatusOK {
+		t.Fatalf("idempotent change password status = %d, want %d; body=%s", retryRecorder.Code, http.StatusOK, retryRecorder.Body.String())
+	}
+}
+
+func doLoginRequest(t *testing.T, handler http.Handler, username, password string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"`+username+`","password":"`+password+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
 func TestLoginReportsMissingDevelopmentConfiguration(t *testing.T) {
 	handler := NewRouter("v1.0.0", nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"password"}`))
@@ -126,6 +197,43 @@ func TestCreatedUserCanLoginWithTheSameControlPlaneCredentials(t *testing.T) {
 	clientToken := loginWithCredentialsForTest(t, handler, `{"username":"client-a","password":"client-password"}`)
 	if clientToken == "" || clientToken == adminToken {
 		t.Fatalf("expected a distinct client access token")
+	}
+}
+
+func TestResetUserPasswordRevokesExistingSessions(t *testing.T) {
+	handler := NewRouterWithAuth("v1.0.0", nil, AuthConfig{
+		Username: "admin",
+		Password: "correct-password",
+	})
+	adminToken := loginWithCredentialsForTest(t, handler, `{"username":"admin","password":"correct-password"}`)
+	createRequest := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users", strings.NewReader(`{"username":"client-b","password":"client-password","role":"user"}`))
+	createRequest.Header.Set("Authorization", "Bearer "+adminToken)
+	createRequest.Header.Set("Idempotency-Key", "create-client-b")
+	createRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(createRecorder, createRequest)
+	if createRecorder.Code != http.StatusCreated {
+		t.Fatalf("create user status = %d, want %d; body=%s", createRecorder.Code, http.StatusCreated, createRecorder.Body.String())
+	}
+	clientToken := loginWithCredentialsForTest(t, handler, `{"username":"client-b","password":"client-password"}`)
+
+	resetRequest := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users/usr_00000001/reset-password", strings.NewReader(`{"password":"changed-password"}`))
+	resetRequest.Header.Set("Authorization", "Bearer "+adminToken)
+	resetRequest.Header.Set("Idempotency-Key", "reset-client-b")
+	resetRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(resetRecorder, resetRequest)
+	if resetRecorder.Code != http.StatusOK {
+		t.Fatalf("reset password status = %d, want %d; body=%s", resetRecorder.Code, http.StatusOK, resetRecorder.Body.String())
+	}
+
+	oldSessionRequest := httptest.NewRequest(http.MethodGet, "/api/v1/client/profile", nil)
+	oldSessionRequest.Header.Set("Authorization", "Bearer "+clientToken)
+	oldSessionRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(oldSessionRecorder, oldSessionRequest)
+	if oldSessionRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("old session status = %d, want %d", oldSessionRecorder.Code, http.StatusUnauthorized)
+	}
+	if loginWithCredentialsForTest(t, handler, `{"username":"client-b","password":"changed-password"}`) == "" {
+		t.Fatal("new password did not create a session")
 	}
 }
 
@@ -226,6 +334,60 @@ func TestLogoutRevokesAccessAndRefreshTokens(t *testing.T) {
 	}
 }
 
+func TestLogoutReportsPersistentRevocationFailure(t *testing.T) {
+	sessionStore := newTestSessionStore()
+	sessionStore.revokeErr = errors.New("database unavailable")
+	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStore("v1.0.0", nil, AuthConfig{
+		Username: "admin",
+		Password: "correct-password",
+	}, store.NewMemoryStore(time.Now), store.NewMemorySecretStore(), sessionStore)
+	initial := loginTokensForTest(t, handler, `{"username":"admin","password":"correct-password"}`)
+
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+	logoutRequest.Header.Set("Authorization", "Bearer "+initial.AccessToken)
+	logoutRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(logoutRecorder, logoutRequest)
+	if logoutRecorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("logout status = %d, want %d; body=%s", logoutRecorder.Code, http.StatusServiceUnavailable, logoutRecorder.Body.String())
+	}
+
+	refreshRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", strings.NewReader(
+		`{"refresh_token":"`+initial.RefreshToken+`"}`,
+	))
+	refreshRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(refreshRecorder, refreshRequest)
+	if refreshRecorder.Code != http.StatusOK {
+		t.Fatalf("refresh after failed logout status = %d, want %d", refreshRecorder.Code, http.StatusOK)
+	}
+}
+
+func TestBindDeviceReportsPersistentUpdateFailure(t *testing.T) {
+	sessionStore := newTestSessionStore()
+	sessionStore.updateErr = errors.New("database unavailable")
+	repository := store.NewMemoryStore(time.Now)
+	auth := newAuthenticator(service.NewControlPlane(repository), AuthConfig{
+		Username: "admin",
+		Password: "correct-password",
+	}, sessionStore)
+	loginRecorder := httptest.NewRecorder()
+	loginRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(
+		`{"username":"admin","password":"correct-password"}`,
+	))
+	loginHandler(auth).ServeHTTP(loginRecorder, loginRequest)
+	if loginRecorder.Code != http.StatusOK {
+		t.Fatalf("login status = %d, want %d; body=%s", loginRecorder.Code, http.StatusOK, loginRecorder.Body.String())
+	}
+	var payload loginResponse
+	if err := json.Unmarshal(loginRecorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode login response: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/client/activate", nil)
+	request = request.WithContext(context.WithValue(request.Context(), sessionTokenContextKey, payload.Tokens.AccessToken))
+	if err := auth.bindDevice(request, "dev_binding_failure"); err == nil {
+		t.Fatal("bindDevice() unexpectedly succeeded when session update failed")
+	}
+}
+
 func TestLogoutCannotRevokeAnotherSessionRefreshToken(t *testing.T) {
 	handler := NewRouterWithAuth("v1.0.0", nil, AuthConfig{
 		Username: "admin",
@@ -301,6 +463,8 @@ type testSessionStore struct {
 	byAccess  map[string]store.AuthSession
 	byRefresh map[string]string
 	revoked   map[string]bool
+	revokeErr error
+	updateErr error
 }
 
 func newTestSessionStore() *testSessionStore {
@@ -363,8 +527,39 @@ func (s *testSessionStore) Rotate(_ context.Context, refreshHash string, next st
 func (s *testSessionStore) RevokeByAccessTokenHash(_ context.Context, hash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.revokeErr != nil {
+		return s.revokeErr
+	}
 	if session, ok := s.byAccess[hash]; ok {
 		s.revoked[session.ID] = true
+	}
+	return nil
+}
+
+func (s *testSessionStore) RevokeByUserID(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revokeErr != nil {
+		return s.revokeErr
+	}
+	for _, session := range s.byAccess {
+		if session.UserID == userID {
+			s.revoked[session.ID] = true
+		}
+	}
+	return nil
+}
+
+func (s *testSessionStore) RevokeByDeviceID(_ context.Context, deviceID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revokeErr != nil {
+		return s.revokeErr
+	}
+	for _, session := range s.byAccess {
+		if session.DeviceID == deviceID {
+			s.revoked[session.ID] = true
+		}
 	}
 	return nil
 }
@@ -372,11 +567,28 @@ func (s *testSessionStore) RevokeByAccessTokenHash(_ context.Context, hash strin
 func (s *testSessionStore) UpdateDeviceID(_ context.Context, hash, deviceID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.updateErr != nil {
+		return s.updateErr
+	}
 	if session, ok := s.byAccess[hash]; ok {
 		session.DeviceID = deviceID
 		s.byAccess[hash] = session
 	}
 	return nil
+}
+
+func (s *testSessionStore) ClearDeviceID(_ context.Context, hash, deviceID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.updateErr != nil {
+		return s.updateErr
+	}
+	if session, ok := s.byAccess[hash]; ok && session.DeviceID == deviceID {
+		session.DeviceID = ""
+		s.byAccess[hash] = session
+		return nil
+	}
+	return errors.New("session device binding not found")
 }
 
 type testSessionTokens struct {

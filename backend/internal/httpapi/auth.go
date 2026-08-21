@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,8 @@ type loginRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 }
+
+var deviceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$`)
 
 type loginResponse struct {
 	RequestID string        `json:"request_id"`
@@ -37,7 +41,7 @@ type refreshTokenResponse struct {
 }
 
 type logoutRequest struct {
-	RefreshToken string `json:"refresh_token"`
+	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
 type logoutResponse struct {
@@ -77,7 +81,7 @@ const deviceContextKey authContextKey = "device"
 type authenticator struct {
 	mu           sync.Mutex
 	controlPlane *service.ControlPlane
-	config       AuthConfig
+	initErr      error
 	sessions     map[string]sessionRecord
 	refreshIndex map[string]string
 	store        store.SessionStore
@@ -88,9 +92,14 @@ func newAuthenticator(controlPlane *service.ControlPlane, config AuthConfig, ses
 	if len(sessionStores) > 0 {
 		sessionStore = sessionStores[0]
 	}
+	var initializationErr error
+	if !(config.UsePersistedAdmin && strings.TrimSpace(config.Username) == "" && config.Password == "") {
+		initializationErr = controlPlane.EnsureConfiguredAdmin(context.Background(), config.Username, config.Password)
+	}
+	config.Password = ""
 	return &authenticator{
 		controlPlane: controlPlane,
-		config:       config,
+		initErr:      initializationErr,
 		sessions:     map[string]sessionRecord{},
 		refreshIndex: map[string]string{},
 		store:        sessionStore,
@@ -105,8 +114,8 @@ func registerAuthRoutes(mux *http.ServeMux, auth *authenticator) {
 
 func loginHandler(auth *authenticator) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.TrimSpace(auth.config.Username) == "" || auth.config.Password == "" {
-			writeError(w, r, http.StatusServiceUnavailable, "AUTH_NOT_CONFIGURED", "开发阶段认证账号尚未配置")
+		if auth.initErr != nil {
+			writeError(w, r, http.StatusServiceUnavailable, "AUTH_INITIALIZATION_UNAVAILABLE", "管理员认证初始化暂不可用")
 			return
 		}
 
@@ -116,25 +125,14 @@ func loginHandler(auth *authenticator) http.Handler {
 			return
 		}
 
-		var actor controlplane.Actor
-		var user controlplane.UserSummary
-		if subtle.ConstantTimeCompare([]byte(request.Username), []byte(auth.config.Username)) == 1 &&
-			subtle.ConstantTimeCompare([]byte(request.Password), []byte(auth.config.Password)) == 1 {
-			auth.controlPlane.EnsureLocalAdmin(auth.config.Username)
-			var err error
-			user, err = auth.controlPlane.GetUser(r.Context(), "usr_local_admin")
-			if err != nil {
-				writeAppError(w, r, err)
-				return
-			}
-			actor = controlplane.Actor{UserID: user.ID, Role: user.Role}
-		} else {
-			var err error
-			actor, user, err = auth.controlPlane.AuthenticateUser(r.Context(), request.Username, request.Password)
-			if err != nil {
-				writeAppError(w, r, err)
-				return
-			}
+		actor, user, err := auth.controlPlane.AuthenticateUser(r.Context(), request.Username, request.Password)
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
+		if principal, ok := r.Context().Value(auditPrincipalContextKey{}).(*auditPrincipal); ok {
+			principal.actor = actor
+			principal.set = true
 		}
 
 		accessToken, err := newToken()
@@ -288,7 +286,10 @@ func logoutHandler(auth *authenticator) func(http.ResponseWriter, *http.Request,
 			return
 		}
 		token, _ := r.Context().Value(sessionTokenContextKey).(string)
-		auth.revokeAccessToken(r.Context(), token)
+		if err := auth.revokeAccessToken(r.Context(), token); err != nil {
+			writeError(w, r, http.StatusServiceUnavailable, "AUTH_SESSION_STORE_UNAVAILABLE", "登录会话暂时无法注销")
+			return
+		}
 		writeJSON(w, http.StatusOK, logoutResponse{
 			RequestID: RequestIDFromContext(r.Context()),
 			Success:   true,
@@ -375,9 +376,9 @@ func hashToken(token string) string {
 	return base64.RawURLEncoding.EncodeToString(digest[:])
 }
 
-func (a *authenticator) revokeAccessToken(ctx context.Context, accessToken string) {
+func (a *authenticator) revokeAccessToken(ctx context.Context, accessToken string) error {
 	if accessToken == "" {
-		return
+		return errors.New("access token is required")
 	}
 	accessTokenHash := hashToken(accessToken)
 	a.mu.Lock()
@@ -388,22 +389,94 @@ func (a *authenticator) revokeAccessToken(ctx context.Context, accessToken strin
 	}
 	a.mu.Unlock()
 	if a.store != nil {
-		_ = a.store.RevokeByAccessTokenHash(ctx, accessTokenHash)
+		if err := a.store.RevokeByAccessTokenHash(ctx, accessTokenHash); err != nil {
+			return fmt.Errorf("revoke auth session: %w", err)
+		}
 	}
+	return nil
 }
 
-func (a *authenticator) bindDevice(r *http.Request, deviceID string) {
+func (a *authenticator) revokeUserSessions(ctx context.Context, userID string) error {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return errors.New("user id is required")
+	}
+	if a.store != nil {
+		if err := a.store.RevokeByUserID(ctx, userID); err != nil {
+			return fmt.Errorf("revoke user sessions: %w", err)
+		}
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for accessHash, session := range a.sessions {
+		if session.Actor.UserID == userID {
+			delete(a.sessions, accessHash)
+			delete(a.refreshIndex, session.RefreshTokenHash)
+		}
+	}
+	return nil
+}
+
+func (a *authenticator) revokeDeviceSessions(ctx context.Context, deviceID string) error {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return errors.New("device id is required")
+	}
+	if a.store != nil {
+		if err := a.store.RevokeByDeviceID(ctx, deviceID); err != nil {
+			return fmt.Errorf("revoke device sessions: %w", err)
+		}
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for accessHash, session := range a.sessions {
+		if session.DeviceID == deviceID {
+			delete(a.sessions, accessHash)
+			delete(a.refreshIndex, session.RefreshTokenHash)
+		}
+	}
+	return nil
+}
+
+func (a *authenticator) bindDevice(r *http.Request, deviceID string) error {
+	_, err := a.bindDeviceTracked(r, deviceID)
+	return err
+}
+
+// accessTokenHash returns the already-authenticated token lookup key for the
+// optional SQL transaction coordinator. The token itself never crosses the
+// service boundary or gets persisted.
+func (a *authenticator) accessTokenHash(r *http.Request) string {
 	token, _ := r.Context().Value(sessionTokenContextKey).(string)
-	if token == "" || deviceID == "" {
-		return
+	if token == "" {
+		return ""
+	}
+	return hashToken(token)
+}
+
+// bindDeviceTracked returns true only when this request changed an unbound
+// session. Callers can then clear that exact binding if a later operation in
+// the same HTTP flow fails, without disturbing an already-bound session.
+func (a *authenticator) bindDeviceTracked(r *http.Request, deviceID string) (bool, error) {
+	token, _ := r.Context().Value(sessionTokenContextKey).(string)
+	if token == "" {
+		return false, errors.New("access token and device id are required")
+	}
+	if !deviceIDPattern.MatchString(deviceID) {
+		return false, controlplane.ErrInvalidRequest
 	}
 	tokenHash := hashToken(token)
 	var session sessionRecord
 	var ok bool
 	if a.store != nil {
 		persisted, found, err := a.store.GetByAccessTokenHash(r.Context(), tokenHash)
-		if err != nil || !found {
-			return
+		if err != nil {
+			return false, fmt.Errorf("read auth session for device binding: %w", err)
+		}
+		if !found {
+			return false, errors.New("auth session not found for device binding")
 		}
 		session = sessionFromPersisted(persisted)
 		ok = true
@@ -413,19 +486,59 @@ func (a *authenticator) bindDevice(r *http.Request, deviceID string) {
 		a.mu.Unlock()
 	}
 	if !ok {
-		return
+		return false, errors.New("auth session not found for device binding")
 	}
 	if session.DeviceID != "" && session.DeviceID != deviceID {
-		return
+		return false, controlplane.ErrDeviceBindingConflict
+	}
+	if session.DeviceID == deviceID {
+		setAuditDeviceID(r, deviceID)
+		return false, nil
 	}
 	if a.store != nil {
-		_ = a.store.UpdateDeviceID(r.Context(), tokenHash, deviceID)
-		return
+		if err := a.store.UpdateDeviceID(r.Context(), tokenHash, deviceID); err != nil {
+			return false, fmt.Errorf("bind device to auth session: %w", err)
+		}
+		setAuditDeviceID(r, deviceID)
+		return true, nil
 	}
 	session.DeviceID = deviceID
 	a.mu.Lock()
 	a.sessions[tokenHash] = session
 	a.mu.Unlock()
+	setAuditDeviceID(r, deviceID)
+	return true, nil
+}
+
+func setAuditDeviceID(r *http.Request, deviceID string) {
+	if principal, ok := r.Context().Value(auditPrincipalContextKey{}).(*auditPrincipal); ok {
+		principal.deviceID = deviceID
+	}
+}
+
+func (a *authenticator) clearDeviceBinding(r *http.Request, deviceID string) error {
+	compensationCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
+	defer cancel()
+	token, _ := r.Context().Value(sessionTokenContextKey).(string)
+	if token == "" || deviceID == "" {
+		return errors.New("access token and device id are required")
+	}
+	tokenHash := hashToken(token)
+	if a.store != nil {
+		if err := a.store.ClearDeviceID(compensationCtx, tokenHash, deviceID); err != nil {
+			return fmt.Errorf("clear auth session device binding: %w", err)
+		}
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	session, ok := a.sessions[tokenHash]
+	if !ok || session.DeviceID != deviceID {
+		return errors.New("auth session device binding not found")
+	}
+	session.DeviceID = ""
+	a.sessions[tokenHash] = session
+	return nil
 }
 
 func (a *authenticator) deviceID(r *http.Request) string {

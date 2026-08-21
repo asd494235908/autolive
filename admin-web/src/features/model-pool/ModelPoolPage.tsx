@@ -16,6 +16,7 @@ import {
   Typography,
 } from 'antd';
 import { useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { apiClient, ApiClientError, createRequestId } from '../../api/client';
 import { StatusTag } from '../../components/StatusTag';
 import { createModelPoolIdempotencyKeyManager } from './modelPoolIdempotency';
@@ -26,39 +27,85 @@ import type {
   ModelPoolConnectivityTestResponse,
   ModelPoolResponse,
   ModelUsageListResponse,
+  RotateModelPoolAccountSecretRequest,
   UpdateModelPoolAccountRequest,
 } from '../../types/api';
 
 export function ModelPoolPage() {
   const { message, modal } = App.useApp();
   const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [form] = Form.useForm<CreateModelPoolAccountRequest>();
   const [editForm] = Form.useForm<UpdateModelPoolAccountRequest>();
+  const [rotateForm] = Form.useForm<RotateModelPoolAccountSecretRequest>();
   const [createOpen, setCreateOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
+  const [rotateOpen, setRotateOpen] = useState(false);
   const [editingAccount, setEditingAccount] = useState<ModelPoolAccountSummary | null>(null);
+  const [rotatingAccount, setRotatingAccount] = useState<ModelPoolAccountSummary | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [disablingAccountId, setDisablingAccountId] = useState<string | null>(null);
   const [testingAccountId, setTestingAccountId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<ModelPoolConnectivityTestResponse | null>(null);
-  const [usagePage, setUsagePage] = useState(1);
+  const [modelPoolPage, setModelPoolPage] = useState(1);
+  const [modelPoolPageSize, setModelPoolPageSize] = useState(20);
+  const usagePage = Math.max(1, Number(searchParams.get('usage_page') ?? '1') || 1);
+  const usageFilters = useMemo(
+    () => ({
+      provider: searchParams.get('usage_provider') ?? '',
+      model: searchParams.get('usage_model') ?? '',
+      user_id: searchParams.get('usage_user_id') ?? '',
+      device_id: searchParams.get('usage_device_id') ?? '',
+      request_id: searchParams.get('usage_request_id') ?? '',
+      created_after: searchParams.get('usage_created_after') ?? '',
+      created_before: searchParams.get('usage_created_before') ?? '',
+      sort: searchParams.get('usage_sort') ?? 'created_at_desc',
+    }),
+    [searchParams],
+  );
   const testIdempotencyKeys = useRef(new Map<string, string>());
   const [idempotencyKeyManager] = useState(() =>
     createModelPoolIdempotencyKeyManager(createRequestId),
   );
 
   const modelPoolQuery = useQuery({
-    queryKey: ['admin-model-pool'],
-    queryFn: () => apiClient.get<ModelPoolResponse>('/api/v1/admin/model-pool'),
+    queryKey: ['admin-model-pool', modelPoolPage, modelPoolPageSize],
+    queryFn: () =>
+      apiClient.get<ModelPoolResponse>('/api/v1/admin/model-pool', {
+        query: { page: modelPoolPage, page_size: modelPoolPageSize },
+      }),
   });
 
   const usageQuery = useQuery({
-    queryKey: ['admin-model-usage', usagePage],
+    queryKey: ['admin-model-usage', usagePage, usageFilters],
     queryFn: () =>
       apiClient.get<ModelUsageListResponse>('/api/v1/admin/model-usage', {
-        query: { page: usagePage, page_size: 20 },
+        query: {
+          page: usagePage,
+          page_size: 20,
+          provider: usageFilters.provider || undefined,
+          model: usageFilters.model || undefined,
+          user_id: usageFilters.user_id || undefined,
+          device_id: usageFilters.device_id || undefined,
+          request_id: usageFilters.request_id || undefined,
+          created_after: usageFilters.created_after || undefined,
+          created_before: usageFilters.created_before || undefined,
+          sort: usageFilters.sort,
+        },
       }),
   });
+
+  const updateUsageQuery = (key: keyof typeof usageFilters, value: string) => {
+    const next = new URLSearchParams(searchParams);
+    const normalized = value.trim();
+    if (normalized) {
+      next.set(`usage_${key}`, normalized);
+    } else {
+      next.delete(`usage_${key}`);
+    }
+    next.set('usage_page', '1');
+    setSearchParams(next, { replace: true });
+  };
 
   const createModelAccountMutation = useMutation({
     mutationFn: (values: CreateModelPoolAccountRequest) =>
@@ -138,6 +185,32 @@ export function ModelPoolPage() {
     },
   });
 
+  const rotateModelAccountMutation = useMutation({
+    mutationFn: ({ accountId, values }: { accountId: string; values: RotateModelPoolAccountSecretRequest }) =>
+      apiClient.post<ModelPoolAccountEnvelope>(
+        `/api/v1/admin/model-pool/${accountId}/rotate-secret`,
+        {
+          body: values,
+          headers: { 'Idempotency-Key': createRequestId() },
+          timeoutMs: 70_000,
+        },
+      ),
+    onSuccess: async (response) => {
+      void message.success(`号池密钥已轮换（request_id：${response.request_id}）`);
+      setRotateOpen(false);
+      setRotatingAccount(null);
+      rotateForm.resetFields();
+      await queryClient.invalidateQueries({ queryKey: ['admin-model-pool'] });
+    },
+    onError: (error) => {
+      void message.error(
+        error instanceof ApiClientError
+          ? `${error.message}${error.requestId ? `（request_id：${error.requestId}）` : ''}`
+          : '号池密钥轮换失败',
+      );
+    },
+  });
+
   const testModelAccountMutation = useMutation({
     mutationFn: (accountId: string) => {
       const idempotencyKey = testIdempotencyKeys.current.get(accountId) ?? createRequestId();
@@ -190,6 +263,16 @@ export function ModelPoolPage() {
         dataIndex: 'status',
         key: 'status',
         render: (status: ModelPoolAccountSummary['status']) => <StatusTag status={status} />,
+      },
+      {
+        title: '冷却截止',
+        dataIndex: 'cooldown_until',
+        key: 'cooldown_until',
+        render: (value?: string) => {
+          if (!value) return '—';
+          const parsed = new Date(value);
+          return Number.isNaN(parsed.valueOf()) ? '时间无效' : parsed.toLocaleString();
+        },
       },
       {
         title: '优先级',
@@ -245,6 +328,18 @@ export function ModelPoolPage() {
             </Button>
             <Button
               type="link"
+              disabled={rotateModelAccountMutation.isPending}
+              onClick={() => {
+                setRotatingAccount(record);
+                rotateForm.resetFields();
+                rotateForm.setFieldsValue({ timeout_seconds: 15 });
+                setRotateOpen(true);
+              }}
+            >
+              换密钥
+            </Button>
+            <Button
+              type="link"
               onClick={() => {
                 setEditingAccount(record);
                 editForm.setFieldsValue({
@@ -289,6 +384,8 @@ export function ModelPoolPage() {
       disablingAccountId,
       editForm,
       modal,
+      rotateForm,
+      rotateModelAccountMutation.isPending,
       testModelAccountMutation.isPending,
       testingAccountId,
     ],
@@ -346,7 +443,19 @@ export function ModelPoolPage() {
           columns={columns}
           dataSource={modelPoolQuery.data?.accounts ?? []}
           loading={modelPoolQuery.isLoading}
-          pagination={false}
+          pagination={{
+            current: modelPoolPage,
+            pageSize: modelPoolPageSize,
+            total: modelPoolQuery.data?.pagination.total ?? 0,
+            showSizeChanger: true,
+            onChange: (page, pageSize) => {
+              setModelPoolPage(page);
+              if (pageSize !== modelPoolPageSize) {
+                setModelPoolPageSize(pageSize);
+                setModelPoolPage(1);
+              }
+            },
+          }}
           locale={{
             emptyText: modelPoolQuery.isLoading ? '加载中...' : <Empty description="暂无号池账号" />,
           }}
@@ -368,6 +477,59 @@ export function ModelPoolPage() {
       ) : null}
 
       <Card title="模型调用摘要">
+        <Space wrap style={{ marginBottom: 16 }}>
+          <Input
+            allowClear
+            placeholder="供应商"
+            value={usageFilters.provider}
+            onChange={(event) => updateUsageQuery('provider', event.target.value)}
+          />
+          <Input
+            allowClear
+            placeholder="模型"
+            value={usageFilters.model}
+            onChange={(event) => updateUsageQuery('model', event.target.value)}
+          />
+          <Input
+            allowClear
+            placeholder="用户 ID"
+            value={usageFilters.user_id}
+            onChange={(event) => updateUsageQuery('user_id', event.target.value)}
+          />
+          <Input
+            allowClear
+            placeholder="设备 ID"
+            value={usageFilters.device_id}
+            onChange={(event) => updateUsageQuery('device_id', event.target.value)}
+          />
+          <Input
+            allowClear
+            placeholder="请求 ID"
+            value={usageFilters.request_id}
+            onChange={(event) => updateUsageQuery('request_id', event.target.value)}
+          />
+          <Input
+            allowClear
+            placeholder="开始时间 RFC3339"
+            value={usageFilters.created_after}
+            onChange={(event) => updateUsageQuery('created_after', event.target.value)}
+          />
+          <Input
+            allowClear
+            placeholder="结束时间 RFC3339"
+            value={usageFilters.created_before}
+            onChange={(event) => updateUsageQuery('created_before', event.target.value)}
+          />
+          <Select
+            value={usageFilters.sort}
+            style={{ width: 160 }}
+            options={[
+              { label: '最新优先', value: 'created_at_desc' },
+              { label: '最早优先', value: 'created_at_asc' },
+            ]}
+            onChange={(value) => updateUsageQuery('sort', value)}
+          />
+        </Space>
         {usageQuery.isError ? (
           <Alert
             type="error"
@@ -388,7 +550,11 @@ export function ModelPoolPage() {
             pageSize: 20,
             total: usageQuery.data?.pagination.total ?? 0,
             showSizeChanger: false,
-            onChange: (page) => setUsagePage(page),
+            onChange: (page) => {
+              const next = new URLSearchParams(searchParams);
+              next.set('usage_page', String(page));
+              setSearchParams(next, { replace: true });
+            },
           }}
           locale={{ emptyText: usageQuery.isLoading ? '加载中...' : <Empty description="暂无调用摘要" /> }}
           columns={[
@@ -551,6 +717,59 @@ export function ModelPoolPage() {
           </Form.Item>
           <Form.Item label="并发上限" name="concurrency_limit" rules={[{ required: true, message: '请输入并发上限' }]}>
             <InputNumber min={1} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        title={`轮换模型密钥${rotatingAccount ? `：${rotatingAccount.provider} / ${rotatingAccount.model}` : ''}`}
+        open={rotateOpen}
+        confirmLoading={rotateModelAccountMutation.isPending}
+        onCancel={() => {
+          if (!rotateModelAccountMutation.isPending) {
+            setRotateOpen(false);
+            setRotatingAccount(null);
+            rotateForm.resetFields();
+          }
+        }}
+        onOk={() => {
+          void rotateForm.validateFields().then((values) => {
+            if (!rotatingAccount) {
+              return;
+            }
+            rotateModelAccountMutation.mutate({ accountId: rotatingAccount.id, values });
+          });
+        }}
+      >
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="新密钥会先做连通性校验"
+          description="校验成功后才切换服务端密钥；密钥只提交本次请求，成功后不会回显。"
+        />
+        <Form<RotateModelPoolAccountSecretRequest>
+          form={rotateForm}
+          layout="vertical"
+          initialValues={{ timeout_seconds: 15 }}
+        >
+          <Form.Item
+            label="新 API Key"
+            name="api_key"
+            rules={[
+              { required: true, message: '请输入新 API Key' },
+              { min: 8, message: 'API Key 至少 8 个字符' },
+              { max: 4096, message: 'API Key 不能超过 4096 个字符' },
+            ]}
+          >
+            <Input.Password placeholder="仅本次提交使用，不回显" autoComplete="new-password" />
+          </Form.Item>
+          <Form.Item
+            label="校验超时（秒）"
+            name="timeout_seconds"
+            rules={[{ required: true, message: '请输入校验超时时间' }]}
+          >
+            <InputNumber min={1} max={60} precision={0} style={{ width: '100%' }} />
           </Form.Item>
         </Form>
       </Modal>

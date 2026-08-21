@@ -87,6 +87,63 @@ func TestServerGracefulShutdown(t *testing.T) {
 	}
 }
 
+func TestServerGracefulShutdownWaitsForInFlightRequest(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	handler := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		close(requestStarted)
+		<-releaseRequest
+		response.WriteHeader(http.StatusOK)
+		_, _ = response.Write([]byte("ok"))
+	})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	server := &http.Server{Handler: handler}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve(listener) }()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	requestDone := make(chan error, 1)
+	go func() {
+		response, requestErr := client.Get("http://" + listener.Addr().String() + "/in-flight")
+		if response != nil {
+			response.Body.Close()
+		}
+		requestDone <- requestErr
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight request did not start")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- server.Shutdown(shutdownCtx) }()
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("server.Shutdown() returned before in-flight request completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseRequest)
+	if err := <-requestDone; err != nil {
+		t.Fatalf("in-flight request error = %v", err)
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatalf("server.Shutdown() error = %v", err)
+	}
+	if err := <-serveErr; err != http.ErrServerClosed {
+		t.Fatalf("Serve() error = %v, want %v", err, http.ErrServerClosed)
+	}
+	if response, err := client.Get("http://" + listener.Addr().String() + "/after-shutdown"); err == nil {
+		response.Body.Close()
+		t.Fatal("request after graceful shutdown unexpectedly succeeded")
+	}
+}
+
 func TestDefaultHTTPServerTimeoutsAreConfigured(t *testing.T) {
 	server := configureHTTPServer(&http.Server{})
 

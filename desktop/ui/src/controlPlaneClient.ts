@@ -1,72 +1,110 @@
 import { fetch } from '@tauri-apps/plugin-http';
+import type { components as OpenAPIComponents } from './api/openapi.generated';
 
-const DEFAULT_CONTROL_PLANE_BASE_URL = 'http://192.168.100.213:18090';
-const configuredControlPlaneBaseUrl = (
-  import.meta as ImportMeta & { env?: { VITE_CONTROL_PLANE_BASE_URL?: string } }
-).env?.VITE_CONTROL_PLANE_BASE_URL?.trim();
+type ViteEnvironment = { DEV?: boolean; VITE_CONTROL_PLANE_BASE_URL?: string };
+const viteEnvironment = (import.meta as ImportMeta & { env?: ViteEnvironment }).env;
+const configuredControlPlaneBaseUrl = viteEnvironment?.VITE_CONTROL_PLANE_BASE_URL?.trim();
+const developmentControlPlaneBaseUrl = 'http://127.0.0.1:18090';
 
-export const CONTROL_PLANE_BASE_URL = (
-  configuredControlPlaneBaseUrl || DEFAULT_CONTROL_PLANE_BASE_URL
-).replace(/\/+$/, '');
-export interface ErrorResponseDto { code: string; message: string; request_id: string }
-export interface UserSummaryDto { id: string; username: string; role: 'admin' | 'user'; status: 'active' | 'disabled'; created_at: string }
-export interface DeviceSummaryDto {
-  id: string; user_id: string; device_name: string; platform: string; app_version: string;
-  status: 'pending_activation' | 'active' | 'disabled' | 'revoked'; disk_free_bytes?: number;
-  memory_total_bytes?: number; memory_available_bytes?: number; cpu_logical_cores?: number;
-  runtime_os_name?: string; runtime_os_version?: string; kernel_version?: string; last_seen_at: string;
+function resolveControlPlaneBaseUrl() {
+  const candidate = configuredControlPlaneBaseUrl || (viteEnvironment?.DEV ? developmentControlPlaneBaseUrl : '');
+  if (!candidate) {
+    throw new Error('VITE_CONTROL_PLANE_BASE_URL must be set for production desktop builds');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error('VITE_CONTROL_PLANE_BASE_URL must be an absolute URL');
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error('VITE_CONTROL_PLANE_BASE_URL must not contain credentials, query, or hash');
+  }
+  if (!viteEnvironment?.DEV && parsed.protocol !== 'https:') {
+    throw new Error('VITE_CONTROL_PLANE_BASE_URL must use HTTPS for production desktop builds');
+  }
+  if (viteEnvironment?.DEV && parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('VITE_CONTROL_PLANE_BASE_URL must use HTTP or HTTPS');
+  }
+  return parsed.toString().replace(/\/+$/, '');
 }
-export interface LoginRequestDto { username: string; password: string }
-export interface LoginResponseDto { request_id: string; tokens: { access_token: string; refresh_token: string; expires_at: string }; user: UserSummaryDto }
-export interface RefreshTokenResponseDto { request_id: string; tokens: LoginResponseDto['tokens'] }
-export interface LogoutResponseDto { request_id: string; success: true }
-export interface DeviceRegistrationDto { device_id: string; device_name: string; platform: string; app_version: string; os_version?: string }
-export interface ActivateDeviceRequestDto { activation_code: string; device: DeviceRegistrationDto }
-export interface ActivateDeviceResponseDto { request_id: string; device: DeviceSummaryDto }
-export interface ClientProfileResponseDto { request_id: string; user: UserSummaryDto; device: DeviceSummaryDto; permissions: string[] }
-export interface HeartbeatRequestDto {
-  device_id: string; sent_at: string;
-  status: { disk_free_bytes: number; memory_total_bytes?: number; memory_available_bytes?: number; cpu_logical_cores?: number; os_name?: string; os_version?: string; kernel_version?: string; current_media_name?: string; playback_state?: 'idle' | 'playing' | 'paused' | 'error' }
-}
-export interface HeartbeatResponseDto { request_id: string; accepted_at: string; device_status: DeviceSummaryDto['status'] }
-export interface CreateModelLeaseRequestDto { provider: string; model: string; purpose: string; max_duration_seconds: number }
-export interface ModelLeaseDto { id: string; provider: string; model: string; status: 'active' | 'released' | 'expired'; expires_at: string; proxy_mode: 'direct_lease'; direct_base_url?: string; concurrency_limit: number }
-export interface ModelLeaseResponseDto { request_id: string; lease: ModelLeaseDto }
-export interface ReleaseModelLeaseResponseDto { request_id: string; lease_id: string; released: boolean }
-export interface DirectLLMCallRecordRequestDto { client_call_id: string; lease_id: string; provider: string; model: string; input_tokens: number; output_tokens: number; total_tokens: number; latency_ms: number; status: 'succeeded' | 'failed' | 'timeout' | 'cancelled' | 'unknown'; usage_source: 'client_reported'; error_code?: string }
-export interface DirectLLMCallRecordResponseDto { request_id: string; recorded: boolean }
+
+export const CONTROL_PLANE_BASE_URL = resolveControlPlaneBaseUrl();
+type OpenAPISchemas = OpenAPIComponents['schemas'];
+export type ApiErrorDetailDto = OpenAPISchemas['ErrorDetail'];
+export type ErrorResponseDto = OpenAPISchemas['ErrorResponse'];
+export type UserSummaryDto = OpenAPISchemas['UserSummary'];
+export type DeviceSummaryDto = OpenAPISchemas['DeviceSummary'];
+export type LoginRequestDto = OpenAPISchemas['LoginRequest'];
+export type LoginResponseDto = OpenAPISchemas['LoginResponse'];
+export type RefreshTokenResponseDto = OpenAPISchemas['RefreshTokenResponse'];
+export type LogoutRequestDto = OpenAPISchemas['LogoutRequest'];
+export type LogoutResponseDto = OpenAPISchemas['LogoutResponse'];
+export type DeviceRegistrationDto = OpenAPISchemas['DeviceRegistration'];
+export type ActivateDeviceRequestDto = OpenAPISchemas['ActivateDeviceRequest'];
+export type ActivateDeviceResponseDto = OpenAPISchemas['ActivateDeviceResponse'];
+export type ClientProfileResponseDto = OpenAPISchemas['ClientProfileResponse'];
+export type HeartbeatRequestDto = OpenAPISchemas['HeartbeatRequest'];
+export type HeartbeatResponseDto = OpenAPISchemas['HeartbeatResponse'];
+export type CreateModelLeaseRequestDto = OpenAPISchemas['CreateModelLeaseRequest'];
+export type ModelLeaseDto = OpenAPISchemas['ModelLease'];
+export type ModelLeaseResponseDto = OpenAPISchemas['ModelLeaseResponse'];
+export type ReleaseModelLeaseResponseDto = OpenAPISchemas['ReleaseModelLeaseResponse'];
+export type DirectLLMCallRecordRequestDto = OpenAPISchemas['DirectLLMCallRecordRequest'];
+export type DirectLLMCallRecordResponseDto = OpenAPISchemas['DirectLLMCallRecordResponse'];
 
 export class ControlPlaneError extends Error {
-  code: string; status: number; requestId?: string;
-  constructor(input: { code: string; message: string; status: number; requestId?: string }) { super(input.message); this.name = 'ControlPlaneError'; this.code = input.code; this.status = input.status; this.requestId = input.requestId }
+  code: string; status: number; requestId?: string; details?: ApiErrorDetailDto[];
+  constructor(input: { code: string; message: string; status: number; requestId?: string; details?: ApiErrorDetailDto[] }) {
+    super(input.message);
+    this.name = 'ControlPlaneError';
+    this.code = input.code;
+    this.status = input.status;
+    this.requestId = input.requestId;
+    this.details = input.details;
+  }
 }
 async function parseJsonSafely(response: Response): Promise<unknown> { const text = await response.text(); if (!text) return null; try { return JSON.parse(text) as unknown } catch { return text } }
+function createRequestId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null; }
 type SessionRefreshHandler = () => Promise<string | null>;
 let sessionRefreshHandler: SessionRefreshHandler | null = null;
 let sessionRefreshInFlight: Promise<string | null> | null = null;
 export function setSessionRefreshHandler(handler: SessionRefreshHandler | null) { sessionRefreshHandler = handler }
 async function refreshExpiredSession(): Promise<string | null> { if (sessionRefreshInFlight) return sessionRefreshInFlight; if (!sessionRefreshHandler) return null; sessionRefreshInFlight = sessionRefreshHandler().finally(() => { sessionRefreshInFlight = null }); return sessionRefreshInFlight }
 
-async function requestJson<T>(path: string, init: { method: 'GET' | 'POST'; body?: unknown; accessToken?: string; idempotencyKey?: string; timeoutMs?: number }, allowAuthRefresh = true): Promise<T> {
-  const headers = new Headers({ Accept: 'application/json' });
+async function requestJson<T>(path: string, init: { method: 'GET' | 'POST'; body?: unknown; accessToken?: string; idempotencyKey?: string; timeoutMs?: number; requestId?: string }, allowAuthRefresh = true, allowAuditRetry = true): Promise<T> {
+  const requestId = init.requestId ?? createRequestId();
+  const headers = new Headers({ Accept: 'application/json', 'X-Request-Id': requestId });
   if (init.body !== undefined) headers.set('Content-Type', 'application/json');
   if (init.accessToken) headers.set('Authorization', `Bearer ${init.accessToken}`);
   if (init.idempotencyKey) headers.set('Idempotency-Key', init.idempotencyKey);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), init.timeoutMs ?? 15_000);
   let response: Response;
-  try { response = await fetch(`${CONTROL_PLANE_BASE_URL}${path}`, { method: init.method, headers, body: init.body === undefined ? undefined : JSON.stringify(init.body), connectTimeout: 5_000, signal: controller.signal }) }
-  catch (error) { if (controller.signal.aborted) throw new ControlPlaneError({ code: 'CONTROL_PLANE_TIMEOUT', message: '控制面请求超时', status: 408 }); throw error }
+  try {
+    response = await fetch(`${CONTROL_PLANE_BASE_URL}${path}`, { method: init.method, headers, body: init.body === undefined ? undefined : JSON.stringify(init.body), connectTimeout: 5_000, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) throw new ControlPlaneError({ code: 'CONTROL_PLANE_TIMEOUT', message: '控制面请求超时', status: 408, requestId });
+    if (error instanceof ControlPlaneError) throw error;
+    throw new ControlPlaneError({ code: 'NETWORK_ERROR', message: '网络异常，暂时无法连接到控制面', status: 0, requestId });
+  }
   finally { clearTimeout(timeout) }
   const payload = await parseJsonSafely(response);
   if (!response.ok) {
+    if (response.status === 503 && allowAuditRetry && init.method !== 'GET' && init.idempotencyKey && isRecord(payload) && payload.code === 'AUDIT_UNAVAILABLE') {
+      return requestJson<T>(path, init, allowAuthRefresh, false);
+    }
     if (response.status === 401 && allowAuthRefresh && init.accessToken && !path.startsWith('/api/v1/auth/')) { const refreshed = await refreshExpiredSession(); if (refreshed && refreshed !== init.accessToken) return requestJson<T>(path, { ...init, accessToken: refreshed }, false) }
-    if (payload && typeof payload === 'object' && 'code' in payload && 'message' in payload) { const errorPayload = payload as ErrorResponseDto; throw new ControlPlaneError({ code: errorPayload.code, message: errorPayload.message, requestId: errorPayload.request_id, status: response.status }) }
-    throw new ControlPlaneError({ code: 'http_error', message: `${response.status} ${response.statusText}`.trim(), status: response.status })
+    if (isRecord(payload) && typeof payload.code === 'string' && typeof payload.message === 'string') { const errorPayload = payload as unknown as ErrorResponseDto; throw new ControlPlaneError({ code: errorPayload.code, message: errorPayload.message, requestId: errorPayload.request_id ?? requestId, details: errorPayload.details, status: response.status }) }
+    throw new ControlPlaneError({ code: 'HTTP_ERROR', message: `${response.status} ${response.statusText}`.trim(), status: response.status, requestId })
   }
   return payload as T;
 }
-export function buildIdempotencyKey(): string { return crypto.randomUUID() }
+export function buildIdempotencyKey(): string { return createRequestId() }
 export function loginControlPlane(request: LoginRequestDto) { return requestJson<LoginResponseDto>('/api/v1/auth/login', { method: 'POST', body: request }) }
 export function refreshControlPlane(refreshToken: string) { return requestJson<RefreshTokenResponseDto>('/api/v1/auth/refresh', { method: 'POST', body: { refresh_token: refreshToken } }, false) }
 export function logoutControlPlane(accessToken: string, refreshToken?: string) { return requestJson<LogoutResponseDto>('/api/v1/auth/logout', { method: 'POST', body: refreshToken ? { refresh_token: refreshToken } : undefined, accessToken }, false) }

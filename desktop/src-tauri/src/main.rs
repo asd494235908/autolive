@@ -166,7 +166,8 @@ mod tests {
             .expect("capabilities/default.json should exist");
 
         assert!(config.contains("\"identifier\": \"http:default\""));
-        assert!(config.contains("http://192.168.100.213:18090/**"));
+        assert!(config.contains("http://127.0.0.1:18090/**"));
+        assert!(config.contains("https://admin.example.com/**"));
         assert!(!config.contains("http://127.0.0.1:8080/**"));
         assert!(!config.contains("http://localhost:8080/**"));
         assert!(config.contains("\"final-effect\""));

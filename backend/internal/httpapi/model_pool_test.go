@@ -62,6 +62,14 @@ func TestAdminModelPoolCreateAndListEndpointsRedactSecret(t *testing.T) {
 	if listAccount["secret_configured"] != true {
 		t.Fatalf("secret_configured = %v, want true", listAccount["secret_configured"])
 	}
+	pagination := listPayload["pagination"].(map[string]any)
+	if pagination["page"].(float64) != 1 || pagination["page_size"].(float64) != 20 || pagination["total"].(float64) != 1 {
+		t.Fatalf("model pool pagination = %v", pagination)
+	}
+	invalidPageRec := doJSON(t, handler, http.MethodGet, "/api/v1/admin/model-pool?page_size=201", nil, token, "")
+	if invalidPageRec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid model pool page status = %d, want %d, body=%s", invalidPageRec.Code, http.StatusBadRequest, invalidPageRec.Body.String())
+	}
 }
 
 func TestAdminModelPoolConnectivityTestEndpoint(t *testing.T) {
@@ -184,7 +192,7 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 	}, token, "idem-model-account-2")
 
 	codeRec := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
-		"expires_at":  "2026-08-14T11:00:00Z",
+		"expires_at":  testActivationExpiresAt(),
 		"max_devices": 1,
 	}, token, "idem-model-lease-code")
 	var codePayload map[string]any
@@ -221,6 +229,36 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 		t.Fatalf("proxy_mode = %v, want direct_lease", lease["proxy_mode"])
 	}
 	leaseID := lease["id"].(string)
+	adminLeasesRec := doJSON(t, handler, http.MethodGet, "/api/v1/admin/model-leases?page_size=10", nil, token, "")
+	if adminLeasesRec.Code != http.StatusOK {
+		t.Fatalf("admin lease list status = %d, want %d, body=%s", adminLeasesRec.Code, http.StatusOK, adminLeasesRec.Body.String())
+	}
+	var adminLeasesPayload map[string]any
+	decodeJSON(t, adminLeasesRec.Body.Bytes(), &adminLeasesPayload)
+	adminLeases := adminLeasesPayload["items"].([]any)
+	if len(adminLeases) != 1 {
+		t.Fatalf("admin lease list = %v", adminLeasesPayload)
+	}
+	adminLease := adminLeases[0].(map[string]any)
+	if adminLease["id"] != leaseID || adminLease["user_id"] == nil || adminLease["device_id"] == nil || adminLease["account_id"] == nil {
+		t.Fatalf("admin lease summary = %v", adminLease)
+	}
+	if _, leaked := adminLease["direct_base_url"]; leaked {
+		t.Fatalf("admin lease response leaked direct base URL: %v", adminLease)
+	}
+	filteredLeasesRec := doJSON(t, handler, http.MethodGet, "/api/v1/admin/model-leases?status=active&provider=openai-compatible&sort=provider_model&page_size=10", nil, token, "")
+	if filteredLeasesRec.Code != http.StatusOK {
+		t.Fatalf("filtered admin lease list status = %d, want %d, body=%s", filteredLeasesRec.Code, http.StatusOK, filteredLeasesRec.Body.String())
+	}
+	var filteredLeasesPayload map[string]any
+	decodeJSON(t, filteredLeasesRec.Body.Bytes(), &filteredLeasesPayload)
+	if filteredLeasesPayload["pagination"].(map[string]any)["total"].(float64) != 1 || len(filteredLeasesPayload["items"].([]any)) != 1 {
+		t.Fatalf("filtered admin lease list = %v", filteredLeasesPayload)
+	}
+	invalidFilterRec := doJSON(t, handler, http.MethodGet, "/api/v1/admin/model-leases?status=unsupported", nil, token, "")
+	if invalidFilterRec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid admin lease filter status = %d, want %d, body=%s", invalidFilterRec.Code, http.StatusBadRequest, invalidFilterRec.Body.String())
+	}
 	callRec := doJSON(t, handler, http.MethodPost, "/api/v1/client/llm/call-records", map[string]any{
 		"client_call_id": "call_http01",
 		"lease_id":       leaseID,
@@ -248,6 +286,19 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 	decodeJSON(t, usageRec.Body.Bytes(), &usagePayload)
 	if len(usagePayload["items"].([]any)) != 1 {
 		t.Fatalf("usage payload = %v", usagePayload)
+	}
+	filteredUsageRec := doJSON(t, handler, http.MethodGet, "/api/v1/admin/model-usage?page_size=10&provider=openai-compatible&model=rewrite-model&user_id=usr_local_admin&sort=created_at_asc", nil, token, "")
+	if filteredUsageRec.Code != http.StatusOK {
+		t.Fatalf("filtered usage list status = %d, want %d, body=%s", filteredUsageRec.Code, http.StatusOK, filteredUsageRec.Body.String())
+	}
+	var filteredUsagePayload map[string]any
+	decodeJSON(t, filteredUsageRec.Body.Bytes(), &filteredUsagePayload)
+	if filteredUsagePayload["pagination"].(map[string]any)["total"].(float64) != 1 || len(filteredUsagePayload["items"].([]any)) != 1 {
+		t.Fatalf("filtered usage payload = %v", filteredUsagePayload)
+	}
+	invalidUsageFilterRec := doJSON(t, handler, http.MethodGet, "/api/v1/admin/model-usage?sort=created_at%20desc", nil, token, "")
+	if invalidUsageFilterRec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid usage filter status = %d, want %d, body=%s", invalidUsageFilterRec.Code, http.StatusBadRequest, invalidUsageFilterRec.Body.String())
 	}
 
 	leaseRecRepeat := doJSON(t, handler, http.MethodPost, "/api/v1/client/model-leases", map[string]any{
@@ -331,5 +382,44 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 	decodeJSON(t, conflictCreate.Body.Bytes(), &conflictPayload)
 	if conflictPayload["code"] != "IDEMPOTENCY_CONFLICT" {
 		t.Fatalf("unexpected conflict code: %v", conflictPayload)
+	}
+
+	thirdLeaseRec := doJSON(t, handler, http.MethodPost, "/api/v1/client/model-leases", map[string]any{
+		"provider": "openai-compatible",
+		"model":    "rewrite-model",
+		"purpose":  "realtime_script",
+	}, token, "idem-model-lease-create-third")
+	if thirdLeaseRec.Code != http.StatusOK {
+		t.Fatalf("third lease create status = %d, want %d, body=%s", thirdLeaseRec.Code, http.StatusOK, thirdLeaseRec.Body.String())
+	}
+	var thirdLeasePayload map[string]any
+	decodeJSON(t, thirdLeaseRec.Body.Bytes(), &thirdLeasePayload)
+	thirdLeaseID := thirdLeasePayload["lease"].(map[string]any)["id"].(string)
+	detailRec := doJSON(t, handler, http.MethodGet, "/api/v1/admin/model-leases/"+thirdLeaseID, nil, token, "")
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("admin lease detail status = %d, want %d, body=%s", detailRec.Code, http.StatusOK, detailRec.Body.String())
+	}
+	var detailPayload map[string]any
+	decodeJSON(t, detailRec.Body.Bytes(), &detailPayload)
+	detailLease := detailPayload["lease"].(map[string]any)
+	if detailLease["id"] != thirdLeaseID || detailLease["created_at"] == nil {
+		t.Fatalf("admin lease detail = %v", detailPayload)
+	}
+	if _, leaked := detailLease["direct_base_url"]; leaked {
+		t.Fatalf("admin lease detail leaked direct base URL: %v", detailLease)
+	}
+	reclaimRec := doJSON(t, handler, http.MethodPost, "/api/v1/admin/model-leases/"+thirdLeaseID+"/reclaim", map[string]any{"reason": "admin cleanup"}, token, "idem-admin-reclaim-lease")
+	if reclaimRec.Code != http.StatusOK {
+		t.Fatalf("admin lease reclaim status = %d, want %d, body=%s", reclaimRec.Code, http.StatusOK, reclaimRec.Body.String())
+	}
+	reclaimRepeatRec := doJSON(t, handler, http.MethodPost, "/api/v1/admin/model-leases/"+thirdLeaseID+"/reclaim", map[string]any{"reason": "admin cleanup"}, token, "idem-admin-reclaim-lease")
+	if reclaimRepeatRec.Code != http.StatusOK {
+		t.Fatalf("admin lease reclaim repeat status = %d, want %d, body=%s", reclaimRepeatRec.Code, http.StatusOK, reclaimRepeatRec.Body.String())
+	}
+	detailAfterRec := doJSON(t, handler, http.MethodGet, "/api/v1/admin/model-leases/"+thirdLeaseID, nil, token, "")
+	var detailAfterPayload map[string]any
+	decodeJSON(t, detailAfterRec.Body.Bytes(), &detailAfterPayload)
+	if detailAfterPayload["lease"].(map[string]any)["status"] != "released" {
+		t.Fatalf("admin lease detail after reclaim = %v", detailAfterPayload)
 	}
 }

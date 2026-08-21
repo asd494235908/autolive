@@ -12,7 +12,9 @@ import { UserManagementPage } from '../features/users/UserManagementPage';
 import { DeviceManagementPage } from '../features/devices/DeviceManagementPage';
 import { ActivationCodesPage } from '../features/activation-codes/ActivationCodesPage';
 import { ModelPoolPage } from '../features/model-pool/ModelPoolPage';
+import { ModelLeasesPage } from '../features/model-leases/ModelLeasesPage';
 import { AuditLogsPage } from '../features/audit-logs/AuditLogsPage';
+import { AdminSecurityPage } from '../features/security/AdminSecurityPage';
 import { readSession } from '../features/auth/session';
 
 type NavItem = {
@@ -27,7 +29,9 @@ export const navItems: NavItem[] = [
   { key: 'devices', label: '设备管理', path: '/devices' },
   { key: 'activation-codes', label: '激活码', path: '/activation-codes' },
   { key: 'model-pools', label: '号池管理', path: '/model-pools' },
-  { key: 'audit-logs', label: '审计日志', path: '/audit-logs' }
+  { key: 'model-leases', label: '模型租约', path: '/model-leases' },
+  { key: 'audit-logs', label: '审计日志', path: '/audit-logs' },
+  { key: 'security', label: '管理员安全', path: '/security' }
 ];
 
 function PlaceholderPage({ title, description }: { title: string; description: string }) {
@@ -104,8 +108,16 @@ export const router = createBrowserRouter([
         element: <ModelPoolPage />
       },
       {
+        path: 'model-leases',
+        element: <ModelLeasesPage />
+      },
+      {
         path: 'audit-logs',
         element: <AuditLogsPage />
+      },
+      {
+        path: 'security',
+        element: <AdminSecurityPage />
       },
       {
         path: '404',

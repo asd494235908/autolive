@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"autoLive/backend/internal/service"
@@ -18,8 +19,9 @@ type contextKey string
 const requestIDKey contextKey = "request_id"
 
 type AuthConfig struct {
-	Username string
-	Password string
+	Username          string
+	Password          string
+	UsePersistedAdmin bool
 }
 
 func NewRouter(serviceVersion string, logger *slog.Logger) http.Handler {
@@ -39,23 +41,50 @@ func NewRouterWithRepositoryAndSecretStore(serviceVersion string, logger *slog.L
 }
 
 func NewRouterWithRepositoryAndSecretStoreAndSessionStore(serviceVersion string, logger *slog.Logger, authConfig AuthConfig, repository store.Repository, secretStore store.SecretStore, sessionStore store.SessionStore) http.Handler {
+	return NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions(serviceVersion, logger, authConfig, repository, secretStore, sessionStore, false)
+}
+
+func NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions(serviceVersion string, logger *slog.Logger, authConfig AuthConfig, repository store.Repository, secretStore store.SecretStore, sessionStore store.SessionStore, allowInsecureHTTP bool) http.Handler {
+	return NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTelemetry(serviceVersion, logger, authConfig, repository, secretStore, sessionStore, allowInsecureHTTP, nil, nil)
+}
+
+// NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTelemetry
+// keeps the existing router constructor stable while allowing the server to
+// share one bounded health telemetry collector with its background scheduler.
+func NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTelemetry(serviceVersion string, logger *slog.Logger, authConfig AuthConfig, repository store.Repository, secretStore store.SecretStore, sessionStore store.SessionStore, allowInsecureHTTP bool, healthTelemetry service.ModelPoolHealthProbeTelemetry, retentionTelemetry service.RetentionCleanupTelemetry) http.Handler {
+	handler, _ := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTelemetryAndRetentionCleaner(serviceVersion, logger, authConfig, repository, secretStore, sessionStore, allowInsecureHTTP, healthTelemetry, retentionTelemetry)
+	return handler
+}
+
+// NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTelemetryAndRetentionCleaner
+// also returns the authenticator's session cleaner so the server can clean
+// memory-mode sessions with the same owned retention scheduler.
+func NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTelemetryAndRetentionCleaner(serviceVersion string, logger *slog.Logger, authConfig AuthConfig, repository store.Repository, secretStore store.SecretStore, sessionStore store.SessionStore, allowInsecureHTTP bool, healthTelemetry service.ModelPoolHealthProbeTelemetry, retentionTelemetry service.RetentionCleanupTelemetry) (http.Handler, store.AuthSessionRetentionCleaner) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	controlPlane := service.NewControlPlaneWithRepositoryAndSecretStore(repository, nil, secretStore)
-	controlPlane.EnsureLocalAdmin(authConfig.Username)
+	controlPlane := service.NewControlPlaneWithRepositoryAndSecretStoreAndOptions(repository, nil, secretStore, service.ControlPlaneOptions{AllowInsecureHTTP: allowInsecureHTTP})
 	authenticator := newAuthenticator(controlPlane, authConfig, sessionStore)
+	metrics := newHTTPMetricsWithTelemetry(repository, healthTelemetry, retentionTelemetry)
 
 	mux := http.NewServeMux()
 	registerAuthRoutes(mux, authenticator)
 	registerControlPlaneRoutes(mux, controlPlane, authenticator)
 	mux.Handle("/api/v1/health", healthHandler(serviceVersion))
+	mux.Handle("/api/v1/livez", healthHandler(serviceVersion))
+	mux.Handle("/api/v1/readyz", readinessHandler(serviceVersion, func(ctx context.Context) error {
+		if authenticator.initErr != nil {
+			return authenticator.initErr
+		}
+		return controlPlane.CheckReady(ctx)
+	}))
+	mux.Handle("/metrics", metrics.handler())
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "请求的资源不存在")
 	}))
 
-	return requestIDMiddleware(loggingMiddleware(logger, auditMiddleware(controlPlane, mux)))
+	return requestIDMiddleware(loggingMiddleware(logger, auditMiddlewareWithOptions(controlPlane, logger, metrics, metrics.middleware(rateLimitMiddlewareWithMetrics(newRequestRateLimiter(time.Now), metrics, mux))))), authenticator
 }
 
 func RequestIDFromContext(ctx context.Context) string {
@@ -65,11 +94,28 @@ func RequestIDFromContext(ctx context.Context) string {
 
 func requestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestID := newRequestID()
+		requestID := validatedRequestID(r.Header.Get("X-Request-Id"))
+		if requestID == "" {
+			requestID = newRequestID()
+		}
 		ctx := context.WithValue(r.Context(), requestIDKey, requestID)
 		w.Header().Set("X-Request-Id", requestID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func validatedRequestID(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) < 8 || len(value) > 128 {
+		return ""
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_' {
+			continue
+		}
+		return ""
+	}
+	return value
 }
 
 func loggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {

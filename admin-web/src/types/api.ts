@@ -1,18 +1,13 @@
-export type Id = string;
-export type Timestamp = string;
+import type { components as OpenAPIComponents } from '../api/openapi.generated';
+
+type OpenAPISchemas = OpenAPIComponents['schemas'];
+
+export type Id = OpenAPISchemas['Id'];
+export type Timestamp = OpenAPISchemas['Timestamp'];
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
-export type ApiErrorDetail = {
-  field: string;
-  reason: string;
-};
-
-export type ApiErrorResponse = {
-  code: string;
-  message: string;
-  request_id: string;
-  details?: ApiErrorDetail[];
-};
+export type ApiErrorDetail = OpenAPISchemas['ErrorDetail'];
+export type ApiErrorResponse = OpenAPISchemas['ErrorResponse'];
 
 export type ApiRequestOptions = {
   method?: HttpMethod;
@@ -24,224 +19,62 @@ export type ApiRequestOptions = {
   signal?: AbortSignal;
 };
 
-export type ActorRole = 'admin' | 'user';
-export type UserStatus = 'active' | 'disabled';
-export type DeviceStatus = 'pending_activation' | 'active' | 'disabled' | 'revoked';
-export type ActivationCodeStatus = 'active' | 'used' | 'expired' | 'revoked';
-export type ModelAccountStatus = 'active' | 'cooldown' | 'exhausted' | 'disabled';
+export type ActorRole = OpenAPISchemas['ActorRole'];
+export type UserStatus = OpenAPISchemas['UserStatus'];
+export type DeviceStatus = OpenAPISchemas['DeviceStatus'];
+export type ActivationCodeStatus = OpenAPISchemas['ActivationCodeStatus'];
+export type ModelAccountStatus = OpenAPISchemas['ModelAccountStatus'];
+export type ModelLeaseStatus = OpenAPISchemas['ModelLeaseStatus'];
 
-export type Pagination = {
-  page: number;
-  page_size: number;
-  total: number;
-};
+export type SessionTokens = OpenAPISchemas['SessionTokens'];
+export type UserSummary = OpenAPISchemas['UserSummary'];
+export type UserAuthorizationSummary = OpenAPISchemas['UserAuthorizationSummary'];
+export type UserAuthorizationPolicy = OpenAPISchemas['UserAuthorizationPolicy'];
+export type DeviceSummary = OpenAPISchemas['DeviceSummary'];
+export type ActivationCode = OpenAPISchemas['ActivationCode'];
+export type ModelPoolAccountSummary = OpenAPISchemas['ModelPoolAccountSummary'];
+export type AuditLog = OpenAPISchemas['AuditLog'];
 
-export type SessionTokens = {
-  access_token: string;
-  refresh_token: string;
-  expires_at: Timestamp;
-};
+export type Pagination = OpenAPISchemas['Pagination'];
+export type UserListResponse = OpenAPISchemas['UserListResponse'];
+export type UserEnvelope = OpenAPISchemas['UserEnvelope'];
+export type UserAuthorizationSummaryResponse = OpenAPISchemas['UserAuthorizationSummaryResponse'];
+export type UserAuthorizationPolicyResponse = OpenAPISchemas['UserAuthorizationPolicyResponse'];
+export type DeviceListResponse = OpenAPISchemas['DeviceListResponse'];
+export type DeviceEnvelope = OpenAPISchemas['DeviceEnvelope'];
+export type UnbindDeviceResponse = OpenAPISchemas['UnbindDeviceResponse'];
+export type ActivationCodeListResponse = OpenAPISchemas['ActivationCodeListResponse'];
+export type ActivationCodeEnvelope = OpenAPISchemas['ActivationCodeEnvelope'];
+export type ModelPoolResponse = OpenAPISchemas['ModelPoolResponse'];
+export type ModelPoolAccountEnvelope = OpenAPISchemas['ModelPoolAccountEnvelope'];
+export type ModelUsageRecord = OpenAPISchemas['ModelUsageRecord'];
+export type ModelUsageListResponse = OpenAPISchemas['ModelUsageListResponse'];
+export type AuditLogListResponse = OpenAPISchemas['AuditLogListResponse'];
+export type HealthResponse = OpenAPISchemas['HealthResponse'];
 
-export type UserSummary = {
-  id: Id;
-  username: string;
-  role: ActorRole;
-  status: UserStatus;
-  created_at: Timestamp;
-};
-
-export type DeviceSummary = {
-  id: Id;
-  user_id: Id;
-  device_name: string;
-  platform: string;
-  app_version: string;
-  status: DeviceStatus;
-  disk_free_bytes?: number;
-  memory_total_bytes?: number;
-  memory_available_bytes?: number;
-  cpu_logical_cores?: number;
-  runtime_os_name?: string;
-  runtime_os_version?: string;
-  kernel_version?: string;
-  last_seen_at: Timestamp;
-};
-
-export type ActivationCode = {
-  id: Id;
-  status: ActivationCodeStatus;
-  expires_at: Timestamp;
-  max_devices: number;
-  plain_code?: string | null;
-};
-
-
-export type ModelPoolAccountSummary = {
-  id: Id;
-  provider: string;
-  model: string;
-  base_url?: string;
-  status: ModelAccountStatus;
-  priority?: number;
-  daily_limit?: number;
-  concurrency_limit?: number;
-  secret_configured: boolean;
-  active_leases: number;
-  daily_used_tokens: number;
-  last_test_status?: 'succeeded' | 'failed' | 'timeout';
-  last_tested_at?: Timestamp;
-};
-
-export type AuditLog = {
-  id: Id;
-  actor_user_id?: string | null;
-  device_id?: string | null;
-  action: string;
-  target_type: string;
-  target_id?: string | null;
-  request_id?: string | null;
-  created_at: Timestamp;
-};
-
-export type LoginRequest = {
-  username: string;
-  password: string;
-};
-
-export type LoginResponse = {
-  request_id: string;
-  tokens: SessionTokens;
-  user: UserSummary;
-};
-
-export type RefreshTokenResponse = {
-  request_id: string;
-  tokens: SessionTokens;
-};
-
-export type LogoutResponse = {
-  request_id: string;
-  success: true;
-};
-
-export type HealthResponse = {
-  request_id: string;
-  status: 'ok' | 'degraded';
-  service: string;
-  version: string;
-  now: Timestamp;
-};
-
-export type UserListResponse = {
-  request_id: string;
-  items: UserSummary[];
-  pagination: Pagination;
-};
-
-export type UserEnvelope = {
-  request_id: string;
-  user: UserSummary;
-};
-
-export type CreateUserRequest = {
-  username: string;
-  password: string;
-  role: ActorRole;
-};
-
-export type DeviceListResponse = {
-  request_id: string;
-  items: DeviceSummary[];
-  pagination: Pagination;
-};
-
-export type DeviceEnvelope = {
-  request_id: string;
-  device: DeviceSummary;
-};
-
-export type ActivationCodeListResponse = {
-  request_id: string;
-  items: ActivationCode[];
-  pagination: Pagination;
-};
-
-export type CreateActivationCodeRequest = {
-  expires_at: Timestamp;
-  max_devices: 1;
-};
-
-export type ActivationCodeEnvelope = {
-  request_id: string;
-  activation_code: ActivationCode;
-};
-
-export type ModelPoolResponse = {
-  request_id: string;
-  accounts: ModelPoolAccountSummary[];
-};
-
-export type CreateModelPoolAccountRequest = {
-  provider: string;
-  model: string;
-  base_url: string;
-  api_key: string;
-  priority: number;
-  daily_limit: number;
-  concurrency_limit: number;
-};
-
-export type UpdateModelPoolAccountRequest = {
-  base_url?: string;
-  priority?: number;
-  daily_limit?: number;
-  concurrency_limit?: number;
-  status?: ModelAccountStatus;
-};
-
-export type ModelPoolAccountEnvelope = {
-  request_id: string;
-  account: ModelPoolAccountSummary;
-};
-
-export type ModelPoolConnectivityTestResponse = {
-  request_id: string;
-  account_id: Id;
-  provider: string;
-  model: string;
-  status: 'succeeded' | 'failed' | 'timeout';
-  tested_at: Timestamp;
-  latency_ms: number;
-  http_status?: number;
-  response_summary?: string;
-  error_code?: string;
-};
-
-export type ModelUsageRecord = {
-  id: Id;
-  lease_id: Id;
-  request_id: Id;
-  client_call_id: Id;
-  provider: string;
-  model: string;
-  input_tokens: number;
-  output_tokens: number;
-  total_tokens: number;
-  latency_ms: number;
-  status: 'succeeded' | 'failed' | 'timeout' | 'cancelled' | 'unknown';
-  usage_source: 'client_reported';
-  error_code?: string;
-  created_at: Timestamp;
-};
-
-export type ModelUsageListResponse = {
-  request_id: string;
-  items: ModelUsageRecord[];
-  pagination: Pagination;
-};
-
-export type AuditLogListResponse = {
-  request_id: string;
-  items: AuditLog[];
-  pagination: Pagination;
-};
+export type LoginRequest = OpenAPISchemas['LoginRequest'];
+export type LoginResponse = OpenAPISchemas['LoginResponse'];
+export type RefreshTokenResponse = OpenAPISchemas['RefreshTokenResponse'];
+export type LogoutResponse = OpenAPISchemas['LogoutResponse'];
+export type CreateUserRequest = OpenAPISchemas['CreateUserRequest'];
+export type UpdateUserRequest = OpenAPISchemas['UpdateUserRequest'];
+export type ResetUserPasswordRequest = OpenAPISchemas['ResetUserPasswordRequest'];
+export type ChangeLocalAdminPasswordRequest = OpenAPISchemas['ChangeLocalAdminPasswordRequest'];
+export type UpdateUserAuthorizationRequest = OpenAPISchemas['UpdateUserAuthorizationRequest'];
+export type CreateActivationCodeRequest = OpenAPISchemas['CreateActivationCodeRequest'];
+export type CreateModelPoolAccountRequest = OpenAPISchemas['CreateModelPoolAccountRequest'];
+export type UpdateModelPoolAccountRequest = OpenAPISchemas['UpdateModelPoolAccountRequest'];
+export type TestModelPoolAccountRequest = OpenAPISchemas['TestModelPoolAccountRequest'];
+export type RotateModelPoolAccountSecretRequest = OpenAPISchemas['RotateModelPoolAccountSecretRequest'];
+export type ModelPoolConnectivityTestResponse = OpenAPISchemas['ModelPoolConnectivityTestResponse'];
+export type CreateModelLeaseRequest = OpenAPISchemas['CreateModelLeaseRequest'];
+export type RenewModelLeaseRequest = OpenAPISchemas['RenewModelLeaseRequest'];
+export type ReleaseModelLeaseRequest = OpenAPISchemas['ReleaseModelLeaseRequest'];
+export type ModelLeaseResponse = OpenAPISchemas['ModelLeaseResponse'];
+export type ModelLeaseAdminSummary = OpenAPISchemas['ModelLeaseAdminSummary'];
+export type ModelLeaseListResponse = OpenAPISchemas['ModelLeaseListResponse'];
+export type ModelLeaseAdminDetail = OpenAPISchemas['ModelLeaseAdminDetail'];
+export type ModelLeaseAdminDetailResponse = OpenAPISchemas['ModelLeaseAdminDetailResponse'];
+export type ReleaseModelLeaseResponse = OpenAPISchemas['ReleaseModelLeaseResponse'];
+export type DirectLLMCallRecordRequest = OpenAPISchemas['DirectLLMCallRecordRequest'];
+export type DirectLLMCallRecordResponse = OpenAPISchemas['DirectLLMCallRecordResponse'];

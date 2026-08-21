@@ -1,9 +1,20 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Alert, App, Button, Card, Empty, Space, Table, Typography } from 'antd';
+import {
+  Alert,
+  App,
+  Button,
+  Card,
+  Descriptions,
+  Drawer,
+  Empty,
+  Space,
+  Table,
+  Typography
+} from 'antd';
 import { useMemo, useState } from 'react';
 import { apiClient, ApiClientError, createRequestId } from '../../api/client';
 import { StatusTag } from '../../components/StatusTag';
-import type { DeviceEnvelope, DeviceListResponse, DeviceSummary } from '../../types/api';
+import type { DeviceEnvelope, DeviceListResponse, DeviceSummary, UnbindDeviceResponse } from '../../types/api';
 
 function formatDiskSize(bytes?: number) {
   if (bytes === undefined) {
@@ -27,6 +38,7 @@ export function DeviceManagementPage() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [unbindingDeviceId, setUnbindingDeviceId] = useState<string | null>(null);
+  const [detailDeviceId, setDetailDeviceId] = useState<string | null>(null);
 
   const devicesQuery = useQuery({
     queryKey: ['admin-devices', page, pageSize],
@@ -34,6 +46,12 @@ export function DeviceManagementPage() {
       apiClient.get<DeviceListResponse>('/api/v1/admin/devices', {
         query: { page, page_size: pageSize }
       })
+  });
+
+  const deviceDetailQuery = useQuery({
+    queryKey: ['admin-device', detailDeviceId],
+    queryFn: () => apiClient.get<DeviceEnvelope>(`/api/v1/admin/devices/${detailDeviceId}`),
+    enabled: detailDeviceId !== null
   });
 
   const disableDeviceMutation = useMutation({
@@ -56,11 +74,11 @@ export function DeviceManagementPage() {
 
   const unbindDeviceMutation = useMutation({
     mutationFn: (deviceId: string) =>
-      apiClient.post<DeviceEnvelope>(`/api/v1/admin/devices/${deviceId}/unbind`, {
+      apiClient.post<UnbindDeviceResponse>(`/api/v1/admin/devices/${deviceId}/unbind`, {
         headers: { 'Idempotency-Key': createRequestId() }
       }),
     onSuccess: async (response) => {
-      void message.success(`设备已解除绑定：${response.device.device_name}`);
+      void message.success(`设备已解除绑定：${response.device_name}`);
       await queryClient.invalidateQueries({ queryKey: ['admin-devices'] });
     },
     onError: (error) => {
@@ -88,6 +106,12 @@ export function DeviceManagementPage() {
         render: (status: DeviceSummary['status']) => <StatusTag status={status} />
       },
       {
+        title: '在线',
+        dataIndex: 'online',
+        key: 'online',
+        render: (online: boolean) => (online ? '在线' : '离线')
+      },
+      {
         title: '磁盘剩余',
         dataIndex: 'disk_free_bytes',
         key: 'disk_free_bytes',
@@ -111,6 +135,14 @@ export function DeviceManagementPage() {
         }
       },
       {
+        title: '当前播放',
+        key: 'playback',
+        render: (_: unknown, record: DeviceSummary) =>
+          record.current_media_name || record.playback_state
+            ? `${record.current_media_name || '未命名媒体'}（${record.playback_state || '未上报'}）`
+            : '未上报'
+      },
+      {
         title: '最后心跳',
         dataIndex: 'last_seen_at',
         key: 'last_seen_at',
@@ -121,6 +153,7 @@ export function DeviceManagementPage() {
         key: 'actions',
         render: (_: unknown, record: DeviceSummary) => (
           <Space>
+            <Button onClick={() => setDetailDeviceId(record.id)}>详情</Button>
             <Button
               danger
               disabled={record.status === 'disabled' || record.status === 'revoked'}
@@ -159,7 +192,7 @@ export function DeviceManagementPage() {
         )
       }
     ],
-    [disableDeviceMutation, modal, unbindDeviceMutation, unbindingDeviceId]
+    [disableDeviceMutation, modal, setDetailDeviceId, unbindDeviceMutation, unbindingDeviceId]
   );
 
   return (
@@ -215,6 +248,48 @@ export function DeviceManagementPage() {
           最近请求 ID：{devicesQuery.data?.request_id ?? '暂无'}
         </Typography.Text>
       </Card>
+      <Drawer
+        title="设备详情"
+        open={detailDeviceId !== null}
+        width={480}
+        onClose={() => setDetailDeviceId(null)}
+      >
+        {deviceDetailQuery.isError ? (
+          <Alert
+            type="error"
+            showIcon
+            message="设备详情加载失败"
+            description={
+              deviceDetailQuery.error instanceof ApiClientError
+                ? `${deviceDetailQuery.error.message}${deviceDetailQuery.error.requestId ? `（request_id：${deviceDetailQuery.error.requestId}）` : ''}`
+                : '发生未知错误'
+            }
+          />
+        ) : deviceDetailQuery.isLoading ? (
+          <Typography.Text type="secondary">加载中...</Typography.Text>
+        ) : deviceDetailQuery.data?.device ? (
+          <Descriptions column={1} bordered size="small">
+            <Descriptions.Item label="设备 ID">{deviceDetailQuery.data.device.id}</Descriptions.Item>
+            <Descriptions.Item label="设备名">{deviceDetailQuery.data.device.device_name}</Descriptions.Item>
+            <Descriptions.Item label="用户 ID">{deviceDetailQuery.data.device.user_id || '未绑定'}</Descriptions.Item>
+            <Descriptions.Item label="状态">{deviceDetailQuery.data.device.status}</Descriptions.Item>
+            <Descriptions.Item label="在线状态">
+              {deviceDetailQuery.data.device.online ? '在线' : '离线'}
+            </Descriptions.Item>
+            <Descriptions.Item label="当前播放">
+              {deviceDetailQuery.data.device.current_media_name || '未上报'}
+              {deviceDetailQuery.data.device.playback_state
+                ? `（${deviceDetailQuery.data.device.playback_state}）`
+                : ''}
+            </Descriptions.Item>
+            <Descriptions.Item label="最后心跳">
+              {new Date(deviceDetailQuery.data.device.last_seen_at).toLocaleString('zh-CN')}
+            </Descriptions.Item>
+          </Descriptions>
+        ) : (
+          <Empty description="暂无设备详情" />
+        )}
+      </Drawer>
     </Space>
   );
 }

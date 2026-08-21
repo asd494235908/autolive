@@ -9,26 +9,66 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // EncryptedSQLSecretStore 将密钥以 AES-256-GCM 密文保存到受控数据库表。
 // 加密主密钥不进入数据库，必须由部署环境的 Secret Store 注入进程。
 type EncryptedSQLSecretStore struct {
-	db  *sql.DB
-	key []byte
+	db               *sql.DB
+	key              []byte
+	operationTimeout time.Duration
+}
+
+func (s *EncryptedSQLSecretStore) Ping(ctx context.Context) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	return postgresOperationError(ctx, s.db.PingContext(ctx))
 }
 
 func NewEncryptedSQLSecretStore(db *sql.DB, key []byte) (*EncryptedSQLSecretStore, error) {
+	return NewEncryptedSQLSecretStoreWithTimeout(db, key, defaultPostgresOperationTimeout)
+}
+
+func NewEncryptedSQLSecretStoreWithTimeout(db *sql.DB, key []byte, operationTimeout time.Duration) (*EncryptedSQLSecretStore, error) {
 	if db == nil {
 		return nil, errors.New("secret store database must not be nil")
 	}
 	if len(key) != 32 {
 		return nil, errors.New("secret store key must be 32 bytes")
 	}
-	return &EncryptedSQLSecretStore{db: db, key: append([]byte(nil), key...)}, nil
+	if operationTimeout <= 0 {
+		return nil, errors.New("secret store operation timeout must be greater than zero")
+	}
+	return &EncryptedSQLSecretStore{db: db, key: append([]byte(nil), key...), operationTimeout: operationTimeout}, nil
+}
+
+func (s *EncryptedSQLSecretStore) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, s.operationTimeout)
 }
 
 func (s *EncryptedSQLSecretStore) Put(ctx context.Context, reference, value string) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	return s.putWithExecutor(ctx, s.db, reference, value)
+}
+
+// PutTx writes the encrypted value through the caller's transaction. The
+// transaction must use this store's database; callers own commit/rollback.
+func (s *EncryptedSQLSecretStore) PutTx(ctx context.Context, tx *sql.Tx, reference, value string) error {
+	if tx == nil {
+		return errors.New("secret store transaction must not be nil")
+	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	return s.putWithExecutor(ctx, tx, reference, value)
+}
+
+type secretSQLExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func (s *EncryptedSQLSecretStore) putWithExecutor(ctx context.Context, executor secretSQLExecutor, reference, value string) error {
 	reference = strings.TrimSpace(reference)
 	value = strings.TrimSpace(value)
 	if reference == "" || value == "" {
@@ -38,23 +78,25 @@ func (s *EncryptedSQLSecretStore) Put(ctx context.Context, reference, value stri
 	if err != nil {
 		return fmt.Errorf("encrypt secret: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx, `
+	_, err = executor.ExecContext(ctx, `
 		INSERT INTO model_account_secrets (secret_ref, ciphertext, updated_at)
 		VALUES ($1, $2, CURRENT_TIMESTAMP)
 		ON CONFLICT (secret_ref) DO UPDATE SET ciphertext = EXCLUDED.ciphertext, updated_at = CURRENT_TIMESTAMP
 	`, reference, ciphertext)
-	return err
+	return postgresOperationError(ctx, err)
 }
 
 func (s *EncryptedSQLSecretStore) Get(ctx context.Context, reference string) (string, error) {
 	reference = strings.TrimSpace(reference)
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	var ciphertext []byte
 	err := s.db.QueryRowContext(ctx, `SELECT ciphertext FROM model_account_secrets WHERE secret_ref = $1`, reference).Scan(&ciphertext)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrSecretNotFound
 	}
 	if err != nil {
-		return "", err
+		return "", postgresOperationError(ctx, err)
 	}
 	plaintext, err := decryptSecret(s.key, ciphertext)
 	if err != nil {
@@ -64,13 +106,15 @@ func (s *EncryptedSQLSecretStore) Get(ctx context.Context, reference string) (st
 }
 
 func (s *EncryptedSQLSecretStore) Delete(ctx context.Context, reference string) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	result, err := s.db.ExecContext(ctx, `DELETE FROM model_account_secrets WHERE secret_ref = $1`, strings.TrimSpace(reference))
 	if err != nil {
-		return err
+		return postgresOperationError(ctx, err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return postgresOperationError(ctx, err)
 	}
 	if rows == 0 {
 		return ErrSecretNotFound
