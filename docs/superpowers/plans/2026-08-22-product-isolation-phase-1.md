@@ -14,6 +14,7 @@
 - 全局用户身份复用，产品准入使用 `user_products`；同一 `device_id` 在两个 product 下是两条独立记录。
 - 设备、激活码、设备绑定、Profile、模型租约、用量、审计及幂等 scope 必须包含或可确定 product。
 - 历史数据先回填 `autolive`，兼容窗口后缺失 product 必须 fail-closed；不得永久默认。
+- 设备的业务唯一键是 `(product, device_id)`；迁移不能保留 `devices.id` 的跨产品全局唯一语义，否则同一客户端 ID 无法在两个产品下独立存在。所有仍引用设备的规范化表必须同步使用产品限定外键或等价的内部设备键。
 - 服务端授权不能依赖 React 隐藏、客户端传参诚实性或 product 查询筛选。
 - 不修改 0001～0022 历史迁移；新增前向迁移必须注册到 catalog，API 启动不隐式执行迁移。
 - 新行为先写失败测试并确认失败原因，再写最小实现；每个任务结束运行对应 Go/OpenAPI/迁移检查。
@@ -98,7 +99,7 @@ Commit: `feat(controlplane): add product domain primitives`
 
 **Interfaces:**
 - Produces `store.ProductRepository` with `ListProducts`, `GetProduct`, `GetUserProductMembership` and `EnsureUserProductMembership`.
-- Migration creates immutable `products`, product-scoped `user_products`, adds non-null product columns with `autolive` backfill to current normalized business tables, and creates product-aware indexes/constraints without editing 0001～0022.
+- Migration creates immutable `products`, product-scoped `user_products`, adds non-null product columns with `autolive` backfill to current normalized business tables, binds `auth_sessions` to product, converts the device logical key and all live device foreign keys to product-aware constraints, and creates product-aware indexes/constraints without editing 0001～0022.
 
 - [ ] **Step 1: Write failing catalog and SQL contract tests**
 
@@ -112,11 +113,11 @@ Expected: FAIL because catalog version remains 22 and migration file is absent.
 
 - [ ] **Step 3: Add the forward migration**
 
-Create `products(code, status, created_at)` with a check for the two seed codes and unique code. Create `user_products(user_id, product, status, entitlement_revision, created_at, updated_at)` with composite primary key and user/product indexes. Insert both products idempotently. Add product columns to `devices`, `activation_codes`, `model_accounts`, `model_leases`, `model_usage_records`, `audit_logs`, `audit_outbox`, `model_pool_test_results`, `user_authorization_policies` and any existing device-binding table; backfill `autolive`, then set `NOT NULL`, add product foreign keys/compound indexes, and preserve old data counts. Do not add a product column to historical `variant_*` tables unless a current read/write path uses them.
+Create `products(code, status, created_at)` with a check for the two seed codes and unique code. Create `user_products(user_id, product, status, entitlement_revision, created_at, updated_at)` with composite primary key and user/product indexes. Insert both products idempotently. Add product columns to `devices`, `activation_codes`, `auth_sessions`, `model_accounts`, `model_leases`, `model_usage_records`, `model_request_reservations`, `audit_logs`, `audit_outbox`, `model_pool_test_results`, `user_authorization_policies` and any existing device-binding table; backfill `autolive`, then convert the `devices` key and every live device reference to product-aware composite constraints, set `NOT NULL`, add product foreign keys/compound indexes, and preserve old data counts. Historical `variant_*` tables may receive only the product column required to preserve an existing device foreign key; they remain outside current reads/writes and must not be reintroduced into the product API.
 
 - [ ] **Step 4: Add the repository seam and tests**
 
-Define the smallest repository interface in `repository.go`; implement normalized PostgreSQL reads/writes with parameterized SQL and short transactions. Add tests for both products, missing membership, idempotent membership creation, disabled membership, and cross-product lookup returning not found/forbidden semantics. Keep product registry data separate from the legacy snapshot.
+Define the smallest repository interface in `repository.go`; implement normalized PostgreSQL reads/writes with parameterized SQL and short transactions. Add tests for both products, missing membership, idempotent membership creation, disabled membership, and cross-product lookup returning not found/forbidden semantics. Add migration/SQL contract coverage proving the device composite key prevents the same `device_id` from colliding across products and that session product is persisted. Keep product registry data separate from the legacy snapshot.
 
 - [ ] **Step 5: Run migration and repository checks**
 
