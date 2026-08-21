@@ -139,6 +139,7 @@ func TestMetricsExposeRateLimitAndAuditFailureCounters(t *testing.T) {
 		rec := doJSON(t, handler, http.MethodPost, "/api/v1/auth/login", map[string]any{
 			"username": "admin",
 			"password": "wrong-password",
+			"product":  "autolive",
 		}, "", "")
 		if attempt < 5 && rec.Code != http.StatusUnauthorized {
 			t.Fatalf("login attempt %d status = %d, want %d", attempt+1, rec.Code, http.StatusUnauthorized)

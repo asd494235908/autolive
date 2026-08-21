@@ -202,6 +202,7 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 	activateRec := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", map[string]any{
 		"activation_code": plainCode,
 		"device": map[string]any{
+			"product":     "autolive",
 			"device_id":   "dev_model_lease_1",
 			"device_name": "MacBook",
 			"platform":    "macOS",

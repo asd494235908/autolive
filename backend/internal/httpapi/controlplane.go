@@ -128,6 +128,7 @@ type heartbeatResponse struct {
 
 type clientProfileResponse struct {
 	RequestID   string                     `json:"request_id"`
+	Product     controlplane.ProductCode   `json:"product"`
 	User        controlplane.UserSummary   `json:"user"`
 	Device      controlplane.DeviceSummary `json:"device"`
 	Permissions []string                   `json:"permissions"`
@@ -544,6 +545,10 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
 			return
 		}
+		if err := requireActorProduct(actor, input.Device.Product); err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		if svc.SupportsTransactionalSessionBinding() {
 			setAuditDeviceID(r, input.Device.DeviceID)
 			audit := successAuditForDevice(r, actor, input.Device.DeviceID)
@@ -598,6 +603,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		}
 		writeJSON(w, http.StatusOK, clientProfileResponse{
 			RequestID:   RequestIDFromContext(r.Context()),
+			Product:     actor.Product,
 			User:        profile.User,
 			Device:      profile.Device,
 			Permissions: profile.Permissions,
@@ -608,6 +614,10 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		var input controlplane.HeartbeatInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
+			return
+		}
+		if err := requireActorProduct(actor, input.Product); err != nil {
+			writeAppError(w, r, err)
 			return
 		}
 		if svc.SupportsTransactionalSessionBinding() {
@@ -828,6 +838,17 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
+}
+
+func requireActorProduct(actor controlplane.Actor, requested controlplane.ProductCode) error {
+	product, err := controlplane.ParseProductCode(string(requested))
+	if err != nil || !actor.Product.Valid() {
+		return controlplane.ErrInvalidRequest
+	}
+	if product != actor.Product {
+		return controlplane.ErrForbidden
+	}
+	return nil
 }
 
 func decodeJSONBody(r *http.Request, target any) error {

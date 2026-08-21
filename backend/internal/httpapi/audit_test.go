@@ -87,6 +87,7 @@ func TestLoginAuditCapturesSuccessAndFailureWithoutCredentials(t *testing.T) {
 	failed := doJSON(t, handler, http.MethodPost, "/api/v1/auth/login", map[string]any{
 		"username": "admin",
 		"password": "wrong-password",
+		"product":  "autolive",
 	}, "", "")
 	if failed.Code != http.StatusUnauthorized {
 		t.Fatalf("failed login status = %d, want %d", failed.Code, http.StatusUnauthorized)
@@ -94,6 +95,7 @@ func TestLoginAuditCapturesSuccessAndFailureWithoutCredentials(t *testing.T) {
 	succeeded := doJSON(t, handler, http.MethodPost, "/api/v1/auth/login", map[string]any{
 		"username": "admin",
 		"password": "password",
+		"product":  "autolive",
 	}, "", "")
 	if succeeded.Code != http.StatusOK {
 		t.Fatalf("successful login status = %d, want %d", succeeded.Code, http.StatusOK)

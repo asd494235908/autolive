@@ -21,6 +21,7 @@ import (
 type loginRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+	Product  string `json:"product"`
 }
 
 var deviceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$`)
@@ -68,6 +69,7 @@ type sessionRecord struct {
 	RefreshTokenHash string
 	ExpiresAt        time.Time
 	RefreshExpiresAt time.Time
+	Product          controlplane.ProductCode
 	Actor            controlplane.Actor
 	DeviceID         string
 }
@@ -77,6 +79,8 @@ type authContextKey string
 const sessionTokenContextKey authContextKey = "session_token"
 const actorContextKey authContextKey = "actor"
 const deviceContextKey authContextKey = "device"
+
+const legacyClientCompatibilityHeader = "X-Client-Compatibility"
 
 type authenticator struct {
 	mu           sync.Mutex
@@ -124,12 +128,18 @@ func loginHandler(auth *authenticator) http.Handler {
 			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "登录请求格式无效")
 			return
 		}
+		product, err := loginProduct(r, request.Product)
+		if err != nil {
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "登录请求格式无效")
+			return
+		}
 
 		actor, user, err := auth.controlPlane.AuthenticateUser(r.Context(), request.Username, request.Password)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
 		}
+		actor.Product = product
 		if principal, ok := r.Context().Value(auditPrincipalContextKey{}).(*auditPrincipal); ok {
 			principal.actor = actor
 			principal.set = true
@@ -152,6 +162,7 @@ func loginHandler(auth *authenticator) http.Handler {
 			RefreshTokenHash: hashToken(refreshToken),
 			ExpiresAt:        now.Add(time.Hour),
 			RefreshExpiresAt: now.Add(30 * 24 * time.Hour),
+			Product:          product,
 			Actor:            actor,
 		}
 		if auth.store != nil {
@@ -244,8 +255,13 @@ func refreshHandler(auth *authenticator) http.Handler {
 			RefreshTokenHash: hashToken(newRefreshToken),
 			ExpiresAt:        now.Add(time.Hour),
 			RefreshExpiresAt: oldSession.RefreshExpiresAt,
-			Actor:            controlplane.Actor{UserID: user.ID, Role: user.Role},
+			Product:          oldSession.Product,
+			Actor:            controlplane.Actor{UserID: user.ID, Role: user.Role, Product: oldSession.Product},
 			DeviceID:         oldSession.DeviceID,
+		}
+		if !newSession.Product.Valid() {
+			writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "会话产品无效")
+			return
 		}
 		if auth.store != nil {
 			rotated, found, err := auth.store.Rotate(r.Context(), refreshHash, persistedSession("session_"+newSession.AccessTokenHash, user.ID, newSession))
@@ -328,6 +344,10 @@ func (a *authenticator) requireBearer(next func(http.ResponseWriter, *http.Reque
 			writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "会话已失效或不存在")
 			return
 		}
+		if !session.Product.Valid() {
+			writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "会话产品无效")
+			return
+		}
 
 		user, err := a.controlPlane.GetUser(r.Context(), session.Actor.UserID)
 		if err != nil {
@@ -339,7 +359,7 @@ func (a *authenticator) requireBearer(next func(http.ResponseWriter, *http.Reque
 			return
 		}
 
-		actor := controlplane.Actor{UserID: user.ID, Role: user.Role}
+		actor := controlplane.Actor{UserID: user.ID, Role: user.Role, Product: session.Product}
 		ctx := context.WithValue(r.Context(), sessionTokenContextKey, token)
 		ctx = context.WithValue(ctx, actorContextKey, actor)
 		ctx = context.WithValue(ctx, deviceContextKey, session.DeviceID)
@@ -369,6 +389,13 @@ func newToken() (string, error) {
 	}
 
 	return base64.RawURLEncoding.EncodeToString(token[:]), nil
+}
+
+func loginProduct(r *http.Request, raw string) (controlplane.ProductCode, error) {
+	if strings.TrimSpace(raw) == "" && strings.EqualFold(strings.TrimSpace(r.Header.Get(legacyClientCompatibilityHeader)), "legacy") {
+		return controlplane.ProductAutoLive, nil
+	}
+	return controlplane.ParseProductCode(raw)
 }
 
 func hashToken(token string) string {
@@ -567,6 +594,7 @@ func persistedSession(id, userID string, session sessionRecord) store.AuthSessio
 	return store.AuthSession{
 		ID:               id,
 		UserID:           userID,
+		Product:          session.Product,
 		DeviceID:         session.DeviceID,
 		AccessTokenHash:  session.AccessTokenHash,
 		RefreshTokenHash: session.RefreshTokenHash,
@@ -582,7 +610,8 @@ func sessionFromPersisted(session store.AuthSession) sessionRecord {
 		RefreshTokenHash: session.RefreshTokenHash,
 		ExpiresAt:        session.AccessExpiresAt,
 		RefreshExpiresAt: session.RefreshExpiresAt,
-		Actor:            controlplane.Actor{UserID: session.UserID},
+		Product:          session.Product,
+		Actor:            controlplane.Actor{UserID: session.UserID, Product: session.Product},
 		DeviceID:         session.DeviceID,
 	}
 }

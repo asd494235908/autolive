@@ -37,7 +37,7 @@ func TestActivateBindsBeforeBusinessMutationWhenSessionStoreFails(t *testing.T) 
 	sessions.mu.Unlock()
 	response := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", controlplane.ActivateDeviceInput{
 		ActivationCode: *codeEnvelope.ActivationCode.PlainCode,
-		Device:         controlplane.DeviceRegistration{DeviceID: "dev_bindfail1", DeviceName: "Test", Platform: "windows", AppVersion: "1.0.0"},
+		Device:         controlplane.DeviceRegistration{Product: controlplane.ProductAutoLive, DeviceID: "dev_bindfail1", DeviceName: "Test", Platform: "windows", AppVersion: "1.0.0"},
 	}, token, "activation-bind-failure")
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("activation with unavailable session store status = %d; body=%s", response.Code, response.Body.String())
@@ -67,7 +67,7 @@ func TestActivateCompensatesNewSessionBindingWhenBusinessFails(t *testing.T) {
 	token := loginForTest(t, handler)
 	response := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", controlplane.ActivateDeviceInput{
 		ActivationCode: "missing-code-123",
-		Device:         controlplane.DeviceRegistration{DeviceID: "dev_compens1", DeviceName: "Test", Platform: "windows", AppVersion: "1.0.0"},
+		Device:         controlplane.DeviceRegistration{Product: controlplane.ProductAutoLive, DeviceID: "dev_compens1", DeviceName: "Test", Platform: "windows", AppVersion: "1.0.0"},
 	}, token, "activation-compensation")
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("activation business failure status = %d; body=%s", response.Code, response.Body.String())
@@ -101,7 +101,7 @@ func TestHeartbeatCompensatesNewSessionBindingWhenBusinessFails(t *testing.T) {
 	)
 	token := loginForTest(t, handler)
 	response := doJSON(t, handler, http.MethodPost, "/api/v1/client/heartbeat", controlplane.HeartbeatInput{
-		DeviceID: "dev_hb_fail1", SentAt: testNow,
+		Product: controlplane.ProductAutoLive, DeviceID: "dev_hb_fail1", SentAt: testNow,
 	}, token, "heartbeat-compensation")
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("heartbeat business failure status = %d; body=%s", response.Code, response.Body.String())

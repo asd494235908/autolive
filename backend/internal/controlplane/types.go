@@ -139,6 +139,7 @@ type HeartbeatStatus struct {
 }
 
 type HeartbeatInput struct {
+	Product  ProductCode     `json:"product"`
 	DeviceID string          `json:"device_id"`
 	SentAt   time.Time       `json:"sent_at"`
 	Status   HeartbeatStatus `json:"status"`

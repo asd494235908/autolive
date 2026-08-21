@@ -5,12 +5,15 @@ import (
 	"database/sql"
 	"errors"
 	"time"
+
+	"autoLive/backend/internal/controlplane"
 )
 
 // AuthSession 是鉴权会话的持久化形状，只包含 Token 哈希，不包含 Token 原文。
 type AuthSession struct {
 	ID               string
 	UserID           string
+	Product          controlplane.ProductCode
 	DeviceID         string
 	AccessTokenHash  string
 	RefreshTokenHash string
@@ -72,12 +75,12 @@ func (s *SQLSessionStore) Create(ctx context.Context, session AuthSession) error
 	defer cancel()
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO auth_sessions (
-			id, user_id, device_id, access_token_hash, refresh_token_hash,
+			id, user_id, product, device_id, access_token_hash, refresh_token_hash,
 			access_expires_at, refresh_expires_at, created_at, device_bound_at
 		)
-		VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7, $8,
-			CASE WHEN NULLIF($3, '') IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END)
-	`, session.ID, session.UserID, session.DeviceID, session.AccessTokenHash, session.RefreshTokenHash,
+		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, $9,
+			CASE WHEN NULLIF($4, '') IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END)
+	`, session.ID, session.UserID, session.Product, session.DeviceID, session.AccessTokenHash, session.RefreshTokenHash,
 		session.AccessExpiresAt.UTC(), session.RefreshExpiresAt.UTC(), session.CreatedAt.UTC())
 	return postgresOperationError(ctx, err)
 }
@@ -96,13 +99,13 @@ func (s *SQLSessionStore) get(ctx context.Context, predicate, value string) (Aut
 	var session AuthSession
 	var deviceID sql.NullString
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, user_id, device_id, access_token_hash, refresh_token_hash,
+		SELECT id, user_id, product, device_id, access_token_hash, refresh_token_hash,
 			access_expires_at, refresh_expires_at, created_at
 		FROM auth_sessions
 		WHERE `+predicate+` AND revoked_at IS NULL
 		LIMIT 1
 	`, value).Scan(
-		&session.ID, &session.UserID, &deviceID, &session.AccessTokenHash, &session.RefreshTokenHash,
+		&session.ID, &session.UserID, &session.Product, &deviceID, &session.AccessTokenHash, &session.RefreshTokenHash,
 		&session.AccessExpiresAt, &session.RefreshExpiresAt, &session.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -135,7 +138,7 @@ func (s *SQLSessionStore) Rotate(ctx context.Context, refreshTokenHash string, n
 	var old AuthSession
 	var deviceID sql.NullString
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, user_id, device_id, access_token_hash, refresh_token_hash,
+		SELECT id, user_id, product, device_id, access_token_hash, refresh_token_hash,
 			access_expires_at, refresh_expires_at, created_at
 		FROM auth_sessions
 		WHERE refresh_token_hash = $1
@@ -143,7 +146,7 @@ func (s *SQLSessionStore) Rotate(ctx context.Context, refreshTokenHash string, n
 		  AND refresh_expires_at > CURRENT_TIMESTAMP
 		FOR UPDATE
 	`, refreshTokenHash).Scan(
-		&old.ID, &old.UserID, &deviceID, &old.AccessTokenHash, &old.RefreshTokenHash,
+		&old.ID, &old.UserID, &old.Product, &deviceID, &old.AccessTokenHash, &old.RefreshTokenHash,
 		&old.AccessExpiresAt, &old.RefreshExpiresAt, &old.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -155,7 +158,7 @@ func (s *SQLSessionStore) Rotate(ctx context.Context, refreshTokenHash string, n
 	if deviceID.Valid {
 		old.DeviceID = deviceID.String
 	}
-	if next.UserID != old.UserID || next.DeviceID != old.DeviceID ||
+	if next.UserID != old.UserID || next.Product != old.Product || next.DeviceID != old.DeviceID ||
 		next.RefreshExpiresAt.After(old.RefreshExpiresAt) || next.AccessExpiresAt.After(old.RefreshExpiresAt) {
 		return AuthSession{}, false, errors.New("rotated auth session changes identity or exceeds refresh expiry")
 	}
@@ -164,12 +167,12 @@ func (s *SQLSessionStore) Rotate(ctx context.Context, refreshTokenHash string, n
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO auth_sessions (
-			id, user_id, device_id, access_token_hash, refresh_token_hash,
+			id, user_id, product, device_id, access_token_hash, refresh_token_hash,
 			access_expires_at, refresh_expires_at, created_at, device_bound_at
 		)
-		VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7, $8,
-			CASE WHEN NULLIF($3, '') IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END)
-	`, next.ID, next.UserID, next.DeviceID, next.AccessTokenHash, next.RefreshTokenHash,
+		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, $9,
+			CASE WHEN NULLIF($4, '') IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END)
+	`, next.ID, next.UserID, next.Product, next.DeviceID, next.AccessTokenHash, next.RefreshTokenHash,
 		next.AccessExpiresAt.UTC(), next.RefreshExpiresAt.UTC(), next.CreatedAt.UTC()); err != nil {
 		return AuthSession{}, false, postgresOperationError(ctx, err)
 	}
@@ -266,7 +269,7 @@ func (s *SQLSessionStore) ClearDeviceID(ctx context.Context, accessTokenHash, de
 
 func validateAuthSession(session AuthSession) error {
 	if session.ID == "" || session.UserID == "" || session.AccessTokenHash == "" || session.RefreshTokenHash == "" ||
-		session.AccessExpiresAt.IsZero() || session.RefreshExpiresAt.IsZero() || !session.RefreshExpiresAt.After(session.AccessExpiresAt) {
+		!session.Product.Valid() || session.AccessExpiresAt.IsZero() || session.RefreshExpiresAt.IsZero() || !session.RefreshExpiresAt.After(session.AccessExpiresAt) {
 		return errors.New("invalid auth session")
 	}
 	return nil

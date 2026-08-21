@@ -54,6 +54,7 @@ func auditMiddlewareWithOptions(controlPlane *service.ControlPlane, logger *slog
 		auditCtx := context.WithoutCancel(r.Context())
 		if err := controlPlane.RecordAudit(auditCtx, controlplane.AuditLogInput{
 			ActorUserID: principal.actor.UserID,
+			Product:     principal.actor.Product,
 			DeviceID:    principal.deviceID,
 			Action:      r.Method + " " + r.URL.Path,
 			TargetType:  targetType,
@@ -126,6 +127,7 @@ func successAuditForDevice(r *http.Request, actor controlplane.Actor, deviceID s
 func successAuditForTarget(r *http.Request, actor controlplane.Actor, targetType, targetID, deviceID string) controlplane.AuditLogInput {
 	return controlplane.AuditLogInput{
 		ActorUserID: actor.UserID,
+		Product:     actor.Product,
 		DeviceID:    deviceID,
 		Action:      r.Method + " " + r.URL.Path,
 		TargetType:  targetType,

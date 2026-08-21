@@ -30,6 +30,7 @@ func TestUnbindDeviceUsesUnboundResponseWithoutUserID(t *testing.T) {
 	activate := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", map[string]any{
 		"activation_code": codePayload.ActivationCode.PlainCode,
 		"device": map[string]any{
+			"product":     "autolive",
 			"device_id":   "dev_unbind1",
 			"device_name": "Contract Device",
 			"platform":    "windows",
@@ -79,6 +80,7 @@ func TestDeviceActivationAuditUsesDeviceTargetWithoutPlainCode(t *testing.T) {
 	activate := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", map[string]any{
 		"activation_code": codePayload.ActivationCode.PlainCode,
 		"device": map[string]any{
+			"product":     "autolive",
 			"device_id":   "dev_audit_activation",
 			"device_name": "Audit Device",
 			"platform":    "windows",

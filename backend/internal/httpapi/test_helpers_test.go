@@ -28,7 +28,7 @@ func testActivationExpiresAt() string {
 
 func loginForTest(t *testing.T, handler http.Handler) string {
 	t.Helper()
-	return loginWithCredentialsForTest(t, handler, `{"username":"admin","password":"password"}`)
+	return loginWithCredentialsForTest(t, handler, `{"username":"admin","password":"password","product":"autolive"}`)
 }
 
 func doJSON(t *testing.T, handler http.Handler, method, path string, body any, token, idempotencyKey string) *httptest.ResponseRecorder {

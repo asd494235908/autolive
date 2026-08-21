@@ -1385,6 +1385,7 @@ func (s *ControlPlane) recordHeartbeatWithSessionBinding(ctx context.Context, id
 			Fingerprint:     fingerprint,
 			AccessTokenHash: accessTokenHash,
 			UserID:          userID,
+			Product:         input.Product,
 			Input:           input,
 			Audit:           audit,
 		})
@@ -2972,7 +2973,7 @@ func (s *ControlPlane) CreateActivationCode(ctx context.Context, idempotencyKey 
 			return controlplane.ActivationCode{}, controlplane.NewError(http.StatusInternalServerError, "RANDOM_GENERATION_FAILED", "无法生成激活码")
 		}
 		return writer.CreateActivationCode(ctx, "control-plane-state", "create-activation-code:"+idempotencyKey, fingerprint, store.ActivationCodeCreateRecord{
-			PlainCode: plainCode, CodeHash: secretDigest(plainCode), CodePrefix: plainCode[:12], ExpiresAt: input.ExpiresAt, MaxDevices: input.MaxDevices, CreatedAt: s.repository.Now(),
+			Product: controlplane.ProductAutoLive, PlainCode: plainCode, CodeHash: secretDigest(plainCode), CodePrefix: plainCode[:12], ExpiresAt: input.ExpiresAt, MaxDevices: input.MaxDevices, CreatedAt: s.repository.Now(),
 		})
 	}
 
@@ -3001,6 +3002,7 @@ func (s *ControlPlane) CreateActivationCode(ctx context.Context, idempotencyKey 
 		}
 		code := controlplane.ActivationCode{
 			ID:           id,
+			Product:      controlplane.ProductAutoLive,
 			Status:       controlplane.ActivationCodeStatusActive,
 			ExpiresAt:    input.ExpiresAt.UTC().Format(time.RFC3339),
 			MaxDevices:   input.MaxDevices,
@@ -3250,6 +3252,7 @@ func (s *ControlPlane) activateDeviceWithSessionBinding(ctx context.Context, ide
 			Fingerprint:        fingerprint,
 			AccessTokenHash:    accessTokenHash,
 			UserID:             userID,
+			Product:            input.Device.Product,
 			ActivationCodeHash: secretDigest(input.ActivationCode),
 			Device:             input.Device,
 			Audit:              audit,
@@ -3344,6 +3347,7 @@ func (s *ControlPlane) activateDeviceWithRunner(ctx context.Context, idempotency
 		device := controlplane.DeviceSummary{
 			ID:                  input.Device.DeviceID,
 			UserID:              userID,
+			Product:             input.Device.Product,
 			DeviceName:          strings.TrimSpace(input.Device.DeviceName),
 			Platform:            strings.TrimSpace(input.Device.Platform),
 			AppVersion:          strings.TrimSpace(input.Device.AppVersion),

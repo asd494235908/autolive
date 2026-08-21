@@ -937,6 +937,7 @@ func TestSQLSessionStoreRestartsAndConsumesRefreshTokenOnce(t *testing.T) {
 	first := AuthSession{
 		ID:               fmt.Sprintf("session_first_%d", suffix),
 		UserID:           userID,
+		Product:          controlplane.ProductAutoLive,
 		AccessTokenHash:  fmt.Sprintf("access_first_%d", suffix),
 		RefreshTokenHash: fmt.Sprintf("refresh_first_%d", suffix),
 		AccessExpiresAt:  now.Add(time.Hour),
@@ -946,6 +947,7 @@ func TestSQLSessionStoreRestartsAndConsumesRefreshTokenOnce(t *testing.T) {
 	second := AuthSession{
 		ID:               fmt.Sprintf("session_second_%d", suffix),
 		UserID:           userID,
+		Product:          controlplane.ProductAutoLive,
 		AccessTokenHash:  fmt.Sprintf("access_second_%d", suffix),
 		RefreshTokenHash: fmt.Sprintf("refresh_second_%d", suffix),
 		AccessExpiresAt:  now.Add(2 * time.Hour),
@@ -955,6 +957,7 @@ func TestSQLSessionStoreRestartsAndConsumesRefreshTokenOnce(t *testing.T) {
 	replayCandidate := AuthSession{
 		ID:               fmt.Sprintf("session_replay_%d", suffix),
 		UserID:           userID,
+		Product:          controlplane.ProductAutoLive,
 		AccessTokenHash:  fmt.Sprintf("access_replay_%d", suffix),
 		RefreshTokenHash: fmt.Sprintf("refresh_replay_%d", suffix),
 		AccessExpiresAt:  now.Add(3 * time.Hour),
@@ -1021,6 +1024,7 @@ func TestSQLSessionStoreReconcilesPreDeviceActivationBinding(t *testing.T) {
 	session := AuthSession{
 		ID:               fmt.Sprintf("binding_session_%d", suffix),
 		UserID:           userID,
+		Product:          controlplane.ProductAutoLive,
 		AccessTokenHash:  fmt.Sprintf("binding_access_%d", suffix),
 		RefreshTokenHash: fmt.Sprintf("binding_refresh_%d", suffix),
 		AccessExpiresAt:  now.Add(time.Hour),
@@ -1069,6 +1073,7 @@ func TestPostgresRepositorySessionBindingRollsBackWithDomainFailure(t *testing.T
 	userID := fmt.Sprintf("tx_binding_user_%d", suffix)
 	session := AuthSession{
 		ID: fmt.Sprintf("tx_binding_session_%d", suffix), UserID: userID,
+		Product:         controlplane.ProductAutoLive,
 		AccessTokenHash: fmt.Sprintf("tx_binding_access_%d", suffix), RefreshTokenHash: fmt.Sprintf("tx_binding_refresh_%d", suffix),
 		AccessExpiresAt: now.Add(time.Hour), RefreshExpiresAt: now.Add(24 * time.Hour), CreatedAt: now,
 	}
