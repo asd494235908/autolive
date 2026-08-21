@@ -79,6 +79,30 @@ func TestMigration23ProductIsolationContract(t *testing.T) {
 	}
 }
 
+func TestMigration23ProductScopedConstraintChecksAreTableQualified(t *testing.T) {
+	payload, err := fs.ReadFile(FS, "0023_补齐多产品控制面.up.sql")
+	if err != nil {
+		t.Fatalf("read migration 0023: %v", err)
+	}
+	sql := string(payload)
+	for _, fragment := range []string{
+		"WHERE conrelid = 'devices'::regclass AND conname = 'devices_user_product_fkey'",
+		"WHERE conrelid = 'activation_codes'::regclass AND conname = 'activation_codes_used_by_user_product_fkey'",
+		"WHERE conrelid = 'auth_sessions'::regclass AND conname = 'auth_sessions_user_product_fkey'",
+		"WHERE conrelid = 'model_leases'::regclass AND conname = 'model_leases_user_product_fkey'",
+		"WHERE conrelid = 'model_usage_records'::regclass AND conname = 'model_usage_records_user_product_fkey'",
+		"WHERE conrelid = 'audit_logs'::regclass AND conname = 'audit_logs_actor_user_product_fkey'",
+		"WHERE conrelid = 'user_authorization_policies'::regclass AND conname = 'user_authorization_policies_user_product_fkey'",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0023 must scope product FK check with table-qualified regclass, missing %q", fragment)
+		}
+	}
+	if strings.Contains(sql, "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '") {
+		t.Fatal("migration 0023 must not use global pg_constraint conname-only guards for product FK checks")
+	}
+}
+
 func TestActivationMultiDeviceMigrationAddsCapacityAndCount(t *testing.T) {
 	payload, err := fs.ReadFile(FS, "0022_支持激活码多设备绑定.up.sql")
 	if err != nil {

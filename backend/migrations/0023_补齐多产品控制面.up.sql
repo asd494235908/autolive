@@ -162,35 +162,67 @@ $$;
 
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'devices_user_product_fkey') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'devices'::regclass AND conname = 'devices_user_product_fkey'
+    ) THEN
         ALTER TABLE devices ADD CONSTRAINT devices_user_product_fkey
             FOREIGN KEY (user_id, product) REFERENCES user_products(user_id, product);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'activation_codes_used_by_user_product_fkey') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'activation_codes'::regclass AND conname = 'activation_codes_used_by_user_product_fkey'
+    ) THEN
         ALTER TABLE activation_codes ADD CONSTRAINT activation_codes_used_by_user_product_fkey
             FOREIGN KEY (used_by_user_id, product) REFERENCES user_products(user_id, product);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'auth_sessions_user_product_fkey') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'auth_sessions'::regclass AND conname = 'auth_sessions_user_product_fkey'
+    ) THEN
         ALTER TABLE auth_sessions ADD CONSTRAINT auth_sessions_user_product_fkey
             FOREIGN KEY (user_id, product) REFERENCES user_products(user_id, product);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'model_leases_user_product_fkey') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'model_leases'::regclass AND conname = 'model_leases_user_product_fkey'
+    ) THEN
         ALTER TABLE model_leases ADD CONSTRAINT model_leases_user_product_fkey
             FOREIGN KEY (user_id, product) REFERENCES user_products(user_id, product);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'model_usage_records_user_product_fkey') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'model_usage_records'::regclass AND conname = 'model_usage_records_user_product_fkey'
+    ) THEN
         ALTER TABLE model_usage_records ADD CONSTRAINT model_usage_records_user_product_fkey
             FOREIGN KEY (user_id, product) REFERENCES user_products(user_id, product);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'audit_logs_actor_user_product_fkey') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'audit_logs'::regclass AND conname = 'audit_logs_actor_user_product_fkey'
+    ) THEN
         ALTER TABLE audit_logs ADD CONSTRAINT audit_logs_actor_user_product_fkey
             FOREIGN KEY (actor_user_id, product) REFERENCES user_products(user_id, product);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'user_authorization_policies_user_product_fkey') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'user_authorization_policies'::regclass AND conname = 'user_authorization_policies_user_product_fkey'
+    ) THEN
         ALTER TABLE user_authorization_policies ADD CONSTRAINT user_authorization_policies_user_product_fkey
             FOREIGN KEY (user_id, product) REFERENCES user_products(user_id, product);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'variant_tasks_user_product_fkey') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'variant_tasks'::regclass AND conname = 'variant_tasks_user_product_fkey'
+    ) THEN
         ALTER TABLE variant_tasks ADD CONSTRAINT variant_tasks_user_product_fkey
             FOREIGN KEY (user_id, product) REFERENCES user_products(user_id, product);
     END IF;
