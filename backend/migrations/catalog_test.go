@@ -3,6 +3,7 @@ package migrations
 import (
 	"fmt"
 	"io/fs"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -32,6 +33,7 @@ var migration23ForeignKeyContracts = []migration23ForeignKeyContract{
 	{table: "devices", name: "devices_user_product_fkey", parentTable: "user_products", localColumns: "user_id, product", referencedColumns: "user_id, product"},
 	{table: "activation_codes", name: "activation_codes_used_by_user_product_fkey", parentTable: "user_products", localColumns: "used_by_user_id, product", referencedColumns: "user_id, product"},
 	{table: "auth_sessions", name: "auth_sessions_user_product_fkey", parentTable: "user_products", localColumns: "user_id, product", referencedColumns: "user_id, product"},
+	{table: "model_request_reservations", name: "model_request_reservations_user_product_fkey", parentTable: "user_products", localColumns: "user_id, product", referencedColumns: "user_id, product"},
 	{table: "model_leases", name: "model_leases_user_product_fkey", parentTable: "user_products", localColumns: "user_id, product", referencedColumns: "user_id, product"},
 	{table: "model_usage_records", name: "model_usage_records_user_product_fkey", parentTable: "user_products", localColumns: "user_id, product", referencedColumns: "user_id, product"},
 	{table: "audit_logs", name: "audit_logs_actor_user_product_fkey", parentTable: "user_products", localColumns: "actor_user_id, product", referencedColumns: "user_id, product"},
@@ -84,6 +86,8 @@ func TestMigration23ProductIsolationContract(t *testing.T) {
 		"'autolive'",
 		"'douyin_desktop'",
 		"CREATE TABLE IF NOT EXISTS user_products",
+		"user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE",
+		"product TEXT NOT NULL REFERENCES products(code)",
 		"ALTER TABLE devices",
 		"ADD COLUMN IF NOT EXISTS product",
 		"DEFAULT 'autolive'",
@@ -97,8 +101,10 @@ func TestMigration23ProductIsolationContract(t *testing.T) {
 			t.Fatalf("migration 0023 is missing product-isolation fragment %q", fragment)
 		}
 	}
-	if strings.Contains(sql, "auth_sessions_product_device_fkey") {
-		t.Fatal("migration 0023 must not reintroduce auth_sessions device foreign key dropped by migration 0018")
+	normalizedSQL := strings.ToLower(strings.Join(strings.Fields(sql), " "))
+	legacyAuthSessionsDeviceReference := regexp.MustCompile(`(?:alter\s+table(?:\s+only)?|create\s+table)\s+auth_sessions\b[^;]*references\s+devices\b`)
+	if legacyAuthSessionsDeviceReference.MatchString(normalizedSQL) {
+		t.Fatal("migration 0023 must not reintroduce any auth_sessions foreign key referencing devices")
 	}
 	for _, fragment := range []string{
 		"ALTER COLUMN product SET NOT NULL",
@@ -118,6 +124,7 @@ func TestMigration23ProductScopedConstraintChecksAreTableQualified(t *testing.T)
 		t.Fatalf("read migration 0023: %v", err)
 	}
 	sql := string(payload)
+	normalizedSQL := strings.ToLower(strings.Join(strings.Fields(sql), " "))
 	for _, fragment := range []string{
 		"WHERE conrelid = 'devices'::regclass AND conname = 'devices_user_product_fkey'",
 		"WHERE conrelid = 'activation_codes'::regclass AND conname = 'activation_codes_used_by_user_product_fkey'",
@@ -133,6 +140,9 @@ func TestMigration23ProductScopedConstraintChecksAreTableQualified(t *testing.T)
 	}
 	if strings.Contains(sql, "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '") {
 		t.Fatal("migration 0023 must not use global pg_constraint conname-only guards for product FK checks")
+	}
+	if !strings.Contains(normalizedSQL, "foreign key (product) references products(code)") {
+		t.Fatal("migration 0023 must define product foreign keys on the product column")
 	}
 }
 
@@ -177,8 +187,8 @@ func TestMigration23ForeignKeyContractCoversAllProductReferences(t *testing.T) {
 	if productForeignKeyCount != 13 {
 		t.Fatalf("migration 0023 product FK contract count = %d, want 13", productForeignKeyCount)
 	}
-	if userProductForeignKeyCount != 8 {
-		t.Fatalf("migration 0023 user_products FK contract count = %d, want 8", userProductForeignKeyCount)
+	if userProductForeignKeyCount != 9 {
+		t.Fatalf("migration 0023 user_products FK contract count = %d, want 9", userProductForeignKeyCount)
 	}
 	if actual := strings.Count(normalizedSQL, "REFERENCES user_products(user_id, product)"); actual != userProductForeignKeyCount {
 		t.Fatalf("migration 0023 user_products FK definition count = %d, want %d", actual, userProductForeignKeyCount)

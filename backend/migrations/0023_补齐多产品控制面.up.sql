@@ -189,6 +189,14 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1
         FROM pg_constraint
+        WHERE conrelid = 'model_request_reservations'::regclass AND conname = 'model_request_reservations_user_product_fkey'
+    ) THEN
+        ALTER TABLE model_request_reservations ADD CONSTRAINT model_request_reservations_user_product_fkey
+            FOREIGN KEY (user_id, product) REFERENCES user_products(user_id, product);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
         WHERE conrelid = 'model_leases'::regclass AND conname = 'model_leases_user_product_fkey'
     ) THEN
         ALTER TABLE model_leases ADD CONSTRAINT model_leases_user_product_fkey
