@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"regexp"
 	"strings"
@@ -80,6 +81,142 @@ func TestPostgresRepositoryRecordAuditWithOutboxMarksDeliveryFailureRetryable(t 
 	}
 }
 
+func TestPostgresEnqueueAuditOutboxValidatesModelAccountProduct(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 8, 22, 18, 0, 0, 0, time.UTC)
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, func() time.Time { return now }, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM model_accounts WHERE id = $1 AND product = $2")).
+		WithArgs("account_douyin", controlplane.ProductDouyinDesktop).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).
+		WithArgs(sqlmock.AnyArg(), controlplane.ProductDouyinDesktop, "audit-request:model-account", sqlmock.AnyArg(), now).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	tx, err := database.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	err = repository.enqueueAuditOutboxTx(context.Background(), tx, controlplane.AuditLogInput{
+		Product: controlplane.ProductDouyinDesktop, Action: "PATCH /api/v1/admin/model-pool/account_douyin",
+		TargetType: "model_account", TargetID: "account_douyin", RequestID: "model-account", Outcome: "success", StatusCode: 200,
+	}, now)
+	if err != nil {
+		t.Fatalf("enqueueAuditOutboxTx() error = %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestPostgresRecordAuditWithOutboxRejectsMissingSuccessTargetButAllowsFailureTarget(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, time.Now, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+	input := controlplane.AuditLogInput{
+		Product: controlplane.ProductDouyinDesktop, Action: "POST /api/v1/admin/model-pool",
+		TargetType: "model_account", TargetID: "account-missing", StatusCode: 201,
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM model_accounts WHERE id = $1 AND product = $2")).
+		WithArgs("account-missing", controlplane.ProductDouyinDesktop).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM model_accounts WHERE id = $1 AND (product IS NULL OR product <> $2)")).
+		WithArgs("account-missing", controlplane.ProductDouyinDesktop).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectRollback()
+	if err := repository.RecordAuditWithOutbox(context.Background(), input); !errors.Is(err, controlplane.ErrForbidden) {
+		t.Fatalf("RecordAuditWithOutbox(success) error = %v, want forbidden", err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM model_accounts WHERE id = $1 AND product = $2")).
+		WithArgs("account-missing", controlplane.ProductDouyinDesktop).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM model_accounts WHERE id = $1 AND (product IS NULL OR product <> $2)")).
+		WithArgs("account-missing", controlplane.ProductDouyinDesktop).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).
+		WithArgs(sqlmock.AnyArg(), controlplane.ProductDouyinDesktop, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, payload, product\n\t\tFROM audit_outbox")).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload", "product"}))
+	mock.ExpectCommit()
+	if err := repository.RecordAuditWithOutbox(context.Background(), controlplane.AuditLogInput{
+		Product: controlplane.ProductDouyinDesktop, Action: input.Action, TargetType: input.TargetType,
+		TargetID: input.TargetID, Outcome: "failure", StatusCode: 404,
+	}); err != nil {
+		t.Fatalf("RecordAuditWithOutbox(failure) error = %v, want nil", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestPostgresRecordAuditRejectsModelAccountProductConflicts(t *testing.T) {
+	cases := []struct {
+		name string
+		id   string
+	}{
+		{name: "cross product", id: "account-other-product"},
+		{name: "null product", id: "account-null-product"},
+		{name: "invalid product", id: "account-invalid-product"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			database, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock.New() error = %v", err)
+			}
+			defer database.Close()
+			repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, time.Now, nil, ModelReadSourceNormalized)
+			if err != nil {
+				t.Fatalf("constructor error = %v", err)
+			}
+			mock.ExpectBegin()
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM model_accounts WHERE id = $1 AND product = $2")).
+				WithArgs(tt.id, controlplane.ProductDouyinDesktop).
+				WillReturnError(sql.ErrNoRows)
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM model_accounts WHERE id = $1 AND (product IS NULL OR product <> $2)")).
+				WithArgs(tt.id, controlplane.ProductDouyinDesktop).
+				WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(1))
+			mock.ExpectRollback()
+
+			err = repository.RecordAudit(context.Background(), controlplane.AuditLogInput{
+				Product: controlplane.ProductDouyinDesktop, Action: "PATCH /api/v1/admin/model-pool", TargetType: "model_account", TargetID: tt.id, Outcome: "success", StatusCode: 200,
+			})
+			if !errors.Is(err, controlplane.ErrForbidden) {
+				t.Fatalf("RecordAudit() error = %v, want forbidden", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("sql expectations: %v", err)
+			}
+		})
+	}
+}
+
 func TestPostgresRepositoryDispatchAuditOutboxRejectsInvalidBatchAndCancellation(t *testing.T) {
 	database, _, err := sqlmock.New()
 	if err != nil {
@@ -98,4 +235,10 @@ func TestPostgresRepositoryDispatchAuditOutboxRejectsInvalidBatchAndCancellation
 	if _, err := repository.DispatchAuditOutbox(ctx, 1); !errors.Is(err, context.Canceled) {
 		t.Fatalf("DispatchAuditOutbox(cancelled) error = %v, want context canceled", err)
 	}
+}
+
+func expectNormalizedAuditTargetProduct(mock sqlmock.Sqlmock, table string, id any, product controlplane.ProductCode) {
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM "+table+" WHERE id = $1 AND product = $2")).
+		WithArgs(id, product).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(1))
 }

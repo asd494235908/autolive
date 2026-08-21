@@ -436,34 +436,57 @@ func productScopedScope(scope string, product controlplane.ProductCode) string {
 func validateAuditTargetProduct(state *store.State, input controlplane.AuditLogInput) error {
 	product := effectiveStoredProduct(input.Product)
 	if input.DeviceID != "" {
-		if device, ok := state.Devices[input.DeviceID]; ok && effectiveStoredProduct(device.Product) != product {
-			return controlplane.ErrForbidden
+		device, ok := state.Devices[input.DeviceID]
+		if ok {
+			storedProduct, valid := strictStoredProduct(device.Product)
+			if !valid || storedProduct != product {
+				return controlplane.ErrForbidden
+			}
 		}
 	}
 	if input.TargetID == "" {
 		return nil
 	}
 	var target controlplane.ProductCode
-	var found bool
+	var found, knownTarget bool
 	switch input.TargetType {
 	case "device":
+		knownTarget = true
 		var item controlplane.DeviceSummary
 		item, found = state.Devices[input.TargetID]
 		target = item.Product
 	case "model_lease":
+		knownTarget = true
 		var item controlplane.ModelLease
 		item, found = state.ModelLeases[input.TargetID]
 		target = item.Product
 	case "model_usage":
+		knownTarget = true
 		var item controlplane.ModelUsageRecord
 		item, found = state.ModelUsageRecords[input.TargetID]
 		target = item.Product
 	case "activation_code":
+		knownTarget = true
 		var item store.ActivationCodeRecord
 		item, found = state.ActivationCodes[input.TargetID]
 		target = item.ActivationCode.Product
+	case "model_account":
+		knownTarget = true
+		var item controlplane.ModelPoolAccountSummary
+		item, found = state.ModelPoolAccounts[input.TargetID]
+		target = item.Product
 	}
-	if found && effectiveStoredProduct(target) != product {
+	if !knownTarget {
+		return nil
+	}
+	if !found {
+		if input.Outcome == "failure" {
+			return nil
+		}
+		return controlplane.ErrForbidden
+	}
+	storedProduct, valid := strictStoredProduct(target)
+	if !valid || storedProduct != product {
 		return controlplane.ErrForbidden
 	}
 	return nil

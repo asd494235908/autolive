@@ -41,6 +41,7 @@ func TestPostgresRepositoryRotateModelPoolAccountSecretUsesSharedTransaction(t *
 	dayStart := time.Date(2026, 8, 21, 0, 0, 0, 0, time.UTC)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COALESCE(SUM(total_tokens), 0)")).WithArgs("mpa_1", dayStart, dayStart.Add(24*time.Hour)).WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(0))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT payload, created_at")).WithArgs("mpa_1").WillReturnRows(sqlmock.NewRows([]string{"payload", "created_at"}).AddRow(payload, now))
+	expectNormalizedAuditTargetProduct(mock, "model_accounts", "mpa_1", controlplane.ProductAutoLive)
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-rotate-account", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 

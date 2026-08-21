@@ -33,6 +33,8 @@ func TestPostgresRepositoryRecordDirectLLMCallUsesNormalizedTransaction(t *testi
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT provider, model, base_url, status, concurrency_limit, daily_token_limit")).WithArgs("mpa_1").WillReturnRows(sqlmock.NewRows([]string{"provider", "model", "base_url", "status", "concurrency_limit", "daily_token_limit"}).AddRow("openai", "gpt", "https://api.example.test", controlplane.ModelAccountStatusActive, 2, 0))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO model_usage_records (")).WithArgs(sqlmock.AnyArg(), "mpa_1", "lease_1", "usr_1", "dev_1", "openai", "gpt", 2, 3, 5, int64(120), "req-1", "call_0001", "client_reported", "succeeded", "", now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE idempotency_records SET resource_id = $3")).WithArgs("control-plane-state", "record-direct-llm-call:usr_1:dev_1:usage-key", sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectNormalizedAuditTargetProduct(mock, "devices", "dev_1", controlplane.ProductAutoLive)
+	expectNormalizedAuditTargetProduct(mock, "model_usage_records", sqlmock.AnyArg(), controlplane.ProductAutoLive)
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-1", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 

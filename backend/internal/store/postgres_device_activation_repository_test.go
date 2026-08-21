@@ -34,6 +34,7 @@ func TestPostgresRepositoryActivateDeviceWithSessionBindingCommitsTogether(t *te
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO devices (id, user_id, product, device_key, device_name, platform, client_version, status, last_heartbeat_at)")).WithArgs("dev_1", "usr_1", controlplane.ProductAutoLive, "state-device/dev_1", "Demo", "windows", "1.0.0", controlplane.DeviceStatusActive, now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE activation_codes SET status = $2, bound_devices = $3, used_at = COALESCE(used_at, $4), used_by_user_id = COALESCE(used_by_user_id, $5), used_by_device_id = COALESCE(used_by_device_id, $6)")).WithArgs("ac_1", controlplane.ActivationCodeStatusActive, 1, now, "usr_1", "dev_1", controlplane.ProductAutoLive).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET device_id = $2, device_bound_at = CURRENT_TIMESTAMP")).WithArgs("access-hash", "dev_1", controlplane.ProductAutoLive).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectNormalizedAuditTargetProduct(mock, "devices", "dev_1", controlplane.ProductAutoLive)
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-1", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
@@ -75,6 +76,7 @@ func TestPostgresRepositoryActivateDeviceAuditFailureRollsBackBusinessTransactio
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO devices (id, user_id, product, device_key, device_name, platform, client_version, status, last_heartbeat_at)")).WithArgs("dev_1", "usr_1", controlplane.ProductAutoLive, "state-device/dev_1", "Demo", "windows", "1.0.0", controlplane.DeviceStatusActive, now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE activation_codes SET status = $2, bound_devices = $3, used_at = COALESCE(used_at, $4), used_by_user_id = COALESCE(used_by_user_id, $5), used_by_device_id = COALESCE(used_by_device_id, $6)")).WithArgs("ac_1", controlplane.ActivationCodeStatusUsed, 1, now, "usr_1", "dev_1", controlplane.ProductAutoLive).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET device_id = $2, device_bound_at = CURRENT_TIMESTAMP")).WithArgs("access-hash", "dev_1", controlplane.ProductAutoLive).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectNormalizedAuditTargetProduct(mock, "devices", "dev_1", controlplane.ProductAutoLive)
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-fail", sqlmock.AnyArg(), now).WillReturnError(errors.New("outbox unavailable"))
 	mock.ExpectRollback()
 

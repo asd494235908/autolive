@@ -28,6 +28,7 @@ func TestPostgresRepositoryDisableDeviceCommitsLifecycle(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE model_leases SET status = $2, released_at = $3")).WithArgs("dev_1", controlplane.ModelLeaseStatusReleased, now, controlplane.ModelLeaseStatusActive).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP")).WithArgs("dev_1").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE devices SET status = $2 WHERE id = $1")).WithArgs("dev_1", controlplane.DeviceStatusDisabled).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectNormalizedAuditTargetProduct(mock, "devices", "dev_1", controlplane.ProductAutoLive)
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-disable", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
@@ -61,6 +62,7 @@ func TestPostgresRepositoryUnbindDeviceCommitsLifecycle(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE model_leases SET status = $2, released_at = $3")).WithArgs("dev_1", controlplane.ModelLeaseStatusReleased, now, controlplane.ModelLeaseStatusActive).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP")).WithArgs("dev_1").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE devices SET user_id = NULL, status = $2 WHERE id = $1")).WithArgs("dev_1", controlplane.DeviceStatusPendingActivation).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectNormalizedAuditTargetProduct(mock, "devices", "dev_1", controlplane.ProductAutoLive)
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-unbind", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 

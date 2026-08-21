@@ -41,9 +41,6 @@ func (s *PostgresRepository) RecordAuditWithOutbox(ctx context.Context, input co
 	if err != nil {
 		return err
 	}
-	if err := validateNormalizedAuditTargetProduct(operationCtx, tx, input); err != nil {
-		return err
-	}
 	if err := s.enqueueAuditOutboxTx(operationCtx, tx, input, now); err != nil {
 		return postgresOperationError(operationCtx, err)
 	}
@@ -63,6 +60,9 @@ func (s *PostgresRepository) enqueueAuditOutboxTx(ctx context.Context, tx *sql.T
 	}
 	input, err := normalizeAuditInput(input)
 	if err != nil {
+		return err
+	}
+	if err := validateNormalizedAuditTargetProduct(ctx, tx, input); err != nil {
 		return err
 	}
 	outboxID, err := newRepositoryID("audit_outbox")

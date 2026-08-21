@@ -192,6 +192,59 @@ func TestTask4AuditTargetProductMismatchIsRejected(t *testing.T) {
 	}
 }
 
+func TestTask4ModelAccountAuditTargetIsStrictlyProductScoped(t *testing.T) {
+	repository := store.NewMemoryStore(time.Now)
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.ModelPoolAccounts["account_douyin"] = controlplane.ModelPoolAccountSummary{
+			ID: "account_douyin", Product: controlplane.ProductDouyinDesktop, Provider: "openai", Model: "gpt", Status: controlplane.ModelAccountStatusActive,
+		}
+		state.ModelPoolAccounts["account_null"] = controlplane.ModelPoolAccountSummary{
+			ID: "account_null", Product: "", Provider: "openai", Model: "gpt", Status: controlplane.ModelAccountStatusActive,
+		}
+		state.ModelPoolAccounts["account_invalid"] = controlplane.ModelPoolAccountSummary{
+			ID: "account_invalid", Product: controlplane.ProductCode("invalid_product"), Provider: "openai", Model: "gpt", Status: controlplane.ModelAccountStatusActive,
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		target string
+		want   error
+	}{
+		{name: "cross product", target: "account_douyin", want: controlplane.ErrForbidden},
+		{name: "null product", target: "account_null", want: controlplane.ErrForbidden},
+		{name: "invalid product", target: "account_invalid", want: controlplane.ErrForbidden},
+		{name: "missing success target", target: "account_missing", want: controlplane.ErrForbidden},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := NewControlPlane(repository).RecordAuditForProduct(context.Background(), controlplane.ProductAutoLive, controlplane.AuditLogInput{
+				Action: "POST /api/v1/admin/model-pool", TargetType: "model_account", TargetID: tt.target, Outcome: "success", StatusCode: 200,
+			})
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("RecordAuditForProduct() error = %v, want %v", err, tt.want)
+			}
+		})
+	}
+
+	if err := NewControlPlane(repository).RecordAuditForProduct(context.Background(), controlplane.ProductAutoLive, controlplane.AuditLogInput{
+		Action: "POST /api/v1/admin/model-pool", TargetType: "model_account", TargetID: "account_missing", Outcome: "failure", StatusCode: 404,
+	}); err != nil {
+		t.Fatalf("RecordAuditForProduct(failure) error = %v, want nil", err)
+	}
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		if len(state.AuditLogs) != 1 {
+			t.Fatalf("audit log count = %d, want 1", len(state.AuditLogs))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTask4ProductFilteredPagesDoNotMixProducts(t *testing.T) {
 	repository := store.NewMemoryStore(time.Now)
 	if err := repository.Run(context.Background(), func(state *store.State) error {

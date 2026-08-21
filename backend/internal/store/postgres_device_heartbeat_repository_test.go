@@ -30,6 +30,7 @@ func TestPostgresRepositoryRecordHeartbeatWithSessionBindingCommitsTogether(t *t
 	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO idempotency_records (scope, idempotency_key, fingerprint, resource_id, created_at)")).WithArgs("control-plane-state", "heartbeat:usr_1:dev_1:heartbeat-key", "fp-1", sqlmock.AnyArg(), now).WillReturnRows(sqlmock.NewRows([]string{"fingerprint", "resource_id"}).AddRow("fp-1", "dev_1"))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE devices SET disk_free_bytes = $2")).WithArgs("dev_1", int64(1024), int64(4096), int64(2048), 8, "windows", "11", "kernel", "demo.mp4", "playing", now, controlplane.ProductAutoLive).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET device_id = $2, device_bound_at = CURRENT_TIMESTAMP")).WithArgs("access-hash", "dev_1", controlplane.ProductAutoLive).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectNormalizedAuditTargetProduct(mock, "devices", "dev_1", controlplane.ProductAutoLive)
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-1", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 

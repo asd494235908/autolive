@@ -41,6 +41,7 @@ func TestPostgresRepositoryCreateModelLeaseUsesNormalizedTransaction(t *testing.
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT a.id\n\t\tFROM model_accounts a")).WithArgs("openai", "gpt", controlplane.ModelAccountStatusActive, now, dayStart, dayEnd).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("mpa_1"))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, provider, model, base_url, secret_ref, status, priority,")).WithArgs("mpa_1").WillReturnRows(sqlmock.NewRows([]string{"id", "provider", "model", "base_url", "secret_ref", "status", "priority", "concurrency_limit", "daily_token_limit", "cooldown_until"}).AddRow("mpa_1", "openai", "gpt", "https://api.example.test", "model-account/mpa_1", controlplane.ModelAccountStatusActive, 2, 2, 0, nil))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO model_leases (id, account_id, user_id, device_id, purpose, status, expires_at, created_at, released_at, provider, model, proxy_mode, concurrency_limit)")).WithArgs(sqlmock.AnyArg(), "mpa_1", "usr_1", "dev_1", "chat", controlplane.ModelLeaseStatusActive, now.Add(5*time.Minute), now, "openai", "gpt", controlplane.ModelLeaseProxyModeDirectLease, 2).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectNormalizedAuditTargetProduct(mock, "devices", "dev_1", controlplane.ProductAutoLive)
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-create-lease", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
@@ -135,6 +136,8 @@ func TestPostgresRepositoryRenewModelLeaseUsesNormalizedTransaction(t *testing.T
 	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO idempotency_records (scope, idempotency_key, fingerprint, resource_id, created_at)")).WithArgs("control-plane-state", "renew-model-lease:lease_1:renew-key", "fp-1", "lease_1", now).WillReturnRows(sqlmock.NewRows([]string{"fingerprint", "resource_id"}).AddRow("fp-1", "lease_1"))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT provider, model, base_url, status, concurrency_limit, daily_token_limit")).WithArgs("mpa_1").WillReturnRows(sqlmock.NewRows([]string{"provider", "model", "base_url", "status", "concurrency_limit", "daily_token_limit"}).AddRow("openai", "gpt", "https://api.example.test", controlplane.ModelAccountStatusActive, 2, 0))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE model_leases SET expires_at = $2, provider = $3, model = $4, proxy_mode = $5, concurrency_limit = $6")).WithArgs("lease_1", now.Add(10*time.Minute), "openai", "gpt", controlplane.ModelLeaseProxyModeDirectLease, 2).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectNormalizedAuditTargetProduct(mock, "devices", "dev_1", controlplane.ProductAutoLive)
+	expectNormalizedAuditTargetProduct(mock, "model_leases", "lease_1", controlplane.ProductAutoLive)
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-renew-lease", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
@@ -168,6 +171,8 @@ func TestPostgresRepositoryReleaseModelLeaseUsesNormalizedTransaction(t *testing
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, account_id, user_id, device_id, purpose, status, expires_at,")).WithArgs("lease_1").WillReturnRows(sqlmock.NewRows([]string{"id", "account_id", "user_id", "device_id", "purpose", "status", "expires_at", "created_at", "released_at", "provider", "model", "proxy_mode", "concurrency_limit"}).AddRow("lease_1", "mpa_1", "usr_1", "dev_1", "chat", controlplane.ModelLeaseStatusActive, now.Add(time.Hour), now.Add(-time.Minute), nil, "openai", "gpt", controlplane.ModelLeaseProxyModeDirectLease, 2))
 	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO idempotency_records (scope, idempotency_key, fingerprint, resource_id, created_at)")).WithArgs("control-plane-state", "release-model-lease:lease_1:release-key", "fp-1", "lease_1", now).WillReturnRows(sqlmock.NewRows([]string{"fingerprint", "resource_id"}).AddRow("fp-1", "lease_1"))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE model_leases SET status = $2, released_at = $3 WHERE id = $1")).WithArgs("lease_1", controlplane.ModelLeaseStatusReleased, now).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectNormalizedAuditTargetProduct(mock, "devices", "dev_1", controlplane.ProductAutoLive)
+	expectNormalizedAuditTargetProduct(mock, "model_leases", "lease_1", controlplane.ProductAutoLive)
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-release-lease", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
@@ -199,6 +204,7 @@ func TestPostgresRepositoryReclaimModelLeaseUsesNormalizedTransaction(t *testing
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, account_id, user_id, device_id, purpose, status, expires_at,")).WithArgs("lease_1").WillReturnRows(sqlmock.NewRows([]string{"id", "account_id", "user_id", "device_id", "purpose", "status", "expires_at", "created_at", "released_at", "provider", "model", "proxy_mode", "concurrency_limit"}).AddRow("lease_1", "mpa_1", "usr_1", "dev_1", "chat", controlplane.ModelLeaseStatusActive, now.Add(time.Hour), now.Add(-time.Minute), nil, "openai", "gpt", controlplane.ModelLeaseProxyModeDirectLease, 2))
 	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO idempotency_records (scope, idempotency_key, fingerprint, resource_id, created_at)")).WithArgs("control-plane-state", "admin-reclaim-model-lease:lease_1:reclaim-key", "fp-1", "lease_1", now).WillReturnRows(sqlmock.NewRows([]string{"fingerprint", "resource_id"}).AddRow("fp-1", "lease_1"))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE model_leases SET status = $2, released_at = $3 WHERE id = $1")).WithArgs("lease_1", controlplane.ModelLeaseStatusReleased, now).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectNormalizedAuditTargetProduct(mock, "model_leases", "lease_1", controlplane.ProductAutoLive)
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-reclaim-lease", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 

@@ -117,13 +117,16 @@ func validateNormalizedAuditTargetProduct(ctx context.Context, tx *sql.Tx, input
 				return controlplane.ErrForbidden
 			}
 			if errors.Is(conflictErr, sql.ErrNoRows) {
-				return nil
+				if input.Outcome == "failure" {
+					return nil
+				}
+				return controlplane.ErrForbidden
 			}
 			return postgresOperationError(ctx, fmt.Errorf("validate conflicting audit %s product: %w", table, conflictErr))
 		}
 		return postgresOperationError(ctx, fmt.Errorf("validate audit %s product: %w", table, err))
 	}
-	if input.DeviceID != "" {
+	if input.DeviceID != "" && !(input.TargetType == "device" && input.TargetID == input.DeviceID) {
 		if err := check("devices", input.DeviceID); err != nil {
 			return err
 		}
@@ -134,6 +137,7 @@ func validateNormalizedAuditTargetProduct(ctx context.Context, tx *sql.Tx, input
 	table := map[string]string{
 		"device":          "devices",
 		"activation_code": "activation_codes",
+		"model_account":   "model_accounts",
 		"model_lease":     "model_leases",
 		"model_usage":     "model_usage_records",
 	}[input.TargetType]
