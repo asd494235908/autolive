@@ -1,8 +1,8 @@
-# Phase 8：公共配置 Schema
+# Phase 9：公共配置 Schema
 
 Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-production-readiness.md)
 状态：Not Started
-最后更新：2026-08-21
+最后更新：2026-08-22
 
 ## 目标
 
@@ -10,9 +10,9 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 ## 主 PRD 上下文
 
-- 目标：G-7
-- 成功标准：SC-7
-- 需求：FR-22～FR-24，NFR-1、NFR-2、NFR-4、NFR-6
+- 目标：G-7、G-8
+- 成功标准：SC-7、SC-9
+- 需求：FR-22～FR-24、FR-34、FR-35，NFR-1、NFR-2、NFR-4、NFR-6、NFR-12
 - 场景：公共配置管理员发布与客户端读取
 
 ## 阶段发现门禁
@@ -30,6 +30,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - namespace/schema versions/config revisions 事实、Draft 2020-12 校验和审计。
 - 受信本地 `$ref` registry、大小/复杂度上限、dry-run、原子发布/回滚。
 - 客户端只读已发布 revision、ETag 与 schema version。
+- React namespace/Schema/revision 列表、校验 dry-run、发布和回滚管理页。
 
 ### 不包含
 
@@ -46,6 +47,8 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] 发布顺序为 namespace 存在 → Schema 编译 → 实例校验 → 敏感字段扫描 → 幂等发布/审计。
 - [ ] 新 Schema 发布前对当前已发布和保留 revision dry-run，导出有界 JSON Pointer 错误而不返回敏感值。
 - [ ] 客户端 GET 返回 namespace/schema version/revision/ETag，未变更支持 304，回滚只切换指针不改写历史内容。
+- [ ] 使用 `public_config.read/manage/publish/rollback` 分离浏览、Schema/revision 管理、发布和回滚。
+- [ ] React 编辑与 dry-run 显示有界 JSON Pointer 错误，使用 Ant Design 表单/表格/弹窗，不将敏感值或过大完整实例放入通知。
 
 ## 验证策略
 
@@ -58,6 +61,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] 敏感字段在 Schema 允许时仍被第二层规则拒绝
 - [ ] dry-run 不修改指针，发布和回滚幂等，ETag/304 一致
 - [ ] 校验错误不泄露配置值/内部 Schema 路径
+- [ ] React typecheck/test/build 和读取/管理/发布/回滚/403/dry-run 失败的浏览器冒烟通过
 
 ## 退出标准
 
@@ -72,3 +76,4 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 ## 发现/决策
 
 - 2026-08-21：规划 JSON Schema Draft 2020-12、版本化 namespace 与无远程 `$ref` 校验，本轮未实施。
+- 2026-08-22：纳入 React 公共配置管理页与读/管理/发布/回滚权限。

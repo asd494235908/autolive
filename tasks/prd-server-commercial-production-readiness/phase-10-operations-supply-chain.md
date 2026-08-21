@@ -1,8 +1,8 @@
-# Phase 9：生产运维与供应链
+# Phase 10：生产运维与供应链
 
 Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-production-readiness.md)
 状态：Not Started
-最后更新：2026-08-21
+最后更新：2026-08-22
 
 ## 目标
 
@@ -10,9 +10,9 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 ## 主 PRD 上下文
 
-- 目标：G-6
-- 成功标准：SC-6、SC-8
-- 需求：FR-25～FR-28，NFR-2、NFR-4～NFR-10
+- 目标：G-6、G-8
+- 成功标准：SC-6、SC-8、SC-9
+- 需求：FR-25～FR-28、FR-34、FR-35，NFR-2、NFR-4～NFR-12
 - 场景：所有场景的生产保障
 
 ## 阶段发现门禁
@@ -31,6 +31,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - PostgreSQL + 对象存储加密备份、隔离恢复、RPO/RTO 证据和 Runbook。
 - Prometheus 业务/运维指标和 OpenTelemetry OTLP traces。
 - CI 制品签名、SBOM/Provenance、签名验证、发布清单、迁移/回滚与服务器无构建门禁。
+- React 运维视图：Worker 积压/死信、备份新鲜度/恢复演练摘要、存储容量、发布验证与告警链接。
 
 ### 不包含
 
@@ -50,6 +51,8 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] CI 使用托管 OIDC 生成签名/SBOM/SLSA Provenance，所有 Action/基础镜像/工具版本可复现并受门禁。
 - [ ] 部署前验证签名身份、issuer、workflow/ref、subject digest、SBOM/Provenance、迁移版本与回滚清单；服务器脚本不含构建命令。
 - [ ] 进行一次签名制品发布、迁移、健康验收、回滚/前滚和服务器重启演练。
+- [ ] 将只读运维视图绑定 `operations.read`，将重试/解除冻结/发布等操作绑定 `operations.manage` 或对应领域权限，不在前端暴露密钥或预签名 URL。
+- [ ] React 运维页只显示低基数摘要和有界运维记录，通过明确开放链接跳转外部指标/trace 系统，不在管理端重造监控平台。
 
 ## 验证策略
 
@@ -61,7 +64,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] 备份缺失/损坏/密钥不可用、隔离恢复、数据/对象核对与实际 RPO/RTO 记录
 - [ ] metrics 无高基数/秘密，trace 可关联 HTTP→DB→Worker→provider 且 exporter 故障不拖垮业务
 - [ ] 错误签名、issuer、workflow/ref、digest、Provenance 和 SBOM 任一失败均阻止发布
-- [ ] `go test ./...`、Race、Vet、Build、govulncheck、PostgreSQL integration、OpenAPI、现有消费端契约兼容检查与镜像冒烟全通过
+- [ ] `go test ./...`、Race、Vet、Build、govulncheck、PostgreSQL integration、OpenAPI、React typecheck/test/build/浏览器冒烟、Rust 契约兼容检查与镜像冒烟全通过
 - [ ] 服务器无源码、无 Go/pnpm/Rust/Docker 构建，只验证/加载/迁移/启动/冒烟
 
 ## 退出标准
@@ -78,3 +81,4 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 ## 发现/决策
 
 - 2026-08-21：规划保留 Prometheus 作为指标事实源、使用 OpenTelemetry OTLP 增加 tracing，并以签名/Provenance 验证作为发布门禁；本轮未实施。
+- 2026-08-22：纳入受权限保护的 React 运维摘要页，明确不在管理端重造指标/trace 平台。

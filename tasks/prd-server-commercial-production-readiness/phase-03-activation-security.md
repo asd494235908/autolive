@@ -1,24 +1,25 @@
-# Phase 2：激活码安全管理
+# Phase 3：激活码安全管理
 
 Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-production-readiness.md)
 状态：Not Started
-最后更新：2026-08-21
+最后更新：2026-08-22
 
 ## 目标
 
-为新激活码增加独立加密明文存储与安全重显，建立逐设备绑定事实，并支持容量修改和已知绑定设备切换。
+为新激活码增加独立加密明文存储与安全重显，建立逐设备绑定事实，并在 React 管理端支持容量修改和已知绑定设备切换。
 
 ## 主 PRD 上下文
 
-- 目标：G-4
-- 成功标准：SC-4
-- 需求：FR-14～FR-17，NFR-1、NFR-2、NFR-6、NFR-8
-- 场景：场景 4
+- 目标：G-4、G-8
+- 成功标准：SC-4、SC-9
+- 需求：FR-14～FR-17、FR-34、FR-35，NFR-1、NFR-2、NFR-6、NFR-8、NFR-12
+- 场景：场景 5
 
 ## 阶段发现门禁
 
 - [ ] 重读激活码多设备设计/计划、迁移 0011/0022 和所有核销/解绑/到期 reader
 - [ ] 重读 `sql_secret_store.go`、密钥配置、审计失败关闭和限流规则
+- [ ] 重读 Phase 2 权限目录、现有激活码管理页、API 调用与详情交互
 - [ ] 核对生产 HTTPS 、管理员密码二次验证方式和密钥轮换运维责任
 - [ ] 查询生产库中 `bound_devices > 1` 的历史数量，不读取/导出明文秘密
 - [ ] 如历史语义与假设不同，先修订 PRD 与回填方案
@@ -30,6 +31,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - `activation_code_secrets` 独立表、AAD/key id/version 和多密钥读取。
 - `activation_code_device_bindings` 的 slot 与历史未知状态。
 - 详情、reveal、容量 PATCH 和 binding switch API。
+- React 激活码详情中的绑定列表、容量修改、二次认证重显和切换设备交互。
 - 核销、解绑、到期、会话和租约路径的绑定事实同步。
 
 ### 不包含
@@ -48,11 +50,13 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] 实现容量状态机：1～100、不低于已核销、过期/作废拒绝、上调后重新可核销。
 - [ ] 实现切换事务：稳定锁顺序、目标待激活/无主且无活动绑定、旧会话/租约撤销、复用 slot 和审计 Outbox。
 - [ ] 修正解绑和到期 reader，使绑定明细成为设备到期/归属事实，不再只依赖首台设备字段。
-- [ ] 更新 OpenAPI、错误码和服务端架构/密钥文档；不在本专项实现管理页面。
+- [ ] 将读取、容量修改、明文重显和设备切换分别绑定 `activation_codes.*` 固定权限点。
+- [ ] 用 Ant Design `Descriptions`、`Table`、`InputNumber`、`Modal`、`Form` 和认证字段完成管理交互；明文默认隐藏，不进入 URL、持久 Store 或通知详情。
+- [ ] 更新 OpenAPI、错误码、React 生成类型和服务端/管理端/密钥文档。
 
 ## 验证策略
 
-密码学单元测试 + 服务/路由安全测试 + PostgreSQL 事务/并发/故障集成测试 + HTTPS 管理流程冒烟。
+密码学单元测试 + 服务/路由安全测试 + PostgreSQL 事务/并发/故障集成测试 + React 权限/交互测试 + HTTPS 管理流程冒烟。
 
 ## 验证清单
 
@@ -61,6 +65,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] 容量修改与并发核销，切换与解绑/禁用竞态，幂等重试与提交结果未知
 - [ ] 历史回填数量守恒，`legacy_unavailable`/`legacy_unknown` 清晰返回
 - [ ] Go 全量、Race、PostgreSQL integration、OpenAPI 和 API 管理流程验证通过
+- [ ] React typecheck/test/build 和浏览器冒烟覆盖无权限、二次认证、取消、失败与成功后敏感状态清理
 
 ## 退出标准
 
@@ -75,3 +80,4 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 ## 发现/决策
 
 - 2026-08-21：选定独立激活码加密表，本轮未开始实施。
+- 2026-08-22：纳入 React 激活码安全管理页和固定权限点。

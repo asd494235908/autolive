@@ -8,15 +8,15 @@
 - 活动阶段文件：无（本轮不实施）
 - 上下文：[context.md](./prd-server-commercial-production-readiness/context.md)
 - 设计：[服务端商业化与生产能力补齐设计](../docs/superpowers/specs/2026-08-21-服务端商业化与生产能力补齐设计.md)
-- 最后更新：2026-08-21
+- 最后更新：2026-08-22
 - PRD 文件：`tasks/prd-server-commercial-production-readiness.md`
-- 目的：作为 Go 服务端商业化、安全发布和生产运维的活文档与执行事实源。
+- 目的：作为 Go 服务端商业化、React 管理面、安全发布和生产运维的活文档与执行事实源。
 
 ## 问题
 
-当前 Go 控制面已具备用户、设备、激活码、模型号池、租约、用量、审计、PostgreSQL 与部分保留清理/指标能力，但缺少完整商业资源查询、生产支付、密码重置投递、对象存储发布、制品签名验证、备份恢复、追踪和 namespace 级配置 Schema。现有激活码仅保存哈希和首个核销设备，无法再次显示新功能上线前的明文，也无法准确管理全部历史设备绑定。
+当前 Go 控制面已具备用户、设备、激活码、模型号池、租约、用量、审计、PostgreSQL 与部分保留清理/指标能力，但缺少完整商业资源查询、生产支付、密码重置投递、对象存储发布、制品签名验证、备份恢复、追踪和 namespace 级配置 Schema。管理权限目前只有 `admin/user` 粗粒度角色，`/api/v1/admin/*` 统一经过 `requireAdmin`；React 管理端只验证会话，所有导航和路由对已登录管理员全部可见。现有激活码仅保存哈希和首个核销设备，无法再次显示新功能上线前的明文，也无法准确管理全部历史设备绑定。
 
-本专项的实施边界全部位于服务端：Go API/领域服务、PostgreSQL/Secret Store、服务端 Worker、支付/邮件/对象存储适配器、服务端发布 CI 和生产运维。React 管理页与 Rust/Tauri 客户端不在本专项实施范围；OpenAPI 只提供可消费契约，消费端功能如需开发必须另立任务。
+本专项的实施边界包含 Go 服务端和 React 管理端：Go API/领域服务、PostgreSQL/Secret Store、服务端 Worker、支付/邮件/对象存储适配器、服务端发布 CI、生产运维，以及基于 Ant Design 的角色权限和业务管理页。Rust/Tauri 桌面客户端仍不在本专项实施范围。
 
 ## 目标
 
@@ -27,6 +27,7 @@
 - G-5：在服务端使用私有对象存储、短时预签名 URL、签名清单、SBOM 和 Provenance 建立外部制品分发链。
 - G-6：将数据保留、备份/恢复、指标/追踪、容量告警和可验证 CI 发布变成上线门禁。
 - G-7：每个公共配置 namespace 通过版本化 JSON Schema Draft 2020-12 校验后才能发布。
+- G-8：使用自定义角色与服务端固定权限点实现管理员最小权限，并在 React 管理端中提供角色配置、用户角色分配和按权限展示的业务页。
 
 ## 非目标
 
@@ -35,7 +36,7 @@
 - NG-3：首期不做退款、优惠券、发票、多币种、短信重置和多支付渠道。
 - NG-4：不预先拆微服务、引入 Kubernetes 或外部消息队列。
 - NG-5：本轮只保存规划文档，不修改 OpenAPI、代码、数据库或生产环境。
-- NG-6：本专项不实现 React 管理页面、Rust/Tauri 下载器、客户端安装器或客户端签名验证逻辑；这些消费端能力另立集成任务。
+- NG-6：本专项不实现 Rust/Tauri 下载器、客户端安装器或客户端签名验证逻辑；桌面端消费能力另立集成任务。
 
 ## 成功标准
 
@@ -47,34 +48,41 @@
 - SC-6：达到已验证的 RPO≤24h、RTO≤4h，备份恢复、回滚、指标告警和 trace 链路有可复现证据。
 - SC-7：未注册 namespace、Schema 无效、实例校验失败、包含敏感字段或依赖远程 `$ref` 的公共配置不能发布。
 - SC-8：服务器不构建源码，只加载经 CI 验证和签名的发布制品。
+- SC-9：管理员可持有多个自定义角色，有效权限为固定权限点并集；服务端对每个受保护操作即时鉴权，React 导航、路由、按钮和 403 状态与当前权限一致，且无法通过直接调用 API 绕过。
 
 ## 关键场景
 
-### 场景 1：管理员调查商业事实
+### 场景 1：超级管理员分配最小权限
+
+- 操作者：超级管理员
+- 触发：创建自定义角色，从固定权限点中选择能力，再绑定给一个或多个管理员
+- 结果：权限立即生效，不得授予操作者自身不具备的权限，角色变更可审计且不能删除最后一个超级管理员
+
+### 场景 2：管理员调查商业事实
 
 - 操作者：管理员
 - 触发：按用户、状态、套餐版本和时间窗口筛选订单/订阅
 - 结果：获得有界分页结果与详情，不暴露支付凭证或原始通知
 
-### 场景 2：微信支付交付订阅
+### 场景 3：微信支付交付订阅
 
 - 操作者：普通用户、微信支付、支付 Worker
 - 触发：用户为固定套餐版本创建订单并扫码支付
 - 结果：验签、解密、幂等落库和对账通过后，订单变为已支付并交付一份订阅权益
 
-### 场景 3：用户自助重置密码
+### 场景 4：用户自助重置密码
 
 - 操作者：用户、投递 Worker
 - 触发：用户提交账号标识，Worker 向已验证邮箱发送一次性重置链接
 - 结果：外部响应不泄露账号是否存在，Token 单次消费后撤销用户已有会话
 
-### 场景 4：管理员管理激活码
+### 场景 5：管理员管理激活码
 
 - 操作者：管理员
 - 触发：二次认证后重显新激活码，或修改容量/切换已知设备
 - 结果：敏感读取受限流和审计保护；切换不增加已核销名额且旧会话失效
 
-### 场景 5：客户端下载可信制品
+### 场景 6：客户端下载可信制品
 
 - 操作者：CI、服务端、已授权客户端
 - 触发：CI 上传已签名制品，客户端请求短时下载
@@ -84,6 +92,8 @@
 
 - 证据、当前系统和验证面见 [context.md](./prd-server-commercial-production-readiness/context.md)。
 - 当前 Router 只有用户、设备、激活码、模型账号/租约/用量和审计管理路由，未见订阅、订单、套餐版本或支付领域。
+- 当前服务端只有 `admin/user` 角色和统一 `requireAdmin`；未见权限目录、自定义角色、用户-角色绑定表或按动作鉴权。
+- React 管理端目前只有会话守卫，导航、路由和页面操作未按权限点过滤。
 - 当前设备有列表/详情，但缺少本 PRD 要求的完整筛选与排序契约。
 - 现有保留 Worker 和 Prometheus 是可复用基础；保留范围、容量告警、备份恢复和 tracing 未形成生产闭环。
 - 现有制品链能生成 SHA-256、SBOM 和 BuildKit Provenance，运行资源通过 SSH/rsync 发布并验证清单；尚无对象存储、下载授权、签名身份和下游 Provenance 验证。
@@ -121,6 +131,13 @@
 - FR-26：PostgreSQL 和对象存储有加密备份、失效域隔离、保留和隔离恢复演练。
 - FR-27：Prometheus 增加商业/Worker/存储/备份/发布低基数指标，OpenTelemetry 通过 OTLP 导出 HTTP、DB、Worker 和供应商追踪。
 - FR-28：CI 生成和签名 SBOM/Provenance，部署和对象存储发布前都要验证，服务器不构建源码。
+- FR-29：权限目录是服务端固定、版本化的权限点集合，自定义角色只能组合已登记权限点，管理员不能创建任意权限代码。
+- FR-30：一个管理员可绑定多个角色，有效权限取并集；首期不提供用户级 allow/deny 覆盖，避免第二个权限事实源。
+- FR-31：系统保留内建 `super_admin` 角色；本地管理员永久具有超级权限，现有 `role=admin` 账号通过可审查迁移保持兼容，且系统不得移除最后一个可用超级管理员。
+- FR-32：受保护管理 API 使用按权限点鉴权的 `requirePermission` 等价边界，每次请求计算当前有效权限，不把长期可过期权限快照作为 Token 中的唯一授权依据。
+- FR-33：提供当前管理员/权限目录、角色 CRUD 和用户角色分配 API；写操作具有幂等、防越权委派、最后超管保护和审计。
+- FR-34：React 管理端通过 `/api/v1/admin/me` 或等价契约获取当前角色与权限，按权限控制导航、路由、按钮和操作列，并提供统一无权限/403 状态；前端隐藏不替代服务端鉴权。
+- FR-35：React 管理端提供角色管理、用户角色分配，以及套餐版本、订单、订阅、支付/对账、密码重置投递、激活码安全操作、制品发布、公共配置和运维状态页，统一使用 Ant Design 和 OpenAPI 生成契约。
 
 ### 非功能需求
 
@@ -134,6 +151,8 @@
 - NFR-8：生产明文激活码、微信支付和制品下载仅通过 HTTPS。
 - NFR-9：首期备份目标 RPO≤24h、RTO≤4h，只有隔离恢复演练可作为达标证据。
 - NFR-10：服务端新代码按领域拆分文件，复用现有 Outbox、幂等、限流和可观测边界，删除本次暴露的未使用 Go 代码/导入/配置。
+- NFR-11：服务端是授权唯一权威，角色变更在后续请求中即时生效；权限查询有索引和有界资源使用，不引入第二个不可审计缓存事实源。
+- NFR-12：React 管理页覆盖 loading、empty、error、403 和请求竞态/取消，具备键盘、焦点和可读标签等基本可访问性，不覆盖 Ant Design 内部样式。
 
 ## 假设
 
@@ -142,10 +161,12 @@
 - A-3：对象存储提供 S3-compatible 基本语义；具体厂商、区域和 CDN 在 Phase 7 发现门禁确认。
 - A-4：保留 Prometheus 指标，首期只用 OpenTelemetry 增加 tracing，避免重复指标事实源。
 - A-5：功能上线前的激活码明文无法恢复；历史多设备除首台外无法准确归属。
+- A-6：首期权限冲突按角色并集解决，不定义 deny 优先级；业务资源范围权限在需求出现前不预留通用策略引擎。
 
 ## 依赖/约束
 
 - 现有 PostgreSQL normalized 读写、Outbox、会话、限流、Prometheus、OpenAPI 契约门禁和 CI 构建链。
+- 现有 React/Vite/TypeScript 管理端、Ant Design、路由/会话守卫和 OpenAPI 生成类型链。
 - 微信支付商户号、APPID、API v3 密钥、商户私钥/证书或微信支付公钥；所有秘密由 Secret Store/外部秘密注入管理。
 - 受控邮件投递凭证、可信域名、重置链接 origin 和已验证用户邮箱数据。
 - 私有对象存储、托管 CI OIDC 身份、Sigstore/GitHub Attestation 能力和服务端发布验证信任策略。
@@ -159,29 +180,32 @@
 - 对象存储预签名 URL 泄露、无限制续期、签名者策略过宽或仅校验 SHA-256 会导致伪造制品被信任。
 - 备份可创建不等于可恢复；只有隔离恢复与业务核对能证明 RPO/RTO。
 - 不受限的 JSON Schema 远程 `$ref`、灾难正则、过大 Schema/实例或 Schema 变更可造成 SSRF/DoS/配置不兼容。
+- 自定义角色可能通过越权委派、并发更新或删除最后超管导致提权或锁死，必须在服务端事务中实施授权子集和最后超管保护。
+- React 菜单隐藏不是安全边界；会话中的陈旧权限、直达 URL 和手工 API 请求必须由服务端当前权限校验拒绝。
 
 ## 执行规则
 
-- 默认按 Phase 1～9 顺序执行；任何并行都必须使用不重叠写入集，由主线统一审查。
+- 默认按 Phase 1～10 顺序执行；任何并行都必须使用不重叠写入集，由主线统一审查。
 - 实施任一阶段前读本 PRD、当前 Phase、context 和对应专项约束。
 - 每阶段先写失败测试/等价验证，再写实现；OpenAPI 变更先于手写 DTO/路由，生成文件不手改。
 - 外部供应商和平台规则在阶段开始时重新查阅官方文档，不依赖本 PRD 的时点性记忆。
 - 服务器只接收本地/CI 构建且签名的制品，不上传源码构建。
-- 每阶段结束后更新当前 Phase、主 PRD 和受影响的后续 Phase，并完成服务端代码总监复核；消费端只做契约兼容检查，不在本专项修改业务代码。
+- 每阶段结束后更新当前 Phase、主 PRD 和受影响的后续 Phase，并完成 Go/React 代码总监复核；Rust/Tauri 只做契约兼容检查，不在本专项修改业务代码。
 
 ## 阶段索引
 
 | 阶段 | 状态 | 目标 | 验证重点 | 文件 |
 | --- | --- | --- | --- | --- |
 | Phase 1：契约与领域基线 | Not Started | 锁定资源、状态机、事务、错误码和迁移顺序 | 契约/迁移/安全边界 | [phase-01-contract-domain-baseline.md](./prd-server-commercial-production-readiness/phase-01-contract-domain-baseline.md) |
-| Phase 2：激活码安全管理 | Not Started | 加密明文、绑定明细、容量与切换 | 密钥/事务/历史兼容 | [phase-02-activation-security.md](./prd-server-commercial-production-readiness/phase-02-activation-security.md) |
-| Phase 3：商业核心事实 | Not Started | 套餐版本、订单、订阅和权益状态机 | 价格快照/幂等/并发 | [phase-03-commercial-core.md](./prd-server-commercial-production-readiness/phase-03-commercial-core.md) |
-| Phase 4：管理查询 API | Not Started | 补齐订阅、订单、套餐版本和设备查询/筛选 | SQL 分页/筛选/权限 | [phase-04-admin-query-apis.md](./prd-server-commercial-production-readiness/phase-04-admin-query-apis.md) |
-| Phase 5：微信支付 | Not Started | Native 下单、验签回调、对账和权益交付 | 官方 SDK/回调幂等/未知结果 | [phase-05-wechat-pay.md](./prd-server-commercial-production-readiness/phase-05-wechat-pay.md) |
-| Phase 6：密码重置 Worker | Not Started | 一次性 Token、邮件 Outbox 和可恢复投递 | 防枚举/限流/重试/死信 | [phase-06-password-reset-worker.md](./prd-server-commercial-production-readiness/phase-06-password-reset-worker.md) |
-| Phase 7：制品存储与下载 | Not Started | 对象存储、发布清单、签名校验和短时下载 | 真实性/授权/完整性 | [phase-07-artifact-distribution.md](./prd-server-commercial-production-readiness/phase-07-artifact-distribution.md) |
-| Phase 8：公共配置 Schema | Not Started | namespace 级 JSON Schema 注册、校验和发布 | Draft 2020-12/SSRF/兼容性 | [phase-08-public-config-schema.md](./prd-server-commercial-production-readiness/phase-08-public-config-schema.md) |
-| Phase 9：生产运维与供应链 | Not Started | 保留、备份恢复、指标/追踪、签名/Provenance 与发布 | RPO/RTO/告警/可验证发布 | [phase-09-operations-supply-chain.md](./prd-server-commercial-production-readiness/phase-09-operations-supply-chain.md) |
+| Phase 2：管理员 RBAC 与权限化管理壳 | Not Started | 固定权限点、自定义角色、多角色并集与 React 权限壳 | 防提权/立即生效/403 | [phase-02-admin-rbac.md](./prd-server-commercial-production-readiness/phase-02-admin-rbac.md) |
+| Phase 3：激活码安全管理 | Not Started | 加密明文、绑定明细、容量与切换管理页 | 密钥/事务/历史兼容 | [phase-03-activation-security.md](./prd-server-commercial-production-readiness/phase-03-activation-security.md) |
+| Phase 4：商业核心事实 | Not Started | 套餐版本、订单、订阅和权益状态机 | 价格快照/幂等/并发 | [phase-04-commercial-core.md](./prd-server-commercial-production-readiness/phase-04-commercial-core.md) |
+| Phase 5：管理查询 API 与管理页面 | Not Started | 补齐订阅、订单、套餐版本和设备查询/筛选及 React 页面 | SQL 分页/筛选/权限/URL 状态 | [phase-05-admin-query-apis.md](./prd-server-commercial-production-readiness/phase-05-admin-query-apis.md) |
+| Phase 6：微信支付 | Not Started | Native 下单、验签回调、对账、权益交付与支付管理页 | 官方 SDK/回调幂等/未知结果 | [phase-06-wechat-pay.md](./prd-server-commercial-production-readiness/phase-06-wechat-pay.md) |
+| Phase 7：密码重置 Worker | Not Started | 一次性 Token、邮件 Outbox、可恢复投递与管理页 | 防枚举/限流/重试/死信 | [phase-07-password-reset-worker.md](./prd-server-commercial-production-readiness/phase-07-password-reset-worker.md) |
+| Phase 8：制品存储与下载 | Not Started | 对象存储、发布清单、签名校验、短时下载与发布页 | 真实性/授权/完整性 | [phase-08-artifact-distribution.md](./prd-server-commercial-production-readiness/phase-08-artifact-distribution.md) |
+| Phase 9：公共配置 Schema | Not Started | namespace 级 JSON Schema 注册、校验、发布与管理页 | Draft 2020-12/SSRF/兼容性 | [phase-09-public-config-schema.md](./prd-server-commercial-production-readiness/phase-09-public-config-schema.md) |
+| Phase 10：生产运维与供应链 | Not Started | 保留、备份恢复、指标/追踪、签名/Provenance、发布和运维视图 | RPO/RTO/告警/可验证发布 | [phase-10-operations-supply-chain.md](./prd-server-commercial-production-readiness/phase-10-operations-supply-chain.md) |
 
 ## 全部阶段结束后的多轮复核
 
@@ -195,13 +219,15 @@
 - [ ] 8. 验证：单元、PostgreSQL 集成、API E2E、供应商沙箱/小额真实验收、恢复演练和发布签名校验适合风险。
 - [ ] 9. 文档/运维：OpenAPI、错误码、架构、Runbook、迁移、回滚、告警和支持文档同步。
 - [ ] 10. PRD 收尾：状态、变更记录、延期项和实际证据更新完成。
+- [ ] 11. 管理端验收：权限矩阵、直达 URL、操作按钮、403、加载/空/错误态和键盘/焦点通过类型检查、组件测试与浏览器冒烟。
 
 ## 开放问题
 
-- 在 Phase 5 开始前确认微信 Native 支付是否为首个上线交付形态；若改为 JSAPI/App/H5，必须先修订 Phase 5。
-- 在 Phase 6 开始前确认邮件供应商、发件域和用户邮箱验证流程。
-- 在 Phase 7 开始前确认对象存储厂商/区域/CDN、公司 CI 平台与签名信任根托管方式。
+- 在 Phase 6 开始前确认微信 Native 支付是否为首个上线交付形态；若改为 JSAPI/App/H5，必须先修订 Phase 6。
+- 在 Phase 7 开始前确认邮件供应商、发件域和用户邮箱验证流程。
+- 在 Phase 8 开始前确认对象存储厂商/区域/CDN、公司 CI 平台与签名信任根托管方式。
 
 ## 变更记录
 
 - 2026-08-21：创建拆分式主 PRD，纳入管理查询、微信支付、密码重置 Worker、激活码独立加密表、制品链、生产运维和 namespace 级 JSON Schema；根据用户要求全部作为服务端专项且本轮不实施。
+- 2026-08-22：根据确认方案纳入 React 管理端、自定义角色与固定权限点，将计划扩展为 10 个 Phase；Rust/Tauri 仍为非目标，本轮仍只更新文档。

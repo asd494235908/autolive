@@ -1,12 +1,13 @@
 # 服务端商业化与生产就绪：发现上下文
 
 Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-production-readiness.md)
-最后更新：2026-08-21
+最后更新：2026-08-22
 
 ## 已检查输入
 
 - 需求/架构：`AGENTS.md`、`产品需求文档.md`、`系统架构总览.md`、`管理系统架构.md`、`长任务开发总计划.md`、`服务端未完成功能长任务开发计划.md`、`数据库迁移与密钥存储约束.md`。
 - 契约/路由：`接口契约/openapi.yaml`、`backend/internal/httpapi/controlplane.go`、`backend/internal/httpapi/auth.go`、`backend/internal/httpapi/audit.go`、`backend/internal/httpapi/rate_limit.go`。
+- React 管理端：`admin-web/src/app/router.tsx`、`admin-web/src/app/AppLayout.tsx`、会话守卫/存储、现有管理页与 OpenAPI 生成类型调用。
 - 存储/迁移：`backend/migrations/0001～0022`、`backend/internal/store/repository.go`、`postgres_*_repository.go`、`sql_secret_store.go`、`retention_postgres.go`。
 - 运维/发布：`.github/workflows/backend-quality.yml`、`.github/workflows/desktop-package.yml`、`tools/check-backend-release.mjs`、`deploy/runtime-resources/*`。
 - 激活码专项：`docs/superpowers/specs/2026-08-21-激活码多设备绑定设计.md`、迁移 0022 及相关 service/store/httpapi 测试。
@@ -15,6 +16,8 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 ## 当前系统摘要
 
 - Go Router 已提供登录/Refresh/Logout、管理员换密码、用户、设备、激活码、模型账号、租约、用量和审计路由。
+- 当前用户只有 `admin` 与 `user` 两类角色，管理 API 统一使用 `requireAdmin` 检查 `actor.Role`；数据库未见权限目录、自定义角色、角色-权限和用户-角色关系表。
+- React 管理端的 `RequireSession` 只校验登录会话，`AppLayout` 对所有已登录管理员显示全部导航，Router 未实现按权限点的路由守卫和统一 403 页。
 - 未发现 subscriptions、orders、plans/plan versions、payment attempts 或 WeChat Pay 路由/领域/迁移。
 - 用户管理员可直接设置新密码并撤销会话，但未发现公开自助密码重置 Token、邮件投递 Outbox 或 Worker。
 - 设备已有列表/详情、心跳、禁用和解绑；需扩展固定白名单筛选、排序和索引。
@@ -29,6 +32,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 ## 可复用模式
 
 - OpenAPI 路由/错误码/DTO/生成类型门禁。
+- React 现有路由、会话守卫、Ant Design 布局/表单/表格和 OpenAPI 生成类型链，可在不手写重复 DTO 的前提下扩展权限化管理壳。
 - normalized Repository + PostgreSQL 短事务 + 行锁/唯一约束 + `COMMIT_OUTCOME_UNKNOWN`。
 - `Idempotency-Key` + 指纹冲突语义。
 - `audit_outbox` 和失败关闭审计。
@@ -40,7 +44,8 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 - Go：`gofmt -l .`、`go vet ./...`、`go test ./...`、`go test -race ./...`、`go build ./...`、`govulncheck`。
 - PostgreSQL：从空库执行全部迁移，`postgres_integration` 覆盖事务、并发、锁等待、断连、提交结果未知和查询计划。
-- 契约：OpenAPI YAML/本地 `$ref`、Router 路径/方法、Go 错误码/DTO；React/Rust 只执行现有生成契约兼容检查，不在本专项修改消费端业务代码。
+- 契约：OpenAPI YAML/本地 `$ref`、Router 路径/方法、Go 错误码/DTO 与 React 生成类型；Rust 只执行现有生成契约兼容检查。
+- React：格式化、Lint、TypeScript 类型检查、组件/路由权限测试、生产构建和浏览器冒烟；覆盖导航、直达 URL、按钮、403、loading/empty/error 与键盘/焦点。
 - 微信支付：官方 SDK fixture/回调样本、重入和金额不一致测试；上线门禁需要小额真实支付/查询验收。
 - 制品：服务端签名验证、错误 signer/issuer/ref/digest 拒绝、对象存储预签名 URL 时效/权限，以及向消费端返回签名清单和哈希元数据。
 - 运维：隔离恢复演练、故障注入、告警测试、trace 串联、SIGTERM 和 Worker 租约恢复。

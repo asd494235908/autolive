@@ -1,8 +1,8 @@
-# Phase 5：微信支付
+# Phase 6：微信支付
 
 Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-production-readiness.md)
 状态：Not Started
-最后更新：2026-08-21
+最后更新：2026-08-22
 
 ## 目标
 
@@ -10,17 +10,17 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 ## 主 PRD 上下文
 
-- 目标：G-2
-- 成功标准：SC-2
-- 需求：FR-7～FR-11，NFR-2～NFR-5、NFR-8
-- 场景：场景 2
+- 目标：G-2、G-8
+- 成功标准：SC-2、SC-9
+- 需求：FR-7～FR-11、FR-34、FR-35，NFR-2～NFR-5、NFR-8、NFR-12
+- 场景：场景 3
 
 ## 阶段发现门禁
 
 - [ ] 用户确认 Native/JSAPI/App/H5 中的首个支付形态；未变更时按 Native
 - [ ] 重读微信支付 API v3 官方 SDK、回调验签/解密、签名探测、公钥/平台证书轮换和订单查询文档
 - [ ] 确认商户号、APPID、回调 HTTPS 域名、API v3 密钥和私钥的 Secret Store/外部密钥边界
-- [ ] 确认 Phase 3 订单/订阅状态机和 Phase 4 管理查询已完成且不需要退款范围
+- [ ] 确认 Phase 4 订单/订阅状态机和 Phase 5 管理查询/页面已完成且不需要退款范围
 - [ ] 确认小额真实支付验收账号与资金处理责任人
 
 ## 范围
@@ -30,6 +30,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - Native 预支付下单、查询、关闭、回调验签/解密与支付尝试状态。
 - 通知幂等、金额/主体校验、支付/订单/订阅原子履约、对账 Worker、下游通知 Outbox 和运维查询。
 - 支付 Secret、限流、超时、审计、指标和 trace 脱敏。
+- React 支付详情、对账队列/结果和受权限保护的手工对账操作。
 
 ### 不包含
 
@@ -47,6 +48,8 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] 已验证支付事实、订单终态、订阅权益和下游通知 Outbox 同事务；重复通知返回幂等成功，核心权益不依赖通知 Worker 才生效。
 - [ ] 对账 Worker 查询长时间 paying/unknown 订单，使用有界重试与死信。
 - [ ] 实现支付密钥/公钥或证书轮换、就绪检查、健康观测和不泄密运维 Runbook。
+- [ ] 使用 `payments.read`/`payments.reconcile` 和 `orders.read`/`orders.reconcile` 区分只读与高风险操作，手工对账要求原因、确认和幂等键。
+- [ ] 在 React 订单/支付页显示脱敏状态、供应商查单结果和 Worker 积压，不显示密钥、原始通知或完整二维码 URL。
 
 ## 验证策略
 
@@ -59,6 +62,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] 金额、APPID、商户号、订单号任一不一致均不交付
 - [ ] 密钥/原始通知/二维码 URL 不进入日志、metrics、trace、审计或测试快照
 - [ ] 小额真实支付、回调、查询和重复通知验收有脱敏证据
+- [ ] React typecheck/test/build 和浏览器冒烟覆盖只读、可对账、无权限、提交重试与结果未知
 
 ## 退出标准
 
@@ -73,3 +77,4 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 ## 发现/决策
 
 - 2026-08-21：规划优先使用微信支付官方 Go SDK，默认 Native 支付，本轮未实施。
+- 2026-08-22：纳入 React 支付/对账管理页和独立读/对账权限点。

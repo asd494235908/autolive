@@ -1,8 +1,8 @@
-# Phase 6：密码重置 Worker
+# Phase 7：密码重置 Worker
 
 Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-production-readiness.md)
 状态：Not Started
-最后更新：2026-08-21
+最后更新：2026-08-22
 
 ## 目标
 
@@ -10,10 +10,10 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 ## 主 PRD 上下文
 
-- 目标：G-3
-- 成功标准：SC-3
-- 需求：FR-12、FR-13，NFR-1、NFR-2、NFR-4、NFR-5
-- 场景：场景 3
+- 目标：G-3、G-8
+- 成功标准：SC-3、SC-9
+- 需求：FR-12、FR-13、FR-34、FR-35，NFR-1、NFR-2、NFR-4、NFR-5、NFR-12
+- 场景：场景 4
 
 ## 阶段发现门禁
 
@@ -29,6 +29,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 - 已验证邮箱、reset token 哈希、公开请求/确认端点、投递 Outbox/Worker。
 - IP + 账号摘要限流、中性响应、重试/死信、会话撤销、审计和脱敏观测。
+- React 管理端的投递状态/死信查询和受限手工重试。
 
 ### 不包含
 
@@ -45,6 +46,8 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] Worker 有批次/并发/超时/退避/最大尝试/死信/取消/优雅关闭，且不跨网络调用持有 DB 事务。
 - [ ] 确认端点锁定 Token 行，单事务更新密码、消费 Token、撤销会话并写审计 Outbox。
 - [ ] 清理过期/已消费 Token 与投递记录，尊重安全调查的保留冻结。
+- [ ] 将状态查询与重试分别绑定 `password_resets.read`/`password_resets.retry`，重试要求原因、幂等键和审计。
+- [ ] React 页只展示脱敏账号摘要、状态、尝试次数、下次时间和错误分类，不返回 Token、邮件正文或完整重置 URL。
 
 ## 验证策略
 
@@ -57,6 +60,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] 投递超时、可重试/不可重试错误、进程重启、死信和 SIGTERM
 - [ ] Token、邮箱、重置 URL 和邮件正文不进日志/metrics/trace/审计/快照
 - [ ] Go 全量、Race、PostgreSQL integration 和一次受控投递冒烟通过
+- [ ] React typecheck/test/build 和投递列表、死信、无权限、重试确认的浏览器冒烟通过
 
 ## 退出标准
 
@@ -71,3 +75,4 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 ## 发现/决策
 
 - 2026-08-21：首期规划邮箱投递和 PostgreSQL Outbox Worker，本轮未实施。
+- 2026-08-22：纳入脱敏的 React 投递运维页和受限重试权限。
