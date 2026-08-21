@@ -1,10 +1,43 @@
 package migrations
 
 import (
+	"fmt"
 	"io/fs"
 	"strings"
 	"testing"
 )
+
+type migration23ForeignKeyContract struct {
+	table             string
+	name              string
+	parentTable       string
+	localColumns      string
+	referencedColumns string
+}
+
+var migration23ForeignKeyContracts = []migration23ForeignKeyContract{
+	{table: "devices", name: "devices_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "activation_codes", name: "activation_codes_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "auth_sessions", name: "auth_sessions_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "model_accounts", name: "model_accounts_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "model_leases", name: "model_leases_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "model_usage_records", name: "model_usage_records_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "model_request_reservations", name: "model_request_reservations_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "audit_logs", name: "audit_logs_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "audit_outbox", name: "audit_outbox_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "model_pool_test_results", name: "model_pool_test_results_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "user_authorization_policies", name: "user_authorization_policies_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "idempotency_records", name: "idempotency_records_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "variant_tasks", name: "variant_tasks_product_fkey", parentTable: "products", localColumns: "product", referencedColumns: "code"},
+	{table: "devices", name: "devices_user_product_fkey", parentTable: "user_products", localColumns: "user_id, product", referencedColumns: "user_id, product"},
+	{table: "activation_codes", name: "activation_codes_used_by_user_product_fkey", parentTable: "user_products", localColumns: "used_by_user_id, product", referencedColumns: "user_id, product"},
+	{table: "auth_sessions", name: "auth_sessions_user_product_fkey", parentTable: "user_products", localColumns: "user_id, product", referencedColumns: "user_id, product"},
+	{table: "model_leases", name: "model_leases_user_product_fkey", parentTable: "user_products", localColumns: "user_id, product", referencedColumns: "user_id, product"},
+	{table: "model_usage_records", name: "model_usage_records_user_product_fkey", parentTable: "user_products", localColumns: "user_id, product", referencedColumns: "user_id, product"},
+	{table: "audit_logs", name: "audit_logs_actor_user_product_fkey", parentTable: "user_products", localColumns: "actor_user_id, product", referencedColumns: "user_id, product"},
+	{table: "user_authorization_policies", name: "user_authorization_policies_user_product_fkey", parentTable: "user_products", localColumns: "user_id, product", referencedColumns: "user_id, product"},
+	{table: "variant_tasks", name: "variant_tasks_user_product_fkey", parentTable: "user_products", localColumns: "user_id, product", referencedColumns: "user_id, product"},
+}
 
 func TestEmbeddedMigrationsUseVersionedUpSQLFiles(t *testing.T) {
 	entries, err := fs.ReadDir(FS, ".")
@@ -100,6 +133,55 @@ func TestMigration23ProductScopedConstraintChecksAreTableQualified(t *testing.T)
 	}
 	if strings.Contains(sql, "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '") {
 		t.Fatal("migration 0023 must not use global pg_constraint conname-only guards for product FK checks")
+	}
+}
+
+func TestMigration23ForeignKeyContractCoversAllProductReferences(t *testing.T) {
+	payload, err := fs.ReadFile(FS, "0023_补齐多产品控制面.up.sql")
+	if err != nil {
+		t.Fatalf("read migration 0023: %v", err)
+	}
+	sql := string(payload)
+	normalizedSQL := strings.Join(strings.Fields(sql), " ")
+	userProductForeignKeyCount := 0
+	productForeignKeyCount := 0
+
+	for _, contract := range migration23ForeignKeyContracts {
+		if contract.parentTable == "products" {
+			productForeignKeyCount++
+			fragment := fmt.Sprintf("('%s'::regclass, '%s')", contract.table, contract.name)
+			if !strings.Contains(sql, fragment) {
+				t.Fatalf("migration 0023 product FK catalog is missing %q", fragment)
+			}
+			continue
+		}
+
+		userProductForeignKeyCount++
+		guard := fmt.Sprintf("WHERE conrelid = '%s'::regclass AND conname = '%s'", contract.table, contract.name)
+		if !strings.Contains(sql, guard) {
+			t.Fatalf("migration 0023 user_products FK guard is missing %q", guard)
+		}
+		definition := fmt.Sprintf(
+			"ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s(%s);",
+			contract.table,
+			contract.name,
+			contract.localColumns,
+			contract.parentTable,
+			contract.referencedColumns,
+		)
+		if !strings.Contains(normalizedSQL, strings.Join(strings.Fields(definition), " ")) {
+			t.Fatalf("migration 0023 is missing user_products FK definition %q", definition)
+		}
+	}
+
+	if productForeignKeyCount != 13 {
+		t.Fatalf("migration 0023 product FK contract count = %d, want 13", productForeignKeyCount)
+	}
+	if userProductForeignKeyCount != 8 {
+		t.Fatalf("migration 0023 user_products FK contract count = %d, want 8", userProductForeignKeyCount)
+	}
+	if actual := strings.Count(normalizedSQL, "REFERENCES user_products(user_id, product)"); actual != userProductForeignKeyCount {
+		t.Fatalf("migration 0023 user_products FK definition count = %d, want %d", actual, userProductForeignKeyCount)
 	}
 }
 

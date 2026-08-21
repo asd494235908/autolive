@@ -15,7 +15,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 func TestPostgresMigration23CompatibilityAndOrphanRecovery(t *testing.T) {
@@ -55,6 +55,7 @@ func TestPostgresMigration23CompatibilityAndOrphanRecovery(t *testing.T) {
 		if dirty || version != LatestVersion {
 			t.Fatalf("migration version after upgrade = (%d, dirty=%v), want (%d, false)", version, dirty, LatestVersion)
 		}
+		assertMigration23ForeignKeys(t, schemaDB)
 
 		var storedProduct, storedDeviceID string
 		if err := schemaDB.QueryRowContext(context.Background(), `
@@ -91,6 +92,7 @@ func TestPostgresMigration23CompatibilityAndOrphanRecovery(t *testing.T) {
 		if dirty || version != LatestVersion {
 			t.Fatalf("migration version after clean forward = (%d, dirty=%v), want (%d, false)", version, dirty, LatestVersion)
 		}
+		assertMigration23ForeignKeys(t, schemaDB)
 
 		now := time.Date(2026, 8, 21, 13, 0, 0, 0, time.UTC)
 		userID := fmt.Sprintf("migration_clean_user_%d", time.Now().UTC().UnixNano())
@@ -140,6 +142,72 @@ func TestPostgresMigration23CompatibilityAndOrphanRecovery(t *testing.T) {
 			t.Fatalf("clean forward autolive membership count = %d, want 1", membershipCount)
 		}
 	})
+}
+
+func assertMigration23ForeignKeys(t *testing.T, database *sql.DB) {
+	t.Helper()
+
+	names := make([]string, 0, len(migration23ForeignKeyContracts))
+	for _, contract := range migration23ForeignKeyContracts {
+		names = append(names, contract.name)
+	}
+
+	rows, err := database.QueryContext(context.Background(), `
+		SELECT c.conname, child.relname, parent.relname, current_schema(), pg_get_constraintdef(c.oid)
+		FROM pg_constraint AS c
+		JOIN pg_class AS child ON child.oid = c.conrelid
+		JOIN pg_namespace AS child_namespace ON child_namespace.oid = child.relnamespace
+		JOIN pg_class AS parent ON parent.oid = c.confrelid
+		JOIN pg_namespace AS parent_namespace ON parent_namespace.oid = parent.relnamespace
+		WHERE c.contype = 'f'
+		  AND child_namespace.nspname = current_schema()
+		  AND parent_namespace.nspname = current_schema()
+		  AND c.conname = ANY($1::text[])
+	`, pq.Array(names))
+	if err != nil {
+		t.Fatalf("query migration 0023 foreign keys: %v", err)
+	}
+	defer rows.Close()
+
+	type actualForeignKey struct {
+		table       string
+		parentTable string
+		definition  string
+	}
+	actual := make(map[string]actualForeignKey, len(names))
+	for rows.Next() {
+		var name, table, parentTable, schemaName, definition string
+		if err := rows.Scan(&name, &table, &parentTable, &schemaName, &definition); err != nil {
+			t.Fatalf("scan migration 0023 foreign key: %v", err)
+		}
+		definition = strings.ReplaceAll(definition, fmt.Sprintf(`"%s".`, schemaName), "")
+		definition = strings.ReplaceAll(definition, schemaName+".", "")
+		actual[name] = actualForeignKey{
+			table:       table,
+			parentTable: parentTable,
+			definition:  strings.Join(strings.Fields(definition), " "),
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate migration 0023 foreign keys: %v", err)
+	}
+
+	for _, contract := range migration23ForeignKeyContracts {
+		got, ok := actual[contract.name]
+		if !ok {
+			t.Errorf("migration 0023 foreign key %q is missing", contract.name)
+			continue
+		}
+		wantDefinition := fmt.Sprintf(
+			"FOREIGN KEY (%s) REFERENCES %s(%s)",
+			contract.localColumns,
+			contract.parentTable,
+			contract.referencedColumns,
+		)
+		if got.table != contract.table || got.parentTable != contract.parentTable || got.definition != wantDefinition {
+			t.Errorf("foreign key %q = table %s, parent %s, definition %q; want table %s, parent %s, definition %q", contract.name, got.table, got.parentTable, got.definition, contract.table, contract.parentTable, wantDefinition)
+		}
+	}
 }
 
 func openIsolatedMigrationDatabase(t *testing.T, baseURL string) (*sql.DB, *sql.DB, string, func()) {
