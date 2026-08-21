@@ -37,6 +37,13 @@ func (s *PostgresRepository) RecordAuditWithOutbox(ctx context.Context, input co
 		return postgresOperationError(operationCtx, err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	input, err = normalizeAuditInput(input)
+	if err != nil {
+		return err
+	}
+	if err := validateNormalizedAuditTargetProduct(operationCtx, tx, input); err != nil {
+		return err
+	}
 	if err := s.enqueueAuditOutboxTx(operationCtx, tx, input, now); err != nil {
 		return postgresOperationError(operationCtx, err)
 	}

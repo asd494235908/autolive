@@ -23,6 +23,8 @@ func TestPostgresRepositoryRecordAuditUsesNormalizedAppend(t *testing.T) {
 		t.Fatalf("constructor error = %v", err)
 	}
 	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT product FROM devices WHERE id = $1")).WithArgs("dev_1").WillReturnRows(sqlmock.NewRows([]string{"product"}).AddRow(string(controlplane.ProductDouyinDesktop)))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT product FROM model_leases WHERE id = $1")).WithArgs("lease_1").WillReturnRows(sqlmock.NewRows([]string{"product"}).AddRow(string(controlplane.ProductDouyinDesktop)))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_logs (")).WithArgs(sqlmock.AnyArg(), "douyin_desktop", "usr_1", "dev_1", "model.lease.release", "model_lease", "lease_1", "req-1", "success", 200, "", now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 

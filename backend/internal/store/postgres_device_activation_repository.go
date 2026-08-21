@@ -109,7 +109,13 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 	}
 
 	createdAt := s.Now()
-	storedFingerprint, storedResourceID, inserted, err := s.reserveUserIdempotency(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, record.Device.DeviceID, createdAt)
+	var storedFingerprint, storedResourceID string
+	var inserted bool
+	if record.Product != controlplane.ProductAutoLive {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotencyForProduct(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, record.Device.DeviceID, createdAt, record.Product)
+	} else {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotency(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, record.Device.DeviceID, createdAt)
+	}
 	if err != nil {
 		return controlplane.DeviceSummary{}, err
 	}

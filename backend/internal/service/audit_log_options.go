@@ -12,6 +12,7 @@ import (
 // audit list. Time values remain strings at the HTTP boundary and are parsed
 // before reaching the repository.
 type AuditLogListOptions struct {
+	Product       controlplane.ProductCode
 	ActorUserID   string
 	DeviceID      string
 	Action        string
@@ -26,6 +27,7 @@ type AuditLogListOptions struct {
 
 func normalizeAuditLogListOptions(options AuditLogListOptions) (store.AuditLogPageOptions, error) {
 	result := store.AuditLogPageOptions{
+		Product:     controlplane.ProductCode(strings.TrimSpace(string(options.Product))),
 		ActorUserID: options.ActorUserID,
 		DeviceID:    options.DeviceID,
 		Action:      options.Action,
@@ -34,6 +36,9 @@ func normalizeAuditLogListOptions(options AuditLogListOptions) (store.AuditLogPa
 		ErrorCode:   options.ErrorCode,
 		RequestID:   options.RequestID,
 		Sort:        options.Sort,
+	}
+	if result.Product != "" && !result.Product.Valid() {
+		return store.AuditLogPageOptions{}, controlplane.ErrInvalidRequest
 	}
 	result.ActorUserID = strings.TrimSpace(result.ActorUserID)
 	result.DeviceID = strings.TrimSpace(result.DeviceID)

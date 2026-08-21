@@ -390,6 +390,70 @@ func runDeviceState(run func(store.StateOperation) error, fn func(*store.State) 
 	return result, err
 }
 
+func operationProduct(input controlplane.AuditLogInput) (controlplane.ProductCode, error) {
+	product := controlplane.ProductCode(strings.TrimSpace(string(input.Product)))
+	if product == "" {
+		// Existing non-HTTP service callers are the explicit compatibility
+		// boundary. Normalized HTTP callers always provide the session product
+		// through the success audit input.
+		return controlplane.ProductAutoLive, nil
+	}
+	if !product.Valid() {
+		return "", controlplane.ErrInvalidRequest
+	}
+	return product, nil
+}
+
+func effectiveStoredProduct(product controlplane.ProductCode) controlplane.ProductCode {
+	if product == "" {
+		return controlplane.ProductAutoLive
+	}
+	return product
+}
+
+func productScopedScope(scope string, product controlplane.ProductCode) string {
+	if product == "" || product == controlplane.ProductAutoLive {
+		return scope
+	}
+	return scope + ":product:" + string(product)
+}
+
+func validateAuditTargetProduct(state *store.State, input controlplane.AuditLogInput) error {
+	product := effectiveStoredProduct(input.Product)
+	if input.DeviceID != "" {
+		if device, ok := state.Devices[input.DeviceID]; ok && effectiveStoredProduct(device.Product) != product {
+			return controlplane.ErrForbidden
+		}
+	}
+	if input.TargetID == "" {
+		return nil
+	}
+	var target controlplane.ProductCode
+	var found bool
+	switch input.TargetType {
+	case "device":
+		var item controlplane.DeviceSummary
+		item, found = state.Devices[input.TargetID]
+		target = item.Product
+	case "model_lease":
+		var item controlplane.ModelLease
+		item, found = state.ModelLeases[input.TargetID]
+		target = item.Product
+	case "model_usage":
+		var item controlplane.ModelUsageRecord
+		item, found = state.ModelUsageRecords[input.TargetID]
+		target = item.Product
+	case "activation_code":
+		var item store.ActivationCodeRecord
+		item, found = state.ActivationCodes[input.TargetID]
+		target = item.ActivationCode.Product
+	}
+	if found && effectiveStoredProduct(target) != product {
+		return controlplane.ErrForbidden
+	}
+	return nil
+}
+
 func (s *ControlPlane) RecordAudit(ctx context.Context, input controlplane.AuditLogInput) error {
 	if err := checkContext(ctx); err != nil {
 		return err
@@ -402,6 +466,11 @@ func (s *ControlPlane) RecordAudit(ctx context.Context, input controlplane.Audit
 	input.Outcome = strings.TrimSpace(input.Outcome)
 	input.ErrorCode = strings.TrimSpace(input.ErrorCode)
 	input.RequestID = strings.TrimSpace(input.RequestID)
+	product, err := operationProduct(input)
+	if err != nil {
+		return err
+	}
+	input.Product = product
 	if input.Outcome == "" {
 		input.Outcome = "unknown"
 	}
@@ -421,9 +490,13 @@ func (s *ControlPlane) RecordAudit(ctx context.Context, input controlplane.Audit
 		return store.ErrNormalizedAuditRepositoryRequired
 	}
 	return s.repository.Run(ctx, func(state *store.State) error {
+		if err := validateAuditTargetProduct(state, input); err != nil {
+			return err
+		}
 		id := nextID(state, "audit")
 		state.AuditLogs[id] = controlplane.AuditLog{
 			ID:          id,
+			Product:     input.Product,
 			ActorUserID: input.ActorUserID,
 			DeviceID:    input.DeviceID,
 			Action:      input.Action,
@@ -1444,6 +1517,7 @@ func (s *ControlPlane) recordHeartbeatWithRunner(ctx context.Context, idempotenc
 	if err := validateHeartbeatInput(input); err != nil {
 		return controlplane.HeartbeatResult{}, err
 	}
+	input.Product = effectiveStoredProduct(input.Product)
 
 	return runHeartbeatState(run, func(state *store.State) (controlplane.HeartbeatResult, error) {
 		user, ok := state.Users[userID]
@@ -1459,6 +1533,9 @@ func (s *ControlPlane) recordHeartbeatWithRunner(ctx context.Context, idempotenc
 		}
 		if device.Status != controlplane.DeviceStatusActive {
 			return controlplane.HeartbeatResult{}, controlplane.ErrDeviceDisabled
+		}
+		if effectiveStoredProduct(device.Product) != input.Product {
+			return controlplane.HeartbeatResult{}, controlplane.ErrForbidden
 		}
 
 		fingerprint, err := fingerprintValue(struct {
@@ -1761,6 +1838,10 @@ func (s *ControlPlane) reclaimModelLease(ctx context.Context, idempotencyKey, le
 	if leaseID == "" || len(input.Reason) > 255 {
 		return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrInvalidRequest
 	}
+	product, err := operationProduct(audit)
+	if err != nil {
+		return controlplane.ReleaseModelLeaseResult{}, err
+	}
 	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
 		writer, ok := s.repository.(store.ModelLeaseRepository)
 		if !ok {
@@ -1768,32 +1849,37 @@ func (s *ControlPlane) reclaimModelLease(ctx context.Context, idempotencyKey, le
 		}
 		fingerprint, err := fingerprintValue(struct {
 			LeaseID string                              `json:"lease_id"`
+			Product controlplane.ProductCode            `json:"product"`
 			Input   controlplane.ReleaseModelLeaseInput `json:"input"`
-		}{LeaseID: leaseID, Input: input})
+		}{LeaseID: leaseID, Product: product, Input: input})
 		if err != nil {
 			return controlplane.ReleaseModelLeaseResult{}, err
 		}
 		return writer.ReclaimModelLease(ctx, store.ModelLeaseReclaimRecord{
-			Scope: "control-plane-state", IdempotencyKey: "admin-reclaim-model-lease:" + leaseID + ":" + idempotencyKey,
-			Fingerprint: fingerprint, LeaseID: leaseID, Reason: input.Reason, Audit: audit,
+			Scope: productScopedScope("control-plane-state", product), IdempotencyKey: "admin-reclaim-model-lease:" + leaseID + ":" + idempotencyKey,
+			Fingerprint: fingerprint, Product: product, LeaseID: leaseID, Reason: input.Reason, Audit: audit,
 		})
 	}
 
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ReleaseModelLeaseResult, error) {
-		now := s.repository.Now()
-		sweepExpiredModelLeases(state, now)
 		lease, ok := state.ModelLeases[leaseID]
 		if !ok {
 			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrModelLeaseNotFound
 		}
+		if effectiveStoredProduct(lease.Product) != product {
+			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrForbidden
+		}
+		now := s.repository.Now()
+		sweepExpiredModelLeases(state, now)
 		fingerprint, err := fingerprintValue(struct {
 			LeaseID string                              `json:"lease_id"`
+			Product controlplane.ProductCode            `json:"product"`
 			Input   controlplane.ReleaseModelLeaseInput `json:"input"`
-		}{LeaseID: leaseID, Input: input})
+		}{LeaseID: leaseID, Product: product, Input: input})
 		if err != nil {
 			return controlplane.ReleaseModelLeaseResult{}, err
 		}
-		scope := "admin-reclaim-model-lease:" + leaseID + ":" + idempotencyKey
+		scope := productScopedScope("admin-reclaim-model-lease:"+leaseID+":"+idempotencyKey, product)
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
 				return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrIdempotencyConflict
@@ -2290,13 +2376,18 @@ func (s *ControlPlane) createModelLease(ctx context.Context, idempotencyKey, use
 	if err := validateCreateModelLeaseInput(&input); err != nil {
 		return controlplane.ModelLease{}, err
 	}
+	product, err := operationProduct(audit)
+	if err != nil {
+		return controlplane.ModelLease{}, err
+	}
 	userID = strings.TrimSpace(userID)
 	deviceID = strings.TrimSpace(deviceID)
 	fingerprint, err := fingerprintValue(struct {
 		UserID   string                             `json:"user_id"`
 		DeviceID string                             `json:"device_id"`
+		Product  controlplane.ProductCode           `json:"product"`
 		Input    controlplane.CreateModelLeaseInput `json:"input"`
-	}{UserID: userID, DeviceID: deviceID, Input: input})
+	}{UserID: userID, DeviceID: deviceID, Product: product, Input: input})
 	if err != nil {
 		return controlplane.ModelLease{}, err
 	}
@@ -2306,8 +2397,8 @@ func (s *ControlPlane) createModelLease(ctx context.Context, idempotencyKey, use
 			return controlplane.ModelLease{}, store.ErrNormalizedModelLeaseCreatorRequired
 		}
 		return creator.CreateModelLease(ctx, store.ModelLeaseCreateRecord{
-			Scope: "control-plane-state", IdempotencyKey: "create-model-lease:" + userID + ":" + deviceID + ":" + idempotencyKey,
-			Fingerprint: fingerprint, UserID: userID, DeviceID: deviceID, Provider: input.Provider,
+			Scope: productScopedScope("control-plane-state", product), IdempotencyKey: "create-model-lease:" + userID + ":" + deviceID + ":" + idempotencyKey,
+			Fingerprint: fingerprint, UserID: userID, DeviceID: deviceID, Product: product, Provider: input.Provider,
 			Model: input.Model, Purpose: input.Purpose, MaxDurationSeconds: input.MaxDurationSeconds, Audit: audit,
 		})
 	}
@@ -2327,10 +2418,13 @@ func (s *ControlPlane) createModelLease(ctx context.Context, idempotencyKey, use
 		if device.Status != controlplane.DeviceStatusActive {
 			return controlplane.ModelLease{}, controlplane.ErrDeviceDisabled
 		}
+		if effectiveStoredProduct(device.Product) != product {
+			return controlplane.ModelLease{}, controlplane.ErrForbidden
+		}
 
 		sweepExpiredModelLeases(state, s.repository.Now())
 
-		scope := "create-model-lease:" + userID + ":" + device.ID + ":" + idempotencyKey
+		scope := productScopedScope("create-model-lease:"+userID+":"+device.ID+":"+idempotencyKey, product)
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
 				return controlplane.ModelLease{}, controlplane.ErrIdempotencyConflict
@@ -2345,7 +2439,7 @@ func (s *ControlPlane) createModelLease(ctx context.Context, idempotencyKey, use
 			if len(policy.AllowedModels) > 0 && !slices.Contains(policy.AllowedModels, input.Provider+"/"+input.Model) {
 				return controlplane.ModelLease{}, controlplane.ErrUserModelNotAuthorized
 			}
-			if policy.DailyTokenLimit > 0 && dailyUsedTokensForUser(state, userID, s.repository.Now()) >= policy.DailyTokenLimit {
+			if policy.DailyTokenLimit > 0 && dailyUsedTokensForUser(state, userID, s.repository.Now(), product) >= policy.DailyTokenLimit {
 				return controlplane.ModelLease{}, controlplane.ErrUserRecordedQuotaExceeded
 			}
 		}
@@ -2361,6 +2455,7 @@ func (s *ControlPlane) createModelLease(ctx context.Context, idempotencyKey, use
 		now := s.repository.Now()
 		lease := controlplane.ModelLease{
 			ID:               nextID(state, "lease"),
+			Product:          product,
 			UserID:           userID,
 			DeviceID:         device.ID,
 			AccountID:        account.ID,
@@ -2403,6 +2498,10 @@ func (s *ControlPlane) renewModelLease(ctx context.Context, idempotencyKey, user
 	if err := validateRenewModelLeaseInput(&input); err != nil {
 		return controlplane.ModelLease{}, err
 	}
+	product, err := operationProduct(audit)
+	if err != nil {
+		return controlplane.ModelLease{}, err
+	}
 	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
 		writer, ok := s.repository.(store.ModelLeaseRepository)
 		if !ok {
@@ -2411,15 +2510,16 @@ func (s *ControlPlane) renewModelLease(ctx context.Context, idempotencyKey, user
 		fingerprint, err := fingerprintValue(struct {
 			UserID       string                            `json:"user_id"`
 			DeviceID     string                            `json:"device_id"`
+			Product      controlplane.ProductCode          `json:"product"`
 			LeaseID      string                            `json:"lease_id"`
 			RenewRequest controlplane.RenewModelLeaseInput `json:"renew_request"`
-		}{UserID: userID, DeviceID: deviceID, LeaseID: leaseID, RenewRequest: input})
+		}{UserID: userID, DeviceID: deviceID, Product: product, LeaseID: leaseID, RenewRequest: input})
 		if err != nil {
 			return controlplane.ModelLease{}, err
 		}
 		return writer.RenewModelLease(ctx, store.ModelLeaseRenewRecord{
-			Scope: "control-plane-state", IdempotencyKey: "renew-model-lease:" + leaseID + ":" + idempotencyKey,
-			Fingerprint: fingerprint, UserID: userID, DeviceID: deviceID, LeaseID: leaseID, ExtendSeconds: input.ExtendSeconds, Audit: audit,
+			Scope: productScopedScope("control-plane-state", product), IdempotencyKey: "renew-model-lease:" + leaseID + ":" + idempotencyKey,
+			Fingerprint: fingerprint, UserID: userID, DeviceID: deviceID, Product: product, LeaseID: leaseID, ExtendSeconds: input.ExtendSeconds, Audit: audit,
 		})
 	}
 
@@ -2438,6 +2538,9 @@ func (s *ControlPlane) renewModelLease(ctx context.Context, idempotencyKey, user
 		if device.Status != controlplane.DeviceStatusActive {
 			return controlplane.ModelLease{}, controlplane.ErrDeviceDisabled
 		}
+		if effectiveStoredProduct(device.Product) != product {
+			return controlplane.ModelLease{}, controlplane.ErrForbidden
+		}
 
 		sweepExpiredModelLeases(state, s.repository.Now())
 
@@ -2448,22 +2551,27 @@ func (s *ControlPlane) renewModelLease(ctx context.Context, idempotencyKey, user
 		if lease.UserID != userID || lease.DeviceID != device.ID {
 			return controlplane.ModelLease{}, controlplane.ErrForbidden
 		}
+		if effectiveStoredProduct(lease.Product) != product {
+			return controlplane.ModelLease{}, controlplane.ErrForbidden
+		}
 
 		fingerprint, err := fingerprintValue(struct {
 			UserID       string                            `json:"user_id"`
 			DeviceID     string                            `json:"device_id"`
+			Product      controlplane.ProductCode          `json:"product"`
 			LeaseID      string                            `json:"lease_id"`
 			RenewRequest controlplane.RenewModelLeaseInput `json:"renew_request"`
 		}{
 			UserID:       userID,
 			DeviceID:     device.ID,
+			Product:      product,
 			LeaseID:      leaseID,
 			RenewRequest: input,
 		})
 		if err != nil {
 			return controlplane.ModelLease{}, err
 		}
-		scope := "renew-model-lease:" + leaseID + ":" + idempotencyKey
+		scope := productScopedScope("renew-model-lease:"+leaseID+":"+idempotencyKey, product)
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
 				return controlplane.ModelLease{}, controlplane.ErrIdempotencyConflict
@@ -2513,6 +2621,10 @@ func (s *ControlPlane) releaseModelLease(ctx context.Context, idempotencyKey, us
 		return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrInvalidRequest
 	}
 	input.Reason = strings.TrimSpace(input.Reason)
+	product, err := operationProduct(audit)
+	if err != nil {
+		return controlplane.ReleaseModelLeaseResult{}, err
+	}
 	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
 		writer, ok := s.repository.(store.ModelLeaseRepository)
 		if !ok {
@@ -2521,15 +2633,16 @@ func (s *ControlPlane) releaseModelLease(ctx context.Context, idempotencyKey, us
 		fingerprint, err := fingerprintValue(struct {
 			UserID       string                              `json:"user_id"`
 			DeviceID     string                              `json:"device_id"`
+			Product      controlplane.ProductCode            `json:"product"`
 			LeaseID      string                              `json:"lease_id"`
 			ReleaseInput controlplane.ReleaseModelLeaseInput `json:"release_input"`
-		}{UserID: userID, DeviceID: deviceID, LeaseID: leaseID, ReleaseInput: input})
+		}{UserID: userID, DeviceID: deviceID, Product: product, LeaseID: leaseID, ReleaseInput: input})
 		if err != nil {
 			return controlplane.ReleaseModelLeaseResult{}, err
 		}
 		return writer.ReleaseModelLease(ctx, store.ModelLeaseReleaseRecord{
-			Scope: "control-plane-state", IdempotencyKey: "release-model-lease:" + leaseID + ":" + idempotencyKey,
-			Fingerprint: fingerprint, UserID: userID, DeviceID: deviceID, LeaseID: leaseID, Reason: input.Reason, Audit: audit,
+			Scope: productScopedScope("control-plane-state", product), IdempotencyKey: "release-model-lease:" + leaseID + ":" + idempotencyKey,
+			Fingerprint: fingerprint, UserID: userID, DeviceID: deviceID, Product: product, LeaseID: leaseID, Reason: input.Reason, Audit: audit,
 		})
 	}
 
@@ -2548,6 +2661,9 @@ func (s *ControlPlane) releaseModelLease(ctx context.Context, idempotencyKey, us
 		if device.Status != controlplane.DeviceStatusActive {
 			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrDeviceDisabled
 		}
+		if effectiveStoredProduct(device.Product) != product {
+			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrForbidden
+		}
 
 		sweepExpiredModelLeases(state, s.repository.Now())
 
@@ -2558,22 +2674,27 @@ func (s *ControlPlane) releaseModelLease(ctx context.Context, idempotencyKey, us
 		if lease.UserID != userID || lease.DeviceID != device.ID {
 			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrForbidden
 		}
+		if effectiveStoredProduct(lease.Product) != product {
+			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrForbidden
+		}
 
 		fingerprint, err := fingerprintValue(struct {
 			UserID       string                              `json:"user_id"`
 			DeviceID     string                              `json:"device_id"`
+			Product      controlplane.ProductCode            `json:"product"`
 			LeaseID      string                              `json:"lease_id"`
 			ReleaseInput controlplane.ReleaseModelLeaseInput `json:"release_input"`
 		}{
 			UserID:       userID,
 			DeviceID:     device.ID,
+			Product:      product,
 			LeaseID:      leaseID,
 			ReleaseInput: input,
 		})
 		if err != nil {
 			return controlplane.ReleaseModelLeaseResult{}, err
 		}
-		scope := "release-model-lease:" + leaseID + ":" + idempotencyKey
+		scope := productScopedScope("release-model-lease:"+leaseID+":"+idempotencyKey, product)
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
 				return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrIdempotencyConflict
@@ -2741,6 +2862,10 @@ func (s *ControlPlane) recordDirectLLMCall(ctx context.Context, idempotencyKey, 
 	if input.TotalTokens < input.InputTokens+input.OutputTokens {
 		return controlplane.ModelUsageRecord{}, controlplane.ErrInvalidRequest
 	}
+	product, err := operationProduct(audit)
+	if err != nil {
+		return controlplane.ModelUsageRecord{}, err
+	}
 	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
 		writer, ok := s.repository.(store.ModelUsageRepository)
 		if !ok {
@@ -2749,20 +2874,24 @@ func (s *ControlPlane) recordDirectLLMCall(ctx context.Context, idempotencyKey, 
 		fingerprint, err := fingerprintValue(struct {
 			UserID   string                                      `json:"user_id"`
 			DeviceID string                                      `json:"device_id"`
+			Product  controlplane.ProductCode                    `json:"product"`
 			Input    controlplane.CreateDirectLLMCallRecordInput `json:"input"`
-		}{UserID: userID, DeviceID: deviceID, Input: input})
+		}{UserID: userID, DeviceID: deviceID, Product: product, Input: input})
 		if err != nil {
 			return controlplane.ModelUsageRecord{}, err
 		}
 		return writer.RecordDirectLLMCall(ctx, store.ModelUsageWriteRecord{
-			Scope: "control-plane-state", IdempotencyKey: "record-direct-llm-call:" + userID + ":" + deviceID + ":" + idempotencyKey,
-			Fingerprint: fingerprint, UserID: userID, DeviceID: deviceID, RequestID: strings.TrimSpace(requestID), Input: input, Audit: audit,
+			Scope: productScopedScope("control-plane-state", product), IdempotencyKey: "record-direct-llm-call:" + userID + ":" + deviceID + ":" + idempotencyKey,
+			Fingerprint: fingerprint, UserID: userID, DeviceID: deviceID, Product: product, RequestID: strings.TrimSpace(requestID), Input: input, Audit: audit,
 		})
 	}
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ModelUsageRecord, error) {
 		device, err := resolveBoundOwnedDevice(state, userID, deviceID)
 		if err != nil {
 			return controlplane.ModelUsageRecord{}, err
+		}
+		if effectiveStoredProduct(device.Product) != product {
+			return controlplane.ModelUsageRecord{}, controlplane.ErrForbidden
 		}
 		lease, ok := state.ModelLeases[input.LeaseID]
 		if !ok {
@@ -2771,18 +2900,22 @@ func (s *ControlPlane) recordDirectLLMCall(ctx context.Context, idempotencyKey, 
 		if lease.UserID != userID || lease.DeviceID != device.ID {
 			return controlplane.ModelUsageRecord{}, controlplane.ErrForbidden
 		}
+		if effectiveStoredProduct(lease.Product) != product {
+			return controlplane.ModelUsageRecord{}, controlplane.ErrForbidden
+		}
 		if lease.Provider != input.Provider || lease.Model != input.Model {
 			return controlplane.ModelUsageRecord{}, controlplane.ErrInvalidRequest
 		}
 		fingerprint, err := fingerprintValue(struct {
 			UserID   string                                      `json:"user_id"`
 			DeviceID string                                      `json:"device_id"`
+			Product  controlplane.ProductCode                    `json:"product"`
 			Input    controlplane.CreateDirectLLMCallRecordInput `json:"input"`
-		}{UserID: userID, DeviceID: device.ID, Input: input})
+		}{UserID: userID, DeviceID: device.ID, Product: product, Input: input})
 		if err != nil {
 			return controlplane.ModelUsageRecord{}, err
 		}
-		scope := "record-direct-llm-call:" + userID + ":" + device.ID + ":" + idempotencyKey
+		scope := productScopedScope("record-direct-llm-call:"+userID+":"+device.ID+":"+idempotencyKey, product)
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
 				return controlplane.ModelUsageRecord{}, controlplane.ErrIdempotencyConflict
@@ -2798,11 +2931,12 @@ func (s *ControlPlane) recordDirectLLMCall(ctx context.Context, idempotencyKey, 
 				return existing, nil
 			}
 		}
-		if policy, configured := state.UserAuthorizationPolicies[userID]; configured && policy.DailyTokenLimit > 0 && dailyUsedTokensForUser(state, userID, s.repository.Now()) >= policy.DailyTokenLimit {
+		if policy, configured := state.UserAuthorizationPolicies[userID]; configured && policy.DailyTokenLimit > 0 && dailyUsedTokensForUser(state, userID, s.repository.Now(), product) >= policy.DailyTokenLimit {
 			return controlplane.ModelUsageRecord{}, controlplane.ErrUserRecordedQuotaExceeded
 		}
 		record := controlplane.ModelUsageRecord{
 			ID:           nextID(state, "usage"),
+			Product:      product,
 			LeaseID:      input.LeaseID,
 			ClientCallID: input.ClientCallID,
 			RequestID:    strings.TrimSpace(requestID),
@@ -2819,7 +2953,7 @@ func (s *ControlPlane) recordDirectLLMCall(ctx context.Context, idempotencyKey, 
 		}
 		state.ModelUsageRecords[record.ID] = record
 		account, accountExists := state.ModelPoolAccounts[lease.AccountID]
-		if accountExists && account.DailyLimit > 0 && dailyUsedTokensForAccount(state, account.ID, s.repository.Now()) >= account.DailyLimit {
+		if accountExists && account.DailyLimit > 0 && dailyUsedTokensForAccount(state, account.ID, s.repository.Now(), product) >= account.DailyLimit {
 			account.Status = controlplane.ModelAccountStatusExhausted
 			state.ModelPoolAccounts[account.ID] = account
 		}
@@ -3315,6 +3449,7 @@ func (s *ControlPlane) activateDeviceWithRunner(ctx context.Context, idempotency
 	if err := validateActivateDeviceInput(input); err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
+	input.Device.Product = effectiveStoredProduct(input.Device.Product)
 
 	device, err := runDeviceState(run, func(state *store.State) (controlplane.DeviceSummary, error) {
 		fingerprint, err := fingerprintValue(struct {
@@ -3343,6 +3478,9 @@ func (s *ControlPlane) activateDeviceWithRunner(ctx context.Context, idempotency
 			return controlplane.DeviceSummary{}, controlplane.ErrUserDisabled
 		}
 		if existing, exists := state.Devices[input.Device.DeviceID]; exists {
+			if effectiveStoredProduct(existing.Product) != input.Device.Product {
+				return controlplane.DeviceSummary{}, controlplane.ErrForbidden
+			}
 			if existing.Status == controlplane.DeviceStatusPendingActivation && existing.UserID == "" {
 				// 允许管理员解除绑定后的同一设备使用新激活码重新绑定。
 			} else {
@@ -3357,6 +3495,9 @@ func (s *ControlPlane) activateDeviceWithRunner(ctx context.Context, idempotency
 			return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeNotFound
 		}
 		record := state.ActivationCodes[codeID]
+		if effectiveStoredProduct(record.ActivationCode.Product) != input.Device.Product {
+			return controlplane.DeviceSummary{}, controlplane.ErrForbidden
+		}
 		expiresAt, _ := time.Parse(time.RFC3339, record.ActivationCode.ExpiresAt)
 		if !s.repository.Now().Before(expiresAt) {
 			record.ActivationCode.Status = controlplane.ActivationCodeStatusExpired
@@ -3432,19 +3573,24 @@ func (s *ControlPlane) disableDevice(ctx context.Context, idempotencyKey, device
 	if deviceID == "" {
 		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
 	}
+	product, err := operationProduct(audit)
+	if err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
 	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
 		lifecycle, ok := s.repository.(store.DeviceLifecycleRepository)
 		if !ok {
 			return controlplane.DeviceSummary{}, store.ErrNormalizedDeviceLifecycleRepositoryRequired
 		}
 		fingerprint, err := fingerprintValue(struct {
-			DeviceID string `json:"device_id"`
-		}{DeviceID: deviceID})
+			DeviceID string                   `json:"device_id"`
+			Product  controlplane.ProductCode `json:"product"`
+		}{DeviceID: deviceID, Product: product})
 		if err != nil {
 			return controlplane.DeviceSummary{}, err
 		}
 		device, err := lifecycle.DisableDevice(ctx, store.DeviceMutationRecord{
-			Scope: "control-plane-state", IdempotencyKey: "disable-device:" + deviceID + ":" + idempotencyKey, Fingerprint: fingerprint, DeviceID: deviceID,
+			Scope: productScopedScope("control-plane-state", product), IdempotencyKey: "disable-device:" + deviceID + ":" + idempotencyKey, Fingerprint: fingerprint, DeviceID: deviceID, Product: product,
 			Audit: audit,
 		})
 		if err != nil {
@@ -3457,13 +3603,17 @@ func (s *ControlPlane) disableDevice(ctx context.Context, idempotencyKey, device
 		if !ok {
 			return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
 		}
+		if effectiveStoredProduct(device.Product) != product {
+			return controlplane.DeviceSummary{}, controlplane.ErrForbidden
+		}
 		fingerprint, err := fingerprintValue(struct {
-			DeviceID string `json:"device_id"`
-		}{DeviceID: deviceID})
+			DeviceID string                   `json:"device_id"`
+			Product  controlplane.ProductCode `json:"product"`
+		}{DeviceID: deviceID, Product: product})
 		if err != nil {
 			return controlplane.DeviceSummary{}, err
 		}
-		scope := "disable-device:" + deviceID + ":" + idempotencyKey
+		scope := productScopedScope("disable-device:"+deviceID+":"+idempotencyKey, product)
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
 				return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyConflict
@@ -3509,19 +3659,24 @@ func (s *ControlPlane) unbindDevice(ctx context.Context, idempotencyKey, deviceI
 	if deviceID == "" {
 		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
 	}
+	product, err := operationProduct(audit)
+	if err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
 	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
 		lifecycle, ok := s.repository.(store.DeviceLifecycleRepository)
 		if !ok {
 			return controlplane.DeviceSummary{}, store.ErrNormalizedDeviceLifecycleRepositoryRequired
 		}
 		fingerprint, err := fingerprintValue(struct {
-			DeviceID string `json:"device_id"`
-		}{DeviceID: deviceID})
+			DeviceID string                   `json:"device_id"`
+			Product  controlplane.ProductCode `json:"product"`
+		}{DeviceID: deviceID, Product: product})
 		if err != nil {
 			return controlplane.DeviceSummary{}, err
 		}
 		device, err := lifecycle.UnbindDevice(ctx, store.DeviceMutationRecord{
-			Scope: "control-plane-state", IdempotencyKey: "unbind-device:" + deviceID + ":" + idempotencyKey, Fingerprint: fingerprint, DeviceID: deviceID,
+			Scope: productScopedScope("control-plane-state", product), IdempotencyKey: "unbind-device:" + deviceID + ":" + idempotencyKey, Fingerprint: fingerprint, DeviceID: deviceID, Product: product,
 			Audit: audit,
 		})
 		if err != nil {
@@ -3534,13 +3689,17 @@ func (s *ControlPlane) unbindDevice(ctx context.Context, idempotencyKey, deviceI
 		if !ok {
 			return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
 		}
+		if effectiveStoredProduct(device.Product) != product {
+			return controlplane.DeviceSummary{}, controlplane.ErrForbidden
+		}
 		fingerprint, err := fingerprintValue(struct {
-			DeviceID string `json:"device_id"`
-		}{DeviceID: deviceID})
+			DeviceID string                   `json:"device_id"`
+			Product  controlplane.ProductCode `json:"product"`
+		}{DeviceID: deviceID, Product: product})
 		if err != nil {
 			return controlplane.DeviceSummary{}, err
 		}
-		scope := "unbind-device:" + deviceID + ":" + idempotencyKey
+		scope := productScopedScope("unbind-device:"+deviceID+":"+idempotencyKey, product)
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
 				return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyConflict
@@ -3850,8 +4009,12 @@ func activeLeaseCountForAccount(state *store.State, accountID string) int {
 	return count
 }
 
-func dailyUsedTokensForAccount(state *store.State, accountID string, now time.Time) int {
+func dailyUsedTokensForAccount(state *store.State, accountID string, now time.Time, products ...controlplane.ProductCode) int {
 	day := now.UTC().Format("2006-01-02")
+	product := controlplane.ProductCode("")
+	if len(products) > 0 {
+		product = products[0]
+	}
 	leaseAccountByID := make(map[string]string, len(state.ModelLeases))
 	for id, lease := range state.ModelLeases {
 		leaseAccountByID[id] = lease.AccountID
@@ -3859,6 +4022,9 @@ func dailyUsedTokensForAccount(state *store.State, accountID string, now time.Ti
 	used := 0
 	for _, usage := range state.ModelUsageRecords {
 		if leaseAccountByID[usage.LeaseID] != accountID {
+			continue
+		}
+		if product != "" && effectiveStoredProduct(usage.Product) != product {
 			continue
 		}
 		createdAt, err := time.Parse(time.RFC3339, usage.CreatedAt)
@@ -3870,15 +4036,23 @@ func dailyUsedTokensForAccount(state *store.State, accountID string, now time.Ti
 	return used
 }
 
-func dailyUsedTokensForUser(state *store.State, userID string, now time.Time) int {
+func dailyUsedTokensForUser(state *store.State, userID string, now time.Time, products ...controlplane.ProductCode) int {
 	day := now.UTC().Format("2006-01-02")
+	product := controlplane.ProductCode("")
+	if len(products) > 0 {
+		product = products[0]
+	}
 	leaseUserByID := make(map[string]string, len(state.ModelLeases))
 	for id, lease := range state.ModelLeases {
 		leaseUserByID[id] = lease.UserID
 	}
 	used := 0
 	for _, usage := range state.ModelUsageRecords {
+		lease := state.ModelLeases[usage.LeaseID]
 		if leaseUserByID[usage.LeaseID] != userID {
+			continue
+		}
+		if product != "" && effectiveStoredProduct(usage.Product) != product && effectiveStoredProduct(lease.Product) != product {
 			continue
 		}
 		createdAt, err := time.Parse(time.RFC3339, usage.CreatedAt)
@@ -3948,6 +4122,7 @@ func normalizeModelPoolAccountSummary(account *controlplane.ModelPoolAccountSumm
 func modelLeaseAdminSummary(lease controlplane.ModelLease) controlplane.ModelLeaseAdminSummary {
 	return controlplane.ModelLeaseAdminSummary{
 		ID:               lease.ID,
+		Product:          effectiveStoredProduct(lease.Product),
 		AccountID:        lease.AccountID,
 		UserID:           lease.UserID,
 		DeviceID:         lease.DeviceID,
@@ -3964,6 +4139,7 @@ func modelLeaseAdminSummary(lease controlplane.ModelLease) controlplane.ModelLea
 func modelLeaseAdminDetail(lease controlplane.ModelLease) controlplane.ModelLeaseAdminDetail {
 	return controlplane.ModelLeaseAdminDetail{
 		ID:               lease.ID,
+		Product:          effectiveStoredProduct(lease.Product),
 		AccountID:        lease.AccountID,
 		UserID:           lease.UserID,
 		DeviceID:         lease.DeviceID,

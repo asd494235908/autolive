@@ -32,8 +32,18 @@ func (s *PostgresRepository) mutateDeviceLifecycle(ctx context.Context, record D
 	record.IdempotencyKey = strings.TrimSpace(record.IdempotencyKey)
 	record.Fingerprint = strings.TrimSpace(record.Fingerprint)
 	record.DeviceID = strings.TrimSpace(record.DeviceID)
-	if record.Scope == "" || record.IdempotencyKey == "" || record.Fingerprint == "" || record.DeviceID == "" {
+	explicitProduct := record.Product != ""
+	record.Product = controlplane.ProductCode(strings.TrimSpace(string(record.Product)))
+	if record.Product == "" {
+		record.Product = controlplane.ProductAutoLive
+	}
+	if record.Scope == "" || record.IdempotencyKey == "" || record.Fingerprint == "" || record.DeviceID == "" || !record.Product.Valid() {
 		return controlplane.DeviceSummary{}, errors.New("normalized device lifecycle arguments are incomplete")
+	}
+	var err error
+	record.Audit, err = normalizeOptionalAuditInputForProduct(record.Audit, record.Product)
+	if err != nil {
+		return controlplane.DeviceSummary{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return controlplane.DeviceSummary{}, err
@@ -57,7 +67,16 @@ func (s *PostgresRepository) mutateDeviceLifecycle(ctx context.Context, record D
 	if !exists {
 		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
 	}
-	storedFingerprint, storedResourceID, inserted, err := s.reserveUserIdempotency(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, record.DeviceID, s.Now())
+	if device.Product != record.Product {
+		return controlplane.DeviceSummary{}, controlplane.ErrForbidden
+	}
+	var storedFingerprint, storedResourceID string
+	var inserted bool
+	if explicitProduct {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotencyForProduct(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, record.DeviceID, s.Now(), record.Product)
+	} else {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotency(operationCtx, tx, record.Scope, record.IdempotencyKey, record.Fingerprint, record.DeviceID, s.Now())
+	}
 	if err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
@@ -71,7 +90,7 @@ func (s *PostgresRepository) mutateDeviceLifecycle(ctx context.Context, record D
 				return controlplane.DeviceSummary{}, err
 			}
 		}
-		if err := releaseDeviceLeases(operationCtx, tx, record.DeviceID, s.Now()); err != nil {
+		if err := releaseDeviceLeases(operationCtx, tx, record.DeviceID, s.Now(), productReadArgs(explicitProduct, record.Product)...); err != nil {
 			return controlplane.DeviceSummary{}, err
 		}
 		if err := revokeDeviceSessions(operationCtx, tx, record.DeviceID); err != nil {
@@ -89,22 +108,32 @@ func (s *PostgresRepository) mutateDeviceLifecycle(ctx context.Context, record D
 	}
 
 	now := s.Now()
-	if err := releaseDeviceLeases(operationCtx, tx, record.DeviceID, now); err != nil {
+	if err := releaseDeviceLeases(operationCtx, tx, record.DeviceID, now, productReadArgs(explicitProduct, record.Product)...); err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
 	if err := revokeDeviceSessions(operationCtx, tx, record.DeviceID); err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
 	if unbind {
-		if _, err := tx.ExecContext(operationCtx, `
-			UPDATE devices SET user_id = NULL, status = $2 WHERE id = $1
-		`, record.DeviceID, controlplane.DeviceStatusPendingActivation); err != nil {
+		updateQuery := `UPDATE devices SET user_id = NULL, status = $2 WHERE id = $1`
+		updateArgs := []any{record.DeviceID, controlplane.DeviceStatusPendingActivation}
+		if explicitProduct {
+			updateQuery += " AND product = $3"
+			updateArgs = append(updateArgs, record.Product)
+		}
+		if _, err := tx.ExecContext(operationCtx, updateQuery, updateArgs...); err != nil {
 			return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("unbind normalized device: %w", err))
 		}
 		device.UserID = ""
 		device.Status = controlplane.DeviceStatusPendingActivation
 	} else {
-		if _, err := tx.ExecContext(operationCtx, `UPDATE devices SET status = $2 WHERE id = $1`, record.DeviceID, controlplane.DeviceStatusDisabled); err != nil {
+		updateQuery := `UPDATE devices SET status = $2 WHERE id = $1`
+		updateArgs := []any{record.DeviceID, controlplane.DeviceStatusDisabled}
+		if explicitProduct {
+			updateQuery += " AND product = $3"
+			updateArgs = append(updateArgs, record.Product)
+		}
+		if _, err := tx.ExecContext(operationCtx, updateQuery, updateArgs...); err != nil {
 			return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("disable normalized device: %w", err))
 		}
 		device.Status = controlplane.DeviceStatusDisabled
@@ -120,12 +149,18 @@ func (s *PostgresRepository) mutateDeviceLifecycle(ctx context.Context, record D
 	return device, nil
 }
 
-func releaseDeviceLeases(ctx context.Context, tx *sql.Tx, deviceID string, now time.Time) error {
-	if _, err := tx.ExecContext(ctx, `
+func releaseDeviceLeases(ctx context.Context, tx *sql.Tx, deviceID string, now time.Time, products ...controlplane.ProductCode) error {
+	query := `
 		UPDATE model_leases
 		SET status = $2, released_at = $3
 		WHERE device_id = $1 AND status = $4
-	`, deviceID, controlplane.ModelLeaseStatusReleased, now, controlplane.ModelLeaseStatusActive); err != nil {
+	`
+	args := []any{deviceID, controlplane.ModelLeaseStatusReleased, now, controlplane.ModelLeaseStatusActive}
+	if len(products) > 0 && products[0] != "" {
+		query += " AND product = $5"
+		args = append(args, products[0])
+	}
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 		return postgresOperationError(ctx, fmt.Errorf("release normalized device leases: %w", err))
 	}
 	return nil

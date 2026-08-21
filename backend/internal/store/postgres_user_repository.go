@@ -403,6 +403,35 @@ func (s *PostgresRepository) reserveUserIdempotency(ctx context.Context, tx *sql
 	return storedFingerprint, storedResourceID, false, nil
 }
 
+func (s *PostgresRepository) reserveUserIdempotencyForProduct(ctx context.Context, tx *sql.Tx, scope, idempotencyKey, fingerprint, resourceID string, createdAt time.Time, product controlplane.ProductCode) (string, string, bool, error) {
+	var storedFingerprint, storedResourceID string
+	err := tx.QueryRowContext(ctx, `
+		INSERT INTO idempotency_records (scope, idempotency_key, fingerprint, resource_id, created_at, product)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (scope, idempotency_key) DO NOTHING
+		RETURNING fingerprint, resource_id, product
+	`, scope, idempotencyKey, fingerprint, resourceID, createdAt, product).Scan(&storedFingerprint, &storedResourceID, &product)
+	if err == nil {
+		return storedFingerprint, storedResourceID, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, postgresOperationError(ctx, fmt.Errorf("insert product-scoped idempotency record: %w", err))
+	}
+	var storedProduct controlplane.ProductCode
+	if err := tx.QueryRowContext(ctx, `
+		SELECT fingerprint, resource_id, product
+		FROM idempotency_records
+		WHERE scope = $1 AND idempotency_key = $2
+		FOR UPDATE
+	`, scope, idempotencyKey).Scan(&storedFingerprint, &storedResourceID, &storedProduct); err != nil {
+		return "", "", false, postgresOperationError(ctx, fmt.Errorf("load existing product-scoped idempotency record: %w", err))
+	}
+	if storedProduct != product {
+		return "", "", false, controlplane.ErrForbidden
+	}
+	return storedFingerprint, storedResourceID, false, nil
+}
+
 func (s *PostgresRepository) loadUserByID(ctx context.Context, tx *sql.Tx, userID string) (controlplane.UserSummary, error) {
 	var user controlplane.UserSummary
 	var createdAt time.Time

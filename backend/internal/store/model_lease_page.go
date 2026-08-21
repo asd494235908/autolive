@@ -17,6 +17,10 @@ const (
 )
 
 func NormalizeModelLeasePageOptions(options ModelLeasePageOptions) (ModelLeasePageOptions, error) {
+	options.Product = controlplane.ProductCode(strings.TrimSpace(string(options.Product)))
+	if options.Product != "" && !options.Product.Valid() {
+		return ModelLeasePageOptions{}, errors.New("model lease product filter is not supported")
+	}
 	options.Status = strings.TrimSpace(options.Status)
 	options.Provider = strings.TrimSpace(options.Provider)
 	options.Model = strings.TrimSpace(options.Model)
@@ -58,6 +62,9 @@ func normalizeModelLeaseSummaryStatus(item *controlplane.ModelLeaseAdminSummary,
 
 func modelLeaseMatchesPageOptions(item controlplane.ModelLeaseAdminSummary, options ModelLeasePageOptions, now time.Time) bool {
 	normalizeModelLeaseSummaryStatus(&item, now)
+	if options.Product != "" && item.Product != options.Product {
+		return false
+	}
 	if options.Status != "" && item.Status != options.Status {
 		return false
 	}
@@ -101,6 +108,7 @@ func sortModelLeaseSummaries(items []controlplane.ModelLeaseAdminSummary, sortKe
 func modelLeaseAdminSummary(lease controlplane.ModelLease) controlplane.ModelLeaseAdminSummary {
 	return controlplane.ModelLeaseAdminSummary{
 		ID:               lease.ID,
+		Product:          lease.Product,
 		AccountID:        lease.AccountID,
 		UserID:           lease.UserID,
 		DeviceID:         lease.DeviceID,

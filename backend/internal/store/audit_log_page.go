@@ -15,6 +15,10 @@ const (
 )
 
 func NormalizeAuditLogPageOptions(options AuditLogPageOptions) (AuditLogPageOptions, error) {
+	options.Product = controlplane.ProductCode(strings.TrimSpace(string(options.Product)))
+	if options.Product != "" && !options.Product.Valid() {
+		return AuditLogPageOptions{}, errors.New("audit log product filter is not supported")
+	}
 	options.ActorUserID = strings.TrimSpace(options.ActorUserID)
 	options.DeviceID = strings.TrimSpace(options.DeviceID)
 	options.Action = strings.TrimSpace(options.Action)
@@ -57,6 +61,9 @@ func NormalizeAuditLogPageOptions(options AuditLogPageOptions) (AuditLogPageOpti
 }
 
 func auditLogMatchesPageOptions(item controlplane.AuditLog, options AuditLogPageOptions) bool {
+	if options.Product != "" && item.Product != options.Product {
+		return false
+	}
 	if options.ActorUserID != "" && item.ActorUserID != options.ActorUserID {
 		return false
 	}

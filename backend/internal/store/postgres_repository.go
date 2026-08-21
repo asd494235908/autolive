@@ -336,6 +336,7 @@ func (s *PostgresRepository) ListModelUsagePageWithOptions(ctx context.Context, 
 			column string
 			value  string
 		}{
+			{column: "product", value: string(options.Product)},
 			{column: "provider", value: options.Provider},
 			{column: "model", value: options.Model},
 			{column: "user_id", value: options.UserID},
@@ -365,14 +366,18 @@ func (s *PostgresRepository) ListModelUsagePageWithOptions(ctx context.Context, 
 		}
 		limitPlaceholder := addArg(options.Limit)
 		offsetPlaceholder := addArg(options.Offset)
+		selectProduct := ""
+		if options.Product != "" {
+			selectProduct = "product, "
+		}
 		query := fmt.Sprintf(`
-			SELECT id, lease_id, client_call_id, request_id, provider, model,
+			SELECT id, %slease_id, client_call_id, request_id, provider, model,
 			       prompt_tokens, completion_tokens, total_tokens, latency_ms,
 			       status, usage_source, error_code, created_at
 			FROM model_usage_records%s
 			ORDER BY %s
 			LIMIT %s OFFSET %s
-		`, whereSQL, orderBy, limitPlaceholder, offsetPlaceholder)
+		`, selectProduct, whereSQL, orderBy, limitPlaceholder, offsetPlaceholder)
 		rows, err := tx.QueryContext(ctx, query, filterArgs...)
 		if err != nil {
 			return ModelUsagePage{}, err
@@ -382,15 +387,30 @@ func (s *PostgresRepository) ListModelUsagePageWithOptions(ctx context.Context, 
 			var (
 				item               controlplane.ModelUsageRecord
 				leaseID, errorCode sql.NullString
+				product            sql.NullString
 				createdAt          time.Time
 			)
-			if err := rows.Scan(&item.ID, &leaseID, &item.ClientCallID, &item.RequestID, &item.Provider, &item.Model,
+			dest := []any{&item.ID, &leaseID, &item.ClientCallID, &item.RequestID, &item.Provider, &item.Model,
 				&item.InputTokens, &item.OutputTokens, &item.TotalTokens, &item.LatencyMS,
-				&item.Status, &item.UsageSource, &errorCode, &createdAt); err != nil {
+				&item.Status, &item.UsageSource, &errorCode, &createdAt}
+			if options.Product != "" {
+				dest = []any{&item.ID, &product, &leaseID, &item.ClientCallID, &item.RequestID, &item.Provider, &item.Model,
+					&item.InputTokens, &item.OutputTokens, &item.TotalTokens, &item.LatencyMS,
+					&item.Status, &item.UsageSource, &errorCode, &createdAt}
+			}
+			if err := rows.Scan(dest...); err != nil {
 				return ModelUsagePage{}, err
 			}
 			item.LeaseID = leaseID.String
 			item.ErrorCode = errorCode.String
+			if options.Product != "" {
+				item.Product, err = normalizedAuditProduct(product)
+				if err != nil {
+					return ModelUsagePage{}, err
+				}
+			} else {
+				item.Product = controlplane.ProductAutoLive
+			}
 			item.CreatedAt = createdAt.UTC().Format(time.RFC3339)
 			page.Items = append(page.Items, item)
 		}
@@ -439,6 +459,7 @@ func (s *PostgresRepository) ListAuditLogsPageWithOptions(ctx context.Context, o
 			column string
 			value  string
 		}{
+			{column: "product", value: string(options.Product)},
 			{column: "actor_user_id", value: options.ActorUserID},
 			{column: "device_id", value: options.DeviceID},
 			{column: "action", value: options.Action},
@@ -736,6 +757,7 @@ func (s *PostgresRepository) ListModelLeasesPageWithOptions(ctx context.Context,
 			column string
 			value  string
 		}{
+			{column: "product", value: string(options.Product)},
 			{column: "provider", value: options.Provider},
 			{column: "model", value: options.Model},
 			{column: "user_id", value: options.UserID},
@@ -766,13 +788,17 @@ func (s *PostgresRepository) ListModelLeasesPageWithOptions(ctx context.Context,
 		}
 		limitPlaceholder := addArg(options.Limit)
 		offsetPlaceholder := addArg(options.Offset)
+		selectProduct := ""
+		if options.Product != "" {
+			selectProduct = "product, "
+		}
 		query := fmt.Sprintf(`
-			SELECT id, account_id, user_id, device_id, purpose, status, expires_at,
+			SELECT id, %saccount_id, user_id, device_id, purpose, status, expires_at,
 			       provider, model, proxy_mode, concurrency_limit
 			  FROM model_leases%s
 			 ORDER BY %s
 			 LIMIT %s OFFSET %s
-		`, whereSQL, orderBy, limitPlaceholder, offsetPlaceholder)
+		`, selectProduct, whereSQL, orderBy, limitPlaceholder, offsetPlaceholder)
 		rows, err := tx.QueryContext(ctx, query, filterArgs...)
 		if err != nil {
 			return ModelLeasePage{}, err
@@ -781,11 +807,25 @@ func (s *PostgresRepository) ListModelLeasesPageWithOptions(ctx context.Context,
 		for rows.Next() {
 			var (
 				item      controlplane.ModelLeaseAdminSummary
+				product   sql.NullString
 				expiresAt time.Time
 			)
-			if err := rows.Scan(&item.ID, &item.AccountID, &item.UserID, &item.DeviceID, &item.Purpose, &item.Status,
-				&expiresAt, &item.Provider, &item.Model, &item.ProxyMode, &item.ConcurrencyLimit); err != nil {
+			dest := []any{&item.ID, &item.AccountID, &item.UserID, &item.DeviceID, &item.Purpose, &item.Status,
+				&expiresAt, &item.Provider, &item.Model, &item.ProxyMode, &item.ConcurrencyLimit}
+			if options.Product != "" {
+				dest = []any{&item.ID, &product, &item.AccountID, &item.UserID, &item.DeviceID, &item.Purpose, &item.Status,
+					&expiresAt, &item.Provider, &item.Model, &item.ProxyMode, &item.ConcurrencyLimit}
+			}
+			if err := rows.Scan(dest...); err != nil {
 				return ModelLeasePage{}, err
+			}
+			if options.Product != "" {
+				item.Product, err = normalizedAuditProduct(product)
+				if err != nil {
+					return ModelLeasePage{}, err
+				}
+			} else {
+				item.Product = controlplane.ProductAutoLive
 			}
 			item.ExpiresAt = expiresAt.UTC().Format(time.RFC3339)
 			page.Items = append(page.Items, item)
@@ -808,22 +848,27 @@ func (s *PostgresRepository) GetModelLeaseAdminDetail(ctx context.Context, lease
 	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (controlplane.ModelLeaseAdminDetail, error) {
 		var (
 			detail               controlplane.ModelLeaseAdminDetail
+			product              sql.NullString
 			createdAt, expiresAt time.Time
 			releasedAt           sql.NullTime
 		)
 		err := tx.QueryRowContext(ctx, `
-			SELECT id, account_id, user_id, device_id, purpose, status, created_at,
+			SELECT id, product, account_id, user_id, device_id, purpose, status, created_at,
 			       expires_at, released_at, provider, model, proxy_mode, concurrency_limit
 			  FROM model_leases
 			 WHERE id = $1
 		`, leaseID).Scan(
-			&detail.ID, &detail.AccountID, &detail.UserID, &detail.DeviceID, &detail.Purpose,
+			&detail.ID, &product, &detail.AccountID, &detail.UserID, &detail.DeviceID, &detail.Purpose,
 			&detail.Status, &createdAt, &expiresAt, &releasedAt, &detail.Provider,
 			&detail.Model, &detail.ProxyMode, &detail.ConcurrencyLimit,
 		)
 		if errors.Is(err, sql.ErrNoRows) {
 			return controlplane.ModelLeaseAdminDetail{}, controlplane.ErrModelLeaseNotFound
 		}
+		if err != nil {
+			return controlplane.ModelLeaseAdminDetail{}, err
+		}
+		detail.Product, err = normalizedAuditProduct(product)
 		if err != nil {
 			return controlplane.ModelLeaseAdminDetail{}, err
 		}

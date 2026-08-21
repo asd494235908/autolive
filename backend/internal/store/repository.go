@@ -469,6 +469,7 @@ type AuditPage struct {
 type AuditLogPageOptions struct {
 	Offset        int
 	Limit         int
+	Product       controlplane.ProductCode
 	ActorUserID   string
 	DeviceID      string
 	Action        string
@@ -494,6 +495,7 @@ type ModelLeasePage struct {
 type ModelLeasePageOptions struct {
 	Offset    int
 	Limit     int
+	Product   controlplane.ProductCode
 	Status    string
 	Provider  string
 	Model     string

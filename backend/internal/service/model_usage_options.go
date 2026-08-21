@@ -10,6 +10,7 @@ import (
 // ModelUsageListOptions is the bounded public filter surface for the admin
 // model usage list. Timestamps are parsed before reaching the repository.
 type ModelUsageListOptions struct {
+	Product       controlplane.ProductCode
 	Provider      string
 	Model         string
 	UserID        string
@@ -22,8 +23,12 @@ type ModelUsageListOptions struct {
 
 func normalizeModelUsageListOptions(options ModelUsageListOptions) (store.ModelUsagePageOptions, error) {
 	result := store.ModelUsagePageOptions{
+		Product:  controlplane.ProductCode(strings.TrimSpace(string(options.Product))),
 		Provider: options.Provider, Model: options.Model, UserID: options.UserID,
 		DeviceID: options.DeviceID, RequestID: options.RequestID, Sort: options.Sort,
+	}
+	if result.Product != "" && !result.Product.Valid() {
+		return store.ModelUsagePageOptions{}, controlplane.ErrInvalidRequest
 	}
 	result.Provider = strings.TrimSpace(result.Provider)
 	result.Model = strings.TrimSpace(result.Model)

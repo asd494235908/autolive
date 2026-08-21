@@ -11,6 +11,7 @@ import (
 // lease list. Values are converted to the storage whitelist at the service
 // boundary; callers cannot provide SQL identifiers or expressions.
 type ModelLeaseListOptions struct {
+	Product   controlplane.ProductCode
 	Status    string
 	Provider  string
 	Model     string
@@ -22,6 +23,7 @@ type ModelLeaseListOptions struct {
 
 func normalizeModelLeaseListOptions(options ModelLeaseListOptions) (store.ModelLeasePageOptions, error) {
 	result := store.ModelLeasePageOptions{
+		Product:   controlplane.ProductCode(strings.TrimSpace(string(options.Product))),
 		Status:    strings.TrimSpace(options.Status),
 		Provider:  strings.TrimSpace(options.Provider),
 		Model:     strings.TrimSpace(options.Model),
@@ -29,6 +31,9 @@ func normalizeModelLeaseListOptions(options ModelLeaseListOptions) (store.ModelL
 		DeviceID:  strings.TrimSpace(options.DeviceID),
 		AccountID: strings.TrimSpace(options.AccountID),
 		Sort:      strings.TrimSpace(options.Sort),
+	}
+	if result.Product != "" && !result.Product.Valid() {
+		return store.ModelLeasePageOptions{}, controlplane.ErrInvalidRequest
 	}
 	if result.Status != "" {
 		switch result.Status {

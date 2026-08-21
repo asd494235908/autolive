@@ -19,6 +19,7 @@ const (
 type ModelUsagePageOptions struct {
 	Offset        int
 	Limit         int
+	Product       controlplane.ProductCode
 	Provider      string
 	Model         string
 	UserID        string
@@ -30,6 +31,10 @@ type ModelUsagePageOptions struct {
 }
 
 func NormalizeModelUsagePageOptions(options ModelUsagePageOptions) (ModelUsagePageOptions, error) {
+	options.Product = controlplane.ProductCode(strings.TrimSpace(string(options.Product)))
+	if options.Product != "" && !options.Product.Valid() {
+		return ModelUsagePageOptions{}, errors.New("model usage product filter is not supported")
+	}
 	options.Provider = strings.TrimSpace(options.Provider)
 	options.Model = strings.TrimSpace(options.Model)
 	options.UserID = strings.TrimSpace(options.UserID)
@@ -65,6 +70,9 @@ func NormalizeModelUsagePageOptions(options ModelUsagePageOptions) (ModelUsagePa
 }
 
 func modelUsageMatchesPageOptions(item controlplane.ModelUsageRecord, options ModelUsagePageOptions, userID, deviceID string) bool {
+	if options.Product != "" && item.Product != options.Product {
+		return false
+	}
 	if options.Provider != "" && item.Provider != options.Provider {
 		return false
 	}

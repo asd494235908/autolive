@@ -96,6 +96,9 @@ func validateHeartbeatInput(input controlplane.HeartbeatInput) error {
 	if !idPattern.MatchString(input.DeviceID) || input.SentAt.IsZero() {
 		return controlplane.ErrInvalidRequest
 	}
+	if input.Product != "" && !input.Product.Valid() {
+		return controlplane.ErrInvalidRequest
+	}
 	if input.Status.DiskFreeBytes < 0 || input.Status.MemoryTotalBytes < 0 || input.Status.MemoryAvailableBytes < 0 || (input.Status.MemoryTotalBytes > 0 && input.Status.MemoryAvailableBytes > input.Status.MemoryTotalBytes) || input.Status.CPULogicalCores < 0 || input.Status.CPULogicalCores > 4096 || len(input.Status.OSName) > 128 || len(input.Status.OSVersion) > 128 || len(input.Status.KernelVersion) > 128 || len(input.Status.CurrentMediaName) > 255 {
 		return controlplane.ErrInvalidRequest
 	}
@@ -112,6 +115,9 @@ func validateActivateDeviceInput(input controlplane.ActivateDeviceInput) error {
 		return controlplane.ErrInvalidRequest
 	}
 	if strings.TrimSpace(input.Device.DeviceName) == "" || len(input.Device.DeviceName) > 128 || strings.TrimSpace(input.Device.Platform) == "" || len(input.Device.Platform) > 64 || strings.TrimSpace(input.Device.AppVersion) == "" || len(input.Device.AppVersion) > 64 || len(input.Device.OSVersion) > 128 {
+		return controlplane.ErrInvalidRequest
+	}
+	if input.Device.Product != "" && !input.Device.Product.Valid() {
 		return controlplane.ErrInvalidRequest
 	}
 	return nil
