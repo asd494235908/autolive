@@ -34,6 +34,42 @@ func TestLatestVersionMatchesEmbeddedCatalog(t *testing.T) {
 	}
 }
 
+func TestLatestVersionIsProductIsolationMigration23(t *testing.T) {
+	if LatestVersion != 23 {
+		t.Fatalf("LatestVersion = %d, want 23", LatestVersion)
+	}
+}
+
+func TestMigration23ProductIsolationContract(t *testing.T) {
+	payload, err := fs.ReadFile(FS, "0023_补齐多产品控制面.up.sql")
+	if err != nil {
+		t.Fatalf("read migration 0023: %v", err)
+	}
+	sql := string(payload)
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS products",
+		"'autolive'",
+		"'douyin_desktop'",
+		"CREATE TABLE IF NOT EXISTS user_products",
+		"ALTER TABLE devices",
+		"ADD COLUMN IF NOT EXISTS product",
+		"ALTER COLUMN product SET NOT NULL",
+		"devices_product_id_pkey PRIMARY KEY (product, id)",
+		"FOREIGN KEY (product, used_by_device_id) REFERENCES devices(product, id)",
+		"auth_sessions",
+		"user_authorization_policies",
+		"idx_devices_product_device_id",
+		"idx_auth_sessions_product_device",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0023 is missing product-isolation fragment %q", fragment)
+		}
+	}
+	if strings.Contains(sql, "auth_sessions_product_device_fkey") {
+		t.Fatal("migration 0023 must not reintroduce auth_sessions device foreign key dropped by migration 0018")
+	}
+}
+
 func TestActivationMultiDeviceMigrationAddsCapacityAndCount(t *testing.T) {
 	payload, err := fs.ReadFile(FS, "0022_支持激活码多设备绑定.up.sql")
 	if err != nil {

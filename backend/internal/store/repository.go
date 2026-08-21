@@ -20,6 +20,17 @@ type Repository interface {
 	Run(ctx context.Context, fn StateOperation) error
 }
 
+// ProductRepository owns the normalized product registry and user-product
+// membership facts. It is intentionally small so later profile/session/RBAC
+// work can depend on one bounded read/write seam instead of the legacy
+// snapshot.
+type ProductRepository interface {
+	ListProducts(ctx context.Context) ([]controlplane.ProductSummary, error)
+	GetProduct(ctx context.Context, product controlplane.ProductCode) (controlplane.ProductSummary, error)
+	GetUserProductMembership(ctx context.Context, userID string, product controlplane.ProductCode) (controlplane.UserProductMembership, error)
+	EnsureUserProductMembership(ctx context.Context, userID string, product controlplane.ProductCode) (controlplane.UserProductMembership, error)
+}
+
 // TransactionalSessionBinder is the compatibility transaction boundary for
 // client activation/heartbeat flows. Implementations bind the authenticated
 // session and execute the legacy StateOperation on the same database

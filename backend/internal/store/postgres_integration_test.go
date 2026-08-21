@@ -1491,6 +1491,79 @@ func (f *normalizedModelLeaseIntegrationFixture) addAccount(t *testing.T, ctx co
 	return accountID
 }
 
+func TestPostgresProductIsolationAllowsSameDeviceIDAcrossProductsAndPersistsSessionProduct(t *testing.T) {
+	database, ctx := openPostgresIntegrationDatabase(t)
+
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	suffix := time.Now().UTC().UnixNano()
+	userID := fmt.Sprintf("product_scope_user_%d", suffix)
+	deviceID := fmt.Sprintf("product_scope_device_%d", suffix)
+	sessionID := fmt.Sprintf("session_product_scope_%d", suffix)
+	accessTokenHash := fmt.Sprintf("access_product_scope_%d", suffix)
+	refreshTokenHash := fmt.Sprintf("refresh_product_scope_%d", suffix)
+	deviceKey := "state-device/" + deviceID
+
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM auth_sessions WHERE id = $1`, sessionID)
+		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM devices WHERE id = $1`, deviceID)
+		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM user_products WHERE user_id = $1`, userID)
+		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM users WHERE id = $1`, userID)
+	})
+
+	if _, err := database.ExecContext(ctx, `
+		INSERT INTO users (id, username, password_hash, role, status, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`, userID, userID, "$2a$10$integration-hash", controlplane.RoleUser, controlplane.UserStatusActive, now); err != nil {
+		t.Fatalf("seed product isolation user: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `
+		INSERT INTO user_products (user_id, product, status, entitlement_revision, created_at, updated_at)
+		VALUES
+			($1, $2, 'active', 0, $4, $4),
+			($1, $3, 'active', 0, $4, $4)
+	`, userID, controlplane.ProductAutoLive, controlplane.ProductDouyinDesktop, now); err != nil {
+		t.Fatalf("seed product memberships: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `
+		INSERT INTO devices (product, id, user_id, device_key, device_name, platform, client_version, status, last_heartbeat_at)
+		VALUES
+			($1, $3, $5, $4, 'AutoLive Device', 'windows', 'integration', $6, $7),
+			($2, $3, $5, $4, 'Douyin Device', 'windows', 'integration', $6, $7)
+	`, controlplane.ProductAutoLive, controlplane.ProductDouyinDesktop, deviceID, deviceKey, userID, controlplane.DeviceStatusActive, now); err != nil {
+		t.Fatalf("seed product-scoped devices: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `
+		INSERT INTO auth_sessions (
+			id, user_id, product, device_id, access_token_hash, refresh_token_hash,
+			access_expires_at, refresh_expires_at, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`, sessionID, userID, controlplane.ProductAutoLive, deviceID, accessTokenHash, refreshTokenHash, now.Add(time.Hour), now.Add(24*time.Hour), now); err != nil {
+		t.Fatalf("seed product-scoped auth session: %v", err)
+	}
+
+	var deviceCount int
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM devices WHERE id = $1`, deviceID).Scan(&deviceCount); err != nil {
+		t.Fatalf("count product-scoped devices: %v", err)
+	}
+	if deviceCount != 2 {
+		t.Fatalf("devices with shared id = %d, want 2", deviceCount)
+	}
+
+	var storedProduct, storedDeviceID string
+	if err := database.QueryRowContext(ctx, `
+		SELECT product, device_id
+		FROM auth_sessions
+		WHERE id = $1
+	`, sessionID).Scan(&storedProduct, &storedDeviceID); err != nil {
+		t.Fatalf("read auth session product scope: %v", err)
+	}
+	if storedProduct != string(controlplane.ProductAutoLive) || storedDeviceID != deviceID {
+		t.Fatalf("auth session scope = (%q, %q), want (%q, %q)", storedProduct, storedDeviceID, controlplane.ProductAutoLive, deviceID)
+	}
+}
+
 func openPostgresIntegrationDatabase(t *testing.T) (*sql.DB, context.Context) {
 	t.Helper()
 	databaseURL := os.Getenv("TEST_POSTGRES_URL")
