@@ -32,10 +32,12 @@ export function resolveDevEnvironment({ root = desktopRoot, env = process.env } 
 }
 
 function main() {
+  const environment = resolveDevEnvironment();
   const command = process.platform === 'win32' ? 'tauri.cmd' : 'tauri';
-  const child = spawn(command, ['dev', '--config', 'src-tauri/tauri.conf.json'], {
+  const tauriConfig = environment.AUTOLIVE_TAURI_CONFIG || 'src-tauri/tauri.test.conf.json';
+  const child = spawn(command, ['dev', '--config', tauriConfig], {
     cwd: desktopRoot,
-    env: resolveDevEnvironment(),
+    env: environment,
     stdio: 'inherit',
     shell: process.platform === 'win32',
   });

@@ -25,7 +25,10 @@ test('桌面端控制面请求遵守 JSON、请求追踪和统一错误契约', 
   assert.match(source, /payload\.code === 'AUDIT_UNAVAILABLE'/);
   assert.match(source, /requestJson<T>\(path, init, allowAuthRefresh, false\)/);
   assert.match(source, /VITE_CONTROL_PLANE_BASE_URL/);
-  assert.match(source, /http:\/\/127\.0\.0\.1:18090/);
+  assert.match(source, /VITE_CONTROL_PLANE_ENV/);
+  assert.match(source, /VITE_CONTROL_PLANE_ENV === 'test'/);
+  assert.match(source, /loginControlPlane\(request: LoginRequestDto\).*'\/api\/v1\/auth\/login'/);
+  assert.match(source, /http:\/\/101\.96\.208\.132:9090/);
   assert.match(source, /must be set for production desktop builds/);
   assert.match(source, /parsed\.protocol !== 'https:'/);
   assert.match(source, /must use HTTPS for production desktop builds/);

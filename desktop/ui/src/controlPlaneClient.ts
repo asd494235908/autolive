@@ -1,10 +1,11 @@
 import { fetch } from '@tauri-apps/plugin-http';
 import type { components as OpenAPIComponents } from './api/openapi.generated';
 
-type ViteEnvironment = { DEV?: boolean; VITE_CONTROL_PLANE_BASE_URL?: string };
+type ViteEnvironment = { DEV?: boolean; VITE_CONTROL_PLANE_BASE_URL?: string; VITE_CONTROL_PLANE_ENV?: string };
 const viteEnvironment = (import.meta as ImportMeta & { env?: ViteEnvironment }).env;
 const configuredControlPlaneBaseUrl = viteEnvironment?.VITE_CONTROL_PLANE_BASE_URL?.trim();
-const developmentControlPlaneBaseUrl = 'http://127.0.0.1:18090';
+const developmentControlPlaneBaseUrl = 'http://101.96.208.132:9090';
+const testControlPlaneBuild = viteEnvironment?.VITE_CONTROL_PLANE_ENV === 'test';
 
 function resolveControlPlaneBaseUrl() {
   const candidate = configuredControlPlaneBaseUrl || (viteEnvironment?.DEV ? developmentControlPlaneBaseUrl : '');
@@ -20,11 +21,11 @@ function resolveControlPlaneBaseUrl() {
   if (parsed.username || parsed.password || parsed.search || parsed.hash) {
     throw new Error('VITE_CONTROL_PLANE_BASE_URL must not contain credentials, query, or hash');
   }
-  if (!viteEnvironment?.DEV && parsed.protocol !== 'https:') {
+  if (!viteEnvironment?.DEV && !testControlPlaneBuild && parsed.protocol !== 'https:') {
     throw new Error('VITE_CONTROL_PLANE_BASE_URL must use HTTPS for production desktop builds');
   }
-  if (viteEnvironment?.DEV && parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('VITE_CONTROL_PLANE_BASE_URL must use HTTP or HTTPS');
+  if ((viteEnvironment?.DEV || testControlPlaneBuild) && parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('VITE_CONTROL_PLANE_BASE_URL must use HTTP or HTTPS for development/test desktop builds');
   }
   return parsed.toString().replace(/\/+$/, '');
 }

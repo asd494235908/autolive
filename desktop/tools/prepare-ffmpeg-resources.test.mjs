@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
-import { tauriBuildArguments } from './build-desktop-artifact.mjs';
+import { applyBuildProfile, tauriBuildArguments, TEST_CONTROL_PLANE_BASE_URL } from './build-desktop-artifact.mjs';
 import { readDesktopVersion } from './desktop-version.mjs';
 
 const script = fileURLToPath(new URL('./prepare-ffmpeg-resources.mjs', import.meta.url));
@@ -68,6 +68,7 @@ test('Tauri scripts use the package binary lookup that works on Windows', () => 
   const buildSource = readFileSync(buildScript, 'utf8');
 
   assert.match(packageJson.scripts['tauri:build'], /build-desktop-artifact\.mjs/);
+  assert.match(packageJson.scripts['tauri:build:test'], /build-desktop-artifact\.mjs --profile=test/);
   assert.match(buildSource, /'tauri'/);
   assert.deepEqual(tauriBuildArguments('x86_64-pc-windows-msvc'), [
     'build',
@@ -77,6 +78,37 @@ test('Tauri scripts use the package binary lookup that works on Windows', () => 
     'nsis',
   ]);
   assert.doesNotMatch(`${packageJson.scripts['tauri:dev']}\n${buildSource}`, /\.\/ui\/node_modules\/\.bin\/tauri/);
+});
+
+test('测试包固定使用测试控制面和测试 Tauri 配置', () => {
+  const previous = {
+    baseUrl: process.env.VITE_CONTROL_PLANE_BASE_URL,
+    environment: process.env.VITE_CONTROL_PLANE_ENV,
+    config: process.env.AUTOLIVE_TAURI_CONFIG,
+  };
+  try {
+    delete process.env.VITE_CONTROL_PLANE_BASE_URL;
+    delete process.env.VITE_CONTROL_PLANE_ENV;
+    delete process.env.AUTOLIVE_TAURI_CONFIG;
+    applyBuildProfile('test');
+    assert.equal(process.env.VITE_CONTROL_PLANE_BASE_URL, TEST_CONTROL_PLANE_BASE_URL);
+    assert.equal(process.env.VITE_CONTROL_PLANE_ENV, 'test');
+    assert.equal(process.env.AUTOLIVE_TAURI_CONFIG, 'src-tauri/tauri.test.conf.json');
+    assert.deepEqual(tauriBuildArguments('x86_64-pc-windows-msvc').slice(0, 3), [
+      'build',
+      '--config',
+      'src-tauri/tauri.test.conf.json',
+    ]);
+  } finally {
+    for (const [key, value] of Object.entries({
+      VITE_CONTROL_PLANE_BASE_URL: previous.baseUrl,
+      VITE_CONTROL_PLANE_ENV: previous.environment,
+      AUTOLIVE_TAURI_CONFIG: previous.config,
+    })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test('归档脚本按版本和目标平台目录保存 bundle', () => {

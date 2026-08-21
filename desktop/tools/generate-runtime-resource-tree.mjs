@@ -25,6 +25,16 @@ function assertSupportedTarget(target) {
   }
 }
 
+function detectTargetTriple() {
+  if (process.platform === 'darwin') {
+    return process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin';
+  }
+  if (process.platform === 'win32' && process.arch === 'x64') {
+    return 'x86_64-pc-windows-msvc';
+  }
+  return null;
+}
+
 function removeReleaseExcludedEntries(root) {
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     const path = join(root, entry.name);
@@ -129,7 +139,7 @@ function stageEmbeddedResourceTree({ releaseRoot, sourceRoot, target }) {
 }
 
 export function buildRuntimeResourceRelease({
-  target = process.env.AUTOLIVE_TARGET_TRIPLE,
+  target = process.env.AUTOLIVE_TARGET_TRIPLE || detectTargetTriple(),
   sourceRoot = join(desktopRoot, 'src-tauri'),
   outputRoot = join(desktopRoot, 'resource-release'),
   manifestPath = join(desktopRoot, 'src-tauri', 'runtime-resources.json'),

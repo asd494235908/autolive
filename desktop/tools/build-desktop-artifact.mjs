@@ -5,11 +5,24 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { archiveDesktopArtifacts, detectTargetTriple } from './archive-desktop-artifact.mjs';
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+export const TEST_CONTROL_PLANE_BASE_URL = 'http://101.96.208.132:9090';
+
+export function applyBuildProfile(profile = process.argv.includes('--profile=test') ? 'test' : '') {
+  if (profile !== 'test') return;
+  const configuredBaseUrl = process.env.VITE_CONTROL_PLANE_BASE_URL?.trim();
+  if (configuredBaseUrl && configuredBaseUrl !== TEST_CONTROL_PLANE_BASE_URL) {
+    throw new Error(`测试包只能使用 ${TEST_CONTROL_PLANE_BASE_URL}`);
+  }
+  process.env.VITE_CONTROL_PLANE_BASE_URL = TEST_CONTROL_PLANE_BASE_URL;
+  process.env.VITE_CONTROL_PLANE_ENV = 'test';
+  process.env.AUTOLIVE_TAURI_CONFIG = 'src-tauri/tauri.test.conf.json';
+}
 
 export function tauriBuildArguments(
   targetTriple = process.env.AUTOLIVE_TARGET_TRIPLE?.trim() || detectTargetTriple(),
 ) {
-  const argumentsList = ['build', '--config', 'src-tauri/tauri.conf.json'];
+  const config = process.env.AUTOLIVE_TAURI_CONFIG?.trim() || 'src-tauri/tauri.conf.json';
+  const argumentsList = ['build', '--config', config];
   if (targetTriple === 'x86_64-pc-windows-msvc') {
     argumentsList.push('--bundles', 'nsis');
     return argumentsList;
@@ -37,6 +50,7 @@ export function buildDesktopArtifacts(
 }
 
 function main() {
+  applyBuildProfile();
   const destination = buildDesktopArtifacts();
   console.log(`已构建并归档桌面产物：${destination}`);
 }

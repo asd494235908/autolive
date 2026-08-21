@@ -15,6 +15,7 @@
     "ffmpeg:prepare": "node ../tools/prepare-ffmpeg-resources.mjs",
     "ffmpeg:test": "node --test ../tools/prepare-ffmpeg-resources.test.mjs",
     "tauri:build": "node ../tools/prepare-ffmpeg-resources.mjs && node ../tools/generate-runtime-resource-tree.mjs && node ../tools/build-desktop-artifact.mjs",
+    "tauri:build:test": "node ../tools/prepare-ffmpeg-resources.mjs && node ../tools/generate-runtime-resource-tree.mjs && node ../tools/build-desktop-artifact.mjs --profile=test",
     "tauri:build:prepared-resources": "node ../tools/prepare-ffmpeg-resources.mjs && node ../tools/generate-runtime-resource-tree.mjs && node ../tools/build-desktop-artifact.mjs"
   },
   "dependencies": {

@@ -30,6 +30,51 @@ test('开发启动只自动注入 FFmpeg 资源', () => {
   assert.equal(environment.AUTOLIVE_VOICE_PYTHON, undefined);
 });
 
+test('开发启动允许显式选择测试 Tauri 配置', () => {
+  const environment = resolveDevEnvironment({
+    root: desktopRoot,
+    env: {
+      AUTOLIVE_TAURI_CONFIG: 'src-tauri/tauri.test.conf.json',
+    },
+  });
+
+  assert.equal(environment.AUTOLIVE_TAURI_CONFIG, 'src-tauri/tauri.test.conf.json');
+});
+
+test('开发启动默认使用测试 Tauri 配置', () => {
+  const source = readFileSync(new URL('./start-desktop-dev.mjs', import.meta.url), 'utf8');
+  assert.match(source, /AUTOLIVE_TAURI_CONFIG \|\| 'src-tauri\/tauri\.test\.conf\.json'/);
+});
+
+test('测试 Tauri capability 只放行明确的测试控制面 origin', () => {
+  const defaultCapability = JSON.parse(
+    readFileSync(resolve(desktopRoot, 'src-tauri', 'capabilities', 'default.json'), 'utf8'),
+  );
+  const testCapability = JSON.parse(
+    readFileSync(resolve(desktopRoot, 'src-tauri', 'capabilities', 'test-control-plane.json'), 'utf8'),
+  );
+  const testConfig = JSON.parse(
+    readFileSync(resolve(desktopRoot, 'src-tauri', 'tauri.test.conf.json'), 'utf8'),
+  );
+  const testHttpPermission = testCapability.permissions.find(
+    (permission) => permission?.identifier === 'http:default',
+  );
+
+  assert.equal(testCapability.identifier, 'test-control-plane');
+  assert.ok(testConfig.app.security.capabilities.includes('test-control-plane'));
+  assert.deepEqual(testHttpPermission.allow, [
+    { url: 'http://127.0.0.1:18090/**' },
+    { url: 'https://admin.example.com/**' },
+    { url: 'http://101.96.208.132:9090/**' },
+  ]);
+  assert.equal(
+    defaultCapability.permissions.find((permission) => permission?.identifier === 'http:default')?.allow.some(
+      (entry) => entry.url.includes('101.96.208.132'),
+    ),
+    false,
+  );
+});
+
 test('tauri:dev 通过统一启动脚本运行当前开发版本', () => {
   const packageJson = JSON.parse(
     readFileSync(fileURLToPath(new URL('../ui/package.json', import.meta.url)), 'utf8'),
