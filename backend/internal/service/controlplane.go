@@ -1254,6 +1254,25 @@ func (s *ControlPlane) GetClientProfile(ctx context.Context, userID, deviceID st
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ClientProfile{}, err
 	}
+	return s.getClientProfile(ctx, userID, deviceID, "")
+}
+
+// GetClientProfileForProduct is the product-bound client profile boundary.
+// The device product is checked before the profile is returned so callers
+// cannot combine an actor from one product with a device from another.
+func (s *ControlPlane) GetClientProfileForProduct(ctx context.Context, userID, deviceID string, product controlplane.ProductCode) (controlplane.ClientProfile, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.ClientProfile{}, err
+	}
+	if !product.Valid() {
+		return controlplane.ClientProfile{}, controlplane.ErrInvalidRequest
+	}
+	return s.getClientProfile(ctx, userID, deviceID, product)
+}
+
+func (s *ControlPlane) getClientProfile(ctx context.Context, userID, deviceID string, product controlplane.ProductCode) (controlplane.ClientProfile, error) {
+	userID = strings.TrimSpace(userID)
+	deviceID = strings.TrimSpace(deviceID)
 	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
 		userReader, ok := s.repository.(store.UserReader)
 		if !ok {
@@ -1274,10 +1293,14 @@ func (s *ControlPlane) GetClientProfile(ctx context.Context, userID, deviceID st
 		if err != nil {
 			return controlplane.ClientProfile{}, err
 		}
+		if product != "" && device.Product != product {
+			return controlplane.ClientProfile{}, controlplane.ErrForbidden
+		}
 		if device.Status != controlplane.DeviceStatusActive {
 			return controlplane.ClientProfile{}, controlplane.ErrDeviceDisabled
 		}
 		profile := controlplane.ClientProfile{
+			Product:     product,
 			User:        user,
 			Device:      decorateDeviceSummary(device, s.repository.Now()),
 			Permissions: permissionsForRole(user.Role),
@@ -1303,10 +1326,14 @@ func (s *ControlPlane) GetClientProfile(ctx context.Context, userID, deviceID st
 		if err != nil {
 			return controlplane.ClientProfile{}, err
 		}
+		if product != "" && device.Product != product {
+			return controlplane.ClientProfile{}, controlplane.ErrForbidden
+		}
 		if device.Status != controlplane.DeviceStatusActive {
 			return controlplane.ClientProfile{}, controlplane.ErrDeviceDisabled
 		}
 		profile := controlplane.ClientProfile{
+			Product:     product,
 			User:        user,
 			Device:      device,
 			Permissions: permissionsForRole(user.Role),

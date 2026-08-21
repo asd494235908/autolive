@@ -47,17 +47,53 @@ func TestGetClientProfileUsesNormalizedUserAndDeviceReaders(t *testing.T) {
 			Status: controlplane.UserStatusActive, CreatedAt: now.Format(time.RFC3339),
 		},
 		device: controlplane.DeviceSummary{
-			ID: "dev_1", UserID: "usr_1", DeviceName: "Studio", Platform: "windows",
+			ID: "dev_1", UserID: "usr_1", Product: controlplane.ProductAutoLive, DeviceName: "Studio", Platform: "windows",
 			AppVersion: "1.2.3", Status: controlplane.DeviceStatusActive, LastSeenAt: now.Format(time.RFC3339),
 		},
 		expiresAt: now.Add(24 * time.Hour),
 	}
-	profile, err := NewControlPlaneWithRepository(repository).GetClientProfile(context.Background(), "usr_1", "dev_1")
+	profile, err := NewControlPlaneWithRepository(repository).GetClientProfileForProduct(context.Background(), "usr_1", "dev_1", controlplane.ProductAutoLive)
 	if err != nil {
 		t.Fatalf("GetClientProfile() error = %v", err)
 	}
 	if profile.User.ID != "usr_1" || profile.Device.ID != "dev_1" || profile.Device.ActivationExpiresAt == nil || *profile.Device.ActivationExpiresAt != now.Add(24*time.Hour).Format(time.RFC3339) || len(profile.Permissions) != 1 || profile.Permissions[0] != "client" || !profile.Device.Online {
 		t.Fatalf("profile = %+v", profile)
+	}
+}
+
+func TestGetClientProfileForProductRejectsNormalizedDeviceProductMismatch(t *testing.T) {
+	repository := &normalizedDeviceReaderRepository{
+		MemoryStore: store.NewMemoryStore(time.Now),
+		user:        controlplane.UserSummary{ID: "usr_1", Role: controlplane.RoleUser, Status: controlplane.UserStatusActive},
+		device:      controlplane.DeviceSummary{ID: "dev_1", UserID: "usr_1", Product: controlplane.ProductDouyinDesktop, Status: controlplane.DeviceStatusActive},
+	}
+	_, err := NewControlPlaneWithRepository(repository).GetClientProfileForProduct(context.Background(), "usr_1", "dev_1", controlplane.ProductAutoLive)
+	if err != controlplane.ErrForbidden {
+		t.Fatalf("GetClientProfileForProduct() error = %v, want forbidden", err)
+	}
+}
+
+func TestGetClientProfileForProductRejectsMemoryDeviceProductMismatchWithoutMutation(t *testing.T) {
+	repository := store.NewMemoryStore(time.Now)
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Users["usr_1"] = controlplane.UserSummary{ID: "usr_1", Role: controlplane.RoleUser, Status: controlplane.UserStatusActive}
+		state.Devices["dev_1"] = controlplane.DeviceSummary{ID: "dev_1", UserID: "usr_1", Product: controlplane.ProductDouyinDesktop, Status: controlplane.DeviceStatusActive}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed profile state: %v", err)
+	}
+	_, err := NewControlPlaneWithRepository(repository).GetClientProfileForProduct(context.Background(), "usr_1", "dev_1", controlplane.ProductAutoLive)
+	if err != controlplane.ErrForbidden {
+		t.Fatalf("GetClientProfileForProduct() error = %v, want forbidden", err)
+	}
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		device := state.Devices["dev_1"]
+		if device.Product != controlplane.ProductDouyinDesktop || device.UserID != "usr_1" {
+			t.Fatalf("profile mismatch mutated device = %+v", device)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify profile state: %v", err)
 	}
 }
 

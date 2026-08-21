@@ -552,6 +552,46 @@ func TestClientProfileReturnsActorAndDeviceProduct(t *testing.T) {
 	}
 }
 
+func TestClientProfileRejectsBoundDeviceFromAnotherProductWithoutMutation(t *testing.T) {
+	repository := store.NewMemoryStore(time.Now)
+	sessions := newTestSessionStore()
+	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{
+		Username: "admin",
+		Password: "password",
+	}, repository, store.NewMemorySecretStore(), sessions, true)
+	token := loginForTest(t, handler)
+	deviceID := "dev_profile_mismatch"
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Devices[deviceID] = controlplane.DeviceSummary{
+			ID: deviceID, UserID: "usr_local_admin", Product: controlplane.ProductDouyinDesktop,
+			Status: controlplane.DeviceStatusActive,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed mismatched device: %v", err)
+	}
+	if err := sessions.UpdateDeviceID(context.Background(), hashToken(token), deviceID); err != nil {
+		t.Fatalf("bind session device: %v", err)
+	}
+
+	profile := doJSON(t, handler, http.MethodGet, "/api/v1/client/profile", nil, token, "")
+	if profile.Code != http.StatusForbidden {
+		t.Fatalf("profile mismatch status = %d, want %d; body=%s", profile.Code, http.StatusForbidden, profile.Body.String())
+	}
+	session, found, err := sessions.GetByAccessTokenHash(context.Background(), hashToken(token))
+	if err != nil || !found || session.DeviceID != deviceID {
+		t.Fatalf("profile mismatch changed session binding: session=%+v found=%t err=%v", session, found, err)
+	}
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		if got := state.Devices[deviceID].Product; got != controlplane.ProductDouyinDesktop {
+			t.Fatalf("profile mismatch changed device product = %q", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify mismatched device: %v", err)
+	}
+}
+
 func TestLogoutRevokesAccessAndRefreshTokens(t *testing.T) {
 	handler := NewRouterWithAuth("v1.0.0", nil, AuthConfig{
 		Username: "admin",
@@ -716,6 +756,49 @@ type testSessionStore struct {
 	revoked   map[string]bool
 	revokeErr error
 	updateErr error
+}
+
+type snapshotProductRepositoryStub struct {
+	*store.MemoryStore
+	membershipCalls int
+}
+
+func (s *snapshotProductRepositoryStub) ListProducts(context.Context) ([]controlplane.ProductSummary, error) {
+	return nil, store.ErrNormalizedProductRepositoryRequired
+}
+
+func (s *snapshotProductRepositoryStub) GetProduct(context.Context, controlplane.ProductCode) (controlplane.ProductSummary, error) {
+	return controlplane.ProductSummary{}, store.ErrNormalizedProductRepositoryRequired
+}
+
+func (s *snapshotProductRepositoryStub) GetUserProductMembership(context.Context, string, controlplane.ProductCode) (controlplane.UserProductMembership, error) {
+	s.membershipCalls++
+	return controlplane.UserProductMembership{}, store.ErrNormalizedProductRepositoryRequired
+}
+
+func (s *snapshotProductRepositoryStub) EnsureUserProductMembership(context.Context, string, controlplane.ProductCode) (controlplane.UserProductMembership, error) {
+	return controlplane.UserProductMembership{}, store.ErrNormalizedProductRepositoryRequired
+}
+
+func (s *snapshotProductRepositoryStub) UsesNormalizedReadSource() bool { return false }
+
+func TestSnapshotProductRepositoryIsNotInjectedIntoAuthenticator(t *testing.T) {
+	repository := &snapshotProductRepositoryStub{MemoryStore: store.NewMemoryStore(time.Now)}
+	handler := NewRouterWithRepositoryAndSecretStore("test", nil, AuthConfig{
+		Username: "admin",
+		Password: "password",
+	}, repository, store.NewMemorySecretStore())
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(
+		`{"username":"admin","password":"password","product":"autolive"}`,
+	))
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("snapshot login status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if repository.membershipCalls != 0 {
+		t.Fatalf("snapshot membership calls = %d, want 0", repository.membershipCalls)
+	}
 }
 
 func newTestSessionStore() *testSessionStore {

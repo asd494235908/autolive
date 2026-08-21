@@ -67,7 +67,12 @@ func NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTele
 	controlPlane := service.NewControlPlaneWithRepositoryAndSecretStoreAndOptions(repository, nil, secretStore, service.ControlPlaneOptions{AllowInsecureHTTP: allowInsecureHTTP})
 	var productRepository store.ProductRepository
 	if candidate, ok := repository.(store.ProductRepository); ok {
-		productRepository = candidate
+		// Product membership is a normalized-only capability. Snapshot-backed
+		// PostgreSQL implements the compatibility methods too, but must keep the
+		// legacy login path instead of returning normalized-read errors.
+		if source, ok := repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+			productRepository = candidate
+		}
 	}
 	authenticator := newAuthenticatorWithProductRepository(controlPlane, authConfig, productRepository, sessionStore)
 	metrics := newHTTPMetricsWithTelemetry(repository, healthTelemetry, retentionTelemetry)

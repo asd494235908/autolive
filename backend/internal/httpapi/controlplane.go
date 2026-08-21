@@ -596,7 +596,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/client/profile", auth.requireBearer(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		profile, err := svc.GetClientProfile(r.Context(), actor.UserID, auth.deviceID(r))
+		profile, err := svc.GetClientProfileForProduct(r.Context(), actor.UserID, auth.deviceID(r), actor.Product)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
