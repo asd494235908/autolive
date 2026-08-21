@@ -997,7 +997,7 @@ func TestPostgresRepositoryNormalizedModeRestoresDomainFields(t *testing.T) {
 		sqlmock.NewRows([]string{"id", "user_id", "device_name", "platform", "client_version", "status", "disk_free_bytes", "memory_total_bytes", "memory_available_bytes", "cpu_logical_cores", "runtime_os_name", "runtime_os_version", "kernel_version", "current_media_name", "playback_state", "last_heartbeat_at"}).AddRow("dev_00000007", "usr_00000007", "Studio", "windows", "1.2.3", "active", int64(10), int64(20), int64(15), 8, "Windows", "11", "kernel", "demo.mp4", "playing", now),
 	)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, code_hash, code_prefix, status, expires_at, used_at")).WillReturnRows(
-		sqlmock.NewRows([]string{"id", "code_hash", "code_prefix", "status", "expires_at", "used_at", "used_by_user_id", "used_by_device_id"}).AddRow("ac_00000007", "digest", "AUTO-ABCD", "used", now.Add(time.Hour), usedAt, "usr_00000007", "dev_00000007"),
+		sqlmock.NewRows([]string{"id", "code_hash", "code_prefix", "status", "expires_at", "used_at", "used_by_user_id", "used_by_device_id", "max_devices", "bound_devices"}).AddRow("ac_00000007", "digest", "AUTO-ABCD", "used", now.Add(time.Hour), usedAt, "usr_00000007", "dev_00000007", 1, 1),
 	)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, provider, model, base_url, secret_ref, status, priority")).WillReturnRows(
 		sqlmock.NewRows([]string{"id", "provider", "model", "base_url", "secret_ref", "status", "priority", "concurrency_limit", "daily_token_limit", "cooldown_until"}).AddRow("mpa_00000007", "openai", "rewrite", "https://example.com/v1", "model-account/7", "active", 2, 3, 1000, nil),
