@@ -166,6 +166,10 @@
 .feature-drawer .desktop-muted { color: #9a9ba5; font-size: 12px; }
 .feature-drawer-section-action { margin-top: 10px; }
 .feature-drawer-inline-feedback { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.desktop-auth-gate { box-sizing: border-box; display: grid; min-height: 100vh; place-items: center; padding: 24px; background: #0b0b0f; }
+.desktop-auth-card { width: min(100%, 440px); border: 1px solid #303139; background: #17171c; box-shadow: 0 18px 60px rgba(0, 0, 0, 0.28); }
+.desktop-auth-session-warning { position: fixed; z-index: 1000; top: 44px; left: 50%; width: min(560px, calc(100vw - 32px)); transform: translateX(-50%); }
+.desktop-auth-session-controls { position: fixed; z-index: 1001; top: 4px; right: 140px; display: flex; align-items: center; gap: 8px; }
 
 @media (max-width: 1280px) {
   .desktop-workspace { grid-template-columns: 280px minmax(0, 1fr) 240px; }

@@ -121,6 +121,7 @@ import {
 import type { FixedSpeechPreset } from './fixedSpeechPresets';
 import { getCspNonce } from './cspNonce';
 import { CompactNumberField } from './desktop/compact-number-field';
+import { ControlPlaneGate } from './desktop/control-plane-gate';
 import { DesktopPanel } from './desktop/desktop-panel';
 import { FeatureDrawer, FeatureDrawerField, FeatureDrawerSection } from './desktop/feature-drawer';
 import { ParameterMetricCard, ReadOnlyMetricCard } from './desktop/parameter-metric-card';
@@ -6236,7 +6237,9 @@ export default function App() {
           <FinalEffectWindow />
         ) : (
           <HashRouter>
-            <DesktopRouter />
+            <ControlPlaneGate>
+              <DesktopRouter />
+            </ControlPlaneGate>
           </HashRouter>
         )}
       </AntApp>

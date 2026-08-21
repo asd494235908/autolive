@@ -74,6 +74,7 @@ type SessionRefreshHandler = () => Promise<string | null>;
 let sessionRefreshHandler: SessionRefreshHandler | null = null;
 let sessionRefreshInFlight: Promise<string | null> | null = null;
 export function setSessionRefreshHandler(handler: SessionRefreshHandler | null) { sessionRefreshHandler = handler }
+export function clearSessionRefreshHandler(handler: SessionRefreshHandler) { if (sessionRefreshHandler === handler) sessionRefreshHandler = null }
 async function refreshExpiredSession(): Promise<string | null> { if (sessionRefreshInFlight) return sessionRefreshInFlight; if (!sessionRefreshHandler) return null; sessionRefreshInFlight = sessionRefreshHandler().finally(() => { sessionRefreshInFlight = null }); return sessionRefreshInFlight }
 
 async function requestJson<T>(path: string, init: { method: 'GET' | 'POST'; body?: unknown; accessToken?: string; idempotencyKey?: string; timeoutMs?: number; requestId?: string }, allowAuthRefresh = true, allowAuditRetry = true): Promise<T> {
