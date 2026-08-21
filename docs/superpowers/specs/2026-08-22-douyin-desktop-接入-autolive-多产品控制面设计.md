@@ -141,6 +141,8 @@ P0 可托管在权限受控的 CI/Release artifact。商业化 Phase 8 迁移到
 5. 发布固定 OpenAPI 制品并完成跨仓库 E2E。
 6. 商业化 PRD 在同一 product 基线上实现 P1/P2，不复制事实源。
 
+补充落地说明（2026 年 8 月 21 日，Friday）：当前仓库中的 `0023_补齐多产品控制面.up.sql` 只允许实现第 1～2 步的兼容扩展，即 `products` / `user_products`、`product` 列回填、默认 `autolive`、用户默认成员关系和兼容索引/引用。`devices` 改为 `(product, device_id)`、删除旧单列键、补齐 product-aware 复合外键以及对现有业务表 `product` 列执行 `NOT NULL` 收紧，必须等 Task 3–5 完成 product 传播并通过双兼容验证后，再用后续迁移执行。
+
 ## 10. 本轮范围
 
 本轮只将已确认设计写入设计文档与分层 PRD；未修改服务端代码、OpenAPI、数据库迁移、React、douyin-desktop、CI 或服务器部署。

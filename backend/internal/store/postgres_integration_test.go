@@ -1491,7 +1491,7 @@ func (f *normalizedModelLeaseIntegrationFixture) addAccount(t *testing.T, ctx co
 	return accountID
 }
 
-func TestPostgresProductIsolationAllowsSameDeviceIDAcrossProductsAndPersistsSessionProduct(t *testing.T) {
+func TestPostgresProductCompatibilityDefaultsLegacyWritesToAutolive(t *testing.T) {
 	database, ctx := openPostgresIntegrationDatabase(t)
 
 	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
@@ -1519,48 +1519,49 @@ func TestPostgresProductIsolationAllowsSameDeviceIDAcrossProductsAndPersistsSess
 		t.Fatalf("seed product isolation user: %v", err)
 	}
 	if _, err := database.ExecContext(ctx, `
-		INSERT INTO user_products (user_id, product, status, entitlement_revision, created_at, updated_at)
-		VALUES
-			($1, $2, 'active', 0, $4, $4),
-			($1, $3, 'active', 0, $4, $4)
-	`, userID, controlplane.ProductAutoLive, controlplane.ProductDouyinDesktop, now); err != nil {
-		t.Fatalf("seed product memberships: %v", err)
-	}
-	if _, err := database.ExecContext(ctx, `
-		INSERT INTO devices (product, id, user_id, device_key, device_name, platform, client_version, status, last_heartbeat_at)
-		VALUES
-			($1, $3, $5, $4, 'AutoLive Device', 'windows', 'integration', $6, $7),
-			($2, $3, $5, $4, 'Douyin Device', 'windows', 'integration', $6, $7)
-	`, controlplane.ProductAutoLive, controlplane.ProductDouyinDesktop, deviceID, deviceKey, userID, controlplane.DeviceStatusActive, now); err != nil {
-		t.Fatalf("seed product-scoped devices: %v", err)
+		INSERT INTO devices (id, user_id, device_key, device_name, platform, client_version, status, last_heartbeat_at)
+		VALUES ($1, $2, $3, 'AutoLive Device', 'windows', 'integration', $4, $5)
+	`, deviceID, userID, deviceKey, controlplane.DeviceStatusActive, now); err != nil {
+		t.Fatalf("seed legacy-shaped device: %v", err)
 	}
 	if _, err := database.ExecContext(ctx, `
 		INSERT INTO auth_sessions (
-			id, user_id, product, device_id, access_token_hash, refresh_token_hash,
+			id, user_id, device_id, access_token_hash, refresh_token_hash,
 			access_expires_at, refresh_expires_at, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`, sessionID, userID, controlplane.ProductAutoLive, deviceID, accessTokenHash, refreshTokenHash, now.Add(time.Hour), now.Add(24*time.Hour), now); err != nil {
-		t.Fatalf("seed product-scoped auth session: %v", err)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, sessionID, userID, deviceID, accessTokenHash, refreshTokenHash, now.Add(time.Hour), now.Add(24*time.Hour), now); err != nil {
+		t.Fatalf("seed legacy-shaped auth session: %v", err)
 	}
 
-	var deviceCount int
-	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM devices WHERE id = $1`, deviceID).Scan(&deviceCount); err != nil {
-		t.Fatalf("count product-scoped devices: %v", err)
+	var membershipCount int
+	if err := database.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM user_products
+		WHERE user_id = $1 AND product = $2
+	`, userID, controlplane.ProductAutoLive).Scan(&membershipCount); err != nil {
+		t.Fatalf("count default autolive membership: %v", err)
 	}
-	if deviceCount != 2 {
-		t.Fatalf("devices with shared id = %d, want 2", deviceCount)
+	if membershipCount != 1 {
+		t.Fatalf("autolive membership count = %d, want 1", membershipCount)
 	}
 
-	var storedProduct, storedDeviceID string
+	var storedDeviceProduct, storedSessionProduct, storedDeviceID string
+	if err := database.QueryRowContext(ctx, `
+		SELECT product
+		FROM devices
+		WHERE id = $1
+	`, deviceID).Scan(&storedDeviceProduct); err != nil {
+		t.Fatalf("read defaulted device product: %v", err)
+	}
 	if err := database.QueryRowContext(ctx, `
 		SELECT product, device_id
 		FROM auth_sessions
 		WHERE id = $1
-	`, sessionID).Scan(&storedProduct, &storedDeviceID); err != nil {
-		t.Fatalf("read auth session product scope: %v", err)
+	`, sessionID).Scan(&storedSessionProduct, &storedDeviceID); err != nil {
+		t.Fatalf("read defaulted auth session product: %v", err)
 	}
-	if storedProduct != string(controlplane.ProductAutoLive) || storedDeviceID != deviceID {
-		t.Fatalf("auth session scope = (%q, %q), want (%q, %q)", storedProduct, storedDeviceID, controlplane.ProductAutoLive, deviceID)
+	if storedDeviceProduct != string(controlplane.ProductAutoLive) || storedSessionProduct != string(controlplane.ProductAutoLive) || storedDeviceID != deviceID {
+		t.Fatalf("legacy defaulted scope = (%q, %q, %q), want (%q, %q, %q)", storedDeviceProduct, storedSessionProduct, storedDeviceID, controlplane.ProductAutoLive, controlplane.ProductAutoLive, deviceID)
 	}
 }
 

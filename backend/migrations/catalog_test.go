@@ -53,13 +53,12 @@ func TestMigration23ProductIsolationContract(t *testing.T) {
 		"CREATE TABLE IF NOT EXISTS user_products",
 		"ALTER TABLE devices",
 		"ADD COLUMN IF NOT EXISTS product",
-		"ALTER COLUMN product SET NOT NULL",
-		"devices_product_id_pkey PRIMARY KEY (product, id)",
-		"FOREIGN KEY (product, used_by_device_id) REFERENCES devices(product, id)",
+		"DEFAULT 'autolive'",
 		"auth_sessions",
 		"user_authorization_policies",
-		"idx_devices_product_device_id",
-		"idx_auth_sessions_product_device",
+		"autolive_seed_default_user_product",
+		"idx_devices_product",
+		"idx_auth_sessions_product",
 	} {
 		if !strings.Contains(sql, fragment) {
 			t.Fatalf("migration 0023 is missing product-isolation fragment %q", fragment)
@@ -67,6 +66,16 @@ func TestMigration23ProductIsolationContract(t *testing.T) {
 	}
 	if strings.Contains(sql, "auth_sessions_product_device_fkey") {
 		t.Fatal("migration 0023 must not reintroduce auth_sessions device foreign key dropped by migration 0018")
+	}
+	for _, fragment := range []string{
+		"ALTER COLUMN product SET NOT NULL",
+		"DROP CONSTRAINT IF EXISTS devices_pkey",
+		"PRIMARY KEY (product, id)",
+		"auth_sessions contains orphan device bindings",
+	} {
+		if strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0023 must remain a compatibility expansion before Task 3-5 propagation, found forbidden fragment %q", fragment)
+		}
 	}
 }
 

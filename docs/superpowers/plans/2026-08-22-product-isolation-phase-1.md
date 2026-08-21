@@ -4,17 +4,17 @@
 
 **Goal:** 在 autoLive Go 服务端建立 `autolive`/`douyin_desktop` 的产品注册、产品会话、数据约束和跨产品拒绝基础，使设备激活、Profile、租约/用量/审计和管理查询具备同一 product 事实。
 
-**Architecture:** 保留当前模块化单体、兼容快照与 normalized PostgreSQL 双路径。`controlplane.ProductCode` 是唯一产品值对象；PostgreSQL 使用 `products`/`user_products` 及各领域表的 product 字段，MemoryStore 使用相同领域字段做测试回退。登录或激活时确定产品并绑定会话，后续服务端从会话和资源归属校验 product；筛选参数只缩小管理结果，不承担授权。
+**Architecture:** 保留当前模块化单体、兼容快照与 normalized PostgreSQL 双路径。`controlplane.ProductCode` 是唯一产品值对象；PostgreSQL 使用 `products`/`user_products` 及各领域表的 product 字段，MemoryStore 使用相同领域字段做测试回退。登录或激活时确定产品并绑定会话，后续服务端从会话和资源归属校验 product；筛选参数只缩小管理结果，不承担授权。按 2026 年 8 月 21 日（Friday）后的修正规则，0023 只做兼容扩展，不在 Task 3–5 之前删除旧键或把现有写路径收紧到 product-aware 终态。
 
 **Tech Stack:** Go 现有标准库与 `golang-migrate/migrate` 迁移链、PostgreSQL、现有 `MemoryStore`/Repository 边界、Go `httptest`、OpenAPI YAML；不新增依赖，不在服务器构建。
 
 ## Global Constraints
 
 - `product` 首批只允许 `autolive` 与 `douyin_desktop`，产品代码不可变。
-- 全局用户身份复用，产品准入使用 `user_products`；同一 `device_id` 在两个 product 下是两条独立记录。
+- 全局用户身份复用，产品准入使用 `user_products`；目标终态里同一 `device_id` 在两个 product 下是两条独立记录，但 0023 兼容阶段仍保留旧全局键，真正切到 `(product, device_id)` 由后续迁移执行。
 - 设备、激活码、设备绑定、Profile、模型租约、用量、审计及幂等 scope 必须包含或可确定 product。
 - 历史数据先回填 `autolive`，兼容窗口后缺失 product 必须 fail-closed；不得永久默认。
-- 设备的业务唯一键是 `(product, device_id)`；迁移不能保留 `devices.id` 的跨产品全局唯一语义，否则同一客户端 ID 无法在两个产品下独立存在。所有仍引用设备的规范化表必须同步使用产品限定外键或等价的内部设备键。
+- 最终设备业务唯一键是 `(product, device_id)`；但在旧 SQL 仍按单列键写入的兼容窗口内，迁移必须先保留 `devices.id` 的现有唯一语义，通过默认 `autolive` 和双兼容观察承接旧代码，随后再切换到 product-aware 复合键与外键。
 - 服务端授权不能依赖 React 隐藏、客户端传参诚实性或 product 查询筛选。
 - 不修改 0001～0022 历史迁移；新增前向迁移必须注册到 catalog，API 启动不隐式执行迁移。
 - 新行为先写失败测试并确认失败原因，再写最小实现；每个任务结束运行对应 Go/OpenAPI/迁移检查。
@@ -99,11 +99,11 @@ Commit: `feat(controlplane): add product domain primitives`
 
 **Interfaces:**
 - Produces `store.ProductRepository` with `ListProducts`, `GetProduct`, `GetUserProductMembership` and `EnsureUserProductMembership`.
-- Migration creates immutable `products`, product-scoped `user_products`, adds non-null product columns with `autolive` backfill to current normalized business tables, binds `auth_sessions` to product, converts the device logical key and all live device foreign keys to product-aware constraints, and creates product-aware indexes/constraints without editing 0001～0022.
+- Migration creates immutable `products`, product-scoped `user_products`, adds compatibility `product` columns with `autolive` backfill/defaults to current normalized business tables, keeps 0018 orphan-session recovery semantics, seeds default `autolive` membership for historical/new users, and adds only non-breaking product indexes/references without editing 0001～0022 or cutting over to product-aware composite keys yet.
 
 - [ ] **Step 1: Write failing catalog and SQL contract tests**
 
-Add tests asserting `LatestVersion == 23`, the embedded FS contains `0023_补齐多产品控制面.up.sql`, and the migration text contains the seeds `autolive`/`douyin_desktop`, `user_products`, `product` columns, `NOT NULL` constraints after backfill, and product-aware indexes.
+Add tests asserting `LatestVersion == 23`, the embedded FS contains `0023_补齐多产品控制面.up.sql`, and the migration text contains the seeds `autolive`/`douyin_desktop`, `user_products`, `product` columns, default `autolive`, default user-product seeding, and non-breaking product indexes. Also assert 0023 does not reintroduce the dropped `auth_sessions -> devices` foreign key, does not raise on 0018-style orphan bindings, and does not drop legacy device keys or force current business-table `product` columns to `NOT NULL`.
 
 - [ ] **Step 2: Run migration tests and verify RED**
 
@@ -113,11 +113,11 @@ Expected: FAIL because catalog version remains 22 and migration file is absent.
 
 - [ ] **Step 3: Add the forward migration**
 
-Create `products(code, status, created_at)` with a check for the two seed codes and unique code. Create `user_products(user_id, product, status, entitlement_revision, created_at, updated_at)` with composite primary key and user/product indexes. Insert both products idempotently. Add product columns to `devices`, `activation_codes`, `auth_sessions`, `model_accounts`, `model_leases`, `model_usage_records`, `model_request_reservations`, `audit_logs`, `audit_outbox`, `model_pool_test_results`, `user_authorization_policies` and any existing device-binding table; backfill `autolive`, then convert the `devices` key and every live device reference to product-aware composite constraints, set `NOT NULL`, add product foreign keys/compound indexes, and preserve old data counts. Historical `variant_*` tables may receive only the product column required to preserve an existing device foreign key; they remain outside current reads/writes and must not be reintroduced into the product API.
+Create `products(code, status, created_at)` with a check for the two seed codes and unique code. Create `user_products(user_id, product, status, entitlement_revision, created_at, updated_at)` with composite primary key and user/product indexes. Insert both products idempotently, and add a default-membership trigger so post-0023 legacy user creation also gets `autolive` membership. Add product columns to `devices`, `activation_codes`, `auth_sessions`, `model_accounts`, `model_leases`, `model_usage_records`, `model_request_reservations`, `audit_logs`, `audit_outbox`, `model_pool_test_results`, `user_authorization_policies` and any existing device-binding table; backfill existing rows to `autolive`, keep defaults for legacy inserts, preserve 0018 orphan-session recovery semantics, and add only non-breaking product foreign keys/indexes that do not require Task 3–5 code propagation. Historical `variant_*` tables may receive only the product column required for future cleanup; they remain outside current reads/writes and must not be reintroduced into the product API.
 
 - [ ] **Step 4: Add the repository seam and tests**
 
-Define the smallest repository interface in `repository.go`; implement normalized PostgreSQL reads/writes with parameterized SQL and short transactions. Add tests for both products, missing membership, idempotent membership creation, disabled membership, and cross-product lookup returning not found/forbidden semantics. Add migration/SQL contract coverage proving the device composite key prevents the same `device_id` from colliding across products and that session product is persisted. Keep product registry data separate from the legacy snapshot.
+Define the smallest repository interface in `repository.go`; implement normalized PostgreSQL reads/writes with parameterized SQL and short transactions. Add tests for both products, missing membership, idempotent membership creation, disabled membership, and cross-product lookup returning not found/forbidden semantics. Add migration/SQL contract coverage proving 0018-style orphan sessions still migrate forward, legacy writes without explicit `product` default to `autolive`, and session product is persisted. Keep product registry data separate from the legacy snapshot.
 
 - [ ] **Step 5: Run migration and repository checks**
 

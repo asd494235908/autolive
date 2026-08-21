@@ -40,6 +40,7 @@ Parent PRD：[PRD：douyin-desktop 接入 autoLive 多产品控制面](../prd-do
 - [ ] OpenAPI 增加稳定 ProductCode、产品会话上下文、管理筛选和跨产品错误码。
 - [ ] 新增不可变 `products` 并种子化 `autolive`/`douyin_desktop`；新增全局用户到产品成员关系。
 - [ ] 为产品业务表先加可空字段、回填 `autolive`、验证引用，再设非空与产品范围约束。
+- [ ] 兼容阶段的首个迁移只允许做扩展：保留旧主键/唯一键/外键与旧 SQL 写路径，通过默认 `autolive` 和默认成员关系承接未传播 product 的旧代码；真正的复合键和 `NOT NULL` 收紧另立后续迁移。
 - [ ] 将设备唯一性改为 `(product, device_id)`；逐一审查激活码、租约、用量、审计和幂等的 scope。
 - [ ] 登录/激活确定产品并写入会话；后续提示与会话不一致时 fail-closed。
 - [ ] 固定权限目录保持全局，自定义角色保持复用，用户角色分配增加产品范围；查询筛选只取授权交集。
@@ -51,6 +52,7 @@ Parent PRD：[PRD：douyin-desktop 接入 autoLive 多产品控制面](../prd-do
 ## 验证清单
 
 - [ ] 同一 `device_id` 在两个产品独立存在；同产品重复和跨产品引用按契约拒绝。
+- [ ] 在 Task 3–5 发布前，legacy SQL 省略 `product` 的写入仍能通过默认 `autolive` 和默认成员关系前滚到最新迁移。
 - [ ] 跨产品激活码、会话、Profile、租约、用量、审计详情与写操作全部被拒绝。
 - [ ] 普通管理员省略/伪造 product 仍只能看到授权交集；`super_admin` 能审计地跨产品。
 - [ ] 历史数据全部回填 `autolive`，无孤立引用；兼容和收紧两个版本均可验证。
