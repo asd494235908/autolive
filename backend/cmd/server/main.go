@@ -17,6 +17,7 @@ import (
 
 	"autoLive/backend/internal/config"
 	"autoLive/backend/internal/httpapi"
+	"autoLive/backend/internal/service"
 	"autoLive/backend/internal/store"
 	"autoLive/backend/migrations"
 
@@ -38,23 +39,100 @@ func main() {
 		logger.Error("storage initialization failed", "storage_mode", cfg.StorageMode, "error", err)
 		os.Exit(1)
 	}
-	defer func() {
+	closeStorage := func() {
 		if storage.close != nil {
-			_ = storage.close()
+			if closeErr := storage.close(); closeErr != nil {
+				logger.Error("storage close failed", "error", closeErr)
+			}
 		}
-	}()
+	}
+	defer closeStorage()
+	if cfg.StorageMode == config.StorageModePostgres || (cfg.AdminUsername != "" && cfg.AdminPassword != "") {
+		bootstrap := service.NewControlPlaneWithRepositoryAndSecretStoreAndOptions(storage.repository, nil, storage.secretStore, service.ControlPlaneOptions{AllowInsecureHTTP: cfg.AllowInsecureHTTP})
+		bootstrapCtx, cancel := context.WithTimeout(context.Background(), cfg.RequestTimeout)
+		var bootstrapErr error
+		if cfg.AdminUsername != "" || cfg.AdminPassword != "" {
+			bootstrapErr = bootstrap.EnsureConfiguredAdmin(bootstrapCtx, cfg.AdminUsername, cfg.AdminPassword)
+		} else {
+			bootstrapErr = bootstrap.CheckReady(bootstrapCtx)
+		}
+		cancel()
+		if bootstrapErr != nil {
+			logger.Error("administrator bootstrap failed", "storage_mode", cfg.StorageMode, "error", bootstrapErr)
+			closeStorage()
+			os.Exit(1)
+		}
+	}
 
+	healthTelemetry := httpapi.NewModelPoolHealthProbeMetrics()
+	retentionTelemetry := httpapi.NewRetentionCleanupMetrics()
+	handler, authRetentionCleaner := httpapi.NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTelemetryAndRetentionCleaner(cfg.ServiceVersion, logger, httpapi.AuthConfig{
+		Username:          cfg.AdminUsername,
+		Password:          cfg.AdminPassword,
+		UsePersistedAdmin: cfg.StorageMode == config.StorageModePostgres && cfg.AdminUsername == "" && cfg.AdminPassword == "",
+	}, storage.repository, storage.secretStore, storage.sessionStore, cfg.AllowInsecureHTTP, healthTelemetry, retentionTelemetry)
+	healthControlPlane := service.NewControlPlaneWithRepositoryAndSecretStoreAndOptions(storage.repository, nil, storage.secretStore, service.ControlPlaneOptions{AllowInsecureHTTP: cfg.AllowInsecureHTTP})
+	healthScheduler, err := service.NewModelPoolHealthProbeScheduler(healthControlPlane, service.ModelPoolHealthProbeSchedulerOptions{
+		Interval:          cfg.ModelHealthProbeInterval,
+		ProbeTimeout:      cfg.ModelHealthProbeTimeout,
+		MaxConcurrent:     cfg.ModelHealthProbeMaxConcurrent,
+		MaxAccountsPerRun: cfg.ModelHealthProbeMaxAccounts,
+		BackoffBase:       cfg.ModelHealthProbeBackoffBase,
+		BackoffMax:        cfg.ModelHealthProbeBackoffMax,
+		Logger:            logger,
+		Telemetry:         healthTelemetry,
+	})
+	if err != nil {
+		logger.Error("model pool health scheduler initialization failed", "error", err)
+		closeStorage()
+		os.Exit(1)
+	}
+	retentionScheduler, err := service.NewRetentionCleanupScheduler(
+		asControlPlaneRetentionCleaner(storage.repository),
+		authRetentionCleaner,
+		service.RetentionCleanupSchedulerOptions{
+			Interval:              cfg.RetentionCleanupInterval,
+			OperationTimeout:      cfg.RetentionCleanupTimeout,
+			BatchSize:             cfg.RetentionCleanupBatch,
+			StagedSecretCleaner:   healthControlPlane.CleanupStagedSecrets,
+			AuditOutboxDispatcher: healthControlPlane.DispatchAuditOutbox,
+			Policy: service.RetentionCleanupPolicy{
+				AuthSessionTTL:       cfg.AuthSessionRetentionTTL,
+				IdempotencyRecordTTL: cfg.IdempotencyRetentionTTL,
+				ModelTestResultTTL:   cfg.ModelTestRetentionTTL,
+				AuditLogTTL:          cfg.AuditLogRetentionTTL,
+			},
+			Logger:    logger,
+			Telemetry: retentionTelemetry,
+		})
+	if err != nil {
+		logger.Error("retention cleanup scheduler initialization failed", "error", err)
+		closeStorage()
+		os.Exit(1)
+	}
 	server := &http.Server{
-		Addr: cfg.ListenAddr,
-		Handler: httpapi.NewRouterWithRepositoryAndSecretStoreAndSessionStore(cfg.ServiceVersion, logger, httpapi.AuthConfig{
-			Username: cfg.AdminUsername,
-			Password: cfg.AdminPassword,
-		}, storage.repository, storage.secretStore, storage.sessionStore),
+		Addr:    cfg.ListenAddr,
+		Handler: httpapi.WithRequestTimeout(handler, cfg.RequestTimeout),
 	}
 	configureHTTPServer(server)
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if cfg.ModelHealthProbeInterval > 0 {
+		if err := healthScheduler.Start(rootCtx); err != nil {
+			logger.Error("model pool health scheduler start failed", "error", err)
+			closeStorage()
+			os.Exit(1)
+		}
+	}
+	if cfg.RetentionCleanupInterval > 0 {
+		if err := retentionScheduler.Start(rootCtx); err != nil {
+			_ = healthScheduler.Stop(context.Background())
+			logger.Error("retention cleanup scheduler start failed", "error", err)
+			closeStorage()
+			os.Exit(1)
+		}
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -71,6 +149,9 @@ func main() {
 		logger.Info("shutdown signal received")
 	case serveErr := <-errCh:
 		if serveErr != nil {
+			_ = healthScheduler.Stop(context.Background())
+			_ = retentionScheduler.Stop(context.Background())
+			closeStorage()
 			logger.Error("http server stopped unexpectedly", "error", serveErr)
 			os.Exit(1)
 		}
@@ -81,11 +162,27 @@ func main() {
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
+		_ = healthScheduler.Stop(shutdownCtx)
+		_ = retentionScheduler.Stop(shutdownCtx)
+		closeStorage()
 		logger.Error("graceful shutdown failed", "error", err, "timeout", cfg.ShutdownTimeout.String())
+		os.Exit(1)
+	}
+	healthStopErr := healthScheduler.Stop(shutdownCtx)
+	retentionStopErr := retentionScheduler.Stop(shutdownCtx)
+	if healthStopErr != nil {
+		logger.Error("model pool health scheduler shutdown failed", "error", healthStopErr, "timeout", cfg.ShutdownTimeout.String())
+	}
+	if retentionStopErr != nil {
+		logger.Error("retention cleanup scheduler shutdown failed", "error", retentionStopErr, "timeout", cfg.ShutdownTimeout.String())
+	}
+	if healthStopErr != nil || retentionStopErr != nil {
+		closeStorage()
 		os.Exit(1)
 	}
 
 	if serveErr := <-errCh; serveErr != nil {
+		closeStorage()
 		logger.Error("http server stopped with error", "error", serveErr)
 		os.Exit(1)
 	}
@@ -108,6 +205,11 @@ type storageRuntime struct {
 	close        func() error
 }
 
+func asControlPlaneRetentionCleaner(repository store.Repository) store.ControlPlaneRetentionCleaner {
+	cleaner, _ := repository.(store.ControlPlaneRetentionCleaner)
+	return cleaner
+}
+
 func openStorage(cfg config.Config) (storageRuntime, error) {
 	switch cfg.StorageMode {
 	case config.StorageModeMemory:
@@ -128,7 +230,7 @@ func openStorage(cfg config.Config) (storageRuntime, error) {
 		database.SetMaxIdleConns(5)
 		database.SetConnMaxLifetime(30 * time.Minute)
 		closeDatabase := func() error { return database.Close() }
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.RequestTimeout)
 		defer cancel()
 		if err := database.PingContext(ctx); err != nil {
 			_ = closeDatabase()
@@ -138,17 +240,17 @@ func openStorage(cfg config.Config) (storageRuntime, error) {
 			_ = closeDatabase()
 			return storageRuntime{}, err
 		}
-		secretStore, err := store.NewEncryptedSQLSecretStore(database, key)
+		secretStore, err := store.NewEncryptedSQLSecretStoreWithTimeout(database, key, cfg.RequestTimeout)
 		if err != nil {
 			_ = closeDatabase()
 			return storageRuntime{}, err
 		}
-		repository, err := store.NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, time.Now, secretStore, cfg.ModelReadSource)
+		repository, err := store.NewPostgresRepositoryWithSecretStoreAndModelReadSourceAndTimeout(database, time.Now, secretStore, cfg.ModelReadSource, cfg.RequestTimeout)
 		if err != nil {
 			_ = closeDatabase()
 			return storageRuntime{}, err
 		}
-		sessionStore, err := store.NewSQLSessionStore(database, time.Now)
+		sessionStore, err := store.NewSQLSessionStoreWithTimeout(database, time.Now, cfg.RequestTimeout)
 		if err != nil {
 			_ = closeDatabase()
 			return storageRuntime{}, err

@@ -152,7 +152,8 @@ async function refreshAccessToken() {
 export async function request<T>(
   path: string,
   options: ApiRequestOptions = {},
-  allowAuthRefresh = true
+  allowAuthRefresh = true,
+  allowAuditRetry = true
 ): Promise<T> {
   const requestId = options.requestId ?? createRequestId();
   const controller = new AbortController();
@@ -161,6 +162,7 @@ export async function request<T>(
 
   try {
     const token = accessToken();
+    const method = options.method ?? 'GET';
     const headers: Record<string, string> = {
       Accept: 'application/json',
       'X-Request-Id': requestId,
@@ -173,7 +175,7 @@ export async function request<T>(
     }
 
     const response = await fetch(buildUrl(path, options.query), {
-      method: options.method ?? 'GET',
+      method,
       headers,
       body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
       signal: options.signal ?? controller.signal,
@@ -186,6 +188,19 @@ export async function request<T>(
       (isRecord(payload) && typeof payload.request_id === 'string' ? payload.request_id : requestId);
 
     if (!response.ok) {
+      const hasIdempotencyKey = Object.entries(headers).some(
+        ([name, value]) => name.toLowerCase() === 'idempotency-key' && value.trim().length > 0
+      );
+      if (
+        response.status === 503 &&
+        allowAuditRetry &&
+        method !== 'GET' &&
+        hasIdempotencyKey &&
+        isRecord(payload) &&
+        payload.code === 'AUDIT_UNAVAILABLE'
+      ) {
+        return request<T>(path, options, allowAuthRefresh, false);
+      }
       if (
         response.status === 401 &&
         allowAuthRefresh &&

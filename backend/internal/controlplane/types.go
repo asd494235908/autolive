@@ -44,6 +44,9 @@ type AuditLog struct {
 	Action      string `json:"action"`
 	TargetType  string `json:"target_type"`
 	TargetID    string `json:"target_id,omitempty"`
+	Outcome     string `json:"outcome"`
+	StatusCode  int    `json:"status_code"`
+	ErrorCode   string `json:"error_code,omitempty"`
 	RequestID   string `json:"request_id,omitempty"`
 	CreatedAt   string `json:"created_at"`
 }
@@ -54,6 +57,9 @@ type AuditLogInput struct {
 	Action      string
 	TargetType  string
 	TargetID    string
+	Outcome     string
+	StatusCode  int
+	ErrorCode   string
 	RequestID   string
 }
 
@@ -63,6 +69,35 @@ type UserSummary struct {
 	Role      string `json:"role"`
 	Status    string `json:"status"`
 	CreatedAt string `json:"created_at"`
+}
+
+// UserAuthorizationPolicy is the administrator-controlled access policy for a
+// user. An empty AllowedModels list means the user may request any registered
+// model. DailyTokenLimit is enforced against accepted server records only; it
+// is not provider-authoritative billing and does not reserve future tokens.
+type UserAuthorizationPolicy struct {
+	UserID          string   `json:"user_id"`
+	AllowedModels   []string `json:"allowed_models"`
+	DailyTokenLimit int      `json:"daily_token_limit"`
+	UpdatedAt       string   `json:"updated_at"`
+}
+
+// UserAuthorizationSummary is an operational snapshot for administrators.
+// Daily usage is derived from client-reported records and is deliberately
+// marked as soft usage; it is not a provider-authoritative quota.
+type UserAuthorizationSummary struct {
+	UserID              string   `json:"user_id"`
+	DeviceCount         int      `json:"device_count"`
+	ActiveDeviceCount   int      `json:"active_device_count"`
+	ActiveLeaseCount    int      `json:"active_lease_count"`
+	ActiveAccountCount  int      `json:"active_account_count"`
+	DailyUsedTokens     int      `json:"daily_used_tokens"`
+	UsageSource         string   `json:"usage_source"`
+	HardQuotaConfigured bool     `json:"hard_quota_configured"`
+	AllowedModels       []string `json:"allowed_models"`
+	DailyTokenLimit     int      `json:"daily_token_limit"`
+	QuotaEnforcement    string   `json:"quota_enforcement"`
+	AsOf                string   `json:"as_of"`
 }
 
 type DeviceSummary struct {
@@ -79,6 +114,9 @@ type DeviceSummary struct {
 	RuntimeOSName        string `json:"runtime_os_name,omitempty"`
 	RuntimeOSVersion     string `json:"runtime_os_version,omitempty"`
 	KernelVersion        string `json:"kernel_version,omitempty"`
+	CurrentMediaName     string `json:"current_media_name,omitempty"`
+	PlaybackState        string `json:"playback_state,omitempty"`
+	Online               bool   `json:"online"`
 	LastSeenAt           string `json:"last_seen_at"`
 }
 
@@ -120,11 +158,15 @@ type DeviceRegistration struct {
 }
 
 type ActivationCode struct {
-	ID         string  `json:"id"`
-	Status     string  `json:"status"`
-	ExpiresAt  string  `json:"expires_at"`
-	MaxDevices int     `json:"max_devices"`
-	PlainCode  *string `json:"plain_code"`
+	ID             string  `json:"id"`
+	Status         string  `json:"status"`
+	ExpiresAt      string  `json:"expires_at"`
+	MaxDevices     int     `json:"max_devices"`
+	CodePrefix     string  `json:"code_prefix,omitempty"`
+	UsedByUserID   string  `json:"used_by_user_id,omitempty"`
+	UsedByDeviceID string  `json:"used_by_device_id,omitempty"`
+	UsedAt         string  `json:"used_at,omitempty"`
+	PlainCode      *string `json:"plain_code"`
 }
 
 type ModelPoolAccountSummary struct {
@@ -139,6 +181,7 @@ type ModelPoolAccountSummary struct {
 	SecretConfigured bool   `json:"secret_configured"`
 	ActiveLeases     int    `json:"active_leases"`
 	DailyUsedTokens  int    `json:"daily_used_tokens"`
+	CooldownUntil    string `json:"cooldown_until,omitempty"`
 	LastTestStatus   string `json:"last_test_status,omitempty"`
 	LastTestedAt     string `json:"last_tested_at,omitempty"`
 	SecretRef        string `json:"-"`
@@ -165,6 +208,11 @@ type UpdateModelPoolAccountInput struct {
 
 type TestModelPoolAccountInput struct {
 	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+}
+
+type RotateModelPoolAccountSecretInput struct {
+	APIKey         string `json:"api_key"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
 type ModelPoolConnectivityTestResult struct {
@@ -195,18 +243,56 @@ type ReleaseModelLeaseInput struct {
 }
 
 type ModelLease struct {
-	ID                string `json:"id"`
-	UserID            string `json:"-"`
-	DeviceID          string `json:"-"`
-	AccountID         string `json:"-"`
-	Purpose           string `json:"-"`
-	Provider          string `json:"provider"`
-	Model             string `json:"model"`
-	Status            string `json:"status"`
-	ExpiresAt         string `json:"expires_at"`
-	ProxyMode         string `json:"proxy_mode"`
-	DirectBaseURL     string `json:"direct_base_url,omitempty"`
-	ConcurrencyLimit  int    `json:"concurrency_limit"`
+	ID               string `json:"id"`
+	UserID           string `json:"-"`
+	DeviceID         string `json:"-"`
+	AccountID        string `json:"-"`
+	Purpose          string `json:"-"`
+	Provider         string `json:"provider"`
+	Model            string `json:"model"`
+	Status           string `json:"status"`
+	CreatedAt        string `json:"created_at,omitempty"`
+	ExpiresAt        string `json:"expires_at"`
+	ReleasedAt       string `json:"released_at,omitempty"`
+	ProxyMode        string `json:"proxy_mode"`
+	DirectBaseURL    string `json:"direct_base_url,omitempty"`
+	ConcurrencyLimit int    `json:"concurrency_limit"`
+}
+
+// ModelLeaseAdminSummary is the redacted control-plane view of a lease.
+// It exposes ownership and lifecycle metadata to administrators without any
+// lease credential or provider secret.
+type ModelLeaseAdminSummary struct {
+	ID               string `json:"id"`
+	AccountID        string `json:"account_id"`
+	UserID           string `json:"user_id"`
+	DeviceID         string `json:"device_id"`
+	Purpose          string `json:"purpose"`
+	Provider         string `json:"provider"`
+	Model            string `json:"model"`
+	Status           string `json:"status"`
+	ExpiresAt        string `json:"expires_at"`
+	ProxyMode        string `json:"proxy_mode"`
+	ConcurrencyLimit int    `json:"concurrency_limit"`
+}
+
+// ModelLeaseAdminDetail is a redacted single-lease view. It deliberately
+// excludes direct credentials and provider secrets while exposing lifecycle
+// timestamps needed for safe administrative recovery.
+type ModelLeaseAdminDetail struct {
+	ID               string `json:"id"`
+	AccountID        string `json:"account_id"`
+	UserID           string `json:"user_id"`
+	DeviceID         string `json:"device_id"`
+	Purpose          string `json:"purpose"`
+	Provider         string `json:"provider"`
+	Model            string `json:"model"`
+	Status           string `json:"status"`
+	CreatedAt        string `json:"created_at,omitempty"`
+	ExpiresAt        string `json:"expires_at"`
+	ReleasedAt       string `json:"released_at,omitempty"`
+	ProxyMode        string `json:"proxy_mode"`
+	ConcurrencyLimit int    `json:"concurrency_limit"`
 }
 
 type ReleaseModelLeaseResult struct {
@@ -236,10 +322,10 @@ type CreateDirectLLMCallRecordInput struct {
 	LeaseID      string `json:"lease_id"`
 	Provider     string `json:"provider"`
 	Model        string `json:"model"`
-	InputTokens  int    `json:"input_tokens"`
-	OutputTokens int    `json:"output_tokens"`
-	TotalTokens  int    `json:"total_tokens"`
-	LatencyMS    int64  `json:"latency_ms"`
+	InputTokens  int    `json:"input_tokens,omitempty"`
+	OutputTokens int    `json:"output_tokens,omitempty"`
+	TotalTokens  int    `json:"total_tokens,omitempty"`
+	LatencyMS    int64  `json:"latency_ms,omitempty"`
 	Status       string `json:"status"`
 	UsageSource  string `json:"usage_source"`
 	ErrorCode    string `json:"error_code,omitempty"`
@@ -252,9 +338,28 @@ type CreateUserInput struct {
 	Role     string `json:"role"`
 }
 
+type UpdateUserInput struct {
+	Username *string `json:"username,omitempty"`
+	Role     *string `json:"role,omitempty"`
+	Status   *string `json:"status,omitempty"`
+}
+
+type UpdateUserAuthorizationInput struct {
+	AllowedModels   []string `json:"allowed_models"`
+	DailyTokenLimit int      `json:"daily_token_limit"`
+}
+
+type ResetUserPasswordInput struct {
+	Password string `json:"password"`
+}
+
+type ChangeLocalAdminPasswordInput struct {
+	Password string `json:"password"`
+}
+
 type CreateActivationCodeInput struct {
 	ExpiresAt  time.Time `json:"expires_at"`
-	MaxDevices int       `json:"max_devices"`
+	MaxDevices int       `json:"max_devices,omitempty"`
 }
 
 type ActivateDeviceInput struct {

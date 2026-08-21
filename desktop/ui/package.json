@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "test": "node --test src/heartbeatOutbox.test.mjs src/runtimeResources.test.mjs src/runtime-parameter-scheduler.test.mjs src/media-cycle-planner.test.mjs src/audio-cycle-prewarm-coordinator.test.mjs src/audio-output-recovery.test.mjs src/audioCycleSnapshot.test.mjs src/audio-playback-sync.test.mjs src/playback-loop.test.mjs src/playback-control-message.test.mjs src/fixedSpeech.test.mjs src/fixedSpeechPresets.test.mjs src/desktop-layout-contract.test.mjs src/desktop-three-column-layout.test.mjs src/interlude-player.test.mjs src/fixed-speech-playback.test.mjs src/startup-loader.test.mjs src/startup-entry.test.mjs src/startup-scheduler.test.mjs ../tools/prepare-ffmpeg-resources.test.mjs ../tools/start-desktop-dev.test.mjs ../tools/desktop-version.test.mjs ../tools/generate-runtime-resource-tree.test.mjs ../tools/lightweight-desktop-build.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "api:generate": "openapi-typescript ../../接口契约/openapi.yaml -o src/api/openapi.generated.ts",
+    "api:check": "openapi-typescript ../../接口契约/openapi.yaml -o src/api/openapi.generated.ts --check",
+    "test": "node --test src/heartbeatOutbox.test.mjs src/runtimeResources.test.mjs src/runtime-parameter-scheduler.test.mjs src/media-cycle-planner.test.mjs src/audio-cycle-prewarm-coordinator.test.mjs src/audio-output-recovery.test.mjs src/audioCycleSnapshot.test.mjs src/audio-playback-sync.test.mjs src/playback-loop.test.mjs src/playback-control-message.test.mjs src/fixedSpeech.test.mjs src/fixedSpeechPresets.test.mjs src/desktop-layout-contract.test.mjs src/desktop-three-column-layout.test.mjs src/desktop-routing-contract.test.mjs src/control-plane-client-contract.test.mjs src/interlude-player.test.mjs src/fixed-speech-playback.test.mjs src/startup-loader.test.mjs src/startup-entry.test.mjs src/startup-scheduler.test.mjs ../tools/prepare-ffmpeg-resources.test.mjs ../tools/start-desktop-dev.test.mjs ../tools/desktop-version.test.mjs ../tools/generate-runtime-resource-tree.test.mjs ../tools/lightweight-desktop-build.test.mjs",
     "preview": "vite preview",
     "tauri:dev": "node ../tools/start-desktop-dev.mjs",
     "ffmpeg:prepare": "node ../tools/prepare-ffmpeg-resources.mjs",
@@ -21,15 +24,17 @@
     "@tauri-apps/plugin-http": "^2.5.9",
     "antd": "^5.27.1",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.18.2"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.8.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.1",
+    "openapi-typescript": "7.13.0",
     "typescript": "^5.6.3",
-    "vite": "^5.4.10"
+    "vite": "^6.4.3"
   },
   "packageManager": "pnpm@10.33.0+sha512.10568bb4a6afb58c9eb3630da90cc9516417abebd3fabbe6739f0ae795728da1491e9db5a544c76ad8eb7570f5c4bb3d6c637b2cb41bfdcdb47fa823c8649319"
 }

@@ -31,6 +31,28 @@ func validIdempotencyKey(value string) bool {
 	return trimmed == value && len(value) >= 8 && len(value) <= 128
 }
 
+func pageOffset(page, pageSize int) (int, error) {
+	if page < 1 || pageSize < 1 || pageSize > 200 {
+		return 0, controlplane.ErrInvalidRequest
+	}
+	maxInt := int(^uint(0) >> 1)
+	if page-1 > maxInt/pageSize {
+		return 0, controlplane.ErrInvalidRequest
+	}
+	return (page - 1) * pageSize, nil
+}
+
+func pageWindow(total, offset, limit int) (int, int) {
+	if offset >= total {
+		return total, total
+	}
+	end := offset + limit
+	if end < offset || end > total {
+		end = total
+	}
+	return offset, end
+}
+
 func nextID(state *store.State, prefix string) string {
 	state.SequenceCounters[prefix]++
 	return fmt.Sprintf("%s_%08d", prefix, state.SequenceCounters[prefix])
@@ -60,7 +82,14 @@ func randomToken(prefix string, size int) (string, error) {
 
 func validModelBaseURL(value string) bool {
 	parsed, err := url.Parse(value)
-	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
+	return err == nil &&
+		(parsed.Scheme == "http" || parsed.Scheme == "https") &&
+		parsed.Host != "" &&
+		parsed.User == nil &&
+		parsed.RawQuery == "" &&
+		parsed.Fragment == "" &&
+		parsed.Hostname() != "" &&
+		!strings.Contains(parsed.Hostname(), "%")
 }
 
 func validateHeartbeatInput(input controlplane.HeartbeatInput) error {
@@ -78,6 +107,16 @@ func validateHeartbeatInput(input controlplane.HeartbeatInput) error {
 	}
 }
 
+func validateActivateDeviceInput(input controlplane.ActivateDeviceInput) error {
+	if len(input.ActivationCode) < 8 || len(input.ActivationCode) > 128 || !idPattern.MatchString(input.Device.DeviceID) {
+		return controlplane.ErrInvalidRequest
+	}
+	if strings.TrimSpace(input.Device.DeviceName) == "" || len(input.Device.DeviceName) > 128 || strings.TrimSpace(input.Device.Platform) == "" || len(input.Device.Platform) > 64 || strings.TrimSpace(input.Device.AppVersion) == "" || len(input.Device.AppVersion) > 64 || len(input.Device.OSVersion) > 128 {
+		return controlplane.ErrInvalidRequest
+	}
+	return nil
+}
+
 func validateTestModelPoolAccountInput(input *controlplane.TestModelPoolAccountInput) error {
 	if input.TimeoutSeconds == 0 {
 		input.TimeoutSeconds = 15
@@ -85,6 +124,16 @@ func validateTestModelPoolAccountInput(input *controlplane.TestModelPoolAccountI
 	if input.TimeoutSeconds < 1 || input.TimeoutSeconds > 60 {
 		return controlplane.ErrInvalidRequest
 	}
+	return nil
+}
+
+func validateRotateModelPoolAccountSecretInput(input *controlplane.RotateModelPoolAccountSecretInput) error {
+	input.APIKey = strings.TrimSpace(input.APIKey)
+	testInput := controlplane.TestModelPoolAccountInput{TimeoutSeconds: input.TimeoutSeconds}
+	if len(input.APIKey) < 8 || len(input.APIKey) > 4096 || validateTestModelPoolAccountInput(&testInput) != nil {
+		return controlplane.ErrInvalidRequest
+	}
+	input.TimeoutSeconds = testInput.TimeoutSeconds
 	return nil
 }
 

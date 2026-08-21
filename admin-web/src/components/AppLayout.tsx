@@ -3,7 +3,9 @@ import {
   FileSearchOutlined,
   KeyOutlined,
   PartitionOutlined,
+  ApiOutlined,
   SafetyCertificateOutlined,
+  SettingOutlined,
   TeamOutlined,
 } from '@ant-design/icons';
 import { Button, Layout, Menu, Space, Typography } from 'antd';
@@ -28,7 +30,9 @@ const iconMap: Record<string, ReactNode> = {
   devices: <DesktopOutlined />,
   'activation-codes': <KeyOutlined />,
   'model-pools': <PartitionOutlined />,
-  'audit-logs': <FileSearchOutlined />
+  'model-leases': <ApiOutlined />,
+  'audit-logs': <FileSearchOutlined />,
+  security: <SettingOutlined />
 };
 
 export function AppLayout({

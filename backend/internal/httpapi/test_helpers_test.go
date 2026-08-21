@@ -6,14 +6,24 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"autoLive/backend/internal/store"
 )
 
 func newTestRouter(t *testing.T) http.Handler {
 	t.Helper()
-	return NewRouterWithAuth("test", nil, AuthConfig{
+	// Keep activation-code tests deterministic while preserving the real router path.
+	testNow := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	repository := store.NewMemoryStore(func() time.Time { return testNow })
+	return NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{
 		Username: "admin",
 		Password: "password",
-	})
+	}, repository, store.NewMemorySecretStore(), nil, true)
+}
+
+func testActivationExpiresAt() string {
+	return time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC).Add(24 * time.Hour).Format(time.RFC3339)
 }
 
 func loginForTest(t *testing.T, handler http.Handler) string {

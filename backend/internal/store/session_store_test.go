@@ -16,6 +16,41 @@ func TestNewSQLSessionStoreRejectsNilDatabase(t *testing.T) {
 	}
 }
 
+func TestNewSQLSessionStoreRejectsNonPositiveOperationTimeout(t *testing.T) {
+	database, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	if _, err := NewSQLSessionStoreWithTimeout(database, time.Now, 0); err == nil {
+		t.Fatal("NewSQLSessionStoreWithTimeout() error = nil, want invalid timeout")
+	}
+}
+
+func TestSQLSessionStoreCreateHonorsOperationTimeout(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	store, err := NewSQLSessionStoreWithTimeout(database, time.Now, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+	now := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	session := AuthSession{ID: "session_timeout", UserID: "user_1", AccessTokenHash: "access_hash", RefreshTokenHash: "refresh_hash", AccessExpiresAt: now.Add(time.Hour), RefreshExpiresAt: now.Add(24 * time.Hour), CreatedAt: now}
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO auth_sessions (")).
+		WithArgs(session.ID, session.UserID, session.DeviceID, session.AccessTokenHash, session.RefreshTokenHash, session.AccessExpiresAt, session.RefreshExpiresAt, session.CreatedAt).
+		WillDelayFor(50 * time.Millisecond).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	if err := store.Create(context.Background(), session); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Create() error = %v, want context deadline exceeded", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
 func TestValidateAuthSessionRequiresHashesAndOrderedExpiry(t *testing.T) {
 	now := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
 	valid := AuthSession{
@@ -61,6 +96,106 @@ func TestSQLSessionStoreCreatePersistsOnlySessionHashesAndMetadata(t *testing.T)
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	if err := store.Create(context.Background(), session); err != nil {
 		t.Fatalf("Create() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestSQLSessionStoreRevokeByUserID(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	store, err := NewSQLSessionStore(database, time.Now)
+	if err != nil {
+		t.Fatalf("NewSQLSessionStore() error = %v", err)
+	}
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP")).
+		WithArgs("user_1").WillReturnResult(sqlmock.NewResult(1, 2))
+	if err := store.RevokeByUserID(context.Background(), "user_1"); err != nil {
+		t.Fatalf("RevokeByUserID() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestSQLSessionStoreRevokeByDeviceID(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error: %v", err)
+	}
+	defer database.Close()
+	store, err := NewSQLSessionStore(database, time.Now)
+	if err != nil {
+		t.Fatalf("NewSQLSessionStore() error: %v", err)
+	}
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP")).
+		WithArgs("device_1").WillReturnResult(sqlmock.NewResult(1, 2))
+	if err := store.RevokeByDeviceID(context.Background(), "device_1"); err != nil {
+		t.Fatalf("RevokeByDeviceID() error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestSQLSessionStoreDeviceBindingChecksAffectedRowsAndSupportsCompensation(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	store, err := NewSQLSessionStore(database, time.Now)
+	if err != nil {
+		t.Fatalf("NewSQLSessionStore() error = %v", err)
+	}
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET device_id = NULLIF($2, '')")).
+		WithArgs("access_hash", "device_1").WillReturnResult(sqlmock.NewResult(1, 1))
+	if err := store.UpdateDeviceID(context.Background(), "access_hash", "device_1"); err != nil {
+		t.Fatalf("UpdateDeviceID() error = %v", err)
+	}
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET device_id = NULL")).
+		WithArgs("access_hash", "device_1").WillReturnResult(sqlmock.NewResult(1, 1))
+	if err := store.ClearDeviceID(context.Background(), "access_hash", "device_1"); err != nil {
+		t.Fatalf("ClearDeviceID() error = %v", err)
+	}
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET device_id = NULLIF($2, '')")).
+		WithArgs("access_hash", "device_2").WillReturnResult(sqlmock.NewResult(1, 0))
+	if err := store.UpdateDeviceID(context.Background(), "access_hash", "device_2"); err == nil {
+		t.Fatal("UpdateDeviceID() error = nil, want affected-row failure")
+	}
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET device_id = NULL")).
+		WithArgs("access_hash", "device_2").WillReturnResult(sqlmock.NewResult(1, 0))
+	if err := store.ClearDeviceID(context.Background(), "access_hash", "device_2"); err == nil {
+		t.Fatal("ClearDeviceID() error = nil, want affected-row failure")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestSQLSessionStoreDeviceBindingWritesRecoveryMarker(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	sessions, err := NewSQLSessionStore(database, time.Now)
+	if err != nil {
+		t.Fatalf("new session store: %v", err)
+	}
+	mock.ExpectExec(regexp.QuoteMeta("device_bound_at = CASE WHEN NULLIF($2, '') IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END")).
+		WithArgs("access_hash", "device_1").WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := sessions.UpdateDeviceID(context.Background(), "access_hash", "device_1"); err != nil {
+		t.Fatalf("UpdateDeviceID() error = %v", err)
+	}
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET device_id = NULL, device_bound_at = NULL")).
+		WithArgs("access_hash", "device_1").WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := sessions.ClearDeviceID(context.Background(), "access_hash", "device_1"); err != nil {
+		t.Fatalf("ClearDeviceID() error = %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)

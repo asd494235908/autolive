@@ -45,6 +45,14 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/auth/refresh:
     post:
       tags: [Auth]
@@ -70,6 +78,14 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/auth/logout:
     post:
       tags: [Auth]
@@ -95,6 +111,12 @@ paths:
                 $ref: '#/components/schemas/LogoutResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/client/activate:
     post:
       tags: [Client]
@@ -128,6 +150,12 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/client/heartbeat:
     post:
       tags: [Client]
@@ -161,6 +189,12 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/client/profile:
     get:
       tags: [Client]
@@ -182,6 +216,12 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/client/model-leases:
     post:
       tags: [Model Leases]
@@ -217,6 +257,12 @@ paths:
           $ref: '#/components/responses/Conflict'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/client/model-leases/{lease_id}/renew:
     post:
       tags: [Model Leases]
@@ -251,6 +297,12 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/client/model-leases/{lease_id}/release:
     post:
       tags: [Model Leases]
@@ -285,6 +337,12 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/client/llm/call-records:
     post:
       tags: [Model Accounts]
@@ -329,6 +387,56 @@ paths:
           $ref: '#/components/responses/ServiceUnavailable'
         '504':
           $ref: '#/components/responses/GatewayTimeout'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/auth/change-password:
+    post:
+      tags: [Admin]
+      summary: 修改本地管理员密码
+      description: 仅本地管理员可调用；成功后撤销该管理员的所有会话，响应不返回密码。
+      operationId: changeLocalAdminPassword
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangeLocalAdminPasswordRequest'
+      responses:
+        '200':
+          description: 密码已修改并撤销管理员会话
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/users:
     get:
       tags: [Admin]
@@ -353,6 +461,12 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
     post:
       tags: [Admin]
       summary: 创建用户
@@ -385,6 +499,132 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/users/{user_id}/devices:
+    get:
+      tags: [Admin]
+      summary: 查询用户设备
+      operationId: listAdminUserDevices
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 用户设备分页列表
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/users/{user_id}/authorization-summary:
+    get:
+      tags: [Admin]
+      summary: 查询用户授权与软额度摘要
+      description: 返回设备、活动租约、活动模型账号和客户端自报日用量；当前没有供应商权威用户额度。
+      operationId: getAdminUserAuthorizationSummary
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+      responses:
+        '200':
+          description: 用户授权与软额度摘要
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserAuthorizationSummaryResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/users/{user_id}/authorization:
+    patch:
+      tags: [Admin]
+      summary: 更新用户模型授权与服务端记录用量门禁
+      description: 空模型列表表示允许所有已登记模型；daily_token_limit 只约束服务端已接收的客户端用量记录，不是供应商权威计费或未来用量预占。
+      operationId: updateAdminUserAuthorization
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserAuthorizationRequest'
+      responses:
+        '200':
+          description: 用户授权策略已更新
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserAuthorizationPolicyResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/users/{user_id}/disable:
     post:
       tags: [Admin]
@@ -417,6 +657,110 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/users/{user_id}:
+    patch:
+      tags: [Admin]
+      summary: 编辑用户
+      operationId: updateAdminUser
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+      responses:
+        '200':
+          description: 用户已更新
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/users/{user_id}/reset-password:
+    post:
+      tags: [Admin]
+      summary: 重置用户密码
+      operationId: resetAdminUserPassword
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetUserPasswordRequest'
+      responses:
+        '200':
+          description: 用户密码已重置，相关会话已撤销
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/devices:
     get:
       tags: [Admin]
@@ -441,6 +785,47 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/devices/{device_id}:
+    get:
+      tags: [Admin]
+      summary: 查询设备详情
+      operationId: getAdminDevice
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+      responses:
+        '200':
+          description: 设备详情
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/devices/{device_id}/disable:
     post:
       tags: [Admin]
@@ -473,6 +858,14 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/devices/{device_id}/unbind:
     post:
       tags: [Admin]
@@ -496,7 +889,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DeviceEnvelope'
+                $ref: '#/components/schemas/UnbindDeviceResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -505,6 +898,14 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/activation-codes:
     get:
       tags: [Admin]
@@ -529,6 +930,12 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
     post:
       tags: [Admin]
       summary: 创建激活码
@@ -559,6 +966,12 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/activation-codes/{code_id}/revoke:
     post:
       tags: [Admin]
@@ -593,6 +1006,12 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/model-pool:
     get:
       tags: [Admin]
@@ -600,6 +1019,9 @@ paths:
       operationId: getModelPool
       security:
         - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
       responses:
         '200':
           description: 模型池摘要列表
@@ -614,6 +1036,12 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
     post:
       tags: [Admin]
       summary: 新增模型账号
@@ -646,6 +1074,12 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/model-pool/{account_id}/disable:
     post:
       tags: [Admin]
@@ -680,6 +1114,12 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/model-pool/{account_id}/test:
     post:
       tags: [Admin]
@@ -721,6 +1161,67 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/model-pool/{account_id}/rotate-secret:
+    post:
+      tags: [Admin]
+      summary: 轮换模型号池账号密钥
+      description: 新密钥先通过受限连通性测试，成功后写入 Secret Store；响应不会返回密钥原文。不同幂等键并发轮换时，后提交请求返回 MODEL_POOL_SECRET_ROTATION_CONFLICT，不能覆盖已提交密钥。
+      operationId: rotateModelPoolAccountSecret
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: account_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RotateModelPoolAccountSecretRequest'
+      responses:
+        '200':
+          description: 新密钥已验证并切换
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelPoolAccountEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/model-pool/{account_id}:
     patch:
       tags: [Admin]
@@ -761,6 +1262,12 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/model-usage:
     get:
       tags: [Admin]
@@ -771,6 +1278,43 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/PageSize'
+        - name: provider
+          in: query
+          schema:
+            type: string
+            maxLength: 64
+        - name: model
+          in: query
+          schema:
+            type: string
+            maxLength: 128
+        - name: user_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: device_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: request_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: created_after
+          in: query
+          description: 仅返回创建时间大于等于该 RFC3339 时间的记录。
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+        - name: created_before
+          in: query
+          description: 仅返回创建时间小于等于该 RFC3339 时间的记录。
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [created_at_desc, created_at_asc]
       responses:
         '200':
           description: 服务端生成的模型用量记录
@@ -785,6 +1329,152 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/model-leases:
+    get:
+      tags: [Admin]
+      summary: 查询模型租约
+      description: 返回脱敏的租约生命周期和归属摘要，不返回租约凭证、API Key 或模型正文。
+      operationId: listModelLeases
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [active, released, expired]
+        - name: provider
+          in: query
+          schema:
+            type: string
+            maxLength: 64
+        - name: model
+          in: query
+          schema:
+            type: string
+            maxLength: 128
+        - name: user_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: device_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: account_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [expires_at_desc, expires_at_asc, status, provider_model]
+      responses:
+        '200':
+          description: 模型租约分页列表
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelLeaseListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/model-leases/{lease_id}:
+    get:
+      tags: [Admin]
+      summary: 查询单个模型租约详情
+      description: 返回脱敏的租约生命周期详情，不返回租约凭证、API Key 或模型正文。
+      operationId: getModelLeaseAdminDetail
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/LeaseId'
+      responses:
+        '200':
+          description: 模型租约详情
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelLeaseAdminDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/model-leases/{lease_id}/reclaim:
+    post:
+      tags: [Admin]
+      summary: 管理员回收模型租约
+      description: 幂等释放指定租约；只改变租约生命周期，不返回凭证或模型正文。
+      operationId: reclaimModelLease
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/LeaseId'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseModelLeaseRequest'
+      responses:
+        '200':
+          description: 租约已回收或已处于终态
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReleaseModelLeaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/admin/audit-logs:
     get:
       tags: [Admin]
@@ -795,6 +1485,54 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/PageSize'
+        - name: actor_user_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: device_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: action
+          in: query
+          schema:
+            type: string
+            maxLength: 256
+        - name: target_type
+          in: query
+          schema:
+            type: string
+            maxLength: 128
+        - name: outcome
+          in: query
+          schema:
+            type: string
+            enum: [success, failure, unknown]
+        - name: error_code
+          in: query
+          schema:
+            type: string
+            maxLength: 128
+        - name: request_id
+          in: query
+          schema:
+            type: string
+            maxLength: 128
+        - name: created_after
+          in: query
+          description: 包含该 RFC3339 时间点之后（含边界）的记录
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+        - name: created_before
+          in: query
+          description: 包含该 RFC3339 时间点之前（含边界）的记录
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [created_at_desc, created_at_asc]
       responses:
         '200':
           description: 审计日志分页列表
@@ -805,10 +1543,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AuditLogListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/health:
     get:
       tags: [Admin]
@@ -824,6 +1570,63 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/livez:
+    get:
+      tags: [Admin]
+      summary: 存活检查
+      operationId: livez
+      responses:
+        '200':
+          description: 进程存活
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/readyz:
+    get:
+      tags: [Admin]
+      summary: 就绪检查
+      operationId: readyz
+      responses:
+        '200':
+          description: 服务已准备好接收流量
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: 依赖未就绪
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 components:
   securitySchemes:
     bearerAuth:
@@ -832,11 +1635,12 @@ components:
       bearerFormat: Opaque
   headers:
     X-Request-Id:
-      description: 服务端生成或透传的请求追踪 ID
+      description: 客户端提供合法值时服务端校验后透传；缺失或非法时由服务端生成请求追踪 ID
       schema:
         type: string
-        minLength: 1
+        minLength: 8
         maxLength: 128
+        pattern: '^[A-Za-z0-9_-]+$'
   parameters:
     IdempotencyKeyHeader:
       name: Idempotency-Key
@@ -879,6 +1683,13 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            invalid_argument:
+              summary: 参数校验失败
+              value:
+                code: INVALID_ARGUMENT
+                message: 请求参数不合法
+                request_id: req_contract_bad_request
     Unauthorized:
       description: 未登录或会话失效
       headers:
@@ -888,6 +1699,13 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            unauthenticated:
+              summary: 会话无效
+              value:
+                code: UNAUTHENTICATED
+                message: 未提供有效 Bearer Token
+                request_id: req_contract_unauthenticated
     Forbidden:
       description: 已登录但无权限或资源不可用
       headers:
@@ -897,6 +1715,13 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            forbidden:
+              summary: 无权限
+              value:
+                code: FORBIDDEN
+                message: 没有访问该资源的权限
+                request_id: req_contract_forbidden
     NotFound:
       description: 资源不存在
       headers:
@@ -906,6 +1731,13 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            not_found:
+              summary: 资源不存在
+              value:
+                code: NOT_FOUND
+                message: 请求的资源不存在
+                request_id: req_contract_not_found
     Conflict:
       description: 状态冲突或重复请求语义不一致
       headers:
@@ -915,15 +1747,34 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            conflict:
+              summary: 状态冲突
+              value:
+                code: IDEMPOTENCY_CONFLICT
+                message: 幂等键对应的请求语义冲突
+                request_id: req_contract_conflict
     TooManyRequests:
       description: 达到限流或并发上限
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Retry-After:
+          description: 建议客户端等待的秒数
+          schema:
+            type: integer
+            minimum: 1
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            rate_limited:
+              summary: 请求频率超限
+              value:
+                code: RATE_LIMITED
+                message: 请求过于频繁，请稍后重试
+                request_id: req_contract_rate_limited
     BadGateway:
       description: 上游模型供应商返回失败或无效响应
       headers:
@@ -933,8 +1784,15 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            bad_gateway:
+              summary: 上游响应无效
+              value:
+                code: MODEL_POOL_SECRET_VALIDATION_FAILED
+                message: 新模型密钥连通性校验失败
+                request_id: req_contract_bad_gateway
     ServiceUnavailable:
-      description: 模型账号、直连租约或供应商暂时不可用
+      description: 模型账号、直连租约、提交结果核对或供应商暂时不可用
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
@@ -942,6 +1800,13 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            service_unavailable:
+              summary: 服务暂不可用
+              value:
+                code: AUTH_SESSION_STORE_UNAVAILABLE
+                message: 会话存储暂不可用
+                request_id: req_contract_unavailable
     GatewayTimeout:
       description: 上游模型请求超时
       headers:
@@ -951,6 +1816,61 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            gateway_timeout:
+              summary: 请求超时
+              value:
+                code: REQUEST_TIMEOUT
+                message: 请求处理超时
+                request_id: req_contract_gateway_timeout
+    MethodNotAllowed:
+      description: 当前路由不支持该请求方法
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            method_not_allowed:
+              summary: 方法不支持
+              value:
+                code: METHOD_NOT_ALLOWED
+                message: 请求方法不被允许
+                request_id: req_contract_method_not_allowed
+    RequestTimeout:
+      description: 请求在服务端完成前被取消
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            request_canceled:
+              summary: 请求已取消
+              value:
+                code: REQUEST_CANCELED
+                message: 请求已取消
+                request_id: req_contract_request_canceled
+    InternalServerError:
+      description: 未分类服务端异常
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            internal_error:
+              summary: 服务内部错误
+              value:
+                code: INTERNAL_ERROR
+                message: 服务内部错误
+                request_id: req_contract_internal_error
   schemas:
     Id:
       type: string
@@ -968,7 +1888,7 @@ components:
       properties:
         code:
           type: string
-          description: 稳定错误码，供三端分支处理
+          description: 稳定错误码，供三端分支处理；审计持久化失败时返回 AUDIT_UNAVAILABLE（HTTP 503）并不会提交原业务响应
         message:
           type: string
           description: 面向操作者的可读消息
@@ -1033,10 +1953,57 @@ components:
           $ref: '#/components/schemas/UserStatus'
         created_at:
           $ref: '#/components/schemas/Timestamp'
+    UserAuthorizationSummary:
+      type: object
+      additionalProperties: false
+      required: [user_id, device_count, active_device_count, active_lease_count, active_account_count, daily_used_tokens, usage_source, hard_quota_configured, allowed_models, daily_token_limit, quota_enforcement, as_of]
+      properties:
+        user_id:
+          $ref: '#/components/schemas/Id'
+        device_count:
+          type: integer
+          minimum: 0
+        active_device_count:
+          type: integer
+          minimum: 0
+        active_lease_count:
+          type: integer
+          minimum: 0
+        active_account_count:
+          type: integer
+          minimum: 0
+        daily_used_tokens:
+          type: integer
+          minimum: 0
+        usage_source:
+          type: string
+          enum: [client_reported_soft]
+          description: 客户端事后上报的软额度依据，不是供应商权威账单
+        hard_quota_configured:
+          type: boolean
+          description: 当前版本不提供用户级供应商硬额度，固定为 false
+        allowed_models:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            pattern: '^[^/]{1,64}/[^/]{1,128}$'
+          description: provider/model allowlist；空数组表示允许所有已登记模型
+        daily_token_limit:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+          description: 服务端已接收用量门禁；0 表示未配置
+        quota_enforcement:
+          type: string
+          enum: [server_recorded_usage_guard]
+          description: 说明额度只基于服务端已接收记录，不代表供应商权威账单
+        as_of:
+          $ref: '#/components/schemas/Timestamp'
     DeviceSummary:
       type: object
       additionalProperties: false
-      required: [id, user_id, device_name, platform, app_version, status, last_seen_at]
+      required: [id, user_id, device_name, platform, app_version, status, online, last_seen_at]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -1053,6 +2020,9 @@ components:
           maxLength: 64
         status:
           $ref: '#/components/schemas/DeviceStatus'
+        online:
+          type: boolean
+          description: 服务端依据最后心跳和固定阈值派生的在线状态
         disk_free_bytes:
           type: integer
           minimum: 0
@@ -1075,6 +2045,12 @@ components:
         kernel_version:
           type: string
           maxLength: 128
+        current_media_name:
+          type: string
+          maxLength: 255
+        playback_state:
+          type: string
+          enum: [idle, playing, paused, error]
         last_seen_at:
           $ref: '#/components/schemas/Timestamp'
     LoginRequest:
@@ -1269,6 +2245,9 @@ components:
         concurrency_limit:
           type: integer
           minimum: 1
+        status:
+          $ref: '#/components/schemas/ModelAccountStatus'
+          description: 初始状态；默认 active，disabled 仍受活动租约规则约束
     UpdateModelPoolAccountRequest:
       type: object
       additionalProperties: false
@@ -1293,6 +2272,21 @@ components:
       type: object
       additionalProperties: false
       properties:
+        timeout_seconds:
+          type: integer
+          minimum: 1
+          maximum: 60
+          default: 15
+    RotateModelPoolAccountSecretRequest:
+      type: object
+      additionalProperties: false
+      required: [api_key]
+      properties:
+        api_key:
+          type: string
+          minLength: 8
+          maxLength: 4096
+          writeOnly: true
         timeout_seconds:
           type: integer
           minimum: 1
@@ -1329,6 +2323,7 @@ components:
         error_code:
           type: string
           maxLength: 128
+          description: "模型连通性失败原因；明文 HTTP 未显式允许时为 MODEL_POOL_CONNECTIVITY_INSECURE_HTTP"
     CreateModelLeaseRequest:
       type: object
       additionalProperties: false
@@ -1387,7 +2382,11 @@ components:
           type: string
         status:
           $ref: '#/components/schemas/ModelLeaseStatus'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
         expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        released_at:
           $ref: '#/components/schemas/Timestamp'
         proxy_mode:
           type: string
@@ -1400,6 +2399,96 @@ components:
           format: uri
           readOnly: true
           description: 当前租约允许访问的 OpenAI-compatible API 根地址；不得由客户端修改
+    ModelLeaseAdminSummary:
+      type: object
+      additionalProperties: false
+      required: [id, account_id, user_id, device_id, purpose, provider, model, status, expires_at, proxy_mode, concurrency_limit]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        account_id:
+          $ref: '#/components/schemas/Id'
+        user_id:
+          $ref: '#/components/schemas/Id'
+        device_id:
+          $ref: '#/components/schemas/Id'
+        purpose:
+          type: string
+          maxLength: 64
+        provider:
+          type: string
+          maxLength: 64
+        model:
+          type: string
+          maxLength: 128
+        status:
+          $ref: '#/components/schemas/ModelLeaseStatus'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        proxy_mode:
+          type: string
+          enum: [direct_lease]
+        concurrency_limit:
+          type: integer
+          minimum: 1
+    ModelLeaseListResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, items, pagination]
+      properties:
+        request_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelLeaseAdminSummary'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    ModelLeaseAdminDetail:
+      type: object
+      additionalProperties: false
+      required: [id, account_id, user_id, device_id, purpose, provider, model, status, expires_at, proxy_mode, concurrency_limit]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        account_id:
+          $ref: '#/components/schemas/Id'
+        user_id:
+          $ref: '#/components/schemas/Id'
+        device_id:
+          $ref: '#/components/schemas/Id'
+        purpose:
+          type: string
+          maxLength: 64
+        provider:
+          type: string
+          maxLength: 64
+        model:
+          type: string
+          maxLength: 128
+        status:
+          $ref: '#/components/schemas/ModelLeaseStatus'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        released_at:
+          $ref: '#/components/schemas/Timestamp'
+        proxy_mode:
+          type: string
+          enum: [direct_lease]
+        concurrency_limit:
+          type: integer
+          minimum: 1
+    ModelLeaseAdminDetailResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, lease]
+      properties:
+        request_id:
+          type: string
+        lease:
+          $ref: '#/components/schemas/ModelLeaseAdminDetail'
     ReleaseModelLeaseResponse:
       type: object
       additionalProperties: false
@@ -1479,6 +2568,43 @@ components:
           type: string
         user:
           $ref: '#/components/schemas/UserSummary'
+    UserAuthorizationSummaryResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, summary]
+      properties:
+        request_id:
+          type: string
+        summary:
+          $ref: '#/components/schemas/UserAuthorizationSummary'
+    UserAuthorizationPolicyResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, policy]
+      properties:
+        request_id:
+          type: string
+        policy:
+          $ref: '#/components/schemas/UserAuthorizationPolicy'
+    UserAuthorizationPolicy:
+      type: object
+      additionalProperties: false
+      required: [user_id, allowed_models, daily_token_limit, updated_at]
+      properties:
+        user_id:
+          $ref: '#/components/schemas/Id'
+        allowed_models:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            pattern: '^[^/]{1,64}/[^/]{1,128}$'
+        daily_token_limit:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
     DeviceEnvelope:
       type: object
       additionalProperties: false
@@ -1488,6 +2614,27 @@ components:
           type: string
         device:
           $ref: '#/components/schemas/DeviceSummary'
+    UnbindDeviceResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, device_id, device_name, platform, status, online, last_seen_at]
+      properties:
+        request_id:
+          type: string
+        device_id:
+          $ref: '#/components/schemas/Id'
+        device_name:
+          type: string
+          maxLength: 128
+        platform:
+          type: string
+          maxLength: 64
+        status:
+          $ref: '#/components/schemas/DeviceStatus'
+        online:
+          type: boolean
+        last_seen_at:
+          $ref: '#/components/schemas/Timestamp'
     UserListResponse:
       type: object
       additionalProperties: false
@@ -1516,6 +2663,53 @@ components:
           maxLength: 256
         role:
           $ref: '#/components/schemas/ActorRole'
+    UpdateUserRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 64
+        role:
+          $ref: '#/components/schemas/ActorRole'
+        status:
+          $ref: '#/components/schemas/UserStatus'
+    UpdateUserAuthorizationRequest:
+      type: object
+      additionalProperties: false
+      required: [allowed_models, daily_token_limit]
+      properties:
+        allowed_models:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            pattern: '^[^/]{1,64}/[^/]{1,128}$'
+          description: provider/model allowlist；空数组表示允许所有已登记模型
+        daily_token_limit:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+    ResetUserPasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password:
+          type: string
+          minLength: 8
+          maxLength: 256
+    ChangeLocalAdminPasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password:
+          type: string
+          minLength: 12
+          maxLength: 256
     DeviceListResponse:
       type: object
       additionalProperties: false
@@ -1554,6 +2748,18 @@ components:
           $ref: '#/components/schemas/Timestamp'
         max_devices:
           type: integer
+        code_prefix:
+          type: string
+          description: 脱敏后的激活码前缀，不包含完整明文
+        used_by_user_id:
+          $ref: '#/components/schemas/Id'
+          description: 核销设备所属用户；仅核销后返回
+        used_by_device_id:
+          $ref: '#/components/schemas/Id'
+          description: 核销设备；仅核销后返回
+        used_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: 核销时间；仅核销后返回
         plain_code:
           type:
             - string
@@ -1620,6 +2826,8 @@ components:
         daily_used_tokens:
           type: integer
           minimum: 0
+        cooldown_until:
+          $ref: '#/components/schemas/Timestamp'
         last_test_status:
           type: string
           enum: [succeeded, failed, timeout]
@@ -1628,7 +2836,7 @@ components:
     ModelPoolResponse:
       type: object
       additionalProperties: false
-      required: [request_id, accounts]
+      required: [request_id, accounts, pagination]
       properties:
         request_id:
           type: string
@@ -1636,6 +2844,8 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ModelPoolAccountSummary'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
     ModelUsageRecord:
       type: object
       additionalProperties: false
@@ -1691,7 +2901,7 @@ components:
     AuditLog:
       type: object
       additionalProperties: false
-      required: [id, action, target_type, created_at]
+      required: [id, action, target_type, outcome, status_code, created_at]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -1708,6 +2918,17 @@ components:
         target_type:
           type: string
         target_id:
+          type:
+            - string
+            - 'null'
+        outcome:
+          type: string
+          enum: [success, failure, unknown]
+        status_code:
+          type: integer
+          minimum: 0
+          maximum: 599
+        error_code:
           type:
             - string
             - 'null'

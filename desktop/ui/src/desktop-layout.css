@@ -41,9 +41,20 @@
 .desktop-window-button:hover { color: #fff; background: #27282f; }
 .desktop-window-button-close:hover { background: #c42b3a; }
 
+.desktop-route-nav {
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  border-bottom: 1px solid #25262d;
+  background: #111117;
+}
+.desktop-route-nav-label { color: #777983; font-size: 10px; letter-spacing: 0.04em; }
+
 .desktop-page-content {
   width: 100%;
-  height: calc(100vh - 36px);
+  height: calc(100vh - 70px);
   padding: 12px;
   overflow: hidden;
 }
@@ -164,7 +175,7 @@
 
 @media (max-width: 900px) {
   .desktop-page { overflow: auto; }
-  .desktop-page-content { height: auto; min-height: calc(100vh - 36px); overflow: visible; }
+  .desktop-page-content { height: auto; min-height: calc(100vh - 70px); overflow: visible; }
   .desktop-workspace { height: auto; grid-template-columns: minmax(0, 1fr); grid-template-areas: "source" "video" "audio-output"; overflow: visible; }
   .desktop-column { overflow: visible; }
   .desktop-status-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }

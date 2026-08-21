@@ -117,6 +117,15 @@ export function ActivationCodesPage() {
         render: (value: string) => new Date(value).toLocaleString('zh-CN')
       },
       { title: '可绑定设备数', dataIndex: 'max_devices', key: 'max_devices' },
+      { title: '脱敏前缀', dataIndex: 'code_prefix', key: 'code_prefix', render: (value?: string) => value || '未生成' },
+      { title: '核销用户', dataIndex: 'used_by_user_id', key: 'used_by_user_id', render: (value?: string) => value || '未核销' },
+      { title: '核销设备', dataIndex: 'used_by_device_id', key: 'used_by_device_id', render: (value?: string) => value || '未核销' },
+      {
+        title: '核销时间',
+        dataIndex: 'used_at',
+        key: 'used_at',
+        render: (value?: string) => (value ? new Date(value).toLocaleString('zh-CN') : '未核销')
+      },
       {
         title: '操作',
         key: 'actions',

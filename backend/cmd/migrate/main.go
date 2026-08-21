@@ -18,8 +18,6 @@ import (
 	_ "github.com/lib/pq"
 )
 
-const databaseOperationTimeout = 30 * time.Second
-
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	cfg, err := config.LoadFromEnv()
@@ -32,11 +30,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := migrateDatabase(cfg.DatabaseURL); err != nil {
-		logger.Error("database migration failed", "error", err)
+	startedAt := time.Now()
+	migrationErr := migrateDatabase(cfg.DatabaseURL, cfg.MigrationTimeout)
+	duration := time.Since(startedAt)
+	if cfg.MigrationMetricsFile != "" {
+		metrics, metricsErr := renderMigrationMetrics(migrationErr, duration, cfg.MigrationTimeout)
+		if metricsErr == nil {
+			metricsErr = writeMigrationMetricsFile(cfg.MigrationMetricsFile, metrics)
+		}
+		if metricsErr != nil {
+			logger.Error("migration metrics publication failed", "error", metricsErr)
+			if migrationErr == nil {
+				logger.Error("database migration succeeded but metrics publication failed; refusing success")
+				os.Exit(1)
+			}
+		}
+	}
+	if migrationErr != nil {
+		logger.Error("database migration failed", "error", migrationErr, "duration_ms", duration.Milliseconds(), "timeout", cfg.MigrationTimeout.String())
 		os.Exit(1)
 	}
-	logger.Info("database migrations applied")
+	logger.Info("database migrations applied", "duration_ms", duration.Milliseconds(), "timeout", cfg.MigrationTimeout.String())
 }
 
 func validateMigrationConfig(cfg config.Config) error {
@@ -49,14 +63,24 @@ func validateMigrationConfig(cfg config.Config) error {
 	return nil
 }
 
-func migrateDatabase(databaseURL string) error {
+func validateMigrationOperationTimeout(operationTimeout time.Duration) error {
+	if operationTimeout <= 0 {
+		return errors.New("migration operation timeout must be greater than 0")
+	}
+	return nil
+}
+
+func migrateDatabase(databaseURL string, operationTimeout time.Duration) error {
+	if err := validateMigrationOperationTimeout(operationTimeout); err != nil {
+		return err
+	}
 	database, err := sql.Open("postgres", databaseURL)
 	if err != nil {
 		return fmt.Errorf("open postgres: %w", err)
 	}
 	defer database.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), databaseOperationTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
 	defer cancel()
 	if err := database.PingContext(ctx); err != nil {
 		return fmt.Errorf("ping postgres: %w", err)

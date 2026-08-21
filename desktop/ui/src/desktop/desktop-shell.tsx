@@ -1,7 +1,8 @@
 import { BorderOutlined, CloseOutlined, MinusOutlined } from '@ant-design/icons';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { Button } from 'antd';
+import { Button, Space } from 'antd';
 import type { ReactNode } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 
 function runWindowAction(action: 'minimize' | 'toggleMaximize' | 'close') {
   if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return;
@@ -44,10 +45,44 @@ export function DesktopTopbar() {
   );
 }
 
+const DESKTOP_ROUTE_ITEMS = [
+  { path: '/', label: '主页' },
+  { path: '/settings', label: '设置' },
+  { path: '/status', label: '状态' },
+] as const;
+
+function DesktopRouteNavigation() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const currentPath = DESKTOP_ROUTE_ITEMS.some((item) => item.path === location.pathname)
+    ? location.pathname
+    : '/';
+
+  return (
+    <nav className="desktop-route-nav" aria-label="桌面端页面导航">
+      <span className="desktop-route-nav-label">工作区</span>
+      <Space size={4}>
+        {DESKTOP_ROUTE_ITEMS.map((item) => (
+          <Button
+            key={item.path}
+            size="small"
+            type={currentPath === item.path ? 'primary' : 'text'}
+            aria-current={currentPath === item.path ? 'page' : undefined}
+            onClick={() => navigate(item.path)}
+          >
+            {item.label}
+          </Button>
+        ))}
+      </Space>
+    </nav>
+  );
+}
+
 export function DesktopShell({ children }: { children: ReactNode }) {
   return (
     <div className="desktop-page">
       <DesktopTopbar />
+      <DesktopRouteNavigation />
       <main className="desktop-page-content">
         <div className="desktop-workspace">{children}</div>
       </main>

@@ -20,6 +20,7 @@ import {
 import { App as AntApp, Alert, Button, Card, Checkbox, ConfigProvider, Descriptions, Drawer, Input, InputNumber, Layout, Popconfirm, Progress, Select, Slider, Space, Steps, Switch, Tag, Typography, theme as antdTheme } from 'antd';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { SyntheticEvent } from 'react';
+import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { buildInterludeScheduleKey, chooseInterludeIndex, INTERLUDE_LIMITS, nextInterludeAtMs, resolvePlaybackAudioSource, shouldPauseInterlude } from './interlude-player';
 import type { BaseAudioSource } from './interlude-player';
 import {
@@ -3085,6 +3086,8 @@ function FinalEffectWindow() {
 }
 
 function DesktopApp() {
+  const location = useLocation();
+  const initialRoute = location.pathname === '/settings' ? 'settings' : 'home';
   const [probe, setProbe] = useState<MediaProbeResult | null>(null);
   const [snapshot, setSnapshot] = useState<PlaybackSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -3411,6 +3414,10 @@ function DesktopApp() {
   const [interludeDrawerOpen, setInterludeDrawerOpen] = useState(false);
   const [fixedSpeechDrawerOpen, setFixedSpeechDrawerOpen] = useState(false);
   const [sourceManageDrawerOpen, setSourceManageDrawerOpen] = useState(false);
+
+  useEffect(() => {
+    setAudioSettingsDrawerOpen(initialRoute === 'settings');
+  }, [initialRoute]);
   const audioCycleSampleRef = useRef<AudioCycleSample | null>(null);
   const lastAudioCycleSnapshotSignatureRef = useRef<string | null>(null);
   const audioValuePresetIdsRef = useRef(audioValuePresetIds);
@@ -6195,6 +6202,17 @@ function DesktopApp() {
   );
 }
 
+function DesktopRouter() {
+  return (
+    <Routes>
+      <Route path="/" element={<DesktopApp />} />
+      <Route path="/settings" element={<DesktopApp />} />
+      <Route path="/status" element={<DesktopApp />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
+  );
+}
+
 export default function App() {
   return (
     <ConfigProvider
@@ -6213,7 +6231,15 @@ export default function App() {
         },
       }}
     >
-      <AntApp>{isFinalEffectWindow ? <FinalEffectWindow /> : <DesktopApp />}</AntApp>
+      <AntApp>
+        {isFinalEffectWindow ? (
+          <FinalEffectWindow />
+        ) : (
+          <HashRouter>
+            <DesktopRouter />
+          </HashRouter>
+        )}
+      </AntApp>
     </ConfigProvider>
   );
 }

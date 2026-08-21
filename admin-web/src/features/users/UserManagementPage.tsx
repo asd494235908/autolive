@@ -4,25 +4,48 @@ import {
   App,
   Button,
   Card,
+  Descriptions,
+  Drawer,
   Empty,
   Form,
   Input,
+  InputNumber,
   Modal,
   Select,
   Space,
   Table,
   Typography
 } from 'antd';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { apiClient, ApiClientError, createRequestId } from '../../api/client';
 import { StatusTag } from '../../components/StatusTag';
-import type { CreateUserRequest, UserEnvelope, UserListResponse, UserSummary } from '../../types/api';
+import type {
+  CreateUserRequest,
+  ResetUserPasswordRequest,
+  UpdateUserRequest,
+  DeviceListResponse,
+  DeviceSummary,
+  UpdateUserAuthorizationRequest,
+  UserAuthorizationPolicyResponse,
+  UserAuthorizationSummaryResponse,
+  UserEnvelope,
+  UserListResponse,
+  UserSummary
+} from '../../types/api';
 
 export function UserManagementPage() {
   const { message, modal } = App.useApp();
   const queryClient = useQueryClient();
   const [form] = Form.useForm<CreateUserRequest>();
+  const [editForm] = Form.useForm<UpdateUserRequest>();
+  const [resetForm] = Form.useForm<ResetUserPasswordRequest>();
+  const [authorizationForm] = Form.useForm<UpdateUserAuthorizationRequest>();
   const [createOpen, setCreateOpen] = useState(false);
+  const [editingUser, setEditingUser] = useState<UserSummary | null>(null);
+  const [resettingUser, setResettingUser] = useState<UserSummary | null>(null);
+  const [devicesUser, setDevicesUser] = useState<UserSummary | null>(null);
+  const [devicePage, setDevicePage] = useState(1);
+  const [devicePageSize, setDevicePageSize] = useState(20);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
 
@@ -78,6 +101,97 @@ export function UserManagementPage() {
     }
   });
 
+  const userDevicesQuery = useQuery({
+    queryKey: ['admin-user-devices', devicesUser?.id, devicePage, devicePageSize],
+    queryFn: () =>
+      apiClient.get<DeviceListResponse>(`/api/v1/admin/users/${devicesUser?.id}/devices`, {
+        query: { page: devicePage, page_size: devicePageSize }
+      }),
+    enabled: devicesUser !== null
+  });
+
+  const userAuthorizationQuery = useQuery({
+    queryKey: ['admin-user-authorization-summary', devicesUser?.id],
+    queryFn: () =>
+      apiClient.get<UserAuthorizationSummaryResponse>(
+        `/api/v1/admin/users/${devicesUser?.id}/authorization-summary`
+      ),
+    enabled: devicesUser !== null
+  });
+
+  useEffect(() => {
+    const summary = userAuthorizationQuery.data?.summary;
+    if (!summary) {
+      return;
+    }
+    authorizationForm.setFieldsValue({
+      allowed_models: summary.allowed_models,
+      daily_token_limit: summary.daily_token_limit
+    });
+  }, [authorizationForm, userAuthorizationQuery.data]);
+
+  const updateAuthorizationMutation = useMutation({
+    mutationFn: ({ userId, values }: { userId: string; values: UpdateUserAuthorizationRequest }) =>
+      apiClient.request<UserAuthorizationPolicyResponse>(`/api/v1/admin/users/${userId}/authorization`, {
+        method: 'PATCH',
+        body: values,
+        headers: { 'Idempotency-Key': createRequestId() }
+      }),
+    onSuccess: async (response) => {
+      void message.success(`用户授权策略已更新（request_id：${response.request_id}）`);
+      await queryClient.invalidateQueries({ queryKey: ['admin-user-authorization-summary'] });
+    },
+    onError: (error) => {
+      void message.error(
+        error instanceof ApiClientError
+          ? `${error.message}${error.requestId ? `（${error.requestId}）` : ''}`
+          : '更新用户授权策略失败'
+      );
+    }
+  });
+
+  const updateUserMutation = useMutation({
+    mutationFn: ({ userId, values }: { userId: string; values: UpdateUserRequest }) =>
+      apiClient.request<UserEnvelope>(`/api/v1/admin/users/${userId}`, {
+        method: 'PATCH',
+        body: values,
+        headers: { 'Idempotency-Key': createRequestId() }
+      }),
+    onSuccess: async (response) => {
+      void message.success(`用户已更新：${response.user.username}`);
+      setEditingUser(null);
+      await queryClient.invalidateQueries({ queryKey: ['admin-users'] });
+    },
+    onError: (error) => {
+      void message.error(
+        error instanceof ApiClientError
+          ? `${error.message}${error.requestId ? `（request_id：${error.requestId}）` : ''}`
+          : '更新用户失败'
+      );
+    }
+  });
+
+  const resetPasswordMutation = useMutation({
+    mutationFn: ({ userId, values }: { userId: string; values: ResetUserPasswordRequest }) =>
+      apiClient.post<UserEnvelope>(`/api/v1/admin/users/${userId}/reset-password`, {
+        body: values,
+        headers: { 'Idempotency-Key': createRequestId() }
+      }),
+    onSuccess: async (response) => {
+      void message.success(`密码已重置：${response.user.username}`);
+      setResettingUser(null);
+      resetForm.resetFields();
+      await queryClient.invalidateQueries({ queryKey: ['admin-users'] });
+    },
+    onError: (error) => {
+      void message.error(
+        error instanceof ApiClientError
+          ? `${error.message}${error.requestId ? `（request_id：${error.requestId}）` : ''}`
+          : '重置密码失败'
+      );
+    }
+  });
+
   const columns = useMemo(
     () => [
       {
@@ -106,26 +220,79 @@ export function UserManagementPage() {
         title: '操作',
         key: 'actions',
         render: (_: unknown, record: UserSummary) => (
-          <Button
-            danger
-            disabled={record.status === 'disabled' || record.id === 'usr_local_admin'}
-            loading={disableUserMutation.isPending}
-            onClick={() => {
-              modal.confirm({
-                title: '确认禁用用户',
-                content: `将禁用用户“${record.username}”，后续受保护操作会被拒绝。`,
-                okText: '确认禁用',
-                cancelText: '返回',
-                onOk: () => disableUserMutation.mutateAsync(record.id)
-              });
-            }}
-          >
-            禁用
-          </Button>
+          <Space>
+            <Button
+              disabled={record.id === 'usr_local_admin'}
+              onClick={() => {
+                setEditingUser(record);
+                editForm.setFieldsValue({
+                  username: record.username,
+                  role: record.role,
+                  status: record.status
+                });
+              }}
+            >
+              编辑
+            </Button>
+            <Button
+              disabled={record.id === 'usr_local_admin'}
+              onClick={() => {
+                setResettingUser(record);
+                resetForm.resetFields();
+              }}
+            >
+              重置密码
+            </Button>
+            <Button
+              onClick={() => {
+                setDevicePage(1);
+                setDevicesUser(record);
+              }}
+            >
+              设备
+            </Button>
+            <Button
+              danger
+              disabled={record.status === 'disabled' || record.id === 'usr_local_admin'}
+              loading={disableUserMutation.isPending}
+              onClick={() => {
+                modal.confirm({
+                  title: '确认禁用用户',
+                  content: `将禁用用户“${record.username}”，后续受保护操作会被拒绝。`,
+                  okText: '确认禁用',
+                  cancelText: '返回',
+                  onOk: () => disableUserMutation.mutateAsync(record.id)
+                });
+              }}
+            >
+              禁用
+            </Button>
+          </Space>
         )
       }
     ],
-    [disableUserMutation, modal]
+    [disableUserMutation, editForm, modal, resetForm]
+  );
+
+  const deviceColumns = useMemo(
+    () => [
+      { title: '设备名', dataIndex: 'device_name', key: 'device_name' },
+      { title: '平台', dataIndex: 'platform', key: 'platform' },
+      {
+        title: '状态',
+        dataIndex: 'status',
+        key: 'status',
+        render: (status: DeviceSummary['status']) => <StatusTag status={status} />
+      },
+      {
+        title: '在线',
+        dataIndex: 'online',
+        key: 'online',
+        render: (online: boolean) => (online ? '在线' : '离线')
+      },
+      { title: '当前播放', dataIndex: 'current_media_name', key: 'current_media_name' }
+    ],
+    []
   );
 
   return (
@@ -136,7 +303,7 @@ export function UserManagementPage() {
             用户管理
           </Typography.Title>
           <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-            对齐 `/api/v1/admin/users` 的列表、创建和禁用接口。
+            对齐用户列表、创建、编辑、密码重置、禁用，以及模型授权与服务端记录用量门禁。
           </Typography.Paragraph>
         </div>
 
@@ -229,6 +396,176 @@ export function UserManagementPage() {
                 { label: '管理员', value: 'admin' }
               ]}
             />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Drawer
+        title={devicesUser ? `用户授权与设备：${devicesUser.username}` : '用户授权与设备'}
+        open={devicesUser !== null}
+        width={720}
+        onClose={() => setDevicesUser(null)}
+      >
+        {userAuthorizationQuery.isError ? (
+          <Alert
+            type="error"
+            showIcon
+            message="用户授权摘要加载失败"
+            description={
+              userAuthorizationQuery.error instanceof ApiClientError
+                ? `${userAuthorizationQuery.error.message}${userAuthorizationQuery.error.requestId ? `（request_id：${userAuthorizationQuery.error.requestId}）` : ''}`
+                : '发生未知错误'
+            }
+          />
+        ) : (
+          <Card size="small" title="授权与软额度摘要" loading={userAuthorizationQuery.isLoading} style={{ marginBottom: 16 }}>
+            {userAuthorizationQuery.data ? (
+              <Descriptions column={2} size="small">
+                <Descriptions.Item label="设备总数">{userAuthorizationQuery.data.summary.device_count}</Descriptions.Item>
+                <Descriptions.Item label="活动设备">{userAuthorizationQuery.data.summary.active_device_count}</Descriptions.Item>
+                <Descriptions.Item label="活动租约">{userAuthorizationQuery.data.summary.active_lease_count}</Descriptions.Item>
+                <Descriptions.Item label="活动模型账号">{userAuthorizationQuery.data.summary.active_account_count}</Descriptions.Item>
+                <Descriptions.Item label="今日已用 Token">{userAuthorizationQuery.data.summary.daily_used_tokens}</Descriptions.Item>
+                <Descriptions.Item label="额度依据">客户端自报软额度</Descriptions.Item>
+                <Descriptions.Item label="模型授权">
+                  {userAuthorizationQuery.data.summary.allowed_models.length > 0
+                    ? userAuthorizationQuery.data.summary.allowed_models.join('、')
+                    : '全部已登记模型'}
+                </Descriptions.Item>
+                <Descriptions.Item label="记录用量门禁">
+                  {userAuthorizationQuery.data.summary.daily_token_limit > 0
+                    ? `${userAuthorizationQuery.data.summary.daily_token_limit} Token/日`
+                    : '未配置'}
+                </Descriptions.Item>
+                <Descriptions.Item label="供应商硬额度">未配置</Descriptions.Item>
+                <Descriptions.Item label="统计时间">{new Date(userAuthorizationQuery.data.summary.as_of).toLocaleString('zh-CN')}</Descriptions.Item>
+              </Descriptions>
+            ) : null}
+          </Card>
+        )}
+        <Card size="small" title="编辑模型授权与记录用量门禁" style={{ marginBottom: 16 }}>
+          <Form<UpdateUserAuthorizationRequest>
+            form={authorizationForm}
+            layout="vertical"
+            onFinish={(values) => {
+              if (devicesUser) {
+                updateAuthorizationMutation.mutate({ userId: devicesUser.id, values });
+              }
+            }}
+          >
+            <Form.Item
+              label="允许的模型（provider/model）"
+              name="allowed_models"
+              rules={[{ type: 'array', max: 100, message: '最多配置 100 个模型' }]}
+              extra="留空表示允许全部已登记模型；当前仅控制模型租约申请。"
+            >
+              <Select mode="tags" tokenSeparators={[',']} placeholder="例如 openai-compatible/gpt-4o-mini" />
+            </Form.Item>
+            <Form.Item
+              label="每日服务端记录用量上限（Token）"
+              name="daily_token_limit"
+              rules={[{ required: true, type: 'number', min: 0, max: 1000000000, message: '请输入 0～1,000,000,000' }]}
+              extra="只依据服务端已接收记录，不是供应商权威账单或未来用量预占。"
+            >
+              <InputNumber min={0} max={1000000000} style={{ width: '100%' }} />
+            </Form.Item>
+            <Button type="primary" htmlType="submit" loading={updateAuthorizationMutation.isPending}>
+              保存授权策略
+            </Button>
+          </Form>
+        </Card>
+        {userDevicesQuery.isError ? (
+          <Alert
+            type="error"
+            showIcon
+            message="用户设备加载失败"
+            description={
+              userDevicesQuery.error instanceof ApiClientError
+                ? `${userDevicesQuery.error.message}${userDevicesQuery.error.requestId ? `（request_id：${userDevicesQuery.error.requestId}）` : ''}`
+                : '发生未知错误'
+            }
+          />
+        ) : (
+          <Table<DeviceSummary>
+            rowKey="id"
+            size="small"
+            columns={deviceColumns}
+            dataSource={userDevicesQuery.data?.items ?? []}
+            loading={userDevicesQuery.isLoading}
+            pagination={{
+              current: devicePage,
+              pageSize: devicePageSize,
+              total: userDevicesQuery.data?.pagination.total ?? 0,
+              showSizeChanger: true
+            }}
+            locale={{ emptyText: '暂无设备' }}
+            onChange={(pagination) => {
+              setDevicePage(pagination.current ?? 1);
+              setDevicePageSize(pagination.pageSize ?? 20);
+            }}
+          />
+        )}
+      </Drawer>
+
+      <Modal
+        title={editingUser ? `编辑用户：${editingUser.username}` : '编辑用户'}
+        open={editingUser !== null}
+        confirmLoading={updateUserMutation.isPending}
+        onCancel={() => {
+          if (!updateUserMutation.isPending) {
+            setEditingUser(null);
+          }
+        }}
+        onOk={() => {
+          void editForm.validateFields().then((values) => {
+            if (editingUser) {
+              updateUserMutation.mutate({ userId: editingUser.id, values });
+            }
+          });
+        }}
+      >
+        <Form<UpdateUserRequest> form={editForm} layout="vertical">
+          <Form.Item
+            label="用户名"
+            name="username"
+            rules={[{ required: true, message: '请输入用户名' }, { min: 3, message: '用户名至少 3 个字符' }]}
+          >
+            <Input />
+          </Form.Item>
+          <Form.Item label="角色" name="role" rules={[{ required: true, message: '请选择角色' }]}>
+            <Select options={[{ label: '普通用户', value: 'user' }, { label: '管理员', value: 'admin' }]} />
+          </Form.Item>
+          <Form.Item label="状态" name="status" rules={[{ required: true, message: '请选择状态' }]}>
+            <Select options={[{ label: '启用', value: 'active' }, { label: '禁用', value: 'disabled' }]} />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        title={resettingUser ? `重置密码：${resettingUser.username}` : '重置密码'}
+        open={resettingUser !== null}
+        confirmLoading={resetPasswordMutation.isPending}
+        onCancel={() => {
+          if (!resetPasswordMutation.isPending) {
+            setResettingUser(null);
+            resetForm.resetFields();
+          }
+        }}
+        onOk={() => {
+          void resetForm.validateFields().then((values) => {
+            if (resettingUser) {
+              resetPasswordMutation.mutate({ userId: resettingUser.id, values });
+            }
+          });
+        }}
+      >
+        <Form<ResetUserPasswordRequest> form={resetForm} layout="vertical">
+          <Form.Item
+            label="新密码"
+            name="password"
+            rules={[{ required: true, message: '请输入新密码' }, { min: 8, message: '密码至少 8 个字符' }]}
+          >
+            <Input.Password placeholder="至少 8 个字符" />
           </Form.Item>
         </Form>
       </Modal>

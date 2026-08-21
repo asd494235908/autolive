@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"autoLive/backend/internal/config"
 )
@@ -27,5 +28,17 @@ func TestValidateMigrationConfigAcceptsConfiguredPostgres(t *testing.T) {
 	}
 	if err := validateMigrationConfig(cfg); err != nil {
 		t.Fatalf("validateMigrationConfig() error = %v, want nil", err)
+	}
+}
+
+func TestMigrationOperationTimeoutMustBePositive(t *testing.T) {
+	if err := validateMigrationOperationTimeout(0); err == nil {
+		t.Fatal("validateMigrationOperationTimeout(0) error = nil, want error")
+	}
+	if err := validateMigrationOperationTimeout(-time.Second); err == nil {
+		t.Fatal("validateMigrationOperationTimeout(-1s) error = nil, want error")
+	}
+	if err := validateMigrationOperationTimeout(time.Second); err != nil {
+		t.Fatalf("validateMigrationOperationTimeout(1s) error = %v", err)
 	}
 }

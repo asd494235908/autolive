@@ -2,9 +2,8 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"regexp"
 	"slices"
@@ -22,17 +21,32 @@ var (
 )
 
 type ControlPlane struct {
-	repository  store.Repository
-	secretStore store.SecretStore
-	httpClient  *http.Client
+	repository        store.Repository
+	secretStore       store.SecretStore
+	httpClient        *http.Client
+	modelPoolResolver modelPoolIPResolver
+	allowInsecureHTTP bool
 }
+
+// ControlPlaneOptions controls outbound behavior that must be explicit at the
+// application boundary. Insecure HTTP is disabled by default and is intended
+// only for controlled development or test environments.
+type ControlPlaneOptions struct {
+	AllowInsecureHTTP bool
+}
+
+const deviceOnlineThreshold = 2 * time.Minute
+
+const modelAccountCooldownDuration = 5 * time.Minute
+
+const secretRotationCleanupTimeout = 2 * time.Second
 
 func NewControlPlane(memory *store.MemoryStore) *ControlPlane {
 	return NewControlPlaneWithRepositoryAndSecretStore(memory, &http.Client{Timeout: 30 * time.Second}, store.NewMemorySecretStore())
 }
 
 func NewControlPlaneWithHTTPClient(memory *store.MemoryStore, client *http.Client) *ControlPlane {
-	return NewControlPlaneWithRepositoryAndSecretStore(memory, client, store.NewMemorySecretStore())
+	return newControlPlaneWithRepositoryAndSecretStoreOptions(memory, client, store.NewMemorySecretStore(), nil, ControlPlaneOptions{})
 }
 
 func NewControlPlaneWithRepository(repository store.Repository) *ControlPlane {
@@ -40,10 +54,25 @@ func NewControlPlaneWithRepository(repository store.Repository) *ControlPlane {
 }
 
 func NewControlPlaneWithRepositoryAndHTTPClient(repository store.Repository, client *http.Client) *ControlPlane {
-	return NewControlPlaneWithRepositoryAndSecretStore(repository, client, store.NewMemorySecretStore())
+	return newControlPlaneWithRepositoryAndSecretStoreOptions(repository, client, store.NewMemorySecretStore(), nil, ControlPlaneOptions{})
 }
 
 func NewControlPlaneWithRepositoryAndSecretStore(repository store.Repository, client *http.Client, secretStore store.SecretStore) *ControlPlane {
+	return newControlPlaneWithRepositoryAndSecretStoreOptions(repository, client, secretStore, nil, ControlPlaneOptions{})
+}
+
+func newControlPlaneWithRepositoryAndSecretStore(repository store.Repository, client *http.Client, secretStore store.SecretStore, resolver modelPoolIPResolver) *ControlPlane {
+	// This unexported constructor is retained for legacy in-package HTTP tests;
+	// production callers must use the exported options constructor, which keeps
+	// insecure HTTP disabled by default.
+	return newControlPlaneWithRepositoryAndSecretStoreOptions(repository, client, secretStore, resolver, ControlPlaneOptions{AllowInsecureHTTP: true})
+}
+
+func NewControlPlaneWithRepositoryAndSecretStoreAndOptions(repository store.Repository, client *http.Client, secretStore store.SecretStore, options ControlPlaneOptions) *ControlPlane {
+	return newControlPlaneWithRepositoryAndSecretStoreOptions(repository, client, secretStore, nil, options)
+}
+
+func newControlPlaneWithRepositoryAndSecretStoreOptions(repository store.Repository, client *http.Client, secretStore store.SecretStore, resolver modelPoolIPResolver, options ControlPlaneOptions) *ControlPlane {
 	if repository == nil {
 		repository = store.NewMemoryStore(time.Now)
 	}
@@ -53,15 +82,26 @@ func NewControlPlaneWithRepositoryAndSecretStore(repository store.Repository, cl
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
-	return &ControlPlane{repository: repository, secretStore: secretStore, httpClient: client}
+	if resolver == nil {
+		resolver = defaultModelPoolIPResolver
+	}
+	return &ControlPlane{repository: repository, secretStore: secretStore, httpClient: client, modelPoolResolver: resolver, allowInsecureHTTP: options.AllowInsecureHTTP}
 }
 
-func (s *ControlPlane) EnsureLocalAdmin(username string) {
+func (s *ControlPlane) EnsureLocalAdmin(ctx context.Context, username string) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		// Normalized PostgreSQL bootstraps the administrator with a persisted
+		// credential. The legacy user-only helper must not materialize a snapshot.
+		return store.ErrNormalizedLocalAdminBootstrapRequired
+	}
 	if strings.TrimSpace(username) == "" {
 		username = "admin"
 	}
 
-	_ = s.repository.Run(context.Background(), func(state *store.State) error {
+	return s.repository.Run(ctx, func(state *store.State) error {
 		if _, exists := state.Users["usr_local_admin"]; exists {
 			return nil
 		}
@@ -78,12 +118,274 @@ func (s *ControlPlane) EnsureLocalAdmin(username string) {
 	})
 }
 
+// EnsureConfiguredAdmin creates the bootstrap administrator with a persisted
+// bcrypt credential. Existing credentials are never overwritten by a process
+// restart; password changes must go through an explicit control-plane command.
+func (s *ControlPlane) EnsureConfiguredAdmin(ctx context.Context, username, password string) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	username = strings.TrimSpace(username)
+	if username == "" || len(username) > 64 || len(password) < 8 || len(password) > 256 {
+		return errors.New("configured administrator credentials are invalid")
+	}
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("hash configured administrator password: %w", err)
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		bootstrap, ok := s.repository.(store.AdminCredentialRepository)
+		if !ok {
+			return store.ErrNormalizedAdminCredentialRepositoryRequired
+		}
+		return bootstrap.EnsureConfiguredAdmin(ctx, username, passwordHash)
+	}
+
+	return s.repository.Run(ctx, func(state *store.State) error {
+		admin, exists := state.Users["usr_local_admin"]
+		if exists {
+			if admin.Username != username || admin.Role != controlplane.RoleAdmin {
+				return errors.New("persisted local administrator does not match configured identity")
+			}
+			if hash := state.UserCredentialHashes[admin.ID]; len(hash) > 0 {
+				return nil
+			}
+			state.UserCredentialHashes[admin.ID] = append([]byte(nil), passwordHash...)
+			return nil
+		}
+		for _, user := range state.Users {
+			if user.Username == username {
+				return controlplane.ErrUsernameAlreadyExists
+			}
+		}
+		now := s.repository.Now().Format(time.RFC3339)
+		state.Users["usr_local_admin"] = controlplane.UserSummary{
+			ID:        "usr_local_admin",
+			Username:  username,
+			Role:      controlplane.RoleAdmin,
+			Status:    controlplane.UserStatusActive,
+			CreatedAt: now,
+		}
+		state.UserCredentialHashes["usr_local_admin"] = append([]byte(nil), passwordHash...)
+		return nil
+	})
+}
+
+// ChangeLocalAdminPassword rotates the persisted bootstrap administrator
+// credential. It is intentionally separate from user-management password
+// resets so the local administrator cannot be changed through a generic user
+// route.
+func (s *ControlPlane) ChangeLocalAdminPassword(ctx context.Context, idempotencyKey string, input controlplane.ChangeLocalAdminPasswordInput) (controlplane.UserSummary, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.UserSummary{}, err
+	}
+	if !validIdempotencyKey(idempotencyKey) || len(input.Password) < 12 || len(input.Password) > 256 {
+		return controlplane.UserSummary{}, controlplane.ErrInvalidRequest
+	}
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return controlplane.UserSummary{}, fmt.Errorf("hash local administrator password: %w", err)
+	}
+	fingerprint, err := fingerprintValue(input)
+	if err != nil {
+		return controlplane.UserSummary{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		bootstrap, ok := s.repository.(store.AdminCredentialRepository)
+		if !ok {
+			return controlplane.UserSummary{}, store.ErrNormalizedAdminCredentialRepositoryRequired
+		}
+		return bootstrap.ChangeLocalAdminPassword(ctx, "control-plane-state", "change-local-admin-password:"+idempotencyKey, fingerprint, passwordHash)
+	}
+
+	return withState(ctx, s.repository, func(state *store.State) (controlplane.UserSummary, error) {
+		admin, ok := state.Users["usr_local_admin"]
+		if !ok || admin.Role != controlplane.RoleAdmin {
+			return controlplane.UserSummary{}, controlplane.ErrLocalAdminRequired
+		}
+		if admin.Status != controlplane.UserStatusActive {
+			return controlplane.UserSummary{}, controlplane.ErrUserDisabled
+		}
+		scope := "change-local-admin-password:" + idempotencyKey
+		if existing, ok := state.IdempotencyRecords[scope]; ok {
+			if existing.Fingerprint != fingerprint {
+				return controlplane.UserSummary{}, controlplane.ErrIdempotencyConflict
+			}
+			return state.Users[existing.ResourceID], nil
+		}
+		state.UserCredentialHashes[admin.ID] = append([]byte(nil), passwordHash...)
+		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: admin.ID}
+		return admin, nil
+	})
+}
+
+func (s *ControlPlane) CheckReady(ctx context.Context) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		bootstrap, ok := s.repository.(store.AdminCredentialRepository)
+		if !ok {
+			return store.ErrNormalizedAdminCredentialRepositoryRequired
+		}
+		if err := bootstrap.CheckAdminReady(ctx); err != nil {
+			return fmt.Errorf("repository readiness failed: %w", err)
+		}
+	} else if err := s.repository.Run(ctx, func(state *store.State) error {
+		admin, exists := state.Users["usr_local_admin"]
+		if !exists {
+			return errors.New("local admin is not initialized")
+		}
+		if admin.Role != controlplane.RoleAdmin || admin.Status != controlplane.UserStatusActive || len(state.UserCredentialHashes[admin.ID]) == 0 {
+			return errors.New("local admin credential is not initialized")
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("repository readiness failed: %w", err)
+	}
+	if err := s.secretStore.Ping(ctx); err != nil {
+		return fmt.Errorf("secret store readiness failed: %w", err)
+	}
+	return nil
+}
+
+// TryAdvisoryLock exposes the repository coordination boundary to owned
+// background workers without making service code depend on PostgreSQL APIs.
+// Memory and other single-process repositories intentionally use a no-op lock.
+func (s *ControlPlane) TryAdvisoryLock(ctx context.Context, key int64) (store.AdvisoryLockRelease, bool, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, false, err
+	}
+	if locker, ok := s.repository.(store.AdvisoryLocker); ok {
+		return locker.TryAdvisoryLock(ctx, key)
+	}
+	return func(context.Context) error { return nil }, true, nil
+}
+
+// CleanupStagedSecrets reconciles durable rotation candidates after a process
+// crash. The active SecretRef set is read from the business repository first;
+// the secret store only deletes old references matching its staged prefix and
+// never infers the active account state itself.
+func (s *ControlPlane) CleanupStagedSecrets(ctx context.Context, request store.RetentionCleanupRequest) (int64, error) {
+	if err := checkContext(ctx); err != nil {
+		return 0, err
+	}
+	if err := request.Validate(); err != nil {
+		return 0, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		cleaner, ok := s.repository.(store.NormalizedStagedSecretCleaner)
+		if !ok {
+			return 0, store.ErrNormalizedStagedSecretCleanerRequired
+		}
+		return cleaner.CleanupUnreferencedStagedSecrets(ctx, request)
+	}
+	protected, err := withState(ctx, s.repository, func(state *store.State) ([]string, error) {
+		refs := make([]string, 0, len(state.ModelPoolAccounts))
+		seen := make(map[string]struct{}, len(state.ModelPoolAccounts))
+		for _, account := range state.ModelPoolAccounts {
+			ref := strings.TrimSpace(account.SecretRef)
+			if ref == "" {
+				continue
+			}
+			if _, exists := seen[ref]; exists {
+				continue
+			}
+			seen[ref] = struct{}{}
+			refs = append(refs, ref)
+		}
+		slices.Sort(refs)
+		return refs, nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	var deleted int64
+	if cleaner, ok := s.secretStore.(store.StagedSecretCleaner); ok {
+		deleted, err = cleaner.CleanupStagedSecrets(ctx, request, protected)
+		if err != nil {
+			return deleted, err
+		}
+	}
+	referenceCleaner, ok := s.secretStore.(store.SecretReferenceCleaner)
+	pending, err := withState(ctx, s.repository, func(state *store.State) ([]string, error) {
+		refs := make([]string, 0, len(state.PendingSecretCleanup))
+		for reference, queuedAt := range state.PendingSecretCleanup {
+			if queuedAt.IsZero() || !queuedAt.Before(request.Cutoff) {
+				continue
+			}
+			if _, isProtected := slices.BinarySearch(protected, reference); isProtected {
+				continue
+			}
+			refs = append(refs, reference)
+		}
+		slices.Sort(refs)
+		if len(refs) > request.BatchSize {
+			refs = refs[:request.BatchSize]
+		}
+		return refs, nil
+	})
+	if err != nil || len(pending) == 0 {
+		return deleted, err
+	}
+	if !ok {
+		return deleted, controlplane.ErrSecretStoreUnavailable
+	}
+	resolved, err := referenceCleaner.CleanupSecretReferences(ctx, request, pending, protected)
+	if err != nil {
+		return deleted, err
+	}
+	resolvedSet := make(map[string]struct{}, len(resolved))
+	for _, reference := range resolved {
+		resolvedSet[reference] = struct{}{}
+	}
+	for _, reference := range pending {
+		if _, exists := resolvedSet[reference]; exists {
+			continue
+		}
+		if _, getErr := s.secretStore.Get(ctx, reference); errors.Is(getErr, store.ErrSecretNotFound) {
+			resolved = append(resolved, reference)
+			resolvedSet[reference] = struct{}{}
+		} else if getErr != nil {
+			return deleted, getErr
+		}
+	}
+	if len(resolved) == 0 {
+		return deleted, nil
+	}
+	if err := s.repository.Run(ctx, func(state *store.State) error {
+		for _, reference := range resolved {
+			queuedAt, exists := state.PendingSecretCleanup[reference]
+			if exists && queuedAt.Before(request.Cutoff) {
+				delete(state.PendingSecretCleanup, reference)
+			}
+		}
+		return nil
+	}); err != nil {
+		return deleted, err
+	}
+	return deleted + int64(len(resolved)), nil
+}
+
 func withState[T any](ctx context.Context, repository store.Repository, fn func(state *store.State) (T, error)) (T, error) {
 	var result T
 	err := repository.Run(ctx, func(state *store.State) error {
 		var err error
 		result, err = fn(state)
 		return err
+	})
+	return result, err
+}
+
+func runDeviceState(run func(store.StateOperation) error, fn func(*store.State) (controlplane.DeviceSummary, error)) (controlplane.DeviceSummary, error) {
+	if run == nil {
+		return controlplane.DeviceSummary{}, errors.New("device state runner is required")
+	}
+	var result controlplane.DeviceSummary
+	err := run(func(state *store.State) error {
+		var operationErr error
+		result, operationErr = fn(state)
+		return operationErr
 	})
 	return result, err
 }
@@ -97,9 +399,26 @@ func (s *ControlPlane) RecordAudit(ctx context.Context, input controlplane.Audit
 	input.Action = strings.TrimSpace(input.Action)
 	input.TargetType = strings.TrimSpace(input.TargetType)
 	input.TargetID = strings.TrimSpace(input.TargetID)
+	input.Outcome = strings.TrimSpace(input.Outcome)
+	input.ErrorCode = strings.TrimSpace(input.ErrorCode)
 	input.RequestID = strings.TrimSpace(input.RequestID)
-	if input.Action == "" || input.TargetType == "" || len(input.Action) > 512 || len(input.TargetType) > 128 || len(input.TargetID) > 128 || len(input.RequestID) > 128 {
+	if input.Outcome == "" {
+		input.Outcome = "unknown"
+	}
+	if input.Action == "" || input.TargetType == "" || len(input.Action) > 512 || len(input.TargetType) > 128 || len(input.TargetID) > 128 || len(input.ErrorCode) > 128 || len(input.RequestID) > 128 || input.StatusCode < 0 || input.StatusCode > 599 {
 		return controlplane.ErrInvalidRequest
+	}
+	if input.Outcome != "success" && input.Outcome != "failure" && input.Outcome != "unknown" {
+		return controlplane.ErrInvalidRequest
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		if writer, ok := s.repository.(store.AuditOutboxRepository); ok {
+			return writer.RecordAuditWithOutbox(ctx, input)
+		}
+		if writer, ok := s.repository.(store.AuditRepository); ok {
+			return writer.RecordAudit(ctx, input)
+		}
+		return store.ErrNormalizedAuditRepositoryRequired
 	}
 	return s.repository.Run(ctx, func(state *store.State) error {
 		id := nextID(state, "audit")
@@ -110,6 +429,9 @@ func (s *ControlPlane) RecordAudit(ctx context.Context, input controlplane.Audit
 			Action:      input.Action,
 			TargetType:  input.TargetType,
 			TargetID:    input.TargetID,
+			Outcome:     input.Outcome,
+			StatusCode:  input.StatusCode,
+			ErrorCode:   input.ErrorCode,
 			RequestID:   input.RequestID,
 			CreatedAt:   s.repository.Now().Format(time.RFC3339),
 		}
@@ -117,9 +439,25 @@ func (s *ControlPlane) RecordAudit(ctx context.Context, input controlplane.Audit
 	})
 }
 
+// DispatchAuditOutbox performs one bounded durable audit delivery pass. The
+// method is intentionally a no-op boundary for snapshot-backed repositories;
+// production normalized repositories must implement the Outbox interface.
+func (s *ControlPlane) DispatchAuditOutbox(ctx context.Context, batchSize int) (int64, error) {
+	if err := checkContext(ctx); err != nil {
+		return 0, err
+	}
+	if dispatcher, ok := s.repository.(store.AuditOutboxRepository); ok {
+		return dispatcher.DispatchAuditOutbox(ctx, batchSize)
+	}
+	return 0, store.ErrNormalizedRetentionCleanupRequired
+}
+
 func (s *ControlPlane) ListAuditLogs(ctx context.Context) ([]controlplane.AuditLog, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		return nil, store.ErrNormalizedAuditPageReaderRequired
 	}
 	return withState(ctx, s.repository, func(state *store.State) ([]controlplane.AuditLog, error) {
 		items := make([]controlplane.AuditLog, 0, len(state.AuditLogs))
@@ -136,9 +474,118 @@ func (s *ControlPlane) ListAuditLogs(ctx context.Context) ([]controlplane.AuditL
 	})
 }
 
+func (s *ControlPlane) ListAuditLogsPage(ctx context.Context, page, pageSize int) ([]controlplane.AuditLog, int, error) {
+	return s.ListAuditLogsPageWithOptions(ctx, page, pageSize, AuditLogListOptions{})
+}
+
+func (s *ControlPlane) ListAuditLogsPageWithOptions(ctx context.Context, page, pageSize int, options AuditLogListOptions) ([]controlplane.AuditLog, int, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	storageOptions, err := normalizeAuditLogListOptions(options)
+	if err != nil {
+		return nil, 0, err
+	}
+	storageOptions.Offset = offset
+	storageOptions.Limit = pageSize
+	if reader, ok := s.repository.(store.AuditFilteredPageReader); ok {
+		result, err := reader.ListAuditLogsPageWithOptions(ctx, storageOptions)
+		if err != nil {
+			return nil, 0, err
+		}
+		return result.Items, result.Total, nil
+	}
+	if reader, ok := s.repository.(store.AuditPageReader); ok {
+		if storageOptions.ActorUserID != "" || storageOptions.DeviceID != "" || storageOptions.Action != "" || storageOptions.TargetType != "" || storageOptions.Outcome != "" || storageOptions.ErrorCode != "" || storageOptions.RequestID != "" || storageOptions.CreatedAfter != nil || storageOptions.CreatedBefore != nil || storageOptions.Sort != "" {
+			return nil, 0, controlplane.ErrInvalidRequest
+		}
+		result, err := reader.ListAuditLogsPage(ctx, offset, pageSize)
+		if err != nil {
+			return nil, 0, err
+		}
+		return result.Items, result.Total, nil
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		return nil, 0, store.ErrNormalizedAuditPageReaderRequired
+	}
+	result, err := withState(ctx, s.repository, func(state *store.State) ([]controlplane.AuditLog, error) {
+		items := make([]controlplane.AuditLog, 0, len(state.AuditLogs))
+		for _, item := range state.AuditLogs {
+			if auditLogMatchesListOptions(item, storageOptions) {
+				items = append(items, item)
+			}
+		}
+		sortAuditLogsForList(items, storageOptions.Sort)
+		return items, nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	start, end := pageWindow(len(result), offset, pageSize)
+	return result[start:end], len(result), nil
+}
+
+func auditLogMatchesListOptions(item controlplane.AuditLog, options store.AuditLogPageOptions) bool {
+	if options.ActorUserID != "" && item.ActorUserID != options.ActorUserID {
+		return false
+	}
+	if options.DeviceID != "" && item.DeviceID != options.DeviceID {
+		return false
+	}
+	if options.Action != "" && item.Action != options.Action {
+		return false
+	}
+	if options.TargetType != "" && item.TargetType != options.TargetType {
+		return false
+	}
+	if options.Outcome != "" && item.Outcome != options.Outcome {
+		return false
+	}
+	if options.ErrorCode != "" && item.ErrorCode != options.ErrorCode {
+		return false
+	}
+	if options.RequestID != "" && item.RequestID != options.RequestID {
+		return false
+	}
+	if options.CreatedAfter == nil && options.CreatedBefore == nil {
+		return true
+	}
+	createdAt, err := time.Parse(time.RFC3339, item.CreatedAt)
+	if err != nil {
+		return false
+	}
+	if options.CreatedAfter != nil && createdAt.Before(*options.CreatedAfter) {
+		return false
+	}
+	return options.CreatedBefore == nil || !createdAt.After(*options.CreatedBefore)
+}
+
+func sortAuditLogsForList(items []controlplane.AuditLog, sortKey string) {
+	slices.SortFunc(items, func(a, b controlplane.AuditLog) int {
+		if a.CreatedAt != b.CreatedAt {
+			createdAtOrder := store.CompareAuditLogCreatedAt(a.CreatedAt, b.CreatedAt)
+			if sortKey == store.AuditLogSortCreatedAsc {
+				return createdAtOrder
+			}
+			return -createdAtOrder
+		}
+		if sortKey == store.AuditLogSortCreatedAsc {
+			return strings.Compare(a.ID, b.ID)
+		}
+		return strings.Compare(b.ID, a.ID)
+	})
+}
+
 func (s *ControlPlane) ListUsers(ctx context.Context) ([]controlplane.UserSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		return nil, store.ErrNormalizedUserPageReaderRequired
 	}
 	return withState(ctx, s.repository, func(state *store.State) ([]controlplane.UserSummary, error) {
 		items := make([]controlplane.UserSummary, 0, len(state.Users))
@@ -150,6 +597,36 @@ func (s *ControlPlane) ListUsers(ctx context.Context) ([]controlplane.UserSummar
 		})
 		return items, nil
 	})
+}
+
+// ListUsersPage keeps the HTTP page boundary close to the repository. A
+// normalized PostgreSQL repository can execute LIMIT/OFFSET without loading
+// the full control-plane snapshot; compatibility repositories retain the
+// existing bounded in-memory fallback.
+func (s *ControlPlane) ListUsersPage(ctx context.Context, page, pageSize int) ([]controlplane.UserSummary, int, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	if reader, ok := s.repository.(store.UserPageReader); ok {
+		result, err := reader.ListUsersPage(ctx, offset, pageSize)
+		if err != nil {
+			return nil, 0, err
+		}
+		return result.Items, result.Total, nil
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		return nil, 0, store.ErrNormalizedUserPageReaderRequired
+	}
+	items, err := s.ListUsers(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	start, end := pageWindow(len(items), offset, pageSize)
+	return items[start:end], len(items), nil
 }
 
 func (s *ControlPlane) CreateUser(ctx context.Context, idempotencyKey string, input controlplane.CreateUserInput) (controlplane.UserSummary, error) {
@@ -167,13 +644,24 @@ func (s *ControlPlane) CreateUser(ctx context.Context, idempotencyKey string, in
 	if err != nil {
 		return controlplane.UserSummary{}, fmt.Errorf("hash user password: %w", err)
 	}
+	fingerprint, err := fingerprintValue(input)
+	if err != nil {
+		return controlplane.UserSummary{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		writer, ok := s.repository.(store.UserRepository)
+		if !ok {
+			return controlplane.UserSummary{}, store.ErrNormalizedUserRepositoryRequired
+		}
+		return writer.CreateUser(ctx, "control-plane-state", "create-user:"+idempotencyKey, fingerprint, store.UserCreateRecord{
+			Username:     input.Username,
+			Role:         input.Role,
+			PasswordHash: append([]byte(nil), passwordHash...),
+			CreatedAt:    s.repository.Now(),
+		})
+	}
 
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.UserSummary, error) {
-		fingerprint, err := fingerprintValue(input)
-		if err != nil {
-			return controlplane.UserSummary{}, err
-		}
-
 		if existing, ok := state.IdempotencyRecords["create-user:"+idempotencyKey]; ok {
 			if existing.Fingerprint != fingerprint {
 				return controlplane.UserSummary{}, controlplane.ErrIdempotencyConflict
@@ -211,6 +699,23 @@ func (s *ControlPlane) AuthenticateUser(ctx context.Context, username, password 
 	username = strings.TrimSpace(username)
 	if username == "" || password == "" {
 		return controlplane.Actor{}, controlplane.UserSummary{}, controlplane.ErrUnauthenticated
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		reader, ok := s.repository.(store.UserCredentialReader)
+		if !ok {
+			return controlplane.Actor{}, controlplane.UserSummary{}, store.ErrNormalizedUserCredentialReaderRequired
+		}
+		user, passwordHash, err := reader.GetUserCredential(ctx, username)
+		if err != nil {
+			return controlplane.Actor{}, controlplane.UserSummary{}, err
+		}
+		if user.Status != controlplane.UserStatusActive {
+			return controlplane.Actor{}, controlplane.UserSummary{}, controlplane.ErrUserDisabled
+		}
+		if bcrypt.CompareHashAndPassword(passwordHash, []byte(password)) != nil {
+			return controlplane.Actor{}, controlplane.UserSummary{}, controlplane.ErrUnauthenticated
+		}
+		return controlplane.Actor{UserID: user.ID, Role: user.Role}, user, nil
 	}
 
 	result, err := withState(ctx, s.repository, func(state *store.State) (struct {
@@ -260,6 +765,23 @@ func (s *ControlPlane) DisableUser(ctx context.Context, idempotencyKey, userID s
 	if !validIdempotencyKey(idempotencyKey) {
 		return controlplane.UserSummary{}, controlplane.ErrIdempotencyKeyRequired
 	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return controlplane.UserSummary{}, controlplane.ErrUserNotFound
+	}
+	fingerprint, err := fingerprintValue(struct {
+		UserID string `json:"user_id"`
+	}{UserID: userID})
+	if err != nil {
+		return controlplane.UserSummary{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		writer, ok := s.repository.(store.UserRepository)
+		if !ok {
+			return controlplane.UserSummary{}, store.ErrNormalizedUserRepositoryRequired
+		}
+		return writer.DisableUser(ctx, "control-plane-state", "disable-user:"+userID+":"+idempotencyKey, fingerprint, userID)
+	}
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.UserSummary, error) {
 		user, ok := state.Users[userID]
 		if !ok {
@@ -267,12 +789,6 @@ func (s *ControlPlane) DisableUser(ctx context.Context, idempotencyKey, userID s
 		}
 		if user.ID == "usr_local_admin" {
 			return controlplane.UserSummary{}, controlplane.ErrCannotDisableLocalAdmin
-		}
-		fingerprint, err := fingerprintValue(struct {
-			UserID string `json:"user_id"`
-		}{UserID: userID})
-		if err != nil {
-			return controlplane.UserSummary{}, err
 		}
 		scope := "disable-user:" + userID + ":" + idempotencyKey
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
@@ -285,8 +801,130 @@ func (s *ControlPlane) DisableUser(ctx context.Context, idempotencyKey, userID s
 			state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: userID}
 			return user, nil
 		}
+		candidate := user
+		candidate.Status = controlplane.UserStatusDisabled
+		if countActiveAdmins(state, userID, candidate) == 0 {
+			return controlplane.UserSummary{}, controlplane.ErrLastActiveAdmin
+		}
 		user.Status = controlplane.UserStatusDisabled
 		state.Users[user.ID] = user
+		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: userID}
+		return user, nil
+	})
+}
+
+func (s *ControlPlane) UpdateUser(ctx context.Context, idempotencyKey, userID string, input controlplane.UpdateUserInput) (controlplane.UserSummary, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.UserSummary{}, err
+	}
+	if !validIdempotencyKey(idempotencyKey) {
+		return controlplane.UserSummary{}, controlplane.ErrIdempotencyKeyRequired
+	}
+	if err := validateUpdateUserInput(&input); err != nil {
+		return controlplane.UserSummary{}, err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return controlplane.UserSummary{}, controlplane.ErrUserNotFound
+	}
+	fingerprint, err := fingerprintValue(input)
+	if err != nil {
+		return controlplane.UserSummary{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		writer, ok := s.repository.(store.UserRepository)
+		if !ok {
+			return controlplane.UserSummary{}, store.ErrNormalizedUserRepositoryRequired
+		}
+		return writer.UpdateUser(ctx, "control-plane-state", "update-user:"+userID+":"+idempotencyKey, fingerprint, store.UserUpdateRecord{
+			UserID: userID, Username: input.Username, Role: input.Role, Status: input.Status,
+		})
+	}
+	return withState(ctx, s.repository, func(state *store.State) (controlplane.UserSummary, error) {
+		user, ok := state.Users[userID]
+		if !ok {
+			return controlplane.UserSummary{}, controlplane.ErrUserNotFound
+		}
+		if user.ID == "usr_local_admin" {
+			return controlplane.UserSummary{}, controlplane.ErrCannotModifyLocalAdmin
+		}
+		scope := "update-user:" + userID + ":" + idempotencyKey
+		if existing, ok := state.IdempotencyRecords[scope]; ok {
+			if existing.Fingerprint != fingerprint {
+				return controlplane.UserSummary{}, controlplane.ErrIdempotencyConflict
+			}
+			return state.Users[existing.ResourceID], nil
+		}
+		if input.Username != nil {
+			for _, existing := range state.Users {
+				if existing.ID != userID && existing.Username == *input.Username {
+					return controlplane.UserSummary{}, controlplane.ErrUsernameAlreadyExists
+				}
+			}
+			user.Username = *input.Username
+		}
+		if input.Role != nil {
+			user.Role = *input.Role
+		}
+		if input.Status != nil {
+			user.Status = *input.Status
+		}
+		if user.Role != controlplane.RoleAdmin || user.Status != controlplane.UserStatusActive {
+			if countActiveAdmins(state, userID, user) == 0 {
+				return controlplane.UserSummary{}, controlplane.ErrLastActiveAdmin
+			}
+		}
+		state.Users[userID] = user
+		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: userID}
+		return user, nil
+	})
+}
+
+func (s *ControlPlane) ResetUserPassword(ctx context.Context, idempotencyKey, userID string, input controlplane.ResetUserPasswordInput) (controlplane.UserSummary, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.UserSummary{}, err
+	}
+	if !validIdempotencyKey(idempotencyKey) {
+		return controlplane.UserSummary{}, controlplane.ErrIdempotencyKeyRequired
+	}
+	if len(input.Password) < 8 || len(input.Password) > 256 {
+		return controlplane.UserSummary{}, controlplane.ErrInvalidRequest
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return controlplane.UserSummary{}, controlplane.ErrUserNotFound
+	}
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return controlplane.UserSummary{}, fmt.Errorf("hash user password: %w", err)
+	}
+	fingerprint, err := fingerprintValue(input)
+	if err != nil {
+		return controlplane.UserSummary{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		writer, ok := s.repository.(store.UserRepository)
+		if !ok {
+			return controlplane.UserSummary{}, store.ErrNormalizedUserRepositoryRequired
+		}
+		return writer.ResetUserPassword(ctx, "control-plane-state", "reset-user-password:"+userID+":"+idempotencyKey, fingerprint, userID, append([]byte(nil), passwordHash...))
+	}
+	return withState(ctx, s.repository, func(state *store.State) (controlplane.UserSummary, error) {
+		user, ok := state.Users[userID]
+		if !ok {
+			return controlplane.UserSummary{}, controlplane.ErrUserNotFound
+		}
+		if user.ID == "usr_local_admin" {
+			return controlplane.UserSummary{}, controlplane.ErrCannotModifyLocalAdmin
+		}
+		scope := "reset-user-password:" + userID + ":" + idempotencyKey
+		if existing, ok := state.IdempotencyRecords[scope]; ok {
+			if existing.Fingerprint != fingerprint {
+				return controlplane.UserSummary{}, controlplane.ErrIdempotencyConflict
+			}
+			return state.Users[existing.ResourceID], nil
+		}
+		state.UserCredentialHashes[userID] = append([]byte(nil), passwordHash...)
 		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: userID}
 		return user, nil
 	})
@@ -295,6 +933,13 @@ func (s *ControlPlane) DisableUser(ctx context.Context, idempotencyKey, userID s
 func (s *ControlPlane) GetUser(ctx context.Context, userID string) (controlplane.UserSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.UserSummary{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		reader, ok := s.repository.(store.UserReader)
+		if !ok {
+			return controlplane.UserSummary{}, store.ErrNormalizedUserReaderRequired
+		}
+		return reader.GetUserByID(ctx, userID)
 	}
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.UserSummary, error) {
 		user, ok := state.Users[userID]
@@ -309,7 +954,10 @@ func (s *ControlPlane) ListDevices(ctx context.Context) ([]controlplane.DeviceSu
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	return withState(ctx, s.repository, func(state *store.State) ([]controlplane.DeviceSummary, error) {
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		return nil, store.ErrNormalizedUserPageReaderRequired
+	}
+	items, err := withState(ctx, s.repository, func(state *store.State) ([]controlplane.DeviceSummary, error) {
 		items := make([]controlplane.DeviceSummary, 0, len(state.Devices))
 		for _, item := range state.Devices {
 			items = append(items, item)
@@ -319,13 +967,323 @@ func (s *ControlPlane) ListDevices(ctx context.Context) ([]controlplane.DeviceSu
 		})
 		return items, nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	now := s.repository.Now()
+	for index := range items {
+		items[index] = decorateDeviceSummary(items[index], now)
+	}
+	return items, nil
+}
+
+// ListDevicesPage is the bounded counterpart to ListDevices for admin list
+// endpoints. Device online state remains derived at the service boundary.
+func (s *ControlPlane) ListDevicesPage(ctx context.Context, page, pageSize int) ([]controlplane.DeviceSummary, int, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	var items []controlplane.DeviceSummary
+	var total int
+	if reader, ok := s.repository.(store.UserPageReader); ok {
+		result, err := reader.ListDevicesPage(ctx, offset, pageSize)
+		if err != nil {
+			return nil, 0, err
+		}
+		items, total = result.Items, result.Total
+	} else {
+		if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+			return nil, 0, store.ErrNormalizedUserPageReaderRequired
+		}
+		items, err = s.ListDevices(ctx)
+		if err != nil {
+			return nil, 0, err
+		}
+		total = len(items)
+		start, end := pageWindow(total, offset, pageSize)
+		items = items[start:end]
+	}
+	now := s.repository.Now()
+	for index := range items {
+		items[index] = decorateDeviceSummary(items[index], now)
+	}
+	return items, total, nil
+}
+
+func (s *ControlPlane) GetDevice(ctx context.Context, deviceID string) (controlplane.DeviceSummary, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		reader, ok := s.repository.(store.DeviceReader)
+		if !ok {
+			return controlplane.DeviceSummary{}, store.ErrNormalizedDeviceReaderRequired
+		}
+		device, err := reader.GetDevice(ctx, deviceID)
+		if err != nil {
+			return controlplane.DeviceSummary{}, err
+		}
+		return decorateDeviceSummary(device, s.repository.Now()), nil
+	}
+	device, err := withState(ctx, s.repository, func(state *store.State) (controlplane.DeviceSummary, error) {
+		device, ok := state.Devices[deviceID]
+		if !ok {
+			return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
+		}
+		return device, nil
+	})
+	if err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
+	return decorateDeviceSummary(device, s.repository.Now()), nil
+}
+
+func (s *ControlPlane) ListDevicesForUser(ctx context.Context, userID string) ([]controlplane.DeviceSummary, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, controlplane.ErrUserNotFound
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		return nil, store.ErrNormalizedUserPageReaderRequired
+	}
+	items, err := withState(ctx, s.repository, func(state *store.State) ([]controlplane.DeviceSummary, error) {
+		if _, ok := state.Users[userID]; !ok {
+			return nil, controlplane.ErrUserNotFound
+		}
+		items := make([]controlplane.DeviceSummary, 0)
+		for _, device := range state.Devices {
+			if device.UserID == userID {
+				items = append(items, device)
+			}
+		}
+		slices.SortFunc(items, func(a, b controlplane.DeviceSummary) int {
+			return strings.Compare(a.ID, b.ID)
+		})
+		return items, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	now := s.repository.Now()
+	for index := range items {
+		items[index] = decorateDeviceSummary(items[index], now)
+	}
+	return items, nil
+}
+
+// ListDevicesForUserPage avoids materializing every device for normalized
+// PostgreSQL reads while preserving the existing ownership check and derived
+// online state.
+func (s *ControlPlane) ListDevicesForUserPage(ctx context.Context, userID string, page, pageSize int) ([]controlplane.DeviceSummary, int, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, 0, controlplane.ErrUserNotFound
+	}
+	var items []controlplane.DeviceSummary
+	var total int
+	if reader, ok := s.repository.(store.UserPageReader); ok {
+		result, err := reader.ListDevicesForUserPage(ctx, userID, offset, pageSize)
+		if err != nil {
+			return nil, 0, err
+		}
+		items, total = result.Items, result.Total
+	} else {
+		if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+			return nil, 0, store.ErrNormalizedUserPageReaderRequired
+		}
+		items, err = s.ListDevicesForUser(ctx, userID)
+		if err != nil {
+			return nil, 0, err
+		}
+		total = len(items)
+		start, end := pageWindow(total, offset, pageSize)
+		items = items[start:end]
+	}
+	now := s.repository.Now()
+	for index := range items {
+		items[index] = decorateDeviceSummary(items[index], now)
+	}
+	return items, total, nil
+}
+
+// GetUserAuthorizationSummary returns the current device/lease authorization
+// snapshot and soft usage signal for an administrator. Usage is derived from
+// client-reported records because no provider-authoritative billing source is
+// available in the current product scope.
+func (s *ControlPlane) GetUserAuthorizationSummary(ctx context.Context, userID string) (controlplane.UserAuthorizationSummary, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.UserAuthorizationSummary{}, err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return controlplane.UserAuthorizationSummary{}, controlplane.ErrUserNotFound
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		reader, ok := s.repository.(store.UserAuthorizationSummaryReader)
+		if !ok {
+			return controlplane.UserAuthorizationSummary{}, store.ErrNormalizedUserAuthorizationSummaryReaderRequired
+		}
+		return reader.GetUserAuthorizationSummary(ctx, userID)
+	}
+	now := s.repository.Now()
+	return withState(ctx, s.repository, func(state *store.State) (controlplane.UserAuthorizationSummary, error) {
+		if _, ok := state.Users[userID]; !ok {
+			return controlplane.UserAuthorizationSummary{}, controlplane.ErrUserNotFound
+		}
+		userLeaseIDs := make(map[string]struct{})
+		accountIDs := make(map[string]struct{})
+		summary := controlplane.UserAuthorizationSummary{
+			UserID:              userID,
+			UsageSource:         "client_reported_soft",
+			HardQuotaConfigured: false,
+			AllowedModels:       []string{},
+			QuotaEnforcement:    "server_recorded_usage_guard",
+			AsOf:                now.Format(time.RFC3339),
+		}
+		if policy, ok := state.UserAuthorizationPolicies[userID]; ok {
+			summary.AllowedModels = append([]string{}, policy.AllowedModels...)
+			summary.DailyTokenLimit = policy.DailyTokenLimit
+		}
+		for _, device := range state.Devices {
+			if device.UserID != userID {
+				continue
+			}
+			summary.DeviceCount++
+			if device.Status == controlplane.DeviceStatusActive {
+				summary.ActiveDeviceCount++
+			}
+		}
+		for id, lease := range state.ModelLeases {
+			if lease.UserID != userID {
+				continue
+			}
+			userLeaseIDs[id] = struct{}{}
+			if lease.Status != controlplane.ModelLeaseStatusActive {
+				continue
+			}
+			summary.ActiveLeaseCount++
+			if lease.AccountID != "" {
+				accountIDs[lease.AccountID] = struct{}{}
+			}
+		}
+		summary.ActiveAccountCount = len(accountIDs)
+		for _, usage := range state.ModelUsageRecords {
+			if _, ok := userLeaseIDs[usage.LeaseID]; !ok {
+				continue
+			}
+			createdAt, err := time.Parse(time.RFC3339, usage.CreatedAt)
+			if err != nil || createdAt.UTC().Format("2006-01-02") != now.UTC().Format("2006-01-02") {
+				continue
+			}
+			summary.DailyUsedTokens += usage.TotalTokens
+		}
+		return summary, nil
+	})
+}
+
+// UpdateUserAuthorization stores a bounded allowlist and a server-recorded
+// usage guard. The guard is deliberately separate from provider billing: it
+// only uses usage records already accepted by this control plane.
+func (s *ControlPlane) UpdateUserAuthorization(ctx context.Context, idempotencyKey, userID string, input controlplane.UpdateUserAuthorizationInput) (controlplane.UserAuthorizationPolicy, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.UserAuthorizationPolicy{}, err
+	}
+	if !validIdempotencyKey(idempotencyKey) {
+		return controlplane.UserAuthorizationPolicy{}, controlplane.ErrIdempotencyKeyRequired
+	}
+	if err := validateUpdateUserAuthorizationInput(&input); err != nil {
+		return controlplane.UserAuthorizationPolicy{}, err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return controlplane.UserAuthorizationPolicy{}, controlplane.ErrUserNotFound
+	}
+	fingerprint, err := fingerprintValue(input)
+	if err != nil {
+		return controlplane.UserAuthorizationPolicy{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		if writer, ok := s.repository.(store.UserAuthorizationRepository); ok {
+			return writer.UpdateUserAuthorization(ctx, "control-plane-state", "update-user-authorization:"+userID+":"+idempotencyKey, fingerprint, userID, input)
+		}
+		return controlplane.UserAuthorizationPolicy{}, store.ErrNormalizedUserAuthorizationRepositoryRequired
+	}
+	return withState(ctx, s.repository, func(state *store.State) (controlplane.UserAuthorizationPolicy, error) {
+		if _, ok := state.Users[userID]; !ok {
+			return controlplane.UserAuthorizationPolicy{}, controlplane.ErrUserNotFound
+		}
+		scope := "update-user-authorization:" + userID + ":" + idempotencyKey
+		if existing, ok := state.IdempotencyRecords[scope]; ok {
+			if existing.Fingerprint != fingerprint {
+				return controlplane.UserAuthorizationPolicy{}, controlplane.ErrIdempotencyConflict
+			}
+			return state.UserAuthorizationPolicies[userID], nil
+		}
+		now := s.repository.Now().Format(time.RFC3339)
+		policy := controlplane.UserAuthorizationPolicy{
+			UserID:          userID,
+			AllowedModels:   append([]string{}, input.AllowedModels...),
+			DailyTokenLimit: input.DailyTokenLimit,
+			UpdatedAt:       now,
+		}
+		state.UserAuthorizationPolicies[userID] = policy
+		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: userID}
+		return policy, nil
+	})
 }
 
 func (s *ControlPlane) GetClientProfile(ctx context.Context, userID, deviceID string) (controlplane.ClientProfile, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ClientProfile{}, err
 	}
-	return withState(ctx, s.repository, func(state *store.State) (controlplane.ClientProfile, error) {
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		userReader, ok := s.repository.(store.UserReader)
+		if !ok {
+			return controlplane.ClientProfile{}, store.ErrNormalizedUserReaderRequired
+		}
+		deviceReader, ok := s.repository.(store.DeviceReader)
+		if !ok {
+			return controlplane.ClientProfile{}, store.ErrNormalizedDeviceReaderRequired
+		}
+		user, err := userReader.GetUserByID(ctx, strings.TrimSpace(userID))
+		if err != nil {
+			return controlplane.ClientProfile{}, err
+		}
+		if user.Status != controlplane.UserStatusActive {
+			return controlplane.ClientProfile{}, controlplane.ErrUserDisabled
+		}
+		device, err := deviceReader.GetOwnedDevice(ctx, user.ID, strings.TrimSpace(deviceID))
+		if err != nil {
+			return controlplane.ClientProfile{}, err
+		}
+		if device.Status != controlplane.DeviceStatusActive {
+			return controlplane.ClientProfile{}, controlplane.ErrDeviceDisabled
+		}
+		return controlplane.ClientProfile{
+			User:        user,
+			Device:      decorateDeviceSummary(device, s.repository.Now()),
+			Permissions: permissionsForRole(user.Role),
+		}, nil
+	}
+	profile, err := withState(ctx, s.repository, func(state *store.State) (controlplane.ClientProfile, error) {
 		user, ok := state.Users[userID]
 		if !ok {
 			return controlplane.ClientProfile{}, controlplane.ErrUserNotFound
@@ -346,9 +1304,99 @@ func (s *ControlPlane) GetClientProfile(ctx context.Context, userID, deviceID st
 			Permissions: permissionsForRole(user.Role),
 		}, nil
 	})
+	if err != nil {
+		return controlplane.ClientProfile{}, err
+	}
+	profile.Device = decorateDeviceSummary(profile.Device, s.repository.Now())
+	return profile, nil
 }
 
 func (s *ControlPlane) RecordHeartbeat(ctx context.Context, idempotencyKey, userID string, input controlplane.HeartbeatInput) (controlplane.HeartbeatResult, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.HeartbeatResult{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		// This compatibility entry point has no authenticated session hash;
+		// normalized callers must use RecordHeartbeatWithSessionBinding.
+		return controlplane.HeartbeatResult{}, store.ErrNormalizedTransactionalHeartbeatRecorderRequired
+	}
+	return s.recordHeartbeatWithRunner(ctx, idempotencyKey, userID, input, func(operation store.StateOperation) error {
+		return s.repository.Run(ctx, operation)
+	})
+}
+
+// RecordHeartbeatWithSessionBinding keeps the provisional session binding and
+// heartbeat state update in the same PostgreSQL transaction.
+func (s *ControlPlane) RecordHeartbeatWithSessionBinding(ctx context.Context, idempotencyKey, userID, accessTokenHash string, input controlplane.HeartbeatInput) (controlplane.HeartbeatResult, error) {
+	return s.recordHeartbeatWithSessionBinding(ctx, idempotencyKey, userID, accessTokenHash, input, controlplane.AuditLogInput{})
+}
+
+// RecordHeartbeatWithSessionBindingAndAudit is the normalized HTTP path. The
+// optional success event is queued inside the same business transaction; the
+// middleware's later audit call is deduplicated by request ID.
+func (s *ControlPlane) RecordHeartbeatWithSessionBindingAndAudit(ctx context.Context, idempotencyKey, userID, accessTokenHash string, input controlplane.HeartbeatInput, audit controlplane.AuditLogInput) (controlplane.HeartbeatResult, error) {
+	return s.recordHeartbeatWithSessionBinding(ctx, idempotencyKey, userID, accessTokenHash, input, audit)
+}
+
+func (s *ControlPlane) recordHeartbeatWithSessionBinding(ctx context.Context, idempotencyKey, userID, accessTokenHash string, input controlplane.HeartbeatInput, audit controlplane.AuditLogInput) (controlplane.HeartbeatResult, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.HeartbeatResult{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		recorder, ok := s.repository.(store.TransactionalHeartbeatRecorder)
+		if !ok {
+			return controlplane.HeartbeatResult{}, store.ErrNormalizedTransactionalHeartbeatRecorderRequired
+		}
+		if err := checkContext(ctx); err != nil {
+			return controlplane.HeartbeatResult{}, err
+		}
+		if strings.TrimSpace(userID) == "" {
+			return controlplane.HeartbeatResult{}, controlplane.ErrUserNotFound
+		}
+		if strings.TrimSpace(accessTokenHash) == "" {
+			return controlplane.HeartbeatResult{}, controlplane.ErrUnauthenticated
+		}
+		if !validIdempotencyKey(idempotencyKey) {
+			return controlplane.HeartbeatResult{}, controlplane.ErrIdempotencyKeyRequired
+		}
+		if err := validateHeartbeatInput(input); err != nil {
+			return controlplane.HeartbeatResult{}, err
+		}
+		fingerprint, err := fingerprintValue(struct {
+			UserID string                      `json:"user_id"`
+			Input  controlplane.HeartbeatInput `json:"input"`
+		}{UserID: userID, Input: input})
+		if err != nil {
+			return controlplane.HeartbeatResult{}, err
+		}
+		result, err := recorder.RecordHeartbeatWithSessionBinding(ctx, store.DeviceHeartbeatRecord{
+			Scope:           "control-plane-state",
+			IdempotencyKey:  "heartbeat:" + userID + ":" + input.DeviceID + ":" + idempotencyKey,
+			Fingerprint:     fingerprint,
+			AccessTokenHash: accessTokenHash,
+			UserID:          userID,
+			Input:           input,
+			Audit:           audit,
+		})
+		if errors.Is(err, store.ErrSessionDeviceBindingConflict) {
+			return controlplane.HeartbeatResult{}, controlplane.ErrDeviceBindingConflict
+		}
+		return result, err
+	}
+	binder, ok := s.repository.(store.TransactionalSessionBinder)
+	if !ok {
+		return s.RecordHeartbeat(ctx, idempotencyKey, userID, input)
+	}
+	return s.recordHeartbeatWithRunner(ctx, idempotencyKey, userID, input, func(operation store.StateOperation) error {
+		err := binder.RunWithSessionBinding(ctx, accessTokenHash, userID, input.DeviceID, operation)
+		if errors.Is(err, store.ErrSessionDeviceBindingConflict) {
+			return controlplane.ErrDeviceBindingConflict
+		}
+		return err
+	})
+}
+
+func (s *ControlPlane) recordHeartbeatWithRunner(ctx context.Context, idempotencyKey, userID string, input controlplane.HeartbeatInput, run func(store.StateOperation) error) (controlplane.HeartbeatResult, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.HeartbeatResult{}, err
 	}
@@ -359,7 +1407,7 @@ func (s *ControlPlane) RecordHeartbeat(ctx context.Context, idempotencyKey, user
 		return controlplane.HeartbeatResult{}, err
 	}
 
-	return withState(ctx, s.repository, func(state *store.State) (controlplane.HeartbeatResult, error) {
+	return runHeartbeatState(run, func(state *store.State) (controlplane.HeartbeatResult, error) {
 		user, ok := state.Users[userID]
 		if !ok {
 			return controlplane.HeartbeatResult{}, controlplane.ErrUserNotFound
@@ -402,6 +1450,8 @@ func (s *ControlPlane) RecordHeartbeat(ctx context.Context, idempotencyKey, user
 		device.RuntimeOSName = input.Status.OSName
 		device.RuntimeOSVersion = input.Status.OSVersion
 		device.KernelVersion = input.Status.KernelVersion
+		device.CurrentMediaName = input.Status.CurrentMediaName
+		device.PlaybackState = input.Status.PlaybackState
 		device.LastSeenAt = acceptedAt
 		state.Devices[device.ID] = device
 		state.IdempotencyRecords[scope] = store.IdempotencyRecord{
@@ -415,13 +1465,56 @@ func (s *ControlPlane) RecordHeartbeat(ctx context.Context, idempotencyKey, user
 	})
 }
 
+func runHeartbeatState(run func(store.StateOperation) error, fn func(*store.State) (controlplane.HeartbeatResult, error)) (controlplane.HeartbeatResult, error) {
+	if run == nil {
+		return controlplane.HeartbeatResult{}, errors.New("heartbeat state runner is required")
+	}
+	var result controlplane.HeartbeatResult
+	err := run(func(state *store.State) error {
+		var operationErr error
+		result, operationErr = fn(state)
+		return operationErr
+	})
+	return result, err
+}
+
 func (s *ControlPlane) ListModelPoolAccounts(ctx context.Context) ([]controlplane.ModelPoolAccountSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		if reader, ok := s.repository.(store.ModelPoolPageReader); ok {
+			const pageSize = 200
+			items := make([]controlplane.ModelPoolAccountSummary, 0)
+			for offset := 0; ; {
+				page, err := reader.ListModelPoolAccountsPage(ctx, offset, pageSize)
+				if err != nil {
+					return nil, err
+				}
+				if len(page.Items) == 0 {
+					if len(items) >= page.Total {
+						break
+					}
+					return nil, errors.New("normalized model pool page made no progress")
+				}
+				now := s.repository.Now()
+				for index := range page.Items {
+					normalizeModelPoolAccountSummary(&page.Items[index], now)
+				}
+				items = append(items, page.Items...)
+				if len(items) >= page.Total {
+					break
+				}
+				offset += len(page.Items)
+			}
+			return items, nil
+		}
+		return nil, store.ErrNormalizedModelPoolPageReaderRequired
+	}
 	return withState(ctx, s.repository, func(state *store.State) ([]controlplane.ModelPoolAccountSummary, error) {
 		now := s.repository.Now()
 		sweepExpiredModelLeases(state, now)
+		refreshModelAccountStatuses(state, now)
 		items := make([]controlplane.ModelPoolAccountSummary, 0, len(state.ModelPoolAccounts))
 		for _, account := range state.ModelPoolAccounts {
 			items = append(items, decorateModelPoolAccount(state, account, now))
@@ -433,7 +1526,267 @@ func (s *ControlPlane) ListModelPoolAccounts(ctx context.Context) ([]controlplan
 	})
 }
 
+func (s *ControlPlane) ListModelPoolAccountsPage(ctx context.Context, page, pageSize int) ([]controlplane.ModelPoolAccountSummary, int, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		reader, ok := s.repository.(store.ModelPoolPageReader)
+		if !ok {
+			return nil, 0, store.ErrNormalizedModelPoolPageReaderRequired
+		}
+		result, err := reader.ListModelPoolAccountsPage(ctx, offset, pageSize)
+		if err != nil {
+			return nil, 0, err
+		}
+		now := s.repository.Now()
+		for index := range result.Items {
+			normalizeModelPoolAccountSummary(&result.Items[index], now)
+		}
+		return result.Items, result.Total, nil
+	}
+	if reader, ok := s.repository.(store.ModelPoolPageReader); ok {
+		result, err := reader.ListModelPoolAccountsPage(ctx, offset, pageSize)
+		if err != nil {
+			return nil, 0, err
+		}
+		now := s.repository.Now()
+		for index := range result.Items {
+			normalizeModelPoolAccountSummary(&result.Items[index], now)
+		}
+		return result.Items, result.Total, nil
+	}
+	items, err := s.ListModelPoolAccounts(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	start, end := pageWindow(len(items), offset, pageSize)
+	return items[start:end], len(items), nil
+}
+
+// ListModelPoolHealthAccounts keeps the normalized health worker on a bounded
+// eligible-account query. A generic account page is insufficient here because
+// disabled/cooldown/exhausted rows at the beginning of an ID-ordered page can
+// otherwise hide later accounts that are ready to probe.
+func (s *ControlPlane) ListModelPoolHealthAccounts(ctx context.Context, limit int) ([]controlplane.ModelPoolAccountSummary, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if limit < 1 || limit > 200 {
+		return nil, controlplane.ErrInvalidRequest
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		reader, ok := s.repository.(store.ModelPoolHealthPageReader)
+		if !ok {
+			return nil, store.ErrNormalizedModelPoolHealthPageReaderRequired
+		}
+		items, err := reader.ListModelPoolHealthAccounts(ctx, limit)
+		if err != nil {
+			return nil, err
+		}
+		now := s.repository.Now()
+		for index := range items {
+			normalizeModelPoolAccountSummary(&items[index], now)
+		}
+		return items, nil
+	}
+	items, err := s.ListModelPoolAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
+}
+
+func (s *ControlPlane) ListModelLeasesPage(ctx context.Context, page, pageSize int) ([]controlplane.ModelLeaseAdminSummary, int, error) {
+	return s.ListModelLeasesPageWithOptions(ctx, page, pageSize, ModelLeaseListOptions{})
+}
+
+func (s *ControlPlane) ListModelLeasesPageWithOptions(ctx context.Context, page, pageSize int, options ModelLeaseListOptions) ([]controlplane.ModelLeaseAdminSummary, int, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	storageOptions, err := normalizeModelLeaseListOptions(options)
+	if err != nil {
+		return nil, 0, err
+	}
+	storageOptions.Offset = offset
+	storageOptions.Limit = pageSize
+	if reader, ok := s.repository.(store.ModelLeaseFilteredPageReader); ok {
+		result, err := reader.ListModelLeasesPageWithOptions(ctx, storageOptions)
+		if err != nil {
+			return nil, 0, err
+		}
+		now := s.repository.Now()
+		for index := range result.Items {
+			normalizeModelLeaseAdminSummary(&result.Items[index], now)
+		}
+		return result.Items, result.Total, nil
+	}
+	if reader, ok := s.repository.(store.ModelLeasePageReader); ok {
+		if storageOptions.Status != "" || storageOptions.Provider != "" || storageOptions.Model != "" || storageOptions.UserID != "" || storageOptions.DeviceID != "" || storageOptions.AccountID != "" || storageOptions.Sort != "" {
+			return nil, 0, controlplane.ErrInvalidRequest
+		}
+		result, err := reader.ListModelLeasesPage(ctx, offset, pageSize)
+		if err != nil {
+			return nil, 0, err
+		}
+		now := s.repository.Now()
+		for index := range result.Items {
+			normalizeModelLeaseAdminSummary(&result.Items[index], now)
+		}
+		return result.Items, result.Total, nil
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		return nil, 0, store.ErrNormalizedModelLeasePageReaderRequired
+	}
+	result, err := withState(ctx, s.repository, func(state *store.State) ([]controlplane.ModelLeaseAdminSummary, error) {
+		now := s.repository.Now()
+		sweepExpiredModelLeases(state, now)
+		items := make([]controlplane.ModelLeaseAdminSummary, 0, len(state.ModelLeases))
+		for _, lease := range state.ModelLeases {
+			item := modelLeaseAdminSummary(lease)
+			if !modelLeaseAdminSummaryMatchesOptions(item, storageOptions, now) {
+				continue
+			}
+			items = append(items, item)
+		}
+		sortModelLeaseAdminSummaries(items, storageOptions.Sort)
+		return items, nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	start, end := pageWindow(len(result), offset, pageSize)
+	return result[start:end], len(result), nil
+}
+
+// GetModelLeaseAdminDetail returns lifecycle metadata only. Credentials and
+// direct provider secrets never cross this administrative boundary.
+func (s *ControlPlane) GetModelLeaseAdminDetail(ctx context.Context, leaseID string) (controlplane.ModelLeaseAdminDetail, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.ModelLeaseAdminDetail{}, err
+	}
+	leaseID = strings.TrimSpace(leaseID)
+	if leaseID == "" {
+		return controlplane.ModelLeaseAdminDetail{}, controlplane.ErrInvalidRequest
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		reader, ok := s.repository.(store.ModelLeaseDetailReader)
+		if !ok {
+			return controlplane.ModelLeaseAdminDetail{}, store.ErrNormalizedModelLeaseDetailReaderRequired
+		}
+		return reader.GetModelLeaseAdminDetail(ctx, leaseID)
+	}
+	return withState(ctx, s.repository, func(state *store.State) (controlplane.ModelLeaseAdminDetail, error) {
+		sweepExpiredModelLeases(state, s.repository.Now())
+		lease, ok := state.ModelLeases[leaseID]
+		if !ok {
+			return controlplane.ModelLeaseAdminDetail{}, controlplane.ErrModelLeaseNotFound
+		}
+		return modelLeaseAdminDetail(lease), nil
+	})
+}
+
+// ReclaimModelLease is an administrator-owned, idempotent release operation
+// for stale or misconfigured leases. It does not require a client device
+// binding and never returns the lease credential.
+func (s *ControlPlane) ReclaimModelLease(ctx context.Context, idempotencyKey, leaseID string, input controlplane.ReleaseModelLeaseInput) (controlplane.ReleaseModelLeaseResult, error) {
+	return s.reclaimModelLease(ctx, idempotencyKey, leaseID, input, controlplane.AuditLogInput{})
+}
+
+// ReclaimModelLeaseWithAudit is the normalized administrative HTTP path. The
+// success event is committed with the lease release transaction.
+func (s *ControlPlane) ReclaimModelLeaseWithAudit(ctx context.Context, idempotencyKey, leaseID string, input controlplane.ReleaseModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ReleaseModelLeaseResult, error) {
+	return s.reclaimModelLease(ctx, idempotencyKey, leaseID, input, audit)
+}
+
+func (s *ControlPlane) reclaimModelLease(ctx context.Context, idempotencyKey, leaseID string, input controlplane.ReleaseModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ReleaseModelLeaseResult, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.ReleaseModelLeaseResult{}, err
+	}
+	if !validIdempotencyKey(idempotencyKey) {
+		return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrIdempotencyKeyRequired
+	}
+	leaseID = strings.TrimSpace(leaseID)
+	input.Reason = strings.TrimSpace(input.Reason)
+	if leaseID == "" || len(input.Reason) > 255 {
+		return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrInvalidRequest
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		writer, ok := s.repository.(store.ModelLeaseRepository)
+		if !ok {
+			return controlplane.ReleaseModelLeaseResult{}, store.ErrNormalizedModelLeaseRepositoryRequired
+		}
+		fingerprint, err := fingerprintValue(struct {
+			LeaseID string                              `json:"lease_id"`
+			Input   controlplane.ReleaseModelLeaseInput `json:"input"`
+		}{LeaseID: leaseID, Input: input})
+		if err != nil {
+			return controlplane.ReleaseModelLeaseResult{}, err
+		}
+		return writer.ReclaimModelLease(ctx, store.ModelLeaseReclaimRecord{
+			Scope: "control-plane-state", IdempotencyKey: "admin-reclaim-model-lease:" + leaseID + ":" + idempotencyKey,
+			Fingerprint: fingerprint, LeaseID: leaseID, Reason: input.Reason, Audit: audit,
+		})
+	}
+
+	return withState(ctx, s.repository, func(state *store.State) (controlplane.ReleaseModelLeaseResult, error) {
+		now := s.repository.Now()
+		sweepExpiredModelLeases(state, now)
+		lease, ok := state.ModelLeases[leaseID]
+		if !ok {
+			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrModelLeaseNotFound
+		}
+		fingerprint, err := fingerprintValue(struct {
+			LeaseID string                              `json:"lease_id"`
+			Input   controlplane.ReleaseModelLeaseInput `json:"input"`
+		}{LeaseID: leaseID, Input: input})
+		if err != nil {
+			return controlplane.ReleaseModelLeaseResult{}, err
+		}
+		scope := "admin-reclaim-model-lease:" + leaseID + ":" + idempotencyKey
+		if existing, ok := state.IdempotencyRecords[scope]; ok {
+			if existing.Fingerprint != fingerprint {
+				return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrIdempotencyConflict
+			}
+			return controlplane.ReleaseModelLeaseResult{LeaseID: leaseID, Released: true}, nil
+		}
+		if lease.Status != controlplane.ModelLeaseStatusActive && lease.Status != controlplane.ModelLeaseStatusReleased && lease.Status != controlplane.ModelLeaseStatusExpired {
+			return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrModelLeaseStateConflict
+		}
+		if lease.Status == controlplane.ModelLeaseStatusActive {
+			lease.Status = controlplane.ModelLeaseStatusReleased
+			lease.ReleasedAt = now.Format(time.RFC3339)
+			state.ModelLeases[lease.ID] = lease
+		}
+		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: leaseID}
+		return controlplane.ReleaseModelLeaseResult{LeaseID: leaseID, Released: true}, nil
+	})
+}
+
 func (s *ControlPlane) CreateModelPoolAccount(ctx context.Context, idempotencyKey string, input controlplane.CreateModelPoolAccountInput) (controlplane.ModelPoolAccountSummary, error) {
+	return s.createModelPoolAccount(ctx, idempotencyKey, input, controlplane.AuditLogInput{})
+}
+
+// CreateModelPoolAccountWithAudit is the normalized administrative HTTP path.
+// The optional success event is committed with the account row, encrypted
+// secret and idempotency record when the repository supports that boundary.
+func (s *ControlPlane) CreateModelPoolAccountWithAudit(ctx context.Context, idempotencyKey string, input controlplane.CreateModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+	return s.createModelPoolAccount(ctx, idempotencyKey, input, audit)
+}
+
+func (s *ControlPlane) createModelPoolAccount(ctx context.Context, idempotencyKey string, input controlplane.CreateModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -443,12 +1796,36 @@ func (s *ControlPlane) CreateModelPoolAccount(ctx context.Context, idempotencyKe
 	if err := validateCreateModelPoolAccountInput(&input); err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
+	fingerprint, err := fingerprintValue(input)
+	if err != nil {
+		return controlplane.ModelPoolAccountSummary{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		creator, ok := s.repository.(store.ModelPoolAccountCreator)
+		if !ok {
+			return controlplane.ModelPoolAccountSummary{}, store.ErrNormalizedModelPoolAccountCreatorRequired
+		}
+		account, err := creator.CreateModelPoolAccount(ctx, store.ModelPoolAccountCreateRecord{
+			Scope:            "control-plane-state",
+			IdempotencyKey:   "create-model-account:" + idempotencyKey,
+			Fingerprint:      fingerprint,
+			Provider:         input.Provider,
+			Model:            input.Model,
+			BaseURL:          input.BaseURL,
+			APIKey:           input.APIKey,
+			Status:           input.Status,
+			Priority:         input.Priority,
+			DailyLimit:       input.DailyLimit,
+			ConcurrencyLimit: input.ConcurrencyLimit,
+			Audit:            audit,
+		})
+		if errors.Is(err, store.ErrTransactionalSecretStoreRequired) {
+			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrSecretStoreUnavailable
+		}
+		return account, err
+	}
 
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ModelPoolAccountSummary, error) {
-		fingerprint, err := fingerprintValue(input)
-		if err != nil {
-			return controlplane.ModelPoolAccountSummary{}, err
-		}
 		scope := "create-model-account:" + idempotencyKey
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
@@ -487,6 +1864,16 @@ func (s *ControlPlane) CreateModelPoolAccount(ctx context.Context, idempotencyKe
 }
 
 func (s *ControlPlane) DisableModelPoolAccount(ctx context.Context, idempotencyKey, accountID string) (controlplane.ModelPoolAccountSummary, error) {
+	return s.disableModelPoolAccount(ctx, idempotencyKey, accountID, controlplane.AuditLogInput{})
+}
+
+// DisableModelPoolAccountWithAudit is the normalized administrative HTTP
+// path. The success event shares the account mutation transaction.
+func (s *ControlPlane) DisableModelPoolAccountWithAudit(ctx context.Context, idempotencyKey, accountID string, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+	return s.disableModelPoolAccount(ctx, idempotencyKey, accountID, audit)
+}
+
+func (s *ControlPlane) disableModelPoolAccount(ctx context.Context, idempotencyKey, accountID string, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -497,14 +1884,23 @@ func (s *ControlPlane) DisableModelPoolAccount(ctx context.Context, idempotencyK
 	if accountID == "" {
 		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolAccountNotFound
 	}
+	fingerprint, err := fingerprintValue(struct {
+		AccountID string `json:"account_id"`
+	}{AccountID: accountID})
+	if err != nil {
+		return controlplane.ModelPoolAccountSummary{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		writer, ok := s.repository.(store.ModelPoolRepository)
+		if !ok {
+			return controlplane.ModelPoolAccountSummary{}, store.ErrNormalizedModelPoolRepositoryRequired
+		}
+		return writer.DisableModelPoolAccount(ctx, store.ModelPoolAccountMutationRecord{
+			Scope: "control-plane-state", IdempotencyKey: "disable-model-account:" + idempotencyKey, Fingerprint: fingerprint, AccountID: accountID, Audit: audit,
+		})
+	}
 
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ModelPoolAccountSummary, error) {
-		fingerprint, err := fingerprintValue(struct {
-			AccountID string `json:"account_id"`
-		}{AccountID: accountID})
-		if err != nil {
-			return controlplane.ModelPoolAccountSummary{}, err
-		}
 		scope := "disable-model-account:" + idempotencyKey
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
@@ -536,6 +1932,16 @@ func (s *ControlPlane) DisableModelPoolAccount(ctx context.Context, idempotencyK
 }
 
 func (s *ControlPlane) UpdateModelPoolAccount(ctx context.Context, idempotencyKey, accountID string, input controlplane.UpdateModelPoolAccountInput) (controlplane.ModelPoolAccountSummary, error) {
+	return s.updateModelPoolAccount(ctx, idempotencyKey, accountID, input, controlplane.AuditLogInput{})
+}
+
+// UpdateModelPoolAccountWithAudit is the normalized administrative HTTP path.
+// The success event shares the account mutation transaction.
+func (s *ControlPlane) UpdateModelPoolAccountWithAudit(ctx context.Context, idempotencyKey, accountID string, input controlplane.UpdateModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+	return s.updateModelPoolAccount(ctx, idempotencyKey, accountID, input, audit)
+}
+
+func (s *ControlPlane) updateModelPoolAccount(ctx context.Context, idempotencyKey, accountID string, input controlplane.UpdateModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelPoolAccountSummary{}, err
 	}
@@ -568,15 +1974,26 @@ func (s *ControlPlane) UpdateModelPoolAccount(ctx context.Context, idempotencyKe
 	if input.Status != nil && !validModelAccountStatus(*input.Status) {
 		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrInvalidRequest
 	}
+	fingerprint, err := fingerprintValue(struct {
+		AccountID string                                   `json:"account_id"`
+		Input     controlplane.UpdateModelPoolAccountInput `json:"input"`
+	}{AccountID: accountID, Input: input})
+	if err != nil {
+		return controlplane.ModelPoolAccountSummary{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		writer, ok := s.repository.(store.ModelPoolRepository)
+		if !ok {
+			return controlplane.ModelPoolAccountSummary{}, store.ErrNormalizedModelPoolRepositoryRequired
+		}
+		return writer.UpdateModelPoolAccount(ctx, store.ModelPoolAccountUpdateRecord{
+			ModelPoolAccountMutationRecord: store.ModelPoolAccountMutationRecord{
+				Scope: "control-plane-state", IdempotencyKey: "update-model-account:" + idempotencyKey, Fingerprint: fingerprint, AccountID: accountID, Audit: audit,
+			}, Input: input,
+		})
+	}
 
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ModelPoolAccountSummary, error) {
-		fingerprint, err := fingerprintValue(struct {
-			AccountID string                                   `json:"account_id"`
-			Input     controlplane.UpdateModelPoolAccountInput `json:"input"`
-		}{AccountID: accountID, Input: input})
-		if err != nil {
-			return controlplane.ModelPoolAccountSummary{}, err
-		}
 		scope := "update-model-account:" + idempotencyKey
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
@@ -594,6 +2011,9 @@ func (s *ControlPlane) UpdateModelPoolAccount(ctx context.Context, idempotencyKe
 			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolAccountNotFound
 		}
 		sweepExpiredModelLeases(state, s.repository.Now())
+		if input.Status != nil && *input.Status == controlplane.ModelAccountStatusDisabled && activeLeaseCountForAccount(state, account.ID) > 0 {
+			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolAccountInUse
+		}
 		if input.ConcurrencyLimit != nil && activeLeaseCountForAccount(state, account.ID) > *input.ConcurrencyLimit {
 			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolConcurrencyConflict
 		}
@@ -611,6 +2031,9 @@ func (s *ControlPlane) UpdateModelPoolAccount(ctx context.Context, idempotencyKe
 		}
 		if input.Status != nil {
 			account.Status = *input.Status
+			if *input.Status != controlplane.ModelAccountStatusCooldown {
+				account.CooldownUntil = ""
+			}
 		}
 		state.ModelPoolAccounts[account.ID] = account
 		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: account.ID}
@@ -618,7 +2041,208 @@ func (s *ControlPlane) UpdateModelPoolAccount(ctx context.Context, idempotencyKe
 	})
 }
 
+func (s *ControlPlane) RotateModelPoolAccountSecret(ctx context.Context, idempotencyKey, accountID string, input controlplane.RotateModelPoolAccountSecretInput) (controlplane.ModelPoolAccountSummary, error) {
+	return s.rotateModelPoolAccountSecret(ctx, idempotencyKey, accountID, input, controlplane.AuditLogInput{})
+}
+
+// RotateModelPoolAccountSecretWithAudit uses the normalized transactional
+// SecretStore boundary when available. Compatibility stores retain the staged
+// fallback and the regular post-request audit path.
+func (s *ControlPlane) RotateModelPoolAccountSecretWithAudit(ctx context.Context, idempotencyKey, accountID string, input controlplane.RotateModelPoolAccountSecretInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+	return s.rotateModelPoolAccountSecret(ctx, idempotencyKey, accountID, input, audit)
+}
+
+func (s *ControlPlane) rotateModelPoolAccountSecret(ctx context.Context, idempotencyKey, accountID string, input controlplane.RotateModelPoolAccountSecretInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolAccountSummary, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.ModelPoolAccountSummary{}, err
+	}
+	if !validIdempotencyKey(idempotencyKey) {
+		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrIdempotencyKeyRequired
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" || validateRotateModelPoolAccountSecretInput(&input) != nil {
+		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrInvalidRequest
+	}
+	type rotationContext struct {
+		account     controlplane.ModelPoolAccountSummary
+		fingerprint string
+		existing    *controlplane.ModelPoolAccountSummary
+	}
+	fingerprint, err := fingerprintValue(struct {
+		AccountID string                                         `json:"account_id"`
+		Input     controlplane.RotateModelPoolAccountSecretInput `json:"input"`
+	}{AccountID: accountID, Input: input})
+	if err != nil {
+		return controlplane.ModelPoolAccountSummary{}, err
+	}
+	scope := "rotate-model-account-secret:" + accountID + ":" + idempotencyKey
+	normalized := false
+	if source, ok := s.repository.(store.NormalizedReadSource); ok {
+		normalized = source.UsesNormalizedReadSource()
+	}
+	var rotation rotationContext
+	if normalized {
+		preparer, ok := s.repository.(store.ModelPoolSecretRotationPreparer)
+		if !ok {
+			return controlplane.ModelPoolAccountSummary{}, store.ErrNormalizedModelPoolSecretRotationPreparerRequired
+		}
+		rotator, ok := s.repository.(store.ModelPoolSecretRotator)
+		if !ok {
+			return controlplane.ModelPoolAccountSummary{}, store.ErrNormalizedModelPoolSecretRotatorRequired
+		}
+		preparation, prepareErr := preparer.PrepareModelPoolAccountSecretRotation(ctx, "control-plane-state", scope, fingerprint, accountID)
+		if prepareErr != nil {
+			return controlplane.ModelPoolAccountSummary{}, prepareErr
+		}
+		rotation = rotationContext{account: preparation.Account, fingerprint: fingerprint, existing: preparation.Existing}
+		if rotation.existing != nil {
+			return *rotation.existing, nil
+		}
+		probe := s.probeModelPoolAccount(ctx, rotation.account, controlplane.TestModelPoolAccountInput{TimeoutSeconds: input.TimeoutSeconds}, input.APIKey)
+		if probe.Status != "succeeded" {
+			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolSecretValidation
+		}
+		rotated, rotateErr := rotator.RotateModelPoolAccountSecret(ctx, store.ModelPoolSecretRotationRecord{
+			Scope: "control-plane-state", IdempotencyKey: scope,
+			Fingerprint: fingerprint, AccountID: accountID, ExpectedSecretRef: rotation.account.SecretRef,
+			APIKey: input.APIKey, Probe: probe, Audit: audit,
+		})
+		if errors.Is(rotateErr, store.ErrTransactionalSecretStoreRequired) {
+			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrSecretStoreUnavailable
+		}
+		return rotated, rotateErr
+	}
+	rotation, err = withState(ctx, s.repository, func(state *store.State) (rotationContext, error) {
+		account, ok := state.ModelPoolAccounts[accountID]
+		if !ok {
+			return rotationContext{}, controlplane.ErrModelPoolAccountNotFound
+		}
+		if existing, exists := state.IdempotencyRecords[scope]; exists {
+			if existing.Fingerprint != fingerprint {
+				return rotationContext{}, controlplane.ErrIdempotencyConflict
+			}
+			stored, found := state.ModelPoolAccounts[existing.ResourceID]
+			if !found {
+				return rotationContext{}, controlplane.ErrModelPoolAccountNotFound
+			}
+			summary := decorateModelPoolAccount(state, stored, s.repository.Now())
+			return rotationContext{account: stored, fingerprint: fingerprint, existing: &summary}, nil
+		}
+		return rotationContext{account: account, fingerprint: fingerprint}, nil
+	})
+	if err != nil {
+		return controlplane.ModelPoolAccountSummary{}, err
+	}
+	if rotation.existing != nil {
+		return *rotation.existing, nil
+	}
+	probe := s.probeModelPoolAccount(ctx, rotation.account, controlplane.TestModelPoolAccountInput{TimeoutSeconds: input.TimeoutSeconds}, input.APIKey)
+	if probe.Status != "succeeded" {
+		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolSecretValidation
+	}
+	oldSecretRef := rotation.account.SecretRef
+	rotationToken, err := randomToken("rotation_", 12)
+	if err != nil {
+		return controlplane.ModelPoolAccountSummary{}, controlplane.NewError(http.StatusInternalServerError, "RANDOM_GENERATION_FAILED", "无法生成密钥轮换引用")
+	}
+	stagedSecretRef := oldSecretRef + "/" + rotationToken
+	deleteSecret := func(reference string) error {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), secretRotationCleanupTimeout)
+		defer cleanupCancel()
+		err := s.secretStore.Delete(cleanupCtx, reference)
+		if errors.Is(err, store.ErrSecretNotFound) {
+			return nil
+		}
+		return err
+	}
+	if err := s.secretStore.Put(ctx, stagedSecretRef, input.APIKey); err != nil {
+		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrSecretStoreUnavailable
+	}
+	committedRotation := false
+	if err := s.repository.Run(ctx, func(state *store.State) error {
+		account, exists := state.ModelPoolAccounts[accountID]
+		if !exists {
+			return controlplane.ErrModelPoolAccountNotFound
+		}
+		scope := "rotate-model-account-secret:" + accountID + ":" + idempotencyKey
+		if existing, exists := state.IdempotencyRecords[scope]; exists {
+			if existing.Fingerprint != rotation.fingerprint {
+				return controlplane.ErrIdempotencyConflict
+			}
+			return nil
+		}
+		if account.SecretRef != rotation.account.SecretRef {
+			return controlplane.ErrModelPoolSecretRotationConflict
+		}
+		account.SecretRef = stagedSecretRef
+		state.ModelPoolAccounts[account.ID] = account
+		if oldSecretRef != "" {
+			if state.PendingSecretCleanup == nil {
+				state.PendingSecretCleanup = make(map[string]time.Time)
+			}
+			if _, exists := state.PendingSecretCleanup[oldSecretRef]; !exists {
+				state.PendingSecretCleanup[oldSecretRef] = s.repository.Now()
+			}
+		}
+		resultID := nextID(state, "model_test")
+		state.ModelPoolTestResults[resultID] = probe
+		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: rotation.fingerprint, ResourceID: account.ID}
+		committedRotation = true
+		return nil
+	}); err != nil {
+		// A commit error (or cancellation while committing) does not prove the
+		// transaction rolled back. Keep the candidate for staged-secret
+		// reconciliation instead of deleting a value a committed row may use.
+		if !errors.Is(err, store.ErrCommitOutcomeUnknown) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if cleanupErr := deleteSecret(stagedSecretRef); cleanupErr != nil {
+				return controlplane.ModelPoolAccountSummary{}, controlplane.ErrSecretStoreUnavailable
+			}
+		}
+		return controlplane.ModelPoolAccountSummary{}, err
+	}
+	if !committedRotation {
+		if cleanupErr := deleteSecret(stagedSecretRef); cleanupErr != nil {
+			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrSecretStoreUnavailable
+		}
+		return withState(ctx, s.repository, func(state *store.State) (controlplane.ModelPoolAccountSummary, error) {
+			account, exists := state.ModelPoolAccounts[accountID]
+			if !exists {
+				return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolAccountNotFound
+			}
+			return decorateModelPoolAccount(state, account, s.repository.Now()), nil
+		})
+	}
+	// The active reference is switched transactionally with the business state.
+	// The old reference is queued in that same transaction, so an unknown
+	// commit outcome still leaves a durable compensation fact.
+	if cleanupErr := deleteSecret(oldSecretRef); cleanupErr != nil {
+		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrSecretStoreUnavailable
+	}
+	if err := s.repository.Run(ctx, func(state *store.State) error {
+		delete(state.PendingSecretCleanup, oldSecretRef)
+		return nil
+	}); err != nil {
+		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrSecretStoreUnavailable
+	}
+	return withState(ctx, s.repository, func(state *store.State) (controlplane.ModelPoolAccountSummary, error) {
+		account, exists := state.ModelPoolAccounts[accountID]
+		if !exists {
+			return controlplane.ModelPoolAccountSummary{}, controlplane.ErrModelPoolAccountNotFound
+		}
+		return decorateModelPoolAccount(state, account, s.repository.Now()), nil
+	})
+}
 func (s *ControlPlane) CreateModelLease(ctx context.Context, idempotencyKey, userID, deviceID string, input controlplane.CreateModelLeaseInput) (controlplane.ModelLease, error) {
+	return s.createModelLease(ctx, idempotencyKey, userID, deviceID, input, controlplane.AuditLogInput{})
+}
+
+// CreateModelLeaseWithAudit is the normalized client HTTP path. The success
+// event is committed with the lease creation transaction.
+func (s *ControlPlane) CreateModelLeaseWithAudit(ctx context.Context, idempotencyKey, userID, deviceID string, input controlplane.CreateModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ModelLease, error) {
+	return s.createModelLease(ctx, idempotencyKey, userID, deviceID, input, audit)
+}
+
+func (s *ControlPlane) createModelLease(ctx context.Context, idempotencyKey, userID, deviceID string, input controlplane.CreateModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ModelLease, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelLease{}, err
 	}
@@ -627,6 +2251,27 @@ func (s *ControlPlane) CreateModelLease(ctx context.Context, idempotencyKey, use
 	}
 	if err := validateCreateModelLeaseInput(&input); err != nil {
 		return controlplane.ModelLease{}, err
+	}
+	userID = strings.TrimSpace(userID)
+	deviceID = strings.TrimSpace(deviceID)
+	fingerprint, err := fingerprintValue(struct {
+		UserID   string                             `json:"user_id"`
+		DeviceID string                             `json:"device_id"`
+		Input    controlplane.CreateModelLeaseInput `json:"input"`
+	}{UserID: userID, DeviceID: deviceID, Input: input})
+	if err != nil {
+		return controlplane.ModelLease{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		creator, ok := s.repository.(store.ModelLeaseCreator)
+		if !ok {
+			return controlplane.ModelLease{}, store.ErrNormalizedModelLeaseCreatorRequired
+		}
+		return creator.CreateModelLease(ctx, store.ModelLeaseCreateRecord{
+			Scope: "control-plane-state", IdempotencyKey: "create-model-lease:" + userID + ":" + deviceID + ":" + idempotencyKey,
+			Fingerprint: fingerprint, UserID: userID, DeviceID: deviceID, Provider: input.Provider,
+			Model: input.Model, Purpose: input.Purpose, MaxDurationSeconds: input.MaxDurationSeconds, Audit: audit,
+		})
 	}
 
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ModelLease, error) {
@@ -647,18 +2292,6 @@ func (s *ControlPlane) CreateModelLease(ctx context.Context, idempotencyKey, use
 
 		sweepExpiredModelLeases(state, s.repository.Now())
 
-		fingerprint, err := fingerprintValue(struct {
-			UserID   string                             `json:"user_id"`
-			DeviceID string                             `json:"device_id"`
-			Input    controlplane.CreateModelLeaseInput `json:"input"`
-		}{
-			UserID:   userID,
-			DeviceID: device.ID,
-			Input:    input,
-		})
-		if err != nil {
-			return controlplane.ModelLease{}, err
-		}
 		scope := "create-model-lease:" + userID + ":" + device.ID + ":" + idempotencyKey
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
@@ -670,6 +2303,14 @@ func (s *ControlPlane) CreateModelLease(ctx context.Context, idempotencyKey, use
 			}
 			return lease, nil
 		}
+		if policy, configured := state.UserAuthorizationPolicies[userID]; configured {
+			if len(policy.AllowedModels) > 0 && !slices.Contains(policy.AllowedModels, input.Provider+"/"+input.Model) {
+				return controlplane.ModelLease{}, controlplane.ErrUserModelNotAuthorized
+			}
+			if policy.DailyTokenLimit > 0 && dailyUsedTokensForUser(state, userID, s.repository.Now()) >= policy.DailyTokenLimit {
+				return controlplane.ModelLease{}, controlplane.ErrUserRecordedQuotaExceeded
+			}
+		}
 
 		account, ok := selectModelPoolAccount(state, input.Provider, input.Model, s.repository.Now())
 		if !ok {
@@ -679,6 +2320,7 @@ func (s *ControlPlane) CreateModelLease(ctx context.Context, idempotencyKey, use
 			return controlplane.ModelLease{}, controlplane.ErrModelPoolUnavailable
 		}
 
+		now := s.repository.Now()
 		lease := controlplane.ModelLease{
 			ID:               nextID(state, "lease"),
 			UserID:           userID,
@@ -688,7 +2330,8 @@ func (s *ControlPlane) CreateModelLease(ctx context.Context, idempotencyKey, use
 			Provider:         account.Provider,
 			Model:            account.Model,
 			Status:           controlplane.ModelLeaseStatusActive,
-			ExpiresAt:        s.repository.Now().Add(time.Duration(input.MaxDurationSeconds) * time.Second).UTC().Format(time.RFC3339),
+			CreatedAt:        now.Format(time.RFC3339),
+			ExpiresAt:        now.Add(time.Duration(input.MaxDurationSeconds) * time.Second).UTC().Format(time.RFC3339),
 			ProxyMode:        controlplane.ModelLeaseProxyModeDirectLease,
 			DirectBaseURL:    account.BaseURL,
 			ConcurrencyLimit: account.ConcurrencyLimit,
@@ -703,6 +2346,16 @@ func (s *ControlPlane) CreateModelLease(ctx context.Context, idempotencyKey, use
 }
 
 func (s *ControlPlane) RenewModelLease(ctx context.Context, idempotencyKey, userID, deviceID, leaseID string, input controlplane.RenewModelLeaseInput) (controlplane.ModelLease, error) {
+	return s.renewModelLease(ctx, idempotencyKey, userID, deviceID, leaseID, input, controlplane.AuditLogInput{})
+}
+
+// RenewModelLeaseWithAudit is the normalized client HTTP path. The success
+// event is committed with the lease renewal transaction.
+func (s *ControlPlane) RenewModelLeaseWithAudit(ctx context.Context, idempotencyKey, userID, deviceID, leaseID string, input controlplane.RenewModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ModelLease, error) {
+	return s.renewModelLease(ctx, idempotencyKey, userID, deviceID, leaseID, input, audit)
+}
+
+func (s *ControlPlane) renewModelLease(ctx context.Context, idempotencyKey, userID, deviceID, leaseID string, input controlplane.RenewModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ModelLease, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelLease{}, err
 	}
@@ -711,6 +2364,25 @@ func (s *ControlPlane) RenewModelLease(ctx context.Context, idempotencyKey, user
 	}
 	if err := validateRenewModelLeaseInput(&input); err != nil {
 		return controlplane.ModelLease{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		writer, ok := s.repository.(store.ModelLeaseRepository)
+		if !ok {
+			return controlplane.ModelLease{}, store.ErrNormalizedModelLeaseRepositoryRequired
+		}
+		fingerprint, err := fingerprintValue(struct {
+			UserID       string                            `json:"user_id"`
+			DeviceID     string                            `json:"device_id"`
+			LeaseID      string                            `json:"lease_id"`
+			RenewRequest controlplane.RenewModelLeaseInput `json:"renew_request"`
+		}{UserID: userID, DeviceID: deviceID, LeaseID: leaseID, RenewRequest: input})
+		if err != nil {
+			return controlplane.ModelLease{}, err
+		}
+		return writer.RenewModelLease(ctx, store.ModelLeaseRenewRecord{
+			Scope: "control-plane-state", IdempotencyKey: "renew-model-lease:" + leaseID + ":" + idempotencyKey,
+			Fingerprint: fingerprint, UserID: userID, DeviceID: deviceID, LeaseID: leaseID, ExtendSeconds: input.ExtendSeconds, Audit: audit,
+		})
 	}
 
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ModelLease, error) {
@@ -783,6 +2455,16 @@ func (s *ControlPlane) RenewModelLease(ctx context.Context, idempotencyKey, user
 }
 
 func (s *ControlPlane) ReleaseModelLease(ctx context.Context, idempotencyKey, userID, deviceID, leaseID string, input controlplane.ReleaseModelLeaseInput) (controlplane.ReleaseModelLeaseResult, error) {
+	return s.releaseModelLease(ctx, idempotencyKey, userID, deviceID, leaseID, input, controlplane.AuditLogInput{})
+}
+
+// ReleaseModelLeaseWithAudit is the normalized client HTTP path. The success
+// event is committed with the lease release transaction.
+func (s *ControlPlane) ReleaseModelLeaseWithAudit(ctx context.Context, idempotencyKey, userID, deviceID, leaseID string, input controlplane.ReleaseModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ReleaseModelLeaseResult, error) {
+	return s.releaseModelLease(ctx, idempotencyKey, userID, deviceID, leaseID, input, audit)
+}
+
+func (s *ControlPlane) releaseModelLease(ctx context.Context, idempotencyKey, userID, deviceID, leaseID string, input controlplane.ReleaseModelLeaseInput, audit controlplane.AuditLogInput) (controlplane.ReleaseModelLeaseResult, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ReleaseModelLeaseResult{}, err
 	}
@@ -793,6 +2475,25 @@ func (s *ControlPlane) ReleaseModelLease(ctx context.Context, idempotencyKey, us
 		return controlplane.ReleaseModelLeaseResult{}, controlplane.ErrInvalidRequest
 	}
 	input.Reason = strings.TrimSpace(input.Reason)
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		writer, ok := s.repository.(store.ModelLeaseRepository)
+		if !ok {
+			return controlplane.ReleaseModelLeaseResult{}, store.ErrNormalizedModelLeaseRepositoryRequired
+		}
+		fingerprint, err := fingerprintValue(struct {
+			UserID       string                              `json:"user_id"`
+			DeviceID     string                              `json:"device_id"`
+			LeaseID      string                              `json:"lease_id"`
+			ReleaseInput controlplane.ReleaseModelLeaseInput `json:"release_input"`
+		}{UserID: userID, DeviceID: deviceID, LeaseID: leaseID, ReleaseInput: input})
+		if err != nil {
+			return controlplane.ReleaseModelLeaseResult{}, err
+		}
+		return writer.ReleaseModelLease(ctx, store.ModelLeaseReleaseRecord{
+			Scope: "control-plane-state", IdempotencyKey: "release-model-lease:" + leaseID + ":" + idempotencyKey,
+			Fingerprint: fingerprint, UserID: userID, DeviceID: deviceID, LeaseID: leaseID, Reason: input.Reason, Audit: audit,
+		})
+	}
 
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ReleaseModelLeaseResult, error) {
 		user, ok := state.Users[userID]
@@ -843,6 +2544,7 @@ func (s *ControlPlane) ReleaseModelLease(ctx context.Context, idempotencyKey, us
 		}
 		if lease.Status == controlplane.ModelLeaseStatusActive {
 			lease.Status = controlplane.ModelLeaseStatusReleased
+			lease.ReleasedAt = s.repository.Now().Format(time.RFC3339)
 			state.ModelLeases[lease.ID] = lease
 		}
 		state.IdempotencyRecords[scope] = store.IdempotencyRecord{
@@ -854,6 +2556,16 @@ func (s *ControlPlane) ReleaseModelLease(ctx context.Context, idempotencyKey, us
 }
 
 func (s *ControlPlane) TestModelPoolAccount(ctx context.Context, idempotencyKey, accountID string, input controlplane.TestModelPoolAccountInput) (controlplane.ModelPoolConnectivityTestResult, error) {
+	return s.testModelPoolAccount(ctx, idempotencyKey, accountID, input, controlplane.AuditLogInput{})
+}
+
+// TestModelPoolAccountWithAudit is the normalized administrative HTTP path.
+// The success event is committed with the test result and cooldown transition.
+func (s *ControlPlane) TestModelPoolAccountWithAudit(ctx context.Context, idempotencyKey, accountID string, input controlplane.TestModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolConnectivityTestResult, error) {
+	return s.testModelPoolAccount(ctx, idempotencyKey, accountID, input, audit)
+}
+
+func (s *ControlPlane) testModelPoolAccount(ctx context.Context, idempotencyKey, accountID string, input controlplane.TestModelPoolAccountInput, audit controlplane.AuditLogInput) (controlplane.ModelPoolConnectivityTestResult, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelPoolConnectivityTestResult{}, err
 	}
@@ -864,6 +2576,37 @@ func (s *ControlPlane) TestModelPoolAccount(ctx context.Context, idempotencyKey,
 	if accountID == "" || validateTestModelPoolAccountInput(&input) != nil {
 		return controlplane.ModelPoolConnectivityTestResult{}, controlplane.ErrInvalidRequest
 	}
+	fingerprint, err := fingerprintValue(struct {
+		AccountID string                                 `json:"account_id"`
+		Input     controlplane.TestModelPoolAccountInput `json:"input"`
+	}{AccountID: accountID, Input: input})
+	if err != nil {
+		return controlplane.ModelPoolConnectivityTestResult{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		if tester, ok := s.repository.(store.ModelPoolTestRepository); ok {
+			preparation, prepareErr := tester.PrepareModelPoolAccountTest(ctx, store.ModelPoolTestPrepareRecord{
+				Scope: "control-plane-state", IdempotencyKey: "test-model-account:" + accountID + ":" + idempotencyKey,
+				Fingerprint: fingerprint, AccountID: accountID,
+			})
+			if prepareErr != nil {
+				return controlplane.ModelPoolConnectivityTestResult{}, prepareErr
+			}
+			if preparation.Cached != nil {
+				return *preparation.Cached, nil
+			}
+			secret, secretErr := s.secretStore.Get(ctx, preparation.Account.SecretRef)
+			if secretErr != nil {
+				return controlplane.ModelPoolConnectivityTestResult{}, controlplane.ErrSecretStoreUnavailable
+			}
+			result := s.probeModelPoolAccount(ctx, preparation.Account, input, secret)
+			return tester.RecordModelPoolAccountTest(ctx, store.ModelPoolTestRecord{
+				Scope: "control-plane-state", IdempotencyKey: "test-model-account:" + accountID + ":" + idempotencyKey,
+				Fingerprint: fingerprint, AccountID: accountID, Result: result, Audit: audit,
+			})
+		}
+		return controlplane.ModelPoolConnectivityTestResult{}, store.ErrNormalizedModelPoolTestRepositoryRequired
+	}
 	type modelPoolTestContext struct {
 		account controlplane.ModelPoolAccountSummary
 		cached  *controlplane.ModelPoolConnectivityTestResult
@@ -872,13 +2615,6 @@ func (s *ControlPlane) TestModelPoolAccount(ctx context.Context, idempotencyKey,
 		account, ok := state.ModelPoolAccounts[accountID]
 		if !ok {
 			return modelPoolTestContext{}, controlplane.ErrModelPoolAccountNotFound
-		}
-		fingerprint, fingerprintErr := fingerprintValue(struct {
-			AccountID string                                 `json:"account_id"`
-			Input     controlplane.TestModelPoolAccountInput `json:"input"`
-		}{AccountID: accountID, Input: input})
-		if fingerprintErr != nil {
-			return modelPoolTestContext{}, fingerprintErr
 		}
 		if existing, ok := state.IdempotencyRecords["test-model-account:"+accountID+":"+idempotencyKey]; ok {
 			if existing.Fingerprint != fingerprint {
@@ -903,57 +2639,8 @@ func (s *ControlPlane) TestModelPoolAccount(ctx context.Context, idempotencyKey,
 	if err != nil {
 		return controlplane.ModelPoolConnectivityTestResult{}, controlplane.ErrSecretStoreUnavailable
 	}
-	baseURL := strings.TrimRight(account.BaseURL, "/")
-	if baseURL == "" {
-		baseURL = "https://api.openai.com/v1"
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/models", nil)
-	if err != nil {
-		return controlplane.ModelPoolConnectivityTestResult{}, controlplane.ErrInvalidRequest
-	}
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Authorization", "Bearer "+secret)
-	client := *s.httpClient
-	client.Timeout = time.Duration(input.TimeoutSeconds) * time.Second
-	startedAt := time.Now()
-	response, requestErr := client.Do(request)
-	result := controlplane.ModelPoolConnectivityTestResult{
-		AccountID: account.ID,
-		Provider:  account.Provider,
-		Model:     account.Model,
-		TestedAt:  s.repository.Now().Format(time.RFC3339),
-		LatencyMS: time.Since(startedAt).Milliseconds(),
-	}
-	if requestErr != nil {
-		result.Status = "failed"
-		result.ErrorCode = "MODEL_POOL_CONNECTIVITY_FAILED"
-		if ctx.Err() != nil || (func() bool {
-			timeoutError, ok := requestErr.(net.Error)
-			return ok && timeoutError.Timeout()
-		})() {
-			result.Status = "timeout"
-			result.ErrorCode = "MODEL_POOL_CONNECTIVITY_TIMEOUT"
-		}
-	} else {
-		defer response.Body.Close()
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-		result.HTTPStatus = response.StatusCode
-		result.ResponseSummary = fmt.Sprintf("HTTP %d", response.StatusCode)
-		if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
-			result.Status = "succeeded"
-		} else {
-			result.Status = "failed"
-			result.ErrorCode = "MODEL_POOL_PROVIDER_HTTP_ERROR"
-		}
-	}
+	result := s.probeModelPoolAccount(ctx, account, input, secret)
 	if err := s.repository.Run(ctx, func(state *store.State) error {
-		fingerprint, fingerprintErr := fingerprintValue(struct {
-			AccountID string                                 `json:"account_id"`
-			Input     controlplane.TestModelPoolAccountInput `json:"input"`
-		}{AccountID: accountID, Input: input})
-		if fingerprintErr != nil {
-			return fingerprintErr
-		}
 		scope := "test-model-account:" + accountID + ":" + idempotencyKey
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
@@ -966,6 +2653,20 @@ func (s *ControlPlane) TestModelPoolAccount(ctx context.Context, idempotencyKey,
 		}
 		resultID := nextID(state, "model_test")
 		state.ModelPoolTestResults[resultID] = result
+		if account, exists := state.ModelPoolAccounts[accountID]; exists && account.Status != controlplane.ModelAccountStatusDisabled {
+			if result.Status == "succeeded" {
+				account.Status = controlplane.ModelAccountStatusActive
+				account.CooldownUntil = ""
+			} else if result.Status == "failed" || result.Status == "timeout" {
+				account.Status = controlplane.ModelAccountStatusCooldown
+				cooldownUntil := s.repository.Now().Add(modelAccountCooldownDuration)
+				if testedAt, parseErr := time.Parse(time.RFC3339, result.TestedAt); parseErr == nil {
+					cooldownUntil = testedAt.Add(modelAccountCooldownDuration)
+				}
+				account.CooldownUntil = cooldownUntil.UTC().Format(time.RFC3339)
+			}
+			state.ModelPoolAccounts[accountID] = account
+		}
 		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: resultID}
 		return nil
 	}); err != nil {
@@ -975,6 +2676,18 @@ func (s *ControlPlane) TestModelPoolAccount(ctx context.Context, idempotencyKey,
 }
 
 func (s *ControlPlane) RecordDirectLLMCall(ctx context.Context, idempotencyKey, userID, deviceID, requestID string, input controlplane.CreateDirectLLMCallRecordInput) (controlplane.ModelUsageRecord, error) {
+	return s.recordDirectLLMCall(ctx, idempotencyKey, userID, deviceID, requestID, input, controlplane.AuditLogInput{})
+}
+
+// RecordDirectLLMCallWithAudit is the normalized HTTP path. The optional
+// success event is written to the same transaction as the usage summary,
+// quota transition and idempotency record; compatibility stores retain the
+// existing post-request audit path.
+func (s *ControlPlane) RecordDirectLLMCallWithAudit(ctx context.Context, idempotencyKey, userID, deviceID, requestID string, input controlplane.CreateDirectLLMCallRecordInput, audit controlplane.AuditLogInput) (controlplane.ModelUsageRecord, error) {
+	return s.recordDirectLLMCall(ctx, idempotencyKey, userID, deviceID, requestID, input, audit)
+}
+
+func (s *ControlPlane) recordDirectLLMCall(ctx context.Context, idempotencyKey, userID, deviceID, requestID string, input controlplane.CreateDirectLLMCallRecordInput, audit controlplane.AuditLogInput) (controlplane.ModelUsageRecord, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelUsageRecord{}, err
 	}
@@ -983,6 +2696,30 @@ func (s *ControlPlane) RecordDirectLLMCall(ctx context.Context, idempotencyKey, 
 	}
 	if err := validateDirectLLMCallRecordInput(&input); err != nil {
 		return controlplane.ModelUsageRecord{}, err
+	}
+	if input.TotalTokens == 0 {
+		input.TotalTokens = input.InputTokens + input.OutputTokens
+	}
+	if input.TotalTokens < input.InputTokens+input.OutputTokens {
+		return controlplane.ModelUsageRecord{}, controlplane.ErrInvalidRequest
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		writer, ok := s.repository.(store.ModelUsageRepository)
+		if !ok {
+			return controlplane.ModelUsageRecord{}, store.ErrNormalizedModelUsageRepositoryRequired
+		}
+		fingerprint, err := fingerprintValue(struct {
+			UserID   string                                      `json:"user_id"`
+			DeviceID string                                      `json:"device_id"`
+			Input    controlplane.CreateDirectLLMCallRecordInput `json:"input"`
+		}{UserID: userID, DeviceID: deviceID, Input: input})
+		if err != nil {
+			return controlplane.ModelUsageRecord{}, err
+		}
+		return writer.RecordDirectLLMCall(ctx, store.ModelUsageWriteRecord{
+			Scope: "control-plane-state", IdempotencyKey: "record-direct-llm-call:" + userID + ":" + deviceID + ":" + idempotencyKey,
+			Fingerprint: fingerprint, UserID: userID, DeviceID: deviceID, RequestID: strings.TrimSpace(requestID), Input: input, Audit: audit,
+		})
 	}
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ModelUsageRecord, error) {
 		device, err := resolveBoundOwnedDevice(state, userID, deviceID)
@@ -997,12 +2734,6 @@ func (s *ControlPlane) RecordDirectLLMCall(ctx context.Context, idempotencyKey, 
 			return controlplane.ModelUsageRecord{}, controlplane.ErrForbidden
 		}
 		if lease.Provider != input.Provider || lease.Model != input.Model {
-			return controlplane.ModelUsageRecord{}, controlplane.ErrInvalidRequest
-		}
-		if input.TotalTokens == 0 {
-			input.TotalTokens = input.InputTokens + input.OutputTokens
-		}
-		if input.TotalTokens < input.InputTokens+input.OutputTokens {
 			return controlplane.ModelUsageRecord{}, controlplane.ErrInvalidRequest
 		}
 		fingerprint, err := fingerprintValue(struct {
@@ -1028,6 +2759,9 @@ func (s *ControlPlane) RecordDirectLLMCall(ctx context.Context, idempotencyKey, 
 				state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: existing.ID}
 				return existing, nil
 			}
+		}
+		if policy, configured := state.UserAuthorizationPolicies[userID]; configured && policy.DailyTokenLimit > 0 && dailyUsedTokensForUser(state, userID, s.repository.Now()) >= policy.DailyTokenLimit {
+			return controlplane.ModelUsageRecord{}, controlplane.ErrUserRecordedQuotaExceeded
 		}
 		record := controlplane.ModelUsageRecord{
 			ID:           nextID(state, "usage"),
@@ -1060,6 +2794,9 @@ func (s *ControlPlane) ListModelUsage(ctx context.Context) ([]controlplane.Model
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		return nil, store.ErrNormalizedModelUsagePageReaderRequired
+	}
 	return withState(ctx, s.repository, func(state *store.State) ([]controlplane.ModelUsageRecord, error) {
 		items := make([]controlplane.ModelUsageRecord, 0, len(state.ModelUsageRecords))
 		for _, item := range state.ModelUsageRecords {
@@ -1072,6 +2809,123 @@ func (s *ControlPlane) ListModelUsage(ctx context.Context) ([]controlplane.Model
 			return strings.Compare(b.ID, a.ID)
 		})
 		return items, nil
+	})
+}
+
+func (s *ControlPlane) ListModelUsagePage(ctx context.Context, page, pageSize int) ([]controlplane.ModelUsageRecord, int, error) {
+	return s.ListModelUsagePageWithOptions(ctx, page, pageSize, ModelUsageListOptions{})
+}
+
+func (s *ControlPlane) ListModelUsagePageWithOptions(ctx context.Context, page, pageSize int, options ModelUsageListOptions) ([]controlplane.ModelUsageRecord, int, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	storageOptions, err := normalizeModelUsageListOptions(options)
+	if err != nil {
+		return nil, 0, err
+	}
+	storageOptions.Offset = offset
+	storageOptions.Limit = pageSize
+	if reader, ok := s.repository.(store.ModelUsageFilteredPageReader); ok {
+		result, err := reader.ListModelUsagePageWithOptions(ctx, storageOptions)
+		if err != nil {
+			return nil, 0, err
+		}
+		return result.Items, result.Total, nil
+	}
+	if reader, ok := s.repository.(store.ModelUsagePageReader); ok {
+		if storageOptions.Provider != "" || storageOptions.Model != "" || storageOptions.UserID != "" || storageOptions.DeviceID != "" || storageOptions.RequestID != "" || storageOptions.CreatedAfter != nil || storageOptions.CreatedBefore != nil || (storageOptions.Sort != "" && storageOptions.Sort != store.ModelUsageSortCreatedDesc) {
+			return nil, 0, controlplane.ErrInvalidRequest
+		}
+		result, err := reader.ListModelUsagePage(ctx, offset, pageSize)
+		if err != nil {
+			return nil, 0, err
+		}
+		return result.Items, result.Total, nil
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		return nil, 0, store.ErrNormalizedModelUsagePageReaderRequired
+	}
+	result, err := withState(ctx, s.repository, func(state *store.State) ([]controlplane.ModelUsageRecord, error) {
+		items := make([]controlplane.ModelUsageRecord, 0, len(state.ModelUsageRecords))
+		for _, item := range state.ModelUsageRecords {
+			lease := state.ModelLeases[item.LeaseID]
+			if !modelUsageMatchesListOptions(item, storageOptions, lease.UserID, lease.DeviceID) {
+				continue
+			}
+			items = append(items, item)
+		}
+		sortModelUsageRecordsForList(items, storageOptions.Sort)
+		return items, nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	start, end := pageWindow(len(result), offset, pageSize)
+	return result[start:end], len(result), nil
+}
+
+func modelUsageMatchesListOptions(item controlplane.ModelUsageRecord, options store.ModelUsagePageOptions, userID, deviceID string) bool {
+	if options.Provider != "" && item.Provider != options.Provider {
+		return false
+	}
+	if options.Model != "" && item.Model != options.Model {
+		return false
+	}
+	if options.UserID != "" && userID != options.UserID {
+		return false
+	}
+	if options.DeviceID != "" && deviceID != options.DeviceID {
+		return false
+	}
+	if options.RequestID != "" && item.RequestID != options.RequestID {
+		return false
+	}
+	if options.CreatedAfter == nil && options.CreatedBefore == nil {
+		return true
+	}
+	createdAt, err := time.Parse(time.RFC3339, item.CreatedAt)
+	if err != nil {
+		return false
+	}
+	if options.CreatedAfter != nil && createdAt.Before(*options.CreatedAfter) {
+		return false
+	}
+	return options.CreatedBefore == nil || !createdAt.After(*options.CreatedBefore)
+}
+
+func sortModelUsageRecordsForList(items []controlplane.ModelUsageRecord, sortKey string) {
+	slices.SortFunc(items, func(a, b controlplane.ModelUsageRecord) int {
+		if a.CreatedAt != b.CreatedAt {
+			parsedA, errA := time.Parse(time.RFC3339, a.CreatedAt)
+			parsedB, errB := time.Parse(time.RFC3339, b.CreatedAt)
+			if errA == nil && errB == nil {
+				if parsedA.Before(parsedB) {
+					if sortKey == store.ModelUsageSortCreatedAsc {
+						return -1
+					}
+					return 1
+				}
+				if parsedA.After(parsedB) {
+					if sortKey == store.ModelUsageSortCreatedAsc {
+						return 1
+					}
+					return -1
+				}
+			} else if sortKey == store.ModelUsageSortCreatedAsc {
+				return strings.Compare(a.CreatedAt, b.CreatedAt)
+			} else {
+				return strings.Compare(b.CreatedAt, a.CreatedAt)
+			}
+		}
+		if sortKey == store.ModelUsageSortCreatedAsc {
+			return strings.Compare(a.ID, b.ID)
+		}
+		return strings.Compare(b.ID, a.ID)
 	})
 }
 
@@ -1088,19 +2942,31 @@ func (s *ControlPlane) CreateActivationCode(ctx context.Context, idempotencyKey 
 	if input.MaxDevices != 1 || input.ExpiresAt.IsZero() || !input.ExpiresAt.After(s.repository.Now()) {
 		return controlplane.ActivationCode{}, controlplane.ErrInvalidRequest
 	}
+	fingerprint, err := fingerprintValue(struct {
+		ExpiresAt  string `json:"expires_at"`
+		MaxDevices int    `json:"max_devices"`
+	}{
+		ExpiresAt:  input.ExpiresAt.UTC().Format(time.RFC3339),
+		MaxDevices: input.MaxDevices,
+	})
+	if err != nil {
+		return controlplane.ActivationCode{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		writer, ok := s.repository.(store.ActivationRepository)
+		if !ok {
+			return controlplane.ActivationCode{}, store.ErrNormalizedActivationRepositoryRequired
+		}
+		plainCode, err := randomToken("code_", 18)
+		if err != nil {
+			return controlplane.ActivationCode{}, controlplane.NewError(http.StatusInternalServerError, "RANDOM_GENERATION_FAILED", "无法生成激活码")
+		}
+		return writer.CreateActivationCode(ctx, "control-plane-state", "create-activation-code:"+idempotencyKey, fingerprint, store.ActivationCodeCreateRecord{
+			PlainCode: plainCode, CodeHash: secretDigest(plainCode), CodePrefix: plainCode[:12], ExpiresAt: input.ExpiresAt, MaxDevices: input.MaxDevices, CreatedAt: s.repository.Now(),
+		})
+	}
 
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ActivationCode, error) {
-		fingerprint, err := fingerprintValue(struct {
-			ExpiresAt  string `json:"expires_at"`
-			MaxDevices int    `json:"max_devices"`
-		}{
-			ExpiresAt:  input.ExpiresAt.UTC().Format(time.RFC3339),
-			MaxDevices: input.MaxDevices,
-		})
-		if err != nil {
-			return controlplane.ActivationCode{}, err
-		}
-
 		if existing, ok := state.IdempotencyRecords["create-activation-code:"+idempotencyKey]; ok {
 			if existing.Fingerprint != fingerprint {
 				return controlplane.ActivationCode{}, controlplane.ErrIdempotencyConflict
@@ -1114,6 +2980,7 @@ func (s *ControlPlane) CreateActivationCode(ctx context.Context, idempotencyKey 
 				plainCode := record.PlainCode
 				record.ActivationCode.PlainCode = &plainCode
 			}
+			record.ActivationCode.CodePrefix = record.CodePrefix
 			return record.ActivationCode, nil
 		}
 
@@ -1127,6 +2994,7 @@ func (s *ControlPlane) CreateActivationCode(ctx context.Context, idempotencyKey 
 			Status:     controlplane.ActivationCodeStatusActive,
 			ExpiresAt:  input.ExpiresAt.UTC().Format(time.RFC3339),
 			MaxDevices: input.MaxDevices,
+			CodePrefix: plainCode[:12],
 			PlainCode:  &plainCode,
 		}
 		state.ActivationCodes[id] = store.ActivationCodeRecord{
@@ -1147,11 +3015,14 @@ func (s *ControlPlane) ListActivationCodes(ctx context.Context) ([]controlplane.
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		return nil, store.ErrNormalizedActivationPageReaderRequired
+	}
 	return withState(ctx, s.repository, func(state *store.State) ([]controlplane.ActivationCode, error) {
 		items := make([]controlplane.ActivationCode, 0, len(state.ActivationCodes))
 		now := s.repository.Now()
 		for id, record := range state.ActivationCodes {
-			code := record.ActivationCode
+			code := decorateActivationCode(state, record)
 			if code.Status == controlplane.ActivationCodeStatusActive {
 				expiresAt, _ := time.Parse(time.RFC3339, code.ExpiresAt)
 				if !now.Before(expiresAt) {
@@ -1170,6 +3041,58 @@ func (s *ControlPlane) ListActivationCodes(ctx context.Context) ([]controlplane.
 	})
 }
 
+// ListActivationCodesPage keeps the HTTP page boundary close to storage. A
+// normalized PostgreSQL repository uses bounded SQL; compatibility stores
+// retain the existing in-memory fallback until their migration is complete.
+func (s *ControlPlane) ListActivationCodesPage(ctx context.Context, page, pageSize int) ([]controlplane.ActivationCode, int, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	useNormalizedReader := true
+	if source, ok := s.repository.(store.NormalizedReadSource); ok {
+		useNormalizedReader = source.UsesNormalizedReadSource()
+	}
+	if useNormalizedReader {
+		if reader, ok := s.repository.(store.ActivationPageReader); ok {
+			result, err := reader.ListActivationCodesPage(ctx, offset, pageSize)
+			if err != nil {
+				return nil, 0, err
+			}
+			return result.Items, result.Total, nil
+		}
+		if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+			return nil, 0, store.ErrNormalizedActivationPageReaderRequired
+		}
+	}
+	items, err := s.ListActivationCodes(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	start, end := pageWindow(len(items), offset, pageSize)
+	return items[start:end], len(items), nil
+}
+
+func decorateActivationCode(state *store.State, record store.ActivationCodeRecord) controlplane.ActivationCode {
+	code := record.ActivationCode
+	code.PlainCode = nil
+	code.CodePrefix = record.CodePrefix
+	code.UsedByUserID = record.UsedByUserID
+	code.UsedByDeviceID = record.UsedByDeviceID
+	code.UsedAt = record.UsedAt
+	if record.UsedByDeviceID != "" {
+		if code.UsedByUserID == "" {
+			if device, ok := state.Devices[record.UsedByDeviceID]; ok {
+				code.UsedByUserID = device.UserID
+			}
+		}
+	}
+	return code
+}
+
 func (s *ControlPlane) RevokeActivationCode(ctx context.Context, idempotencyKey, codeID string) (controlplane.ActivationCode, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ActivationCode{}, err
@@ -1181,14 +3104,21 @@ func (s *ControlPlane) RevokeActivationCode(ctx context.Context, idempotencyKey,
 	if codeID == "" {
 		return controlplane.ActivationCode{}, controlplane.ErrActivationCodeNotFound
 	}
+	fingerprint, err := fingerprintValue(struct {
+		CodeID string `json:"code_id"`
+	}{CodeID: codeID})
+	if err != nil {
+		return controlplane.ActivationCode{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		writer, ok := s.repository.(store.ActivationRepository)
+		if !ok {
+			return controlplane.ActivationCode{}, store.ErrNormalizedActivationRepositoryRequired
+		}
+		return writer.RevokeActivationCode(ctx, "control-plane-state", "revoke-activation-code:"+idempotencyKey, fingerprint, codeID)
+	}
 
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ActivationCode, error) {
-		fingerprint, err := fingerprintValue(struct {
-			CodeID string `json:"code_id"`
-		}{CodeID: codeID})
-		if err != nil {
-			return controlplane.ActivationCode{}, err
-		}
 		scope := "revoke-activation-code:" + idempotencyKey
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
@@ -1199,7 +3129,7 @@ func (s *ControlPlane) RevokeActivationCode(ctx context.Context, idempotencyKey,
 				return controlplane.ActivationCode{}, controlplane.ErrActivationCodeNotFound
 			}
 			record.ActivationCode.PlainCode = nil
-			return record.ActivationCode, nil
+			return decorateActivationCode(state, record), nil
 		}
 
 		record, ok := state.ActivationCodes[codeID]
@@ -1210,13 +3140,14 @@ func (s *ControlPlane) RevokeActivationCode(ctx context.Context, idempotencyKey,
 			return controlplane.ActivationCode{}, controlplane.ErrActivationCodeStateConflict
 		}
 		record.ActivationCode.Status = controlplane.ActivationCodeStatusRevoked
+		record.PlainCode = ""
 		record.ActivationCode.PlainCode = nil
 		state.ActivationCodes[codeID] = record
 		state.IdempotencyRecords[scope] = store.IdempotencyRecord{
 			Fingerprint: fingerprint,
 			ResourceID:  codeID,
 		}
-		return record.ActivationCode, nil
+		return decorateActivationCode(state, record), nil
 	})
 }
 
@@ -1224,17 +3155,121 @@ func (s *ControlPlane) ActivateDevice(ctx context.Context, idempotencyKey, userI
 	if err := checkContext(ctx); err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		// This compatibility entry point has no authenticated session hash;
+		// normalized callers must use ActivateDeviceWithSessionBinding.
+		return controlplane.DeviceSummary{}, store.ErrNormalizedTransactionalDeviceActivatorRequired
+	}
+	return s.activateDeviceWithRunner(ctx, idempotencyKey, userID, input, func(operation store.StateOperation) error {
+		return s.repository.Run(ctx, operation)
+	})
+}
+
+// SupportsTransactionalSessionBinding reports whether the repository can
+// atomically bind a SQL session with a device state mutation.
+func (s *ControlPlane) SupportsTransactionalSessionBinding() bool {
+	_, ok := s.repository.(store.TransactionalSessionBinder)
+	return ok
+}
+
+// SupportsTransactionalDeviceLifecycle reports whether normalized device
+// disable/unbind also revokes sessions and releases leases in the same SQL
+// transaction. HTTP handlers use this to avoid issuing a second best-effort
+// session write after the domain transaction has already committed.
+func (s *ControlPlane) SupportsTransactionalDeviceLifecycle() bool {
+	source, sourceOK := s.repository.(store.NormalizedReadSource)
+	_, lifecycleOK := s.repository.(store.DeviceLifecycleRepository)
+	return sourceOK && source.UsesNormalizedReadSource() && lifecycleOK
+}
+
+// ActivateDeviceWithSessionBinding is the PostgreSQL production path. The
+// authenticated access-token hash is used only as a lookup key; it is never
+// persisted or returned by the service layer.
+func (s *ControlPlane) ActivateDeviceWithSessionBinding(ctx context.Context, idempotencyKey, userID, accessTokenHash string, input controlplane.ActivateDeviceInput) (controlplane.DeviceSummary, error) {
+	return s.activateDeviceWithSessionBinding(ctx, idempotencyKey, userID, accessTokenHash, input, controlplane.AuditLogInput{})
+}
+
+// ActivateDeviceWithSessionBindingAndAudit is the normalized HTTP path. The
+// success audit event is inserted into the same transaction as activation,
+// device registration and session binding.
+func (s *ControlPlane) ActivateDeviceWithSessionBindingAndAudit(ctx context.Context, idempotencyKey, userID, accessTokenHash string, input controlplane.ActivateDeviceInput, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
+	return s.activateDeviceWithSessionBinding(ctx, idempotencyKey, userID, accessTokenHash, input, audit)
+}
+
+func (s *ControlPlane) activateDeviceWithSessionBinding(ctx context.Context, idempotencyKey, userID, accessTokenHash string, input controlplane.ActivateDeviceInput, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		activator, ok := s.repository.(store.TransactionalDeviceActivator)
+		if !ok {
+			return controlplane.DeviceSummary{}, store.ErrNormalizedTransactionalDeviceActivatorRequired
+		}
+		if err := checkContext(ctx); err != nil {
+			return controlplane.DeviceSummary{}, err
+		}
+		if strings.TrimSpace(userID) == "" {
+			return controlplane.DeviceSummary{}, controlplane.ErrUserNotFound
+		}
+		if strings.TrimSpace(accessTokenHash) == "" {
+			return controlplane.DeviceSummary{}, controlplane.ErrUnauthenticated
+		}
+		if !validIdempotencyKey(idempotencyKey) {
+			return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyKeyRequired
+		}
+		if err := validateActivateDeviceInput(input); err != nil {
+			return controlplane.DeviceSummary{}, err
+		}
+		fingerprint, err := fingerprintValue(struct {
+			UserID string                           `json:"user_id"`
+			Input  controlplane.ActivateDeviceInput `json:"input"`
+		}{UserID: userID, Input: input})
+		if err != nil {
+			return controlplane.DeviceSummary{}, err
+		}
+		device, err := activator.ActivateDeviceWithSessionBinding(ctx, store.DeviceActivationRecord{
+			Scope:              "control-plane-state",
+			IdempotencyKey:     "activate-device:" + userID + ":" + idempotencyKey,
+			Fingerprint:        fingerprint,
+			AccessTokenHash:    accessTokenHash,
+			UserID:             userID,
+			ActivationCodeHash: secretDigest(input.ActivationCode),
+			Device:             input.Device,
+			Audit:              audit,
+		})
+		if errors.Is(err, store.ErrSessionDeviceBindingConflict) {
+			return controlplane.DeviceSummary{}, controlplane.ErrDeviceBindingConflict
+		}
+		if err != nil {
+			return controlplane.DeviceSummary{}, err
+		}
+		return decorateDeviceSummary(device, s.repository.Now()), nil
+	}
+	binder, ok := s.repository.(store.TransactionalSessionBinder)
+	if !ok {
+		return s.ActivateDevice(ctx, idempotencyKey, userID, input)
+	}
+	return s.activateDeviceWithRunner(ctx, idempotencyKey, userID, input, func(operation store.StateOperation) error {
+		err := binder.RunWithSessionBinding(ctx, accessTokenHash, userID, input.Device.DeviceID, operation)
+		if errors.Is(err, store.ErrSessionDeviceBindingConflict) {
+			return controlplane.ErrDeviceBindingConflict
+		}
+		return err
+	})
+}
+
+func (s *ControlPlane) activateDeviceWithRunner(ctx context.Context, idempotencyKey, userID string, input controlplane.ActivateDeviceInput, run func(store.StateOperation) error) (controlplane.DeviceSummary, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
 	if !validIdempotencyKey(idempotencyKey) {
 		return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyKeyRequired
 	}
-	if len(input.ActivationCode) < 8 || len(input.ActivationCode) > 128 || !idPattern.MatchString(input.Device.DeviceID) {
-		return controlplane.DeviceSummary{}, controlplane.ErrInvalidRequest
-	}
-	if strings.TrimSpace(input.Device.DeviceName) == "" || len(input.Device.DeviceName) > 128 || strings.TrimSpace(input.Device.Platform) == "" || len(input.Device.Platform) > 64 || strings.TrimSpace(input.Device.AppVersion) == "" || len(input.Device.AppVersion) > 64 || len(input.Device.OSVersion) > 128 {
-		return controlplane.DeviceSummary{}, controlplane.ErrInvalidRequest
+	if err := validateActivateDeviceInput(input); err != nil {
+		return controlplane.DeviceSummary{}, err
 	}
 
-	return withState(ctx, s.repository, func(state *store.State) (controlplane.DeviceSummary, error) {
+	device, err := runDeviceState(run, func(state *store.State) (controlplane.DeviceSummary, error) {
 		fingerprint, err := fingerprintValue(struct {
 			UserID string                           `json:"user_id"`
 			Input  controlplane.ActivateDeviceInput `json:"input"`
@@ -1300,22 +3335,68 @@ func (s *ControlPlane) ActivateDevice(ctx context.Context, idempotencyKey, userI
 		}
 		state.Devices[device.ID] = device
 		record.ActivationCode.Status = controlplane.ActivationCodeStatusUsed
+		record.PlainCode = ""
 		record.ActivationCode.PlainCode = nil
+		record.ActivationCode.CodePrefix = record.CodePrefix
+		record.ActivationCode.UsedByUserID = userID
+		record.ActivationCode.UsedByDeviceID = device.ID
+		record.ActivationCode.UsedAt = now
+		record.UsedByUserID = userID
 		record.UsedByDeviceID = device.ID
+		record.UsedAt = now
 		state.ActivationCodes[codeID] = record
 		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: device.ID}
 		return device, nil
 	})
+	if err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
+	return decorateDeviceSummary(device, s.repository.Now()), nil
 }
 
 func (s *ControlPlane) DisableDevice(ctx context.Context, idempotencyKey, deviceID string) (controlplane.DeviceSummary, error) {
+	return s.disableDevice(ctx, idempotencyKey, deviceID, controlplane.AuditLogInput{})
+}
+
+// DisableDeviceWithAudit is the normalized administrative HTTP path. The
+// success event is committed with the device lifecycle mutation when the
+// repository supports the transaction boundary.
+func (s *ControlPlane) DisableDeviceWithAudit(ctx context.Context, idempotencyKey, deviceID string, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
+	return s.disableDevice(ctx, idempotencyKey, deviceID, audit)
+}
+
+func (s *ControlPlane) disableDevice(ctx context.Context, idempotencyKey, deviceID string, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
 	if !validIdempotencyKey(idempotencyKey) {
 		return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyKeyRequired
 	}
-	return withState(ctx, s.repository, func(state *store.State) (controlplane.DeviceSummary, error) {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		lifecycle, ok := s.repository.(store.DeviceLifecycleRepository)
+		if !ok {
+			return controlplane.DeviceSummary{}, store.ErrNormalizedDeviceLifecycleRepositoryRequired
+		}
+		fingerprint, err := fingerprintValue(struct {
+			DeviceID string `json:"device_id"`
+		}{DeviceID: deviceID})
+		if err != nil {
+			return controlplane.DeviceSummary{}, err
+		}
+		device, err := lifecycle.DisableDevice(ctx, store.DeviceMutationRecord{
+			Scope: "control-plane-state", IdempotencyKey: "disable-device:" + deviceID + ":" + idempotencyKey, Fingerprint: fingerprint, DeviceID: deviceID,
+			Audit: audit,
+		})
+		if err != nil {
+			return controlplane.DeviceSummary{}, err
+		}
+		return decorateDeviceSummary(device, s.repository.Now()), nil
+	}
+	device, err := withState(ctx, s.repository, func(state *store.State) (controlplane.DeviceSummary, error) {
 		device, ok := state.Devices[deviceID]
 		if !ok {
 			return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
@@ -1331,20 +3412,37 @@ func (s *ControlPlane) DisableDevice(ctx context.Context, idempotencyKey, device
 			if existing.Fingerprint != fingerprint {
 				return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyConflict
 			}
+			releaseActiveModelLeasesForDevice(state, deviceID, s.repository.Now())
 			return device, nil
 		}
 		if device.Status == controlplane.DeviceStatusDisabled {
+			releaseActiveModelLeasesForDevice(state, deviceID, s.repository.Now())
 			state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: deviceID}
 			return device, nil
 		}
 		device.Status = controlplane.DeviceStatusDisabled
+		releaseActiveModelLeasesForDevice(state, deviceID, s.repository.Now())
 		state.Devices[device.ID] = device
 		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: deviceID}
 		return device, nil
 	})
+	if err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
+	return decorateDeviceSummary(device, s.repository.Now()), nil
 }
 
 func (s *ControlPlane) UnbindDevice(ctx context.Context, idempotencyKey, deviceID string) (controlplane.DeviceSummary, error) {
+	return s.unbindDevice(ctx, idempotencyKey, deviceID, controlplane.AuditLogInput{})
+}
+
+// UnbindDeviceWithAudit is the normalized administrative HTTP path. The
+// success event is committed with the device lifecycle mutation.
+func (s *ControlPlane) UnbindDeviceWithAudit(ctx context.Context, idempotencyKey, deviceID string, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
+	return s.unbindDevice(ctx, idempotencyKey, deviceID, audit)
+}
+
+func (s *ControlPlane) unbindDevice(ctx context.Context, idempotencyKey, deviceID string, audit controlplane.AuditLogInput) (controlplane.DeviceSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
@@ -1355,7 +3453,27 @@ func (s *ControlPlane) UnbindDevice(ctx context.Context, idempotencyKey, deviceI
 	if deviceID == "" {
 		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
 	}
-	return withState(ctx, s.repository, func(state *store.State) (controlplane.DeviceSummary, error) {
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		lifecycle, ok := s.repository.(store.DeviceLifecycleRepository)
+		if !ok {
+			return controlplane.DeviceSummary{}, store.ErrNormalizedDeviceLifecycleRepositoryRequired
+		}
+		fingerprint, err := fingerprintValue(struct {
+			DeviceID string `json:"device_id"`
+		}{DeviceID: deviceID})
+		if err != nil {
+			return controlplane.DeviceSummary{}, err
+		}
+		device, err := lifecycle.UnbindDevice(ctx, store.DeviceMutationRecord{
+			Scope: "control-plane-state", IdempotencyKey: "unbind-device:" + deviceID + ":" + idempotencyKey, Fingerprint: fingerprint, DeviceID: deviceID,
+			Audit: audit,
+		})
+		if err != nil {
+			return controlplane.DeviceSummary{}, err
+		}
+		return decorateDeviceSummary(device, s.repository.Now()), nil
+	}
+	device, err := withState(ctx, s.repository, func(state *store.State) (controlplane.DeviceSummary, error) {
 		device, ok := state.Devices[deviceID]
 		if !ok {
 			return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
@@ -1371,14 +3489,33 @@ func (s *ControlPlane) UnbindDevice(ctx context.Context, idempotencyKey, deviceI
 			if existing.Fingerprint != fingerprint {
 				return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyConflict
 			}
+			releaseActiveModelLeasesForDevice(state, deviceID, s.repository.Now())
 			return state.Devices[existing.ResourceID], nil
 		}
+		releaseActiveModelLeasesForDevice(state, deviceID, s.repository.Now())
 		device.UserID = ""
 		device.Status = controlplane.DeviceStatusPendingActivation
 		state.Devices[device.ID] = device
 		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: device.ID}
 		return device, nil
 	})
+	if err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
+	return decorateDeviceSummary(device, s.repository.Now()), nil
+}
+
+func decorateDeviceSummary(device controlplane.DeviceSummary, now time.Time) controlplane.DeviceSummary {
+	device.Online = false
+	if device.Status != controlplane.DeviceStatusActive || strings.TrimSpace(device.LastSeenAt) == "" {
+		return device
+	}
+	lastSeen, err := time.Parse(time.RFC3339, device.LastSeenAt)
+	if err != nil {
+		return device
+	}
+	device.Online = !lastSeen.After(now.Add(5*time.Second)) && now.Sub(lastSeen) <= deviceOnlineThreshold
+	return device
 }
 
 func validateCreateUserInput(input controlplane.CreateUserInput) error {
@@ -1390,6 +3527,70 @@ func validateCreateUserInput(input controlplane.CreateUserInput) error {
 		return controlplane.ErrInvalidRequest
 	}
 	return nil
+}
+
+func validateUpdateUserInput(input *controlplane.UpdateUserInput) error {
+	if input == nil || (input.Username == nil && input.Role == nil && input.Status == nil) {
+		return controlplane.ErrInvalidRequest
+	}
+	if input.Username != nil {
+		username := strings.TrimSpace(*input.Username)
+		if len(username) < 3 || len(username) > 64 {
+			return controlplane.ErrInvalidRequest
+		}
+		input.Username = &username
+	}
+	if input.Role != nil && *input.Role != controlplane.RoleAdmin && *input.Role != controlplane.RoleUser {
+		return controlplane.ErrInvalidRequest
+	}
+	if input.Status != nil && *input.Status != controlplane.UserStatusActive && *input.Status != controlplane.UserStatusDisabled {
+		return controlplane.ErrInvalidRequest
+	}
+	return nil
+}
+
+func validateUpdateUserAuthorizationInput(input *controlplane.UpdateUserAuthorizationInput) error {
+	if input == nil || input.DailyTokenLimit < 0 || input.DailyTokenLimit > 1_000_000_000 || len(input.AllowedModels) > 100 {
+		return controlplane.ErrInvalidRequest
+	}
+	seen := make(map[string]struct{}, len(input.AllowedModels))
+	canonical := make([]string, 0, len(input.AllowedModels))
+	for _, modelKey := range input.AllowedModels {
+		modelKey = strings.TrimSpace(modelKey)
+		separator := strings.IndexByte(modelKey, '/')
+		if separator <= 0 || separator == len(modelKey)-1 || strings.IndexByte(modelKey[separator+1:], '/') >= 0 {
+			return controlplane.ErrInvalidRequest
+		}
+		provider, model := strings.TrimSpace(modelKey[:separator]), strings.TrimSpace(modelKey[separator+1:])
+		if len(provider) == 0 || len(provider) > 64 || len(model) == 0 || len(model) > 128 {
+			return controlplane.ErrInvalidRequest
+		}
+		modelKey = provider + "/" + model
+		if _, ok := seen[modelKey]; ok {
+			return controlplane.ErrInvalidRequest
+		}
+		seen[modelKey] = struct{}{}
+		canonical = append(canonical, modelKey)
+	}
+	slices.Sort(canonical)
+	input.AllowedModels = canonical
+	return nil
+}
+
+func countActiveAdmins(state *store.State, excludedID string, candidate controlplane.UserSummary) int {
+	count := 0
+	for id, user := range state.Users {
+		if id == excludedID {
+			user = candidate
+		}
+		if user.Role == controlplane.RoleAdmin && user.Status == controlplane.UserStatusActive {
+			count++
+		}
+	}
+	if _, exists := state.Users[excludedID]; !exists && candidate.Role == controlplane.RoleAdmin && candidate.Status == controlplane.UserStatusActive {
+		count++
+	}
+	return count
 }
 
 func validateCreateModelPoolAccountInput(input *controlplane.CreateModelPoolAccountInput) error {
@@ -1508,12 +3709,26 @@ func sweepExpiredModelLeases(state *store.State, now time.Time) {
 		}
 		if !now.Before(expiresAt) {
 			lease.Status = controlplane.ModelLeaseStatusExpired
+			if lease.ReleasedAt == "" {
+				lease.ReleasedAt = now.UTC().Format(time.RFC3339)
+			}
+			state.ModelLeases[id] = lease
+		}
+	}
+}
+
+func releaseActiveModelLeasesForDevice(state *store.State, deviceID string, now time.Time) {
+	for id, lease := range state.ModelLeases {
+		if lease.DeviceID == deviceID && lease.Status == controlplane.ModelLeaseStatusActive {
+			lease.Status = controlplane.ModelLeaseStatusReleased
+			lease.ReleasedAt = now.UTC().Format(time.RFC3339)
 			state.ModelLeases[id] = lease
 		}
 	}
 }
 
 func selectModelPoolAccount(state *store.State, provider, model string, now time.Time) (controlplane.ModelPoolAccountSummary, bool) {
+	refreshModelAccountStatuses(state, now)
 	candidates := make([]controlplane.ModelPoolAccountSummary, 0, len(state.ModelPoolAccounts))
 	for _, account := range state.ModelPoolAccounts {
 		if account.Provider != provider || account.Model != model || account.Status != controlplane.ModelAccountStatusActive {
@@ -1574,6 +3789,26 @@ func dailyUsedTokensForAccount(state *store.State, accountID string, now time.Ti
 	return used
 }
 
+func dailyUsedTokensForUser(state *store.State, userID string, now time.Time) int {
+	day := now.UTC().Format("2006-01-02")
+	leaseUserByID := make(map[string]string, len(state.ModelLeases))
+	for id, lease := range state.ModelLeases {
+		leaseUserByID[id] = lease.UserID
+	}
+	used := 0
+	for _, usage := range state.ModelUsageRecords {
+		if leaseUserByID[usage.LeaseID] != userID {
+			continue
+		}
+		createdAt, err := time.Parse(time.RFC3339, usage.CreatedAt)
+		if err != nil || createdAt.UTC().Format("2006-01-02") != day {
+			continue
+		}
+		used += usage.TotalTokens
+	}
+	return used
+}
+
 func decorateModelPoolAccount(state *store.State, account controlplane.ModelPoolAccountSummary, now time.Time) controlplane.ModelPoolAccountSummary {
 	account.ActiveLeases = activeLeaseCountForAccount(state, account.ID)
 	account.DailyUsedTokens = dailyUsedTokensForAccount(state, account.ID, now)
@@ -1587,6 +3822,182 @@ func decorateModelPoolAccount(state *store.State, account controlplane.ModelPool
 	if latest.TestedAt != "" {
 		account.LastTestStatus = latest.Status
 		account.LastTestedAt = latest.TestedAt
+		if account.Status == controlplane.ModelAccountStatusCooldown && (latest.Status == "failed" || latest.Status == "timeout") {
+			if testedAt, err := time.Parse(time.RFC3339, latest.TestedAt); err == nil {
+				account.CooldownUntil = testedAt.Add(modelAccountCooldownDuration).UTC().Format(time.RFC3339)
+			}
+		}
 	}
 	return account
+}
+
+func normalizeModelPoolAccountSummary(account *controlplane.ModelPoolAccountSummary, now time.Time) {
+	if account == nil || account.Status == controlplane.ModelAccountStatusDisabled {
+		return
+	}
+	switch account.Status {
+	case controlplane.ModelAccountStatusActive:
+		if account.DailyLimit > 0 && account.DailyUsedTokens >= account.DailyLimit {
+			account.Status = controlplane.ModelAccountStatusExhausted
+		}
+	case controlplane.ModelAccountStatusExhausted:
+		if account.DailyLimit > 0 && account.DailyUsedTokens < account.DailyLimit {
+			account.Status = controlplane.ModelAccountStatusActive
+		}
+	case controlplane.ModelAccountStatusCooldown:
+		cooldownUntil := account.CooldownUntil
+		if cooldownUntil == "" && (account.LastTestStatus == "failed" || account.LastTestStatus == "timeout") {
+			if testedAt, err := time.Parse(time.RFC3339, account.LastTestedAt); err == nil {
+				cooldownUntil = testedAt.Add(modelAccountCooldownDuration).UTC().Format(time.RFC3339)
+				account.CooldownUntil = cooldownUntil
+			}
+		}
+		if cooldownUntil != "" {
+			if until, err := time.Parse(time.RFC3339, cooldownUntil); err == nil && !now.Before(until) {
+				account.Status = controlplane.ModelAccountStatusActive
+				account.CooldownUntil = ""
+			}
+		}
+	}
+	if account.Status == controlplane.ModelAccountStatusActive && account.DailyLimit > 0 && account.DailyUsedTokens >= account.DailyLimit {
+		account.Status = controlplane.ModelAccountStatusExhausted
+	}
+}
+
+func modelLeaseAdminSummary(lease controlplane.ModelLease) controlplane.ModelLeaseAdminSummary {
+	return controlplane.ModelLeaseAdminSummary{
+		ID:               lease.ID,
+		AccountID:        lease.AccountID,
+		UserID:           lease.UserID,
+		DeviceID:         lease.DeviceID,
+		Purpose:          lease.Purpose,
+		Provider:         lease.Provider,
+		Model:            lease.Model,
+		Status:           lease.Status,
+		ExpiresAt:        lease.ExpiresAt,
+		ProxyMode:        lease.ProxyMode,
+		ConcurrencyLimit: lease.ConcurrencyLimit,
+	}
+}
+
+func modelLeaseAdminDetail(lease controlplane.ModelLease) controlplane.ModelLeaseAdminDetail {
+	return controlplane.ModelLeaseAdminDetail{
+		ID:               lease.ID,
+		AccountID:        lease.AccountID,
+		UserID:           lease.UserID,
+		DeviceID:         lease.DeviceID,
+		Purpose:          lease.Purpose,
+		Provider:         lease.Provider,
+		Model:            lease.Model,
+		Status:           lease.Status,
+		CreatedAt:        lease.CreatedAt,
+		ExpiresAt:        lease.ExpiresAt,
+		ReleasedAt:       lease.ReleasedAt,
+		ProxyMode:        lease.ProxyMode,
+		ConcurrencyLimit: lease.ConcurrencyLimit,
+	}
+}
+
+func normalizeModelLeaseAdminSummary(lease *controlplane.ModelLeaseAdminSummary, now time.Time) {
+	if lease == nil || lease.Status != controlplane.ModelLeaseStatusActive || lease.ExpiresAt == "" {
+		return
+	}
+	expiresAt, err := time.Parse(time.RFC3339, lease.ExpiresAt)
+	if err == nil && !now.Before(expiresAt) {
+		lease.Status = controlplane.ModelLeaseStatusExpired
+	}
+}
+
+func modelLeaseAdminSummaryMatchesOptions(item controlplane.ModelLeaseAdminSummary, options store.ModelLeasePageOptions, now time.Time) bool {
+	normalizeModelLeaseAdminSummary(&item, now)
+	if options.Status != "" && item.Status != options.Status {
+		return false
+	}
+	return (options.Provider == "" || item.Provider == options.Provider) &&
+		(options.Model == "" || item.Model == options.Model) &&
+		(options.UserID == "" || item.UserID == options.UserID) &&
+		(options.DeviceID == "" || item.DeviceID == options.DeviceID) &&
+		(options.AccountID == "" || item.AccountID == options.AccountID)
+}
+
+func sortModelLeaseAdminSummaries(items []controlplane.ModelLeaseAdminSummary, sortKey string) {
+	slices.SortFunc(items, func(a, b controlplane.ModelLeaseAdminSummary) int {
+		switch sortKey {
+		case store.ModelLeaseSortExpiresAsc:
+			if a.ExpiresAt != b.ExpiresAt {
+				return strings.Compare(a.ExpiresAt, b.ExpiresAt)
+			}
+		case store.ModelLeaseSortStatus:
+			if a.Status != b.Status {
+				return strings.Compare(a.Status, b.Status)
+			}
+			if a.ExpiresAt != b.ExpiresAt {
+				return strings.Compare(b.ExpiresAt, a.ExpiresAt)
+			}
+		case store.ModelLeaseSortProviderModel:
+			if value := strings.Compare(a.Provider, b.Provider); value != 0 {
+				return value
+			}
+			if value := strings.Compare(a.Model, b.Model); value != 0 {
+				return value
+			}
+		default:
+			if a.ExpiresAt != b.ExpiresAt {
+				return strings.Compare(b.ExpiresAt, a.ExpiresAt)
+			}
+		}
+		return strings.Compare(b.ID, a.ID)
+	})
+}
+
+func refreshModelAccountStatuses(state *store.State, now time.Time) {
+	for id, account := range state.ModelPoolAccounts {
+		if account.Status == controlplane.ModelAccountStatusDisabled {
+			continue
+		}
+		used := dailyUsedTokensForAccount(state, id, now)
+		switch account.Status {
+		case controlplane.ModelAccountStatusActive:
+			if account.DailyLimit > 0 && used >= account.DailyLimit {
+				account.Status = controlplane.ModelAccountStatusExhausted
+			}
+		case controlplane.ModelAccountStatusExhausted:
+			if account.DailyLimit > 0 && used < account.DailyLimit {
+				account.Status = controlplane.ModelAccountStatusActive
+			}
+		case controlplane.ModelAccountStatusCooldown:
+			cooldownUntil := account.CooldownUntil
+			if cooldownUntil == "" {
+				latest, ok := latestModelPoolTestResult(state, id)
+				if ok && (latest.Status == "failed" || latest.Status == "timeout") {
+					if testedAt, err := time.Parse(time.RFC3339, latest.TestedAt); err == nil {
+						cooldownUntil = testedAt.Add(modelAccountCooldownDuration).UTC().Format(time.RFC3339)
+					}
+				}
+			}
+			if cooldownUntil != "" {
+				if until, err := time.Parse(time.RFC3339, cooldownUntil); err == nil && !now.Before(until) {
+					account.Status = controlplane.ModelAccountStatusActive
+					account.CooldownUntil = ""
+				}
+			}
+		}
+		if account.Status == controlplane.ModelAccountStatusActive && account.DailyLimit > 0 && used >= account.DailyLimit {
+			account.Status = controlplane.ModelAccountStatusExhausted
+		}
+		state.ModelPoolAccounts[id] = account
+	}
+}
+
+func latestModelPoolTestResult(state *store.State, accountID string) (controlplane.ModelPoolConnectivityTestResult, bool) {
+	var latest controlplane.ModelPoolConnectivityTestResult
+	found := false
+	for _, result := range state.ModelPoolTestResults {
+		if result.AccountID != accountID || result.TestedAt == "" || (found && result.TestedAt <= latest.TestedAt) {
+			continue
+		}
+		latest = result
+		found = true
+	}
+	return latest, found
 }

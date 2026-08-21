@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node --test src/features/model-pool/modelPoolIdempotency.test.mjs src/features/auth/session.test.mjs",
+    "api:generate": "openapi-typescript ../接口契约/openapi.yaml -o src/api/openapi.generated.ts",
+    "api:check": "openapi-typescript ../接口契约/openapi.yaml -o src/api/openapi.generated.ts --check",
+    "test": "node --test src/api/client-contract.test.mjs src/features/model-pool/modelPoolIdempotency.test.mjs src/features/auth/session.test.mjs",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"
   },
@@ -23,6 +25,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^5.0.0",
+    "openapi-typescript": "7.13.0",
     "typescript": "^5.0.0",
     "vite": "^7.0.0"
   }

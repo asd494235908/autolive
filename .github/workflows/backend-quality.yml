@@ -1,0 +1,297 @@
+name: backend-quality
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - backend/**
+      - deploy/**
+      - desktop/src-tauri/capabilities/default.json
+      - admin-web/nginx.conf
+      - admin-web/**
+      - desktop/ui/**
+      - 接口契约/**
+      - tools/check-https-publish.*
+      - tools/check-backend-release.*
+      - .github/workflows/backend-quality.yml
+  pull_request:
+    paths:
+      - backend/**
+      - deploy/**
+      - desktop/src-tauri/capabilities/default.json
+      - admin-web/nginx.conf
+      - admin-web/**
+      - desktop/ui/**
+      - 接口契约/**
+      - tools/check-https-publish.*
+      - tools/check-backend-release.*
+      - .github/workflows/backend-quality.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go 1.26.6 checks
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: go1.26.6+auto
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.6'
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Verify toolchain
+        run: |
+          set -euo pipefail
+          test "$(go env GOVERSION)" = "go1.26.6"
+          go version
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify HTTPS publish gate
+        working-directory: .
+        run: node tools/check-https-publish.mjs --env-file deploy/.env.example --reverse-proxy deploy/reverse-proxy/nginx.conf --capability desktop/src-tauri/capabilities/default.json --admin-nginx admin-web/nginx.conf
+
+      - name: Verify backend release reproducibility gate
+        working-directory: .
+        run: node tools/check-backend-release.mjs --dockerfile backend/Dockerfile --workflow .github/workflows/backend-quality.yml
+
+      - name: Test
+        run: go test ./...
+
+      - name: Race test
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Graceful shutdown smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/autolive-api"
+          log_file="$RUNNER_TEMP/autolive-api.log"
+          go build -o "$binary" ./cmd/server
+          APP_ADDR=127.0.0.1:18082 \
+          APP_STORAGE_MODE=memory \
+          APP_MODEL_READ_SOURCE=snapshot \
+          APP_ADMIN_USERNAME=ci-admin \
+          APP_ADMIN_PASSWORD=ci-password-123 \
+          APP_MODEL_HEALTH_PROBE_INTERVAL=0s \
+          APP_RETENTION_CLEANUP_INTERVAL=0s \
+          "$binary" >"$log_file" 2>&1 &
+          pid=$!
+          cleanup() { kill -TERM "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused \
+            http://127.0.0.1:18082/api/v1/readyz
+          kill -TERM "$pid"
+          wait "$pid"
+          trap - EXIT
+          grep -F 'http server stopped cleanly' "$log_file"
+
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
+  postgres-integration:
+    name: PostgreSQL normalized integration
+    runs-on: ubuntu-latest
+    needs: go
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: autolive_test
+          POSTGRES_PASSWORD: autolive_test
+          POSTGRES_DB: autolive_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U autolive_test -d autolive_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      GOTOOLCHAIN: go1.26.6+auto
+      APP_STORAGE_MODE: postgres
+      APP_DATABASE_URL: postgres://autolive_test:autolive_test@127.0.0.1:5432/autolive_test?sslmode=disable
+      TEST_POSTGRES_URL: postgres://autolive_test:autolive_test@127.0.0.1:5432/autolive_test?sslmode=disable
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.6'
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Apply migrations
+        run: go run ./cmd/migrate
+
+      - name: Backfill and unlock normalized projection
+        env:
+          APP_NORMALIZED_BACKFILL_CONFIRM: YES
+        run: go run ./cmd/backfill-normalized
+
+      - name: Verify normalized cutover preflight
+        env:
+          APP_MODEL_READ_SOURCE: normalized
+          APP_NORMALIZED_CUTOVER_CONFIRM: YES
+        run: go run ./cmd/verify-normalized-cutover
+
+      - name: Run PostgreSQL integration tests
+        run: go test -tags=postgres_integration ./internal/store
+
+  container:
+    name: Backend image smoke
+    runs-on: ubuntu-latest
+    needs: go
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build backend image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          file: backend/Dockerfile
+          platforms: linux/amd64
+          push: false
+          outputs: |
+            type=docker,dest=/tmp/autolive-api.docker.tar
+            type=oci,dest=/tmp/autolive-api.oci.tar
+          tags: autolive-api:${{ github.sha }}
+          sbom: true
+          provenance: mode=max
+
+      - name: Load attested image and record content digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker load --input /tmp/autolive-api.docker.tar
+          buildx_digest="${{ steps.build.outputs.digest }}"
+          case "$buildx_digest" in
+            sha256:*) ;;
+            *) echo "unexpected BuildKit digest: $buildx_digest" >&2; exit 1 ;;
+          esac
+          image_id="$(docker image inspect --format '{{.Id}}' "autolive-api:${GITHUB_SHA}")"
+          case "$image_id" in
+            sha256:*) ;;
+            *) echo "unexpected image id: $image_id" >&2; exit 1 ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/autolive-release"
+          {
+            echo "git_sha=$GITHUB_SHA"
+            echo "buildx_digest=$buildx_digest"
+            echo "image_id=$image_id"
+            sha256sum /tmp/autolive-api.docker.tar /tmp/autolive-api.oci.tar
+          } | tee "$RUNNER_TEMP/autolive-release/backend-image-metadata.txt"
+
+      - name: Run image smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_name=autolive-api-smoke
+          trap 'docker rm -f "$container_name" >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name "$container_name" --publish 18081:8080 \
+            --env APP_STORAGE_MODE=memory \
+            --env APP_MODEL_READ_SOURCE=snapshot \
+            --env APP_ADMIN_USERNAME=ci-admin \
+            --env APP_ADMIN_PASSWORD=ci-password-123 \
+            "autolive-api:${GITHUB_SHA}"
+          curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused \
+            http://127.0.0.1:18081/api/v1/readyz
+          curl --fail --silent --show-error \
+            http://127.0.0.1:18081/metrics | grep -F 'autolive_http_requests_total'
+
+      - name: Upload reproducibility metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-image-metadata-${{ github.sha }}
+          path: ${{ runner.temp }}/autolive-release/backend-image-metadata.txt
+          if-no-files-found: error
+
+  frontend-contract:
+    name: Admin web contract and generated types
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.0.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: admin-web/pnpm-lock.yaml
+
+      - name: Install admin web dependencies
+        run: pnpm --dir admin-web install --frozen-lockfile
+
+      - name: Check generated OpenAPI types
+        run: pnpm --dir admin-web api:check
+
+      - name: Typecheck, test and build admin web
+        run: |
+          pnpm --dir admin-web typecheck
+          pnpm --dir admin-web test
+          pnpm --dir admin-web build
+
+  desktop-contract:
+    name: Desktop contract and generated types
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.0.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: desktop/ui/pnpm-lock.yaml
+
+      - name: Install desktop UI dependencies
+        run: pnpm --dir desktop/ui install --frozen-lockfile
+
+      - name: Check generated OpenAPI types
+        run: pnpm --dir desktop/ui api:check
+
+      - name: Typecheck, test and build desktop UI
+        run: |
+          pnpm --dir desktop/ui typecheck
+          pnpm --dir desktop/ui test
+          pnpm --dir desktop/ui build
