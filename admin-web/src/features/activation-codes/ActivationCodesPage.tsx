@@ -1,12 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import dayjs, { type Dayjs } from 'dayjs';
 import {
   Alert,
   App,
   Button,
   Card,
+  DatePicker,
   Empty,
   Form,
-  Input,
   Modal,
   Space,
   Table,
@@ -15,6 +16,10 @@ import {
 import { useMemo, useState } from 'react';
 import { apiClient, ApiClientError, createRequestId } from '../../api/client';
 import { StatusTag } from '../../components/StatusTag';
+import {
+  ACTIVATION_CODE_EXPIRY_PRESETS,
+  calculateActivationCodeExpiry
+} from './activationCodeExpiry';
 import type {
   ActivationCode,
   ActivationCodeEnvelope,
@@ -25,11 +30,19 @@ import type {
 export function ActivationCodesPage() {
   const { message, modal } = App.useApp();
   const queryClient = useQueryClient();
-  const [form] = Form.useForm<{ expires_at: string }>();
+  const [form] = Form.useForm<{ expires_at: Dayjs }>();
   const [createOpen, setCreateOpen] = useState(false);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [revokingCodeId, setRevokingCodeId] = useState<string | null>(null);
+  const expiryPresets = useMemo(
+    () =>
+      ACTIVATION_CODE_EXPIRY_PRESETS.map((preset) => ({
+        label: preset.label,
+        value: () => dayjs(calculateActivationCodeExpiry(new Date(), preset.amount, preset.unit))
+      })),
+    []
+  );
 
   const activationCodesQuery = useQuery({
     queryKey: ['activation-codes', page, pageSize],
@@ -230,26 +243,25 @@ export function ActivationCodesPage() {
         onOk={() => {
           void form.validateFields().then((values) =>
             createActivationCodeMutation.mutate({
-              expires_at: values.expires_at,
+              expires_at: values.expires_at.toISOString(),
               max_devices: 1
             })
           );
         }}
       >
-        <Alert
-          type="info"
-          showIcon
-          style={{ marginBottom: 16 }}
-          message="请输入 RFC3339 时间"
-          description="示例：2026-08-12T20:00:00+08:00"
-        />
-        <Form<{ expires_at: string }> form={form} layout="vertical">
+        <Form<{ expires_at: Dayjs }> form={form} layout="vertical">
           <Form.Item
             label="过期时间"
             name="expires_at"
             rules={[{ required: true, message: '请输入过期时间' }]}
           >
-            <Input placeholder="2026-08-12T20:00:00+08:00" />
+            <DatePicker
+              showTime
+              format="YYYY-MM-DD HH:mm:ss"
+              presets={expiryPresets}
+              placeholder="请选择过期时间"
+              style={{ width: '100%' }}
+            />
           </Form.Item>
         </Form>
       </Modal>
