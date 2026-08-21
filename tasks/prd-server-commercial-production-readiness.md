@@ -1,0 +1,207 @@
+# PRD：服务端商业化与生产就绪
+
+## 文档状态
+
+- 状态：Draft
+- 文件模式：Split
+- 当前阶段：Not Started
+- 活动阶段文件：无（本轮不实施）
+- 上下文：[context.md](./prd-server-commercial-production-readiness/context.md)
+- 设计：[服务端商业化与生产能力补齐设计](../docs/superpowers/specs/2026-08-21-服务端商业化与生产能力补齐设计.md)
+- 最后更新：2026-08-21
+- PRD 文件：`tasks/prd-server-commercial-production-readiness.md`
+- 目的：作为 Go 服务端商业化、安全发布和生产运维的活文档与执行事实源。
+
+## 问题
+
+当前 Go 控制面已具备用户、设备、激活码、模型号池、租约、用量、审计、PostgreSQL 与部分保留清理/指标能力，但缺少完整商业资源查询、生产支付、密码重置投递、对象存储发布、制品签名验证、备份恢复、追踪和 namespace 级配置 Schema。现有激活码仅保存哈希和首个核销设备，无法再次显示新功能上线前的明文，也无法准确管理全部历史设备绑定。
+
+本专项的实施边界全部位于服务端：Go API/领域服务、PostgreSQL/Secret Store、服务端 Worker、支付/邮件/对象存储适配器、服务端发布 CI 和生产运维。React 管理页与 Rust/Tauri 客户端不在本专项实施范围；OpenAPI 只提供可消费契约，消费端功能如需开发必须另立任务。
+
+## 目标
+
+- G-1：管理员能通过有界、可组合、可审计的 API 查询订阅、订单、设备和套餐版本。
+- G-2：建立不可变套餐版本、订单、微信支付、对账和订阅权益交付闭环。
+- G-3：建立不枚举账号、Token 仅存哈希、可重试可死信的密码重置投递 Worker。
+- G-4：新激活码使用独立加密表支持管理员二次认证后重显，并支持查看/修改设备容量与切换已知绑定。
+- G-5：在服务端使用私有对象存储、短时预签名 URL、签名清单、SBOM 和 Provenance 建立外部制品分发链。
+- G-6：将数据保留、备份/恢复、指标/追踪、容量告警和可验证 CI 发布变成上线门禁。
+- G-7：每个公共配置 namespace 通过版本化 JSON Schema Draft 2020-12 校验后才能发布。
+
+## 非目标
+
+- NG-1：本 PRD 不恢复实时话术幻化、旧媒体任务、服务端模型正文代理或请求预占。
+- NG-2：对象存储不存储用户本地视频/音频，不使 Go API 代理大文件数据面。
+- NG-3：首期不做退款、优惠券、发票、多币种、短信重置和多支付渠道。
+- NG-4：不预先拆微服务、引入 Kubernetes 或外部消息队列。
+- NG-5：本轮只保存规划文档，不修改 OpenAPI、代码、数据库或生产环境。
+- NG-6：本专项不实现 React 管理页面、Rust/Tauri 下载器、客户端安装器或客户端签名验证逻辑；这些消费端能力另立集成任务。
+
+## 成功标准
+
+- SC-1：四类管理资源的列表/详情均具备 SQL 分页、固定白名单筛选/排序、稳定错误码和权限测试。
+- SC-2：重复微信回调、结果未知和 Worker 重启不会重复收款或重复交付订阅；未验签、金额不一致或主体不一致的通知不会交付权益。
+- SC-3：密码重置不枚举账号，Token 不以明文落库/日志，投递 Worker 的重试、死信、取消和优雅关闭可验证。
+- SC-4：功能上线后的新激活码可在 HTTPS 下经二次认证重显；历史明文和未知历史设备不伪造。
+- SC-5：未通过签名身份、subject digest 和 Provenance 策略校验的制品无法由服务端发布或签发下载地址；服务端响应提供签名清单、digest 和客户端后续验证所需元数据。
+- SC-6：达到已验证的 RPO≤24h、RTO≤4h，备份恢复、回滚、指标告警和 trace 链路有可复现证据。
+- SC-7：未注册 namespace、Schema 无效、实例校验失败、包含敏感字段或依赖远程 `$ref` 的公共配置不能发布。
+- SC-8：服务器不构建源码，只加载经 CI 验证和签名的发布制品。
+
+## 关键场景
+
+### 场景 1：管理员调查商业事实
+
+- 操作者：管理员
+- 触发：按用户、状态、套餐版本和时间窗口筛选订单/订阅
+- 结果：获得有界分页结果与详情，不暴露支付凭证或原始通知
+
+### 场景 2：微信支付交付订阅
+
+- 操作者：普通用户、微信支付、支付 Worker
+- 触发：用户为固定套餐版本创建订单并扫码支付
+- 结果：验签、解密、幂等落库和对账通过后，订单变为已支付并交付一份订阅权益
+
+### 场景 3：用户自助重置密码
+
+- 操作者：用户、投递 Worker
+- 触发：用户提交账号标识，Worker 向已验证邮箱发送一次性重置链接
+- 结果：外部响应不泄露账号是否存在，Token 单次消费后撤销用户已有会话
+
+### 场景 4：管理员管理激活码
+
+- 操作者：管理员
+- 触发：二次认证后重显新激活码，或修改容量/切换已知设备
+- 结果：敏感读取受限流和审计保护；切换不增加已核销名额且旧会话失效
+
+### 场景 5：客户端下载可信制品
+
+- 操作者：CI、服务端、已授权客户端
+- 触发：CI 上传已签名制品，客户端请求短时下载
+- 结果：只有通过签名/Provenance 策略的制品可获得短时 URL，响应携带消费端后续验证所需的签名清单和 digest
+
+## 发现摘要
+
+- 证据、当前系统和验证面见 [context.md](./prd-server-commercial-production-readiness/context.md)。
+- 当前 Router 只有用户、设备、激活码、模型账号/租约/用量和审计管理路由，未见订阅、订单、套餐版本或支付领域。
+- 当前设备有列表/详情，但缺少本 PRD 要求的完整筛选与排序契约。
+- 现有保留 Worker 和 Prometheus 是可复用基础；保留范围、容量告警、备份恢复和 tracing 未形成生产闭环。
+- 现有制品链能生成 SHA-256、SBOM 和 BuildKit Provenance，运行资源通过 SSH/rsync 发布并验证清单；尚无对象存储、下载授权、签名身份和下游 Provenance 验证。
+- 代码中未找到用户所述“已有公共配置只校验 JSON/敏感字段”的对应服务端路由或领域实现；实施前按用户提供的外部现状重新核对，但本 PRD 已将 namespace 级 Schema 作为完整目标纳入。
+
+## 需求
+
+### 功能需求
+
+- FR-1：OpenAPI 作为订阅、订单、套餐版本、支付、激活码、制品和公共配置 API 的唯一外部契约。
+- FR-2：管理列表支持页码/页大小、资源白名单筛选、RFC3339 时间窗口、白名单排序和数据库中的 `COUNT + LIMIT/OFFSET`。
+- FR-3：订阅列表/详情返回用户、套餐版本、状态、起止时间、来源订单和脱敏权益摘要。
+- FR-4：订单列表/详情支持用户、渠道、状态、套餐版本、商户订单号和时间筛选，不返回微信密钥或原始通知。
+- FR-5：套餐版本一经发布即不可原地修改，订单保存当时价格/权益快照。
+- FR-6：设备管理 API 支持用户、状态、在线派生状态、OS、客户端版本、心跳时间和排序筛选。
+- FR-7：订单、支付尝试和订阅使用显式状态机、唯一约束和幂等键。
+- FR-8：首期生产支付适配器使用微信支付 API v3 官方 Go SDK 创建 Native 支付并查询/关闭订单。
+- FR-9：微信回调必须对原始 body 验签/解密，校验金额、币种、APPID、商户号和订单号，通知重入只交付一次。
+- FR-10：支付结果未知不盲目重建订单，由对账 Worker 查询供应商状态并恢复。
+- FR-11：订阅权益只由已验证支付事实或受审计的管理员命令交付。
+- FR-12：密码重置请求返回中性结果，Token 只存哈希且单次消费，成功后撤销用户会话。
+- FR-13：密码重置投递 Worker 使用持久化 Outbox，具有幂等、批次、超时、重试、退避、死信和优雅关闭。
+- FR-14：功能上线后创建的激活码在独立表使用 AES-256-GCM、AAD、`format_version` 和 `key_id` 加密保存明文。
+- FR-15：激活码重显必须是管理员、经密码二次认证、专用限流、审计、HTTPS 和 `no-store` 保护的 POST 操作。
+- FR-16：激活码详情返回逐设备绑定；历史无法还原的明文/设备明确标记不可用/未知。
+- FR-17：激活码容量为 1～100，不能低于已核销名额；切换设备使用原 slot，撤销旧设备会话/租约，并不转移会话给新设备。
+- FR-18：制品元数据包含版本、渠道、平台/架构、对象 key、字节数、SHA-256、签名 bundle、SBOM 和 Provenance 引用。
+- FR-19：制品只有在签名者身份、issuer、repository/workflow/ref、subject digest 和 Provenance 策略通过后才能发布。
+- FR-20：对象存储保持私有，下载前校验订阅/设备权限并签发短时、只读、单对象预签名 URL。
+- FR-21：服务端下载响应必须返回或引用已验证的签名清单、制品 digest、平台/架构和信任策略版本；消费端执行安装前校验属于后续客户端集成任务。
+- FR-22：每个公共配置 namespace 必须绑定不可变 JSON Schema Draft 2020-12 版本，未注册 namespace 拒绝发布。
+- FR-23：Schema 校验禁止运行时任意远程 `$ref`，敏感字段拒绝规则在 Schema 校验后仍必须执行。
+- FR-24：Schema 发布前 dry-run 已有配置，客户端读取响应携带 namespace、schema version、revision 和 ETag。
+- FR-25：保留 Worker 覆盖新数据集，每类数据有 TTL、批次、超时、索引、容量告警和审计例外。
+- FR-26：PostgreSQL 和对象存储有加密备份、失效域隔离、保留和隔离恢复演练。
+- FR-27：Prometheus 增加商业/Worker/存储/备份/发布低基数指标，OpenTelemetry 通过 OTLP 导出 HTTP、DB、Worker 和供应商追踪。
+- FR-28：CI 生成和签名 SBOM/Provenance，部署和对象存储发布前都要验证，服务器不构建源码。
+
+### 非功能需求
+
+- NFR-1：所有管理读写在服务端验证角色、动作和资源，不依赖前端隐藏按钮。
+- NFR-2：密码、Token、明文激活码、微信密钥/原始回调、邮箱和预签名 URL 不进入普通日志、指标、trace 或审计 payload。
+- NFR-3：金额使用整型分和显式币种，不使用浮点数。
+- NFR-4：外部调用有超时、取消、有界重试和重定向/SSRF 限制，不在数据库事务内执行。
+- NFR-5：Worker 有所有者、并发上限、锁租约、取消、优雅关闭和死信运维入口。
+- NFR-6：迁移是可审查前向迁移，不修改 0001～0022；每阶段说明发布顺序、回滚/前滚和锁表影响。
+- NFR-7：列表无 N+1 和无界内存分页；索引使用代表性数据的 `EXPLAIN (ANALYZE, BUFFERS)` 验证。
+- NFR-8：生产明文激活码、微信支付和制品下载仅通过 HTTPS。
+- NFR-9：首期备份目标 RPO≤24h、RTO≤4h，只有隔离恢复演练可作为达标证据。
+- NFR-10：服务端新代码按领域拆分文件，复用现有 Outbox、幂等、限流和可观测边界，删除本次暴露的未使用 Go 代码/导入/配置。
+
+## 假设
+
+- A-1：首个付费交付场景为桌面客户端/管理 Web 显示微信 Native 支付二维码。
+- A-2：首期密码重置投递渠道为邮箱，编程边界不绑定具体 SMTP/邮件供应商。
+- A-3：对象存储提供 S3-compatible 基本语义；具体厂商、区域和 CDN 在 Phase 7 发现门禁确认。
+- A-4：保留 Prometheus 指标，首期只用 OpenTelemetry 增加 tracing，避免重复指标事实源。
+- A-5：功能上线前的激活码明文无法恢复；历史多设备除首台外无法准确归属。
+
+## 依赖/约束
+
+- 现有 PostgreSQL normalized 读写、Outbox、会话、限流、Prometheus、OpenAPI 契约门禁和 CI 构建链。
+- 微信支付商户号、APPID、API v3 密钥、商户私钥/证书或微信支付公钥；所有秘密由 Secret Store/外部秘密注入管理。
+- 受控邮件投递凭证、可信域名、重置链接 origin 和已验证用户邮箱数据。
+- 私有对象存储、托管 CI OIDC 身份、Sigstore/GitHub Attestation 能力和服务端发布验证信任策略。
+- 生产 HTTPS、对象存储 TLS、PostgreSQL TLS 和不高于 9999 的公网监听端口约束。
+
+## 风险/边界情况
+
+- 支付回调重复、延迟、丢失、签名探测、证书/公钥轮换、金额不一致和未知提交结果。
+- 回调履约短事务提交结果未知或回调丢失；必须由本地幂等事实和主动查单恢复，不重复订阅，也不把已确认付款长期伪装成未付款。
+- 历史激活码和绑定数据缺口无法通过迁移消除，界面/API 必须显式表达未知。
+- 对象存储预签名 URL 泄露、无限制续期、签名者策略过宽或仅校验 SHA-256 会导致伪造制品被信任。
+- 备份可创建不等于可恢复；只有隔离恢复与业务核对能证明 RPO/RTO。
+- 不受限的 JSON Schema 远程 `$ref`、灾难正则、过大 Schema/实例或 Schema 变更可造成 SSRF/DoS/配置不兼容。
+
+## 执行规则
+
+- 默认按 Phase 1～9 顺序执行；任何并行都必须使用不重叠写入集，由主线统一审查。
+- 实施任一阶段前读本 PRD、当前 Phase、context 和对应专项约束。
+- 每阶段先写失败测试/等价验证，再写实现；OpenAPI 变更先于手写 DTO/路由，生成文件不手改。
+- 外部供应商和平台规则在阶段开始时重新查阅官方文档，不依赖本 PRD 的时点性记忆。
+- 服务器只接收本地/CI 构建且签名的制品，不上传源码构建。
+- 每阶段结束后更新当前 Phase、主 PRD 和受影响的后续 Phase，并完成服务端代码总监复核；消费端只做契约兼容检查，不在本专项修改业务代码。
+
+## 阶段索引
+
+| 阶段 | 状态 | 目标 | 验证重点 | 文件 |
+| --- | --- | --- | --- | --- |
+| Phase 1：契约与领域基线 | Not Started | 锁定资源、状态机、事务、错误码和迁移顺序 | 契约/迁移/安全边界 | [phase-01-contract-domain-baseline.md](./prd-server-commercial-production-readiness/phase-01-contract-domain-baseline.md) |
+| Phase 2：激活码安全管理 | Not Started | 加密明文、绑定明细、容量与切换 | 密钥/事务/历史兼容 | [phase-02-activation-security.md](./prd-server-commercial-production-readiness/phase-02-activation-security.md) |
+| Phase 3：商业核心事实 | Not Started | 套餐版本、订单、订阅和权益状态机 | 价格快照/幂等/并发 | [phase-03-commercial-core.md](./prd-server-commercial-production-readiness/phase-03-commercial-core.md) |
+| Phase 4：管理查询 API | Not Started | 补齐订阅、订单、套餐版本和设备查询/筛选 | SQL 分页/筛选/权限 | [phase-04-admin-query-apis.md](./prd-server-commercial-production-readiness/phase-04-admin-query-apis.md) |
+| Phase 5：微信支付 | Not Started | Native 下单、验签回调、对账和权益交付 | 官方 SDK/回调幂等/未知结果 | [phase-05-wechat-pay.md](./prd-server-commercial-production-readiness/phase-05-wechat-pay.md) |
+| Phase 6：密码重置 Worker | Not Started | 一次性 Token、邮件 Outbox 和可恢复投递 | 防枚举/限流/重试/死信 | [phase-06-password-reset-worker.md](./prd-server-commercial-production-readiness/phase-06-password-reset-worker.md) |
+| Phase 7：制品存储与下载 | Not Started | 对象存储、发布清单、签名校验和短时下载 | 真实性/授权/完整性 | [phase-07-artifact-distribution.md](./prd-server-commercial-production-readiness/phase-07-artifact-distribution.md) |
+| Phase 8：公共配置 Schema | Not Started | namespace 级 JSON Schema 注册、校验和发布 | Draft 2020-12/SSRF/兼容性 | [phase-08-public-config-schema.md](./prd-server-commercial-production-readiness/phase-08-public-config-schema.md) |
+| Phase 9：生产运维与供应链 | Not Started | 保留、备份恢复、指标/追踪、签名/Provenance 与发布 | RPO/RTO/告警/可验证发布 | [phase-09-operations-supply-chain.md](./prd-server-commercial-production-readiness/phase-09-operations-supply-chain.md) |
+
+## 全部阶段结束后的多轮复核
+
+- [ ] 1. 需求覆盖：每个 FR、NFR 和成功标准已满足或显式延期。
+- [ ] 2. 跨阶段集成：套餐→订单→支付→订阅→下载权限无重复事实源或断链。
+- [ ] 3. 正确性：成功、重复、失败、结果未知、过期、取消、并发和恢复路径全部覆盖。
+- [ ] 4. 简化复核：未引入无实际负载证据的微服务、队列、缓存或抽象。
+- [ ] 5. 重复/清理：死代码、无用导入/依赖、临时开关、敏感调试日志和重复组件已删除。
+- [ ] 6. 安全/隐私：身份授权、密钥、支付、邮箱、激活码、预签名 URL 和制品信任边界通过。
+- [ ] 7. 性能/负载：管理查询、支付回调、Worker、保留清理和对象存储无无界资源使用。
+- [ ] 8. 验证：单元、PostgreSQL 集成、API E2E、供应商沙箱/小额真实验收、恢复演练和发布签名校验适合风险。
+- [ ] 9. 文档/运维：OpenAPI、错误码、架构、Runbook、迁移、回滚、告警和支持文档同步。
+- [ ] 10. PRD 收尾：状态、变更记录、延期项和实际证据更新完成。
+
+## 开放问题
+
+- 在 Phase 5 开始前确认微信 Native 支付是否为首个上线交付形态；若改为 JSAPI/App/H5，必须先修订 Phase 5。
+- 在 Phase 6 开始前确认邮件供应商、发件域和用户邮箱验证流程。
+- 在 Phase 7 开始前确认对象存储厂商/区域/CDN、公司 CI 平台与签名信任根托管方式。
+
+## 变更记录
+
+- 2026-08-21：创建拆分式主 PRD，纳入管理查询、微信支付、密码重置 Worker、激活码独立加密表、制品链、生产运维和 namespace 级 JSON Schema；根据用户要求全部作为服务端专项且本轮不实施。

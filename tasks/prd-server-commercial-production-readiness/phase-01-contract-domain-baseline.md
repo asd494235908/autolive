@@ -1,0 +1,80 @@
+# Phase 1：契约与领域基线
+
+Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-production-readiness.md)
+状态：Not Started
+最后更新：2026-08-21
+
+## 目标
+
+在实现任何商业能力前，锁定资源名称、状态机、数据分类、幂等、审计、错误码、迁移和发布顺序，避免后续阶段建立多个事实源。
+
+## 主 PRD 上下文
+
+- 目标：G-1～G-7
+- 成功标准：SC-1～SC-8
+- 需求：FR-1～FR-28，NFR-1～NFR-10
+- 场景：全部场景的共享基础
+
+## 阶段发现门禁
+
+编码前重新检查：
+
+- [ ] `产品需求文档.md`、`系统架构总览.md`、`管理系统架构.md`、`数据库迁移与密钥存储约束.md`
+- [ ] `接口契约/openapi.yaml`、`接口契约/错误码.md`、`backend/internal/httpapi/contract_test.go`
+- [ ] `backend/migrations/catalog.go`、`backend/migrations/catalog_test.go`、已部署最新迁移版本
+- [ ] 数据分类、保留、加密、审计和是否允许 API 回显的字段矩阵
+- [ ] 微信支付、JSON Schema、OpenTelemetry、Sigstore/SLSA 官方文档仍适用
+- [ ] 主 PRD 假设仍成立；如改变，先更新本 PRD 和后续 Phase
+
+## 范围
+
+### 包含
+
+- 建立领域词汇、状态转换表、金额/时间/ID 约定和数据分类。
+- 锁定计划路由、DTO、错误码、权限、幂等 scope 和审计 action/target 命名。
+- 编写迁移序列、兼容发布、前滚/回滚和数据回填策略。
+- 定义共享 Worker 租约/重试/死信协议和 provider adapter 最小接口。
+
+### 不包含
+
+- 不实现具体业务路由、供应商调用或 Worker。
+- 不变更 0001～0022 历史迁移。
+
+## 实施清单
+
+- [ ] 为 plan/plan version/order/payment attempt/subscription/reset token/delivery/artifact/config schema 定义唯一词汇。
+- [ ] 将每个状态的允许转换、终态、恢复路径和管理员例外写入设计。
+- [ ] 为所有新字段标注 public/internal/secret/personal/payment/audit-only 分类。
+- [ ] 定义列表筛选/排序白名单、页大小和时间窗口上限。
+- [ ] 定义商业写入幂等指纹和 `COMMIT_OUTCOME_UNKNOWN` 核对语义。
+- [ ] 定义 Worker 任务表的领取、锁超时、重试、死信、取消和优雅关闭共享约定。
+- [ ] 将预计迁移按领域分组，并说明大表加列/索引的锁表影响。
+- [ ] 建立 OpenAPI/错误码/Go DTO 的变更顺序和 CI 失败门禁；消费端生成类型只做兼容检查，不在本专项修改业务代码。
+- [ ] 同步产品、系统、管理系统、数据库和运维文档。
+
+## 验证策略
+
+本阶段以契约和静态验证为主：文档链接、OpenAPI 解析/本地引用、错误码映射、迁移 catalog 和数据分类审查。
+
+## 验证清单
+
+- [ ] `bash tools/check-document-references.sh`
+- [ ] OpenAPI YAML、本地 `$ref`、Router 方法和共享错误响应检查通过
+- [ ] 迁移 catalog 和从空库迁移测试通过
+- [ ] 金额、时间、幂等、审计和秘密分类无两义
+- [ ] 后续 8 个 Phase 与最终状态机/迁移序列一致
+
+## 退出标准
+
+- [ ] 阶段目标完成，共享语义已定稿
+- [ ] 无未解释的双事实源、密钥落点或事务边界
+- [ ] 后续 Phase 已根据最终发现修订
+
+## 阶段末多轮复核
+
+- [ ] 1. 意图/覆盖；2. 正确性；3. 简化；4. 边界/命名；5. 重复/清理
+- [ ] 6. 安全/隐私；7. 性能/容量；8. 验证充分性；9. 后续阶段；10. 主 PRD 同步
+
+## 发现/决策
+
+- 2026-08-21：阶段文件创建，本轮未开始实施。
