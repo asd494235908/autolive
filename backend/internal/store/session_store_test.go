@@ -134,6 +134,54 @@ func TestSQLSessionStoreGetRestoresProduct(t *testing.T) {
 	}
 }
 
+func TestSQLSessionStoreGetRejectsNullProduct(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	sessions, err := NewSQLSessionStore(database, time.Now)
+	if err != nil {
+		t.Fatalf("NewSQLSessionStore() error = %v", err)
+	}
+	now := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, product, device_id, access_token_hash, refresh_token_hash")).
+		WithArgs("access-null-product").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "product", "device_id", "access_token_hash", "refresh_token_hash", "access_expires_at", "refresh_expires_at", "created_at"}).
+			AddRow("session-1", "user-1", nil, nil, "access-null-product", "refresh-1", now.Add(time.Hour), now.Add(24*time.Hour), now))
+
+	if _, found, err := sessions.GetByAccessTokenHash(context.Background(), "access-null-product"); err == nil || found {
+		t.Fatalf("GetByAccessTokenHash() = found %t, error %v; want fail closed", found, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestSQLSessionStoreGetRejectsInvalidProduct(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	sessions, err := NewSQLSessionStore(database, time.Now)
+	if err != nil {
+		t.Fatalf("NewSQLSessionStore() error = %v", err)
+	}
+	now := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, product, device_id, access_token_hash, refresh_token_hash")).
+		WithArgs("access-invalid-product").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "product", "device_id", "access_token_hash", "refresh_token_hash", "access_expires_at", "refresh_expires_at", "created_at"}).
+			AddRow("session-1", "user-1", "unknown", nil, "access-invalid-product", "refresh-1", now.Add(time.Hour), now.Add(24*time.Hour), now))
+
+	if _, found, err := sessions.GetByAccessTokenHash(context.Background(), "access-invalid-product"); err == nil || found {
+		t.Fatalf("GetByAccessTokenHash() = found %t, error %v; want fail closed", found, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
 func TestSQLSessionStoreRevokeByUserID(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	if err != nil {

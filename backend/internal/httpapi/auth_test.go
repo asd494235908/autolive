@@ -342,6 +342,49 @@ func TestLoginBindsProductAndRefreshIgnoresProductReplacement(t *testing.T) {
 	}
 }
 
+type loginProductRepositoryStub struct {
+	membership controlplane.UserProductMembership
+	err        error
+}
+
+func (s loginProductRepositoryStub) ListProducts(context.Context) ([]controlplane.ProductSummary, error) {
+	return nil, nil
+}
+
+func (s loginProductRepositoryStub) GetProduct(context.Context, controlplane.ProductCode) (controlplane.ProductSummary, error) {
+	return controlplane.ProductSummary{}, nil
+}
+
+func (s loginProductRepositoryStub) GetUserProductMembership(context.Context, string, controlplane.ProductCode) (controlplane.UserProductMembership, error) {
+	return s.membership, s.err
+}
+
+func (s loginProductRepositoryStub) EnsureUserProductMembership(context.Context, string, controlplane.ProductCode) (controlplane.UserProductMembership, error) {
+	return controlplane.UserProductMembership{}, errors.New("EnsureUserProductMembership must not be called during login")
+}
+
+func TestLoginRejectsMissingOrDisabledProductMembership(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		membership controlplane.UserProductMembership
+		err        error
+	}{
+		{name: "missing", err: controlplane.ErrForbidden},
+		{name: "disabled", membership: controlplane.UserProductMembership{Status: "disabled"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := store.NewMemoryStore(time.Now)
+			auth := newAuthenticatorWithProductRepository(service.NewControlPlane(repository), AuthConfig{Username: "admin", Password: "correct-password"}, loginProductRepositoryStub{membership: test.membership, err: test.err})
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"correct-password","product":"douyin_desktop"}`))
+			loginHandler(auth).ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusForbidden {
+				t.Fatalf("login status = %d, want %d; body=%s", recorder.Code, http.StatusForbidden, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestLoginRequiresProductUnlessExplicitLegacyCompatibility(t *testing.T) {
 	auth := newAuthenticator(service.NewControlPlane(store.NewMemoryStore(time.Now)), AuthConfig{
 		Username: "admin",

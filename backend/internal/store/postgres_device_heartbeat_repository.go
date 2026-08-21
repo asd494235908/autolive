@@ -28,9 +28,24 @@ func (s *PostgresRepository) RecordHeartbeatWithSessionBinding(ctx context.Conte
 	record.Fingerprint = strings.TrimSpace(record.Fingerprint)
 	record.AccessTokenHash = strings.TrimSpace(record.AccessTokenHash)
 	record.UserID = strings.TrimSpace(record.UserID)
+	record.Product = controlplane.ProductCode(strings.TrimSpace(string(record.Product)))
 	record.Input.DeviceID = strings.TrimSpace(record.Input.DeviceID)
+	record.Input.Product = controlplane.ProductCode(strings.TrimSpace(string(record.Input.Product)))
+	if !record.Product.Valid() || !record.Input.Product.Valid() {
+		return controlplane.HeartbeatResult{}, controlplane.ErrInvalidRequest
+	}
 	if record.Scope == "" || record.IdempotencyKey == "" || record.Fingerprint == "" || record.AccessTokenHash == "" || record.UserID == "" || record.Input.DeviceID == "" {
 		return controlplane.HeartbeatResult{}, errors.New("normalized heartbeat arguments are incomplete")
+	}
+	if record.Product != record.Input.Product {
+		return controlplane.HeartbeatResult{}, controlplane.ErrForbidden
+	}
+	if record.Audit.Product == "" {
+		record.Audit.Product = record.Product
+	} else if !record.Audit.Product.Valid() {
+		return controlplane.HeartbeatResult{}, controlplane.ErrInvalidRequest
+	} else if record.Audit.Product != record.Product {
+		return controlplane.HeartbeatResult{}, controlplane.ErrForbidden
 	}
 	if err := ctx.Err(); err != nil {
 		return controlplane.HeartbeatResult{}, err
@@ -47,9 +62,12 @@ func (s *PostgresRepository) RecordHeartbeatWithSessionBinding(ctx context.Conte
 		return controlplane.HeartbeatResult{}, err
 	}
 
-	currentDeviceID, err := s.lockAuthenticatedSession(operationCtx, tx, record.AccessTokenHash, record.UserID)
+	currentDeviceID, sessionProduct, err := s.lockAuthenticatedSession(operationCtx, tx, record.AccessTokenHash, record.UserID)
 	if err != nil {
 		return controlplane.HeartbeatResult{}, err
+	}
+	if sessionProduct != record.Product {
+		return controlplane.HeartbeatResult{}, controlplane.ErrForbidden
 	}
 	if currentDeviceID != "" && currentDeviceID != record.Input.DeviceID {
 		return controlplane.HeartbeatResult{}, ErrSessionDeviceBindingConflict
@@ -69,6 +87,9 @@ func (s *PostgresRepository) RecordHeartbeatWithSessionBinding(ctx context.Conte
 	if !exists || device.UserID != record.UserID {
 		return controlplane.HeartbeatResult{}, controlplane.ErrDeviceNotFound
 	}
+	if device.Product != record.Product {
+		return controlplane.HeartbeatResult{}, controlplane.ErrForbidden
+	}
 	if device.Status != controlplane.DeviceStatusActive {
 		return controlplane.HeartbeatResult{}, controlplane.ErrDeviceDisabled
 	}
@@ -85,7 +106,7 @@ func (s *PostgresRepository) RecordHeartbeatWithSessionBinding(ctx context.Conte
 			return controlplane.HeartbeatResult{}, controlplane.ErrIdempotencyConflict
 		}
 		if currentDeviceID == "" {
-			if err := bindAuthenticatedSession(operationCtx, tx, record.AccessTokenHash, record.Input.DeviceID); err != nil {
+			if err := bindAuthenticatedSession(operationCtx, tx, record.AccessTokenHash, record.Input.DeviceID, record.Product); err != nil {
 				return controlplane.HeartbeatResult{}, err
 			}
 		}
@@ -102,7 +123,7 @@ func (s *PostgresRepository) RecordHeartbeatWithSessionBinding(ctx context.Conte
 
 	acceptedAt := s.Now()
 	status := record.Input.Status
-	if _, err := tx.ExecContext(operationCtx, `
+	result, err := tx.ExecContext(operationCtx, `
 		UPDATE devices
 		SET disk_free_bytes = $2,
 		    memory_total_bytes = $3,
@@ -114,12 +135,20 @@ func (s *PostgresRepository) RecordHeartbeatWithSessionBinding(ctx context.Conte
 		    current_media_name = $9,
 		    playback_state = $10,
 		    last_heartbeat_at = $11
-		WHERE id = $1
-	`, record.Input.DeviceID, status.DiskFreeBytes, status.MemoryTotalBytes, status.MemoryAvailableBytes, status.CPULogicalCores, status.OSName, status.OSVersion, status.KernelVersion, status.CurrentMediaName, status.PlaybackState, acceptedAt); err != nil {
+		WHERE id = $1 AND product = $12
+	`, record.Input.DeviceID, status.DiskFreeBytes, status.MemoryTotalBytes, status.MemoryAvailableBytes, status.CPULogicalCores, status.OSName, status.OSVersion, status.KernelVersion, status.CurrentMediaName, status.PlaybackState, acceptedAt, record.Product)
+	if err != nil {
 		return controlplane.HeartbeatResult{}, postgresOperationError(operationCtx, fmt.Errorf("update normalized device heartbeat: %w", err))
 	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return controlplane.HeartbeatResult{}, postgresOperationError(operationCtx, fmt.Errorf("count normalized device heartbeat update: %w", err))
+	}
+	if rows != 1 {
+		return controlplane.HeartbeatResult{}, controlplane.ErrForbidden
+	}
 	if currentDeviceID == "" {
-		if err := bindAuthenticatedSession(operationCtx, tx, record.AccessTokenHash, record.Input.DeviceID); err != nil {
+		if err := bindAuthenticatedSession(operationCtx, tx, record.AccessTokenHash, record.Input.DeviceID, record.Product); err != nil {
 			return controlplane.HeartbeatResult{}, err
 		}
 	}

@@ -38,10 +38,10 @@ func (s *PostgresRepository) RecordAudit(ctx context.Context, input controlplane
 	}
 	if _, err := tx.ExecContext(operationCtx, `
 		INSERT INTO audit_logs (
-			id, actor_user_id, device_id, action, resource_type, resource_id,
+			id, product, actor_user_id, device_id, action, resource_type, resource_id,
 			request_id, outcome, status_code, error_code, payload, created_at
-		) VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), $4, $5, NULLIF($6, ''), NULLIF($7, ''), $8, $9, NULLIF($10, ''), '{}'::jsonb, $11)
-	`, id, input.ActorUserID, input.DeviceID, input.Action, input.TargetType, input.TargetID, input.RequestID, input.Outcome, input.StatusCode, input.ErrorCode, s.Now()); err != nil {
+		) VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, NULLIF($7, ''), NULLIF($8, ''), $9, $10, NULLIF($11, ''), '{}'::jsonb, $12)
+		`, id, input.Product, input.ActorUserID, input.DeviceID, input.Action, input.TargetType, input.TargetID, input.RequestID, input.Outcome, input.StatusCode, input.ErrorCode, s.Now()); err != nil {
 		return postgresOperationError(operationCtx, fmt.Errorf("insert normalized audit: %w", err))
 	}
 	if err := tx.Commit(); err != nil {
@@ -52,6 +52,7 @@ func (s *PostgresRepository) RecordAudit(ctx context.Context, input controlplane
 
 func normalizeAuditInput(input controlplane.AuditLogInput) (controlplane.AuditLogInput, error) {
 	input.ActorUserID = strings.TrimSpace(input.ActorUserID)
+	input.Product = controlplane.ProductCode(strings.TrimSpace(string(input.Product)))
 	input.DeviceID = strings.TrimSpace(input.DeviceID)
 	input.Action = strings.TrimSpace(input.Action)
 	input.TargetType = strings.TrimSpace(input.TargetType)
@@ -61,6 +62,11 @@ func normalizeAuditInput(input controlplane.AuditLogInput) (controlplane.AuditLo
 	input.RequestID = strings.TrimSpace(input.RequestID)
 	if input.Outcome == "" {
 		input.Outcome = "unknown"
+	}
+	if input.Product == "" {
+		input.Product = controlplane.ProductAutoLive
+	} else if !input.Product.Valid() {
+		return controlplane.AuditLogInput{}, controlplane.ErrInvalidRequest
 	}
 	if input.Action == "" || input.TargetType == "" || len(input.Action) > 512 || len(input.TargetType) > 128 || len(input.TargetID) > 128 || len(input.ErrorCode) > 128 || len(input.RequestID) > 128 || input.StatusCode < 0 || input.StatusCode > 599 {
 		return controlplane.AuditLogInput{}, controlplane.ErrInvalidRequest

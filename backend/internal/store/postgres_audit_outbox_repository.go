@@ -72,11 +72,11 @@ func (s *PostgresRepository) enqueueAuditOutboxTx(ctx context.Context, tx *sql.T
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO audit_outbox (
-			id, dedupe_key, payload, status, attempts, next_attempt_at,
+			id, product, dedupe_key, payload, status, attempts, next_attempt_at,
 			created_at, updated_at
-		) VALUES ($1, $2, $3::jsonb, 'pending', 0, $4, $4, $4)
+		) VALUES ($1, $2, $3, $4::jsonb, 'pending', 0, $5, $5, $5)
 		ON CONFLICT (dedupe_key) DO NOTHING
-	`, outboxID, dedupeKey, payload, now); err != nil {
+	`, outboxID, input.Product, dedupeKey, payload, now); err != nil {
 		return fmt.Errorf("enqueue audit outbox: %w", err)
 	}
 	return nil
@@ -106,7 +106,7 @@ func (s *PostgresRepository) DispatchAuditOutbox(ctx context.Context, batchSize 
 	}
 	defer func() { _ = tx.Rollback() }()
 	rows, err := tx.QueryContext(operationCtx, `
-		SELECT id, payload
+		SELECT id, payload, product
 		FROM audit_outbox
 		WHERE next_attempt_at <= $1
 		  AND (status = 'pending' OR (status = 'processing' AND updated_at <= $2))
@@ -120,11 +120,12 @@ func (s *PostgresRepository) DispatchAuditOutbox(ctx context.Context, batchSize 
 	type row struct {
 		id      string
 		payload []byte
+		product sql.NullString
 	}
 	claimed := make([]row, 0, batchSize)
 	for rows.Next() {
 		var item row
-		if err := rows.Scan(&item.id, &item.payload); err != nil {
+		if err := rows.Scan(&item.id, &item.payload, &item.product); err != nil {
 			_ = rows.Close()
 			return 0, postgresOperationError(operationCtx, fmt.Errorf("scan audit outbox: %w", err))
 		}
@@ -153,7 +154,7 @@ func (s *PostgresRepository) DispatchAuditOutbox(ctx context.Context, batchSize 
 		if err := ctx.Err(); err != nil {
 			return delivered, err
 		}
-		if err := s.deliverAuditOutboxRow(ctx, item.id, item.payload, now); err != nil {
+		if err := s.deliverAuditOutboxRow(ctx, item.id, item.payload, item.product, now); err != nil {
 			return delivered, err
 		}
 		delivered++
@@ -161,10 +162,22 @@ func (s *PostgresRepository) DispatchAuditOutbox(ctx context.Context, batchSize 
 	return delivered, nil
 }
 
-func (s *PostgresRepository) deliverAuditOutboxRow(ctx context.Context, outboxID string, payload []byte, now time.Time) error {
+func (s *PostgresRepository) deliverAuditOutboxRow(ctx context.Context, outboxID string, payload []byte, storedProduct sql.NullString, now time.Time) error {
 	var input controlplane.AuditLogInput
 	if err := json.Unmarshal(payload, &input); err != nil {
 		return s.markAuditOutboxRetry(ctx, outboxID, fmt.Errorf("decode audit outbox payload: %w", err), now)
+	}
+	if !storedProduct.Valid || strings.TrimSpace(storedProduct.String) == "" {
+		storedProduct = sql.NullString{String: string(controlplane.ProductAutoLive), Valid: true}
+	}
+	product, productErr := controlplane.ParseProductCode(storedProduct.String)
+	if productErr != nil {
+		return s.markAuditOutboxRetry(ctx, outboxID, fmt.Errorf("validate stored audit outbox product: %w", productErr), now)
+	}
+	if input.Product == "" {
+		input.Product = product
+	} else if input.Product != product {
+		return s.markAuditOutboxRetry(ctx, outboxID, controlplane.ErrForbidden, now)
 	}
 	input, err := normalizeAuditInput(input)
 	if err != nil {
@@ -180,11 +193,11 @@ func (s *PostgresRepository) deliverAuditOutboxRow(ctx context.Context, outboxID
 	auditID := "audit_" + strings.TrimPrefix(outboxID, "audit_outbox_")
 	if _, err := tx.ExecContext(operationCtx, `
 		INSERT INTO audit_logs (
-			id, actor_user_id, device_id, action, resource_type, resource_id,
+			id, product, actor_user_id, device_id, action, resource_type, resource_id,
 			request_id, outcome, status_code, error_code, payload, created_at
-		) VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), $4, $5, NULLIF($6, ''), NULLIF($7, ''), $8, $9, NULLIF($10, ''), '{}'::jsonb, $11)
+		) VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, NULLIF($7, ''), NULLIF($8, ''), $9, $10, NULLIF($11, ''), '{}'::jsonb, $12)
 		ON CONFLICT (id) DO NOTHING
-	`, auditID, input.ActorUserID, input.DeviceID, input.Action, input.TargetType, input.TargetID, input.RequestID, input.Outcome, input.StatusCode, input.ErrorCode, now); err != nil {
+		`, auditID, input.Product, input.ActorUserID, input.DeviceID, input.Action, input.TargetType, input.TargetID, input.RequestID, input.Outcome, input.StatusCode, input.ErrorCode, now); err != nil {
 		_ = tx.Rollback()
 		return s.markAuditOutboxRetry(ctx, outboxID, fmt.Errorf("deliver audit outbox: %w", err), now)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"autoLive/backend/internal/controlplane"
@@ -97,6 +98,7 @@ func (s *SQLSessionStore) get(ctx context.Context, predicate, value string) (Aut
 	ctx, cancel := s.operationContext(ctx)
 	defer cancel()
 	var session AuthSession
+	var product sql.NullString
 	var deviceID sql.NullString
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, user_id, product, device_id, access_token_hash, refresh_token_hash,
@@ -105,7 +107,7 @@ func (s *SQLSessionStore) get(ctx context.Context, predicate, value string) (Aut
 		WHERE `+predicate+` AND revoked_at IS NULL
 		LIMIT 1
 	`, value).Scan(
-		&session.ID, &session.UserID, &session.Product, &deviceID, &session.AccessTokenHash, &session.RefreshTokenHash,
+		&session.ID, &session.UserID, &product, &deviceID, &session.AccessTokenHash, &session.RefreshTokenHash,
 		&session.AccessExpiresAt, &session.RefreshExpiresAt, &session.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -113,6 +115,9 @@ func (s *SQLSessionStore) get(ctx context.Context, predicate, value string) (Aut
 	}
 	if err != nil {
 		return AuthSession{}, false, postgresOperationError(ctx, err)
+	}
+	if err := assignSessionProduct(&session, product); err != nil {
+		return AuthSession{}, false, err
 	}
 	if deviceID.Valid {
 		session.DeviceID = deviceID.String
@@ -136,6 +141,7 @@ func (s *SQLSessionStore) Rotate(ctx context.Context, refreshTokenHash string, n
 	defer func() { _ = tx.Rollback() }()
 
 	var old AuthSession
+	var oldProduct sql.NullString
 	var deviceID sql.NullString
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, user_id, product, device_id, access_token_hash, refresh_token_hash,
@@ -146,7 +152,7 @@ func (s *SQLSessionStore) Rotate(ctx context.Context, refreshTokenHash string, n
 		  AND refresh_expires_at > CURRENT_TIMESTAMP
 		FOR UPDATE
 	`, refreshTokenHash).Scan(
-		&old.ID, &old.UserID, &old.Product, &deviceID, &old.AccessTokenHash, &old.RefreshTokenHash,
+		&old.ID, &old.UserID, &oldProduct, &deviceID, &old.AccessTokenHash, &old.RefreshTokenHash,
 		&old.AccessExpiresAt, &old.RefreshExpiresAt, &old.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -154,6 +160,9 @@ func (s *SQLSessionStore) Rotate(ctx context.Context, refreshTokenHash string, n
 	}
 	if err != nil {
 		return AuthSession{}, false, postgresOperationError(ctx, err)
+	}
+	if err := assignSessionProduct(&old, oldProduct); err != nil {
+		return AuthSession{}, false, err
 	}
 	if deviceID.Valid {
 		old.DeviceID = deviceID.String
@@ -272,5 +281,17 @@ func validateAuthSession(session AuthSession) error {
 		!session.Product.Valid() || session.AccessExpiresAt.IsZero() || session.RefreshExpiresAt.IsZero() || !session.RefreshExpiresAt.After(session.AccessExpiresAt) {
 		return errors.New("invalid auth session")
 	}
+	return nil
+}
+
+func assignSessionProduct(session *AuthSession, raw sql.NullString) error {
+	if session == nil || !raw.Valid {
+		return errors.New("auth session product is missing")
+	}
+	product, err := controlplane.ParseProductCode(raw.String)
+	if err != nil {
+		return fmt.Errorf("auth session product is invalid: %w", err)
+	}
+	session.Product = product
 	return nil
 }

@@ -527,13 +527,13 @@ func TestPostgresRepositoryNormalizedUserDevicePageChecksOwnershipAndBoundsSQL(t
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM devices WHERE user_id = $1")).
 		WithArgs("usr_00000001").
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, device_name, platform, client_version, status")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, product, device_name, platform, client_version, status")).
 		WithArgs("usr_00000001", 20, 0).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "user_id", "device_name", "platform", "client_version", "status",
+			"id", "user_id", "product", "device_name", "platform", "client_version", "status",
 			"disk_free_bytes", "memory_total_bytes", "memory_available_bytes", "cpu_logical_cores",
 			"runtime_os_name", "runtime_os_version", "kernel_version", "current_media_name", "playback_state", "last_heartbeat_at",
-		}).AddRow("dev_00000001", "usr_00000001", "Studio", "windows", "1.2.3", controlplane.DeviceStatusActive,
+		}).AddRow("dev_00000001", "usr_00000001", string(controlplane.ProductAutoLive), "Studio", "windows", "1.2.3", controlplane.DeviceStatusActive,
 			int64(100), int64(200), int64(150), 8, "Windows", "11", "kernel", "demo.mp4", "playing", time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)))
 	mock.ExpectCommit()
 
@@ -595,11 +595,11 @@ func TestPostgresRepositoryNormalizedAuditPageKeepsStructuredFields(t *testing.T
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM audit_logs")).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, actor_user_id, device_id, action, resource_type")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, actor_user_id, device_id, action, resource_type")).
 		WithArgs(20, 0).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "actor_user_id", "device_id", "action", "resource_type", "resource_id", "request_id", "outcome", "status_code", "error_code", "created_at",
-		}).AddRow("audit_00000001", "usr_00000001", "dev_00000001", "update", "user", "usr_00000001", "req_00000001", "failure", 409, "CONFLICT", time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)))
+			"id", "product", "actor_user_id", "device_id", "action", "resource_type", "resource_id", "request_id", "outcome", "status_code", "error_code", "created_at",
+		}).AddRow("audit_00000001", string(controlplane.ProductAutoLive), "usr_00000001", "dev_00000001", "update", "user", "usr_00000001", "req_00000001", "failure", 409, "CONFLICT", time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)))
 	mock.ExpectCommit()
 
 	page, err := repository.ListAuditLogsPage(context.Background(), 0, 20)
@@ -630,10 +630,10 @@ func TestPostgresRepositoryNormalizedAuditFilteredPageUsesWhitelist(t *testing.T
 	expectNormalizedPageCoverage(mock)
 	countExpectation := mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM audit_logs WHERE actor_user_id = $1 AND outcome = $2 AND created_at >= $3 AND created_at <= $4"))
 	countExpectation.WithArgs("usr_00000001", "failure", createdAfter, createdBefore).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	pageExpectation := mock.ExpectQuery(regexp.QuoteMeta("SELECT id, actor_user_id, device_id, action, resource_type"))
+	pageExpectation := mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, actor_user_id, device_id, action, resource_type"))
 	pageExpectation.WithArgs("usr_00000001", "failure", createdAfter, createdBefore, 10, 1).WillReturnRows(sqlmock.NewRows([]string{
-		"id", "actor_user_id", "device_id", "action", "resource_type", "resource_id", "request_id", "outcome", "status_code", "error_code", "created_at",
-	}).AddRow("audit_00000001", "usr_00000001", "dev_00000001", "PATCH /users", "user", "usr_00000001", "req_00000001", "failure", 409, "CONFLICT", createdBefore))
+		"id", "product", "actor_user_id", "device_id", "action", "resource_type", "resource_id", "request_id", "outcome", "status_code", "error_code", "created_at",
+	}).AddRow("audit_00000001", string(controlplane.ProductAutoLive), "usr_00000001", "dev_00000001", "PATCH /users", "user", "usr_00000001", "req_00000001", "failure", 409, "CONFLICT", createdBefore))
 	mock.ExpectCommit()
 
 	page, err := repository.ListAuditLogsPageWithOptions(context.Background(), AuditLogPageOptions{
@@ -941,14 +941,14 @@ func TestPostgresRepositoryNormalizedModeLoadsDomainTablesUnderAdvisoryLock(t *t
 	mock.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock")).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, username, password_hash, role, status, created_at")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT user_id, allowed_models, daily_token_limit, updated_at")).WillReturnRows(sqlmock.NewRows([]string{"user_id"}))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, device_name, platform, client_version, status")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, product, device_name, platform, client_version, status")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, code_hash, code_prefix, status, expires_at, used_at")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, provider, model, base_url, secret_ref, status, priority")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, account_id, user_id, device_id, purpose, status, expires_at")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, lease_id, client_call_id, request_id, provider, model")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, payload FROM model_pool_test_results")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT idempotency_key, fingerprint, resource_id")).WillReturnRows(sqlmock.NewRows([]string{"idempotency_key"}))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, actor_user_id, device_id, action, resource_type")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, actor_user_id, device_id, action, resource_type")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT status FROM normalized_backfill_state WHERE id = TRUE FOR SHARE")).WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("completed"))
 	mock.ExpectCommit()
 
@@ -993,8 +993,8 @@ func TestPostgresRepositoryNormalizedModeRestoresDomainFields(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT user_id, allowed_models, daily_token_limit, updated_at")).WillReturnRows(
 		sqlmock.NewRows([]string{"user_id", "allowed_models", "daily_token_limit", "updated_at"}).AddRow("usr_00000007", []byte(`["openai/rewrite"]`), 100, createdAt),
 	)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, device_name, platform, client_version, status")).WillReturnRows(
-		sqlmock.NewRows([]string{"id", "user_id", "device_name", "platform", "client_version", "status", "disk_free_bytes", "memory_total_bytes", "memory_available_bytes", "cpu_logical_cores", "runtime_os_name", "runtime_os_version", "kernel_version", "current_media_name", "playback_state", "last_heartbeat_at"}).AddRow("dev_00000007", "usr_00000007", "Studio", "windows", "1.2.3", "active", int64(10), int64(20), int64(15), 8, "Windows", "11", "kernel", "demo.mp4", "playing", now),
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, product, device_name, platform, client_version, status")).WillReturnRows(
+		sqlmock.NewRows([]string{"id", "user_id", "product", "device_name", "platform", "client_version", "status", "disk_free_bytes", "memory_total_bytes", "memory_available_bytes", "cpu_logical_cores", "runtime_os_name", "runtime_os_version", "kernel_version", "current_media_name", "playback_state", "last_heartbeat_at"}).AddRow("dev_00000007", "usr_00000007", string(controlplane.ProductAutoLive), "Studio", "windows", "1.2.3", "active", int64(10), int64(20), int64(15), 8, "Windows", "11", "kernel", "demo.mp4", "playing", now),
 	)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, code_hash, code_prefix, status, expires_at, used_at")).WillReturnRows(
 		sqlmock.NewRows([]string{"id", "code_hash", "code_prefix", "status", "expires_at", "used_at", "used_by_user_id", "used_by_device_id", "max_devices", "bound_devices"}).AddRow("ac_00000007", "digest", "AUTO-ABCD", "used", now.Add(time.Hour), usedAt, "usr_00000007", "dev_00000007", 1, 1),
@@ -1014,8 +1014,8 @@ func TestPostgresRepositoryNormalizedModeRestoresDomainFields(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT idempotency_key, fingerprint, resource_id")).WillReturnRows(
 		sqlmock.NewRows([]string{"idempotency_key", "fingerprint", "resource_id"}).AddRow("create-user:key-7", "fp-7", "usr_00000007"),
 	)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, actor_user_id, device_id, action, resource_type")).WillReturnRows(
-		sqlmock.NewRows([]string{"id", "actor_user_id", "device_id", "action", "resource_type", "resource_id", "request_id", "outcome", "status_code", "error_code", "created_at"}).AddRow("audit_00000007", "usr_00000007", "dev_00000007", "create", "user", "usr_00000007", "req-7", "success", 201, nil, createdAt),
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, actor_user_id, device_id, action, resource_type")).WillReturnRows(
+		sqlmock.NewRows([]string{"id", "product", "actor_user_id", "device_id", "action", "resource_type", "resource_id", "request_id", "outcome", "status_code", "error_code", "created_at"}).AddRow("audit_00000007", string(controlplane.ProductAutoLive), "usr_00000007", "dev_00000007", "create", "user", "usr_00000007", "req-7", "success", 201, nil, createdAt),
 	)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT status FROM normalized_backfill_state WHERE id = TRUE FOR SHARE")).WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("completed"))
 	mock.ExpectRollback()

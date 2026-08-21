@@ -44,7 +44,7 @@ func TestPostgresRepositoryCreateModelPoolAccountUsesSharedTransaction(t *testin
 	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO idempotency_records (scope, idempotency_key, fingerprint, resource_id, created_at)")).WithArgs("control-plane-state", "create-model-account:create-key", "fp-1", sqlmock.AnyArg(), now).WillReturnRows(sqlmock.NewRows([]string{"fingerprint", "resource_id"}).AddRow("fp-1", "mpa_created"))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO model_accounts (id, provider, model, base_url, secret_ref, status, priority, concurrency_limit, daily_token_limit, active_requests, daily_reserved_tokens, created_at, updated_at)")).WithArgs(sqlmock.AnyArg(), "openai", "gpt", "https://api.example.test", sqlmock.AnyArg(), controlplane.ModelAccountStatusActive, 2, 3, 100, now).WillReturnResult(sqlmock.NewResult(1, 1))
 	expectModelPoolAccountSummary(mock, now, sqlmock.AnyArg())
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), "audit-request:req-create-account", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-create-account", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
 	summary, err := repository.CreateModelPoolAccount(context.Background(), ModelPoolAccountCreateRecord{
@@ -108,7 +108,7 @@ func TestPostgresRepositoryDisableModelPoolAccountUsesNormalizedTransaction(t *t
 	expectModelPoolAccountMutationPrefix(mock, now, "mpa_1", controlplane.ModelAccountStatusActive)
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE model_accounts SET status = $2, updated_at = $3 WHERE id = $1")).WithArgs("mpa_1", controlplane.ModelAccountStatusDisabled, now).WillReturnResult(sqlmock.NewResult(1, 1))
 	expectModelPoolAccountSummary(mock, now, "mpa_1")
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), "audit-request:req-disable-account", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-disable-account", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
 	summary, err := repository.DisableModelPoolAccount(context.Background(), ModelPoolAccountMutationRecord{Scope: "control-plane-state", IdempotencyKey: "disable-model-account:disable-key", Fingerprint: "fp-1", AccountID: "mpa_1", Audit: controlplane.AuditLogInput{ActorUserID: "usr_local_admin", Action: "POST /api/v1/admin/model-pool/{account_id}/disable", TargetType: "model_account", Outcome: "success", StatusCode: 200, RequestID: "req-disable-account"}})
@@ -139,7 +139,7 @@ func TestPostgresRepositoryUpdateModelPoolAccountUsesNormalizedTransaction(t *te
 	newPriority := 3
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE model_accounts SET base_url = $2, priority = $3, updated_at = $4 WHERE id = $1")).WithArgs("mpa_1", newBaseURL, newPriority, now).WillReturnResult(sqlmock.NewResult(1, 1))
 	expectModelPoolAccountSummary(mock, now, "mpa_1")
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), "audit-request:req-update-account", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-update-account", sqlmock.AnyArg(), now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
 	summary, err := repository.UpdateModelPoolAccount(context.Background(), ModelPoolAccountUpdateRecord{

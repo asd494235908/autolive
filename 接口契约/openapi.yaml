@@ -2400,7 +2400,7 @@ components:
       type: object
       additionalProperties: false
       required:
-        [id, product, provider, model, status, expires_at, proxy_mode, concurrency_limit]
+        [id, provider, model, status, expires_at, proxy_mode, concurrency_limit]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -2432,7 +2432,7 @@ components:
     ModelLeaseAdminSummary:
       type: object
       additionalProperties: false
-      required: [id, product, account_id, user_id, device_id, purpose, provider, model, status, expires_at, proxy_mode, concurrency_limit]
+      required: [id, account_id, user_id, device_id, purpose, provider, model, status, expires_at, proxy_mode, concurrency_limit]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -2479,7 +2479,7 @@ components:
     ModelLeaseAdminDetail:
       type: object
       additionalProperties: false
-      required: [id, product, account_id, user_id, device_id, purpose, provider, model, status, expires_at, proxy_mode, concurrency_limit]
+      required: [id, account_id, user_id, device_id, purpose, provider, model, status, expires_at, proxy_mode, concurrency_limit]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -2772,7 +2772,7 @@ components:
     ActivationCode:
       type: object
       additionalProperties: false
-      required: [id, product, status, expires_at, max_devices, bound_devices]
+      required: [id, status, expires_at, max_devices, bound_devices]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -2891,7 +2891,7 @@ components:
     ModelUsageRecord:
       type: object
       additionalProperties: false
-      required: [id, product, lease_id, request_id, client_call_id, provider, model, input_tokens, output_tokens, total_tokens, latency_ms, status, usage_source, created_at]
+      required: [id, lease_id, request_id, client_call_id, provider, model, input_tokens, output_tokens, total_tokens, latency_ms, status, usage_source, created_at]
       properties:
         id:
           $ref: '#/components/schemas/Id'

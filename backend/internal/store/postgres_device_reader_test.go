@@ -25,12 +25,12 @@ func TestPostgresRepositoryGetDeviceReadsNormalizedRow(t *testing.T) {
 
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, device_name, platform, client_version, status")).WithArgs("dev_1").WillReturnRows(
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, product, device_name, platform, client_version, status")).WithArgs("dev_1").WillReturnRows(
 		sqlmock.NewRows([]string{
-			"id", "user_id", "device_name", "platform", "client_version", "status",
+			"id", "user_id", "product", "device_name", "platform", "client_version", "status",
 			"disk_free_bytes", "memory_total_bytes", "memory_available_bytes", "cpu_logical_cores",
 			"runtime_os_name", "runtime_os_version", "kernel_version", "current_media_name", "playback_state", "last_heartbeat_at",
-		}).AddRow("dev_1", "usr_1", "Studio", "windows", "1.2.3", controlplane.DeviceStatusActive,
+		}).AddRow("dev_1", "usr_1", string(controlplane.ProductAutoLive), "Studio", "windows", "1.2.3", controlplane.DeviceStatusActive,
 			int64(100), int64(200), int64(150), 8, "Windows", "11", "kernel", "demo.mp4", "playing", now.Add(-time.Minute)),
 	)
 	mock.ExpectCommit()
@@ -61,12 +61,12 @@ func TestPostgresRepositoryGetOwnedDeviceSelectsLatestWhenDeviceMissing(t *testi
 
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, device_name, platform, client_version, status")).WithArgs("usr_1").WillReturnRows(
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, product, device_name, platform, client_version, status")).WithArgs("usr_1").WillReturnRows(
 		sqlmock.NewRows([]string{
-			"id", "user_id", "device_name", "platform", "client_version", "status",
+			"id", "user_id", "product", "device_name", "platform", "client_version", "status",
 			"disk_free_bytes", "memory_total_bytes", "memory_available_bytes", "cpu_logical_cores",
 			"runtime_os_name", "runtime_os_version", "kernel_version", "current_media_name", "playback_state", "last_heartbeat_at",
-		}).AddRow("dev_2", "usr_1", "Studio", "windows", "1.2.3", controlplane.DeviceStatusActive,
+		}).AddRow("dev_2", "usr_1", string(controlplane.ProductAutoLive), "Studio", "windows", "1.2.3", controlplane.DeviceStatusActive,
 			int64(100), int64(200), int64(150), 8, "Windows", "11", "kernel", "demo.mp4", "playing", now.Add(-time.Minute)),
 	)
 	mock.ExpectCommit()
@@ -95,8 +95,8 @@ func TestPostgresRepositoryGetOwnedDeviceMapsMissingDevice(t *testing.T) {
 	}
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, device_name, platform, client_version, status")).WithArgs("usr_1", "missing").WillReturnRows(sqlmock.NewRows([]string{
-		"id", "user_id", "device_name", "platform", "client_version", "status",
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, product, device_name, platform, client_version, status")).WithArgs("usr_1", "missing").WillReturnRows(sqlmock.NewRows([]string{
+		"id", "user_id", "product", "device_name", "platform", "client_version", "status",
 		"disk_free_bytes", "memory_total_bytes", "memory_available_bytes", "cpu_logical_cores",
 		"runtime_os_name", "runtime_os_version", "kernel_version", "current_media_name", "playback_state", "last_heartbeat_at",
 	}))

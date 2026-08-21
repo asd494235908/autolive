@@ -471,7 +471,7 @@ func (s *PostgresRepository) ListAuditLogsPageWithOptions(ctx context.Context, o
 		limitPlaceholder := addArg(options.Limit)
 		offsetPlaceholder := addArg(options.Offset)
 		query := fmt.Sprintf(`
-			SELECT id, actor_user_id, device_id, action, resource_type, resource_id,
+			SELECT id, product, actor_user_id, device_id, action, resource_type, resource_id,
 			       request_id, outcome, status_code, error_code, created_at
 			FROM audit_logs%s
 			ORDER BY %s
@@ -487,14 +487,19 @@ func (s *PostgresRepository) ListAuditLogsPageWithOptions(ctx context.Context, o
 				item                                         controlplane.AuditLog
 				actorUserID, deviceID, resourceID, requestID sql.NullString
 				outcome, errorCode                           sql.NullString
+				product                                      sql.NullString
 				statusCode                                   sql.NullInt64
 				createdAt                                    time.Time
 			)
-			if err := rows.Scan(&item.ID, &actorUserID, &deviceID, &item.Action, &item.TargetType, &resourceID,
+			if err := rows.Scan(&item.ID, &product, &actorUserID, &deviceID, &item.Action, &item.TargetType, &resourceID,
 				&requestID, &outcome, &statusCode, &errorCode, &createdAt); err != nil {
 				return AuditPage{}, err
 			}
 			item.ActorUserID = actorUserID.String
+			item.Product, err = normalizedAuditProduct(product)
+			if err != nil {
+				return AuditPage{}, err
+			}
 			item.DeviceID = deviceID.String
 			item.TargetID = resourceID.String
 			item.RequestID = requestID.String
@@ -839,7 +844,7 @@ func (s *PostgresRepository) GetModelLeaseAdminDetail(ctx context.Context, lease
 }
 
 const devicePageQuery = `
-	SELECT id, user_id, device_name, platform, client_version, status,
+	SELECT id, user_id, product, device_name, platform, client_version, status,
 	       disk_free_bytes, memory_total_bytes, memory_available_bytes,
 	       cpu_logical_cores, runtime_os_name, runtime_os_version,
 	       kernel_version, current_media_name, playback_state, last_heartbeat_at
@@ -866,13 +871,13 @@ type deviceRowScanner interface {
 
 func scanDeviceSummary(scanner deviceRowScanner) (controlplane.DeviceSummary, error) {
 	var (
-		item                                                   controlplane.DeviceSummary
-		userID, runtimeOSName, runtimeOSVersion, kernelVersion sql.NullString
-		currentMediaName, playbackState                        sql.NullString
-		lastHeartbeatAt                                        sql.NullTime
+		item                                                            controlplane.DeviceSummary
+		userID, product, runtimeOSName, runtimeOSVersion, kernelVersion sql.NullString
+		currentMediaName, playbackState                                 sql.NullString
+		lastHeartbeatAt                                                 sql.NullTime
 	)
 	if err := scanner.Scan(
-		&item.ID, &userID, &item.DeviceName, &item.Platform, &item.AppVersion, &item.Status,
+		&item.ID, &userID, &product, &item.DeviceName, &item.Platform, &item.AppVersion, &item.Status,
 		&item.DiskFreeBytes, &item.MemoryTotalBytes, &item.MemoryAvailableBytes,
 		&item.CPULogicalCores, &runtimeOSName, &runtimeOSVersion,
 		&kernelVersion, &currentMediaName, &playbackState, &lastHeartbeatAt,
@@ -880,6 +885,11 @@ func scanDeviceSummary(scanner deviceRowScanner) (controlplane.DeviceSummary, er
 		return controlplane.DeviceSummary{}, err
 	}
 	item.UserID = userID.String
+	storedProduct, err := normalizedStoredProduct(product)
+	if err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
+	item.Product = storedProduct
 	item.RuntimeOSName = runtimeOSName.String
 	item.RuntimeOSVersion = runtimeOSVersion.String
 	item.KernelVersion = kernelVersion.String
@@ -1221,7 +1231,7 @@ func (s *PostgresRepository) loadNormalized(ctx context.Context, tx *sql.Tx) (*S
 	}
 
 	devices, err := tx.QueryContext(ctx, `
-		SELECT id, user_id, device_name, platform, client_version, status,
+		SELECT id, user_id, product, device_name, platform, client_version, status,
 		       disk_free_bytes, memory_total_bytes, memory_available_bytes,
 		       cpu_logical_cores, runtime_os_name, runtime_os_version,
 		       kernel_version, current_media_name, playback_state, last_heartbeat_at
@@ -1233,15 +1243,15 @@ func (s *PostgresRepository) loadNormalized(ctx context.Context, tx *sql.Tx) (*S
 	}
 	for devices.Next() {
 		var (
-			id, deviceName, platform, clientVersion, status        string
-			userID, runtimeOSName, runtimeOSVersion, kernelVersion sql.NullString
-			currentMediaName, playbackState                        sql.NullString
-			lastHeartbeatAt                                        sql.NullTime
-			diskFreeBytes, memoryTotalBytes, memoryAvailableBytes  int64
-			cpuLogicalCores                                        int
+			id, deviceName, platform, clientVersion, status                 string
+			userID, product, runtimeOSName, runtimeOSVersion, kernelVersion sql.NullString
+			currentMediaName, playbackState                                 sql.NullString
+			lastHeartbeatAt                                                 sql.NullTime
+			diskFreeBytes, memoryTotalBytes, memoryAvailableBytes           int64
+			cpuLogicalCores                                                 int
 		)
 		if err := devices.Scan(
-			&id, &userID, &deviceName, &platform, &clientVersion, &status,
+			&id, &userID, &product, &deviceName, &platform, &clientVersion, &status,
 			&diskFreeBytes, &memoryTotalBytes, &memoryAvailableBytes,
 			&cpuLogicalCores, &runtimeOSName, &runtimeOSVersion,
 			&kernelVersion, &currentMediaName, &playbackState, &lastHeartbeatAt,
@@ -1249,8 +1259,13 @@ func (s *PostgresRepository) loadNormalized(ctx context.Context, tx *sql.Tx) (*S
 			_ = devices.Close()
 			return nil, err
 		}
+		storedProduct, err := normalizedStoredProduct(product)
+		if err != nil {
+			_ = devices.Close()
+			return nil, err
+		}
 		device := controlplane.DeviceSummary{
-			ID: id, UserID: userID.String, DeviceName: deviceName, Platform: platform,
+			ID: id, UserID: userID.String, Product: storedProduct, DeviceName: deviceName, Platform: platform,
 			AppVersion: clientVersion, Status: status, DiskFreeBytes: diskFreeBytes,
 			MemoryTotalBytes: memoryTotalBytes, MemoryAvailableBytes: memoryAvailableBytes,
 			CPULogicalCores: cpuLogicalCores, RuntimeOSName: runtimeOSName.String,
@@ -1486,7 +1501,7 @@ func (s *PostgresRepository) loadNormalized(ctx context.Context, tx *sql.Tx) (*S
 	}
 
 	auditRows, err := tx.QueryContext(ctx, `
-		SELECT id, actor_user_id, device_id, action, resource_type, resource_id, request_id, outcome, status_code, error_code, created_at
+		SELECT id, product, actor_user_id, device_id, action, resource_type, resource_id, request_id, outcome, status_code, error_code, created_at
 		FROM audit_logs
 		ORDER BY id
 	`)
@@ -1495,15 +1510,21 @@ func (s *PostgresRepository) loadNormalized(ctx context.Context, tx *sql.Tx) (*S
 	}
 	for auditRows.Next() {
 		var id, action, resourceType string
+		var product sql.NullString
 		var actorUserID, deviceID, resourceID, requestID, outcome, errorCode sql.NullString
 		var statusCode sql.NullInt64
 		var createdAt time.Time
-		if err := auditRows.Scan(&id, &actorUserID, &deviceID, &action, &resourceType, &resourceID, &requestID, &outcome, &statusCode, &errorCode, &createdAt); err != nil {
+		if err := auditRows.Scan(&id, &product, &actorUserID, &deviceID, &action, &resourceType, &resourceID, &requestID, &outcome, &statusCode, &errorCode, &createdAt); err != nil {
+			_ = auditRows.Close()
+			return nil, err
+		}
+		storedProduct, err := normalizedAuditProduct(product)
+		if err != nil {
 			_ = auditRows.Close()
 			return nil, err
 		}
 		state.AuditLogs[id] = controlplane.AuditLog{
-			ID: id, ActorUserID: actorUserID.String, DeviceID: deviceID.String, Action: action,
+			ID: id, Product: storedProduct, ActorUserID: actorUserID.String, DeviceID: deviceID.String, Action: action,
 			TargetType: resourceType, TargetID: resourceID.String, RequestID: requestID.String,
 			Outcome: outcome.String, StatusCode: int(statusCode.Int64), ErrorCode: errorCode.String,
 			CreatedAt: createdAt.UTC().Format(time.RFC3339),
@@ -1782,11 +1803,18 @@ func (s *PostgresRepository) syncReferenceRows(ctx context.Context, tx *sql.Tx, 
 		}
 	}
 	for id, audit := range state.AuditLogs {
+		product := audit.Product
+		if product == "" {
+			product = controlplane.ProductAutoLive
+		}
+		if !product.Valid() {
+			return controlplane.ErrInvalidRequest
+		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO audit_logs (id, actor_user_id, device_id, action, resource_type, resource_id, request_id, outcome, status_code, error_code, payload, created_at)
-			VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), $4, $5, NULLIF($6, ''), NULLIF($7, ''), $8, $9, NULLIF($10, ''), '{}'::jsonb, $11)
+			INSERT INTO audit_logs (id, product, actor_user_id, device_id, action, resource_type, resource_id, request_id, outcome, status_code, error_code, payload, created_at)
+			VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, NULLIF($7, ''), NULLIF($8, ''), $9, $10, NULLIF($11, ''), '{}'::jsonb, $12)
 			ON CONFLICT (id) DO NOTHING
-		`, id, audit.ActorUserID, audit.DeviceID, audit.Action, audit.TargetType, audit.TargetID, audit.RequestID, audit.Outcome, audit.StatusCode, audit.ErrorCode, audit.CreatedAt); err != nil {
+		`, id, product, audit.ActorUserID, audit.DeviceID, audit.Action, audit.TargetType, audit.TargetID, audit.RequestID, audit.Outcome, audit.StatusCode, audit.ErrorCode, audit.CreatedAt); err != nil {
 			return err
 		}
 	}

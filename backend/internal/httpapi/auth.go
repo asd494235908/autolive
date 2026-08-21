@@ -89,9 +89,14 @@ type authenticator struct {
 	sessions     map[string]sessionRecord
 	refreshIndex map[string]string
 	store        store.SessionStore
+	productRepo  store.ProductRepository
 }
 
 func newAuthenticator(controlPlane *service.ControlPlane, config AuthConfig, sessionStores ...store.SessionStore) *authenticator {
+	return newAuthenticatorWithProductRepository(controlPlane, config, nil, sessionStores...)
+}
+
+func newAuthenticatorWithProductRepository(controlPlane *service.ControlPlane, config AuthConfig, productRepo store.ProductRepository, sessionStores ...store.SessionStore) *authenticator {
 	var sessionStore store.SessionStore
 	if len(sessionStores) > 0 {
 		sessionStore = sessionStores[0]
@@ -107,6 +112,7 @@ func newAuthenticator(controlPlane *service.ControlPlane, config AuthConfig, ses
 		sessions:     map[string]sessionRecord{},
 		refreshIndex: map[string]string{},
 		store:        sessionStore,
+		productRepo:  productRepo,
 	}
 }
 
@@ -138,6 +144,21 @@ func loginHandler(auth *authenticator) http.Handler {
 		if err != nil {
 			writeAppError(w, r, err)
 			return
+		}
+		if auth.productRepo != nil {
+			membership, err := auth.productRepo.GetUserProductMembership(r.Context(), user.ID, product)
+			if err != nil {
+				if errors.Is(err, controlplane.ErrForbidden) {
+					writeAppError(w, r, controlplane.ErrForbidden)
+				} else {
+					writeError(w, r, http.StatusServiceUnavailable, "PRODUCT_MEMBERSHIP_UNAVAILABLE", "产品授权暂时无法读取")
+				}
+				return
+			}
+			if membership.Status != "active" {
+				writeAppError(w, r, controlplane.ErrForbidden)
+				return
+			}
 		}
 		actor.Product = product
 		if principal, ok := r.Context().Value(auditPrincipalContextKey{}).(*auditPrincipal); ok {

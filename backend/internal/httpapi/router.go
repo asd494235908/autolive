@@ -65,7 +65,11 @@ func NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTele
 	}
 
 	controlPlane := service.NewControlPlaneWithRepositoryAndSecretStoreAndOptions(repository, nil, secretStore, service.ControlPlaneOptions{AllowInsecureHTTP: allowInsecureHTTP})
-	authenticator := newAuthenticator(controlPlane, authConfig, sessionStore)
+	var productRepository store.ProductRepository
+	if candidate, ok := repository.(store.ProductRepository); ok {
+		productRepository = candidate
+	}
+	authenticator := newAuthenticatorWithProductRepository(controlPlane, authConfig, productRepository, sessionStore)
 	metrics := newHTTPMetricsWithTelemetry(repository, healthTelemetry, retentionTelemetry)
 
 	mux := http.NewServeMux()

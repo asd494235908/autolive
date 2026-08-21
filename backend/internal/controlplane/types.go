@@ -168,7 +168,7 @@ type DeviceRegistration struct {
 
 type ActivationCode struct {
 	ID             string      `json:"id"`
-	Product        ProductCode `json:"product"`
+	Product        ProductCode `json:"product,omitempty"`
 	Status         string      `json:"status"`
 	ExpiresAt      string      `json:"expires_at"`
 	MaxDevices     int         `json:"max_devices"`
@@ -255,7 +255,7 @@ type ReleaseModelLeaseInput struct {
 
 type ModelLease struct {
 	ID               string      `json:"id"`
-	Product          ProductCode `json:"product"`
+	Product          ProductCode `json:"product,omitempty"`
 	UserID           string      `json:"-"`
 	DeviceID         string      `json:"-"`
 	AccountID        string      `json:"-"`
@@ -276,7 +276,7 @@ type ModelLease struct {
 // lease credential or provider secret.
 type ModelLeaseAdminSummary struct {
 	ID               string      `json:"id"`
-	Product          ProductCode `json:"product"`
+	Product          ProductCode `json:"product,omitempty"`
 	AccountID        string      `json:"account_id"`
 	UserID           string      `json:"user_id"`
 	DeviceID         string      `json:"device_id"`
@@ -294,7 +294,7 @@ type ModelLeaseAdminSummary struct {
 // timestamps needed for safe administrative recovery.
 type ModelLeaseAdminDetail struct {
 	ID               string      `json:"id"`
-	Product          ProductCode `json:"product"`
+	Product          ProductCode `json:"product,omitempty"`
 	AccountID        string      `json:"account_id"`
 	UserID           string      `json:"user_id"`
 	DeviceID         string      `json:"device_id"`
@@ -316,7 +316,7 @@ type ReleaseModelLeaseResult struct {
 
 type ModelUsageRecord struct {
 	ID           string      `json:"id"`
-	Product      ProductCode `json:"product"`
+	Product      ProductCode `json:"product,omitempty"`
 	LeaseID      string      `json:"lease_id"`
 	ClientCallID string      `json:"client_call_id"`
 	RequestID    string      `json:"request_id"`
