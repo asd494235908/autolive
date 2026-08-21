@@ -22,6 +22,8 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] 盘点全部当前及后续 `/api/v1/admin/*` 路由，形成“路由/动作 → 权限点”唯一矩阵
 - [ ] 核对现有 `role=admin/user` 数据量、非本地管理员账号和兼容迁移策略
 - [ ] 确认角色委派规则、内置 `super_admin` 保护和高风险操作二次认证仍符合主 PRD
+- [ ] 确认 P0 接入 PRD 的产品范围角色绑定已定稿；不得另建第二套权限目录或通用 ABAC
+- [ ] 与 P0 Phase 1 明确共同写入集：本阶段拥有权限目录、角色生命周期、角色 API 和 React 通用权限壳；P0 拥有 product 范围语义与跨产品拒绝验收
 
 ## 范围
 
@@ -29,6 +31,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 - 固定权限目录、内置 `super_admin`、自定义角色、角色权限和用户多角色关系。
 - 当前管理员有效角色/权限摘要、角色 CRUD、用户角色分配和服务端权限中间件。
+- 用户角色按 product 绑定，普通管理员资源范围取授权产品交集，内建 `super_admin` 才能默认跨产品。
 - React“角色与权限”页面、用户角色分配、权限化导航/路由/按钮和 403 页面。
 - 权限变更审计、立即生效、兼容回填和防提权约束。
 
@@ -44,6 +47,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - 设备/激活：`devices.read`、`devices.manage`、`activation_codes.read`、`activation_codes.manage`、`activation_codes.reveal`、`activation_codes.switch_device`。
 - 商业：`plans.read`、`plans.manage`、`plans.publish`、`orders.read`、`orders.reconcile`、`subscriptions.read`、`subscriptions.adjust`、`payments.read`、`payments.reconcile`。
 - 投递/制品/配置：`password_resets.read`、`password_resets.retry`、`artifacts.read`、`artifacts.manage`、`artifacts.publish`、`artifacts.revoke`、`public_config.read`、`public_config.manage`、`public_config.publish`、`public_config.rollback`。
+- 报告/反馈：`error_reports.read`、`error_reports.manage`、`feedback.read`、`feedback.manage`。
 - 现有控制面：`model_pool.read`、`model_pool.manage`、`model_pool.test`、`model_pool.rotate_secret`、`model_leases.read`、`model_leases.reclaim`、`model_usage.read`、`audit_logs.read`。
 - 运维：`operations.read`、`operations.manage`。
 
@@ -51,12 +55,13 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 ## 实施清单
 
-- [ ] 新增 `admin_permissions`、`admin_roles`、`admin_role_permissions`、`user_admin_roles` 前向迁移、唯一约束、外键和索引。
+- [ ] 新增 `admin_permissions`、`admin_roles`、`admin_role_permissions`、产品范围 `user_admin_roles` 前向迁移、唯一约束、外键和索引。
 - [ ] 创建不可删除/不可改名的内置 `super_admin`，固定拥有全部权限；`usr_local_admin` 永久绑定该角色。
 - [ ] 将现有 `role=admin` 用户兼容回填为 `super_admin`，`role=user` 不获得管理角色；保留旧字段直至所有授权路径切换并完成回滚窗口。
 - [ ] 建立 PermissionCatalog/RoleRepository/PermissionReader，启动时校验代码目录和数据库种子无缺失/未知项。
 - [ ] 用 `requirePermission(permissionCode)` 替换后续管理路由的粗粒度 `requireAdmin`；每次受保护请求按用户 ID 读取当前有效权限，撤销后立即生效。
 - [ ] 禁止普通角色管理者授予自身不拥有的权限；分配角色时，目标角色的权限也必须是操作者当前权限的子集。只有 `super_admin` 可分配/撤销 `super_admin`，且不得移除最后一个有效 `super_admin` 或本地管理员绑定。
+- [ ] 普通管理员只能在自身产品范围内分配角色和操作资源；product 查询参数只能缩小范围，跨产品高风险操作要求 `super_admin`、理由、幂等和审计。
 - [ ] 提供仅需有效认证会话且只返回本人角色/权限的 `GET /api/v1/admin/me`、权限目录读取、角色列表/详情/创建/编辑/删除和用户角色读取/替换 API；用户角色替换要求 `roles.assign`，所有写操作要求幂等键。
 - [ ] 角色删除前要求无用户绑定；角色停用后相关权限立即失效，活动 Session 不需要等待重新登录。
 - [ ] 权限目录、角色和用户角色变更写入语义化审计 Outbox，不记录密码、Token 或二次认证正文。
@@ -93,3 +98,4 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 ## 发现/决策
 
 - 2026-08-22：用户确认采用“自定义角色 + 固定权限点”，角色可多选，权限取并集，不支持用户级覆盖。
+- 2026-08-22：角色目录保持全局复用，具体用户角色绑定增加产品范围；不引入通用 ABAC。

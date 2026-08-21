@@ -6,13 +6,13 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 ## 目标
 
-提供订阅、订单、套餐版本和增强设备的管理列表/详情 API 与 React 管理页，所有筛选、排序和分页在 normalized PostgreSQL 中有界执行。
+提供按产品授权的订阅、订单、套餐版本、设备席位和增强设备管理列表/详情 API 与 React 管理页，所有筛选、排序和分页在 normalized PostgreSQL 中有界执行。
 
 ## 主 PRD 上下文
 
 - 目标：G-1、G-8
 - 成功标准：SC-1、SC-9
-- 需求：FR-1～FR-6、FR-34、FR-35，NFR-1、NFR-7、NFR-12
+- 需求：FR-1～FR-6、FR-34～FR-39，NFR-1、NFR-7、NFR-12、NFR-13
 - 场景：场景 2
 
 ## 阶段发现门禁
@@ -28,7 +28,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 ### 包含
 
-- subscriptions/orders/plan-versions 管理列表与详情。
+- subscriptions/orders/plan-versions/device-slots 管理列表与详情。
 - devices 用户、状态、在线、OS、客户端版本、心跳时间与排序筛选。
 - 查询白名单、SQL 索引、OpenAPI 和服务端权限/审计语义。
 - React 套餐版本、订单、订阅和增强设备页，筛选/分页/排序写入 URL 状态。
@@ -40,7 +40,8 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 ## 实施清单
 
-- [ ] 先在 OpenAPI 定义四类资源的列表/详情路由、query enum、DTO 和错误响应。
+- [ ] 先在 OpenAPI 定义套餐版本、订单、订阅、设备席位和设备五类资源的列表/详情路由、query enum、DTO 和错误响应。
+- [ ] 所有列表/详情支持有界 product 筛选，并先与操作者产品授权求交集；省略/伪造筛选都不能扩大结果。
 - [ ] 分别创建领域 options、page reader 和脱敏 detail reader，不继续扩大一个通用 options 文件。
 - [ ] 为 normalized PostgreSQL 实现 `COUNT + LIMIT/OFFSET` 和参数化白名单查询。
 - [ ] 为 Memory 模式保留有界测试回退，生产 normalized 缺少 reader 时 fail-closed。
@@ -58,6 +59,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 ## 验证清单
 
 - [ ] 合法/非法筛选、空结果、页越界、时间反转、排序注入和无权限测试
+- [ ] 普通管理员跨产品列表/详情/排序/URL 直达均 403 或收窄，`super_admin` 跨产品行为可审计
 - [ ] 组合筛选无 N+1，真实数据量 `EXPLAIN (ANALYZE, BUFFERS)` 符合容量目标
 - [ ] `go test ./internal/service ./internal/store ./internal/httpapi`
 - [ ] `go test -tags=postgres_integration ./internal/store`
@@ -65,7 +67,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 ## 退出标准
 
-- [ ] 四类查询资源的契约、SQL、索引、权限和界面筛选语义一致
+- [ ] 五类查询资源的契约、SQL、索引、权限和界面筛选语义一致
 - [ ] 不存在无界加载、任意排序或敏感字段泄露
 
 ## 阶段末多轮复核
@@ -77,3 +79,4 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 - 2026-08-21：阶段文件创建，本轮未开始实施。
 - 2026-08-22：将范围从管理查询 API 扩展到相应 React 管理页和权限化操作。
+- 2026-08-22：纳入产品授权交集、设备席位查询和管理端产品上下文。

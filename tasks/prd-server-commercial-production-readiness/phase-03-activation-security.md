@@ -22,6 +22,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] 重读 Phase 2 权限目录、现有激活码管理页、API 调用与详情交互
 - [ ] 核对生产 HTTPS 、管理员密码二次验证方式和密钥轮换运维责任
 - [ ] 查询生产库中 `bound_devices > 1` 的历史数量，不读取/导出明文秘密
+- [ ] 确认激活码 product 归属、P0 会话产品校验，以及激活码“绑定凭证”与订阅席位“商业事实”的边界
 - [ ] 如历史语义与假设不同，先修订 PRD 与回填方案
 
 ## 范围
@@ -48,6 +49,8 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] 实现 reveal POST：管理员二次验证、专用限流、`no-store/private`、审计失败不返回明文。
 - [ ] 实现 binding detail/backfill：首台设备可证明回填，其余 slot 记为 `legacy_unknown`。
 - [ ] 实现容量状态机：1～100、不低于已核销、过期/作废拒绝、上调后重新可核销。
+- [ ] 激活码创建时固定 product，核销时必须与会话 product 一致；设备槽位不能跨产品切换。
+- [ ] 商业化 Phase 4 上线后，激活码核销与订阅席位占用在同一产品短事务中协调；无有效席位不得仅凭激活码获得权益。
 - [ ] 实现切换事务：稳定锁顺序、目标待激活/无主且无活动绑定、旧会话/租约撤销、复用 slot 和审计 Outbox。
 - [ ] 修正解绑和到期 reader，使绑定明细成为设备到期/归属事实，不再只依赖首台设备字段。
 - [ ] 将读取、容量修改、明文重显和设备切换分别绑定 `activation_codes.*` 固定权限点。
@@ -63,6 +66,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - [ ] 加密随机 nonce、AAD 篡改、错误 key id、旧 key 读取、密文行替换和敏感日志扫描
 - [ ] reveal 的 401/403/404/409/429/503、审计故障、缓存头和明文不进入列表
 - [ ] 容量修改与并发核销，切换与解绑/禁用竞态，幂等重试与提交结果未知
+- [ ] 跨产品核销/切换被拒绝，且不会占用错误产品的订阅席位
 - [ ] 历史回填数量守恒，`legacy_unavailable`/`legacy_unknown` 清晰返回
 - [ ] Go 全量、Race、PostgreSQL integration、OpenAPI 和 API 管理流程验证通过
 - [ ] React typecheck/test/build 和浏览器冒烟覆盖无权限、二次认证、取消、失败与成功后敏感状态清理
@@ -81,3 +85,4 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 - 2026-08-21：选定独立激活码加密表，本轮未开始实施。
 - 2026-08-22：纳入 React 激活码安全管理页和固定权限点。
+- 2026-08-22：纳入激活码 product 归属，并与产品订阅席位明确分离。

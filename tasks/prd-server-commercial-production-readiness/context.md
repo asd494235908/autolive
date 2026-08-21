@@ -11,6 +11,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - 存储/迁移：`backend/migrations/0001～0022`、`backend/internal/store/repository.go`、`postgres_*_repository.go`、`sql_secret_store.go`、`retention_postgres.go`。
 - 运维/发布：`.github/workflows/backend-quality.yml`、`.github/workflows/desktop-package.yml`、`tools/check-backend-release.mjs`、`deploy/runtime-resources/*`。
 - 激活码专项：`docs/superpowers/specs/2026-08-21-激活码多设备绑定设计.md`、迁移 0022 及相关 service/store/httpapi 测试。
+- 多产品接入：`tasks/prd-douyin-desktop-control-plane-integration.md`、对应 context/四个阶段和 `docs/superpowers/specs/2026-08-22-douyin-desktop-接入-autolive-多产品控制面设计.md`。
 - 官方资料：微信支付 API v3 回调/证书/官方 Go SDK、JSON Schema Draft 2020-12、OpenTelemetry Go、SLSA Provenance、Sigstore Cosign 和 GitHub Artifact Attestations。
 
 ## 当前系统摘要
@@ -19,6 +20,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - 当前用户只有 `admin` 与 `user` 两类角色，管理 API 统一使用 `requireAdmin` 检查 `actor.Role`；数据库未见权限目录、自定义角色、角色-权限和用户-角色关系表。
 - React 管理端的 `RequireSession` 只校验登录会话，`AppLayout` 对所有已登录管理员显示全部导航，Router 未实现按权限点的路由守卫和统一 403 页。
 - 未发现 subscriptions、orders、plans/plan versions、payment attempts 或 WeChat Pay 路由/领域/迁移。
+- 当前设备、激活码、Profile、租约、用量与审计没有统一 `product` 硬隔离；该事实由 P0 接入 PRD 先行补齐，商业资源只能引用同一产品注册表和成员关系。
 - 用户管理员可直接设置新密码并撤销会话，但未发现公开自助密码重置 Token、邮件投递 Outbox 或 Worker。
 - 设备已有列表/详情、心跳、禁用和解绑；需扩展固定白名单筛选、排序和索引。
 - 激活码只保存 SHA-256 哈希/前缀，列表脱敏；迁移 0022 只增加 `max_devices`/`bound_devices`，仍只保存首次核销主体和设备。
@@ -28,6 +30,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - Backend CI 已生成 Docker/OCI 制品、SBOM、BuildKit Provenance 和 SHA-256 元数据；未生成/验证可信签名和下游发布策略。
 - Desktop package CI 从外部 HTTPS 下载 FFmpeg 并校验固定 SHA-256，生成运行资源清单；通过 SSH/rsync 上传静态服务器，非对象存储或权限化外部下载。
 - 未在 `dev-2.0` 分支找到公共配置的服务端实现；将用户提供的“已校验 JSON 与敏感字段”视为实施前必须复核的外部基线。
+- 未找到错误报告或反馈的服务端路由/领域/迁移；douyin-desktop 旧 OpenAPI 中的同名契约只作迁移参考。
 
 ## 可复用模式
 
@@ -46,8 +49,10 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - PostgreSQL：从空库执行全部迁移，`postgres_integration` 覆盖事务、并发、锁等待、断连、提交结果未知和查询计划。
 - 契约：OpenAPI YAML/本地 `$ref`、Router 路径/方法、Go 错误码/DTO 与 React 生成类型；Rust 只执行现有生成契约兼容检查。
 - React：格式化、Lint、TypeScript 类型检查、组件/路由权限测试、生产构建和浏览器冒烟；覆盖导航、直达 URL、按钮、403、loading/empty/error 与键盘/焦点。
+- 产品隔离：相同 device ID 双产品、跨产品激活/订阅/席位/下载/管理拒绝、普通管理员省略筛选仍收窄，以及恢复后的跨产品引用核对。
 - 微信支付：官方 SDK fixture/回调样本、重入和金额不一致测试；上线门禁需要小额真实支付/查询验收。
 - 制品：服务端签名验证、错误 signer/issuer/ref/digest 拒绝、对象存储预签名 URL 时效/权限，以及向消费端返回签名清单和哈希元数据。
+- 错误反馈：禁止字段 fixture、双重脱敏、同意、批大小/长度/速率、指纹去重、采样、TTL/删除和产品范围 403。
 - 运维：隔离恢复演练、故障注入、告警测试、trace 串联、SIGTERM 和 Worker 租约恢复。
 
 ## 官方外部依据
@@ -67,3 +72,4 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - 未选定邮件和对象存储供应商，未验证实际限额/区域/合规条件。
 - 未设置生产 OTLP backend、对象存储权限或 CI 签名信任策略。
 - 未执行备份恢复演练，RPO/RTO 只是规划验收目标，不是已完成事实。
+- 本轮未实施产品隔离、席位、错误报告或反馈，也未执行跨仓库 E2E。
