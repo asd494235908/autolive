@@ -555,6 +555,42 @@ func TestPostgresNormalizedActivationRejectsCommittedRedeemAndIdempotencyConflic
 	}
 }
 
+func TestPostgresNormalizedActivationBindsConfiguredDeviceCount(t *testing.T) {
+	database, ctx := openPostgresIntegrationDatabase(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	fixture := seedPostgresActivationFixture(t, database, ctx, now, controlplane.ActivationCodeStatusActive, now.Add(time.Hour), 2, 2)
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, func() time.Time { return now }, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("repository constructor: %v", err)
+	}
+	for index := range fixture.DeviceIDs {
+		device, activateErr := repository.ActivateDeviceWithSessionBinding(ctx, DeviceActivationRecord{
+			Scope:              "control-plane-state",
+			IdempotencyKey:     fixture.IdempotencyPrefix + fmt.Sprintf("redeem-%d", index),
+			Fingerprint:        fixture.IdempotencyPrefix + fmt.Sprintf("fingerprint-%d", index),
+			AccessTokenHash:    fixture.AccessTokenHashes[index],
+			UserID:             fixture.UserID,
+			ActivationCodeHash: fixture.CodeHash,
+			Device: controlplane.DeviceRegistration{
+				DeviceID: fixture.DeviceIDs[index], DeviceName: "multi-device",
+				Platform: "integration", AppVersion: "test",
+			},
+		})
+		if activateErr != nil || device.ID != fixture.DeviceIDs[index] {
+			t.Fatalf("activation %d = device %+v, error %v", index+1, device, activateErr)
+		}
+	}
+
+	var status string
+	var maxDevices, boundDevices int
+	if err := database.QueryRowContext(ctx, `SELECT status, max_devices, bound_devices FROM activation_codes WHERE id = $1`, fixture.CodeID).Scan(&status, &maxDevices, &boundDevices); err != nil {
+		t.Fatalf("read multi-device activation: %v", err)
+	}
+	if status != controlplane.ActivationCodeStatusUsed || maxDevices != 2 || boundDevices != 2 {
+		t.Fatalf("multi-device activation = status %q max %d bound %d, want used/2/2", status, maxDevices, boundDevices)
+	}
+}
+
 type postgresActivationFixture struct {
 	UserID            string
 	CodeID            string
@@ -564,7 +600,7 @@ type postgresActivationFixture struct {
 	IdempotencyPrefix string
 }
 
-func seedPostgresActivationFixture(t *testing.T, database *sql.DB, ctx context.Context, now time.Time, status string, expiresAt time.Time, sessionCount int) postgresActivationFixture {
+func seedPostgresActivationFixture(t *testing.T, database *sql.DB, ctx context.Context, now time.Time, status string, expiresAt time.Time, sessionCount int, configuredMaxDevices ...int) postgresActivationFixture {
 	t.Helper()
 	if sessionCount < 1 {
 		t.Fatalf("session count = %d, want at least one", sessionCount)
@@ -585,10 +621,14 @@ func seedPostgresActivationFixture(t *testing.T, database *sql.DB, ctx context.C
 	`, fixture.UserID, username, "$2a$10$integration-hash", controlplane.RoleUser, controlplane.UserStatusActive, now); err != nil {
 		t.Fatalf("seed activation edge user: %v", err)
 	}
+	maxDevices := 1
+	if len(configuredMaxDevices) > 0 {
+		maxDevices = configuredMaxDevices[0]
+	}
 	if _, err := database.ExecContext(ctx, `
-		INSERT INTO activation_codes (id, code_hash, code_prefix, status, created_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, fixture.CodeID, fixture.CodeHash, "edge_", status, now, expiresAt); err != nil {
+		INSERT INTO activation_codes (id, code_hash, code_prefix, status, created_at, expires_at, max_devices, bound_devices)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 0)
+	`, fixture.CodeID, fixture.CodeHash, "edge_", status, now, expiresAt, maxDevices); err != nil {
 		t.Fatalf("seed activation edge code: %v", err)
 	}
 	for index := range fixture.AccessTokenHashes {

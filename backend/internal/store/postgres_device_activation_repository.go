@@ -13,8 +13,8 @@ import (
 
 var _ TransactionalDeviceActivator = (*PostgresRepository)(nil)
 
-// ActivateDeviceWithSessionBinding keeps the one-time activation, device
-// registration and authenticated-session binding in one normalized SQL
+// ActivateDeviceWithSessionBinding keeps the capacity-limited activation,
+// device registration and authenticated-session binding in one normalized SQL
 // transaction. The legacy snapshot path remains behind the existing runner.
 func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Context, record DeviceActivationRecord) (controlplane.DeviceSummary, error) {
 	if s.modelReadSource != ModelReadSourceNormalized {
@@ -111,12 +111,13 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 
 	var codeID, codeStatus string
 	var expiresAt sql.NullTime
+	var maxDevices, boundDevices int
 	if err := tx.QueryRowContext(operationCtx, `
-		SELECT id, status, expires_at
+		SELECT id, status, expires_at, max_devices, bound_devices
 		FROM activation_codes
 		WHERE code_hash = $1
 		FOR UPDATE
-	`, record.ActivationCodeHash).Scan(&codeID, &codeStatus, &expiresAt); err != nil {
+	`, record.ActivationCodeHash).Scan(&codeID, &codeStatus, &expiresAt, &maxDevices, &boundDevices); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeNotFound
 		}
@@ -130,6 +131,9 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 	case controlplane.ActivationCodeStatusRevoked:
 		return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeRevoked
 	case controlplane.ActivationCodeStatusUsed:
+		return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeAlreadyUsed
+	}
+	if maxDevices < 1 || boundDevices >= maxDevices {
 		return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeAlreadyUsed
 	}
 
@@ -158,11 +162,16 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 	`, device.ID, device.UserID, "state-device/"+device.ID, device.DeviceName, device.Platform, device.AppVersion, device.Status, now); err != nil {
 		return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("insert normalized activated device: %w", err))
 	}
+	newBoundDevices := boundDevices + 1
+	newStatus := controlplane.ActivationCodeStatusActive
+	if newBoundDevices >= maxDevices {
+		newStatus = controlplane.ActivationCodeStatusUsed
+	}
 	if _, err := tx.ExecContext(operationCtx, `
 		UPDATE activation_codes
-		SET status = $2, used_at = $3, used_by_user_id = $4, used_by_device_id = $5
+		SET status = $2, bound_devices = $3, used_at = COALESCE(used_at, $4), used_by_user_id = COALESCE(used_by_user_id, $5), used_by_device_id = COALESCE(used_by_device_id, $6)
 		WHERE id = $1
-	`, codeID, controlplane.ActivationCodeStatusUsed, now, record.UserID, device.ID); err != nil {
+	`, codeID, newStatus, newBoundDevices, now, record.UserID, device.ID); err != nil {
 		return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("redeem normalized activation code: %w", err))
 	}
 	if currentDeviceID == "" {

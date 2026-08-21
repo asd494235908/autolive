@@ -16,6 +16,9 @@ func TestActivationCodeSupportsMultipleDevices(t *testing.T) {
 	repository := store.NewMemoryStore(func() time.Time { return now })
 	svc := NewControlPlane(repository)
 	ctx := context.Background()
+	if err := svc.EnsureLocalAdmin(ctx, "admin"); err != nil {
+		t.Fatalf("EnsureLocalAdmin() error = %v", err)
+	}
 
 	code, err := svc.CreateActivationCode(ctx, "multi-device-code", controlplane.CreateActivationCodeInput{
 		ExpiresAt:  now.Add(time.Hour),

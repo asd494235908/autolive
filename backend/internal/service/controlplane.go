@@ -2949,7 +2949,7 @@ func (s *ControlPlane) CreateActivationCode(ctx context.Context, idempotencyKey 
 	if input.MaxDevices == 0 {
 		input.MaxDevices = 1
 	}
-	if input.MaxDevices != 1 || input.ExpiresAt.IsZero() || !input.ExpiresAt.After(s.repository.Now()) {
+	if input.MaxDevices < 1 || input.MaxDevices > controlplane.MaxActivationCodeDevices || input.ExpiresAt.IsZero() || !input.ExpiresAt.After(s.repository.Now()) {
 		return controlplane.ActivationCode{}, controlplane.ErrInvalidRequest
 	}
 	fingerprint, err := fingerprintValue(struct {
@@ -3000,12 +3000,13 @@ func (s *ControlPlane) CreateActivationCode(ctx context.Context, idempotencyKey 
 			return controlplane.ActivationCode{}, controlplane.NewError(http.StatusInternalServerError, "RANDOM_GENERATION_FAILED", "无法生成激活码")
 		}
 		code := controlplane.ActivationCode{
-			ID:         id,
-			Status:     controlplane.ActivationCodeStatusActive,
-			ExpiresAt:  input.ExpiresAt.UTC().Format(time.RFC3339),
-			MaxDevices: input.MaxDevices,
-			CodePrefix: plainCode[:12],
-			PlainCode:  &plainCode,
+			ID:           id,
+			Status:       controlplane.ActivationCodeStatusActive,
+			ExpiresAt:    input.ExpiresAt.UTC().Format(time.RFC3339),
+			MaxDevices:   input.MaxDevices,
+			BoundDevices: 0,
+			CodePrefix:   plainCode[:12],
+			PlainCode:    &plainCode,
 		}
 		state.ActivationCodes[id] = store.ActivationCodeRecord{
 			ActivationCode: code,
@@ -3090,6 +3091,12 @@ func decorateActivationCode(state *store.State, record store.ActivationCodeRecor
 	code := record.ActivationCode
 	code.PlainCode = nil
 	code.CodePrefix = record.CodePrefix
+	if code.MaxDevices == 0 {
+		code.MaxDevices = 1
+	}
+	if code.BoundDevices == 0 && record.UsedByDeviceID != "" {
+		code.BoundDevices = 1
+	}
 	code.UsedByUserID = record.UsedByUserID
 	code.UsedByDeviceID = record.UsedByDeviceID
 	code.UsedAt = record.UsedAt
@@ -3329,7 +3336,7 @@ func (s *ControlPlane) activateDeviceWithRunner(ctx context.Context, idempotency
 		if record.ActivationCode.Status == controlplane.ActivationCodeStatusRevoked {
 			return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeRevoked
 		}
-		if record.ActivationCode.Status == controlplane.ActivationCodeStatusUsed {
+		if record.ActivationCode.Status == controlplane.ActivationCodeStatusUsed || record.ActivationCode.BoundDevices >= record.ActivationCode.MaxDevices {
 			return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeAlreadyUsed
 		}
 
@@ -3345,16 +3352,23 @@ func (s *ControlPlane) activateDeviceWithRunner(ctx context.Context, idempotency
 			ActivationExpiresAt: formatActivationExpiryString(record.ActivationCode.ExpiresAt),
 		}
 		state.Devices[device.ID] = device
-		record.ActivationCode.Status = controlplane.ActivationCodeStatusUsed
+		record.ActivationCode.BoundDevices++
+		if record.ActivationCode.BoundDevices >= record.ActivationCode.MaxDevices {
+			record.ActivationCode.Status = controlplane.ActivationCodeStatusUsed
+		} else {
+			record.ActivationCode.Status = controlplane.ActivationCodeStatusActive
+		}
 		record.PlainCode = ""
 		record.ActivationCode.PlainCode = nil
 		record.ActivationCode.CodePrefix = record.CodePrefix
-		record.ActivationCode.UsedByUserID = userID
-		record.ActivationCode.UsedByDeviceID = device.ID
-		record.ActivationCode.UsedAt = now
-		record.UsedByUserID = userID
-		record.UsedByDeviceID = device.ID
-		record.UsedAt = now
+		if record.UsedByDeviceID == "" {
+			record.ActivationCode.UsedByUserID = userID
+			record.ActivationCode.UsedByDeviceID = device.ID
+			record.ActivationCode.UsedAt = now
+			record.UsedByUserID = userID
+			record.UsedByDeviceID = device.ID
+			record.UsedAt = now
+		}
 		state.ActivationCodes[codeID] = record
 		state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: device.ID}
 		return device, nil

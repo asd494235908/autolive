@@ -31,8 +31,9 @@ type TransactionalSessionBinder interface {
 }
 
 // TransactionalDeviceActivator is the normalized PostgreSQL activation path.
-// It redeems the one-time code, writes the device and binds the authenticated
-// session in one transaction without loading or rewriting the legacy snapshot.
+// It redeems one capacity slot from the activation code, writes the device and
+// binds the authenticated session in one transaction without loading or
+// rewriting the legacy snapshot.
 type TransactionalDeviceActivator interface {
 	ActivateDeviceWithSessionBinding(ctx context.Context, record DeviceActivationRecord) (controlplane.DeviceSummary, error)
 }
