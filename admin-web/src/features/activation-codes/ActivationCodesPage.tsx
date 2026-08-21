@@ -8,6 +8,7 @@ import {
   DatePicker,
   Empty,
   Form,
+  InputNumber,
   Modal,
   Space,
   Table,
@@ -30,7 +31,7 @@ import type {
 export function ActivationCodesPage() {
   const { message, modal } = App.useApp();
   const queryClient = useQueryClient();
-  const [form] = Form.useForm<{ expires_at: Dayjs }>();
+  const [form] = Form.useForm<{ expires_at: Dayjs; max_devices: number }>();
   const [createOpen, setCreateOpen] = useState(false);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
@@ -129,7 +130,12 @@ export function ActivationCodesPage() {
         key: 'expires_at',
         render: (value: string) => new Date(value).toLocaleString('zh-CN')
       },
-      { title: '可绑定设备数', dataIndex: 'max_devices', key: 'max_devices' },
+      {
+        title: '已绑定设备',
+        key: 'bound_devices',
+        render: (_value: unknown, record: ActivationCode) =>
+          `${record.bound_devices ?? 0} / ${record.max_devices}`
+      },
       { title: '脱敏前缀', dataIndex: 'code_prefix', key: 'code_prefix', render: (value?: string) => value || '未生成' },
       { title: '核销用户', dataIndex: 'used_by_user_id', key: 'used_by_user_id', render: (value?: string) => value || '未核销' },
       { title: '核销设备', dataIndex: 'used_by_device_id', key: 'used_by_device_id', render: (value?: string) => value || '未核销' },
@@ -244,12 +250,12 @@ export function ActivationCodesPage() {
           void form.validateFields().then((values) =>
             createActivationCodeMutation.mutate({
               expires_at: values.expires_at.toISOString(),
-              max_devices: 1
+              max_devices: values.max_devices
             })
           );
         }}
       >
-        <Form<{ expires_at: Dayjs }> form={form} layout="vertical">
+        <Form<{ expires_at: Dayjs; max_devices: number }> form={form} layout="vertical">
           <Form.Item
             label="过期时间"
             name="expires_at"
@@ -262,6 +268,14 @@ export function ActivationCodesPage() {
               placeholder="请选择过期时间"
               style={{ width: '100%' }}
             />
+          </Form.Item>
+          <Form.Item
+            label="可绑定设备数"
+            name="max_devices"
+            initialValue={1}
+            rules={[{ required: true, message: '请输入可绑定设备数' }]}
+          >
+            <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
           </Form.Item>
         </Form>
       </Modal>
