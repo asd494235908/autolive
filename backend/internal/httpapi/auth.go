@@ -467,12 +467,16 @@ func (a *authenticator) revokeUserSessions(ctx context.Context, userID string) e
 }
 
 func (a *authenticator) revokeDeviceSessions(ctx context.Context, deviceID string) error {
+	return a.revokeDeviceSessionsForProduct(ctx, deviceID, controlplane.ProductAutoLive)
+}
+
+func (a *authenticator) revokeDeviceSessionsForProduct(ctx context.Context, deviceID string, product controlplane.ProductCode) error {
 	deviceID = strings.TrimSpace(deviceID)
-	if deviceID == "" {
+	if deviceID == "" || !product.Valid() {
 		return errors.New("device id is required")
 	}
 	if a.store != nil {
-		if err := a.store.RevokeByDeviceID(ctx, deviceID); err != nil {
+		if err := a.store.RevokeByDeviceIDForProduct(ctx, deviceID, product); err != nil {
 			return fmt.Errorf("revoke device sessions: %w", err)
 		}
 		return nil
@@ -480,7 +484,7 @@ func (a *authenticator) revokeDeviceSessions(ctx context.Context, deviceID strin
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for accessHash, session := range a.sessions {
-		if session.DeviceID == deviceID {
+		if session.DeviceID == deviceID && session.Actor.Product == product {
 			delete(a.sessions, accessHash)
 			delete(a.refreshIndex, session.RefreshTokenHash)
 		}

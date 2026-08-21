@@ -394,7 +394,7 @@ func (s *PostgresRepository) ListModelUsagePageWithOptions(ctx context.Context, 
 			}
 			item.LeaseID = leaseID.String
 			item.ErrorCode = errorCode.String
-			item.Product, err = normalizedAuditProduct(product)
+			item.Product, err = normalizedStoredProduct(product)
 			if err != nil {
 				return ModelUsagePage{}, err
 			}
@@ -677,7 +677,7 @@ func scanModelPoolAccountRows(rows *sql.Rows) ([]controlplane.ModelPoolAccountSu
 			return nil, err
 		}
 		var err error
-		item.Product, err = normalizedAuditProduct(product)
+		item.Product, err = normalizedStoredProduct(product)
 		if err != nil {
 			return nil, err
 		}
@@ -811,7 +811,7 @@ func (s *PostgresRepository) ListModelLeasesPageWithOptions(ctx context.Context,
 			if err := rows.Scan(dest...); err != nil {
 				return ModelLeasePage{}, err
 			}
-			item.Product, err = normalizedAuditProduct(product)
+			item.Product, err = normalizedStoredProduct(product)
 			if err != nil {
 				return ModelLeasePage{}, err
 			}
@@ -826,11 +826,15 @@ func (s *PostgresRepository) ListModelLeasesPageWithOptions(ctx context.Context,
 }
 
 func (s *PostgresRepository) GetModelLeaseAdminDetail(ctx context.Context, leaseID string) (controlplane.ModelLeaseAdminDetail, error) {
+	return s.GetModelLeaseAdminDetailForProduct(ctx, leaseID, controlplane.ProductAutoLive)
+}
+
+func (s *PostgresRepository) GetModelLeaseAdminDetailForProduct(ctx context.Context, leaseID string, requestedProduct controlplane.ProductCode) (controlplane.ModelLeaseAdminDetail, error) {
 	if s.modelReadSource != ModelReadSourceNormalized {
 		return controlplane.ModelLeaseAdminDetail{}, errors.New("normalized model lease detail requires normalized read source")
 	}
 	leaseID = strings.TrimSpace(leaseID)
-	if leaseID == "" {
+	if leaseID == "" || !requestedProduct.Valid() {
 		return controlplane.ModelLeaseAdminDetail{}, controlplane.ErrInvalidRequest
 	}
 	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (controlplane.ModelLeaseAdminDetail, error) {
@@ -843,9 +847,9 @@ func (s *PostgresRepository) GetModelLeaseAdminDetail(ctx context.Context, lease
 		err := tx.QueryRowContext(ctx, `
 			SELECT id, product, account_id, user_id, device_id, purpose, status, created_at,
 			       expires_at, released_at, provider, model, proxy_mode, concurrency_limit
-			  FROM model_leases
-			 WHERE id = $1
-		`, leaseID).Scan(
+		      FROM model_leases
+		     WHERE id = $1 AND product = $2
+		`, leaseID, requestedProduct).Scan(
 			&detail.ID, &product, &detail.AccountID, &detail.UserID, &detail.DeviceID, &detail.Purpose,
 			&detail.Status, &createdAt, &expiresAt, &releasedAt, &detail.Provider,
 			&detail.Model, &detail.ProxyMode, &detail.ConcurrencyLimit,
@@ -856,7 +860,7 @@ func (s *PostgresRepository) GetModelLeaseAdminDetail(ctx context.Context, lease
 		if err != nil {
 			return controlplane.ModelLeaseAdminDetail{}, err
 		}
-		detail.Product, err = normalizedAuditProduct(product)
+		detail.Product, err = normalizedStoredProduct(product)
 		if err != nil {
 			return controlplane.ModelLeaseAdminDetail{}, err
 		}
@@ -875,6 +879,8 @@ func (s *PostgresRepository) GetModelLeaseAdminDetail(ctx context.Context, lease
 		return detail, nil
 	})
 }
+
+var _ ProductModelLeaseDetailReader = (*PostgresRepository)(nil)
 
 const devicePageQuery = `
 	SELECT id, user_id, product, device_name, platform, client_version, status,

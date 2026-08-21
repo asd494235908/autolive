@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"regexp"
 	"testing"
@@ -23,8 +24,8 @@ func TestPostgresRepositoryRecordAuditUsesNormalizedAppend(t *testing.T) {
 		t.Fatalf("constructor error = %v", err)
 	}
 	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT product FROM devices WHERE id = $1")).WithArgs("dev_1").WillReturnRows(sqlmock.NewRows([]string{"product"}).AddRow(string(controlplane.ProductDouyinDesktop)))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT product FROM model_leases WHERE id = $1")).WithArgs("lease_1").WillReturnRows(sqlmock.NewRows([]string{"product"}).AddRow(string(controlplane.ProductDouyinDesktop)))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM devices WHERE id = $1 AND product = $2")).WithArgs("dev_1", controlplane.ProductDouyinDesktop).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM model_leases WHERE id = $1 AND product = $2")).WithArgs("lease_1", controlplane.ProductDouyinDesktop).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(1))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_logs (")).WithArgs(sqlmock.AnyArg(), "douyin_desktop", "usr_1", "dev_1", "model.lease.release", "model_lease", "lease_1", "req-1", "success", 200, "", now).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
@@ -52,5 +53,35 @@ func TestPostgresRepositoryRecordAuditHonorsCancellation(t *testing.T) {
 	err = repository.RecordAudit(ctx, controlplane.AuditLogInput{Action: "test", TargetType: "test", Outcome: "success", StatusCode: 200})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("RecordAudit() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestPostgresRepositoryRecordAuditRejectsNullProductTarget(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, time.Now, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM model_leases WHERE id = $1 AND product = $2")).
+		WithArgs("lease-null", controlplane.ProductDouyinDesktop).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM model_leases WHERE id = $1 AND (product IS NULL OR product <> $2)")).
+		WithArgs("lease-null", controlplane.ProductDouyinDesktop).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(1))
+	mock.ExpectRollback()
+
+	err = repository.RecordAudit(context.Background(), controlplane.AuditLogInput{
+		Product: controlplane.ProductDouyinDesktop, Action: "model.lease.release", TargetType: "model_lease", TargetID: "lease-null", Outcome: "success", StatusCode: 200,
+	})
+	if !errors.Is(err, controlplane.ErrForbidden) {
+		t.Fatalf("RecordAudit() error = %v, want forbidden", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
 	}
 }

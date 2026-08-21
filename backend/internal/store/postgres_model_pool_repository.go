@@ -44,6 +44,13 @@ func (s *PostgresRepository) CreateModelPoolAccount(ctx context.Context, record 
 	record.BaseURL = strings.TrimRight(strings.TrimSpace(record.BaseURL), "/")
 	record.APIKey = strings.TrimSpace(record.APIKey)
 	record.Status = strings.TrimSpace(record.Status)
+	if record.Product.Valid() {
+		audit, err := normalizeOptionalAuditInputForProduct(record.Audit, record.Product)
+		if err != nil {
+			return controlplane.ModelPoolAccountSummary{}, err
+		}
+		record.Audit = audit
+	}
 	operationCtx, cancel := s.operationContext(ctx)
 	defer cancel()
 	tx, err := s.db.BeginTx(operationCtx, nil)
@@ -231,6 +238,13 @@ func (s *PostgresRepository) mutateNormalizedModelPoolAccount(ctx context.Contex
 	record.IdempotencyKey = strings.TrimSpace(record.IdempotencyKey)
 	record.Fingerprint = strings.TrimSpace(record.Fingerprint)
 	record.AccountID = strings.TrimSpace(record.AccountID)
+	if record.Product.Valid() {
+		audit, err := normalizeOptionalAuditInputForProduct(record.Audit, record.Product)
+		if err != nil {
+			return controlplane.ModelPoolAccountSummary{}, err
+		}
+		record.Audit = audit
+	}
 	operationCtx, cancel := s.operationContext(ctx)
 	defer cancel()
 	tx, err := s.db.BeginTx(operationCtx, nil)

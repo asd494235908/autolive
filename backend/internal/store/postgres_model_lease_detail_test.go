@@ -27,7 +27,7 @@ func TestPostgresRepositoryNormalizedModelLeaseDetailUsesBoundedQuery(t *testing
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, account_id, user_id, device_id, purpose, status, created_at,")).
-		WithArgs("lease-detail-1").
+		WithArgs("lease-detail-1", controlplane.ProductAutoLive).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "product", "account_id", "user_id", "device_id", "purpose", "status", "created_at", "expires_at", "released_at", "provider", "model", "proxy_mode", "concurrency_limit",
 		}).AddRow("lease-detail-1", string(controlplane.ProductAutoLive), "account-1", "user-1", "device-1", "validation", "active", createdAt, expiresAt, nil, "openai", "rewrite", controlplane.ModelLeaseProxyModeDirectLease, 2))
@@ -60,7 +60,7 @@ func TestPostgresRepositoryNormalizedModelLeaseDetailDerivesExpiryWithoutSnapsho
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, account_id, user_id, device_id, purpose, status, created_at,")).
-		WithArgs("lease-expired-1").
+		WithArgs("lease-expired-1", controlplane.ProductAutoLive).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "product", "account_id", "user_id", "device_id", "purpose", "status", "created_at", "expires_at", "released_at", "provider", "model", "proxy_mode", "concurrency_limit",
 		}).AddRow("lease-expired-1", string(controlplane.ProductAutoLive), "account-1", "user-1", "device-1", "validation", "active", now.Add(-time.Hour), expiresAt, nil, "openai", "rewrite", controlplane.ModelLeaseProxyModeDirectLease, 2))
@@ -72,6 +72,38 @@ func TestPostgresRepositoryNormalizedModelLeaseDetailDerivesExpiryWithoutSnapsho
 	}
 	if detail.Status != controlplane.ModelLeaseStatusExpired || detail.ReleasedAt != now.Format(time.RFC3339) {
 		t.Fatalf("expired lease detail = %+v", detail)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestPostgresRepositoryNormalizedModelLeaseDetailScopesProduct(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, func() time.Time { return now }, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+	mock.ExpectBegin()
+	expectNormalizedPageCoverage(mock)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, account_id, user_id, device_id, purpose, status, created_at,")).
+		WithArgs("lease-douyin", controlplane.ProductDouyinDesktop).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "product", "account_id", "user_id", "device_id", "purpose", "status", "created_at", "expires_at", "released_at", "provider", "model", "proxy_mode", "concurrency_limit",
+		}).AddRow("lease-douyin", string(controlplane.ProductDouyinDesktop), "account-1", "user-1", "device-1", "validation", "active", now, now.Add(time.Hour), nil, "openai", "rewrite", controlplane.ModelLeaseProxyModeDirectLease, 2))
+	mock.ExpectCommit()
+
+	detail, err := repository.GetModelLeaseAdminDetailForProduct(context.Background(), "lease-douyin", controlplane.ProductDouyinDesktop)
+	if err != nil {
+		t.Fatalf("GetModelLeaseAdminDetailForProduct() error = %v", err)
+	}
+	if detail.Product != controlplane.ProductDouyinDesktop {
+		t.Fatalf("detail product = %q", detail.Product)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)

@@ -434,11 +434,23 @@ type ActivationRepository interface {
 	RevokeActivationCode(ctx context.Context, scope, idempotencyKey, fingerprint, codeID string) (controlplane.ActivationCode, error)
 }
 
+// ProductActivationRepository is the strict administrative activation-code
+// boundary. The product is a fixed authorization predicate, never inferred
+// from the code ID or a legacy snapshot row.
+type ProductActivationRepository interface {
+	CreateActivationCodeForProduct(ctx context.Context, scope, idempotencyKey, fingerprint string, record ActivationCodeCreateRecord, product controlplane.ProductCode) (controlplane.ActivationCode, error)
+	RevokeActivationCodeForProduct(ctx context.Context, scope, idempotencyKey, fingerprint, codeID string, product controlplane.ProductCode) (controlplane.ActivationCode, error)
+}
+
 // ActivationPageReader provides bounded, redacted activation-code reads.
 // Normalized PostgreSQL derives expiry at read time without rewriting the
 // legacy snapshot or storing plaintext codes.
 type ActivationPageReader interface {
 	ListActivationCodesPage(ctx context.Context, offset, limit int) (ActivationCodePage, error)
+}
+
+type ProductActivationPageReader interface {
+	ListActivationCodesPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (ActivationCodePage, error)
 }
 
 type UserCreateRecord struct {
@@ -602,6 +614,10 @@ type ModelLeaseFilteredPageReader interface {
 // control-plane snapshot.
 type ModelLeaseDetailReader interface {
 	GetModelLeaseAdminDetail(ctx context.Context, leaseID string) (controlplane.ModelLeaseAdminDetail, error)
+}
+
+type ProductModelLeaseDetailReader interface {
+	GetModelLeaseAdminDetailForProduct(ctx context.Context, leaseID string, product controlplane.ProductCode) (controlplane.ModelLeaseAdminDetail, error)
 }
 
 var ErrNormalizedModelLeaseDetailReaderRequired = errors.New("normalized model lease detail reader is required")

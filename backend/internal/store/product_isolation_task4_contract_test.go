@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"regexp"
 	"testing"
@@ -103,6 +104,45 @@ func TestTask4StrictModelAccountLookupBindsProductInSQL(t *testing.T) {
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("tx commit error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestTask4SameDeviceIDCanBeReadOnlyWithinRequestedProduct(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, time.Now, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+	now := nowForProductContract()
+	for _, product := range []controlplane.ProductCode{controlplane.ProductAutoLive, controlplane.ProductDouyinDesktop} {
+		mock.ExpectBegin()
+		expectNormalizedPageCoverage(mock)
+		query := "FROM devices WHERE user_id = $1 AND id = $2 AND product = 'autolive'"
+		args := []driver.Value{"user_1", "device-shared"}
+		if product != controlplane.ProductAutoLive {
+			query = "FROM devices WHERE user_id = $1 AND id = $2 AND product = $3"
+			args = append(args, product)
+		}
+		mock.ExpectQuery(regexp.QuoteMeta(query)).
+			WithArgs(args...).
+			WillReturnRows(sqlmock.NewRows([]string{
+				"id", "user_id", "product", "device_name", "platform", "client_version", "status", "disk_free_bytes", "memory_total_bytes", "memory_available_bytes", "cpu_logical_cores", "runtime_os_name", "runtime_os_version", "kernel_version", "current_media_name", "playback_state", "last_heartbeat_at",
+			}).AddRow("device-shared", "user_1", string(product), "Desktop", "windows", "1.0", controlplane.DeviceStatusActive, int64(0), int64(0), int64(0), 0, nil, nil, nil, nil, nil, now))
+		mock.ExpectCommit()
+		device, err := repository.GetOwnedDeviceForProduct(context.Background(), "user_1", "device-shared", product)
+		if err != nil {
+			t.Fatalf("GetOwnedDeviceForProduct(%q) error = %v", product, err)
+		}
+		if device.ID != "device-shared" || device.Product != product {
+			t.Fatalf("device for %q = %+v", product, device)
+		}
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)

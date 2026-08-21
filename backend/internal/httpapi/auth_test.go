@@ -511,6 +511,31 @@ func TestProductMismatchIsRejectedBeforeActivationOrHeartbeatBinding(t *testing.
 	}
 }
 
+func TestRevokeDeviceSessionsForProductDoesNotRevokeOtherProduct(t *testing.T) {
+	sessions := newTestSessionStore()
+	now := time.Now().UTC()
+	for _, session := range []store.AuthSession{
+		{ID: "session-auto", UserID: "user-1", Product: controlplane.ProductAutoLive, DeviceID: "device-shared", AccessTokenHash: "access-auto", RefreshTokenHash: "refresh-auto", AccessExpiresAt: now.Add(time.Hour), RefreshExpiresAt: now.Add(2 * time.Hour)},
+		{ID: "session-douyin", UserID: "user-1", Product: controlplane.ProductDouyinDesktop, DeviceID: "device-shared", AccessTokenHash: "access-douyin", RefreshTokenHash: "refresh-douyin", AccessExpiresAt: now.Add(time.Hour), RefreshExpiresAt: now.Add(2 * time.Hour)},
+	} {
+		if err := sessions.Create(context.Background(), session); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+	}
+	auth := newAuthenticator(service.NewControlPlane(store.NewMemoryStore(time.Now)), AuthConfig{}, sessions)
+	if err := auth.revokeDeviceSessionsForProduct(context.Background(), "device-shared", controlplane.ProductDouyinDesktop); err != nil {
+		t.Fatalf("revokeDeviceSessionsForProduct() error = %v", err)
+	}
+	sessions.mu.Lock()
+	defer sessions.mu.Unlock()
+	if sessions.revoked["session-auto"] {
+		t.Fatal("autolive session was revoked by douyin device lifecycle")
+	}
+	if !sessions.revoked["session-douyin"] {
+		t.Fatal("douyin session was not revoked")
+	}
+}
+
 func TestClientProfileReturnsActorAndDeviceProduct(t *testing.T) {
 	handler := newTestRouter(t)
 	token := loginForTest(t, handler)
@@ -892,6 +917,20 @@ func (s *testSessionStore) RevokeByDeviceID(_ context.Context, deviceID string) 
 	}
 	for _, session := range s.byAccess {
 		if session.DeviceID == deviceID {
+			s.revoked[session.ID] = true
+		}
+	}
+	return nil
+}
+
+func (s *testSessionStore) RevokeByDeviceIDForProduct(_ context.Context, deviceID string, product controlplane.ProductCode) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revokeErr != nil {
+		return s.revokeErr
+	}
+	for _, session := range s.byAccess {
+		if session.DeviceID == deviceID && session.Product == product {
 			s.revoked[session.ID] = true
 		}
 	}

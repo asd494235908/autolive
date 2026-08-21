@@ -222,6 +222,27 @@ func TestSQLSessionStoreRevokeByDeviceID(t *testing.T) {
 	}
 }
 
+func TestSQLSessionStoreRevokeByDeviceIDForProduct(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	store, err := NewSQLSessionStore(database, time.Now)
+	if err != nil {
+		t.Fatalf("NewSQLSessionStore() error: %v", err)
+	}
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP")).
+		WithArgs("device_1", controlplane.ProductDouyinDesktop).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	if err := store.RevokeByDeviceIDForProduct(context.Background(), "device_1", controlplane.ProductDouyinDesktop); err != nil {
+		t.Fatalf("RevokeByDeviceIDForProduct() error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
 func TestSQLSessionStoreDeviceBindingChecksAffectedRowsAndSupportsCompensation(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	if err != nil {

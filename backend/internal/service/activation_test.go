@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -138,5 +139,27 @@ func TestRevokeActivationCodeClearsPlaintextFromMemoryState(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("inspect revoked activation code: %v", err)
+	}
+}
+
+func TestProductActivationCodeCreateAndRevokeStayInProduct(t *testing.T) {
+	now := time.Now().UTC()
+	svc := NewControlPlane(store.NewMemoryStore(func() time.Time { return now }))
+	code, err := svc.CreateActivationCodeForProduct(context.Background(), controlplane.ProductDouyinDesktop, "product-create-code", controlplane.CreateActivationCodeInput{ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
+	if err != nil {
+		t.Fatalf("CreateActivationCodeForProduct() error = %v", err)
+	}
+	if code.Product != controlplane.ProductDouyinDesktop {
+		t.Fatalf("created product = %q", code.Product)
+	}
+	if _, err := svc.RevokeActivationCodeForProduct(context.Background(), controlplane.ProductAutoLive, "product-revoke-wrong", code.ID); !errors.Is(err, controlplane.ErrForbidden) {
+		t.Fatalf("cross-product revoke error = %v, want forbidden", err)
+	}
+	revoked, err := svc.RevokeActivationCodeForProduct(context.Background(), controlplane.ProductDouyinDesktop, "product-revoke-code", code.ID)
+	if err != nil {
+		t.Fatalf("RevokeActivationCodeForProduct() error = %v", err)
+	}
+	if revoked.Product != controlplane.ProductDouyinDesktop || revoked.Status != controlplane.ActivationCodeStatusRevoked {
+		t.Fatalf("revoked code = %+v", revoked)
 	}
 }

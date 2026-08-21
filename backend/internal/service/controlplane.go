@@ -418,6 +418,14 @@ func effectiveStoredProduct(product controlplane.ProductCode) controlplane.Produ
 	return product
 }
 
+func strictStoredProduct(product controlplane.ProductCode) (controlplane.ProductCode, bool) {
+	product = controlplane.ProductCode(strings.TrimSpace(string(product)))
+	if !product.Valid() {
+		return "", false
+	}
+	return product, true
+}
+
 func productScopedScope(scope string, product controlplane.ProductCode) string {
 	if product == "" || product == controlplane.ProductAutoLive {
 		return scope
@@ -1826,14 +1834,33 @@ func (s *ControlPlane) ListModelLeasesPageWithOptions(ctx context.Context, page,
 // GetModelLeaseAdminDetail returns lifecycle metadata only. Credentials and
 // direct provider secrets never cross this administrative boundary.
 func (s *ControlPlane) GetModelLeaseAdminDetail(ctx context.Context, leaseID string) (controlplane.ModelLeaseAdminDetail, error) {
+	return s.getModelLeaseAdminDetail(ctx, leaseID, controlplane.ProductAutoLive, false)
+}
+
+func (s *ControlPlane) GetModelLeaseAdminDetailForProduct(ctx context.Context, leaseID string, product controlplane.ProductCode) (controlplane.ModelLeaseAdminDetail, error) {
+	return s.getModelLeaseAdminDetail(ctx, leaseID, product, true)
+}
+
+func (s *ControlPlane) getModelLeaseAdminDetail(ctx context.Context, leaseID string, product controlplane.ProductCode, strictProduct bool) (controlplane.ModelLeaseAdminDetail, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ModelLeaseAdminDetail{}, err
 	}
 	leaseID = strings.TrimSpace(leaseID)
-	if leaseID == "" {
+	product, err := validateOperationProduct(product, controlplane.AuditLogInput{})
+	if err != nil || leaseID == "" {
+		if err != nil {
+			return controlplane.ModelLeaseAdminDetail{}, err
+		}
 		return controlplane.ModelLeaseAdminDetail{}, controlplane.ErrInvalidRequest
 	}
 	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		if strictProduct {
+			productReader, ok := s.repository.(store.ProductModelLeaseDetailReader)
+			if !ok {
+				return controlplane.ModelLeaseAdminDetail{}, store.ErrNormalizedModelLeaseDetailReaderRequired
+			}
+			return productReader.GetModelLeaseAdminDetailForProduct(ctx, leaseID, product)
+		}
 		reader, ok := s.repository.(store.ModelLeaseDetailReader)
 		if !ok {
 			return controlplane.ModelLeaseAdminDetail{}, store.ErrNormalizedModelLeaseDetailReaderRequired
@@ -1845,6 +1872,17 @@ func (s *ControlPlane) GetModelLeaseAdminDetail(ctx context.Context, leaseID str
 		lease, ok := state.ModelLeases[leaseID]
 		if !ok {
 			return controlplane.ModelLeaseAdminDetail{}, controlplane.ErrModelLeaseNotFound
+		}
+		storedProduct := effectiveStoredProduct(lease.Product)
+		if strictProduct {
+			var ok bool
+			storedProduct, ok = strictStoredProduct(lease.Product)
+			if !ok {
+				return controlplane.ModelLeaseAdminDetail{}, controlplane.ErrForbidden
+			}
+		}
+		if storedProduct != product {
+			return controlplane.ModelLeaseAdminDetail{}, controlplane.ErrForbidden
 		}
 		return modelLeaseAdminDetail(lease), nil
 	})
@@ -3255,7 +3293,19 @@ func sortModelUsageRecordsForList(items []controlplane.ModelUsageRecord, sortKey
 }
 
 func (s *ControlPlane) CreateActivationCode(ctx context.Context, idempotencyKey string, input controlplane.CreateActivationCodeInput) (controlplane.ActivationCode, error) {
+	return s.createActivationCode(ctx, controlplane.ProductAutoLive, idempotencyKey, input, false)
+}
+
+func (s *ControlPlane) CreateActivationCodeForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey string, input controlplane.CreateActivationCodeInput) (controlplane.ActivationCode, error) {
+	return s.createActivationCode(ctx, product, idempotencyKey, input, true)
+}
+
+func (s *ControlPlane) createActivationCode(ctx context.Context, product controlplane.ProductCode, idempotencyKey string, input controlplane.CreateActivationCodeInput, strictProduct bool) (controlplane.ActivationCode, error) {
 	if err := checkContext(ctx); err != nil {
+		return controlplane.ActivationCode{}, err
+	}
+	product, err := validateOperationProduct(product, controlplane.AuditLogInput{})
+	if err != nil {
 		return controlplane.ActivationCode{}, err
 	}
 	if !validIdempotencyKey(idempotencyKey) {
@@ -3268,9 +3318,11 @@ func (s *ControlPlane) CreateActivationCode(ctx context.Context, idempotencyKey 
 		return controlplane.ActivationCode{}, controlplane.ErrInvalidRequest
 	}
 	fingerprint, err := fingerprintValue(struct {
-		ExpiresAt  string `json:"expires_at"`
-		MaxDevices int    `json:"max_devices"`
+		Product    controlplane.ProductCode `json:"product"`
+		ExpiresAt  string                   `json:"expires_at"`
+		MaxDevices int                      `json:"max_devices"`
 	}{
+		Product:    product,
 		ExpiresAt:  input.ExpiresAt.UTC().Format(time.RFC3339),
 		MaxDevices: input.MaxDevices,
 	})
@@ -3286,13 +3338,25 @@ func (s *ControlPlane) CreateActivationCode(ctx context.Context, idempotencyKey 
 		if err != nil {
 			return controlplane.ActivationCode{}, controlplane.NewError(http.StatusInternalServerError, "RANDOM_GENERATION_FAILED", "无法生成激活码")
 		}
-		return writer.CreateActivationCode(ctx, "control-plane-state", "create-activation-code:"+idempotencyKey, fingerprint, store.ActivationCodeCreateRecord{
-			Product: controlplane.ProductAutoLive, PlainCode: plainCode, CodeHash: secretDigest(plainCode), CodePrefix: plainCode[:12], ExpiresAt: input.ExpiresAt, MaxDevices: input.MaxDevices, CreatedAt: s.repository.Now(),
-		})
+		record := store.ActivationCodeCreateRecord{
+			Product: product, PlainCode: plainCode, CodeHash: secretDigest(plainCode), CodePrefix: plainCode[:12], ExpiresAt: input.ExpiresAt, MaxDevices: input.MaxDevices, CreatedAt: s.repository.Now(),
+		}
+		if strictProduct {
+			productWriter, ok := s.repository.(store.ProductActivationRepository)
+			if !ok {
+				return controlplane.ActivationCode{}, store.ErrNormalizedActivationRepositoryRequired
+			}
+			return productWriter.CreateActivationCodeForProduct(ctx, "control-plane-state", "create-activation-code:"+idempotencyKey, fingerprint, record, product)
+		}
+		return writer.CreateActivationCode(ctx, "control-plane-state", "create-activation-code:"+idempotencyKey, fingerprint, record)
 	}
 
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ActivationCode, error) {
-		if existing, ok := state.IdempotencyRecords["create-activation-code:"+idempotencyKey]; ok {
+		scope := "create-activation-code:" + idempotencyKey
+		if strictProduct {
+			scope += ":" + string(product)
+		}
+		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
 				return controlplane.ActivationCode{}, controlplane.ErrIdempotencyConflict
 			}
@@ -3316,7 +3380,7 @@ func (s *ControlPlane) CreateActivationCode(ctx context.Context, idempotencyKey 
 		}
 		code := controlplane.ActivationCode{
 			ID:           id,
-			Product:      controlplane.ProductAutoLive,
+			Product:      product,
 			Status:       controlplane.ActivationCodeStatusActive,
 			ExpiresAt:    input.ExpiresAt.UTC().Format(time.RFC3339),
 			MaxDevices:   input.MaxDevices,
@@ -3330,7 +3394,7 @@ func (s *ControlPlane) CreateActivationCode(ctx context.Context, idempotencyKey 
 			CodePrefix:     plainCode[:12],
 		}
 		state.ActivationCodeIndex[secretDigest(plainCode)] = id
-		state.IdempotencyRecords["create-activation-code:"+idempotencyKey] = store.IdempotencyRecord{
+		state.IdempotencyRecords[scope] = store.IdempotencyRecord{
 			Fingerprint: fingerprint,
 			ResourceID:  id,
 		}
@@ -3403,6 +3467,59 @@ func (s *ControlPlane) ListActivationCodesPage(ctx context.Context, page, pageSi
 	return items[start:end], len(items), nil
 }
 
+func (s *ControlPlane) ListActivationCodesPageForProduct(ctx context.Context, page, pageSize int, product controlplane.ProductCode) ([]controlplane.ActivationCode, int, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
+	product, err := validateOperationProduct(product, controlplane.AuditLogInput{})
+	if err != nil {
+		return nil, 0, err
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		reader, ok := s.repository.(store.ProductActivationPageReader)
+		if !ok {
+			return nil, 0, store.ErrNormalizedActivationPageReaderRequired
+		}
+		result, err := reader.ListActivationCodesPageForProduct(ctx, offset, pageSize, product)
+		if err != nil {
+			return nil, 0, err
+		}
+		return result.Items, result.Total, nil
+	}
+	items, err := withState(ctx, s.repository, func(state *store.State) ([]controlplane.ActivationCode, error) {
+		items := make([]controlplane.ActivationCode, 0, len(state.ActivationCodes))
+		now := s.repository.Now()
+		for id, record := range state.ActivationCodes {
+			storedProduct, ok := strictStoredProduct(record.ActivationCode.Product)
+			if !ok || storedProduct != product {
+				continue
+			}
+			code := decorateActivationCode(state, record)
+			if code.Status == controlplane.ActivationCodeStatusActive {
+				expiresAt, _ := time.Parse(time.RFC3339, code.ExpiresAt)
+				if !now.Before(expiresAt) {
+					code.Status = controlplane.ActivationCodeStatusExpired
+					record.ActivationCode.Status = code.Status
+					state.ActivationCodes[id] = record
+				}
+			}
+			code.PlainCode = nil
+			items = append(items, code)
+		}
+		slices.SortFunc(items, func(a, b controlplane.ActivationCode) int { return strings.Compare(a.ID, b.ID) })
+		return items, nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	start, end := pageWindow(len(items), offset, pageSize)
+	return items[start:end], len(items), nil
+}
+
 func decorateActivationCode(state *store.State, record store.ActivationCodeRecord) controlplane.ActivationCode {
 	code := record.ActivationCode
 	code.PlainCode = nil
@@ -3427,19 +3544,32 @@ func decorateActivationCode(state *store.State, record store.ActivationCodeRecor
 }
 
 func (s *ControlPlane) RevokeActivationCode(ctx context.Context, idempotencyKey, codeID string) (controlplane.ActivationCode, error) {
+	return s.revokeActivationCode(ctx, controlplane.ProductAutoLive, idempotencyKey, codeID, false)
+}
+
+func (s *ControlPlane) RevokeActivationCodeForProduct(ctx context.Context, product controlplane.ProductCode, idempotencyKey, codeID string) (controlplane.ActivationCode, error) {
+	return s.revokeActivationCode(ctx, product, idempotencyKey, codeID, true)
+}
+
+func (s *ControlPlane) revokeActivationCode(ctx context.Context, product controlplane.ProductCode, idempotencyKey, codeID string, strictProduct bool) (controlplane.ActivationCode, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.ActivationCode{}, err
 	}
 	if !validIdempotencyKey(idempotencyKey) {
 		return controlplane.ActivationCode{}, controlplane.ErrIdempotencyKeyRequired
 	}
+	product, err := validateOperationProduct(product, controlplane.AuditLogInput{})
+	if err != nil {
+		return controlplane.ActivationCode{}, err
+	}
 	codeID = strings.TrimSpace(codeID)
 	if codeID == "" {
 		return controlplane.ActivationCode{}, controlplane.ErrActivationCodeNotFound
 	}
 	fingerprint, err := fingerprintValue(struct {
-		CodeID string `json:"code_id"`
-	}{CodeID: codeID})
+		CodeID  string                   `json:"code_id"`
+		Product controlplane.ProductCode `json:"product"`
+	}{CodeID: codeID, Product: product})
 	if err != nil {
 		return controlplane.ActivationCode{}, err
 	}
@@ -3448,11 +3578,21 @@ func (s *ControlPlane) RevokeActivationCode(ctx context.Context, idempotencyKey,
 		if !ok {
 			return controlplane.ActivationCode{}, store.ErrNormalizedActivationRepositoryRequired
 		}
+		if strictProduct {
+			productWriter, ok := s.repository.(store.ProductActivationRepository)
+			if !ok {
+				return controlplane.ActivationCode{}, store.ErrNormalizedActivationRepositoryRequired
+			}
+			return productWriter.RevokeActivationCodeForProduct(ctx, "control-plane-state", "revoke-activation-code:"+idempotencyKey, fingerprint, codeID, product)
+		}
 		return writer.RevokeActivationCode(ctx, "control-plane-state", "revoke-activation-code:"+idempotencyKey, fingerprint, codeID)
 	}
 
 	return withState(ctx, s.repository, func(state *store.State) (controlplane.ActivationCode, error) {
 		scope := "revoke-activation-code:" + idempotencyKey
+		if strictProduct {
+			scope += ":" + string(product)
+		}
 		if existing, ok := state.IdempotencyRecords[scope]; ok {
 			if existing.Fingerprint != fingerprint {
 				return controlplane.ActivationCode{}, controlplane.ErrIdempotencyConflict
@@ -3468,6 +3608,10 @@ func (s *ControlPlane) RevokeActivationCode(ctx context.Context, idempotencyKey,
 		record, ok := state.ActivationCodes[codeID]
 		if !ok {
 			return controlplane.ActivationCode{}, controlplane.ErrActivationCodeNotFound
+		}
+		storedProduct, ok := strictStoredProduct(record.ActivationCode.Product)
+		if strictProduct && (!ok || storedProduct != product) {
+			return controlplane.ActivationCode{}, controlplane.ErrForbidden
 		}
 		if record.ActivationCode.Status != controlplane.ActivationCodeStatusActive && record.ActivationCode.Status != controlplane.ActivationCodeStatusRevoked {
 			return controlplane.ActivationCode{}, controlplane.ErrActivationCodeStateConflict

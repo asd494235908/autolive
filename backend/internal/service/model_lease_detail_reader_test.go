@@ -33,10 +33,48 @@ func TestGetModelLeaseAdminDetailFailsClosedWithoutNormalizedReader(t *testing.T
 	}
 }
 
+func TestGetModelLeaseAdminDetailForProductUsesStrictReader(t *testing.T) {
+	reader := &normalizedProductLeaseDetailReader{detail: controlplane.ModelLeaseAdminDetail{ID: "lease-1", Product: controlplane.ProductDouyinDesktop}}
+	svc := NewControlPlaneWithRepository(reader)
+	detail, err := svc.GetModelLeaseAdminDetailForProduct(context.Background(), "lease-1", controlplane.ProductDouyinDesktop)
+	if err != nil {
+		t.Fatalf("GetModelLeaseAdminDetailForProduct() error = %v", err)
+	}
+	if detail.Product != controlplane.ProductDouyinDesktop || reader.product != controlplane.ProductDouyinDesktop {
+		t.Fatalf("detail=%+v product=%q", detail, reader.product)
+	}
+}
+
+func TestGetModelLeaseAdminDetailForProductFailsClosedWithoutStrictReader(t *testing.T) {
+	reader := &normalizedLeaseDetailReader{detail: controlplane.ModelLeaseAdminDetail{ID: "lease-1"}}
+	svc := NewControlPlaneWithRepository(reader)
+	if _, err := svc.GetModelLeaseAdminDetailForProduct(context.Background(), "lease-1", controlplane.ProductDouyinDesktop); !errors.Is(err, store.ErrNormalizedModelLeaseDetailReaderRequired) {
+		t.Fatalf("error = %v, want normalized strict detail reader requirement", err)
+	}
+}
+
 type normalizedLeaseDetailReader struct {
 	detail   controlplane.ModelLeaseAdminDetail
 	runCalls int
 	leaseID  string
+}
+
+type normalizedProductLeaseDetailReader struct {
+	detail  controlplane.ModelLeaseAdminDetail
+	product controlplane.ProductCode
+}
+
+func (r *normalizedProductLeaseDetailReader) Now() time.Time { return time.Unix(0, 0) }
+
+func (r *normalizedProductLeaseDetailReader) Run(context.Context, store.StateOperation) error {
+	return errors.New("state fallback must not be used")
+}
+
+func (r *normalizedProductLeaseDetailReader) UsesNormalizedReadSource() bool { return true }
+
+func (r *normalizedProductLeaseDetailReader) GetModelLeaseAdminDetailForProduct(_ context.Context, _ string, product controlplane.ProductCode) (controlplane.ModelLeaseAdminDetail, error) {
+	r.product = product
+	return r.detail, nil
 }
 
 func (r *normalizedLeaseDetailReader) Now() time.Time { return time.Unix(0, 0) }

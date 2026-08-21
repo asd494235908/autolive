@@ -33,6 +33,7 @@ type SessionStore interface {
 	RevokeByAccessTokenHash(ctx context.Context, accessTokenHash string) error
 	RevokeByUserID(ctx context.Context, userID string) error
 	RevokeByDeviceID(ctx context.Context, deviceID string) error
+	RevokeByDeviceIDForProduct(ctx context.Context, deviceID string, product controlplane.ProductCode) error
 	UpdateDeviceID(ctx context.Context, accessTokenHash, deviceID string) error
 	ClearDeviceID(ctx context.Context, accessTokenHash, deviceID string) error
 }
@@ -224,6 +225,19 @@ func (s *SQLSessionStore) RevokeByDeviceID(ctx context.Context, deviceID string)
 		UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP
 		WHERE device_id = $1 AND revoked_at IS NULL
 	`, deviceID)
+	return postgresOperationError(ctx, err)
+}
+
+func (s *SQLSessionStore) RevokeByDeviceIDForProduct(ctx context.Context, deviceID string, product controlplane.ProductCode) error {
+	if deviceID == "" || !product.Valid() {
+		return errors.New("device id and product are required")
+	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP
+		WHERE device_id = $1 AND product = $2 AND revoked_at IS NULL
+	`, deviceID, product)
 	return postgresOperationError(ctx, err)
 }
 

@@ -344,7 +344,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			return
 		}
 		if !svc.SupportsTransactionalDeviceLifecycle() {
-			if err := auth.revokeDeviceSessions(r.Context(), device.ID); err != nil {
+			if err := auth.revokeDeviceSessionsForProduct(r.Context(), device.ID, actor.Product); err != nil {
 				writeError(w, r, http.StatusServiceUnavailable, "AUTH_SESSION_STORE_UNAVAILABLE", "设备会话暂时无法撤销")
 				return
 			}
@@ -363,7 +363,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			return
 		}
 		if !svc.SupportsTransactionalDeviceLifecycle() {
-			if err := auth.revokeDeviceSessions(r.Context(), device.ID); err != nil {
+			if err := auth.revokeDeviceSessionsForProduct(r.Context(), device.ID, actor.Product); err != nil {
 				writeError(w, r, http.StatusServiceUnavailable, "AUTH_SESSION_STORE_UNAVAILABLE", "设备会话暂时无法撤销")
 				return
 			}
@@ -385,7 +385,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			writeAppError(w, r, err)
 			return
 		}
-		items, total, err := svc.ListActivationCodesPage(r.Context(), page, pageSize)
+		items, total, err := svc.ListActivationCodesPageForProduct(r.Context(), page, pageSize, actor.Product)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -411,7 +411,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
 			return
 		}
-		code, err := svc.CreateActivationCode(r.Context(), r.Header.Get("Idempotency-Key"), controlplane.CreateActivationCodeInput{
+		code, err := svc.CreateActivationCodeForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), controlplane.CreateActivationCodeInput{
 			ExpiresAt:  expiresAt,
 			MaxDevices: request.MaxDevices,
 		})
@@ -426,7 +426,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("POST /api/v1/admin/activation-codes/{code_id}/revoke", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		code, err := svc.RevokeActivationCode(r.Context(), r.Header.Get("Idempotency-Key"), r.PathValue("code_id"))
+		code, err := svc.RevokeActivationCodeForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), r.PathValue("code_id"))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -790,7 +790,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/admin/model-leases/{lease_id}", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		lease, err := svc.GetModelLeaseAdminDetail(r.Context(), r.PathValue("lease_id"))
+		lease, err := svc.GetModelLeaseAdminDetailForProduct(r.Context(), r.PathValue("lease_id"), actor.Product)
 		if err != nil {
 			writeAppError(w, r, err)
 			return

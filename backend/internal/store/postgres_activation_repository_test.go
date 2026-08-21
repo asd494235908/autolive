@@ -144,3 +144,25 @@ func TestPostgresRepositoryRevokeActivationCodeWritesNormalizedDomain(t *testing
 		t.Fatalf("sql expectations: %v", err)
 	}
 }
+
+func TestPostgresRepositoryProductActivationMethodsRejectInvalidProductBeforeDatabase(t *testing.T) {
+	database, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, time.Now, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+	_, err = repository.CreateActivationCodeForProduct(context.Background(), "scope", "key", "fp", ActivationCodeCreateRecord{
+		PlainCode: "code_0123456789", CodeHash: "digest", CodePrefix: "code_012345", ExpiresAt: time.Now().Add(time.Hour), MaxDevices: 1,
+	}, controlplane.ProductCode("invalid"))
+	if !errors.Is(err, controlplane.ErrInvalidRequest) {
+		t.Fatalf("CreateActivationCodeForProduct() error = %v, want invalid request", err)
+	}
+	_, err = repository.RevokeActivationCodeForProduct(context.Background(), "scope", "key", "fp", "ac_1", controlplane.ProductCode("invalid"))
+	if !errors.Is(err, controlplane.ErrInvalidRequest) {
+		t.Fatalf("RevokeActivationCodeForProduct() error = %v, want invalid request", err)
+	}
+}

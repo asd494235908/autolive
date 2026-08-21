@@ -103,22 +103,25 @@ func normalizeOptionalAuditInputForProduct(input controlplane.AuditLogInput, pro
 
 func validateNormalizedAuditTargetProduct(ctx context.Context, tx *sql.Tx, input controlplane.AuditLogInput) error {
 	check := func(table, id string) error {
-		var raw sql.NullString
-		err := tx.QueryRowContext(ctx, "SELECT product FROM "+table+" WHERE id = $1", id).Scan(&raw)
-		if errors.Is(err, sql.ErrNoRows) {
+		var exists int
+		err := tx.QueryRowContext(ctx, "SELECT 1 FROM "+table+" WHERE id = $1 AND product = $2", id, input.Product).Scan(&exists)
+		if err == nil {
 			return nil
 		}
-		if err != nil {
-			return postgresOperationError(ctx, fmt.Errorf("validate audit %s product: %w", table, err))
+		if errors.Is(err, sql.ErrNoRows) {
+			// A product-mismatched, NULL, or otherwise malformed resource must
+			// not be treated as an absent target. The second query still uses a
+			// fixed product predicate and only checks for a conflicting row.
+			conflictErr := tx.QueryRowContext(ctx, "SELECT 1 FROM "+table+" WHERE id = $1 AND (product IS NULL OR product <> $2)", id, input.Product).Scan(&exists)
+			if conflictErr == nil {
+				return controlplane.ErrForbidden
+			}
+			if errors.Is(conflictErr, sql.ErrNoRows) {
+				return nil
+			}
+			return postgresOperationError(ctx, fmt.Errorf("validate conflicting audit %s product: %w", table, conflictErr))
 		}
-		product, err := normalizedAuditProduct(raw)
-		if err != nil {
-			return err
-		}
-		if product != input.Product {
-			return controlplane.ErrForbidden
-		}
-		return nil
+		return postgresOperationError(ctx, fmt.Errorf("validate audit %s product: %w", table, err))
 	}
 	if input.DeviceID != "" {
 		if err := check("devices", input.DeviceID); err != nil {

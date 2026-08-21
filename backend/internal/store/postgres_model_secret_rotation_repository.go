@@ -37,6 +37,13 @@ func (s *PostgresRepository) RotateModelPoolAccountSecret(ctx context.Context, r
 	if record.Product != "" && !record.Product.Valid() {
 		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrInvalidRequest
 	}
+	if record.Product.Valid() {
+		audit, err := normalizeOptionalAuditInputForProduct(record.Audit, record.Product)
+		if err != nil {
+			return controlplane.ModelPoolAccountSummary{}, err
+		}
+		record.Audit = audit
+	}
 	if record.Probe.Status != "succeeded" || (strings.TrimSpace(record.Probe.AccountID) != "" && strings.TrimSpace(record.Probe.AccountID) != record.AccountID) {
 		return controlplane.ModelPoolAccountSummary{}, controlplane.ErrInvalidRequest
 	}

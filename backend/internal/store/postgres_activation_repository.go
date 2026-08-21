@@ -12,11 +12,20 @@ import (
 )
 
 var _ ActivationRepository = (*PostgresRepository)(nil)
+var _ ProductActivationRepository = (*PostgresRepository)(nil)
 
 // CreateActivationCode persists only the digest of the one-time code. The
 // plaintext is returned for the first response and is never stored in the
 // normalized table or the idempotency record.
 func (s *PostgresRepository) CreateActivationCode(ctx context.Context, scope, idempotencyKey, fingerprint string, record ActivationCodeCreateRecord) (controlplane.ActivationCode, error) {
+	return s.createActivationCode(ctx, scope, idempotencyKey, fingerprint, record, controlplane.ProductAutoLive, false)
+}
+
+func (s *PostgresRepository) CreateActivationCodeForProduct(ctx context.Context, scope, idempotencyKey, fingerprint string, record ActivationCodeCreateRecord, product controlplane.ProductCode) (controlplane.ActivationCode, error) {
+	return s.createActivationCode(ctx, scope, idempotencyKey, fingerprint, record, product, true)
+}
+
+func (s *PostgresRepository) createActivationCode(ctx context.Context, scope, idempotencyKey, fingerprint string, record ActivationCodeCreateRecord, product controlplane.ProductCode, strictProduct bool) (controlplane.ActivationCode, error) {
 	if s.modelReadSource != ModelReadSourceNormalized {
 		return controlplane.ActivationCode{}, errors.New("normalized activation repository requires normalized read source")
 	}
@@ -29,6 +38,14 @@ func (s *PostgresRepository) CreateActivationCode(ctx context.Context, scope, id
 	record.PlainCode = strings.TrimSpace(record.PlainCode)
 	record.CodeHash = strings.TrimSpace(record.CodeHash)
 	record.CodePrefix = strings.TrimSpace(record.CodePrefix)
+	product = controlplane.ProductCode(strings.TrimSpace(string(product)))
+	if strictProduct && !product.Valid() {
+		return controlplane.ActivationCode{}, controlplane.ErrInvalidRequest
+	}
+	if record.Product != "" && controlplane.ProductCode(strings.TrimSpace(string(record.Product))) != product {
+		return controlplane.ActivationCode{}, controlplane.ErrForbidden
+	}
+	record.Product = product
 	if scope == "" || idempotencyKey == "" || fingerprint == "" || record.PlainCode == "" || record.CodeHash == "" || record.CodePrefix == "" || record.ExpiresAt.IsZero() || record.MaxDevices < 1 || record.MaxDevices > controlplane.MaxActivationCodeDevices {
 		return controlplane.ActivationCode{}, errors.New("normalized activation create arguments are invalid")
 	}
@@ -51,7 +68,13 @@ func (s *PostgresRepository) CreateActivationCode(ctx context.Context, scope, id
 	if err != nil {
 		return controlplane.ActivationCode{}, fmt.Errorf("generate activation code id: %w", err)
 	}
-	storedFingerprint, storedResourceID, inserted, err := s.reserveUserIdempotency(operationCtx, tx, scope, idempotencyKey, fingerprint, codeID, createdAt)
+	var storedFingerprint, storedResourceID string
+	var inserted bool
+	if strictProduct {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotencyForProduct(operationCtx, tx, scope, idempotencyKey, fingerprint, codeID, createdAt, product)
+	} else {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotency(operationCtx, tx, scope, idempotencyKey, fingerprint, codeID, createdAt)
+	}
 	if err != nil {
 		return controlplane.ActivationCode{}, err
 	}
@@ -59,12 +82,22 @@ func (s *PostgresRepository) CreateActivationCode(ctx context.Context, scope, id
 		if storedFingerprint != fingerprint {
 			return controlplane.ActivationCode{}, controlplane.ErrIdempotencyConflict
 		}
+		if strictProduct {
+			return s.loadActivationCodeForProduct(operationCtx, tx, storedResourceID, product, false)
+		}
 		return s.loadActivationCode(operationCtx, tx, storedResourceID)
 	}
-	if _, err := tx.ExecContext(operationCtx, `
-		INSERT INTO activation_codes (id, code_hash, code_prefix, status, created_at, expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices)
-		VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL, NULL, $7, $8)
-	`, codeID, record.CodeHash, record.CodePrefix, controlplane.ActivationCodeStatusActive, createdAt, record.ExpiresAt.UTC(), record.MaxDevices, 0); err != nil {
+	insertQuery := `
+		INSERT INTO activation_codes (id, product, code_hash, code_prefix, status, created_at, expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, $8, $9)`
+	insertArgs := []any{codeID, product, record.CodeHash, record.CodePrefix, controlplane.ActivationCodeStatusActive, createdAt, record.ExpiresAt.UTC(), record.MaxDevices, 0}
+	if !strictProduct {
+		insertQuery = `
+			INSERT INTO activation_codes (id, code_hash, code_prefix, status, created_at, expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices)
+			VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL, NULL, $7, $8)`
+		insertArgs = []any{codeID, record.CodeHash, record.CodePrefix, controlplane.ActivationCodeStatusActive, createdAt, record.ExpiresAt.UTC(), record.MaxDevices, 0}
+	}
+	if _, err := tx.ExecContext(operationCtx, insertQuery, insertArgs...); err != nil {
 		return controlplane.ActivationCode{}, postgresOperationError(operationCtx, fmt.Errorf("write normalized activation code: %w", err))
 	}
 	if err := tx.Commit(); err != nil {
@@ -72,12 +105,20 @@ func (s *PostgresRepository) CreateActivationCode(ctx context.Context, scope, id
 	}
 	plainCode := record.PlainCode
 	return controlplane.ActivationCode{
-		ID: codeID, Status: controlplane.ActivationCodeStatusActive, ExpiresAt: record.ExpiresAt.UTC().Format(time.RFC3339), MaxDevices: record.MaxDevices, BoundDevices: 0,
+		ID: codeID, Product: product, Status: controlplane.ActivationCodeStatusActive, ExpiresAt: record.ExpiresAt.UTC().Format(time.RFC3339), MaxDevices: record.MaxDevices, BoundDevices: 0,
 		CodePrefix: record.CodePrefix, PlainCode: &plainCode,
 	}, nil
 }
 
 func (s *PostgresRepository) RevokeActivationCode(ctx context.Context, scope, idempotencyKey, fingerprint, codeID string) (controlplane.ActivationCode, error) {
+	return s.revokeActivationCode(ctx, scope, idempotencyKey, fingerprint, codeID, controlplane.ProductAutoLive, false)
+}
+
+func (s *PostgresRepository) RevokeActivationCodeForProduct(ctx context.Context, scope, idempotencyKey, fingerprint, codeID string, product controlplane.ProductCode) (controlplane.ActivationCode, error) {
+	return s.revokeActivationCode(ctx, scope, idempotencyKey, fingerprint, codeID, product, true)
+}
+
+func (s *PostgresRepository) revokeActivationCode(ctx context.Context, scope, idempotencyKey, fingerprint, codeID string, product controlplane.ProductCode, strictProduct bool) (controlplane.ActivationCode, error) {
 	if s.modelReadSource != ModelReadSourceNormalized {
 		return controlplane.ActivationCode{}, errors.New("normalized activation repository requires normalized read source")
 	}
@@ -88,6 +129,10 @@ func (s *PostgresRepository) RevokeActivationCode(ctx context.Context, scope, id
 	idempotencyKey = strings.TrimSpace(idempotencyKey)
 	fingerprint = strings.TrimSpace(fingerprint)
 	codeID = strings.TrimSpace(codeID)
+	product = controlplane.ProductCode(strings.TrimSpace(string(product)))
+	if strictProduct && !product.Valid() {
+		return controlplane.ActivationCode{}, controlplane.ErrInvalidRequest
+	}
 	if scope == "" || idempotencyKey == "" || fingerprint == "" || codeID == "" {
 		return controlplane.ActivationCode{}, errors.New("normalized activation revoke arguments are invalid")
 	}
@@ -102,11 +147,22 @@ func (s *PostgresRepository) RevokeActivationCode(ctx context.Context, scope, id
 	if err := lockNormalizedControlPlaneMutation(operationCtx, tx); err != nil {
 		return controlplane.ActivationCode{}, err
 	}
-	code, err := s.loadActivationCodeForUpdate(operationCtx, tx, codeID)
+	var code controlplane.ActivationCode
+	if strictProduct {
+		code, err = s.loadActivationCodeForProduct(operationCtx, tx, codeID, product, true)
+	} else {
+		code, err = s.loadActivationCodeForUpdate(operationCtx, tx, codeID)
+	}
 	if err != nil {
 		return controlplane.ActivationCode{}, err
 	}
-	storedFingerprint, storedResourceID, inserted, err := s.reserveUserIdempotency(operationCtx, tx, scope, idempotencyKey, fingerprint, codeID, s.Now())
+	var storedFingerprint, storedResourceID string
+	var inserted bool
+	if strictProduct {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotencyForProduct(operationCtx, tx, scope, idempotencyKey, fingerprint, codeID, s.Now(), product)
+	} else {
+		storedFingerprint, storedResourceID, inserted, err = s.reserveUserIdempotency(operationCtx, tx, scope, idempotencyKey, fingerprint, codeID, s.Now())
+	}
 	if err != nil {
 		return controlplane.ActivationCode{}, err
 	}
@@ -114,13 +170,22 @@ func (s *PostgresRepository) RevokeActivationCode(ctx context.Context, scope, id
 		if storedFingerprint != fingerprint {
 			return controlplane.ActivationCode{}, controlplane.ErrIdempotencyConflict
 		}
+		if strictProduct {
+			return s.loadActivationCodeForProduct(operationCtx, tx, storedResourceID, product, false)
+		}
 		return s.loadActivationCode(operationCtx, tx, storedResourceID)
 	}
 	if code.Status != controlplane.ActivationCodeStatusActive && code.Status != controlplane.ActivationCodeStatusRevoked {
 		return controlplane.ActivationCode{}, controlplane.ErrActivationCodeStateConflict
 	}
 	if code.Status == controlplane.ActivationCodeStatusActive {
-		if _, err := tx.ExecContext(operationCtx, `UPDATE activation_codes SET status = $2 WHERE id = $1`, codeID, controlplane.ActivationCodeStatusRevoked); err != nil {
+		updateQuery := `UPDATE activation_codes SET status = $2 WHERE id = $1`
+		updateArgs := []any{codeID, controlplane.ActivationCodeStatusRevoked}
+		if strictProduct {
+			updateQuery += " AND product = $3"
+			updateArgs = append(updateArgs, product)
+		}
+		if _, err := tx.ExecContext(operationCtx, updateQuery, updateArgs...); err != nil {
 			return controlplane.ActivationCode{}, postgresOperationError(operationCtx, fmt.Errorf("revoke normalized activation code: %w", err))
 		}
 		code.Status = controlplane.ActivationCodeStatusRevoked
@@ -178,6 +243,40 @@ func (s *PostgresRepository) loadActivationCodeForUpdate(ctx context.Context, tx
 	}
 	code.MaxDevices = maxDevices
 	code.BoundDevices = boundDevices
+	if expiresAt.Valid {
+		code.ExpiresAt = expiresAt.Time.UTC().Format(time.RFC3339)
+	}
+	if usedAt.Valid {
+		code.UsedAt = usedAt.Time.UTC().Format(time.RFC3339)
+	}
+	code.UsedByUserID = usedByUserID.String
+	code.UsedByDeviceID = usedByDeviceID.String
+	return code, nil
+}
+
+func (s *PostgresRepository) loadActivationCodeForProduct(ctx context.Context, tx *sql.Tx, codeID string, product controlplane.ProductCode, forUpdate bool) (controlplane.ActivationCode, error) {
+	var code controlplane.ActivationCode
+	var storedProduct string
+	var expiresAt, usedAt sql.NullTime
+	var usedByUserID, usedByDeviceID sql.NullString
+	query := `
+		SELECT id, product, code_prefix, status, expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices
+		FROM activation_codes
+		WHERE id = $1 AND product = $2`
+	if forUpdate {
+		query += " FOR UPDATE"
+	}
+	if err := tx.QueryRowContext(ctx, query, codeID, product).Scan(&code.ID, &storedProduct, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &code.MaxDevices, &code.BoundDevices); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return controlplane.ActivationCode{}, controlplane.ErrActivationCodeNotFound
+		}
+		return controlplane.ActivationCode{}, postgresOperationError(ctx, fmt.Errorf("load product-scoped normalized activation code: %w", err))
+	}
+	parsedProduct, err := controlplane.ParseProductCode(storedProduct)
+	if err != nil || parsedProduct != product {
+		return controlplane.ActivationCode{}, controlplane.ErrForbidden
+	}
+	code.Product = parsedProduct
 	if expiresAt.Valid {
 		code.ExpiresAt = expiresAt.Time.UTC().Format(time.RFC3339)
 	}

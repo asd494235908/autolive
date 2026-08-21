@@ -145,6 +145,13 @@ func (s *PostgresRepository) recordModelPoolAccountTest(ctx context.Context, rec
 	if strictProduct && !record.Product.Valid() {
 		return controlplane.ModelPoolConnectivityTestResult{}, controlplane.ErrInvalidRequest
 	}
+	if strictProduct {
+		audit, err := normalizeOptionalAuditInputForProduct(record.Audit, record.Product)
+		if err != nil {
+			return controlplane.ModelPoolConnectivityTestResult{}, err
+		}
+		record.Audit = audit
+	}
 	if !validModelPoolTestStatus(record.Result.Status) || strings.TrimSpace(record.Result.TestedAt) == "" {
 		return controlplane.ModelPoolConnectivityTestResult{}, controlplane.ErrInvalidRequest
 	}
