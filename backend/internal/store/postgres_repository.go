@@ -1272,7 +1272,7 @@ func (s *PostgresRepository) loadNormalized(ctx context.Context, tx *sql.Tx) (*S
 
 	activationCodes, err := tx.QueryContext(ctx, `
 		SELECT id, code_hash, code_prefix, status, expires_at, used_at,
-		       used_by_user_id, used_by_device_id
+		       used_by_user_id, used_by_device_id, max_devices, bound_devices
 		FROM activation_codes
 		ORDER BY id
 	`)
@@ -1284,14 +1284,15 @@ func (s *PostgresRepository) loadNormalized(ctx context.Context, tx *sql.Tx) (*S
 			id, codeHash, codePrefix, status string
 			expiresAt, usedAt                sql.NullTime
 			usedByUserID, usedByDeviceID     sql.NullString
+			maxDevices, boundDevices         int
 		)
-		if err := activationCodes.Scan(&id, &codeHash, &codePrefix, &status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID); err != nil {
+		if err := activationCodes.Scan(&id, &codeHash, &codePrefix, &status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &maxDevices, &boundDevices); err != nil {
 			_ = activationCodes.Close()
 			return nil, err
 		}
 		record := ActivationCodeRecord{
 			ActivationCode: controlplane.ActivationCode{
-				ID: id, Status: status, CodePrefix: codePrefix, MaxDevices: 1,
+				ID: id, Status: status, CodePrefix: codePrefix, MaxDevices: maxDevices, BoundDevices: boundDevices,
 				UsedByUserID: usedByUserID.String, UsedByDeviceID: usedByDeviceID.String,
 			},
 			CodePrefix: codePrefix, UsedByUserID: usedByUserID.String,
@@ -1685,10 +1686,10 @@ func (s *PostgresRepository) syncReferenceRows(ctx context.Context, tx *sql.Tx, 
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO activation_codes (id, code_hash, code_prefix, status, created_at, expires_at, used_at, used_by_user_id, used_by_device_id)
-			VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, $5, $6, NULLIF($7, ''), NULLIF($8, ''))
-			ON CONFLICT (id) DO UPDATE SET code_hash = EXCLUDED.code_hash, code_prefix = EXCLUDED.code_prefix, status = EXCLUDED.status, expires_at = EXCLUDED.expires_at, used_by_user_id = EXCLUDED.used_by_user_id, used_by_device_id = EXCLUDED.used_by_device_id
-		`, id, digest, prefix, record.ActivationCode.Status, expiresAt, usedAt, usedByUserID, record.UsedByDeviceID); err != nil {
+			INSERT INTO activation_codes (id, code_hash, code_prefix, status, created_at, expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices)
+			VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, $5, $6, NULLIF($7, ''), NULLIF($8, ''), $9, $10)
+			ON CONFLICT (id) DO UPDATE SET code_hash = EXCLUDED.code_hash, code_prefix = EXCLUDED.code_prefix, status = EXCLUDED.status, expires_at = EXCLUDED.expires_at, used_by_user_id = EXCLUDED.used_by_user_id, used_by_device_id = EXCLUDED.used_by_device_id, max_devices = EXCLUDED.max_devices, bound_devices = EXCLUDED.bound_devices
+		`, id, digest, prefix, record.ActivationCode.Status, expiresAt, usedAt, usedByUserID, record.UsedByDeviceID, max(1, record.ActivationCode.MaxDevices), max(0, record.ActivationCode.BoundDevices)); err != nil {
 			return err
 		}
 	}

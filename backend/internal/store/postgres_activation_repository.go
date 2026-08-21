@@ -29,7 +29,7 @@ func (s *PostgresRepository) CreateActivationCode(ctx context.Context, scope, id
 	record.PlainCode = strings.TrimSpace(record.PlainCode)
 	record.CodeHash = strings.TrimSpace(record.CodeHash)
 	record.CodePrefix = strings.TrimSpace(record.CodePrefix)
-	if scope == "" || idempotencyKey == "" || fingerprint == "" || record.PlainCode == "" || record.CodeHash == "" || record.CodePrefix == "" || record.ExpiresAt.IsZero() || record.MaxDevices != 1 {
+	if scope == "" || idempotencyKey == "" || fingerprint == "" || record.PlainCode == "" || record.CodeHash == "" || record.CodePrefix == "" || record.ExpiresAt.IsZero() || record.MaxDevices < 1 || record.MaxDevices > controlplane.MaxActivationCodeDevices {
 		return controlplane.ActivationCode{}, errors.New("normalized activation create arguments are invalid")
 	}
 	createdAt := record.CreatedAt.UTC()
@@ -62,9 +62,9 @@ func (s *PostgresRepository) CreateActivationCode(ctx context.Context, scope, id
 		return s.loadActivationCode(operationCtx, tx, storedResourceID)
 	}
 	if _, err := tx.ExecContext(operationCtx, `
-		INSERT INTO activation_codes (id, code_hash, code_prefix, status, created_at, expires_at, used_at, used_by_user_id, used_by_device_id)
-		VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL, NULL)
-	`, codeID, record.CodeHash, record.CodePrefix, controlplane.ActivationCodeStatusActive, createdAt, record.ExpiresAt.UTC()); err != nil {
+		INSERT INTO activation_codes (id, code_hash, code_prefix, status, created_at, expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices)
+		VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL, NULL, $7, $8)
+	`, codeID, record.CodeHash, record.CodePrefix, controlplane.ActivationCodeStatusActive, createdAt, record.ExpiresAt.UTC(), record.MaxDevices, 0); err != nil {
 		return controlplane.ActivationCode{}, postgresOperationError(operationCtx, fmt.Errorf("write normalized activation code: %w", err))
 	}
 	if err := tx.Commit(); err != nil {
@@ -72,7 +72,7 @@ func (s *PostgresRepository) CreateActivationCode(ctx context.Context, scope, id
 	}
 	plainCode := record.PlainCode
 	return controlplane.ActivationCode{
-		ID: codeID, Status: controlplane.ActivationCodeStatusActive, ExpiresAt: record.ExpiresAt.UTC().Format(time.RFC3339), MaxDevices: record.MaxDevices,
+		ID: codeID, Status: controlplane.ActivationCodeStatusActive, ExpiresAt: record.ExpiresAt.UTC().Format(time.RFC3339), MaxDevices: record.MaxDevices, BoundDevices: 0,
 		CodePrefix: record.CodePrefix, PlainCode: &plainCode,
 	}, nil
 }
@@ -136,17 +136,19 @@ func (s *PostgresRepository) loadActivationCode(ctx context.Context, tx *sql.Tx,
 	var code controlplane.ActivationCode
 	var expiresAt, usedAt sql.NullTime
 	var usedByUserID, usedByDeviceID sql.NullString
+	var maxDevices, boundDevices int
 	if err := tx.QueryRowContext(ctx, `
-		SELECT id, code_prefix, status, expires_at, used_at, used_by_user_id, used_by_device_id
+		SELECT id, code_prefix, status, expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices
 		FROM activation_codes
 		WHERE id = $1
-	`, codeID).Scan(&code.ID, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID); err != nil {
+	`, codeID).Scan(&code.ID, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &maxDevices, &boundDevices); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return controlplane.ActivationCode{}, controlplane.ErrActivationCodeNotFound
 		}
 		return controlplane.ActivationCode{}, postgresOperationError(ctx, fmt.Errorf("load idempotent normalized activation code: %w", err))
 	}
-	code.MaxDevices = 1
+	code.MaxDevices = maxDevices
+	code.BoundDevices = boundDevices
 	if expiresAt.Valid {
 		code.ExpiresAt = expiresAt.Time.UTC().Format(time.RFC3339)
 	}
@@ -162,18 +164,20 @@ func (s *PostgresRepository) loadActivationCodeForUpdate(ctx context.Context, tx
 	var code controlplane.ActivationCode
 	var expiresAt, usedAt sql.NullTime
 	var usedByUserID, usedByDeviceID sql.NullString
+	var maxDevices, boundDevices int
 	if err := tx.QueryRowContext(ctx, `
-		SELECT id, code_prefix, status, expires_at, used_at, used_by_user_id, used_by_device_id
+		SELECT id, code_prefix, status, expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices
 		FROM activation_codes
 		WHERE id = $1
 		FOR UPDATE
-	`, codeID).Scan(&code.ID, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID); err != nil {
+	`, codeID).Scan(&code.ID, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &maxDevices, &boundDevices); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return controlplane.ActivationCode{}, controlplane.ErrActivationCodeNotFound
 		}
 		return controlplane.ActivationCode{}, postgresOperationError(ctx, fmt.Errorf("lock normalized activation code: %w", err))
 	}
-	code.MaxDevices = 1
+	code.MaxDevices = maxDevices
+	code.BoundDevices = boundDevices
 	if expiresAt.Valid {
 		code.ExpiresAt = expiresAt.Time.UTC().Format(time.RFC3339)
 	}

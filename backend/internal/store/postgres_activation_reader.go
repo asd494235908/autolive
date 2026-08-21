@@ -32,7 +32,7 @@ func (s *PostgresRepository) ListActivationCodesPage(ctx context.Context, offset
 			SELECT id, code_prefix,
 			       CASE WHEN status = $1 AND expires_at IS NOT NULL AND expires_at <= $2
 			            THEN $3 ELSE status END AS status,
-			       expires_at, used_at, used_by_user_id, used_by_device_id
+			       expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices
 			FROM activation_codes
 			ORDER BY id
 			LIMIT $4 OFFSET $5
@@ -60,11 +60,13 @@ func scanActivationCodeRow(scanner interface{ Scan(dest ...any) error }) (contro
 		code                         controlplane.ActivationCode
 		expiresAt, usedAt            sql.NullTime
 		usedByUserID, usedByDeviceID sql.NullString
+		maxDevices, boundDevices     int
 	)
-	if err := scanner.Scan(&code.ID, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID); err != nil {
+	if err := scanner.Scan(&code.ID, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &maxDevices, &boundDevices); err != nil {
 		return controlplane.ActivationCode{}, err
 	}
-	code.MaxDevices = 1
+	code.MaxDevices = maxDevices
+	code.BoundDevices = boundDevices
 	if expiresAt.Valid {
 		code.ExpiresAt = expiresAt.Time.UTC().Format(time.RFC3339)
 	}

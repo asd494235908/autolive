@@ -34,6 +34,25 @@ func TestLatestVersionMatchesEmbeddedCatalog(t *testing.T) {
 	}
 }
 
+func TestActivationMultiDeviceMigrationAddsCapacityAndCount(t *testing.T) {
+	payload, err := fs.ReadFile(FS, "0022_支持激活码多设备绑定.up.sql")
+	if err != nil {
+		t.Fatalf("read migration 0022: %v", err)
+	}
+	sql := string(payload)
+	for _, fragment := range []string{
+		"ADD COLUMN IF NOT EXISTS max_devices",
+		"ADD COLUMN IF NOT EXISTS bound_devices",
+		"used_by_device_id IS NOT NULL",
+		"max_devices BETWEEN 1 AND 100",
+		"bound_devices BETWEEN 0 AND max_devices",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0022 is missing fragment %q", fragment)
+		}
+	}
+}
+
 func TestUsageSummaryMigrationGuardsHistoricalDuplicates(t *testing.T) {
 	payload, err := fs.ReadFile(FS, "0012_补齐调用摘要幂等唯一约束.up.sql")
 	if err != nil {
