@@ -437,7 +437,11 @@ func validateAuditTargetProduct(state *store.State, input controlplane.AuditLogI
 	product := effectiveStoredProduct(input.Product)
 	if input.DeviceID != "" {
 		device, ok := state.Devices[input.DeviceID]
-		if ok {
+		if !ok {
+			if input.Outcome != "failure" {
+				return controlplane.ErrForbidden
+			}
+		} else {
 			storedProduct, valid := strictStoredProduct(device.Product)
 			if !valid || storedProduct != product {
 				return controlplane.ErrForbidden

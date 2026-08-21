@@ -192,6 +192,42 @@ func TestTask4AuditTargetProductMismatchIsRejected(t *testing.T) {
 	}
 }
 
+func TestTask4MemoryAuditMissingDeviceMatchesPostgresOutcomeSemantics(t *testing.T) {
+	tests := []struct {
+		name    string
+		outcome string
+		wantErr error
+	}{
+		{name: "success rejects", outcome: "success", wantErr: controlplane.ErrForbidden},
+		{name: "unknown rejects", outcome: "unknown", wantErr: controlplane.ErrForbidden},
+		{name: "failure is recorded", outcome: "failure"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repository := store.NewMemoryStore(time.Now)
+			err := NewControlPlane(repository).RecordAuditForProduct(context.Background(), controlplane.ProductAutoLive, controlplane.AuditLogInput{
+				DeviceID: "missing-device", Action: "POST /device", TargetType: "audit", Outcome: tt.outcome, StatusCode: 200,
+			})
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("RecordAuditForProduct() error = %v, want %v", err, tt.wantErr)
+			}
+			if err := repository.Run(context.Background(), func(state *store.State) error {
+				wantAudits := 0
+				if tt.wantErr == nil {
+					wantAudits = 1
+				}
+				if len(state.AuditLogs) != wantAudits {
+					t.Fatalf("audit log count = %d, want %d", len(state.AuditLogs), wantAudits)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestTask4ModelAccountAuditTargetIsStrictlyProductScoped(t *testing.T) {
 	repository := store.NewMemoryStore(time.Now)
 	if err := repository.Run(context.Background(), func(state *store.State) error {

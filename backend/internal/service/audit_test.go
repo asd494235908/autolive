@@ -12,7 +12,14 @@ import (
 
 func TestAuditLogRecordsActorTargetAndRequestID(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
-	svc := service.NewControlPlane(store.NewMemoryStore(func() time.Time { return now }))
+	repository := store.NewMemoryStore(func() time.Time { return now })
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Devices["dev_12345678"] = controlplane.DeviceSummary{ID: "dev_12345678", Product: controlplane.ProductAutoLive}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc := service.NewControlPlane(repository)
 	ctx := context.Background()
 
 	if err := svc.RecordAudit(ctx, controlplane.AuditLogInput{
