@@ -18,6 +18,7 @@ var ErrNormalizedAdminRBACRepositoryRequired = errors.New("normalized admin rbac
 
 const (
 	adminRBACListLimit                 = 200
+	adminRBACScopedRoleLimit           = adminRBACListLimit - 1
 	listAdminPermissionsQuery          = `SELECT code FROM admin_permissions ORDER BY code LIMIT $1`
 	getAdminAuthorizationUserQuery     = `SELECT role, status FROM users WHERE id = $1 LIMIT 1`
 	getAdminAuthorizationBindingsQuery = `
@@ -35,12 +36,24 @@ const (
 		  )
 	`
 	listAdminRolesQuery = `
-		WITH limited_roles AS (
+		WITH global_role AS (
 			SELECT code, product, name, built_in
 			FROM admin_roles
-			WHERE ($1 = '' OR code = 'super_admin' OR product = $1)
+			WHERE code = 'super_admin'
+			  AND product IS NULL
+		),
+		scoped_roles AS (
+			SELECT code, product, name, built_in
+			FROM admin_roles
+			WHERE code <> 'super_admin'
+			  AND ($1 = '' OR product = $1)
 			ORDER BY code ASC, product ASC
 			LIMIT $2
+		),
+		limited_roles AS (
+			SELECT code, product, name, built_in FROM global_role
+			UNION ALL
+			SELECT code, product, name, built_in FROM scoped_roles
 		)
 		SELECT r.code, r.product, r.name, r.built_in, rp.permission_code
 		FROM limited_roles r
@@ -256,7 +269,7 @@ func (s *PostgresRepository) ListAdminRoles(ctx context.Context, product control
 	operationCtx, cancel := s.operationContext(ctx)
 	defer cancel()
 
-	rows, err := s.db.QueryContext(operationCtx, listAdminRolesQuery, string(product), adminRBACListLimit)
+	rows, err := s.db.QueryContext(operationCtx, listAdminRolesQuery, string(product), adminRBACScopedRoleLimit)
 	if err != nil {
 		return nil, postgresOperationError(operationCtx, fmt.Errorf("list normalized admin roles: %w", err))
 	}
@@ -531,7 +544,11 @@ func (s *PostgresRepository) ReplaceUserAdminRoles(ctx context.Context, record U
 		if storedFingerprint != record.Fingerprint || storedResourceID != record.UserID {
 			return nil, controlplane.ErrIdempotencyConflict
 		}
-		return listUserAdminRolesByQuery(operationCtx, tx, listUserAdminRolesQuery, record.UserID, adminRBACListLimit)
+		assignments, err := listUserAdminRolesByQuery(operationCtx, tx, listUserAdminRolesQuery, record.UserID, adminRBACListLimit)
+		if err != nil {
+			return nil, err
+		}
+		return withCompatibilityLocalSuperAdmin(user, assignments), nil
 	}
 
 	normalizedAssignments, err := s.normalizeUserAdminRoleAssignmentsTx(operationCtx, tx, record.UserID, record.Assignments)

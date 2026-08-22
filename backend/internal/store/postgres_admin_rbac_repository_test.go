@@ -235,12 +235,24 @@ func TestPostgresRepositoryAdminRoleCRUDUsesNormalizedTransactions(t *testing.T)
 	}
 
 	mock.ExpectQuery(regexp.QuoteMeta(`
-		WITH limited_roles AS (
+		WITH global_role AS (
 			SELECT code, product, name, built_in
 			FROM admin_roles
-			WHERE ($1 = '' OR code = 'super_admin' OR product = $1)
+			WHERE code = 'super_admin'
+			  AND product IS NULL
+		),
+		scoped_roles AS (
+			SELECT code, product, name, built_in
+			FROM admin_roles
+			WHERE code <> 'super_admin'
+			  AND ($1 = '' OR product = $1)
 			ORDER BY code ASC, product ASC
 			LIMIT $2
+		),
+		limited_roles AS (
+			SELECT code, product, name, built_in FROM global_role
+			UNION ALL
+			SELECT code, product, name, built_in FROM scoped_roles
 		)
 		SELECT r.code, r.product, r.name, r.built_in, rp.permission_code
 		FROM limited_roles r
@@ -248,7 +260,7 @@ func TestPostgresRepositoryAdminRoleCRUDUsesNormalizedTransactions(t *testing.T)
 			ON rp.role_code = r.code
 		ORDER BY r.code ASC, r.product ASC, rp.permission_code ASC
 	`)).
-		WithArgs(controlplane.ProductAutoLive, adminRBACListLimit).
+		WithArgs(controlplane.ProductAutoLive, adminRBACScopedRoleLimit).
 		WillReturnRows(sqlmock.NewRows([]string{"code", "product", "name", "built_in", "permission_code"}).
 			AddRow("ops_autolive", controlplane.ProductAutoLive, "AutoLive Ops", false, "users.read").
 			AddRow("ops_autolive", controlplane.ProductAutoLive, "AutoLive Ops", false, "devices.read").
@@ -366,7 +378,7 @@ func TestPostgresRepositoryAdminRoleCRUDUsesNormalizedTransactions(t *testing.T)
 	}
 }
 
-func TestPostgresRepositoryListAdminRolesLimitsRoleSetBeforeJoiningPermissions(t *testing.T) {
+func TestPostgresRepositoryListAdminRolesReservesSlotForGlobalSuperAdmin(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New() error = %v", err)
@@ -379,7 +391,7 @@ func TestPostgresRepositoryListAdminRolesLimitsRoleSetBeforeJoiningPermissions(t
 	}
 
 	rows := sqlmock.NewRows([]string{"code", "product", "name", "built_in", "permission_code"})
-	for i := 0; i < 101; i++ {
+	for i := 0; i < 199; i++ {
 		code := fmt.Sprintf("role_%03d", i)
 		name := fmt.Sprintf("Role %03d", i)
 		rows.AddRow(code, controlplane.ProductAutoLive, name, false, "devices.read")
@@ -388,12 +400,24 @@ func TestPostgresRepositoryListAdminRolesLimitsRoleSetBeforeJoiningPermissions(t
 	rows.AddRow("super_admin", nil, "超级管理员", true, "users.manage")
 
 	mock.ExpectQuery(regexp.QuoteMeta(`
-		WITH limited_roles AS (
+		WITH global_role AS (
 			SELECT code, product, name, built_in
 			FROM admin_roles
-			WHERE ($1 = '' OR code = 'super_admin' OR product = $1)
+			WHERE code = 'super_admin'
+			  AND product IS NULL
+		),
+		scoped_roles AS (
+			SELECT code, product, name, built_in
+			FROM admin_roles
+			WHERE code <> 'super_admin'
+			  AND ($1 = '' OR product = $1)
 			ORDER BY code ASC, product ASC
 			LIMIT $2
+		),
+		limited_roles AS (
+			SELECT code, product, name, built_in FROM global_role
+			UNION ALL
+			SELECT code, product, name, built_in FROM scoped_roles
 		)
 		SELECT r.code, r.product, r.name, r.built_in, rp.permission_code
 		FROM limited_roles r
@@ -401,24 +425,84 @@ func TestPostgresRepositoryListAdminRolesLimitsRoleSetBeforeJoiningPermissions(t
 			ON rp.role_code = r.code
 		ORDER BY r.code ASC, r.product ASC, rp.permission_code ASC
 	`)).
-		WithArgs(controlplane.ProductAutoLive, adminRBACListLimit).
+		WithArgs(controlplane.ProductAutoLive, adminRBACScopedRoleLimit).
 		WillReturnRows(rows)
 
 	roles, err := repository.ListAdminRoles(context.Background(), controlplane.ProductAutoLive)
 	if err != nil {
 		t.Fatalf("ListAdminRoles() error = %v", err)
 	}
-	if len(roles) != 102 {
-		t.Fatalf("len(roles) = %d, want 102", len(roles))
+	if len(roles) != adminRBACListLimit {
+		t.Fatalf("len(roles) = %d, want %d", len(roles), adminRBACListLimit)
 	}
 	if roles[0].Code != "role_000" || !slices.Equal(roles[0].Permissions, []controlplane.PermissionCode{"devices.read", "users.read"}) {
 		t.Fatalf("roles[0] = %+v", roles[0])
 	}
-	if roles[100].Code != "role_100" || !slices.Equal(roles[100].Permissions, []controlplane.PermissionCode{"devices.read", "users.read"}) {
-		t.Fatalf("roles[100] = %+v", roles[100])
+	if roles[198].Code != "role_198" || !slices.Equal(roles[198].Permissions, []controlplane.PermissionCode{"devices.read", "users.read"}) {
+		t.Fatalf("roles[198] = %+v", roles[198])
 	}
-	if roles[101].Code != controlplane.BuiltinAdminRoleSuperAdmin || !slices.Equal(roles[101].Permissions, []controlplane.PermissionCode{"users.manage"}) {
-		t.Fatalf("roles[101] = %+v", roles[101])
+	if roles[199].Code != controlplane.BuiltinAdminRoleSuperAdmin || !slices.Equal(roles[199].Permissions, []controlplane.PermissionCode{"users.manage"}) {
+		t.Fatalf("roles[199] = %+v", roles[199])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestPostgresRepositoryReplaceUserAdminRolesReplayAddsCompatibilityLocalSuperAdmin(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, func() time.Time { return now }, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+
+	record := UserAdminRoleReplaceRecord{
+		Scope:          "control-plane-state",
+		IdempotencyKey: "replace-user-admin-roles:usr_local_admin:replay",
+		Fingerprint:    "fp-local-replay",
+		UserID:         "usr_local_admin",
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock")).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, username, role, status, created_at FROM users WHERE id = $1 FOR UPDATE")).
+		WithArgs("usr_local_admin").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "username", "role", "status", "created_at"}).
+			AddRow("usr_local_admin", "local", controlplane.RoleAdmin, controlplane.UserStatusActive, now))
+	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO idempotency_records (scope, idempotency_key, fingerprint, resource_id, created_at)")).
+		WithArgs("control-plane-state", "replace-user-admin-roles:usr_local_admin:replay", "fp-local-replay", "usr_local_admin", now).
+		WillReturnRows(sqlmock.NewRows([]string{"fingerprint", "resource_id"}))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT fingerprint, resource_id FROM idempotency_records WHERE scope = $1 AND idempotency_key = $2 FOR UPDATE")).
+		WithArgs("control-plane-state", "replace-user-admin-roles:usr_local_admin:replay").
+		WillReturnRows(sqlmock.NewRows([]string{"fingerprint", "resource_id"}).AddRow("fp-local-replay", "usr_local_admin"))
+	mock.ExpectQuery(regexp.QuoteMeta(`
+		SELECT role_code, product
+		FROM user_admin_roles
+		WHERE user_id = $1
+		ORDER BY COALESCE(product, ''), role_code
+		LIMIT $2
+	`)).
+		WithArgs("usr_local_admin", adminRBACListLimit).
+		WillReturnRows(sqlmock.NewRows([]string{"role_code", "product"}).
+			AddRow("ops_autolive", controlplane.ProductAutoLive))
+	mock.ExpectRollback()
+
+	assignments, err := repository.ReplaceUserAdminRoles(context.Background(), record)
+	if err != nil {
+		t.Fatalf("ReplaceUserAdminRoles(replay local admin) error = %v", err)
+	}
+	want := []controlplane.AdminRoleAssignment{
+		{UserID: "usr_local_admin", RoleCode: controlplane.BuiltinAdminRoleSuperAdmin},
+		{UserID: "usr_local_admin", RoleCode: "ops_autolive", Product: controlplane.ProductAutoLive},
+	}
+	if !slices.Equal(assignments, want) {
+		t.Fatalf("assignments = %#v, want %#v", assignments, want)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)
