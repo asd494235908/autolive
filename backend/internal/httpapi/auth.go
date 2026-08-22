@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -79,6 +80,7 @@ type authContextKey string
 const sessionTokenContextKey authContextKey = "session_token"
 const actorContextKey authContextKey = "actor"
 const deviceContextKey authContextKey = "device"
+const adminAuthorizationContextKey authContextKey = "admin_authorization"
 
 const legacyClientCompatibilityHeader = "X-Client-Compatibility"
 
@@ -401,6 +403,39 @@ func (a *authenticator) requireAdmin(next func(http.ResponseWriter, *http.Reques
 		}
 		next(w, r, actor)
 	})
+}
+
+func (a *authenticator) requirePermission(code controlplane.PermissionCode, next func(http.ResponseWriter, *http.Request, controlplane.Actor)) http.Handler {
+	return a.requireBearer(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		authorization, err := a.controlPlane.GetAdminAuthorization(r.Context(), actor)
+		if err != nil {
+			writeAdminAuthorizationError(w, r, err)
+			return
+		}
+		if !slices.Contains(authorization.Permissions, code) {
+			writeAppError(w, r, controlplane.ErrAdminPermissionDenied)
+			return
+		}
+		ctx := context.WithValue(r.Context(), adminAuthorizationContextKey, authorization)
+		next(w, r.WithContext(ctx), actor)
+	})
+}
+
+func adminAuthorizationFromContext(ctx context.Context) (controlplane.AdminAuthorization, bool) {
+	authorization, ok := ctx.Value(adminAuthorizationContextKey).(controlplane.AdminAuthorization)
+	return authorization, ok
+}
+
+func writeAdminAuthorizationError(w http.ResponseWriter, r *http.Request, err error) {
+	var appErr *controlplane.Error
+	if errors.As(err, &appErr) {
+		switch appErr.Code {
+		case controlplane.ErrInvalidRequest.Code, controlplane.ErrUnauthenticated.Code, controlplane.ErrForbidden.Code:
+			writeAppError(w, r, err)
+			return
+		}
+	}
+	writeError(w, r, http.StatusServiceUnavailable, "ADMIN_AUTHORIZATION_UNAVAILABLE", "管理员权限暂时无法读取")
 }
 
 func newToken() (string, error) {

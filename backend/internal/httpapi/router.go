@@ -79,6 +79,7 @@ func NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTele
 
 	mux := http.NewServeMux()
 	registerAuthRoutes(mux, authenticator)
+	registerAdminRBACRoutes(mux, controlPlane, authenticator)
 	registerControlPlaneRoutes(mux, controlPlane, authenticator)
 	mux.Handle("/api/v1/health", healthHandler(serviceVersion))
 	mux.Handle("/api/v1/livez", healthHandler(serviceVersion))

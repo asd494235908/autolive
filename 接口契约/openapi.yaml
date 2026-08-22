@@ -1584,6 +1584,333 @@ paths:
           $ref: '#/components/responses/RequestTimeout'
         '500':
           $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/me:
+    get:
+      tags: [Admin]
+      summary: 获取当前管理授权快照
+      operationId: getAdminMe
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 当前会话下的管理授权
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminMeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/permissions:
+    get:
+      tags: [Admin]
+      summary: 获取管理员固定权限目录
+      operationId: listAdminPermissions
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 权限目录
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminPermissionsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/roles:
+    get:
+      tags: [Admin]
+      summary: 查询管理员角色
+      operationId: listAdminRoles
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/AdminProduct'
+      responses:
+        '200':
+          description: 管理员角色列表
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminRoleListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      tags: [Admin]
+      summary: 创建管理员角色
+      operationId: createAdminRole
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminRoleRequest'
+      responses:
+        '201':
+          description: 角色已创建
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminRoleEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/roles/{role_id}:
+    get:
+      tags: [Admin]
+      summary: 获取管理员角色详情
+      operationId: getAdminRole
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: role_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+      responses:
+        '200':
+          description: 管理员角色详情
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminRoleEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    patch:
+      tags: [Admin]
+      summary: 更新管理员角色
+      operationId: updateAdminRole
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: role_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminRoleRequest'
+      responses:
+        '200':
+          description: 角色已更新
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminRoleEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Admin]
+      summary: 删除管理员角色
+      operationId: deleteAdminRole
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: role_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      responses:
+        '204':
+          description: 角色已删除
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/admin/users/{user_id}/roles:
+    get:
+      tags: [Admin]
+      summary: 查询用户管理员角色绑定
+      operationId: listUserAdminRoles
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: product
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/ProductCode'
+      responses:
+        '200':
+          description: 用户角色绑定
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserAdminRolesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Admin]
+      summary: 替换用户管理员角色绑定
+      operationId: replaceUserAdminRoles
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplaceUserAdminRolesRequest'
+      responses:
+        '200':
+          description: 用户角色绑定已替换
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserAdminRolesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/health:
     get:
       tags: [Admin]
@@ -1999,6 +2326,150 @@ components:
           $ref: '#/components/schemas/UserStatus'
         created_at:
           $ref: '#/components/schemas/Timestamp'
+    AdminPermissionCode:
+      type: string
+      enum: [dashboard.read, users.read, users.manage, roles.read, roles.manage, roles.assign, admin_security.manage, devices.read, devices.manage, activation_codes.read, activation_codes.manage, activation_codes.reveal, activation_codes.switch_device, plans.read, plans.manage, plans.publish, orders.read, orders.reconcile, subscriptions.read, subscriptions.adjust, payments.read, payments.reconcile, password_resets.read, password_resets.retry, artifacts.read, artifacts.manage, artifacts.publish, artifacts.revoke, public_config.read, public_config.manage, public_config.publish, public_config.rollback, error_reports.read, error_reports.manage, feedback.read, feedback.manage, model_pool.read, model_pool.manage, model_pool.test, model_pool.rotate_secret, model_leases.read, model_leases.reclaim, model_usage.read, audit_logs.read, operations.read, operations.manage]
+    AdminMeResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, user, product, global_super_admin, role_codes, permissions]
+      properties:
+        request_id:
+          type: string
+        user:
+          $ref: '#/components/schemas/UserSummary'
+        product:
+          $ref: '#/components/schemas/ProductCode'
+        global_super_admin:
+          type: boolean
+        role_codes:
+          type: array
+          maxItems: 200
+          items:
+            type: string
+            maxLength: 128
+        permissions:
+          type: array
+          maxItems: 46
+          items:
+            $ref: '#/components/schemas/AdminPermissionCode'
+    AdminPermissionsResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, permissions]
+      properties:
+        request_id:
+          type: string
+        permissions:
+          type: array
+          maxItems: 46
+          items:
+            $ref: '#/components/schemas/AdminPermissionCode'
+    AdminRole:
+      type: object
+      additionalProperties: false
+      required: [code, product, name, built_in, permissions]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 128
+        product:
+          type:
+            - string
+            - 'null'
+          enum: [autolive, douyin_desktop, null]
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        built_in:
+          type: boolean
+        permissions:
+          type: array
+          maxItems: 46
+          items:
+            $ref: '#/components/schemas/AdminPermissionCode'
+    AdminRoleEnvelope:
+      type: object
+      additionalProperties: false
+      required: [request_id, role]
+      properties:
+        request_id:
+          type: string
+        role:
+          $ref: '#/components/schemas/AdminRole'
+    AdminRoleListResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, roles]
+      properties:
+        request_id:
+          type: string
+        roles:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/AdminRole'
+    AdminRoleRequest:
+      type: object
+      additionalProperties: false
+      required: [name, permissions]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 128
+        product:
+          $ref: '#/components/schemas/ProductCode'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        permissions:
+          type: array
+          maxItems: 46
+          items:
+            $ref: '#/components/schemas/AdminPermissionCode'
+    AdminRoleAssignment:
+      type: object
+      additionalProperties: false
+      required: [user_id, role_code, product]
+      properties:
+        user_id:
+          $ref: '#/components/schemas/Id'
+        role_code:
+          type: string
+          minLength: 1
+          maxLength: 128
+        product:
+          $ref: '#/components/schemas/ProductCode'
+    ReplaceUserAdminRolesRequest:
+      type: object
+      additionalProperties: false
+      required: [product, role_codes]
+      properties:
+        product:
+          $ref: '#/components/schemas/ProductCode'
+        role_codes:
+          type: array
+          maxItems: 200
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+    UserAdminRolesResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, assignments]
+      properties:
+        request_id:
+          type: string
+        assignments:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/AdminRoleAssignment'
     UserAuthorizationSummary:
       type: object
       additionalProperties: false

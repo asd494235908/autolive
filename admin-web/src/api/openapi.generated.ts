@@ -626,6 +626,95 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 获取当前管理授权快照 */
+        get: operations["getAdminMe"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/permissions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 获取管理员固定权限目录 */
+        get: operations["listAdminPermissions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 查询管理员角色 */
+        get: operations["listAdminRoles"];
+        put?: never;
+        /** 创建管理员角色 */
+        post: operations["createAdminRole"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/roles/{role_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 获取管理员角色详情 */
+        get: operations["getAdminRole"];
+        put?: never;
+        post?: never;
+        /** 删除管理员角色 */
+        delete: operations["deleteAdminRole"];
+        options?: never;
+        head?: never;
+        /** 更新管理员角色 */
+        patch: operations["updateAdminRole"];
+        trace?: never;
+    };
+    "/api/v1/admin/users/{user_id}/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 查询用户管理员角色绑定 */
+        get: operations["listUserAdminRoles"];
+        /** 替换用户管理员角色绑定 */
+        put: operations["replaceUserAdminRoles"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -722,6 +811,55 @@ export interface components {
             role: components["schemas"]["ActorRole"];
             status: components["schemas"]["UserStatus"];
             created_at: components["schemas"]["Timestamp"];
+        };
+        /** @enum {string} */
+        AdminPermissionCode: "dashboard.read" | "users.read" | "users.manage" | "roles.read" | "roles.manage" | "roles.assign" | "admin_security.manage" | "devices.read" | "devices.manage" | "activation_codes.read" | "activation_codes.manage" | "activation_codes.reveal" | "activation_codes.switch_device" | "plans.read" | "plans.manage" | "plans.publish" | "orders.read" | "orders.reconcile" | "subscriptions.read" | "subscriptions.adjust" | "payments.read" | "payments.reconcile" | "password_resets.read" | "password_resets.retry" | "artifacts.read" | "artifacts.manage" | "artifacts.publish" | "artifacts.revoke" | "public_config.read" | "public_config.manage" | "public_config.publish" | "public_config.rollback" | "error_reports.read" | "error_reports.manage" | "feedback.read" | "feedback.manage" | "model_pool.read" | "model_pool.manage" | "model_pool.test" | "model_pool.rotate_secret" | "model_leases.read" | "model_leases.reclaim" | "model_usage.read" | "audit_logs.read" | "operations.read" | "operations.manage";
+        AdminMeResponse: {
+            request_id: string;
+            user: components["schemas"]["UserSummary"];
+            product: components["schemas"]["ProductCode"];
+            global_super_admin: boolean;
+            role_codes: string[];
+            permissions: components["schemas"]["AdminPermissionCode"][];
+        };
+        AdminPermissionsResponse: {
+            request_id: string;
+            permissions: components["schemas"]["AdminPermissionCode"][];
+        };
+        AdminRole: {
+            code: string;
+            /** @enum {string|null} */
+            product: "autolive" | "douyin_desktop" | null;
+            name: string;
+            built_in: boolean;
+            permissions: components["schemas"]["AdminPermissionCode"][];
+        };
+        AdminRoleEnvelope: {
+            request_id: string;
+            role: components["schemas"]["AdminRole"];
+        };
+        AdminRoleListResponse: {
+            request_id: string;
+            roles: components["schemas"]["AdminRole"][];
+        };
+        AdminRoleRequest: {
+            code?: string;
+            product?: components["schemas"]["ProductCode"];
+            name: string;
+            permissions: components["schemas"]["AdminPermissionCode"][];
+        };
+        AdminRoleAssignment: {
+            user_id: components["schemas"]["Id"];
+            role_code: string;
+            product: components["schemas"]["ProductCode"];
+        };
+        ReplaceUserAdminRolesRequest: {
+            product: components["schemas"]["ProductCode"];
+            role_codes: string[];
+        };
+        UserAdminRolesResponse: {
+            request_id: string;
+            assignments: components["schemas"]["AdminRoleAssignment"][];
         };
         UserAuthorizationSummary: {
             user_id: components["schemas"]["Id"];
@@ -2618,6 +2756,290 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getAdminMe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 当前会话下的管理授权 */
+            200: {
+                headers: {
+                    "X-Request-Id": components["headers"]["X-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminMeResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            405: components["responses"]["MethodNotAllowed"];
+            408: components["responses"]["RequestTimeout"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listAdminPermissions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 权限目录 */
+            200: {
+                headers: {
+                    "X-Request-Id": components["headers"]["X-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminPermissionsResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            408: components["responses"]["RequestTimeout"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listAdminRoles: {
+        parameters: {
+            query?: {
+                /** @description 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。 */
+                product?: components["parameters"]["AdminProduct"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 管理员角色列表 */
+            200: {
+                headers: {
+                    "X-Request-Id": components["headers"]["X-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminRoleListResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            408: components["responses"]["RequestTimeout"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    createAdminRole: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description 写接口必填。相同认证主体、相同资源语义和相同幂等键的重复请求必须返回同一结果，不能重复产生副作用。 */
+                "Idempotency-Key": components["parameters"]["IdempotencyKeyHeader"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminRoleRequest"];
+            };
+        };
+        responses: {
+            /** @description 角色已创建 */
+            201: {
+                headers: {
+                    "X-Request-Id": components["headers"]["X-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminRoleEnvelope"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            408: components["responses"]["RequestTimeout"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getAdminRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 管理员角色详情 */
+            200: {
+                headers: {
+                    "X-Request-Id": components["headers"]["X-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminRoleEnvelope"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            408: components["responses"]["RequestTimeout"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    deleteAdminRole: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description 写接口必填。相同认证主体、相同资源语义和相同幂等键的重复请求必须返回同一结果，不能重复产生副作用。 */
+                "Idempotency-Key": components["parameters"]["IdempotencyKeyHeader"];
+            };
+            path: {
+                role_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 角色已删除 */
+            204: {
+                headers: {
+                    "X-Request-Id": components["headers"]["X-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            408: components["responses"]["RequestTimeout"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    updateAdminRole: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description 写接口必填。相同认证主体、相同资源语义和相同幂等键的重复请求必须返回同一结果，不能重复产生副作用。 */
+                "Idempotency-Key": components["parameters"]["IdempotencyKeyHeader"];
+            };
+            path: {
+                role_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminRoleRequest"];
+            };
+        };
+        responses: {
+            /** @description 角色已更新 */
+            200: {
+                headers: {
+                    "X-Request-Id": components["headers"]["X-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminRoleEnvelope"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            408: components["responses"]["RequestTimeout"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listUserAdminRoles: {
+        parameters: {
+            query: {
+                product: components["schemas"]["ProductCode"];
+            };
+            header?: never;
+            path: {
+                user_id: components["schemas"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 用户角色绑定 */
+            200: {
+                headers: {
+                    "X-Request-Id": components["headers"]["X-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserAdminRolesResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            408: components["responses"]["RequestTimeout"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    replaceUserAdminRoles: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description 写接口必填。相同认证主体、相同资源语义和相同幂等键的重复请求必须返回同一结果，不能重复产生副作用。 */
+                "Idempotency-Key": components["parameters"]["IdempotencyKeyHeader"];
+            };
+            path: {
+                user_id: components["schemas"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReplaceUserAdminRolesRequest"];
+            };
+        };
+        responses: {
+            /** @description 用户角色绑定已替换 */
+            200: {
+                headers: {
+                    "X-Request-Id": components["headers"]["X-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserAdminRolesResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            408: components["responses"]["RequestTimeout"];
+            409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
         };
     };

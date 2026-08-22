@@ -141,11 +141,7 @@ type pagination struct {
 }
 
 func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, auth *authenticator) {
-	mux.Handle("POST /api/v1/admin/auth/change-password", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		if !isBuiltinLocalAdmin(actor) {
-			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
-			return
-		}
+	mux.Handle("POST /api/v1/admin/auth/change-password", auth.requirePermission("admin_security.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var input controlplane.ChangeLocalAdminPasswordInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -166,7 +162,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("GET /api/v1/admin/users", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("GET /api/v1/admin/users", auth.requirePermission("users.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		product, err := resolveAdminProductScope(r, actor)
 		if err != nil {
 			writeAppError(w, r, err)
@@ -189,7 +185,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("GET /api/v1/admin/users/{user_id}/devices", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("GET /api/v1/admin/users/{user_id}/devices", auth.requirePermission("users.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		product, err := resolveAdminProductScope(r, actor)
 		if err != nil {
 			writeAppError(w, r, err)
@@ -212,11 +208,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("GET /api/v1/admin/users/{user_id}/authorization-summary", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		if !isBuiltinLocalAdmin(actor) {
-			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
-			return
-		}
+	mux.Handle("GET /api/v1/admin/users/{user_id}/authorization-summary", auth.requirePermission("users.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		summary, err := svc.GetUserAuthorizationSummary(r.Context(), r.PathValue("user_id"))
 		if err != nil {
 			writeAppError(w, r, err)
@@ -228,11 +220,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("PATCH /api/v1/admin/users/{user_id}/authorization", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		if !isBuiltinLocalAdmin(actor) {
-			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
-			return
-		}
+	mux.Handle("PATCH /api/v1/admin/users/{user_id}/authorization", auth.requirePermission("users.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var input controlplane.UpdateUserAuthorizationInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -249,11 +237,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/users", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		if !isBuiltinLocalAdmin(actor) {
-			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
-			return
-		}
+	mux.Handle("POST /api/v1/admin/users", auth.requirePermission("users.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var input controlplane.CreateUserInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -270,11 +254,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/users/{user_id}/disable", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		if !isBuiltinLocalAdmin(actor) {
-			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
-			return
-		}
+	mux.Handle("POST /api/v1/admin/users/{user_id}/disable", auth.requirePermission("users.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		user, err := svc.DisableUser(r.Context(), r.Header.Get("Idempotency-Key"), r.PathValue("user_id"))
 		if err != nil {
 			writeAppError(w, r, err)
@@ -290,11 +270,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("PATCH /api/v1/admin/users/{user_id}", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		if !isBuiltinLocalAdmin(actor) {
-			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
-			return
-		}
+	mux.Handle("PATCH /api/v1/admin/users/{user_id}", auth.requirePermission("users.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var input controlplane.UpdateUserInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -315,11 +291,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/users/{user_id}/reset-password", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		if !isBuiltinLocalAdmin(actor) {
-			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
-			return
-		}
+	mux.Handle("POST /api/v1/admin/users/{user_id}/reset-password", auth.requirePermission("users.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var input controlplane.ResetUserPasswordInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -340,7 +312,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("GET /api/v1/admin/devices", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("GET /api/v1/admin/devices", auth.requirePermission("devices.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		product, err := resolveAdminProductScope(r, actor)
 		if err != nil {
 			writeAppError(w, r, err)
@@ -363,7 +335,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("GET /api/v1/admin/devices/{device_id}", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("GET /api/v1/admin/devices/{device_id}", auth.requirePermission("devices.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		product, err := resolveAdminProductScope(r, actor)
 		if err != nil {
 			writeAppError(w, r, err)
@@ -380,7 +352,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/devices/{device_id}/disable", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("POST /api/v1/admin/devices/{device_id}/disable", auth.requirePermission("devices.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		deviceID := r.PathValue("device_id")
 		device, err := svc.DisableDeviceForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), deviceID, successAuditForDevice(r, actor, deviceID))
 		if err != nil {
@@ -399,7 +371,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/devices/{device_id}/unbind", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("POST /api/v1/admin/devices/{device_id}/unbind", auth.requirePermission("devices.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		deviceID := r.PathValue("device_id")
 		device, err := svc.UnbindDeviceForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), deviceID, successAuditForDevice(r, actor, deviceID))
 		if err != nil {
@@ -423,7 +395,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("GET /api/v1/admin/activation-codes", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("GET /api/v1/admin/activation-codes", auth.requirePermission("activation_codes.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		product, err := resolveAdminProductScope(r, actor)
 		if err != nil {
 			writeAppError(w, r, err)
@@ -452,7 +424,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/activation-codes", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("POST /api/v1/admin/activation-codes", auth.requirePermission("activation_codes.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var request struct {
 			ExpiresAt  string `json:"expires_at"`
 			MaxDevices int    `json:"max_devices"`
@@ -480,7 +452,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/activation-codes/{code_id}/revoke", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("POST /api/v1/admin/activation-codes/{code_id}/revoke", auth.requirePermission("activation_codes.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		code, err := svc.RevokeActivationCodeForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), r.PathValue("code_id"))
 		if err != nil {
 			writeAppError(w, r, err)
@@ -492,7 +464,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("GET /api/v1/admin/model-pool", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("GET /api/v1/admin/model-pool", auth.requirePermission("model_pool.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		product, err := resolveAdminProductScope(r, actor)
 		if err != nil {
 			writeAppError(w, r, err)
@@ -515,7 +487,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/model-pool", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("POST /api/v1/admin/model-pool", auth.requirePermission("model_pool.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var input controlplane.CreateModelPoolAccountInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -532,7 +504,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/model-pool/{account_id}/disable", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("POST /api/v1/admin/model-pool/{account_id}/disable", auth.requirePermission("model_pool.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		accountID := r.PathValue("account_id")
 		account, err := svc.DisableModelPoolAccountForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), accountID, successAuditForTarget(r, actor, "model_account", accountID, ""))
 		if err != nil {
@@ -545,7 +517,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("PATCH /api/v1/admin/model-pool/{account_id}", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("PATCH /api/v1/admin/model-pool/{account_id}", auth.requirePermission("model_pool.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var input controlplane.UpdateModelPoolAccountInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -563,7 +535,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/model-pool/{account_id}/rotate-secret", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("POST /api/v1/admin/model-pool/{account_id}/rotate-secret", auth.requirePermission("model_pool.rotate_secret", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var input controlplane.RotateModelPoolAccountSecretInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -581,7 +553,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/model-pool/{account_id}/test", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("POST /api/v1/admin/model-pool/{account_id}/test", auth.requirePermission("model_pool.test", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var input controlplane.TestModelPoolAccountInput
 		if err := decodeOptionalJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -813,7 +785,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("GET /api/v1/admin/model-usage", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("GET /api/v1/admin/model-usage", auth.requirePermission("model_usage.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		product, err := resolveAdminProductScope(r, actor)
 		if err != nil {
 			writeAppError(w, r, err)
@@ -836,7 +808,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("GET /api/v1/admin/model-leases", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("GET /api/v1/admin/model-leases", auth.requirePermission("model_leases.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		product, err := resolveAdminProductScope(r, actor)
 		if err != nil {
 			writeAppError(w, r, err)
@@ -859,7 +831,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("GET /api/v1/admin/model-leases/{lease_id}", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("GET /api/v1/admin/model-leases/{lease_id}", auth.requirePermission("model_leases.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		lease, err := svc.GetModelLeaseAdminDetailForProduct(r.Context(), r.PathValue("lease_id"), actor.Product)
 		if err != nil {
 			writeAppError(w, r, err)
@@ -871,7 +843,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/model-leases/{lease_id}/reclaim", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("POST /api/v1/admin/model-leases/{lease_id}/reclaim", auth.requirePermission("model_leases.reclaim", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var input controlplane.ReleaseModelLeaseInput
 		if err := decodeOptionalJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -890,7 +862,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("GET /api/v1/admin/audit-logs", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("GET /api/v1/admin/audit-logs", auth.requirePermission("audit_logs.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		product, err := resolveAdminProductScope(r, actor)
 		if err != nil {
 			writeAppError(w, r, err)
@@ -996,6 +968,9 @@ func resolveAdminProductScope(r *http.Request, actor controlplane.Actor) (contro
 		return "", controlplane.ErrInvalidRequest
 	}
 	localAdmin := isBuiltinLocalAdmin(actor)
+	if authorization, ok := adminAuthorizationFromContext(r.Context()); ok && authorization.GlobalSuperAdmin {
+		localAdmin = true
+	}
 	if !exists {
 		if localAdmin {
 			return "", nil
