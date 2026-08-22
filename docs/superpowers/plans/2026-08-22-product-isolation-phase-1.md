@@ -270,19 +270,19 @@ Commit: `feat(admin): scope control-plane queries by product`
 - Documentation records actual implemented scope, migration version, compatibility window and remaining P0 Phase 2～4 gaps.
 - No document claims Profile offline signing, model delegated credentials, commercial seats or artifact signing are implemented by Phase 1.
 
-- [ ] **Step 1: Write an integration test matrix**
+- [x] **Step 1: Write an integration test matrix**
 
 Record deterministic cases for login→activation→heartbeat→Profile in both products, same device ID isolation, cross-product activation rejection, admin filter scope, migration replay and restart.
 
-- [ ] **Step 2: Run the matrix**
+- [x] **Step 2: Run the matrix**
 
 Run the exact commands from Tasks 2–5 plus `go test -tags=postgres_integration ./internal/store` when PostgreSQL is available; record unsupported environment checks without marking them passed.
 
-- [ ] **Step 3: Update docs from evidence**
+- [x] **Step 3: Update docs from evidence**
 
 Mark only completed Phase 1 checklist items, add the actual migration/version and compatibility behavior, and leave Profile 6h/24h, model auth, OpenAPI artifact and cross-repo E2E as Not Started until their phases are implemented.
 
-- [ ] **Step 4: Final review and commit**
+- [x] **Step 4: Final review and commit**
 
 Run: `git diff --check && bash tools/check-document-references.sh && git status --short --branch`.
 

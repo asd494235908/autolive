@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -135,18 +136,38 @@ func TestMetricRouteIncludesAdminModelLeaseList(t *testing.T) {
 
 func TestMetricsExposeRateLimitAndAuditFailureCounters(t *testing.T) {
 	handler := newTestRouter(t)
+	start := make(chan struct{})
+	responses := make(chan int, 6)
+	var group sync.WaitGroup
 	for attempt := 0; attempt < 6; attempt++ {
-		rec := doJSON(t, handler, http.MethodPost, "/api/v1/auth/login", map[string]any{
-			"username": "admin",
-			"password": "wrong-password",
-			"product":  "autolive",
-		}, "", "")
-		if attempt < 5 && rec.Code != http.StatusUnauthorized {
-			t.Fatalf("login attempt %d status = %d, want %d", attempt+1, rec.Code, http.StatusUnauthorized)
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			rec := doJSON(t, handler, http.MethodPost, "/api/v1/auth/login", map[string]any{
+				"username": "admin",
+				"password": "wrong-password",
+				"product":  "autolive",
+			}, "", "")
+			responses <- rec.Code
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(responses)
+	unauthorized, rateLimited := 0, 0
+	for status := range responses {
+		switch status {
+		case http.StatusUnauthorized:
+			unauthorized++
+		case http.StatusTooManyRequests:
+			rateLimited++
+		default:
+			t.Fatalf("login status = %d, want 401 or 429", status)
 		}
-		if attempt == 5 && rec.Code != http.StatusTooManyRequests {
-			t.Fatalf("rate-limited login status = %d, want %d", rec.Code, http.StatusTooManyRequests)
-		}
+	}
+	if unauthorized != 5 || rateLimited != 1 {
+		t.Fatalf("login statuses = unauthorized %d, rate_limited %d; want 5/1", unauthorized, rateLimited)
 	}
 
 	metricsRec := doJSON(t, handler, http.MethodGet, "/metrics", nil, "", "")

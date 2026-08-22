@@ -2,15 +2,21 @@
 
 ## 文档状态
 
-- 状态：Draft
+- 状态：Phase 1 基线实现中；后续 P0 阶段仍为规划
 - 文件模式：Split
-- 当前阶段：Not Started
-- 活动阶段文件：无（本轮只更新规划）
+- 当前阶段：Phase 1：产品硬隔离与管理范围（基线已实现，最终验收待补齐）
+- 活动阶段文件：[phase-01-product-isolation.md](./prd-douyin-desktop-control-plane-integration/phase-01-product-isolation.md)
 - 上下文：[context.md](./prd-douyin-desktop-control-plane-integration/context.md)
 - 设计：[多产品控制面与 douyin-desktop 接入设计](../docs/superpowers/specs/2026-08-22-douyin-desktop-接入-autolive-多产品控制面设计.md)
 - 关联规划：[服务端商业化与生产就绪](./prd-server-commercial-production-readiness.md)
 - 最后更新：2026-08-22
 - 目的：作为 autoLive Go/React 控制面承载 `autolive` 与 `douyin_desktop` 的 P0 接入事实源。
+
+## 当前实现状态
+
+本轮已在 autoLive Go 控制面落地 Phase 1 基线：迁移 0023 创建产品注册表和 `user_products`，登录/Refresh/激活/心跳/Profile 绑定产品，会话、设备、激活码、租约、用量、审计和管理分页查询执行产品边界；七类管理列表、用户设备子列表和设备详情支持有界 `product` 查询，普通管理员不能扩大到会话外产品，内建本地管理员保持跨产品列表兼容并可显式收窄。全局用户授权摘要和用户管理写操作在固定产品角色未实现前仅内建本地管理员可用。OpenAPI 源文件、管理端和桌面端生成类型已同步。
+
+这不等于本 PRD 全部完成：迁移 0023 仍保留兼容期旧设备全局唯一键，固定权限目录/自定义角色/React 权限壳、Profile 6 小时复核与 24 小时离线签名、模型委托短期凭证、不可变 OpenAPI 制品和跨仓库 E2E 仍未实施。真实 PostgreSQL 回放也需要 `TEST_POSTGRES_URL` 环境证据。
 
 ## 分层归属
 
@@ -40,7 +46,7 @@ autoLive 已具备登录、Refresh、Logout、激活、设备、心跳、Profile
 - NG-2：不引入通用 ABAC/策略引擎、数据库级多租户框架、微服务、Kubernetes 或外部消息队列。
 - NG-3：不上传 Token、Cookie、完整 Prompt、模型输入输出正文、视频、音频或本地 SQLite 数据。
 - NG-4：不恢复实时话术幻化、媒体任务、服务端模型正文代理或请求预占。
-- NG-5：本轮不修改 OpenAPI、代码、迁移、CI 或服务器，只确认并写入规划。
+- NG-5：本轮不实施 Profile 离线签名、模型认证闭环、商业席位、OpenAPI 不可变制品、跨仓库 E2E 或服务器变更；Phase 1 的 Go、迁移、OpenAPI 和测试基线已按活动阶段文件落地。
 
 ## 成功标准
 
@@ -165,13 +171,13 @@ autoLive 已具备登录、Refresh、Logout、激活、设备、心跳、Profile
 - 每阶段先更新 OpenAPI/错误码和失败测试，再实现数据库、Go、React 与 CI；生成文件不手改。
 - 阶段开始时重读主 PRD、当前 Phase、context、仓库约束和受影响调用方。
 - 任何外部供应商能力在实施时查官方资料并完成撤销/范围/过期探测，不能只依据宣传文档。
-- 阶段结束后更新本 PRD、商业化 PRD 的依赖和根文档；本轮不实施任何阶段。
+- 阶段结束后更新本 PRD、商业化 PRD 的依赖和根文档；本轮已完成 Phase 1 服务端基线，Profile/模型认证/契约制品/E2E 等后续阶段仍未实施。
 
 ## 阶段索引
 
 | 阶段 | 状态 | 目标 | 验证重点 | 文件 |
 | --- | --- | --- | --- | --- |
-| Phase 1：产品硬隔离与管理范围 | Not Started | 建立产品、成员、会话、数据约束和产品范围 RBAC | 跨产品拒绝/兼容迁移/权限 | [phase-01-product-isolation.md](./prd-douyin-desktop-control-plane-integration/phase-01-product-isolation.md) |
+| Phase 1：产品硬隔离与管理范围 | Baseline implemented / acceptance pending | 建立产品、成员、会话、数据约束和管理查询产品范围 | 跨产品拒绝/兼容迁移/管理范围 | [phase-01-product-isolation.md](./prd-douyin-desktop-control-plane-integration/phase-01-product-isolation.md) |
 | Phase 2：Profile 与离线授权 | Not Started | 服务端时间、签名新鲜度、6h/24h 和时钟回拨 | 签名/撤销窗口/安全降级 | [phase-02-profile-offline-authorization.md](./prd-douyin-desktop-control-plane-integration/phase-02-profile-offline-authorization.md) |
 | Phase 3：模型认证闭环 | Not Started | BYOK 默认和可选短期委托凭证 | 不泄密/可撤销/无假租约 | [phase-03-model-authentication.md](./prd-douyin-desktop-control-plane-integration/phase-03-model-authentication.md) |
 | Phase 4：固定契约与跨仓库 E2E | Not Started | 不可变 OpenAPI 制品、兼容门禁和产品矩阵 E2E | digest/复现/负向矩阵 | [phase-04-contract-artifact-cross-repo-e2e.md](./prd-douyin-desktop-control-plane-integration/phase-04-contract-artifact-cross-repo-e2e.md) |
@@ -185,4 +191,5 @@ autoLive 已具备登录、Refresh、Logout、激活、设备、心跳、Profile
 ## 变更记录
 
 - 2026-08-22：基于 autoLive 与 douyin-desktop 当前契约建立接入缺口草案。
-- 2026-08-22：用户确认单库硬逻辑隔离、全局身份加产品成员、6 小时建议复核/24 小时离线硬上限、BYOK 首发和分层双 PRD；拆分为四个 P0 阶段，本轮不实施。
+- 2026-08-22：用户确认单库硬逻辑隔离、全局身份加产品成员、6 小时建议复核/24 小时离线硬上限、BYOK 首发和分层双 PRD；拆分为四个 P0 阶段，后续阶段仍按规划推进。
+- 2026-08-22：完成 Phase 1 产品基线与管理端服务端产品范围收窄；迁移 0023、Go/HTTP/仓储测试和 OpenAPI 生成类型已同步，后续终态收紧与 P0 Phase 2～4 保持未实施。
