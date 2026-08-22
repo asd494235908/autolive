@@ -4,8 +4,8 @@
 
 - 状态：Draft
 - 文件模式：Split
-- 当前阶段：Not Started
-- 活动阶段文件：无（本轮不实施）
+- 当前阶段：Phase 2 已实现；Phase 3～11 尚未开始
+- 活动阶段文件：[Phase 2：管理员 RBAC 与权限化管理壳](./prd-server-commercial-production-readiness/phase-02-admin-rbac.md)
 - 上下文：[context.md](./prd-server-commercial-production-readiness/context.md)
 - 设计：[服务端商业化与生产能力补齐设计](../docs/superpowers/specs/2026-08-21-服务端商业化与生产能力补齐设计.md)
 - P0 依赖：[douyin-desktop 接入 autoLive 多产品控制面](./prd-douyin-desktop-control-plane-integration.md)
@@ -15,11 +15,11 @@
 
 ## P0 产品基线依赖状态
 
-多产品控制面 Phase 1 已完成服务端基线：产品注册表、`user_products`、产品绑定会话、资源 product 字段、跨产品拒绝和管理列表产品范围查询已落地，详见 [P0 接入 PRD](./prd-douyin-desktop-control-plane-integration.md) 及其 [Phase 1 阶段文件](./prd-douyin-desktop-control-plane-integration/phase-01-product-isolation.md)。本专项仍未实施固定权限目录、自定义角色生命周期、订阅/席位、支付、制品、公共配置和错误反馈；所有新增商业资源必须复用该基线，不得另建产品或成员事实源。
+多产品控制面 Phase 1 已完成服务端基线，商业化 Phase 2 已在其上交付固定权限目录、自定义角色生命周期、产品角色绑定、即时服务端鉴权和 React 权限壳；订阅/席位、支付、制品、公共配置和错误反馈仍未实施。详见 [P0 接入 PRD](./prd-douyin-desktop-control-plane-integration.md) 及其 [Phase 1 阶段文件](./prd-douyin-desktop-control-plane-integration/phase-01-product-isolation.md)。所有新增商业资源必须复用该基线，不得另建产品或成员事实源。
 
 ## 问题
 
-当前 Go 控制面已具备用户、设备、激活码、模型号池、租约、用量、审计、PostgreSQL 与部分保留清理/指标能力，但缺少完整商业资源查询、生产支付、密码重置投递、对象存储发布、制品签名验证、备份恢复、追踪和 namespace 级配置 Schema。管理权限目前只有 `admin/user` 粗粒度角色，`/api/v1/admin/*` 统一经过 `requireAdmin`；React 管理端只验证会话，所有导航和路由对已登录管理员全部可见。现有激活码仅保存哈希和首个核销设备，无法再次显示新功能上线前的明文，也无法准确管理全部历史设备绑定。
+当前 Go 控制面已具备用户、设备、激活码、模型号池、租约、用量、审计、PostgreSQL 与部分保留清理/指标能力，但缺少完整商业资源查询、生产支付、密码重置投递、对象存储发布、制品签名验证、备份恢复、追踪和 namespace 级配置 Schema。此前仅有 `admin/user` 粗粒度角色和会话级管理端；这些 RBAC 基线问题已由 Phase 2 修正，剩余商业能力仍待后续阶段。现有激活码仅保存哈希和首个核销设备，无法再次显示新功能上线前的明文，也无法准确管理全部历史设备绑定。
 
 本专项的实施边界包含 Go 服务端和 React 管理端：Go API/领域服务、PostgreSQL/Secret Store、服务端 Worker、支付/邮件/对象存储适配器、服务端发布 CI、生产运维，以及基于 Ant Design 的角色权限和业务管理页。所有商业与运营资源必须消费 P0 接入 PRD 的 `product`、`user_products`、产品会话和产品范围 RBAC 基线。Rust/Tauri 桌面客户端仍不在本专项实施范围。
 
@@ -42,7 +42,7 @@
 - NG-2：对象存储不存储用户本地视频/音频，不使 Go API 代理大文件数据面。
 - NG-3：首期不做退款、优惠券、发票、多币种、短信重置和多支付渠道。
 - NG-4：不预先拆微服务、引入 Kubernetes 或外部消息队列。
-- NG-5：本商业化专项本轮仍只维护规划文档，不修改商业 OpenAPI、商业数据库或生产环境；P0 Phase 1 的基础代码和迁移由接入专项维护。
+- NG-5：本商业化专项除已交付的 Phase 2 RBAC 基线外，本轮不实施订阅/支付/制品/配置/生产运维等后续商业能力；P0 Phase 1 的基础代码和迁移由接入专项维护。
 - NG-6：本专项不实现 Rust/Tauri 下载器、客户端安装器或客户端签名验证逻辑；桌面端消费能力另立集成任务。
 
 ## 成功标准
@@ -113,8 +113,7 @@
 
 - 证据、当前系统和验证面见 [context.md](./prd-server-commercial-production-readiness/context.md)。
 - 当前 Router 只有用户、设备、激活码、模型账号/租约/用量和审计管理路由，未见订阅、订单、套餐版本或支付领域。
-- 当前服务端只有 `admin/user` 角色和统一 `requireAdmin`；未见权限目录、自定义角色、用户-角色绑定表或按动作鉴权。
-- React 管理端目前只有会话守卫，导航、路由和页面操作未按权限点过滤。
+- 初始发现曾只有 `admin/user` 角色和统一 `requireAdmin`，React 管理端仅有会话守卫；该发现已由 Phase 2 的权限目录、角色绑定、固定权限中间件和 React 权限壳修正。
 - 当前设备有列表/详情，但缺少本 PRD 要求的完整筛选与排序契约。
 - 当前设备、激活码、租约、用量和审计已具备 P0 Phase 1 的服务端 `product` 硬隔离与管理查询范围；迁移 0023 仍处于兼容阶段，固定权限/商业资源和终态复合唯一键尚未完成，本 PRD 只消费 P0 产品事实。
 - 现有保留 Worker 和 Prometheus 是可复用基础；保留范围、容量告警、备份恢复和 tracing 未形成生产闭环。
@@ -236,7 +235,7 @@
 | 阶段 | 状态 | 目标 | 验证重点 | 文件 |
 | --- | --- | --- | --- | --- |
 | Phase 1：契约与领域基线 | Not Started | 锁定资源、状态机、事务、错误码和迁移顺序 | 契约/迁移/安全边界 | [phase-01-contract-domain-baseline.md](./prd-server-commercial-production-readiness/phase-01-contract-domain-baseline.md) |
-| Phase 2：管理员 RBAC 与权限化管理壳 | Not Started | 固定权限点、自定义角色、多角色并集与 React 权限壳 | 防提权/立即生效/403 | [phase-02-admin-rbac.md](./prd-server-commercial-production-readiness/phase-02-admin-rbac.md) |
+| Phase 2：管理员 RBAC 与权限化管理壳 | 已实现；PG/浏览器验收待补 | 固定权限点、自定义角色、多角色并集与 React 权限壳 | 防提权/立即生效/403 | [phase-02-admin-rbac.md](./prd-server-commercial-production-readiness/phase-02-admin-rbac.md) |
 | Phase 3：激活码安全管理 | Not Started | 加密明文、绑定明细、容量与切换管理页 | 密钥/事务/历史兼容 | [phase-03-activation-security.md](./prd-server-commercial-production-readiness/phase-03-activation-security.md) |
 | Phase 4：商业核心事实 | Not Started | 套餐版本、订单、订阅和权益状态机 | 价格快照/幂等/并发 | [phase-04-commercial-core.md](./prd-server-commercial-production-readiness/phase-04-commercial-core.md) |
 | Phase 5：管理查询 API 与管理页面 | Not Started | 补齐订阅、订单、套餐版本和设备查询/筛选及 React 页面 | SQL 分页/筛选/权限/URL 状态 | [phase-05-admin-query-apis.md](./prd-server-commercial-production-readiness/phase-05-admin-query-apis.md) |
@@ -270,5 +269,6 @@
 ## 变更记录
 
 - 2026-08-21：创建拆分式主 PRD，纳入管理查询、微信支付、密码重置 Worker、激活码独立加密表、制品链、生产运维和 namespace 级 JSON Schema；根据用户要求全部作为服务端专项且本轮不实施。
-- 2026-08-22：根据确认方案纳入 React 管理端、自定义角色与固定权限点，将计划扩展为 10 个 Phase；Rust/Tauri 仍为非目标，本轮仍只更新文档。
-- 2026-08-22：采用分层双 PRD，商业生产层消费 P0 product 基线；加入产品席位、产品范围配置/制品、双重脱敏错误报告与最小反馈，将计划扩展为 11 个 Phase，本轮仍只更新文档。
+- 2026-08-22：根据确认方案纳入 React 管理端、自定义角色与固定权限点，将计划扩展为 10 个 Phase；Rust/Tauri 仍为非目标。
+- 2026-08-22：采用分层双 PRD，商业生产层消费 P0 product 基线；加入产品席位、产品范围配置/制品、双重脱敏错误报告与最小反馈，将计划扩展为 11 个 Phase。
+- 2026-08-22：完成 Phase 2 RBAC 服务端与 React 权限化管理端实现；Go 全量/Race/vet/build、管理端契约/类型/测试/构建和文档引用检查通过，真实 PostgreSQL 因 `TEST_POSTGRES_URL` 未设置、浏览器与桌面端按范围未验证。

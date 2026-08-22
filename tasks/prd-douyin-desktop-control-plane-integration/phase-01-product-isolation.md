@@ -1,10 +1,10 @@
 # Phase 1：产品硬隔离与管理范围
 
 Parent PRD：[PRD：douyin-desktop 接入 autoLive 多产品控制面](../prd-douyin-desktop-control-plane-integration.md)
-状态：Phase 1 基线已实现；终态收紧与最终验收待后续阶段
+状态：Phase 1 基线已实现；共享 RBAC 已由商业化 Phase 2 交付，终态收紧与真实 PostgreSQL 验收待后续阶段
 最后更新：2026-08-22
 
-> 本轮已完成产品值对象、迁移 0023、产品绑定会话、设备/激活码/Profile/租约/用量/审计的已接入服务端产品边界，以及管理端列表/设备详情的服务端授权收窄；全局用户授权摘要和用户管理写操作在产品角色生命周期完成前仅内建本地管理员可用。当前仍保留兼容快照与旧设备唯一键；固定权限目录、产品角色生命周期、React 产品权限壳、Profile 6h/24h 离线签名、模型委托凭证、不可变 OpenAPI 制品和跨仓库 E2E 不属于本阶段已完成范围。
+> 本轮已完成产品值对象、迁移 0023、产品绑定会话、设备/激活码/Profile/租约/用量/审计的已接入服务端产品边界，以及管理端列表/设备详情的服务端授权收窄；共享固定权限目录、产品角色生命周期和 React 权限壳已由商业化 Phase 2 交付。当前仍保留兼容快照与旧设备唯一键；Profile 6h/24h 离线签名、模型委托凭证、不可变 OpenAPI 制品和跨仓库 E2E 不属于本阶段已完成范围。
 
 ## 目标
 
@@ -45,8 +45,8 @@ Parent PRD：[PRD：douyin-desktop 接入 autoLive 多产品控制面](../prd-do
 - [x] 兼容阶段的首个迁移只做扩展：保留旧主键/唯一键/外键与旧 SQL 写路径，通过默认 `autolive` 和默认成员关系承接旧代码；真正的复合键和 `NOT NULL` 收紧另立后续迁移。
 - [ ] 将设备唯一性改为 `(product, device_id)`；迁移 0023 仍保留旧全局设备键，避免兼容发布破坏旧写路径。
 - [x] 登录/激活确定产品并写入会话；后续提示与会话不一致时 fail-closed。
-- [ ] 固定权限目录、自定义角色生命周期和产品角色分配仍由商业化 Phase 2 交付；本阶段使用现有 `admin/user` 兼容模型，并将内建本地管理员视为跨产品查询兼容边界。
-- [ ] React 管理面完整的授权产品上下文、导航/路由/操作权限壳仍待商业化 Phase 2；本阶段已完成服务端列表筛选、403 和 OpenAPI 类型同步。
+- [x] 固定权限目录、自定义角色生命周期和产品角色分配由商业化 Phase 2 交付；本阶段继续消费同一产品范围事实，不新建第二套角色表。
+- [x] React 管理面完整的授权产品上下文、导航/路由/操作权限壳由商业化 Phase 2 交付；本阶段已完成服务端列表筛选、403 和 OpenAPI 类型同步。
 - [ ] 为 `super_admin` 跨产品写操作增加确认、理由、幂等和审计；本阶段只保留内建管理员的低风险列表兼容范围。
 - [ ] 为兼容默认建立计数/告警，达到下线条件后将新客户端 product 收紧为必填并删除永久默认路径。
 - [x] 同步商业化 PRD 依赖、产品/系统/管理/数据库文档，并明确本阶段已实现范围和剩余 P0 阶段。
@@ -58,7 +58,7 @@ Parent PRD：[PRD：douyin-desktop 接入 autoLive 多产品控制面](../prd-do
 - [x] 跨产品激活码、会话、Profile、租约、用量、审计详情与写操作已由 Go 单元/HTTP/SQLMock 覆盖；真实 PostgreSQL 集成仍待运行。
 - [x] 普通管理员省略/伪造 product 只能看到会话所属产品；内建本地管理员可省略查询参数查看全部或显式收窄，行为已由 HTTP 集成测试覆盖。
 - [ ] 历史数据全部回填 `autolive`、无孤立引用的真实数据验证待 PostgreSQL 环境；迁移静态契约和集成测试已准备。
-- [ ] PostgreSQL integration、React 权限/筛选和迁移回放未全部通过；完整 `go test -race ./...` 已通过，桌面端 API 检查缺少本地生成器但已用管理端同版本生成器完成无漂移比对。
+- [ ] PostgreSQL integration 和迁移回放仍未取得真实数据库证据；服务端完整 `go test -race ./...`、管理端权限壳 typecheck/test/build 已通过，桌面端按本轮范围未验证。
 
 ## 退出标准
 
@@ -75,7 +75,7 @@ Parent PRD：[PRD：douyin-desktop 接入 autoLive 多产品控制面](../prd-do
 | 快照源与归一化源产品分页 | `backend/internal/service/product_snapshot_page_test.go`、`backend/internal/store/postgres_repository_test.go` | 快照回退不调用 normalized 读者；SQLMock 检查 count/list 均带 product 谓词 |
 | 迁移重放、旧写入默认值、重启 | `backend/migrations/postgres_integration_test.go`、`backend/internal/store/postgres_integration_test.go` | 需要 `TEST_POSTGRES_URL`；本轮未执行真实数据库，不能标记通过 |
 
-本轮实际命令记录：`cd backend && go test ./...`、`go vet ./...`、`go build ./...`、`go test -race ./...`、`go test -race ./internal/service ./internal/store`、专项产品测试、`bash tools/check-document-references.sh`、`git diff --check`、管理端 `pnpm api:check` 均通过。桌面端 `pnpm api:check` 因 `openapi-typescript` 未安装而未通过，但已用管理端同版本生成器对两份生成类型做无落盘比对并通过；`TEST_POSTGRES_URL` 未设置，真实 PostgreSQL 未验证。
+本轮实际命令记录：`cd backend && go test ./...`、`go vet ./...`、`go build ./...`、`go test -race ./...`、专项产品测试、`bash tools/check-document-references.sh`、`git diff --check`、管理端 `pnpm api:check`、`pnpm typecheck`、`pnpm test`、`pnpm build` 均通过。桌面端按本次服务端任务范围未验证；`TEST_POSTGRES_URL` 未设置，真实 PostgreSQL 未验证。
 
 ## 发现/决策
 
