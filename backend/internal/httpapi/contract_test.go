@@ -182,6 +182,53 @@ func TestOpenAPIOperationsDeclareCommonRuntimeErrorStatuses(t *testing.T) {
 	}
 }
 
+func TestOpenAPIAdminListGetsDeclareBadRequest(t *testing.T) {
+	document := loadOpenAPIContract(t)
+	want := []string{
+		"/api/v1/admin/users",
+		"/api/v1/admin/users/{user_id}/devices",
+		"/api/v1/admin/devices",
+		"/api/v1/admin/activation-codes",
+		"/api/v1/admin/model-pool",
+		"/api/v1/admin/model-usage",
+		"/api/v1/admin/model-leases",
+	}
+	for _, path := range want {
+		var operation struct {
+			Responses map[string]yaml.Node `yaml:"responses"`
+		}
+		node, ok := document.Paths[path]["get"]
+		if !ok {
+			t.Fatalf("GET %s is missing", path)
+		}
+		if err := node.Decode(&operation); err != nil {
+			t.Fatalf("decode GET %s: %v", path, err)
+		}
+		if ref := localReferenceName(operation.Responses["400"]); ref != "BadRequest" {
+			t.Errorf("GET %s status 400 ref = %q, want BadRequest", path, ref)
+		}
+	}
+}
+
+func TestOpenAPIProductResourceSchemasRequireProduct(t *testing.T) {
+	document := loadOpenAPIContract(t)
+	for _, name := range []string{"DeviceSummary", "ActivationCode", "ModelPoolAccountSummary", "ModelLease", "ModelLeaseAdminSummary", "ModelLeaseAdminDetail", "ModelUsageRecord", "AuditLog"} {
+		node, ok := document.Components["schemas"][name]
+		if !ok {
+			t.Fatalf("schema %s is missing", name)
+		}
+		var schema struct {
+			Required []string `yaml:"required"`
+		}
+		if err := node.Decode(&schema); err != nil {
+			t.Fatalf("decode schema %s: %v", name, err)
+		}
+		if !slices.Contains(schema.Required, "product") {
+			t.Errorf("schema %s required fields = %v, want product", name, schema.Required)
+		}
+	}
+}
+
 func TestOpenAPIMirroredDTOFieldsMatchGoJSONTags(t *testing.T) {
 	document := loadOpenAPIContract(t)
 	// These are the DTOs that cross the Go HTTP boundary. Keeping the mapping

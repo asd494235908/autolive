@@ -901,7 +901,7 @@ export interface components {
         };
         ModelLease: {
             id: components["schemas"]["Id"];
-            product?: components["schemas"]["ProductCode"];
+            product: components["schemas"]["ProductCode"];
             provider: string;
             model: string;
             status: components["schemas"]["ModelLeaseStatus"];
@@ -919,7 +919,7 @@ export interface components {
         };
         ModelLeaseAdminSummary: {
             id: components["schemas"]["Id"];
-            product?: components["schemas"]["ProductCode"];
+            product: components["schemas"]["ProductCode"];
             account_id: components["schemas"]["Id"];
             user_id: components["schemas"]["Id"];
             device_id: components["schemas"]["Id"];
@@ -939,7 +939,7 @@ export interface components {
         };
         ModelLeaseAdminDetail: {
             id: components["schemas"]["Id"];
-            product?: components["schemas"]["ProductCode"];
+            product: components["schemas"]["ProductCode"];
             account_id: components["schemas"]["Id"];
             user_id: components["schemas"]["Id"];
             device_id: components["schemas"]["Id"];
@@ -1057,7 +1057,7 @@ export interface components {
         };
         ActivationCode: {
             id: components["schemas"]["Id"];
-            product?: components["schemas"]["ProductCode"];
+            product: components["schemas"]["ProductCode"];
             status: components["schemas"]["ActivationCodeStatus"];
             expires_at: components["schemas"]["Timestamp"];
             max_devices: number;
@@ -1089,7 +1089,7 @@ export interface components {
         };
         ModelPoolAccountSummary: {
             id: components["schemas"]["Id"];
-            product?: components["schemas"]["ProductCode"];
+            product: components["schemas"]["ProductCode"];
             provider: string;
             model: string;
             /** Format: uri */
@@ -1113,7 +1113,7 @@ export interface components {
         };
         ModelUsageRecord: {
             id: components["schemas"]["Id"];
-            product?: components["schemas"]["ProductCode"];
+            product: components["schemas"]["ProductCode"];
             lease_id: components["schemas"]["Id"];
             request_id: components["schemas"]["Id"];
             client_call_id: components["schemas"]["Id"];
@@ -1709,6 +1709,7 @@ export interface operations {
                     "application/json": components["schemas"]["UserListResponse"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             405: components["responses"]["MethodNotAllowed"];
@@ -1777,6 +1778,7 @@ export interface operations {
                     "application/json": components["schemas"]["DeviceListResponse"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
@@ -1988,6 +1990,7 @@ export interface operations {
                     "application/json": components["schemas"]["DeviceListResponse"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             405: components["responses"]["MethodNotAllowed"];
@@ -2116,6 +2119,7 @@ export interface operations {
                     "application/json": components["schemas"]["ActivationCodeListResponse"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             405: components["responses"]["MethodNotAllowed"];
@@ -2215,6 +2219,7 @@ export interface operations {
                     "application/json": components["schemas"]["ModelPoolResponse"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             405: components["responses"]["MethodNotAllowed"];
@@ -2442,6 +2447,7 @@ export interface operations {
                     "application/json": components["schemas"]["ModelUsageListResponse"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             405: components["responses"]["MethodNotAllowed"];

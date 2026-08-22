@@ -61,7 +61,7 @@ func NormalizeAuditLogPageOptions(options AuditLogPageOptions) (AuditLogPageOpti
 }
 
 func auditLogMatchesPageOptions(item controlplane.AuditLog, options AuditLogPageOptions) bool {
-	if options.Product != "" && item.Product != options.Product {
+	if options.Product != "" && compatibilityStoredProduct(item.Product) != options.Product {
 		return false
 	}
 	if options.ActorUserID != "" && item.ActorUserID != options.ActorUserID {

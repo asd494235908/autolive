@@ -30,7 +30,7 @@ func (s *PostgresRepository) ListActivationCodesPage(ctx context.Context, offset
 			return ActivationCodePage{}, err
 		}
 		rows, err := tx.QueryContext(ctx, `
-			SELECT id, code_prefix,
+			SELECT id, product, code_prefix,
 			       CASE WHEN status = $1 AND expires_at IS NOT NULL AND expires_at <= $2
 			            THEN $3 ELSE status END AS status,
 			       expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices
@@ -100,11 +100,17 @@ func (s *PostgresRepository) ListActivationCodesPageForProduct(ctx context.Conte
 func scanActivationCodeRow(scanner interface{ Scan(dest ...any) error }) (controlplane.ActivationCode, error) {
 	var (
 		code                         controlplane.ActivationCode
+		product                      sql.NullString
 		expiresAt, usedAt            sql.NullTime
 		usedByUserID, usedByDeviceID sql.NullString
 		maxDevices, boundDevices     int
 	)
-	if err := scanner.Scan(&code.ID, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &maxDevices, &boundDevices); err != nil {
+	if err := scanner.Scan(&code.ID, &product, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &maxDevices, &boundDevices); err != nil {
+		return controlplane.ActivationCode{}, err
+	}
+	var err error
+	code.Product, err = normalizedAuditProduct(product)
+	if err != nil {
 		return controlplane.ActivationCode{}, err
 	}
 	code.MaxDevices = maxDevices

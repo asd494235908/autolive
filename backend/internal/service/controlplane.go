@@ -587,6 +587,7 @@ func (s *ControlPlane) ListAuditLogs(ctx context.Context) ([]controlplane.AuditL
 	return withState(ctx, s.repository, func(state *store.State) ([]controlplane.AuditLog, error) {
 		items := make([]controlplane.AuditLog, 0, len(state.AuditLogs))
 		for _, item := range state.AuditLogs {
+			item.Product = effectiveStoredProduct(item.Product)
 			items = append(items, item)
 		}
 		slices.SortFunc(items, func(a, b controlplane.AuditLog) int {
@@ -624,7 +625,7 @@ func (s *ControlPlane) ListAuditLogsPageWithOptions(ctx context.Context, page, p
 		}
 		return result.Items, result.Total, nil
 	}
-	if reader, ok := s.repository.(store.AuditPageReader); ok {
+	if reader, ok := s.repository.(store.AuditPageReader); ok && storageOptions.Product == "" {
 		if storageOptions.ActorUserID != "" || storageOptions.DeviceID != "" || storageOptions.Action != "" || storageOptions.TargetType != "" || storageOptions.Outcome != "" || storageOptions.ErrorCode != "" || storageOptions.RequestID != "" || storageOptions.CreatedAfter != nil || storageOptions.CreatedBefore != nil || storageOptions.Sort != "" {
 			return nil, 0, controlplane.ErrInvalidRequest
 		}
@@ -640,6 +641,7 @@ func (s *ControlPlane) ListAuditLogsPageWithOptions(ctx context.Context, page, p
 	result, err := withState(ctx, s.repository, func(state *store.State) ([]controlplane.AuditLog, error) {
 		items := make([]controlplane.AuditLog, 0, len(state.AuditLogs))
 		for _, item := range state.AuditLogs {
+			item.Product = effectiveStoredProduct(item.Product)
 			if auditLogMatchesListOptions(item, storageOptions) {
 				items = append(items, item)
 			}
@@ -655,6 +657,9 @@ func (s *ControlPlane) ListAuditLogsPageWithOptions(ctx context.Context, page, p
 }
 
 func auditLogMatchesListOptions(item controlplane.AuditLog, options store.AuditLogPageOptions) bool {
+	if options.Product != "" && effectiveStoredProduct(item.Product) != options.Product {
+		return false
+	}
 	if options.ActorUserID != "" && item.ActorUserID != options.ActorUserID {
 		return false
 	}
@@ -2046,7 +2051,7 @@ func (s *ControlPlane) ListModelLeasesPageWithOptions(ctx context.Context, page,
 		}
 		return result.Items, result.Total, nil
 	}
-	if reader, ok := s.repository.(store.ModelLeasePageReader); ok {
+	if reader, ok := s.repository.(store.ModelLeasePageReader); ok && storageOptions.Product == "" {
 		if storageOptions.Status != "" || storageOptions.Provider != "" || storageOptions.Model != "" || storageOptions.UserID != "" || storageOptions.DeviceID != "" || storageOptions.AccountID != "" || storageOptions.Sort != "" {
 			return nil, 0, controlplane.ErrInvalidRequest
 		}
@@ -3416,6 +3421,7 @@ func (s *ControlPlane) ListModelUsage(ctx context.Context) ([]controlplane.Model
 	return withState(ctx, s.repository, func(state *store.State) ([]controlplane.ModelUsageRecord, error) {
 		items := make([]controlplane.ModelUsageRecord, 0, len(state.ModelUsageRecords))
 		for _, item := range state.ModelUsageRecords {
+			item.Product = effectiveStoredProduct(item.Product)
 			items = append(items, item)
 		}
 		slices.SortFunc(items, func(a, b controlplane.ModelUsageRecord) int {
@@ -3453,7 +3459,7 @@ func (s *ControlPlane) ListModelUsagePageWithOptions(ctx context.Context, page, 
 		}
 		return result.Items, result.Total, nil
 	}
-	if reader, ok := s.repository.(store.ModelUsagePageReader); ok {
+	if reader, ok := s.repository.(store.ModelUsagePageReader); ok && storageOptions.Product == "" {
 		if storageOptions.Provider != "" || storageOptions.Model != "" || storageOptions.UserID != "" || storageOptions.DeviceID != "" || storageOptions.RequestID != "" || storageOptions.CreatedAfter != nil || storageOptions.CreatedBefore != nil || (storageOptions.Sort != "" && storageOptions.Sort != store.ModelUsageSortCreatedDesc) {
 			return nil, 0, controlplane.ErrInvalidRequest
 		}
@@ -3473,6 +3479,7 @@ func (s *ControlPlane) ListModelUsagePageWithOptions(ctx context.Context, page, 
 			if !modelUsageMatchesListOptions(item, storageOptions, lease.UserID, lease.DeviceID) {
 				continue
 			}
+			item.Product = effectiveStoredProduct(item.Product)
 			items = append(items, item)
 		}
 		sortModelUsageRecordsForList(items, storageOptions.Sort)
@@ -3486,6 +3493,9 @@ func (s *ControlPlane) ListModelUsagePageWithOptions(ctx context.Context, page, 
 }
 
 func modelUsageMatchesListOptions(item controlplane.ModelUsageRecord, options store.ModelUsagePageOptions, userID, deviceID string) bool {
+	if options.Product != "" && effectiveStoredProduct(item.Product) != options.Product {
+		return false
+	}
 	if options.Provider != "" && item.Provider != options.Provider {
 		return false
 	}
@@ -3747,8 +3757,8 @@ func (s *ControlPlane) ListActivationCodesPageForProduct(ctx context.Context, pa
 		items := make([]controlplane.ActivationCode, 0, len(state.ActivationCodes))
 		now := s.repository.Now()
 		for id, record := range state.ActivationCodes {
-			storedProduct, ok := strictStoredProduct(record.ActivationCode.Product)
-			if !ok || storedProduct != product {
+			storedProduct := effectiveStoredProduct(record.ActivationCode.Product)
+			if storedProduct != product {
 				continue
 			}
 			code := decorateActivationCode(state, record)
@@ -3775,6 +3785,7 @@ func (s *ControlPlane) ListActivationCodesPageForProduct(ctx context.Context, pa
 
 func decorateActivationCode(state *store.State, record store.ActivationCodeRecord) controlplane.ActivationCode {
 	code := record.ActivationCode
+	code.Product = effectiveStoredProduct(code.Product)
 	code.PlainCode = nil
 	code.CodePrefix = record.CodePrefix
 	if code.MaxDevices == 0 {
@@ -4738,6 +4749,9 @@ func normalizeModelLeaseAdminSummary(lease *controlplane.ModelLeaseAdminSummary,
 
 func modelLeaseAdminSummaryMatchesOptions(item controlplane.ModelLeaseAdminSummary, options store.ModelLeasePageOptions, now time.Time) bool {
 	normalizeModelLeaseAdminSummary(&item, now)
+	if options.Product != "" && item.Product != options.Product {
+		return false
+	}
 	if options.Status != "" && item.Status != options.Status {
 		return false
 	}

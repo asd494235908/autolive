@@ -461,6 +461,7 @@ func (s *PostgresRepository) ListModelUsagePageWithOptions(ctx context.Context, 
 				if !modelUsageMatchesPageOptions(item, options, lease.UserID, lease.DeviceID) {
 					continue
 				}
+				item.Product = compatibilityStoredProduct(item.Product)
 				items = append(items, item)
 			}
 			sortModelUsageRecords(items, options.Sort)
@@ -570,6 +571,7 @@ func (s *PostgresRepository) ListAuditLogsPageWithOptions(ctx context.Context, o
 			items := make([]controlplane.AuditLog, 0, len(state.AuditLogs))
 			for _, item := range state.AuditLogs {
 				if auditLogMatchesPageOptions(item, options) {
+					item.Product = compatibilityStoredProduct(item.Product)
 					items = append(items, item)
 				}
 			}

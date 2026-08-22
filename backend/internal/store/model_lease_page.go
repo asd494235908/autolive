@@ -50,6 +50,13 @@ func NormalizeModelLeasePageOptions(options ModelLeasePageOptions) (ModelLeasePa
 	}
 }
 
+func compatibilityStoredProduct(product controlplane.ProductCode) controlplane.ProductCode {
+	if product == "" {
+		return controlplane.ProductAutoLive
+	}
+	return product
+}
+
 func normalizeModelLeaseSummaryStatus(item *controlplane.ModelLeaseAdminSummary, now time.Time) {
 	if item == nil || item.Status != controlplane.ModelLeaseStatusActive || item.ExpiresAt == "" {
 		return
@@ -108,7 +115,7 @@ func sortModelLeaseSummaries(items []controlplane.ModelLeaseAdminSummary, sortKe
 func modelLeaseAdminSummary(lease controlplane.ModelLease) controlplane.ModelLeaseAdminSummary {
 	return controlplane.ModelLeaseAdminSummary{
 		ID:               lease.ID,
-		Product:          lease.Product,
+		Product:          compatibilityStoredProduct(lease.Product),
 		AccountID:        lease.AccountID,
 		UserID:           lease.UserID,
 		DeviceID:         lease.DeviceID,

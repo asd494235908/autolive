@@ -25,10 +25,10 @@ func TestPostgresRepositoryListActivationCodesPageUsesBoundedNormalizedQuery(t *
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM activation_codes")).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(3))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, code_prefix")).WithArgs(controlplane.ActivationCodeStatusActive, now, controlplane.ActivationCodeStatusExpired, 2, 1).WillReturnRows(
-		sqlmock.NewRows([]string{"id", "code_prefix", "status", "expires_at", "used_at", "used_by_user_id", "used_by_device_id", "max_devices", "bound_devices"}).
-			AddRow("ac_2", "code_abcdef", controlplane.ActivationCodeStatusExpired, now.Add(-time.Hour), nil, nil, nil, 1, 0).
-			AddRow("ac_3", "code_ghijkl", controlplane.ActivationCodeStatusUsed, now.Add(time.Hour), now.Add(-time.Minute), "usr_1", "dev_1", 3, 3),
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, code_prefix")).WithArgs(controlplane.ActivationCodeStatusActive, now, controlplane.ActivationCodeStatusExpired, 2, 1).WillReturnRows(
+		sqlmock.NewRows([]string{"id", "product", "code_prefix", "status", "expires_at", "used_at", "used_by_user_id", "used_by_device_id", "max_devices", "bound_devices"}).
+			AddRow("ac_2", string(controlplane.ProductAutoLive), "code_abcdef", controlplane.ActivationCodeStatusExpired, now.Add(-time.Hour), nil, nil, nil, 1, 0).
+			AddRow("ac_3", string(controlplane.ProductDouyinDesktop), "code_ghijkl", controlplane.ActivationCodeStatusUsed, now.Add(time.Hour), now.Add(-time.Minute), "usr_1", "dev_1", 3, 3),
 	)
 	mock.ExpectCommit()
 
@@ -36,7 +36,7 @@ func TestPostgresRepositoryListActivationCodesPageUsesBoundedNormalizedQuery(t *
 	if err != nil {
 		t.Fatalf("ListActivationCodesPage() error = %v", err)
 	}
-	if page.Total != 3 || len(page.Items) != 2 || page.Items[0].ID != "ac_2" || page.Items[0].PlainCode != nil || page.Items[0].MaxDevices != 1 || page.Items[0].BoundDevices != 0 || page.Items[1].UsedByUserID != "usr_1" || page.Items[1].MaxDevices != 3 || page.Items[1].BoundDevices != 3 {
+	if page.Total != 3 || len(page.Items) != 2 || page.Items[0].ID != "ac_2" || page.Items[0].Product != controlplane.ProductAutoLive || page.Items[0].PlainCode != nil || page.Items[0].MaxDevices != 1 || page.Items[0].BoundDevices != 0 || page.Items[1].Product != controlplane.ProductDouyinDesktop || page.Items[1].UsedByUserID != "usr_1" || page.Items[1].MaxDevices != 3 || page.Items[1].BoundDevices != 3 {
 		t.Fatalf("activation page = %+v", page)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

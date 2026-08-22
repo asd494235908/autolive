@@ -168,7 +168,7 @@ type DeviceRegistration struct {
 
 type ActivationCode struct {
 	ID             string      `json:"id"`
-	Product        ProductCode `json:"product,omitempty"`
+	Product        ProductCode `json:"product"`
 	Status         string      `json:"status"`
 	ExpiresAt      string      `json:"expires_at"`
 	MaxDevices     int         `json:"max_devices"`
@@ -182,7 +182,7 @@ type ActivationCode struct {
 
 type ModelPoolAccountSummary struct {
 	ID               string      `json:"id"`
-	Product          ProductCode `json:"product,omitempty"`
+	Product          ProductCode `json:"product"`
 	Provider         string      `json:"provider"`
 	Model            string      `json:"model"`
 	BaseURL          string      `json:"base_url,omitempty"`
@@ -256,7 +256,7 @@ type ReleaseModelLeaseInput struct {
 
 type ModelLease struct {
 	ID               string      `json:"id"`
-	Product          ProductCode `json:"product,omitempty"`
+	Product          ProductCode `json:"product"`
 	UserID           string      `json:"-"`
 	DeviceID         string      `json:"-"`
 	AccountID        string      `json:"-"`
@@ -277,7 +277,7 @@ type ModelLease struct {
 // lease credential or provider secret.
 type ModelLeaseAdminSummary struct {
 	ID               string      `json:"id"`
-	Product          ProductCode `json:"product,omitempty"`
+	Product          ProductCode `json:"product"`
 	AccountID        string      `json:"account_id"`
 	UserID           string      `json:"user_id"`
 	DeviceID         string      `json:"device_id"`
@@ -295,7 +295,7 @@ type ModelLeaseAdminSummary struct {
 // timestamps needed for safe administrative recovery.
 type ModelLeaseAdminDetail struct {
 	ID               string      `json:"id"`
-	Product          ProductCode `json:"product,omitempty"`
+	Product          ProductCode `json:"product"`
 	AccountID        string      `json:"account_id"`
 	UserID           string      `json:"user_id"`
 	DeviceID         string      `json:"device_id"`
@@ -317,7 +317,7 @@ type ReleaseModelLeaseResult struct {
 
 type ModelUsageRecord struct {
 	ID           string      `json:"id"`
-	Product      ProductCode `json:"product,omitempty"`
+	Product      ProductCode `json:"product"`
 	LeaseID      string      `json:"lease_id"`
 	ClientCallID string      `json:"client_call_id"`
 	RequestID    string      `json:"request_id"`

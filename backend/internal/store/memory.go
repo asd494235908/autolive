@@ -374,6 +374,7 @@ func (s *MemoryStore) ListModelUsagePageWithOptions(ctx context.Context, options
 			if !modelUsageMatchesPageOptions(item, options, lease.UserID, lease.DeviceID) {
 				continue
 			}
+			item.Product = compatibilityStoredProduct(item.Product)
 			items = append(items, item)
 		}
 		sortModelUsageRecords(items, options.Sort)
@@ -399,6 +400,7 @@ func (s *MemoryStore) ListAuditLogsPageWithOptions(ctx context.Context, options 
 		items := make([]controlplane.AuditLog, 0, len(state.AuditLogs))
 		for _, item := range state.AuditLogs {
 			if auditLogMatchesPageOptions(item, options) {
+				item.Product = compatibilityStoredProduct(item.Product)
 				items = append(items, item)
 			}
 		}

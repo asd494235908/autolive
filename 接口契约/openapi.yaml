@@ -460,6 +460,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UserListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -534,6 +536,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeviceListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -786,6 +790,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeviceListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -932,6 +938,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ActivationCodeListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1039,6 +1047,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ModelPoolResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1333,6 +1343,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ModelUsageListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -2414,7 +2426,7 @@ components:
       type: object
       additionalProperties: false
       required:
-        [id, provider, model, status, expires_at, proxy_mode, concurrency_limit]
+        [id, product, provider, model, status, expires_at, proxy_mode, concurrency_limit]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -2446,7 +2458,7 @@ components:
     ModelLeaseAdminSummary:
       type: object
       additionalProperties: false
-      required: [id, account_id, user_id, device_id, purpose, provider, model, status, expires_at, proxy_mode, concurrency_limit]
+      required: [id, product, account_id, user_id, device_id, purpose, provider, model, status, expires_at, proxy_mode, concurrency_limit]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -2493,7 +2505,7 @@ components:
     ModelLeaseAdminDetail:
       type: object
       additionalProperties: false
-      required: [id, account_id, user_id, device_id, purpose, provider, model, status, expires_at, proxy_mode, concurrency_limit]
+      required: [id, product, account_id, user_id, device_id, purpose, provider, model, status, expires_at, proxy_mode, concurrency_limit]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -2786,7 +2798,7 @@ components:
     ActivationCode:
       type: object
       additionalProperties: false
-      required: [id, status, expires_at, max_devices, bound_devices]
+      required: [id, product, status, expires_at, max_devices, bound_devices]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -2855,7 +2867,7 @@ components:
     ModelPoolAccountSummary:
       type: object
       additionalProperties: false
-      required: [id, provider, model, status, priority, daily_limit, concurrency_limit, secret_configured, active_leases, daily_used_tokens]
+      required: [id, product, provider, model, status, priority, daily_limit, concurrency_limit, secret_configured, active_leases, daily_used_tokens]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -2907,7 +2919,7 @@ components:
     ModelUsageRecord:
       type: object
       additionalProperties: false
-      required: [id, lease_id, request_id, client_call_id, provider, model, input_tokens, output_tokens, total_tokens, latency_ms, status, usage_source, created_at]
+      required: [id, product, lease_id, request_id, client_call_id, provider, model, input_tokens, output_tokens, total_tokens, latency_ms, status, usage_source, created_at]
       properties:
         id:
           $ref: '#/components/schemas/Id'

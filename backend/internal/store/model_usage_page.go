@@ -70,7 +70,7 @@ func NormalizeModelUsagePageOptions(options ModelUsagePageOptions) (ModelUsagePa
 }
 
 func modelUsageMatchesPageOptions(item controlplane.ModelUsageRecord, options ModelUsagePageOptions, userID, deviceID string) bool {
-	if options.Product != "" && item.Product != options.Product {
+	if options.Product != "" && compatibilityStoredProduct(item.Product) != options.Product {
 		return false
 	}
 	if options.Provider != "" && item.Provider != options.Provider {

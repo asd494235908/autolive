@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -32,6 +33,40 @@ func TestAdminProductScopeFiltersActualControlPlanePages(t *testing.T) {
 			handler, localToken, _ := newProductScopeIntegrationRouter(t)
 			assertScopedProductPage(t, doJSON(t, handler, http.MethodGet, endpoint.path, nil, localToken, ""), endpoint.itemsKey, 2, "")
 			assertScopedProductPage(t, doJSON(t, handler, http.MethodGet, appendProductQuery(endpoint.path, "douyin_desktop"), nil, localToken, ""), endpoint.itemsKey, 1, controlplane.ProductDouyinDesktop)
+		})
+	}
+}
+
+func TestAdminUserListProductScopeReturnsActualItemsAndTotals(t *testing.T) {
+	handler, localToken, ordinaryToken := newProductScopeIntegrationRouter(t)
+	wantAll := []string{"usr_local_admin", "usr_product_admin", "usr_shared"}
+	wantDouyin := []string{"usr_shared"}
+	assertUserPage(t, doJSON(t, handler, http.MethodGet, "/api/v1/admin/users", nil, localToken, ""), wantAll)
+	assertUserPage(t, doJSON(t, handler, http.MethodGet, "/api/v1/admin/users?product=douyin_desktop", nil, localToken, ""), wantDouyin)
+	assertUserPage(t, doJSON(t, handler, http.MethodGet, "/api/v1/admin/users", nil, ordinaryToken, ""), wantAll)
+	assertUserPage(t, doJSON(t, handler, http.MethodGet, "/api/v1/admin/users?product=autolive", nil, ordinaryToken, ""), wantAll)
+}
+
+func TestOrdinaryAdminProductScopeDefaultsToSessionProduct(t *testing.T) {
+	handler, _, ordinaryToken := newProductScopeIntegrationRouter(t)
+	endpoints := []struct {
+		name     string
+		path     string
+		itemsKey string
+		want     int
+	}{
+		{name: "user devices", path: "/api/v1/admin/users/usr_shared/devices", itemsKey: "items", want: 1},
+		{name: "devices", path: "/api/v1/admin/devices", itemsKey: "items", want: 1},
+		{name: "activation codes", path: "/api/v1/admin/activation-codes", itemsKey: "items", want: 1},
+		{name: "model pool", path: "/api/v1/admin/model-pool", itemsKey: "accounts", want: 1},
+		{name: "model usage", path: "/api/v1/admin/model-usage", itemsKey: "items", want: 1},
+		{name: "model leases", path: "/api/v1/admin/model-leases", itemsKey: "items", want: 1},
+		{name: "audit logs", path: "/api/v1/admin/audit-logs?action=seed", itemsKey: "items", want: 1},
+	}
+	for _, endpoint := range endpoints {
+		t.Run(endpoint.name, func(t *testing.T) {
+			assertScopedProductPage(t, doJSON(t, handler, http.MethodGet, endpoint.path, nil, ordinaryToken, ""), endpoint.itemsKey, endpoint.want, controlplane.ProductAutoLive)
+			assertScopedProductPage(t, doJSON(t, handler, http.MethodGet, appendProductQuery(endpoint.path, "autolive"), nil, ordinaryToken, ""), endpoint.itemsKey, endpoint.want, controlplane.ProductAutoLive)
 		})
 	}
 }
@@ -140,5 +175,29 @@ func assertScopedProductPage(t *testing.T, response *httptest.ResponseRecorder, 
 		if item.Product != wantProduct {
 			t.Fatalf("item product = %q, want %q", item.Product, wantProduct)
 		}
+	}
+}
+
+func assertUserPage(t *testing.T, response *httptest.ResponseRecorder, wantIDs []string) {
+	t.Helper()
+	if response.Code != http.StatusOK {
+		t.Fatalf("user list status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var payload struct {
+		Items      []controlplane.UserSummary `json:"items"`
+		Pagination struct {
+			Total int `json:"total"`
+		} `json:"pagination"`
+	}
+	decodeJSON(t, response.Body.Bytes(), &payload)
+	if payload.Pagination.Total != len(wantIDs) || len(payload.Items) != len(wantIDs) {
+		t.Fatalf("user page total/items = %d/%d, want %d/%d; body=%s", payload.Pagination.Total, len(payload.Items), len(wantIDs), len(wantIDs), response.Body.String())
+	}
+	gotIDs := make([]string, 0, len(payload.Items))
+	for _, item := range payload.Items {
+		gotIDs = append(gotIDs, item.ID)
+	}
+	if !slices.Equal(gotIDs, wantIDs) {
+		t.Fatalf("user page ids = %v, want %v", gotIDs, wantIDs)
 	}
 }
