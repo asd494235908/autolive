@@ -211,7 +211,7 @@ func TestOpenAPIAdminListGetsDeclareBadRequest(t *testing.T) {
 	}
 }
 
-func TestOpenAPIAdminPermissionGuardRoutesDeclareServiceUnavailable(t *testing.T) {
+func TestOpenAPIAdminRequirePermissionRoutesDeclareAdminAuthorizationServiceUnavailable(t *testing.T) {
 	document := loadOpenAPIContract(t)
 	required := []struct {
 		method string
@@ -219,17 +219,25 @@ func TestOpenAPIAdminPermissionGuardRoutesDeclareServiceUnavailable(t *testing.T
 	}{
 		{method: "get", path: "/api/v1/admin/users"},
 		{method: "get", path: "/api/v1/admin/users/{user_id}/devices"},
+		{method: "get", path: "/api/v1/admin/devices"},
 		{method: "get", path: "/api/v1/admin/devices/{device_id}"},
+		{method: "post", path: "/api/v1/admin/devices/{device_id}/disable"},
+		{method: "post", path: "/api/v1/admin/devices/{device_id}/unbind"},
+		{method: "get", path: "/api/v1/admin/activation-codes"},
+		{method: "post", path: "/api/v1/admin/activation-codes"},
 		{method: "post", path: "/api/v1/admin/activation-codes/{code_id}/revoke"},
 		{method: "get", path: "/api/v1/admin/model-pool"},
+		{method: "post", path: "/api/v1/admin/model-pool"},
 		{method: "post", path: "/api/v1/admin/model-pool/{account_id}/disable"},
 		{method: "patch", path: "/api/v1/admin/model-pool/{account_id}"},
+		{method: "post", path: "/api/v1/admin/model-pool/{account_id}/rotate-secret"},
 		{method: "post", path: "/api/v1/admin/model-pool/{account_id}/test"},
 		{method: "get", path: "/api/v1/admin/model-usage"},
 		{method: "get", path: "/api/v1/admin/model-leases"},
 		{method: "get", path: "/api/v1/admin/model-leases/{lease_id}"},
 		{method: "post", path: "/api/v1/admin/model-leases/{lease_id}/reclaim"},
 		{method: "get", path: "/api/v1/admin/audit-logs"},
+		{method: "get", path: "/api/v1/admin/permissions"},
 		{method: "get", path: "/api/v1/admin/roles"},
 		{method: "post", path: "/api/v1/admin/roles"},
 		{method: "get", path: "/api/v1/admin/roles/{role_id}"},
@@ -237,6 +245,49 @@ func TestOpenAPIAdminPermissionGuardRoutesDeclareServiceUnavailable(t *testing.T
 		{method: "delete", path: "/api/v1/admin/roles/{role_id}"},
 		{method: "get", path: "/api/v1/admin/users/{user_id}/roles"},
 		{method: "put", path: "/api/v1/admin/users/{user_id}/roles"},
+	}
+
+	componentNode, ok := document.Components["responses"]["ServiceUnavailable"]
+	if !ok {
+		t.Fatal("OpenAPI response component ServiceUnavailable is missing")
+	}
+	var component struct {
+		Content map[string]struct {
+			Schema   yaml.Node            `yaml:"schema"`
+			Examples map[string]yaml.Node `yaml:"examples"`
+		} `yaml:"content"`
+	}
+	if err := componentNode.Decode(&component); err != nil {
+		t.Fatalf("decode ServiceUnavailable response component: %v", err)
+	}
+	content, ok := component.Content["application/json"]
+	if !ok {
+		t.Fatal("ServiceUnavailable response component must declare application/json content")
+	}
+	if ref := localReferenceName(content.Schema); ref != "ErrorResponse" {
+		t.Fatalf("ServiceUnavailable schema ref = %q, want ErrorResponse", ref)
+	}
+	foundAuthorizationUnavailable := false
+	for exampleName, exampleNode := range content.Examples {
+		var example struct {
+			Value map[string]any `yaml:"value"`
+		}
+		if err := exampleNode.Decode(&example); err != nil {
+			t.Fatalf("decode ServiceUnavailable example %s: %v", exampleName, err)
+		}
+		if fmt.Sprint(example.Value["code"]) != "ADMIN_AUTHORIZATION_UNAVAILABLE" {
+			continue
+		}
+		if strings.TrimSpace(fmt.Sprint(example.Value["message"])) == "" {
+			t.Fatalf("ServiceUnavailable example %s must include a non-empty message", exampleName)
+		}
+		if strings.TrimSpace(fmt.Sprint(example.Value["request_id"])) == "" {
+			t.Fatalf("ServiceUnavailable example %s must include a non-empty request_id", exampleName)
+		}
+		foundAuthorizationUnavailable = true
+	}
+	if !foundAuthorizationUnavailable {
+		t.Fatal("ServiceUnavailable response component must document ADMIN_AUTHORIZATION_UNAVAILABLE")
 	}
 
 	for _, test := range required {
@@ -251,7 +302,11 @@ func TestOpenAPIAdminPermissionGuardRoutesDeclareServiceUnavailable(t *testing.T
 			if err := node.Decode(&operation); err != nil {
 				t.Fatalf("decode %s %s: %v", test.method, test.path, err)
 			}
-			if ref := localReferenceName(operation.Responses["503"]); ref != "ServiceUnavailable" {
+			response, ok := operation.Responses["503"]
+			if !ok {
+				t.Fatalf("%s %s is missing 503 ServiceUnavailable", strings.ToUpper(test.method), test.path)
+			}
+			if ref := localReferenceName(response); ref != "ServiceUnavailable" {
 				t.Fatalf("%s %s status 503 ref = %q, want ServiceUnavailable", test.method, test.path, ref)
 			}
 		})
