@@ -42,6 +42,10 @@ type MemoryStore struct {
 type State struct {
 	Products                  map[string]controlplane.ProductSummary
 	UserProducts              map[string]controlplane.UserProductMembership
+	AdminPermissions          map[string]controlplane.PermissionCode
+	AdminRoles                map[string]AdminRoleRecord
+	AdminRolePermissions      map[string][]controlplane.PermissionCode
+	UserAdminRoles            map[string]controlplane.AdminRoleAssignment
 	Users                     map[string]controlplane.UserSummary
 	UserAuthorizationPolicies map[string]controlplane.UserAuthorizationPolicy
 	UserCredentialHashes      map[string][]byte
@@ -85,9 +89,13 @@ func NewMemoryStore(now func() time.Time) *MemoryStore {
 }
 
 func NewState() *State {
-	return &State{
+	state := &State{
 		Products:                  map[string]controlplane.ProductSummary{},
 		UserProducts:              map[string]controlplane.UserProductMembership{},
+		AdminPermissions:          map[string]controlplane.PermissionCode{},
+		AdminRoles:                map[string]AdminRoleRecord{},
+		AdminRolePermissions:      map[string][]controlplane.PermissionCode{},
+		UserAdminRoles:            map[string]controlplane.AdminRoleAssignment{},
 		Users:                     map[string]controlplane.UserSummary{},
 		UserAuthorizationPolicies: map[string]controlplane.UserAuthorizationPolicy{},
 		UserCredentialHashes:      map[string][]byte{},
@@ -103,6 +111,8 @@ func NewState() *State {
 		PendingSecretCleanup:      map[string]time.Time{},
 		SequenceCounters:          map[string]int{},
 	}
+	seedAdminRBACState(state)
+	return state
 }
 
 func ensureStateMaps(state *State) *State {
@@ -115,6 +125,18 @@ func ensureStateMaps(state *State) *State {
 	}
 	if state.UserProducts == nil {
 		state.UserProducts = defaults.UserProducts
+	}
+	if state.AdminPermissions == nil {
+		state.AdminPermissions = defaults.AdminPermissions
+	}
+	if state.AdminRoles == nil {
+		state.AdminRoles = defaults.AdminRoles
+	}
+	if state.AdminRolePermissions == nil {
+		state.AdminRolePermissions = defaults.AdminRolePermissions
+	}
+	if state.UserAdminRoles == nil {
+		state.UserAdminRoles = defaults.UserAdminRoles
 	}
 	if state.Users == nil {
 		state.Users = defaults.Users
@@ -158,6 +180,7 @@ func ensureStateMaps(state *State) *State {
 	if state.SequenceCounters == nil {
 		state.SequenceCounters = defaults.SequenceCounters
 	}
+	seedAdminRBACState(state)
 	return state
 }
 
@@ -174,6 +197,7 @@ func (s *MemoryStore) Run(ctx context.Context, fn StateOperation) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	s.state = ensureStateMaps(s.state)
 	err := fn(s.state)
 	s.syncIdempotencyRecordCreated()
 	return err

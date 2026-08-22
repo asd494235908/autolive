@@ -195,6 +195,41 @@ func TestMigration23ForeignKeyContractCoversAllProductReferences(t *testing.T) {
 	}
 }
 
+func TestLatestVersionIsAdminRBACMigration24(t *testing.T) {
+	if LatestVersion != 24 {
+		t.Fatalf("LatestVersion = %d, want 24", LatestVersion)
+	}
+}
+
+func TestMigration24AdminRBACContract(t *testing.T) {
+	payload, err := fs.ReadFile(FS, "0024_管理员RBAC与产品角色.up.sql")
+	if err != nil {
+		t.Fatalf("read migration 0024: %v", err)
+	}
+	sql := string(payload)
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS admin_permissions",
+		"CREATE TABLE IF NOT EXISTS admin_roles",
+		"CREATE TABLE IF NOT EXISTS admin_role_permissions",
+		"CREATE TABLE IF NOT EXISTS user_admin_roles",
+		"FOREIGN KEY (product) REFERENCES products(code)",
+		"FOREIGN KEY (user_id, product) REFERENCES user_products(user_id, product)",
+		"FOREIGN KEY (role_code) REFERENCES admin_roles(code)",
+		"FOREIGN KEY (permission_code) REFERENCES admin_permissions(code)",
+		"super_admin",
+		"usr_local_admin",
+		"users.role = 'admin'",
+		"users.role = 'user'",
+		"idx_admin_roles_product",
+		"idx_user_admin_roles_product_user",
+		"uq_user_admin_roles_binding",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0024 is missing RBAC fragment %q", fragment)
+		}
+	}
+}
+
 func TestActivationMultiDeviceMigrationAddsCapacityAndCount(t *testing.T) {
 	payload, err := fs.ReadFile(FS, "0022_支持激活码多设备绑定.up.sql")
 	if err != nil {
