@@ -1296,6 +1296,8 @@ export interface components {
         LeaseId: components["schemas"]["Id"];
         Page: number;
         PageSize: number;
+        /** @description 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。 */
+        AdminProduct: components["schemas"]["ProductCode"];
     };
     requestBodies: never;
     headers: {
@@ -1688,6 +1690,8 @@ export interface operations {
             query?: {
                 page?: components["parameters"]["Page"];
                 page_size?: components["parameters"]["PageSize"];
+                /** @description 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。 */
+                product?: components["parameters"]["AdminProduct"];
             };
             header?: never;
             path?: never;
@@ -1752,6 +1756,8 @@ export interface operations {
             query?: {
                 page?: components["parameters"]["Page"];
                 page_size?: components["parameters"]["PageSize"];
+                /** @description 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。 */
+                product?: components["parameters"]["AdminProduct"];
             };
             header?: never;
             path: {
@@ -1963,6 +1969,8 @@ export interface operations {
             query?: {
                 page?: components["parameters"]["Page"];
                 page_size?: components["parameters"]["PageSize"];
+                /** @description 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。 */
+                product?: components["parameters"]["AdminProduct"];
             };
             header?: never;
             path?: never;
@@ -2089,6 +2097,8 @@ export interface operations {
             query?: {
                 page?: components["parameters"]["Page"];
                 page_size?: components["parameters"]["PageSize"];
+                /** @description 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。 */
+                product?: components["parameters"]["AdminProduct"];
             };
             header?: never;
             path?: never;
@@ -2186,6 +2196,8 @@ export interface operations {
             query?: {
                 page?: components["parameters"]["Page"];
                 page_size?: components["parameters"]["PageSize"];
+                /** @description 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。 */
+                product?: components["parameters"]["AdminProduct"];
             };
             header?: never;
             path?: never;
@@ -2401,6 +2413,8 @@ export interface operations {
             query?: {
                 page?: components["parameters"]["Page"];
                 page_size?: components["parameters"]["PageSize"];
+                /** @description 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。 */
+                product?: components["parameters"]["AdminProduct"];
                 provider?: string;
                 model?: string;
                 user_id?: components["schemas"]["Id"];
@@ -2440,6 +2454,8 @@ export interface operations {
             query?: {
                 page?: components["parameters"]["Page"];
                 page_size?: components["parameters"]["PageSize"];
+                /** @description 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。 */
+                product?: components["parameters"]["AdminProduct"];
                 status?: "active" | "released" | "expired";
                 provider?: string;
                 model?: string;
@@ -2544,6 +2560,8 @@ export interface operations {
             query?: {
                 page?: components["parameters"]["Page"];
                 page_size?: components["parameters"]["PageSize"];
+                /** @description 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。 */
+                product?: components["parameters"]["AdminProduct"];
                 actor_user_id?: components["schemas"]["Id"];
                 device_id?: components["schemas"]["Id"];
                 action?: string;

@@ -190,12 +190,17 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/admin/users/{user_id}/devices", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		product, err := resolveAdminProductScope(r, actor)
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		pageNumber, pageSize, err := pageParams(r)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
 		}
-		items, total, err := svc.ListDevicesForUserPage(r.Context(), r.PathValue("user_id"), pageNumber, pageSize)
+		items, total, err := svc.ListDevicesForUserPageForProduct(r.Context(), r.PathValue("user_id"), pageNumber, pageSize, product)
 		if err != nil {
 			writeAppError(w, r, err)
 			return

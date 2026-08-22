@@ -1756,6 +1756,8 @@ export interface operations {
             query?: {
                 page?: components["parameters"]["Page"];
                 page_size?: components["parameters"]["PageSize"];
+                /** @description 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。 */
+                product?: components["parameters"]["AdminProduct"];
             };
             header?: never;
             path: {

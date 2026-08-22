@@ -327,6 +327,36 @@ func (s *MemoryStore) ListDevicesForUserPage(ctx context.Context, userID string,
 	return page, err
 }
 
+func (s *MemoryStore) ListDevicesForUserPageForProduct(ctx context.Context, userID string, offset, limit int, product controlplane.ProductCode) (DevicePage, error) {
+	if product != "" && !product.Valid() {
+		return DevicePage{}, controlplane.ErrInvalidRequest
+	}
+	if product == "" {
+		return s.ListDevicesForUserPage(ctx, userID, offset, limit)
+	}
+	if err := validatePageWindow(offset, limit); err != nil {
+		return DevicePage{}, err
+	}
+	var page DevicePage
+	err := s.Run(ctx, func(state *State) error {
+		if _, ok := state.Users[userID]; !ok {
+			return controlplane.ErrUserNotFound
+		}
+		items := make([]controlplane.DeviceSummary, 0)
+		for _, item := range state.Devices {
+			if item.UserID == userID && memoryResourceProduct(item.Product) == product {
+				items = append(items, item)
+			}
+		}
+		slices.SortFunc(items, func(a, b controlplane.DeviceSummary) int { return strings.Compare(a.ID, b.ID) })
+		page.Total = len(items)
+		start, end := pageWindow(page.Total, offset, limit)
+		page.Items = append([]controlplane.DeviceSummary(nil), items[start:end]...)
+		return nil
+	})
+	return page, err
+}
+
 func (s *MemoryStore) ListModelUsagePage(ctx context.Context, offset, limit int) (ModelUsagePage, error) {
 	return s.ListModelUsagePageWithOptions(ctx, ModelUsagePageOptions{Offset: offset, Limit: limit})
 }

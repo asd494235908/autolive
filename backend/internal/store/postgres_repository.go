@@ -205,11 +205,28 @@ func (s *PostgresRepository) ListUsersPage(ctx context.Context, offset, limit in
 }
 
 func (s *PostgresRepository) ListUsersPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (UserPage, error) {
-	if !product.Valid() || s.modelReadSource != ModelReadSourceNormalized {
+	if !product.Valid() {
 		return UserPage{}, controlplane.ErrInvalidRequest
 	}
 	if err := validatePageWindow(offset, limit); err != nil {
 		return UserPage{}, err
+	}
+	if s.modelReadSource != ModelReadSourceNormalized {
+		var page UserPage
+		err := s.Run(ctx, func(state *State) error {
+			items := make([]controlplane.UserSummary, 0, len(state.Users))
+			for _, item := range state.Users {
+				if memoryUserHasProduct(state, item.ID, product) {
+					items = append(items, item)
+				}
+			}
+			slices.SortFunc(items, func(a, b controlplane.UserSummary) int { return strings.Compare(a.ID, b.ID) })
+			page.Total = len(items)
+			start, end := pageWindow(page.Total, offset, limit)
+			page.Items = append([]controlplane.UserSummary(nil), items[start:end]...)
+			return nil
+		})
+		return page, err
 	}
 	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (UserPage, error) {
 		var page UserPage
@@ -273,11 +290,28 @@ func (s *PostgresRepository) ListDevicesPage(ctx context.Context, offset, limit 
 }
 
 func (s *PostgresRepository) ListDevicesPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (DevicePage, error) {
-	if !product.Valid() || s.modelReadSource != ModelReadSourceNormalized {
+	if !product.Valid() {
 		return DevicePage{}, controlplane.ErrInvalidRequest
 	}
 	if err := validatePageWindow(offset, limit); err != nil {
 		return DevicePage{}, err
+	}
+	if s.modelReadSource != ModelReadSourceNormalized {
+		var page DevicePage
+		err := s.Run(ctx, func(state *State) error {
+			items := make([]controlplane.DeviceSummary, 0, len(state.Devices))
+			for _, item := range state.Devices {
+				if memoryResourceProduct(item.Product) == product {
+					items = append(items, item)
+				}
+			}
+			slices.SortFunc(items, func(a, b controlplane.DeviceSummary) int { return strings.Compare(a.ID, b.ID) })
+			page.Total = len(items)
+			start, end := pageWindow(page.Total, offset, limit)
+			page.Items = append([]controlplane.DeviceSummary(nil), items[start:end]...)
+			return nil
+		})
+		return page, err
 	}
 	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (DevicePage, error) {
 		var page DevicePage
@@ -339,6 +373,63 @@ func (s *PostgresRepository) ListDevicesForUserPage(ctx context.Context, userID 
 			return DevicePage{}, err
 		}
 		rows, err := tx.QueryContext(ctx, devicePageQuery+` WHERE user_id = $1 ORDER BY id LIMIT $2 OFFSET $3`, userID, limit, offset)
+		if err != nil {
+			return DevicePage{}, err
+		}
+		defer rows.Close()
+		items, err := scanDeviceRows(rows)
+		if err != nil {
+			return DevicePage{}, err
+		}
+		page.Items = items
+		return page, nil
+	})
+}
+
+func (s *PostgresRepository) ListDevicesForUserPageForProduct(ctx context.Context, userID string, offset, limit int, product controlplane.ProductCode) (DevicePage, error) {
+	if !product.Valid() {
+		return DevicePage{}, controlplane.ErrInvalidRequest
+	}
+	if err := validatePageWindow(offset, limit); err != nil {
+		return DevicePage{}, err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return DevicePage{}, controlplane.ErrUserNotFound
+	}
+	if s.modelReadSource != ModelReadSourceNormalized {
+		var page DevicePage
+		err := s.Run(ctx, func(state *State) error {
+			if _, ok := state.Users[userID]; !ok {
+				return controlplane.ErrUserNotFound
+			}
+			items := make([]controlplane.DeviceSummary, 0)
+			for _, item := range state.Devices {
+				if item.UserID == userID && memoryResourceProduct(item.Product) == product {
+					items = append(items, item)
+				}
+			}
+			slices.SortFunc(items, func(a, b controlplane.DeviceSummary) int { return strings.Compare(a.ID, b.ID) })
+			page.Total = len(items)
+			start, end := pageWindow(page.Total, offset, limit)
+			page.Items = append([]controlplane.DeviceSummary(nil), items[start:end]...)
+			return nil
+		})
+		return page, err
+	}
+	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (DevicePage, error) {
+		var exists bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)`, userID).Scan(&exists); err != nil {
+			return DevicePage{}, err
+		}
+		if !exists {
+			return DevicePage{}, controlplane.ErrUserNotFound
+		}
+		var page DevicePage
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM devices WHERE user_id = $1 AND product = $2`, userID, product).Scan(&page.Total); err != nil {
+			return DevicePage{}, err
+		}
+		rows, err := tx.QueryContext(ctx, devicePageQuery+` WHERE user_id = $1 AND product = $2 ORDER BY id LIMIT $3 OFFSET $4`, userID, product, limit, offset)
 		if err != nil {
 			return DevicePage{}, err
 		}
@@ -650,11 +741,28 @@ func (s *PostgresRepository) ListModelPoolAccountsPage(ctx context.Context, offs
 }
 
 func (s *PostgresRepository) ListModelPoolAccountsPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (ModelPoolPage, error) {
-	if !product.Valid() || s.modelReadSource != ModelReadSourceNormalized {
+	if !product.Valid() {
 		return ModelPoolPage{}, controlplane.ErrInvalidRequest
 	}
 	if err := validatePageWindow(offset, limit); err != nil {
 		return ModelPoolPage{}, err
+	}
+	if s.modelReadSource != ModelReadSourceNormalized {
+		var page ModelPoolPage
+		err := s.Run(ctx, func(state *State) error {
+			items := make([]controlplane.ModelPoolAccountSummary, 0, len(state.ModelPoolAccounts))
+			for _, item := range state.ModelPoolAccounts {
+				if memoryResourceProduct(item.Product) == product {
+					items = append(items, item)
+				}
+			}
+			slices.SortFunc(items, func(a, b controlplane.ModelPoolAccountSummary) int { return strings.Compare(a.ID, b.ID) })
+			page.Total = len(items)
+			start, end := pageWindow(page.Total, offset, limit)
+			page.Items = append([]controlplane.ModelPoolAccountSummary(nil), items[start:end]...)
+			return nil
+		})
+		return page, err
 	}
 	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (ModelPoolPage, error) {
 		var page ModelPoolPage

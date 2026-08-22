@@ -509,6 +509,130 @@ func TestPostgresRepositoryNormalizedUserPageUsesBoundedQuery(t *testing.T) {
 	}
 }
 
+func TestPostgresRepositoryNormalizedProductPagesKeepProductInCountAndListPredicates(t *testing.T) {
+	now := time.Date(2026, 8, 20, 0, 4, 0, 0, time.UTC)
+	product := string(controlplane.ProductDouyinDesktop)
+
+	t.Run("users", func(t *testing.T) {
+		database, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New() error = %v", err)
+		}
+		defer database.Close()
+		repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, time.Now, nil, ModelReadSourceNormalized)
+		if err != nil {
+			t.Fatalf("constructor error = %v", err)
+		}
+		mock.ExpectBegin()
+		expectNormalizedPageCoverage(mock)
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM users u JOIN user_products up ON up.user_id = u.id WHERE up.product = $1 AND up.status = 'active'")).WithArgs(product).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT u.id, u.username, u.role, u.status, u.created_at FROM users u JOIN user_products up ON up.user_id = u.id WHERE up.product = $1 AND up.status = 'active' ORDER BY u.id LIMIT $2 OFFSET $3")).WithArgs(product, 20, 0).WillReturnRows(sqlmock.NewRows([]string{"id", "username", "role", "status", "created_at"}).AddRow("usr_douyin", "douyin", controlplane.RoleUser, controlplane.UserStatusActive, now))
+		mock.ExpectCommit()
+
+		page, err := repository.ListUsersPageForProduct(context.Background(), 0, 20, controlplane.ProductDouyinDesktop)
+		if err != nil || page.Total != 1 || len(page.Items) != 1 || page.Items[0].ID != "usr_douyin" {
+			t.Fatalf("product users page = (%+v, %v)", page, err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("sql expectations: %v", err)
+		}
+	})
+
+	t.Run("devices", func(t *testing.T) {
+		database, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New() error = %v", err)
+		}
+		defer database.Close()
+		repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, time.Now, nil, ModelReadSourceNormalized)
+		if err != nil {
+			t.Fatalf("constructor error = %v", err)
+		}
+		mock.ExpectBegin()
+		expectNormalizedPageCoverage(mock)
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM devices WHERE product = $1")).WithArgs(product).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, product, device_name, platform, client_version, status")).WithArgs(product, 20, 0).WillReturnRows(productDeviceRows(now))
+		mock.ExpectCommit()
+
+		page, err := repository.ListDevicesPageForProduct(context.Background(), 0, 20, controlplane.ProductDouyinDesktop)
+		if err != nil || page.Total != 1 || len(page.Items) != 1 || page.Items[0].Product != controlplane.ProductDouyinDesktop {
+			t.Fatalf("product devices page = (%+v, %v)", page, err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("sql expectations: %v", err)
+		}
+	})
+
+	t.Run("model pool", func(t *testing.T) {
+		database, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New() error = %v", err)
+		}
+		defer database.Close()
+		repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, func() time.Time { return now }, nil, ModelReadSourceNormalized)
+		if err != nil {
+			t.Fatalf("constructor error = %v", err)
+		}
+		dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		mock.ExpectBegin()
+		expectNormalizedPageCoverage(mock)
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM model_accounts WHERE product = $1")).WithArgs(product).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT a.id, a.product, a.provider, a.model, a.base_url, a.secret_ref, a.status")).WithArgs(now, dayStart, dayStart.Add(24*time.Hour), product, 20, 0).WillReturnRows(productModelPoolRows(now))
+		mock.ExpectCommit()
+
+		page, err := repository.ListModelPoolAccountsPageForProduct(context.Background(), 0, 20, controlplane.ProductDouyinDesktop)
+		if err != nil || page.Total != 1 || len(page.Items) != 1 || page.Items[0].Product != controlplane.ProductDouyinDesktop {
+			t.Fatalf("product model pool page = (%+v, %v)", page, err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("sql expectations: %v", err)
+		}
+	})
+}
+
+func TestPostgresRepositoryNormalizedUserDeviceProductPageKeepsProductInCountAndListPredicates(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, time.Now, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+	now := time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)
+	mock.ExpectBegin()
+	expectNormalizedPageCoverage(mock)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")).WithArgs("usr_shared").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM devices WHERE user_id = $1 AND product = $2")).WithArgs("usr_shared", string(controlplane.ProductDouyinDesktop)).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, product, device_name, platform, client_version, status")).WithArgs("usr_shared", string(controlplane.ProductDouyinDesktop), 20, 0).WillReturnRows(productDeviceRows(now))
+	mock.ExpectCommit()
+
+	page, err := repository.ListDevicesForUserPageForProduct(context.Background(), "usr_shared", 0, 20, controlplane.ProductDouyinDesktop)
+	if err != nil || page.Total != 1 || len(page.Items) != 1 || page.Items[0].Product != controlplane.ProductDouyinDesktop {
+		t.Fatalf("product user devices page = (%+v, %v)", page, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func productDeviceRows(now time.Time) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id", "user_id", "product", "device_name", "platform", "client_version", "status",
+		"disk_free_bytes", "memory_total_bytes", "memory_available_bytes", "cpu_logical_cores",
+		"runtime_os_name", "runtime_os_version", "kernel_version", "current_media_name", "playback_state", "last_heartbeat_at",
+	}).AddRow("dev_douyin", "usr_shared", string(controlplane.ProductDouyinDesktop), "Douyin", "windows", "1.0.0", controlplane.DeviceStatusActive,
+		int64(0), int64(0), int64(0), 0, nil, nil, nil, nil, nil, now)
+}
+
+func productModelPoolRows(now time.Time) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id", "product", "provider", "model", "base_url", "secret_ref", "status", "priority", "concurrency_limit", "daily_token_limit", "cooldown_until",
+		"active_leases", "daily_used_tokens", "payload", "created_at",
+	}).AddRow("mpa_douyin", string(controlplane.ProductDouyinDesktop), "openai-compatible", "douyin", "https://api.example.com/v1", "model-account/douyin", controlplane.ModelAccountStatusActive, 0, 1, 0, nil, 0, 0, nil, now)
+}
+
 func TestPostgresRepositoryNormalizedUserDevicePageChecksOwnershipAndBoundsSQL(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	if err != nil {

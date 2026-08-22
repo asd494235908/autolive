@@ -365,6 +365,7 @@ type UserPageReader interface {
 type ProductUserPageReader interface {
 	ListUsersPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (UserPage, error)
 	ListDevicesPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (DevicePage, error)
+	ListDevicesForUserPageForProduct(ctx context.Context, userID string, offset, limit int, product controlplane.ProductCode) (DevicePage, error)
 }
 
 // UserRepository owns normalized user writes without exposing the legacy

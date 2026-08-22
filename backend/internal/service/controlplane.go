@@ -758,6 +758,9 @@ func (s *ControlPlane) ListUsersPageForProduct(ctx context.Context, page, pageSi
 	if product == "" {
 		return s.ListUsersPage(ctx, page, pageSize)
 	}
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
 	if !product.Valid() {
 		return nil, 0, controlplane.ErrInvalidRequest
 	}
@@ -765,14 +768,44 @@ func (s *ControlPlane) ListUsersPageForProduct(ctx context.Context, page, pageSi
 	if err != nil {
 		return nil, 0, err
 	}
-	if reader, ok := s.repository.(store.ProductUserPageReader); ok {
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		reader, ok := s.repository.(store.ProductUserPageReader)
+		if !ok {
+			return nil, 0, store.ErrNormalizedUserPageReaderRequired
+		}
 		result, err := reader.ListUsersPageForProduct(ctx, offset, pageSize, product)
 		if err != nil {
 			return nil, 0, err
 		}
 		return result.Items, result.Total, nil
 	}
-	return nil, 0, store.ErrNormalizedUserPageReaderRequired
+	items, err := withState(ctx, s.repository, func(state *store.State) ([]controlplane.UserSummary, error) {
+		items := make([]controlplane.UserSummary, 0, len(state.Users))
+		for _, item := range state.Users {
+			hasMembership := false
+			for _, membership := range state.UserProducts {
+				if membership.UserID != item.ID {
+					continue
+				}
+				hasMembership = true
+				if membership.Product == product && membership.Status == "active" {
+					items = append(items, item)
+					break
+				}
+			}
+			if !hasMembership && product == controlplane.ProductAutoLive {
+				items = append(items, item)
+			}
+		}
+		slices.SortFunc(items, func(a, b controlplane.UserSummary) int { return strings.Compare(a.ID, b.ID) })
+		return items, nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	total := len(items)
+	start, end := pageWindow(total, offset, pageSize)
+	return items[start:end], total, nil
 }
 
 func (s *ControlPlane) CreateUser(ctx context.Context, idempotencyKey string, input controlplane.CreateUserInput) (controlplane.UserSummary, error) {
@@ -1164,6 +1197,9 @@ func (s *ControlPlane) ListDevicesPageForProduct(ctx context.Context, page, page
 	if product == "" {
 		return s.ListDevicesPage(ctx, page, pageSize)
 	}
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
 	if !product.Valid() {
 		return nil, 0, controlplane.ErrInvalidRequest
 	}
@@ -1171,19 +1207,46 @@ func (s *ControlPlane) ListDevicesPageForProduct(ctx context.Context, page, page
 	if err != nil {
 		return nil, 0, err
 	}
-	reader, ok := s.repository.(store.ProductUserPageReader)
-	if !ok {
-		return nil, 0, store.ErrNormalizedUserPageReaderRequired
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		reader, ok := s.repository.(store.ProductUserPageReader)
+		if !ok {
+			return nil, 0, store.ErrNormalizedUserPageReaderRequired
+		}
+		result, err := reader.ListDevicesPageForProduct(ctx, offset, pageSize, product)
+		if err != nil {
+			return nil, 0, err
+		}
+		now := s.repository.Now()
+		for index := range result.Items {
+			result.Items[index] = decorateDeviceSummary(result.Items[index], now)
+		}
+		return result.Items, result.Total, nil
 	}
-	result, err := reader.ListDevicesPageForProduct(ctx, offset, pageSize, product)
+	items, err := withState(ctx, s.repository, func(state *store.State) ([]controlplane.DeviceSummary, error) {
+		items := make([]controlplane.DeviceSummary, 0, len(state.Devices))
+		for _, item := range state.Devices {
+			storedProduct := item.Product
+			if storedProduct == "" {
+				storedProduct = controlplane.ProductAutoLive
+			}
+			if storedProduct == product {
+				items = append(items, item)
+			}
+		}
+		slices.SortFunc(items, func(a, b controlplane.DeviceSummary) int { return strings.Compare(a.ID, b.ID) })
+		return items, nil
+	})
 	if err != nil {
 		return nil, 0, err
 	}
+	total := len(items)
+	start, end := pageWindow(total, offset, pageSize)
+	items = items[start:end]
 	now := s.repository.Now()
-	for index := range result.Items {
-		result.Items[index] = decorateDeviceSummary(result.Items[index], now)
+	for index := range items {
+		items[index] = decorateDeviceSummary(items[index], now)
 	}
-	return result.Items, result.Total, nil
+	return items, total, nil
 }
 
 func (s *ControlPlane) GetDevice(ctx context.Context, deviceID string) (controlplane.DeviceSummary, error) {
@@ -1289,6 +1352,69 @@ func (s *ControlPlane) ListDevicesForUserPage(ctx context.Context, userID string
 		start, end := pageWindow(total, offset, pageSize)
 		items = items[start:end]
 	}
+	now := s.repository.Now()
+	for index := range items {
+		items[index] = decorateDeviceSummary(items[index], now)
+	}
+	return items, total, nil
+}
+
+func (s *ControlPlane) ListDevicesForUserPageForProduct(ctx context.Context, userID string, page, pageSize int, product controlplane.ProductCode) ([]controlplane.DeviceSummary, int, error) {
+	if product == "" {
+		return s.ListDevicesForUserPage(ctx, userID, page, pageSize)
+	}
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
+	if !product.Valid() {
+		return nil, 0, controlplane.ErrInvalidRequest
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, 0, controlplane.ErrUserNotFound
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		reader, ok := s.repository.(store.ProductUserPageReader)
+		if !ok {
+			return nil, 0, store.ErrNormalizedUserPageReaderRequired
+		}
+		result, err := reader.ListDevicesForUserPageForProduct(ctx, userID, offset, pageSize, product)
+		if err != nil {
+			return nil, 0, err
+		}
+		now := s.repository.Now()
+		for index := range result.Items {
+			result.Items[index] = decorateDeviceSummary(result.Items[index], now)
+		}
+		return result.Items, result.Total, nil
+	}
+	items, err := withState(ctx, s.repository, func(state *store.State) ([]controlplane.DeviceSummary, error) {
+		if _, ok := state.Users[userID]; !ok {
+			return nil, controlplane.ErrUserNotFound
+		}
+		items := make([]controlplane.DeviceSummary, 0)
+		for _, item := range state.Devices {
+			storedProduct := item.Product
+			if storedProduct == "" {
+				storedProduct = controlplane.ProductAutoLive
+			}
+			if item.UserID == userID && storedProduct == product {
+				items = append(items, item)
+			}
+		}
+		slices.SortFunc(items, func(a, b controlplane.DeviceSummary) int { return strings.Compare(a.ID, b.ID) })
+		return items, nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	total := len(items)
+	start, end := pageWindow(total, offset, pageSize)
+	items = items[start:end]
 	now := s.repository.Now()
 	for index := range items {
 		items[index] = decorateDeviceSummary(items[index], now)
@@ -1806,6 +1932,9 @@ func (s *ControlPlane) ListModelPoolAccountsPageForProduct(ctx context.Context, 
 	if product == "" {
 		return s.ListModelPoolAccountsPage(ctx, page, pageSize)
 	}
+	if err := checkContext(ctx); err != nil {
+		return nil, 0, err
+	}
 	if !product.Valid() {
 		return nil, 0, controlplane.ErrInvalidRequest
 	}
@@ -1813,7 +1942,11 @@ func (s *ControlPlane) ListModelPoolAccountsPageForProduct(ctx context.Context, 
 	if err != nil {
 		return nil, 0, err
 	}
-	if reader, ok := s.repository.(store.ProductModelPoolPageReader); ok {
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		reader, ok := s.repository.(store.ProductModelPoolPageReader)
+		if !ok {
+			return nil, 0, store.ErrNormalizedModelPoolPageReaderRequired
+		}
 		result, err := reader.ListModelPoolAccountsPageForProduct(ctx, offset, pageSize, product)
 		if err != nil {
 			return nil, 0, err
@@ -1824,14 +1957,15 @@ func (s *ControlPlane) ListModelPoolAccountsPageForProduct(ctx context.Context, 
 		}
 		return result.Items, result.Total, nil
 	}
-	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
-		return nil, 0, store.ErrNormalizedModelPoolPageReaderRequired
-	}
 	items, err := withState(ctx, s.repository, func(state *store.State) ([]controlplane.ModelPoolAccountSummary, error) {
 		now := s.repository.Now()
 		result := make([]controlplane.ModelPoolAccountSummary, 0, len(state.ModelPoolAccounts))
 		for _, account := range state.ModelPoolAccounts {
-			storedProduct, ok := strictStoredProduct(account.Product)
+			storedProduct := account.Product
+			if storedProduct == "" {
+				storedProduct = controlplane.ProductAutoLive
+			}
+			storedProduct, ok := strictStoredProduct(storedProduct)
 			if !ok || storedProduct != product {
 				continue
 			}
