@@ -2000,7 +2000,10 @@ export interface operations {
     };
     getAdminDevice: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。 */
+                product?: components["parameters"]["AdminProduct"];
+            };
             header?: never;
             path: {
                 device_id: components["schemas"]["Id"];
@@ -2019,6 +2022,7 @@ export interface operations {
                     "application/json": components["schemas"]["DeviceEnvelope"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];

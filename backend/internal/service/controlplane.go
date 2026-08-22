@@ -1286,6 +1286,48 @@ func (s *ControlPlane) GetDevice(ctx context.Context, deviceID string) (controlp
 	return decorateDeviceSummary(device, s.repository.Now()), nil
 }
 
+// GetDeviceForProduct is the product-bound administrator detail boundary.
+// Callers may pass an empty product only after authorizing the built-in local
+// administrator's compatibility-wide read at the HTTP boundary.
+func (s *ControlPlane) GetDeviceForProduct(ctx context.Context, deviceID string, product controlplane.ProductCode) (controlplane.DeviceSummary, error) {
+	if err := checkContext(ctx); err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
+	}
+	if product != "" && !product.Valid() {
+		return controlplane.DeviceSummary{}, controlplane.ErrInvalidRequest
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		if product == "" {
+			return s.GetDevice(ctx, deviceID)
+		}
+		reader, ok := s.repository.(store.ProductDeviceReader)
+		if !ok {
+			return controlplane.DeviceSummary{}, store.ErrNormalizedDeviceReaderRequired
+		}
+		device, err := reader.GetDeviceForProduct(ctx, deviceID, product)
+		if err != nil {
+			return controlplane.DeviceSummary{}, err
+		}
+		return decorateDeviceSummary(device, s.repository.Now()), nil
+	}
+	device, err := withState(ctx, s.repository, func(state *store.State) (controlplane.DeviceSummary, error) {
+		device, ok := state.Devices[deviceID]
+		if !ok || (product != "" && effectiveStoredProduct(device.Product) != product) {
+			return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
+		}
+		device.Product = effectiveStoredProduct(device.Product)
+		return device, nil
+	})
+	if err != nil {
+		return controlplane.DeviceSummary{}, err
+	}
+	return decorateDeviceSummary(device, s.repository.Now()), nil
+}
+
 func (s *ControlPlane) ListDevicesForUser(ctx context.Context, userID string) ([]controlplane.DeviceSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err

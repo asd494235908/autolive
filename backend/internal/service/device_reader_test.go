@@ -109,4 +109,21 @@ func TestNormalizedUserMutationFailsClosedWithoutRepository(t *testing.T) {
 	if _, err := svc.GetDevice(context.Background(), "dev_1"); err != store.ErrNormalizedDeviceReaderRequired {
 		t.Fatalf("GetDevice() error = %v, want normalized device reader requirement", err)
 	}
+	if _, err := svc.GetDeviceForProduct(context.Background(), "dev_1", controlplane.ProductAutoLive); err != store.ErrNormalizedDeviceReaderRequired {
+		t.Fatalf("GetDeviceForProduct() error = %v, want normalized device reader requirement", err)
+	}
+}
+
+func TestGetDeviceForProductRejectsSnapshotProductMismatch(t *testing.T) {
+	repository := store.NewMemoryStore(time.Now)
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Devices["dev_1"] = controlplane.DeviceSummary{ID: "dev_1", Product: controlplane.ProductDouyinDesktop, Status: controlplane.DeviceStatusActive}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed device state: %v", err)
+	}
+	_, err := NewControlPlaneWithRepository(repository).GetDeviceForProduct(context.Background(), "dev_1", controlplane.ProductAutoLive)
+	if err != controlplane.ErrDeviceNotFound {
+		t.Fatalf("GetDeviceForProduct() error = %v, want device not found", err)
+	}
 }

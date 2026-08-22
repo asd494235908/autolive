@@ -142,7 +142,7 @@ type pagination struct {
 
 func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, auth *authenticator) {
 	mux.Handle("POST /api/v1/admin/auth/change-password", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		if actor.UserID != "usr_local_admin" {
+		if !isBuiltinLocalAdmin(actor) {
 			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
 			return
 		}
@@ -213,6 +213,10 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/admin/users/{user_id}/authorization-summary", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		if !isBuiltinLocalAdmin(actor) {
+			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
+			return
+		}
 		summary, err := svc.GetUserAuthorizationSummary(r.Context(), r.PathValue("user_id"))
 		if err != nil {
 			writeAppError(w, r, err)
@@ -225,6 +229,10 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("PATCH /api/v1/admin/users/{user_id}/authorization", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		if !isBuiltinLocalAdmin(actor) {
+			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
+			return
+		}
 		var input controlplane.UpdateUserAuthorizationInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -259,6 +267,10 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("POST /api/v1/admin/users/{user_id}/disable", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		if !isBuiltinLocalAdmin(actor) {
+			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
+			return
+		}
 		user, err := svc.DisableUser(r.Context(), r.Header.Get("Idempotency-Key"), r.PathValue("user_id"))
 		if err != nil {
 			writeAppError(w, r, err)
@@ -275,6 +287,10 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("PATCH /api/v1/admin/users/{user_id}", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		if !isBuiltinLocalAdmin(actor) {
+			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
+			return
+		}
 		var input controlplane.UpdateUserInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -296,6 +312,10 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("POST /api/v1/admin/users/{user_id}/reset-password", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		if !isBuiltinLocalAdmin(actor) {
+			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
+			return
+		}
 		var input controlplane.ResetUserPasswordInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -340,7 +360,12 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/admin/devices/{device_id}", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		device, err := svc.GetDevice(r.Context(), r.PathValue("device_id"))
+		product, err := resolveAdminProductScope(r, actor)
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
+		device, err := svc.GetDeviceForProduct(r.Context(), r.PathValue("device_id"), product)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -966,7 +991,7 @@ func resolveAdminProductScope(r *http.Request, actor controlplane.Actor) (contro
 	if len(values) > 1 {
 		return "", controlplane.ErrInvalidRequest
 	}
-	localAdmin := actor.UserID == "usr_local_admin" && actor.Role == "admin"
+	localAdmin := isBuiltinLocalAdmin(actor)
 	if !exists {
 		if localAdmin {
 			return "", nil
@@ -984,6 +1009,10 @@ func resolveAdminProductScope(r *http.Request, actor controlplane.Actor) (contro
 		return product, nil
 	}
 	return "", controlplane.ErrForbidden
+}
+
+func isBuiltinLocalAdmin(actor controlplane.Actor) bool {
+	return actor.UserID == "usr_local_admin" && actor.Role == controlplane.RoleAdmin
 }
 
 func modelLeaseListOptions(r *http.Request, product controlplane.ProductCode) service.ModelLeaseListOptions {

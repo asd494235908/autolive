@@ -34,6 +34,27 @@ func (s *PostgresRepository) GetDevice(ctx context.Context, deviceID string) (co
 	})
 }
 
+// GetDeviceForProduct reads one normalized device only when it belongs to the
+// requested product. The unscoped compatibility read remains GetDevice.
+func (s *PostgresRepository) GetDeviceForProduct(ctx context.Context, deviceID string, product controlplane.ProductCode) (controlplane.DeviceSummary, error) {
+	if s.modelReadSource != ModelReadSourceNormalized || !product.Valid() {
+		return controlplane.DeviceSummary{}, ErrNormalizedDeviceReaderRequired
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
+	}
+	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (controlplane.DeviceSummary, error) {
+		condition, productArgs := normalizedProductFilter("product", product, 2)
+		row := tx.QueryRowContext(ctx, devicePageQuery+` WHERE id = $1 AND `+condition, append([]any{deviceID}, productArgs...)...)
+		device, err := scanDeviceSummary(row)
+		if errors.Is(err, sql.ErrNoRows) {
+			return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
+		}
+		return device, err
+	})
+}
+
 // GetOwnedDevice resolves the authenticated user's device. An empty device ID
 // selects the most recently seen owned device, matching the compatibility
 // profile behavior without consulting the snapshot.

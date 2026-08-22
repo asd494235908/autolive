@@ -102,6 +102,48 @@ func TestAdminUserDevicePageAppliesProductScope(t *testing.T) {
 	}
 }
 
+func TestAdminDeviceDetailAppliesProductScope(t *testing.T) {
+	handler, localToken, ordinaryToken := newProductScopeIntegrationRouter(t)
+
+	local := doJSON(t, handler, http.MethodGet, "/api/v1/admin/devices/dev_douyin?product=douyin_desktop", nil, localToken, "")
+	if local.Code != http.StatusOK {
+		t.Fatalf("local admin device detail status = %d, want %d; body=%s", local.Code, http.StatusOK, local.Body.String())
+	}
+
+	ordinary := doJSON(t, handler, http.MethodGet, "/api/v1/admin/devices/dev_douyin", nil, ordinaryToken, "")
+	if ordinary.Code != http.StatusNotFound {
+		t.Fatalf("ordinary admin cross-product device detail status = %d, want %d; body=%s", ordinary.Code, http.StatusNotFound, ordinary.Body.String())
+	}
+
+	widened := doJSON(t, handler, http.MethodGet, "/api/v1/admin/devices/dev_douyin?product=douyin_desktop", nil, ordinaryToken, "")
+	if widened.Code != http.StatusForbidden {
+		t.Fatalf("ordinary admin widened device detail status = %d, want %d; body=%s", widened.Code, http.StatusForbidden, widened.Body.String())
+	}
+}
+
+func TestOrdinaryAdminCannotAccessGlobalUserAuthorizationOperations(t *testing.T) {
+	handler, _, ordinaryToken := newProductScopeIntegrationRouter(t)
+	for _, endpoint := range []struct {
+		name   string
+		method string
+		path   string
+		body   any
+	}{
+		{name: "authorization summary", method: http.MethodGet, path: "/api/v1/admin/users/usr_shared/authorization-summary"},
+		{name: "authorization policy", method: http.MethodPatch, path: "/api/v1/admin/users/usr_shared/authorization", body: map[string]any{}},
+		{name: "disable user", method: http.MethodPost, path: "/api/v1/admin/users/usr_shared/disable"},
+		{name: "update user", method: http.MethodPatch, path: "/api/v1/admin/users/usr_shared", body: map[string]any{}},
+		{name: "reset password", method: http.MethodPost, path: "/api/v1/admin/users/usr_shared/reset-password", body: map[string]any{}},
+	} {
+		t.Run(endpoint.name, func(t *testing.T) {
+			response := doJSON(t, handler, endpoint.method, endpoint.path, endpoint.body, ordinaryToken, "ordinary-admin-guard")
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("ordinary admin %s status = %d, want %d; body=%s", endpoint.name, response.Code, http.StatusForbidden, response.Body.String())
+			}
+		})
+	}
+}
+
 func newProductScopeIntegrationRouter(t *testing.T) (http.Handler, string, string) {
 	t.Helper()
 	now := time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)

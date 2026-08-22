@@ -399,9 +399,10 @@ type DeviceReader interface {
 	GetOwnedDevice(ctx context.Context, userID, deviceID string) (controlplane.DeviceSummary, error)
 }
 
-// ProductDeviceReader is the strict normalized profile read. Product is a
-// fixed SQL predicate, not a post-read comparison against an arbitrary row.
+// ProductDeviceReader owns strict normalized device reads. Product is a fixed
+// SQL predicate, not a post-read comparison against an arbitrary row.
 type ProductDeviceReader interface {
+	GetDeviceForProduct(ctx context.Context, deviceID string, product controlplane.ProductCode) (controlplane.DeviceSummary, error)
 	GetOwnedDeviceForProduct(ctx context.Context, userID, deviceID string, product controlplane.ProductCode) (controlplane.DeviceSummary, error)
 }
 

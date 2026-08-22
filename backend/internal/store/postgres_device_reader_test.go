@@ -47,6 +47,42 @@ func TestPostgresRepositoryGetDeviceReadsNormalizedRow(t *testing.T) {
 	}
 }
 
+func TestPostgresRepositoryGetDeviceForProductBindsProductInSQL(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 8, 21, 15, 0, 0, 0, time.UTC)
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, func() time.Time { return now }, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+
+	mock.ExpectBegin()
+	expectNormalizedPageCoverage(mock)
+	mock.ExpectQuery(regexp.QuoteMeta("WHERE id = $1 AND product = $2")).
+		WithArgs("dev_1", controlplane.ProductDouyinDesktop).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "user_id", "product", "device_name", "platform", "client_version", "status",
+			"disk_free_bytes", "memory_total_bytes", "memory_available_bytes", "cpu_logical_cores",
+			"runtime_os_name", "runtime_os_version", "kernel_version", "current_media_name", "playback_state", "last_heartbeat_at",
+		}).AddRow("dev_1", "usr_1", string(controlplane.ProductDouyinDesktop), "Studio", "windows", "1.2.3", controlplane.DeviceStatusActive,
+			int64(100), int64(200), int64(150), 8, "Windows", "11", "kernel", "demo.mp4", "playing", now.Add(-time.Minute)))
+	mock.ExpectCommit()
+
+	device, err := repository.GetDeviceForProduct(context.Background(), "dev_1", controlplane.ProductDouyinDesktop)
+	if err != nil {
+		t.Fatalf("GetDeviceForProduct() error = %v", err)
+	}
+	if device.ID != "dev_1" || device.Product != controlplane.ProductDouyinDesktop {
+		t.Fatalf("device = %+v", device)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
 func TestPostgresRepositoryGetOwnedDeviceSelectsLatestWhenDeviceMissing(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	if err != nil {

@@ -153,8 +153,28 @@ func TestMemoryActivationPageNormalizesLegacyAutoliveProduct(t *testing.T) {
 func TestNormalizedProductScopedPageWithoutReaderFailsClosed(t *testing.T) {
 	repository := &normalizedPageFallbackRepository{}
 	service := NewControlPlaneWithRepository(repository)
-	_, _, err := service.ListModelUsagePageWithOptions(context.Background(), 1, 20, ModelUsageListOptions{Product: controlplane.ProductAutoLive})
-	if !errors.Is(err, store.ErrNormalizedModelUsagePageReaderRequired) {
-		t.Fatalf("normalized product usage error = %v, want %v", err, store.ErrNormalizedModelUsagePageReaderRequired)
+	for _, test := range []struct {
+		name string
+		want error
+		call func() error
+	}{
+		{name: "usage", want: store.ErrNormalizedModelUsagePageReaderRequired, call: func() error {
+			_, _, err := service.ListModelUsagePageWithOptions(context.Background(), 1, 20, ModelUsageListOptions{Product: controlplane.ProductAutoLive})
+			return err
+		}},
+		{name: "lease", want: store.ErrNormalizedModelLeasePageReaderRequired, call: func() error {
+			_, _, err := service.ListModelLeasesPageWithOptions(context.Background(), 1, 20, ModelLeaseListOptions{Product: controlplane.ProductAutoLive})
+			return err
+		}},
+		{name: "audit", want: store.ErrNormalizedAuditPageReaderRequired, call: func() error {
+			_, _, err := service.ListAuditLogsPageWithOptions(context.Background(), 1, 20, AuditLogListOptions{Product: controlplane.ProductAutoLive})
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.call(); !errors.Is(err, test.want) {
+				t.Fatalf("normalized product page error = %v, want %v", err, test.want)
+			}
+		})
 	}
 }
