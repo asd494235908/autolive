@@ -4,9 +4,11 @@ import { useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiClient, ApiClientError, createRequestId } from '../../api/client';
 import { clearSession } from '../auth/session';
+import { useAdminAuthorization } from '../admin-rbac/useAdminAuthorization';
 import type { ChangeLocalAdminPasswordRequest, UserEnvelope } from '../../types/api';
 
 export function AdminSecurityPage() {
+  const authorization = useAdminAuthorization();
   const { message } = App.useApp();
   const navigate = useNavigate();
   const [form] = Form.useForm<ChangeLocalAdminPasswordRequest & { confirmPassword: string }>();
@@ -100,7 +102,12 @@ export function AdminSecurityPage() {
           >
             <Input.Password prefix={<LockOutlined />} autoComplete="new-password" />
           </Form.Item>
-          <Button type="primary" htmlType="submit" loading={pending}>
+          <Button
+            type="primary"
+            htmlType="submit"
+            loading={pending}
+            disabled={!authorization.can('admin_security.manage')}
+          >
             修改密码并退出
           </Button>
         </Form>

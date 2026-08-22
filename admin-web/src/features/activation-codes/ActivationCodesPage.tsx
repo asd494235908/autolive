@@ -10,6 +10,7 @@ import {
   Form,
   InputNumber,
   Modal,
+  Result,
   Space,
   Table,
   Typography
@@ -17,6 +18,7 @@ import {
 import { useMemo, useState } from 'react';
 import { apiClient, ApiClientError, createRequestId } from '../../api/client';
 import { StatusTag } from '../../components/StatusTag';
+import { useAdminAuthorization } from '../admin-rbac/useAdminAuthorization';
 import {
   ACTIVATION_CODE_EXPIRY_PRESETS,
   calculateActivationCodeExpiry
@@ -29,6 +31,8 @@ import type {
 } from '../../types/api';
 
 export function ActivationCodesPage() {
+  const authorization = useAdminAuthorization();
+  const canManageActivationCodes = authorization.can('activation_codes.manage');
   const { message, modal } = App.useApp();
   const queryClient = useQueryClient();
   const [form] = Form.useForm<{ expires_at: Dayjs; max_devices: number }>();
@@ -149,10 +153,10 @@ export function ActivationCodesPage() {
         title: '操作',
         key: 'actions',
         render: (_value: unknown, record: ActivationCode) => (
-          <Button
-            danger
-            type="link"
-            disabled={record.status !== 'active' || revokeActivationCodeMutation.isPending}
+            <Button
+              danger
+              type="link"
+              disabled={!canManageActivationCodes || record.status !== 'active' || revokeActivationCodeMutation.isPending}
             loading={revokingCodeId === record.id}
             onClick={() => {
               modal.confirm({
@@ -188,12 +192,31 @@ export function ActivationCodesPage() {
           </Typography.Paragraph>
         </div>
 
-        <Button type="primary" onClick={() => setCreateOpen(true)}>
+        <Button type="primary" disabled={!canManageActivationCodes} onClick={() => setCreateOpen(true)}>
           创建激活码
         </Button>
       </Space>
 
-      {activationCodesQuery.isError ? (
+      {activationCodesQuery.isError && activationCodesQuery.error instanceof ApiClientError && activationCodesQuery.error.status === 403 ? (
+        <Result
+          status="403"
+          title="无权读取激活码列表"
+          subTitle="服务端拒绝了当前会话的激活码读取请求，请刷新权限后重试。"
+          extra={
+            <Button
+              type="primary"
+              onClick={() => {
+                void authorization.refresh();
+                void activationCodesQuery.refetch();
+              }}
+            >
+              重新验证权限
+            </Button>
+          }
+        />
+      ) : null}
+
+      {activationCodesQuery.isError && (!(activationCodesQuery.error instanceof ApiClientError) || activationCodesQuery.error.status !== 403) ? (
         <Alert
           type="error"
           showIcon

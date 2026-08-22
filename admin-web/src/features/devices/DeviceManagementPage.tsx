@@ -7,6 +7,7 @@ import {
   Descriptions,
   Drawer,
   Empty,
+  Result,
   Space,
   Table,
   Typography
@@ -14,6 +15,7 @@ import {
 import { useMemo, useState } from 'react';
 import { apiClient, ApiClientError, createRequestId } from '../../api/client';
 import { StatusTag } from '../../components/StatusTag';
+import { useAdminAuthorization } from '../admin-rbac/useAdminAuthorization';
 import type { DeviceEnvelope, DeviceListResponse, DeviceSummary, UnbindDeviceResponse } from '../../types/api';
 
 function formatDiskSize(bytes?: number) {
@@ -33,6 +35,8 @@ function formatMemory(bytes?: number) {
 }
 
 export function DeviceManagementPage() {
+  const authorization = useAdminAuthorization();
+  const canManageDevices = authorization.can('devices.manage');
   const { message, modal } = App.useApp();
   const queryClient = useQueryClient();
   const [page, setPage] = useState(1);
@@ -156,7 +160,7 @@ export function DeviceManagementPage() {
             <Button onClick={() => setDetailDeviceId(record.id)}>详情</Button>
             <Button
               danger
-              disabled={record.status === 'disabled' || record.status === 'revoked'}
+              disabled={!canManageDevices || record.status === 'disabled' || record.status === 'revoked'}
               loading={disableDeviceMutation.isPending}
               onClick={() => {
                 modal.confirm({
@@ -171,7 +175,7 @@ export function DeviceManagementPage() {
               禁用
             </Button>
             <Button
-              disabled={record.status === 'pending_activation' || unbindDeviceMutation.isPending}
+              disabled={!canManageDevices || record.status === 'pending_activation' || unbindDeviceMutation.isPending}
               loading={unbindingDeviceId === record.id}
               onClick={() => {
                 modal.confirm({
@@ -206,7 +210,26 @@ export function DeviceManagementPage() {
         </Typography.Paragraph>
       </div>
 
-      {devicesQuery.isError ? (
+      {devicesQuery.isError && devicesQuery.error instanceof ApiClientError && devicesQuery.error.status === 403 ? (
+        <Result
+          status="403"
+          title="无权读取设备列表"
+          subTitle="服务端拒绝了当前会话的设备读取请求，请刷新权限后重试。"
+          extra={
+            <Button
+              type="primary"
+              onClick={() => {
+                void authorization.refresh();
+                void devicesQuery.refetch();
+              }}
+            >
+              重新验证权限
+            </Button>
+          }
+        />
+      ) : null}
+
+      {devicesQuery.isError && (!(devicesQuery.error instanceof ApiClientError) || devicesQuery.error.status !== 403) ? (
         <Alert
           type="error"
           showIcon
@@ -254,7 +277,10 @@ export function DeviceManagementPage() {
         width={480}
         onClose={() => setDetailDeviceId(null)}
       >
-        {deviceDetailQuery.isError ? (
+        {deviceDetailQuery.isError && deviceDetailQuery.error instanceof ApiClientError && deviceDetailQuery.error.status === 403 ? (
+          <Result status="403" title="无权读取设备详情" subTitle="当前会话缺少 devices.read 权限。" />
+        ) : null}
+        {deviceDetailQuery.isError && (!(deviceDetailQuery.error instanceof ApiClientError) || deviceDetailQuery.error.status !== 403) ? (
           <Alert
             type="error"
             showIcon

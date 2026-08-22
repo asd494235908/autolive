@@ -9,6 +9,7 @@ import {
   Input,
   InputNumber,
   Modal,
+  Result,
   Select,
   Space,
   Table,
@@ -20,6 +21,7 @@ import { useSearchParams } from 'react-router-dom';
 import { apiClient, ApiClientError, createRequestId } from '../../api/client';
 import { StatusTag } from '../../components/StatusTag';
 import { createModelPoolIdempotencyKeyManager } from './modelPoolIdempotency';
+import { useAdminAuthorization } from '../admin-rbac/useAdminAuthorization';
 import type {
   CreateModelPoolAccountRequest,
   ModelPoolAccountEnvelope,
@@ -32,6 +34,10 @@ import type {
 } from '../../types/api';
 
 export function ModelPoolPage() {
+  const authorization = useAdminAuthorization();
+  const canManageModelPool = authorization.can('model_pool.manage');
+  const canTestModelPool = authorization.can('model_pool.test');
+  const canRotateSecret = authorization.can('model_pool.rotate_secret');
   const { message, modal } = App.useApp();
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -317,8 +323,8 @@ export function ModelPoolPage() {
           <Space>
             <Button
               type="link"
+              disabled={!canTestModelPool || (testModelAccountMutation.isPending && testingAccountId !== record.id)}
               loading={testingAccountId === record.id}
-              disabled={testModelAccountMutation.isPending && testingAccountId !== record.id}
               onClick={() => {
                 setTestingAccountId(record.id);
                 testModelAccountMutation.mutate(record.id);
@@ -328,7 +334,7 @@ export function ModelPoolPage() {
             </Button>
             <Button
               type="link"
-              disabled={rotateModelAccountMutation.isPending}
+              disabled={!canRotateSecret || rotateModelAccountMutation.isPending}
               onClick={() => {
                 setRotatingAccount(record);
                 rotateForm.resetFields();
@@ -340,6 +346,7 @@ export function ModelPoolPage() {
             </Button>
             <Button
               type="link"
+              disabled={!canManageModelPool}
               onClick={() => {
                 setEditingAccount(record);
                 editForm.setFieldsValue({
@@ -357,7 +364,7 @@ export function ModelPoolPage() {
             <Button
               danger
               type="link"
-              disabled={record.status === 'disabled' || disableModelAccountMutation.isPending}
+              disabled={!canManageModelPool || record.status === 'disabled' || disableModelAccountMutation.isPending}
               loading={disablingAccountId === record.id}
               onClick={() => {
                 modal.confirm({
@@ -406,6 +413,7 @@ export function ModelPoolPage() {
 
         <Button
           type="primary"
+          disabled={!canManageModelPool}
           onClick={() => {
             setCreateError(null);
             setCreateOpen(true);
@@ -415,7 +423,26 @@ export function ModelPoolPage() {
         </Button>
       </Space>
 
-      {modelPoolQuery.isError ? (
+      {modelPoolQuery.isError && modelPoolQuery.error instanceof ApiClientError && modelPoolQuery.error.status === 403 ? (
+        <Result
+          status="403"
+          title="无权读取模型号池"
+          subTitle="服务端拒绝了当前会话的模型号池读取请求，请刷新权限后重试。"
+          extra={
+            <Button
+              type="primary"
+              onClick={() => {
+                void authorization.refresh();
+                void modelPoolQuery.refetch();
+              }}
+            >
+              重新验证权限
+            </Button>
+          }
+        />
+      ) : null}
+
+      {modelPoolQuery.isError && (!(modelPoolQuery.error instanceof ApiClientError) || modelPoolQuery.error.status !== 403) ? (
         <Alert
           type="error"
           showIcon
@@ -530,7 +557,25 @@ export function ModelPoolPage() {
             onChange={(value) => updateUsageQuery('sort', value)}
           />
         </Space>
-        {usageQuery.isError ? (
+        {usageQuery.isError && usageQuery.error instanceof ApiClientError && usageQuery.error.status === 403 ? (
+          <Result
+            status="403"
+            title="无权读取模型调用摘要"
+            subTitle="当前会话缺少 model_usage.read 权限。"
+            extra={
+              <Button
+                type="primary"
+                onClick={() => {
+                  void authorization.refresh();
+                  void usageQuery.refetch();
+                }}
+              >
+                重新验证权限
+              </Button>
+            }
+          />
+        ) : null}
+        {usageQuery.isError && (!(usageQuery.error instanceof ApiClientError) || usageQuery.error.status !== 403) ? (
           <Alert
             type="error"
             showIcon

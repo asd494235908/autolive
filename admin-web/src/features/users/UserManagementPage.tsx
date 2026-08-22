@@ -11,6 +11,7 @@ import {
   Input,
   InputNumber,
   Modal,
+  Result,
   Select,
   Space,
   Table,
@@ -19,6 +20,7 @@ import {
 import { useEffect, useMemo, useState } from 'react';
 import { apiClient, ApiClientError, createRequestId } from '../../api/client';
 import { StatusTag } from '../../components/StatusTag';
+import { useAdminAuthorization } from '../admin-rbac/useAdminAuthorization';
 import type {
   CreateUserRequest,
   ResetUserPasswordRequest,
@@ -34,6 +36,8 @@ import type {
 } from '../../types/api';
 
 export function UserManagementPage() {
+  const authorization = useAdminAuthorization();
+  const canManageUsers = authorization.can('users.manage');
   const { message, modal } = App.useApp();
   const queryClient = useQueryClient();
   const [form] = Form.useForm<CreateUserRequest>();
@@ -222,7 +226,7 @@ export function UserManagementPage() {
         render: (_: unknown, record: UserSummary) => (
           <Space>
             <Button
-              disabled={record.id === 'usr_local_admin'}
+              disabled={!canManageUsers || record.id === 'usr_local_admin'}
               onClick={() => {
                 setEditingUser(record);
                 editForm.setFieldsValue({
@@ -235,7 +239,7 @@ export function UserManagementPage() {
               编辑
             </Button>
             <Button
-              disabled={record.id === 'usr_local_admin'}
+              disabled={!canManageUsers || record.id === 'usr_local_admin'}
               onClick={() => {
                 setResettingUser(record);
                 resetForm.resetFields();
@@ -253,7 +257,7 @@ export function UserManagementPage() {
             </Button>
             <Button
               danger
-              disabled={record.status === 'disabled' || record.id === 'usr_local_admin'}
+              disabled={!canManageUsers || record.status === 'disabled' || record.id === 'usr_local_admin'}
               loading={disableUserMutation.isPending}
               onClick={() => {
                 modal.confirm({
@@ -307,12 +311,31 @@ export function UserManagementPage() {
           </Typography.Paragraph>
         </div>
 
-        <Button type="primary" onClick={() => setCreateOpen(true)}>
+        <Button type="primary" disabled={!canManageUsers} onClick={() => setCreateOpen(true)}>
           创建用户
         </Button>
       </Space>
 
-      {usersQuery.isError ? (
+      {usersQuery.isError && usersQuery.error instanceof ApiClientError && usersQuery.error.status === 403 ? (
+        <Result
+          status="403"
+          title="无权读取用户列表"
+          subTitle="服务端拒绝了当前会话的用户读取请求，请刷新权限后重试。"
+          extra={
+            <Button
+              type="primary"
+              onClick={() => {
+                void authorization.refresh();
+                void usersQuery.refetch();
+              }}
+            >
+              重新验证权限
+            </Button>
+          }
+        />
+      ) : null}
+
+      {usersQuery.isError && (!(usersQuery.error instanceof ApiClientError) || usersQuery.error.status !== 403) ? (
         <Alert
           type="error"
           showIcon
@@ -406,7 +429,10 @@ export function UserManagementPage() {
         width={720}
         onClose={() => setDevicesUser(null)}
       >
-        {userAuthorizationQuery.isError ? (
+        {userAuthorizationQuery.isError && userAuthorizationQuery.error instanceof ApiClientError && userAuthorizationQuery.error.status === 403 ? (
+          <Result status="403" title="无权读取用户授权摘要" subTitle="当前会话缺少 users.read 权限。" />
+        ) : null}
+        {userAuthorizationQuery.isError && (!(userAuthorizationQuery.error instanceof ApiClientError) || userAuthorizationQuery.error.status !== 403) ? (
           <Alert
             type="error"
             showIcon
@@ -469,12 +495,20 @@ export function UserManagementPage() {
             >
               <InputNumber min={0} max={1000000000} style={{ width: '100%' }} />
             </Form.Item>
-            <Button type="primary" htmlType="submit" loading={updateAuthorizationMutation.isPending}>
+            <Button
+              type="primary"
+              htmlType="submit"
+              loading={updateAuthorizationMutation.isPending}
+              disabled={!canManageUsers}
+            >
               保存授权策略
             </Button>
           </Form>
         </Card>
-        {userDevicesQuery.isError ? (
+        {userDevicesQuery.isError && userDevicesQuery.error instanceof ApiClientError && userDevicesQuery.error.status === 403 ? (
+          <Result status="403" title="无权读取用户设备列表" subTitle="当前会话缺少 users.read 权限。" />
+        ) : null}
+        {userDevicesQuery.isError && (!(userDevicesQuery.error instanceof ApiClientError) || userDevicesQuery.error.status !== 403) ? (
           <Alert
             type="error"
             showIcon

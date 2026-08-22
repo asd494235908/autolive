@@ -10,19 +10,14 @@ import {
 } from '@ant-design/icons';
 import { Button, Layout, Menu, Space, Typography } from 'antd';
 import type { PropsWithChildren, ReactNode } from 'react';
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiClient } from '../api/client';
 import { clearSession, readSession } from '../features/auth/session';
 import type { LogoutResponse } from '../types/api';
+import type { AdminRouteMetaItem } from '../features/admin-rbac/adminRouteMeta';
 
 const { Header, Sider, Content } = Layout;
-
-type NavItem = {
-  key: string;
-  label: string;
-  path: string;
-};
 
 const iconMap: Record<string, ReactNode> = {
   dashboard: <DesktopOutlined />,
@@ -32,24 +27,21 @@ const iconMap: Record<string, ReactNode> = {
   'model-pools': <PartitionOutlined />,
   'model-leases': <ApiOutlined />,
   'audit-logs': <FileSearchOutlined />,
-  security: <SettingOutlined />
+  security: <SettingOutlined />,
+  roles: <SafetyCertificateOutlined />,
 };
 
 export function AppLayout({
   children,
   currentPath,
-  navItems
+  navItems,
 }: PropsWithChildren<{
   currentPath: string;
-  navItems: NavItem[];
+  navItems: AdminRouteMetaItem[];
 }>) {
   const navigate = useNavigate();
   const [logoutPending, setLogoutPending] = useState(false);
-
-  const selectedKey = useMemo(() => {
-    const matched = navItems.find((item) => item.path === currentPath);
-    return matched?.key ?? 'dashboard';
-  }, [currentPath, navItems]);
+  const selectedKey = navItems.find((item) => item.path === currentPath)?.key ?? 'dashboard';
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
@@ -71,7 +63,7 @@ export function AppLayout({
             key: item.key,
             icon: iconMap[item.key] ?? <SafetyCertificateOutlined />,
             label: item.label,
-            onClick: () => navigate(item.path)
+            onClick: () => navigate(item.path),
           }))}
         />
       </Sider>
@@ -82,7 +74,7 @@ export function AppLayout({
             background: '#fff',
             paddingInline: 24,
             display: 'flex',
-            alignItems: 'center'
+            alignItems: 'center',
           }}
         >
           <Space style={{ width: '100%', justifyContent: 'space-between' }}>
@@ -101,7 +93,7 @@ export function AppLayout({
                     .post<LogoutResponse>('/api/v1/auth/logout', {
                       body: session?.tokens.refresh_token
                         ? { refresh_token: session.tokens.refresh_token }
-                        : undefined
+                        : undefined,
                     })
                     .catch(() => undefined)
                     .finally(() => {
@@ -123,7 +115,7 @@ export function AppLayout({
               minHeight: 'calc(100vh - 112px)',
               background: '#fff',
               borderRadius: 8,
-              padding: 24
+              padding: 24,
             }}
           >
             {children}

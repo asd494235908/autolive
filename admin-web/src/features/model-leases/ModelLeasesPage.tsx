@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Alert, Button, Card, Descriptions, Empty, Input, Modal, Popconfirm, Select, Space, Table, Tag, Typography } from 'antd';
+import { Alert, Button, Card, Descriptions, Empty, Input, Modal, Popconfirm, Result, Select, Space, Table, Tag, Typography } from 'antd';
 import { useState } from 'react';
 import { apiClient, ApiClientError, createRequestId } from '../../api/client';
 import { StatusTag } from '../../components/StatusTag';
+import { useAdminAuthorization } from '../admin-rbac/useAdminAuthorization';
 import type { ModelLeaseAdminDetailResponse, ModelLeaseAdminSummary, ModelLeaseListResponse, ModelLeaseStatus, ReleaseModelLeaseResponse } from '../../types/api';
 
 type ModelLeaseSort = 'expires_at_desc' | 'expires_at_asc' | 'status' | 'provider_model';
@@ -28,6 +29,8 @@ const initialFilters: ModelLeaseFilters = {
 };
 
 export function ModelLeasesPage() {
+  const authorization = useAdminAuthorization();
+  const canReclaimLease = authorization.can('model_leases.reclaim');
   const queryClient = useQueryClient();
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
@@ -113,6 +116,24 @@ export function ModelLeasesPage() {
       <Typography.Title level={2} style={{ margin: 0 }}>
         模型租约
       </Typography.Title>
+      {leasesQuery.isError && leasesQuery.error instanceof ApiClientError && leasesQuery.error.status === 403 ? (
+        <Result
+          status="403"
+          title="无权读取模型租约"
+          subTitle="服务端拒绝了当前会话的模型租约读取请求，请刷新权限后重试。"
+          extra={
+            <Button
+              type="primary"
+              onClick={() => {
+                void authorization.refresh();
+                void leasesQuery.refetch();
+              }}
+            >
+              重新验证权限
+            </Button>
+          }
+        />
+      ) : null}
       <Alert
         type={leasesQuery.isError ? 'error' : 'info'}
         showIcon
@@ -264,7 +285,7 @@ export function ModelLeasesPage() {
                   cancelText="取消"
                   onConfirm={() => reclaimMutation.mutate()}
                 >
-                  <Button danger loading={reclaimMutation.isPending}>
+                  <Button danger loading={reclaimMutation.isPending} disabled={!canReclaimLease}>
                     管理员回收租约
                   </Button>
                 </Popconfirm>

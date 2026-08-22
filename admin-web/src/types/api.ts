@@ -20,11 +20,13 @@ export type ApiRequestOptions = {
 };
 
 export type ActorRole = OpenAPISchemas['ActorRole'];
+export type ProductCode = OpenAPISchemas['ProductCode'];
 export type UserStatus = OpenAPISchemas['UserStatus'];
 export type DeviceStatus = OpenAPISchemas['DeviceStatus'];
 export type ActivationCodeStatus = OpenAPISchemas['ActivationCodeStatus'];
 export type ModelAccountStatus = OpenAPISchemas['ModelAccountStatus'];
 export type ModelLeaseStatus = OpenAPISchemas['ModelLeaseStatus'];
+export type AdminPermissionCode = OpenAPISchemas['AdminPermissionCode'];
 
 export type SessionTokens = OpenAPISchemas['SessionTokens'];
 export type UserSummary = OpenAPISchemas['UserSummary'];
@@ -54,6 +56,16 @@ export type HealthResponse = OpenAPISchemas['HealthResponse'];
 
 export type LoginRequest = OpenAPISchemas['LoginRequest'];
 export type LoginResponse = OpenAPISchemas['LoginResponse'];
+export type AdminMeResponse = OpenAPISchemas['AdminMeResponse'];
+export type AdminPermissionsResponse = OpenAPISchemas['AdminPermissionsResponse'];
+export type AdminRole = OpenAPISchemas['AdminRole'];
+export type AdminRoleEnvelope = OpenAPISchemas['AdminRoleEnvelope'];
+export type AdminRoleListResponse = OpenAPISchemas['AdminRoleListResponse'];
+export type AdminRoleCreateRequest = OpenAPISchemas['AdminRoleCreateRequest'];
+export type AdminRoleUpdateRequest = OpenAPISchemas['AdminRoleUpdateRequest'];
+export type AdminRoleAssignment = OpenAPISchemas['AdminRoleAssignment'];
+export type ReplaceUserAdminRolesRequest = OpenAPISchemas['ReplaceUserAdminRolesRequest'];
+export type UserAdminRolesResponse = OpenAPISchemas['UserAdminRolesResponse'];
 export type RefreshTokenResponse = OpenAPISchemas['RefreshTokenResponse'];
 export type LogoutResponse = OpenAPISchemas['LogoutResponse'];
 export type CreateUserRequest = OpenAPISchemas['CreateUserRequest'];

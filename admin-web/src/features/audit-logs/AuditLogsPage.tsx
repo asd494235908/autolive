@@ -1,7 +1,8 @@
 import { useQuery } from '@tanstack/react-query';
-import { Alert, Button, Card, Empty, Input, Select, Space, Table, Tag, Typography } from 'antd';
+import { Alert, Button, Card, Empty, Input, Result, Select, Space, Table, Tag, Typography } from 'antd';
 import { useState } from 'react';
 import { apiClient, ApiClientError } from '../../api/client';
+import { useAdminAuthorization } from '../admin-rbac/useAdminAuthorization';
 import type { AuditLog, AuditLogListResponse } from '../../types/api';
 
 type AuditOutcome = AuditLog['outcome'] | '';
@@ -42,6 +43,7 @@ const initialFilters: AuditFilters = {
 };
 
 export function AuditLogsPage() {
+  const authorization = useAdminAuthorization();
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [filters, setFilters] = useState<AuditFilters>(initialFilters);
@@ -96,6 +98,24 @@ export function AuditLogsPage() {
       <Typography.Title level={2} style={{ margin: 0 }}>
         审计日志
       </Typography.Title>
+      {auditLogsQuery.isError && auditLogsQuery.error instanceof ApiClientError && auditLogsQuery.error.status === 403 ? (
+        <Result
+          status="403"
+          title="无权读取审计日志"
+          subTitle="服务端拒绝了当前会话的审计读取请求，请刷新权限后重试。"
+          extra={
+            <Button
+              type="primary"
+              onClick={() => {
+                void authorization.refresh();
+                void auditLogsQuery.refetch();
+              }}
+            >
+              重新验证权限
+            </Button>
+          }
+        />
+      ) : null}
       <Alert
         type={auditLogsQuery.isError ? 'error' : 'info'}
         showIcon
