@@ -268,6 +268,7 @@ func TestOpenAPIAdminRequirePermissionRoutesDeclareAdminAuthorizationServiceUnav
 		t.Fatalf("ServiceUnavailable schema ref = %q, want ErrorResponse", ref)
 	}
 	foundAuthorizationUnavailable := false
+	const expectedAdminAuthorizationUnavailableMessage = "管理员权限暂时无法读取"
 	for exampleName, exampleNode := range content.Examples {
 		var example struct {
 			Value map[string]any `yaml:"value"`
@@ -280,6 +281,9 @@ func TestOpenAPIAdminRequirePermissionRoutesDeclareAdminAuthorizationServiceUnav
 		}
 		if strings.TrimSpace(fmt.Sprint(example.Value["message"])) == "" {
 			t.Fatalf("ServiceUnavailable example %s must include a non-empty message", exampleName)
+		}
+		if got := fmt.Sprint(example.Value["message"]); got != expectedAdminAuthorizationUnavailableMessage {
+			t.Fatalf("ServiceUnavailable example %s message = %q, want %q", exampleName, got, expectedAdminAuthorizationUnavailableMessage)
 		}
 		if strings.TrimSpace(fmt.Sprint(example.Value["request_id"])) == "" {
 			t.Fatalf("ServiceUnavailable example %s must include a non-empty request_id", exampleName)

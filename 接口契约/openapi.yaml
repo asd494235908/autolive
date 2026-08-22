@@ -2257,7 +2257,7 @@ components:
               summary: 管理员权限快照暂不可用
               value:
                 code: ADMIN_AUTHORIZATION_UNAVAILABLE
-                message: 管理员权限暂时不可用，请稍后重试
+                message: 管理员权限暂时无法读取
                 request_id: req_contract_admin_authorization_unavailable
     GatewayTimeout:
       description: 上游模型请求超时
