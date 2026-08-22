@@ -19,7 +19,8 @@
 2. 为三个列表查询增加固定上限
    - 在 store 层新增私有常量 `adminRBACListLimit = 200`。
    - `ListAdminPermissions` 改为显式 `LIMIT $1`。
-   - `ListAdminRoles` 改为显式 `LIMIT $2`。
+   - `ListAdminRoles` 最初改为显式 `LIMIT $2`，但 reviewer 复核发现该 `LIMIT` 直接作用在角色×权限 JOIN 结果上，可能截断后续角色或某个角色的权限。
+   - 现已进一步修正为：先在 `admin_roles` 子查询/CTE 中按产品过滤、全局 `super_admin` 可见和稳定排序选出固定上限的角色集合，再对该角色集合 `LEFT JOIN admin_role_permissions` 聚合完整权限。
    - `ListUserAdminRoles` 改为显式 `LIMIT $3`。
    - `ReplaceUserAdminRoles` 的幂等回放查询也同步使用带 `LIMIT` 的列表 SQL，避免回放路径绕开有界约束。
 
@@ -35,9 +36,12 @@
   - 钉住 `usr_local_admin` 自动补全局 `super_admin`
   - 钉住 `ListUserAdminRoles` 显式 `LIMIT`
 - 更新现有 SQLMock 断言
-  - `ListAdminRoles` 显式 `LIMIT`
+  - `ListAdminRoles` 显式 `LIMIT` 且 `LIMIT` 位于 role 子查询/CTE，不再直接截断 join 行
   - `ReplaceUserAdminRoles` 幂等回放列表查询显式 `LIMIT`
   - 现有 `ListUserAdminRoles` 过滤测试显式 `LIMIT`
+- 新增 `TestPostgresRepositoryListAdminRolesLimitsRoleSetBeforeJoiningPermissions`
+  - 钉住 `ListAdminRoles` 采用“先限角色集合、后连权限”的 SQL 结构
+  - 使用 203 条返回行验证聚合逻辑不会因 join 行数量超过 200 而丢失后续角色或其完整权限
 
 ## 执行命令
 
@@ -50,8 +54,10 @@
 3. `cd backend && go test ./internal/store -run 'AdminRBAC|RBAC' -count=1`
    - 结果：通过
 
+4. `git diff --check`
+   - 结果：通过
+
 ## 未验证项
 
 - 未运行 `cd backend && go test ./...`
 - 未连接真实 PostgreSQL 做集成验证；本次按任务要求只做 store 层聚焦 SQLMock 测试
-

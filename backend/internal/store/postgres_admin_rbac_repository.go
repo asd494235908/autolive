@@ -35,13 +35,18 @@ const (
 		  )
 	`
 	listAdminRolesQuery = `
+		WITH limited_roles AS (
+			SELECT code, product, name, built_in
+			FROM admin_roles
+			WHERE ($1 = '' OR code = 'super_admin' OR product = $1)
+			ORDER BY code ASC, product ASC
+			LIMIT $2
+		)
 		SELECT r.code, r.product, r.name, r.built_in, rp.permission_code
-		FROM admin_roles r
+		FROM limited_roles r
 		LEFT JOIN admin_role_permissions rp
 			ON rp.role_code = r.code
-		WHERE ($1 = '' OR r.code = 'super_admin' OR r.product = $1)
 		ORDER BY r.code ASC, r.product ASC, rp.permission_code ASC
-		LIMIT $2
 	`
 	getAdminRoleQuery = `
 		SELECT r.code, r.product, r.name, r.built_in, rp.permission_code
