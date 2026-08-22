@@ -842,11 +842,17 @@ export interface components {
             request_id: string;
             roles: components["schemas"]["AdminRole"][];
         };
-        AdminRoleRequest: {
+        AdminRoleCreateRequest: {
+            code: string;
+            product: components["schemas"]["ProductCode"];
+            name: string;
+            permissions?: components["schemas"]["AdminPermissionCode"][];
+        };
+        AdminRoleUpdateRequest: {
             code?: string;
             product?: components["schemas"]["ProductCode"];
             name: string;
-            permissions: components["schemas"]["AdminPermissionCode"][];
+            permissions?: components["schemas"]["AdminPermissionCode"][];
         };
         AdminRoleAssignment: {
             user_id: components["schemas"]["Id"];
@@ -1551,6 +1557,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     clientActivate: {
@@ -1862,9 +1869,11 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     createAdminUser: {
@@ -1896,10 +1905,12 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     listAdminUserDevices: {
@@ -2143,9 +2154,11 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     getAdminDevice: {
@@ -2276,9 +2289,11 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     createActivationCode: {
@@ -2310,9 +2325,11 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     revokeActivationCode: {
@@ -2410,10 +2427,12 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     disableModelPoolAccount: {
@@ -2782,6 +2801,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     listAdminPermissions: {
@@ -2808,6 +2828,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     listAdminRoles: {
@@ -2838,6 +2859,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     createAdminRole: {
@@ -2852,7 +2874,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["AdminRoleRequest"];
+                "application/json": components["schemas"]["AdminRoleCreateRequest"];
             };
         };
         responses: {
@@ -2873,6 +2895,7 @@ export interface operations {
             408: components["responses"]["RequestTimeout"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     getAdminRole: {
@@ -2903,6 +2926,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     deleteAdminRole: {
@@ -2935,6 +2959,7 @@ export interface operations {
             408: components["responses"]["RequestTimeout"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     updateAdminRole: {
@@ -2951,7 +2976,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["AdminRoleRequest"];
+                "application/json": components["schemas"]["AdminRoleUpdateRequest"];
             };
         };
         responses: {
@@ -2973,6 +2998,7 @@ export interface operations {
             408: components["responses"]["RequestTimeout"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     listUserAdminRoles: {
@@ -3001,9 +3027,11 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     replaceUserAdminRoles: {
@@ -3037,10 +3065,12 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     health: {

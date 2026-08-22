@@ -141,7 +141,17 @@ type pagination struct {
 }
 
 func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, auth *authenticator) {
-	mux.Handle("POST /api/v1/admin/auth/change-password", auth.requirePermission("admin_security.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	requireBuiltinLocalAdmin := func(next func(http.ResponseWriter, *http.Request, controlplane.Actor)) http.Handler {
+		return auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+			if !isBuiltinLocalAdmin(actor) {
+				writeAppError(w, r, controlplane.ErrLocalAdminRequired)
+				return
+			}
+			next(w, r, actor)
+		})
+	}
+
+	mux.Handle("POST /api/v1/admin/auth/change-password", requireBuiltinLocalAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var input controlplane.ChangeLocalAdminPasswordInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -186,6 +196,11 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/admin/users/{user_id}/devices", auth.requirePermission("users.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		userID, err := boundedIDPathValue(r.PathValue("user_id"))
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		product, err := resolveAdminProductScope(r, actor)
 		if err != nil {
 			writeAppError(w, r, err)
@@ -196,7 +211,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			writeAppError(w, r, err)
 			return
 		}
-		items, total, err := svc.ListDevicesForUserPageForProduct(r.Context(), r.PathValue("user_id"), pageNumber, pageSize, product)
+		items, total, err := svc.ListDevicesForUserPageForProduct(r.Context(), userID, pageNumber, pageSize, product)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -208,8 +223,13 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("GET /api/v1/admin/users/{user_id}/authorization-summary", auth.requirePermission("users.read", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		summary, err := svc.GetUserAuthorizationSummary(r.Context(), r.PathValue("user_id"))
+	mux.Handle("GET /api/v1/admin/users/{user_id}/authorization-summary", requireBuiltinLocalAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		userID, err := boundedIDPathValue(r.PathValue("user_id"))
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
+		summary, err := svc.GetUserAuthorizationSummary(r.Context(), userID)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -220,13 +240,18 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("PATCH /api/v1/admin/users/{user_id}/authorization", auth.requirePermission("users.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("PATCH /api/v1/admin/users/{user_id}/authorization", requireBuiltinLocalAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		userID, err := boundedIDPathValue(r.PathValue("user_id"))
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		var input controlplane.UpdateUserAuthorizationInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
 			return
 		}
-		policy, err := svc.UpdateUserAuthorization(r.Context(), r.Header.Get("Idempotency-Key"), r.PathValue("user_id"), input)
+		policy, err := svc.UpdateUserAuthorization(r.Context(), r.Header.Get("Idempotency-Key"), userID, input)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -237,7 +262,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/users", auth.requirePermission("users.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("POST /api/v1/admin/users", requireBuiltinLocalAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var input controlplane.CreateUserInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
@@ -254,8 +279,13 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/users/{user_id}/disable", auth.requirePermission("users.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		user, err := svc.DisableUser(r.Context(), r.Header.Get("Idempotency-Key"), r.PathValue("user_id"))
+	mux.Handle("POST /api/v1/admin/users/{user_id}/disable", requireBuiltinLocalAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		userID, err := boundedIDPathValue(r.PathValue("user_id"))
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
+		user, err := svc.DisableUser(r.Context(), r.Header.Get("Idempotency-Key"), userID)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -270,13 +300,18 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("PATCH /api/v1/admin/users/{user_id}", auth.requirePermission("users.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("PATCH /api/v1/admin/users/{user_id}", requireBuiltinLocalAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		userID, err := boundedIDPathValue(r.PathValue("user_id"))
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		var input controlplane.UpdateUserInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
 			return
 		}
-		user, err := svc.UpdateUser(r.Context(), r.Header.Get("Idempotency-Key"), r.PathValue("user_id"), input)
+		user, err := svc.UpdateUser(r.Context(), r.Header.Get("Idempotency-Key"), userID, input)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -291,13 +326,18 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		})
 	}))
 
-	mux.Handle("POST /api/v1/admin/users/{user_id}/reset-password", auth.requirePermission("users.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+	mux.Handle("POST /api/v1/admin/users/{user_id}/reset-password", requireBuiltinLocalAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		userID, err := boundedIDPathValue(r.PathValue("user_id"))
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		var input controlplane.ResetUserPasswordInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
 			return
 		}
-		user, err := svc.ResetUserPassword(r.Context(), r.Header.Get("Idempotency-Key"), r.PathValue("user_id"), input)
+		user, err := svc.ResetUserPassword(r.Context(), r.Header.Get("Idempotency-Key"), userID, input)
 		if err != nil {
 			writeAppError(w, r, err)
 			return

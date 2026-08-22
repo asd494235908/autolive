@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -14,6 +15,8 @@ const (
 	httpAdminRoleNameMaxLen    = 128
 	httpAdminAssignmentsMaxLen = 200
 )
+
+var httpIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$`)
 
 type adminMeResponse struct {
 	RequestID        string                        `json:"request_id"`
@@ -177,7 +180,7 @@ func registerAdminRBACRoutes(mux *http.ServeMux, svc *service.ControlPlane, auth
 	}))
 
 	mux.Handle("GET /api/v1/admin/users/{user_id}/roles", auth.requirePermission("roles.assign", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		userID, err := boundedPathValue(r.PathValue("user_id"), httpAdminRoleCodeMaxLen)
+		userID, err := boundedIDPathValue(r.PathValue("user_id"))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -199,7 +202,7 @@ func registerAdminRBACRoutes(mux *http.ServeMux, svc *service.ControlPlane, auth
 	}))
 
 	mux.Handle("PUT /api/v1/admin/users/{user_id}/roles", auth.requirePermission("roles.assign", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
-		userID, err := boundedPathValue(r.PathValue("user_id"), httpAdminRoleCodeMaxLen)
+		userID, err := boundedIDPathValue(r.PathValue("user_id"))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -334,6 +337,14 @@ func buildAssignments(userID string, product controlplane.ProductCode, roleCodes
 func boundedPathValue(value string, maxLen int) (string, error) {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" || len(trimmed) > maxLen {
+		return "", controlplane.ErrInvalidRequest
+	}
+	return trimmed, nil
+}
+
+func boundedIDPathValue(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if !httpIDPattern.MatchString(trimmed) {
 		return "", controlplane.ErrInvalidRequest
 	}
 	return trimmed, nil

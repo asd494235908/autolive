@@ -55,9 +55,17 @@ func TestAdminRBACContractDeclaresRoutesAndWriteGuards(t *testing.T) {
 		if _, ok := contract.Responses["401"]; !ok {
 			t.Fatalf("%s %s must declare 401", test.method, test.path)
 		}
+		if _, ok := contract.Responses["503"]; !ok {
+			t.Fatalf("%s %s must declare 503", test.method, test.path)
+		}
 		if test.path != "/api/v1/admin/me" {
 			if _, ok := contract.Responses["403"]; !ok {
 				t.Fatalf("%s %s must declare 403", test.method, test.path)
+			}
+		}
+		if test.path == "/api/v1/admin/users/{user_id}/roles" {
+			if _, ok := contract.Responses["404"]; !ok {
+				t.Fatalf("%s %s must declare 404", test.method, test.path)
 			}
 		}
 		if test.method == "post" || test.method == "patch" || test.method == "put" || test.method == "delete" {
@@ -78,15 +86,27 @@ func TestAdminRBACContractDeclaresRoutesAndWriteGuards(t *testing.T) {
 		"AdminMeResponse",
 		"AdminPermissionsResponse",
 		"AdminRole",
+		"AdminRoleCreateRequest",
+		"AdminRoleUpdateRequest",
 		"AdminRoleEnvelope",
 		"AdminRoleListResponse",
-		"AdminRoleRequest",
 		"ReplaceUserAdminRolesRequest",
 		"UserAdminRolesResponse",
 	} {
 		if _, ok := document.Components["schemas"][schema]; !ok {
 			t.Fatalf("OpenAPI schema %s is missing", schema)
 		}
+	}
+
+	var roleRequestSchema struct {
+		Required []string `yaml:"required"`
+	}
+	roleRequestNode := document.Components["schemas"]["AdminRoleCreateRequest"]
+	if err := roleRequestNode.Decode(&roleRequestSchema); err != nil {
+		t.Fatalf("decode AdminRoleCreateRequest: %v", err)
+	}
+	if !slices.Equal(roleRequestSchema.Required, []string{"code", "product", "name"}) {
+		t.Fatalf("AdminRoleCreateRequest.required = %#v, want [code product name]", roleRequestSchema.Required)
 	}
 }
 
@@ -340,7 +360,6 @@ func TestPermissionRoutesUseInstantPermissionsInsteadOfActorRole(t *testing.T) {
 		{name: "model usage read", method: http.MethodGet, path: "/api/v1/admin/model-usage", token: env.tokens["reader"], wantStatus: http.StatusOK},
 		{name: "model leases read", method: http.MethodGet, path: "/api/v1/admin/model-leases", token: env.tokens["reader"], wantStatus: http.StatusOK},
 		{name: "audit logs read", method: http.MethodGet, path: "/api/v1/admin/audit-logs?action=seed", token: env.tokens["reader"], wantStatus: http.StatusOK},
-		{name: "security manage reaches handler", method: http.MethodPost, path: "/api/v1/admin/auth/change-password", token: env.tokens["security"], body: map[string]any{}, idempotent: "security-invalid-body", wantStatus: http.StatusBadRequest},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			response := doJSON(t, env.handler, test.method, test.path, test.body, test.token, test.idempotent)
@@ -356,6 +375,120 @@ func TestPermissionRoutesUseInstantPermissionsInsteadOfActorRole(t *testing.T) {
 		t.Fatalf("fail-closed users list status = %d, want %d; body=%s", failClosed.Code, http.StatusServiceUnavailable, failClosed.Body.String())
 	}
 	assertErrorCode(t, failClosed.Body.Bytes(), "ADMIN_AUTHORIZATION_UNAVAILABLE")
+}
+
+func TestAdminRBACLocalAdminCompatibilityRoutesRemainBuiltinOnly(t *testing.T) {
+	env := newAdminRBACHTTPTestEnv(t, "")
+
+	securityDenied := doJSON(t, env.handler, http.MethodPost, "/api/v1/admin/auth/change-password", map[string]any{
+		"password": "rotated-password-001",
+	}, env.tokens["security"], "security-change-password")
+	if securityDenied.Code != http.StatusForbidden {
+		t.Fatalf("security manager local admin password status = %d, want %d; body=%s", securityDenied.Code, http.StatusForbidden, securityDenied.Body.String())
+	}
+
+	changePassword := doJSON(t, env.handler, http.MethodPost, "/api/v1/admin/auth/change-password", map[string]any{
+		"password": "rotated-password-001",
+	}, env.tokens["local"], "local-change-password")
+	if changePassword.Code != http.StatusOK {
+		t.Fatalf("local admin change password status = %d, want %d; body=%s", changePassword.Code, http.StatusOK, changePassword.Body.String())
+	}
+
+	oldLogin := doLoginRequest(t, env.handler, "admin", "password")
+	if oldLogin.Code != http.StatusUnauthorized {
+		t.Fatalf("old local admin password login status = %d, want %d; body=%s", oldLogin.Code, http.StatusUnauthorized, oldLogin.Body.String())
+	}
+	newLogin := doLoginRequest(t, env.handler, "admin", "rotated-password-001")
+	if newLogin.Code != http.StatusOK {
+		t.Fatalf("new local admin password login status = %d, want %d; body=%s", newLogin.Code, http.StatusOK, newLogin.Body.String())
+	}
+	localToken := loginWithCredentialsForTest(t, env.handler, `{"username":"admin","password":"rotated-password-001","product":"autolive"}`)
+
+	for _, test := range []struct {
+		name       string
+		method     string
+		path       string
+		body       any
+		wantStatus int
+	}{
+		{name: "authorization summary", method: http.MethodGet, path: "/api/v1/admin/users/usr_target/authorization-summary", wantStatus: http.StatusForbidden},
+		{name: "authorization update", method: http.MethodPatch, path: "/api/v1/admin/users/usr_target/authorization", body: map[string]any{"allowed_models": []string{}, "daily_token_limit": 0}, wantStatus: http.StatusForbidden},
+		{name: "create user", method: http.MethodPost, path: "/api/v1/admin/users", body: map[string]any{"username": "created-by-scoped", "password": "created-password", "role": "user"}, wantStatus: http.StatusForbidden},
+		{name: "disable user", method: http.MethodPost, path: "/api/v1/admin/users/usr_target/disable", wantStatus: http.StatusForbidden},
+		{name: "update user", method: http.MethodPatch, path: "/api/v1/admin/users/usr_target", body: map[string]any{"username": "renamed-target"}, wantStatus: http.StatusForbidden},
+		{name: "reset password", method: http.MethodPost, path: "/api/v1/admin/users/usr_target/reset-password", body: map[string]any{"password": "reset-target-password"}, wantStatus: http.StatusForbidden},
+	} {
+		t.Run("scoped denied "+test.name, func(t *testing.T) {
+			response := doJSON(t, env.handler, test.method, test.path, test.body, env.tokens["users_manager"], "scoped-only")
+			if response.Code != test.wantStatus {
+				t.Fatalf("%s status = %d, want %d; body=%s", test.name, response.Code, test.wantStatus, response.Body.String())
+			}
+		})
+	}
+
+	createUser := doJSON(t, env.handler, http.MethodPost, "/api/v1/admin/users", map[string]any{
+		"username": "local-created-user",
+		"password": "local-created-password",
+		"role":     "user",
+	}, localToken, "local-create-user")
+	if createUser.Code != http.StatusCreated {
+		t.Fatalf("local create user status = %d, want %d; body=%s", createUser.Code, http.StatusCreated, createUser.Body.String())
+	}
+	var created userEnvelope
+	decodeJSON(t, createUser.Body.Bytes(), &created)
+
+	summary := doJSON(t, env.handler, http.MethodGet, "/api/v1/admin/users/"+created.User.ID+"/authorization-summary", nil, localToken, "")
+	if summary.Code != http.StatusOK {
+		t.Fatalf("local authorization summary status = %d, want %d; body=%s", summary.Code, http.StatusOK, summary.Body.String())
+	}
+
+	updateAuth := doJSON(t, env.handler, http.MethodPatch, "/api/v1/admin/users/"+created.User.ID+"/authorization", map[string]any{
+		"allowed_models":    []string{},
+		"daily_token_limit": 123,
+	}, localToken, "local-update-auth")
+	if updateAuth.Code != http.StatusOK {
+		t.Fatalf("local authorization update status = %d, want %d; body=%s", updateAuth.Code, http.StatusOK, updateAuth.Body.String())
+	}
+
+	updateUser := doJSON(t, env.handler, http.MethodPatch, "/api/v1/admin/users/"+created.User.ID, map[string]any{
+		"username": "local-created-user-2",
+	}, localToken, "local-update-user")
+	if updateUser.Code != http.StatusOK {
+		t.Fatalf("local update user status = %d, want %d; body=%s", updateUser.Code, http.StatusOK, updateUser.Body.String())
+	}
+
+	resetPassword := doJSON(t, env.handler, http.MethodPost, "/api/v1/admin/users/"+created.User.ID+"/reset-password", map[string]any{
+		"password": "reset-created-password",
+	}, localToken, "local-reset-password")
+	if resetPassword.Code != http.StatusOK {
+		t.Fatalf("local reset password status = %d, want %d; body=%s", resetPassword.Code, http.StatusOK, resetPassword.Body.String())
+	}
+
+	disableUser := doJSON(t, env.handler, http.MethodPost, "/api/v1/admin/users/"+created.User.ID+"/disable", nil, localToken, "local-disable-user")
+	if disableUser.Code != http.StatusOK {
+		t.Fatalf("local disable user status = %d, want %d; body=%s", disableUser.Code, http.StatusOK, disableUser.Body.String())
+	}
+}
+
+func TestAdminRBACUserRoleRoutesValidateUserIDPattern(t *testing.T) {
+	env := newAdminRBACHTTPTestEnv(t, "")
+
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+		body   any
+	}{
+		{name: "list roles invalid user id", method: http.MethodGet, path: "/api/v1/admin/users/bad!/roles?product=autolive"},
+		{name: "replace roles invalid user id", method: http.MethodPut, path: "/api/v1/admin/users/bad!/roles", body: map[string]any{"product": "autolive", "role_codes": []string{"roles_manager_auto"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := doJSON(t, env.handler, test.method, test.path, test.body, env.tokens["roles"], "invalid-user-id")
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("%s status = %d, want %d; body=%s", test.name, response.Code, http.StatusBadRequest, response.Body.String())
+			}
+		})
+	}
 }
 
 type adminRBACHTTPTestEnv struct {
@@ -389,12 +522,13 @@ func newAdminRBACHTTPTestEnv(t *testing.T, failUserID string) adminRBACHTTPTestE
 		seedAdminRBACHTTPUser(t, state, now, "usr_reader", "reader", "reader-password", controlplane.RoleUser)
 		seedAdminRBACHTTPUser(t, state, now, "usr_roles", "roles-admin", "roles-password", controlplane.RoleUser)
 		seedAdminRBACHTTPUser(t, state, now, "usr_security", "security-admin", "security-password", controlplane.RoleUser)
+		seedAdminRBACHTTPUser(t, state, now, "usr_users_manager", "users-manager", "users-manager-password", controlplane.RoleUser)
 		seedAdminRBACHTTPUser(t, state, now, "usr_plain", "plain-user", "plain-password", controlplane.RoleUser)
 		seedAdminRBACHTTPUser(t, state, now, "usr_target", "target-user", "target-password", controlplane.RoleUser)
 		seedAdminRBACHTTPUser(t, state, now, "usr_global", "global-admin", "global-password", controlplane.RoleUser)
 		seedAdminRBACHTTPUser(t, state, now, "usr_broken", "broken-admin", "broken-password", controlplane.RoleUser)
 
-		for _, userID := range []string{"usr_reader", "usr_roles", "usr_security", "usr_plain", "usr_target", "usr_global", "usr_broken"} {
+		for _, userID := range []string{"usr_reader", "usr_roles", "usr_security", "usr_users_manager", "usr_plain", "usr_target", "usr_global", "usr_broken"} {
 			state.UserProducts[userID+":autolive"] = controlplane.UserProductMembership{UserID: userID, Product: controlplane.ProductAutoLive, Status: "active"}
 		}
 		state.UserProducts["usr_target:douyin_desktop"] = controlplane.UserProductMembership{UserID: "usr_target", Product: controlplane.ProductDouyinDesktop, Status: "active"}
@@ -418,6 +552,12 @@ func newAdminRBACHTTPTestEnv(t *testing.T, failUserID string) adminRBACHTTPTestE
 			Permissions: []controlplane.PermissionCode{"admin_security.manage"},
 		})
 		seedAdminRBACHTTPRole(state, store.AdminRoleRecord{
+			Code:        "users_manager_auto",
+			Product:     controlplane.ProductAutoLive,
+			Name:        "AutoLive Users Manager",
+			Permissions: []controlplane.PermissionCode{"users.manage", "users.read"},
+		})
+		seedAdminRBACHTTPRole(state, store.AdminRoleRecord{
 			Code:        "douyin_reader",
 			Product:     controlplane.ProductDouyinDesktop,
 			Name:        "Douyin Reader",
@@ -427,6 +567,7 @@ func newAdminRBACHTTPTestEnv(t *testing.T, failUserID string) adminRBACHTTPTestE
 		state.UserAdminRoles["usr_reader\x1freader_bundle_auto\x1fautolive"] = controlplane.AdminRoleAssignment{UserID: "usr_reader", RoleCode: "reader_bundle_auto", Product: controlplane.ProductAutoLive}
 		state.UserAdminRoles["usr_roles\x1froles_manager_auto\x1fautolive"] = controlplane.AdminRoleAssignment{UserID: "usr_roles", RoleCode: "roles_manager_auto", Product: controlplane.ProductAutoLive}
 		state.UserAdminRoles["usr_security\x1fsecurity_manager_auto\x1fautolive"] = controlplane.AdminRoleAssignment{UserID: "usr_security", RoleCode: "security_manager_auto", Product: controlplane.ProductAutoLive}
+		state.UserAdminRoles["usr_users_manager\x1fusers_manager_auto\x1fautolive"] = controlplane.AdminRoleAssignment{UserID: "usr_users_manager", RoleCode: "users_manager_auto", Product: controlplane.ProductAutoLive}
 		state.UserAdminRoles["usr_global\x1fsuper_admin\x1f"] = controlplane.AdminRoleAssignment{UserID: "usr_global", RoleCode: controlplane.BuiltinAdminRoleSuperAdmin}
 		state.UserAdminRoles["usr_broken\x1froles_manager_auto\x1fautolive"] = controlplane.AdminRoleAssignment{UserID: "usr_broken", RoleCode: "roles_manager_auto", Product: controlplane.ProductAutoLive}
 
@@ -454,12 +595,14 @@ func newAdminRBACHTTPTestEnv(t *testing.T, failUserID string) adminRBACHTTPTestE
 	return adminRBACHTTPTestEnv{
 		handler: handler,
 		tokens: map[string]string{
-			"reader":   loginWithCredentialsAtIPForTest(t, handler, `{"username":"reader","password":"reader-password","product":"autolive"}`, "198.51.100.11:1234"),
-			"roles":    loginWithCredentialsAtIPForTest(t, handler, `{"username":"roles-admin","password":"roles-password","product":"autolive"}`, "198.51.100.12:1234"),
-			"security": loginWithCredentialsAtIPForTest(t, handler, `{"username":"security-admin","password":"security-password","product":"autolive"}`, "198.51.100.13:1234"),
-			"plain":    loginWithCredentialsAtIPForTest(t, handler, `{"username":"plain-user","password":"plain-password","product":"autolive"}`, "198.51.100.14:1234"),
-			"global":   loginWithCredentialsAtIPForTest(t, handler, `{"username":"global-admin","password":"global-password","product":"autolive"}`, "198.51.100.15:1234"),
-			"broken":   loginWithCredentialsAtIPForTest(t, handler, `{"username":"broken-admin","password":"broken-password","product":"autolive"}`, "198.51.100.16:1234"),
+			"reader":        loginWithCredentialsAtIPForTest(t, handler, `{"username":"reader","password":"reader-password","product":"autolive"}`, "198.51.100.11:1234"),
+			"roles":         loginWithCredentialsAtIPForTest(t, handler, `{"username":"roles-admin","password":"roles-password","product":"autolive"}`, "198.51.100.12:1234"),
+			"security":      loginWithCredentialsAtIPForTest(t, handler, `{"username":"security-admin","password":"security-password","product":"autolive"}`, "198.51.100.13:1234"),
+			"users_manager": loginWithCredentialsAtIPForTest(t, handler, `{"username":"users-manager","password":"users-manager-password","product":"autolive"}`, "198.51.100.17:1234"),
+			"plain":         loginWithCredentialsAtIPForTest(t, handler, `{"username":"plain-user","password":"plain-password","product":"autolive"}`, "198.51.100.14:1234"),
+			"global":        loginWithCredentialsAtIPForTest(t, handler, `{"username":"global-admin","password":"global-password","product":"autolive"}`, "198.51.100.15:1234"),
+			"broken":        loginWithCredentialsAtIPForTest(t, handler, `{"username":"broken-admin","password":"broken-password","product":"autolive"}`, "198.51.100.16:1234"),
+			"local":         loginWithCredentialsAtIPForTest(t, handler, `{"username":"admin","password":"password","product":"autolive"}`, "198.51.100.18:1234"),
 		},
 	}
 }

@@ -113,6 +113,8 @@ paths:
                 $ref: '#/components/schemas/LogoutResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -466,6 +468,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -503,8 +509,12 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -800,6 +810,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -951,6 +965,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -987,6 +1005,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1096,8 +1118,12 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1603,6 +1629,8 @@ paths:
                 $ref: '#/components/schemas/AdminMeResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1630,6 +1658,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1661,6 +1691,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1680,7 +1712,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/AdminRoleRequest'
+              $ref: '#/components/schemas/AdminRoleCreateRequest'
       responses:
         '201':
           description: 角色已创建
@@ -1699,6 +1731,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1738,6 +1772,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1764,7 +1800,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/AdminRoleRequest'
+              $ref: '#/components/schemas/AdminRoleUpdateRequest'
       responses:
         '200':
           description: 角色已更新
@@ -1785,6 +1821,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1822,6 +1860,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1862,6 +1902,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1903,8 +1947,12 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -2411,10 +2459,30 @@ components:
           maxItems: 200
           items:
             $ref: '#/components/schemas/AdminRole'
-    AdminRoleRequest:
+    AdminRoleCreateRequest:
       type: object
       additionalProperties: false
-      required: [name, permissions]
+      required: [code, product, name]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 128
+        product:
+          $ref: '#/components/schemas/ProductCode'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        permissions:
+          type: array
+          maxItems: 46
+          items:
+            $ref: '#/components/schemas/AdminPermissionCode'
+    AdminRoleUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
       properties:
         code:
           type: string
