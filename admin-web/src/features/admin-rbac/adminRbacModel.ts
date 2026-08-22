@@ -9,6 +9,42 @@ export type RoleDraft = {
   permissions?: AdminPermissionCode[] | null;
 };
 
+type AdminProductAuthorization = {
+  isLoading: boolean;
+  error: unknown;
+  product: ProductCode | null;
+  isSuperAdmin: boolean;
+};
+
+export function getPermissionKeysFromTreeEvent(
+  event: unknown,
+  availablePermissions: readonly AdminPermissionCode[]
+) {
+  const checkedValue =
+    Array.isArray(event)
+      ? event
+      : event && typeof event === 'object' && 'checked' in event
+        ? (event as { checked?: unknown }).checked
+        : [];
+  const checkedKeys = Array.isArray(checkedValue) ? checkedValue : [];
+  const allowed = new Set(availablePermissions);
+
+  return checkedKeys.filter(
+    (key): key is AdminPermissionCode => typeof key === 'string' && allowed.has(key as AdminPermissionCode)
+  );
+}
+
+export function resolveAdminProductScope(
+  authorization: AdminProductAuthorization,
+  currentSelection: ProductCode | null
+) {
+  if (authorization.isLoading || authorization.error != null || authorization.product === null) {
+    return null;
+  }
+
+  return authorization.isSuperAdmin ? currentSelection ?? authorization.product : authorization.product;
+}
+
 export function validateRoleDraft(values: RoleDraft) {
   const errors: Array<[string, string]> = [];
   const code = values.code?.trim() ?? '';

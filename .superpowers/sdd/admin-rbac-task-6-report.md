@@ -30,6 +30,8 @@
 - 新增 `useAdminAuthorization()`，固定使用 React Query key `['admin-me']` 读取 `/api/v1/admin/me`，缺失数据、加载中、请求失败均 fail-closed。
 - 路由和菜单改为复用同一份权限元数据，直接 URL 未授权显示 `AdminForbiddenPage`，授权信息加载失败显示 Ant Design 加载/错误态。
 - 新增 RBAC 管理页，覆盖角色列表、权限分组、角色创建/编辑/删除、产品范围用户角色替换，以及内建超管只读禁用控件。
+- 根据审查修复权限 Tree：角色表单使用 Ant Design Form 的 `valuePropName="checkedKeys"`、`trigger="onCheck"` 和 `getValueFromEvent`，统一归一化数组及 `{ checked, halfChecked }` 事件，确保创建/编辑提交读取勾选权限。
+- 根据审查修复产品范围状态：产品授权完成前查询保持禁用；非全局管理员强制遵循 `authorization.product`，全局超管保留自己的产品选择；删除未使用的 `assignableRoles`。
 - 既有管理页接入固定读写权限控制，读权限保留列表/详情，写权限控制创建、编辑、禁用、换密钥、测试、回收等操作按钮；服务端 403 显示明确错误状态。
 - 前端测试脚本改为 `tsx --test`，以支持新增 TS/TSX 测试入口。
 
@@ -37,7 +39,7 @@
 
 - `cd admin-web && pnpm api:check`：通过
 - `cd admin-web && pnpm typecheck`：通过
-- `cd admin-web && pnpm test`：通过
+- `cd admin-web && pnpm test`：通过（18/18）
 - `cd admin-web && pnpm build`：通过
 - `git diff --check`：通过
 
@@ -48,6 +50,8 @@
 - 403 无权限 fixture
 - 权限变更后重新取数
 - 角色表单校验与提交重试辅助
+- 权限 Tree 的数组 `checkedKeys` 与 `{ checked, halfChecked }` 事件均只回写权限叶子节点
+- 产品授权加载/错误 fail-closed、非全局管理员产品强制跟随授权、全局超管保留选择
 
 ## 未验证项
 

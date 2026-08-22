@@ -35,8 +35,10 @@ import type {
 import {
   buildPermissionTreeData,
   createRetryableSubmission,
+  getPermissionKeysFromTreeEvent,
   getDomainLabel,
   groupPermissionsByDomain,
+  resolveAdminProductScope,
   validateRoleDraft,
 } from './adminRbacModel';
 import { useAdminAuthorization } from './useAdminAuthorization';
@@ -74,7 +76,7 @@ export function AdminRbacPage() {
   const queryClient = useQueryClient();
   const [roleForm] = Form.useForm<RoleFormValues>();
   const [assignmentForm] = Form.useForm<AssignmentFormValues>();
-  const [selectedProduct, setSelectedProduct] = useState<ProductCode>('autolive');
+  const [selectedProduct, setSelectedProduct] = useState<ProductCode | null>(null);
   const [roleModalMode, setRoleModalMode] = useState<'create' | 'edit' | null>(null);
   const [editingRole, setEditingRole] = useState<AdminRole | null>(null);
   const [detailRole, setDetailRole] = useState<AdminRole | null>(null);
@@ -82,17 +84,38 @@ export function AdminRbacPage() {
   const [assignmentSubmitError, setAssignmentSubmitError] = useState<string | null>(null);
   const [assignmentUserInput, setAssignmentUserInput] = useState('');
   const [assignmentUserId, setAssignmentUserId] = useState('');
-  const [assignmentProduct, setAssignmentProduct] = useState<ProductCode>('autolive');
+  const [assignmentProduct, setAssignmentProduct] = useState<ProductCode | null>(null);
   const [assignmentModalOpen, setAssignmentModalOpen] = useState(false);
   const roleSubmission = useRef(createRetryableSubmission(createRequestId));
   const assignmentSubmission = useRef(createRetryableSubmission(createRequestId));
 
+  const selectedProductForQuery = resolveAdminProductScope(
+    authorization,
+    selectedProduct
+  );
+  const assignmentProductForQuery = resolveAdminProductScope(
+    authorization,
+    assignmentProduct
+  );
+
   useEffect(() => {
-    if (authorization.product) {
-      setSelectedProduct((current) => current ?? authorization.product);
-      setAssignmentProduct((current) => current ?? authorization.product);
+    const nextSelectedProduct = resolveAdminProductScope(authorization, selectedProduct);
+    const nextAssignmentProduct = resolveAdminProductScope(authorization, assignmentProduct);
+
+    if (nextSelectedProduct !== null) {
+      setSelectedProduct(nextSelectedProduct);
     }
-  }, [authorization.product]);
+    if (nextAssignmentProduct !== null) {
+      setAssignmentProduct(nextAssignmentProduct);
+    }
+  }, [
+    authorization.error,
+    authorization.isLoading,
+    authorization.isSuperAdmin,
+    authorization.product,
+    assignmentProduct,
+    selectedProduct,
+  ]);
 
   const permissionsQuery = useQuery({
     queryKey: ['admin-permissions'],
@@ -101,21 +124,32 @@ export function AdminRbacPage() {
   });
 
   const rolesQuery = useQuery({
-    queryKey: ['admin-roles', selectedProduct],
-    queryFn: () =>
-      apiClient.get<AdminRoleListResponse>('/api/v1/admin/roles', {
-        query: { product: selectedProduct },
-      }),
-    enabled: authorization.can('roles.read'),
+    queryKey: ['admin-roles', selectedProductForQuery],
+    queryFn: () => {
+      if (selectedProductForQuery === null) {
+        throw new Error('产品范围尚未就绪');
+      }
+      return apiClient.get<AdminRoleListResponse>('/api/v1/admin/roles', {
+        query: { product: selectedProductForQuery },
+      });
+    },
+    enabled: authorization.can('roles.read') && selectedProductForQuery !== null,
   });
 
   const assignmentsQuery = useQuery({
-    queryKey: ['admin-user-roles', assignmentUserId, assignmentProduct],
-    queryFn: () =>
-      apiClient.get<UserAdminRolesResponse>(`/api/v1/admin/users/${assignmentUserId}/roles`, {
-        query: { product: assignmentProduct },
-      }),
-    enabled: authorization.can('roles.assign') && assignmentUserId.length > 0,
+    queryKey: ['admin-user-roles', assignmentUserId, assignmentProductForQuery],
+    queryFn: () => {
+      if (assignmentProductForQuery === null || assignmentUserId.length === 0) {
+        throw new Error('产品范围或用户尚未就绪');
+      }
+      return apiClient.get<UserAdminRolesResponse>(`/api/v1/admin/users/${assignmentUserId}/roles`, {
+        query: { product: assignmentProductForQuery },
+      });
+    },
+    enabled:
+      authorization.can('roles.assign') &&
+      assignmentUserId.length > 0 &&
+      assignmentProductForQuery !== null,
   });
 
   const createRoleMutation = useMutation({
@@ -198,7 +232,9 @@ export function AdminRbacPage() {
       setAssignmentSubmitError(null);
       setAssignmentModalOpen(false);
       void message.success(`用户角色已替换（request_id：${response.request_id}）`);
-      await queryClient.invalidateQueries({ queryKey: ['admin-user-roles', assignmentUserId, assignmentProduct] });
+      await queryClient.invalidateQueries({
+        queryKey: ['admin-user-roles', assignmentUserId, assignmentProductForQuery],
+      });
     },
     onError: (error) => {
       setAssignmentSubmitError(
@@ -219,27 +255,16 @@ export function AdminRbacPage() {
     [permissionsQuery.data]
   );
 
-  const groupedPermissions = useMemo(
-    () => groupPermissionsByDomain(permissionsQuery.data?.permissions ?? []),
-    [permissionsQuery.data]
-  );
-
-  const assignableRoles = useMemo(
-    () =>
-      (rolesQuery.data?.roles ?? []).filter((role) => role.product === selectedProduct || role.product === null),
-    [rolesQuery.data, selectedProduct]
-  );
-
   const assignmentOptions = useMemo(
     () =>
       (rolesQuery.data?.roles ?? [])
-        .filter((role) => role.product === assignmentProduct || role.product === null)
+        .filter((role) => role.product === assignmentProductForQuery || role.product === null)
         .map((role) => ({
           label: `${role.name}（${role.code}）`,
           value: role.code,
           disabled: role.built_in,
         })),
-    [assignmentProduct, rolesQuery.data]
+    [assignmentProductForQuery, rolesQuery.data]
   );
 
   const roleColumns = [
@@ -271,6 +296,10 @@ export function AdminRbacPage() {
           <Button
             disabled={!authorization.can('roles.manage') || role.built_in}
             onClick={() => {
+              const roleProduct = role.product ?? selectedProductForQuery;
+              if (roleProduct === null) {
+                return;
+              }
               roleSubmission.current.reset();
               setRoleSubmitError(null);
               setEditingRole(role);
@@ -278,7 +307,7 @@ export function AdminRbacPage() {
               roleForm.setFieldsValue({
                 code: role.code,
                 name: role.name,
-                product: role.product ?? selectedProduct,
+                product: roleProduct,
                 permissions: role.permissions,
               });
             }}
@@ -339,9 +368,13 @@ export function AdminRbacPage() {
   };
 
   const submitAssignments = async () => {
+    if (assignmentProductForQuery === null) {
+      setAssignmentSubmitError('产品范围尚未就绪，请等待管理员授权加载完成后重试。');
+      return;
+    }
     const values = await assignmentForm.validateFields();
     await replaceAssignmentsMutation.mutateAsync({
-      product: assignmentProduct,
+      product: assignmentProductForQuery,
       role_codes: [...(values.role_codes ?? [])].sort(),
     });
   };
@@ -382,7 +415,7 @@ export function AdminRbacPage() {
 
         <Space>
           <Select<ProductCode>
-            value={selectedProduct}
+            value={selectedProductForQuery ?? undefined}
             style={{ width: 160 }}
             options={productOptions}
             disabled={!authorization.isSuperAdmin && !!authorization.product}
@@ -390,8 +423,11 @@ export function AdminRbacPage() {
           />
           <Button
             type="primary"
-            disabled={!authorization.can('roles.manage')}
+            disabled={!authorization.can('roles.manage') || selectedProductForQuery === null}
             onClick={() => {
+              if (selectedProductForQuery === null) {
+                return;
+              }
               roleSubmission.current.reset();
               setRoleSubmitError(null);
               setEditingRole(null);
@@ -399,7 +435,7 @@ export function AdminRbacPage() {
               roleForm.setFieldsValue({
                 code: '',
                 name: '',
-                product: selectedProduct,
+                product: selectedProductForQuery,
                 permissions: [],
               });
             }}
@@ -499,7 +535,7 @@ export function AdminRbacPage() {
               style={{ width: 220 }}
             />
             <Select<ProductCode>
-              value={assignmentProduct}
+              value={assignmentProductForQuery ?? undefined}
               style={{ width: 160 }}
               options={productOptions}
               disabled={!authorization.isSuperAdmin && !!authorization.product}
@@ -554,7 +590,9 @@ export function AdminRbacPage() {
             <Space direction="vertical" size="middle" style={{ width: '100%' }}>
               <Descriptions bordered size="small" column={1}>
                 <Descriptions.Item label="用户 ID">{assignmentUserId}</Descriptions.Item>
-                <Descriptions.Item label="产品范围">{formatProduct(assignmentProduct)}</Descriptions.Item>
+                <Descriptions.Item label="产品范围">
+                  {assignmentProductForQuery ? formatProduct(assignmentProductForQuery) : '未就绪'}
+                </Descriptions.Item>
                 <Descriptions.Item label="当前角色">
                   <Space wrap>
                     {(assignmentsQuery.data?.assignments ?? []).length === 0 ? (
@@ -627,6 +665,11 @@ export function AdminRbacPage() {
           <Form.Item
             label="权限集合"
             name="permissions"
+            valuePropName="checkedKeys"
+            trigger="onCheck"
+            getValueFromEvent={(checkedKeys) =>
+              getPermissionKeysFromTreeEvent(checkedKeys, permissionsQuery.data?.permissions ?? [])
+            }
             rules={[{ required: true, message: '至少选择一个权限' }]}
           >
             <Tree checkable selectable={false} treeData={permissionTreeData} />

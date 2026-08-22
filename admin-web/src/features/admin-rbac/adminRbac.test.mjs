@@ -15,7 +15,9 @@ import {
 import {
   FORBIDDEN_RESULT_TEXT,
   createRetryableSubmission,
+  getPermissionKeysFromTreeEvent,
   groupPermissionsByDomain,
+  resolveAdminProductScope,
   validateRoleDraft,
 } from './adminRbacModel.ts';
 import {
@@ -165,4 +167,51 @@ test('角色表单校验和提交重试辅助符合预期', () => {
   ]);
   assert.deepEqual(Object.keys(groups), ['model_pool', 'roles', 'users']);
   assert.deepEqual(groups.users, ['users.manage', 'users.read']);
+});
+
+test('权限 Tree 的数组和 checked 对象事件都会回写为权限集合', () => {
+  const availablePermissions = ['users.read', 'users.manage', 'roles.assign'];
+
+  assert.deepEqual(
+    getPermissionKeysFromTreeEvent(['users', 'users.read'], availablePermissions),
+    ['users.read']
+  );
+  assert.deepEqual(
+    getPermissionKeysFromTreeEvent(
+      { checked: ['roles', 'roles.assign'], halfChecked: ['users'] },
+      availablePermissions
+    ),
+    ['roles.assign']
+  );
+});
+
+test('产品范围授权未就绪时不产生查询范围，非全局管理员遵循授权产品', () => {
+  assert.equal(
+    resolveAdminProductScope(
+      { isLoading: true, error: null, product: null, isSuperAdmin: false },
+      'autolive'
+    ),
+    null
+  );
+  assert.equal(
+    resolveAdminProductScope(
+      { isLoading: false, error: new Error('authorization unavailable'), product: null, isSuperAdmin: false },
+      'autolive'
+    ),
+    null
+  );
+  assert.equal(
+    resolveAdminProductScope(
+      { isLoading: false, error: null, product: 'douyin_desktop', isSuperAdmin: false },
+      'autolive'
+    ),
+    'douyin_desktop'
+  );
+  assert.equal(
+    resolveAdminProductScope(
+      { isLoading: false, error: null, product: 'autolive', isSuperAdmin: true },
+      'douyin_desktop'
+    ),
+    'douyin_desktop'
+  );
 });
