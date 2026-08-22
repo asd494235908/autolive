@@ -1946,6 +1946,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     getAdminUserAuthorizationSummary: {
@@ -1975,6 +1976,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     updateAdminUserAuthorization: {
@@ -2013,6 +2015,7 @@ export interface operations {
             408: components["responses"]["RequestTimeout"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     disableAdminUser: {
@@ -2192,6 +2195,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     disableAdminDevice: {
@@ -2364,6 +2368,7 @@ export interface operations {
             408: components["responses"]["RequestTimeout"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     getModelPool: {
@@ -2396,6 +2401,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     createModelPoolAccount: {
@@ -2467,6 +2473,7 @@ export interface operations {
             408: components["responses"]["RequestTimeout"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     testModelPoolAccount: {
@@ -2505,6 +2512,7 @@ export interface operations {
             409: components["responses"]["Conflict"];
             429: components["responses"]["TooManyRequests"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     rotateModelPoolAccountSecret: {
@@ -2584,6 +2592,7 @@ export interface operations {
             408: components["responses"]["RequestTimeout"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     listModelUsage: {
@@ -2626,6 +2635,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     listModelLeases: {
@@ -2665,6 +2675,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     getModelLeaseAdminDetail: {
@@ -2694,6 +2705,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     reclaimModelLease: {
@@ -2732,6 +2744,7 @@ export interface operations {
             408: components["responses"]["RequestTimeout"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     listAuditLogs: {
@@ -2776,6 +2789,7 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     getAdminMe: {

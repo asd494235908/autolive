@@ -2,21 +2,26 @@
 
 ## 改动文件
 
-- `backend/internal/httpapi/admin_rbac.go`
-- `backend/internal/httpapi/admin_rbac_test.go`
-- `backend/internal/httpapi/controlplane.go`
+- `backend/internal/httpapi/contract_test.go`
+- `backend/internal/httpapi/product_scope_integration_test.go`
 - `接口契约/openapi.yaml`
 - `admin-web/src/api/openapi.generated.ts`
+- `.superpowers/sdd/admin-rbac-task-5-report.md`
 
 ## 实际执行命令与结果
 
-- `cd backend && go test ./internal/httpapi -run 'AdminRBAC|Permission|Contract|Router' -count=1`
-  - 初次执行失败，先后确认了 `/api/v1/admin/me`/RBAC 契约缺口、内建本地管理员兼容边界回退、`user_id` 契约校验以及 OpenAPI 错误响应缺失。
-  - 最终执行通过。
-- `cd backend && gofmt -w internal/httpapi/admin_rbac.go internal/httpapi/admin_rbac_test.go internal/httpapi/controlplane.go`
+- `cd backend && go test ./internal/httpapi -run 'TestOpenAPIAdminPermissionGuardRoutesDeclareServiceUnavailable|TestAdminUserListProductScopeReturnsActualItemsAndTotals|TestOrdinaryUsersReadCannotWidenUserListAcrossProducts' -count=1`
+  - 初次执行失败：
+    - OpenAPI 缺少多条 `requirePermission` 管理路由的 `503 ServiceUnavailable` 响应声明。
+    - `TestAdminUserListProductScopeReturnsActualItemsAndTotals` 返回 `403 ADMIN_PERMISSION_DENIED`，根因是 `usr_product_admin` 只有旧 `role=admin`，没有真实 RBAC `users.read` 绑定。
+  - 修改后重跑通过。
+- `cd backend && gofmt -w internal/httpapi/contract_test.go internal/httpapi/product_scope_integration_test.go`
   - 通过。
+- `cd backend && go test ./internal/httpapi -run 'AdminRBAC|Permission|Contract|Router|ProductScope' -count=1`
+  - 首次在更新 fixture 后失败，暴露 `product_scope_integration_test.go` 中多条“旧 role=admin 自动具备设备/激活码/模型/审计读取能力”的过时断言。
+  - 按显式 RBAC 语义收敛测试后通过。
 - `cd admin-web && pnpm api:generate`
-  - 通过，已更新 `src/api/openapi.generated.ts`。
+  - 通过；`src/api/openapi.generated.ts` 已同步新增多个 `503: ServiceUnavailable` 响应类型。
 - `cd admin-web && pnpm api:check`
   - 通过。
 - `git diff --check`
@@ -24,24 +29,26 @@
 
 ## 本次完成内容
 
-- 新增 `/api/v1/admin/me`、`/api/v1/admin/permissions`、角色 CRUD、用户角色读取/替换 HTTP handler。
-- 新增 `requirePermission`，从 Bearer Session 读取 actor，并按会话产品做即时权限判定；读取失败返回 503 fail-closed。
-- 将产品范围内的管理路由切换到固定权限点：用户列表/设备列表、激活码、模型池、模型用量、模型租约、审计、安全。
-- 按审查要求保留内建本地管理员兼容边界：
-  - `POST /api/v1/admin/auth/change-password`
-  - `GET /api/v1/admin/users/{user_id}/authorization-summary`
-  - `PATCH /api/v1/admin/users/{user_id}/authorization`
-  - `POST /api/v1/admin/users`
-  - `POST /api/v1/admin/users/{user_id}/disable`
-  - `PATCH /api/v1/admin/users/{user_id}`
-  - `POST /api/v1/admin/users/{user_id}/reset-password`
-  以上路由恢复为 `requireAdmin` + 本地管理员边界，产品级 RBAC 不可触达。
-- 补充 Task 5 聚焦 HTTP/OpenAPI/Router 测试，覆盖：
-  - `/admin/me` 的 401、普通用户空权限、即时权限返回、fail-closed。
-  - 权限目录、角色 CRUD、用户角色绑定 API。
-  - 本地管理员兼容路由的 403/成功回归。
-  - `user_id` 按 `Id` schema 正则做路径校验。
-- 更新 OpenAPI 契约并重新生成 `admin-web` API 类型。
+- 在 `contract_test.go` 新增 fail-closed 契约测试，明确要求所有关键 `auth.requirePermission` 管理路由声明 `503`，并复用现有 `#/components/responses/ServiceUnavailable`。
+- 为以下管理 path 补全实际可能的 `503 ADMIN_AUTHORIZATION_UNAVAILABLE` OpenAPI 响应声明：
+  - `GET /api/v1/admin/users/{user_id}/devices`
+  - `GET /api/v1/admin/devices/{device_id}`
+  - `POST /api/v1/admin/activation-codes/{code_id}/revoke`
+  - `GET /api/v1/admin/model-pool`
+  - `POST /api/v1/admin/model-pool/{account_id}/disable`
+  - `PATCH /api/v1/admin/model-pool/{account_id}`
+  - `POST /api/v1/admin/model-pool/{account_id}/test`
+  - `GET /api/v1/admin/model-usage`
+  - `GET /api/v1/admin/model-leases`
+  - `GET /api/v1/admin/model-leases/{lease_id}`
+  - `POST /api/v1/admin/model-leases/{lease_id}/reclaim`
+  - `GET /api/v1/admin/audit-logs`
+  - 同时确认 `GET /api/v1/admin/users` 与角色相关 RBAC 路由保留该声明。
+- 在 `newProductScopeIntegrationRouter` 中通过真实 `MemoryStore` RBAC API 创建 `autolive` 角色并给 `usr_product_admin` 绑定 `users.read`，不恢复任意 `role=admin` 自动授权。
+- 补充普通 `users.read` 场景测试：
+  - 用户列表默认产品与 `product=autolive` 正向返回 200。
+  - 用户列表跨产品 widening 返回 403。
+  - `users.read` 允许访问 `/api/v1/admin/users/{user_id}/devices`，但不会隐式获得设备/激活码/模型/审计等其它管理页权限。
 
 ## 未验证项
 
@@ -51,10 +58,10 @@
 
 ## 剩余风险
 
-- Task 5 只补了管理 RBAC 的最小闭环；更细的 OpenAPI 字段约束、前端消费细节和页面权限壳由 Task 6 继续承接。
-- 现有更广范围的历史测试未全量回归，因此跨模块回归风险仍依赖后续任务或整体验证门禁发现。
+- 当前只回归了 `internal/httpapi` 的 Task 5 聚焦集合，没有跑服务端全量测试，所以更广泛的 HTTP/Service/Store 回归仍要依赖后续门禁。
+- 本次 `api:generate` 已把新增 `503` 响应反映到前端类型；若后续前端开始显式消费这些分支，还需要页面侧单独补交互处理。
 
 ## 后续建议
 
-- Task 6 直接消费新的 `/api/v1/admin/me` 和 RBAC API，不再手写权限快照。
-- 后续若执行更大范围回归，优先跑服务端全量 HTTP 相关测试与 `admin-web` typecheck/test。
+- Task 6/后续前端权限壳开发时，把 `ADMIN_AUTHORIZATION_UNAVAILABLE` 视为独立故障态，不要和普通 403 合并处理。
+- 如果后续继续清理产品范围测试，建议把“具备某权限才可读某页面”的断言拆成按权限点分组的 fixture，避免再次混入旧 `role=admin` 语义。

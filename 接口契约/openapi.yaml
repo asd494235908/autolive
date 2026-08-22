@@ -555,6 +555,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -591,6 +593,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -638,6 +642,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -852,6 +858,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1049,6 +1057,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1082,6 +1092,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1164,6 +1176,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1213,6 +1227,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1312,6 +1328,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1382,6 +1400,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1448,6 +1468,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1480,6 +1502,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1523,6 +1547,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':
@@ -1604,6 +1630,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '408':

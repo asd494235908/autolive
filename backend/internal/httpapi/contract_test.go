@@ -211,6 +211,53 @@ func TestOpenAPIAdminListGetsDeclareBadRequest(t *testing.T) {
 	}
 }
 
+func TestOpenAPIAdminPermissionGuardRoutesDeclareServiceUnavailable(t *testing.T) {
+	document := loadOpenAPIContract(t)
+	required := []struct {
+		method string
+		path   string
+	}{
+		{method: "get", path: "/api/v1/admin/users"},
+		{method: "get", path: "/api/v1/admin/users/{user_id}/devices"},
+		{method: "get", path: "/api/v1/admin/devices/{device_id}"},
+		{method: "post", path: "/api/v1/admin/activation-codes/{code_id}/revoke"},
+		{method: "get", path: "/api/v1/admin/model-pool"},
+		{method: "post", path: "/api/v1/admin/model-pool/{account_id}/disable"},
+		{method: "patch", path: "/api/v1/admin/model-pool/{account_id}"},
+		{method: "post", path: "/api/v1/admin/model-pool/{account_id}/test"},
+		{method: "get", path: "/api/v1/admin/model-usage"},
+		{method: "get", path: "/api/v1/admin/model-leases"},
+		{method: "get", path: "/api/v1/admin/model-leases/{lease_id}"},
+		{method: "post", path: "/api/v1/admin/model-leases/{lease_id}/reclaim"},
+		{method: "get", path: "/api/v1/admin/audit-logs"},
+		{method: "get", path: "/api/v1/admin/roles"},
+		{method: "post", path: "/api/v1/admin/roles"},
+		{method: "get", path: "/api/v1/admin/roles/{role_id}"},
+		{method: "patch", path: "/api/v1/admin/roles/{role_id}"},
+		{method: "delete", path: "/api/v1/admin/roles/{role_id}"},
+		{method: "get", path: "/api/v1/admin/users/{user_id}/roles"},
+		{method: "put", path: "/api/v1/admin/users/{user_id}/roles"},
+	}
+
+	for _, test := range required {
+		t.Run(strings.ToUpper(test.method)+" "+test.path, func(t *testing.T) {
+			var operation struct {
+				Responses map[string]yaml.Node `yaml:"responses"`
+			}
+			node, ok := document.Paths[test.path][test.method]
+			if !ok {
+				t.Fatalf("%s %s is missing", strings.ToUpper(test.method), test.path)
+			}
+			if err := node.Decode(&operation); err != nil {
+				t.Fatalf("decode %s %s: %v", test.method, test.path, err)
+			}
+			if ref := localReferenceName(operation.Responses["503"]); ref != "ServiceUnavailable" {
+				t.Fatalf("%s %s status 503 ref = %q, want ServiceUnavailable", test.method, test.path, ref)
+			}
+		})
+	}
+}
+
 func TestOpenAPIProductResourceSchemasRequireProduct(t *testing.T) {
 	document := loadOpenAPIContract(t)
 	for _, name := range []string{"DeviceSummary", "ActivationCode", "ModelPoolAccountSummary", "ModelLease", "ModelLeaseAdminSummary", "ModelLeaseAdminDetail", "ModelUsageRecord", "AuditLog"} {

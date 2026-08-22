@@ -47,26 +47,40 @@ func TestAdminUserListProductScopeReturnsActualItemsAndTotals(t *testing.T) {
 	assertUserPage(t, doJSON(t, handler, http.MethodGet, "/api/v1/admin/users?product=autolive", nil, ordinaryToken, ""), wantAll)
 }
 
-func TestOrdinaryAdminProductScopeDefaultsToSessionProduct(t *testing.T) {
+func TestOrdinaryUsersReadCannotWidenUserListAcrossProducts(t *testing.T) {
 	handler, _, ordinaryToken := newProductScopeIntegrationRouter(t)
-	endpoints := []struct {
-		name     string
-		path     string
-		itemsKey string
-		want     int
-	}{
-		{name: "user devices", path: "/api/v1/admin/users/usr_shared/devices", itemsKey: "items", want: 1},
-		{name: "devices", path: "/api/v1/admin/devices", itemsKey: "items", want: 1},
-		{name: "activation codes", path: "/api/v1/admin/activation-codes", itemsKey: "items", want: 1},
-		{name: "model pool", path: "/api/v1/admin/model-pool", itemsKey: "accounts", want: 1},
-		{name: "model usage", path: "/api/v1/admin/model-usage", itemsKey: "items", want: 1},
-		{name: "model leases", path: "/api/v1/admin/model-leases", itemsKey: "items", want: 1},
-		{name: "audit logs", path: "/api/v1/admin/audit-logs?action=seed", itemsKey: "items", want: 1},
+	response := doJSON(t, handler, http.MethodGet, "/api/v1/admin/users?product=douyin_desktop", nil, ordinaryToken, "")
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("ordinary admin widened user list status = %d, want %d; body=%s", response.Code, http.StatusForbidden, response.Body.String())
 	}
-	for _, endpoint := range endpoints {
+	assertErrorCode(t, response.Body.Bytes(), controlplane.ErrForbidden.Code)
+}
+
+func TestOrdinaryUsersReadDefaultsToSessionProductForUserRoutes(t *testing.T) {
+	handler, _, ordinaryToken := newProductScopeIntegrationRouter(t)
+	assertScopedProductPage(t, doJSON(t, handler, http.MethodGet, "/api/v1/admin/users/usr_shared/devices", nil, ordinaryToken, ""), "items", 1, controlplane.ProductAutoLive)
+	assertScopedProductPage(t, doJSON(t, handler, http.MethodGet, "/api/v1/admin/users/usr_shared/devices?product=autolive", nil, ordinaryToken, ""), "items", 1, controlplane.ProductAutoLive)
+}
+
+func TestOrdinaryUsersReadCannotAccessOtherAdminPages(t *testing.T) {
+	handler, _, ordinaryToken := newProductScopeIntegrationRouter(t)
+	for _, endpoint := range []struct {
+		name string
+		path string
+	}{
+		{name: "devices", path: "/api/v1/admin/devices"},
+		{name: "activation codes", path: "/api/v1/admin/activation-codes"},
+		{name: "model pool", path: "/api/v1/admin/model-pool"},
+		{name: "model usage", path: "/api/v1/admin/model-usage"},
+		{name: "model leases", path: "/api/v1/admin/model-leases"},
+		{name: "audit logs", path: "/api/v1/admin/audit-logs?action=seed"},
+	} {
 		t.Run(endpoint.name, func(t *testing.T) {
-			assertScopedProductPage(t, doJSON(t, handler, http.MethodGet, endpoint.path, nil, ordinaryToken, ""), endpoint.itemsKey, endpoint.want, controlplane.ProductAutoLive)
-			assertScopedProductPage(t, doJSON(t, handler, http.MethodGet, appendProductQuery(endpoint.path, "autolive"), nil, ordinaryToken, ""), endpoint.itemsKey, endpoint.want, controlplane.ProductAutoLive)
+			response := doJSON(t, handler, http.MethodGet, endpoint.path, nil, ordinaryToken, "")
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("%s status = %d, want %d; body=%s", endpoint.name, response.Code, http.StatusForbidden, response.Body.String())
+			}
+			assertErrorCode(t, response.Body.Bytes(), controlplane.ErrAdminPermissionDenied.Code)
 		})
 	}
 }
@@ -111,14 +125,16 @@ func TestAdminDeviceDetailAppliesProductScope(t *testing.T) {
 	}
 
 	ordinary := doJSON(t, handler, http.MethodGet, "/api/v1/admin/devices/dev_douyin", nil, ordinaryToken, "")
-	if ordinary.Code != http.StatusNotFound {
-		t.Fatalf("ordinary admin cross-product device detail status = %d, want %d; body=%s", ordinary.Code, http.StatusNotFound, ordinary.Body.String())
+	if ordinary.Code != http.StatusForbidden {
+		t.Fatalf("ordinary admin device detail without devices.read status = %d, want %d; body=%s", ordinary.Code, http.StatusForbidden, ordinary.Body.String())
 	}
+	assertErrorCode(t, ordinary.Body.Bytes(), controlplane.ErrAdminPermissionDenied.Code)
 
 	widened := doJSON(t, handler, http.MethodGet, "/api/v1/admin/devices/dev_douyin?product=douyin_desktop", nil, ordinaryToken, "")
 	if widened.Code != http.StatusForbidden {
 		t.Fatalf("ordinary admin widened device detail status = %d, want %d; body=%s", widened.Code, http.StatusForbidden, widened.Body.String())
 	}
+	assertErrorCode(t, widened.Body.Bytes(), controlplane.ErrAdminPermissionDenied.Code)
 }
 
 func TestOrdinaryAdminCannotAccessGlobalUserAuthorizationOperations(t *testing.T) {
@@ -214,6 +230,30 @@ func newProductScopeIntegrationRouter(t *testing.T) (http.Handler, string, strin
 		return nil
 	}); err != nil {
 		t.Fatalf("seed product scope state: %v", err)
+	}
+	if _, err := repository.CreateAdminRole(context.Background(), store.AdminRoleWriteRecord{
+		Scope:          "product-scope-test",
+		IdempotencyKey: "create-admin-role:users-reader-auto",
+		Fingerprint:    "seed-users-reader-auto",
+		Role: store.AdminRoleRecord{
+			Code:        "users_reader_auto",
+			Product:     controlplane.ProductAutoLive,
+			Name:        "AutoLive Users Reader",
+			Permissions: []controlplane.PermissionCode{"users.read"},
+		},
+	}); err != nil {
+		t.Fatalf("create product admin role: %v", err)
+	}
+	if _, err := repository.ReplaceUserAdminRoles(context.Background(), store.UserAdminRoleReplaceRecord{
+		Scope:          "product-scope-test",
+		IdempotencyKey: "replace-user-admin-roles:usr_product_admin",
+		Fingerprint:    "seed-usr-product-admin-users-read",
+		UserID:         "usr_product_admin",
+		Assignments: []controlplane.AdminRoleAssignment{
+			{UserID: "usr_product_admin", RoleCode: "users_reader_auto", Product: controlplane.ProductAutoLive},
+		},
+	}); err != nil {
+		t.Fatalf("bind product admin users.read role: %v", err)
 	}
 	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{Username: "admin", Password: "password"}, repository, store.NewMemorySecretStore(), nil, true)
 	return handler,
