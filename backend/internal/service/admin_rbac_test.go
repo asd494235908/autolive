@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -422,6 +423,49 @@ func TestAdminRBACListAdminRolesScopedAdminHidesGlobalSuperAdmin(t *testing.T) {
 	}
 }
 
+func TestAdminRBACListAdminRolesScopedDefaultScopeKeepsTwoHundredOrdinaryRoles(t *testing.T) {
+	repository := newBoundedAdminRBACListRepository()
+	svc := NewControlPlaneWithRepository(repository)
+
+	seedAdminRBACServiceUser(t, repository.MemoryStore, controlplane.UserSummary{ID: "usr_scoped_reader_200", Username: "reader", Role: controlplane.RoleUser, Status: controlplane.UserStatusActive, CreatedAt: "2026-08-22T00:00:00Z"})
+	seedAdminRBACServiceUser(t, repository.MemoryStore, controlplane.UserSummary{ID: "usr_global_reader_200", Username: "global", Role: controlplane.RoleUser, Status: controlplane.UserStatusActive, CreatedAt: "2026-08-22T00:00:00Z"})
+	seedAdminRBACServiceMembership(t, repository.MemoryStore, controlplane.UserProductMembership{UserID: "usr_scoped_reader_200", Product: controlplane.ProductAutoLive, Status: "active"})
+	seedAdminRBACServiceRole(t, repository.MemoryStore, store.AdminRoleRecord{
+		Code:        "roles_reader_auto_200",
+		Product:     controlplane.ProductAutoLive,
+		Name:        "AutoLive Role Reader",
+		Permissions: []controlplane.PermissionCode{"roles.read"},
+	})
+	seedAdminRBACServiceAssignments(t, repository.MemoryStore, "usr_scoped_reader_200",
+		controlplane.AdminRoleAssignment{UserID: "usr_scoped_reader_200", RoleCode: "roles_reader_auto_200", Product: controlplane.ProductAutoLive},
+	)
+	seedAdminRBACServiceAssignments(t, repository.MemoryStore, "usr_global_reader_200",
+		controlplane.AdminRoleAssignment{UserID: "usr_global_reader_200", RoleCode: controlplane.BuiltinAdminRoleSuperAdmin},
+	)
+
+	scopedRoles, err := svc.ListAdminRoles(context.Background(), controlplane.Actor{UserID: "usr_scoped_reader_200", Product: controlplane.ProductAutoLive}, "")
+	if err != nil {
+		t.Fatalf("ListAdminRoles(scoped bounded) error = %v", err)
+	}
+	if len(scopedRoles) != 200 {
+		t.Fatalf("len(scopedRoles) = %d, want 200", len(scopedRoles))
+	}
+	if scopedRoles[199].Code != "role_199" {
+		t.Fatalf("scopedRoles[199] = %+v, want role_199", scopedRoles[199])
+	}
+
+	globalRoles, err := svc.ListAdminRoles(context.Background(), controlplane.Actor{UserID: "usr_global_reader_200", Product: controlplane.ProductAutoLive}, "")
+	if err != nil {
+		t.Fatalf("ListAdminRoles(global bounded) error = %v", err)
+	}
+	if len(globalRoles) != 200 {
+		t.Fatalf("len(globalRoles) = %d, want 200", len(globalRoles))
+	}
+	if globalRoles[199].Code != controlplane.BuiltinAdminRoleSuperAdmin {
+		t.Fatalf("globalRoles[199] = %+v, want global super_admin", globalRoles[199])
+	}
+}
+
 func TestAdminRBACCreateAdminRoleWithAuditRedactsRequestBody(t *testing.T) {
 	repository := newAdminRBACServiceMemoryStore()
 	svc := NewControlPlaneWithRepository(repository)
@@ -488,6 +532,37 @@ func newAdminRBACServiceMemoryStore() *store.MemoryStore {
 	return store.NewMemoryStore(func() time.Time {
 		return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
 	})
+}
+
+type boundedAdminRBACListRepository struct {
+	*store.MemoryStore
+}
+
+func newBoundedAdminRBACListRepository() *boundedAdminRBACListRepository {
+	return &boundedAdminRBACListRepository{MemoryStore: newAdminRBACServiceMemoryStore()}
+}
+
+func (r *boundedAdminRBACListRepository) ListAdminRoles(_ context.Context, product controlplane.ProductCode) ([]store.AdminRoleRecord, error) {
+	limit := 199
+	if product != "" {
+		limit = 200
+	}
+	roles := make([]store.AdminRoleRecord, 0, limit+1)
+	for i := 0; i < limit; i++ {
+		roles = append(roles, store.AdminRoleRecord{
+			Code:        fmt.Sprintf("role_%03d", i),
+			Product:     controlplane.ProductAutoLive,
+			Name:        fmt.Sprintf("Role %03d", i),
+			Permissions: []controlplane.PermissionCode{"roles.read"},
+		})
+	}
+	roles = append(roles, store.AdminRoleRecord{
+		Code:        controlplane.BuiltinAdminRoleSuperAdmin,
+		Name:        "超级管理员",
+		BuiltIn:     true,
+		Permissions: []controlplane.PermissionCode{"roles.read"},
+	})
+	return roles, nil
 }
 
 func seedAdminRBACServiceUser(t *testing.T, repository *store.MemoryStore, user controlplane.UserSummary) {

@@ -111,3 +111,44 @@
 - 未运行 PostgreSQL 真库集成场景，本次只覆盖 sqlmock/Memory 的聚焦验证
 - 未实现也未验证 HTTP/OpenAPI/React 接线，仍留给 Task 5/6
 - 未运行桌面端验证、未跑全量 `go test ./...`
+
+## 2026-08-22 Task 4 最终复核 Important 修复
+
+### 本次改动文件
+
+- `backend/internal/service/admin_rbac_test.go`
+- `backend/internal/store/postgres_admin_rbac_repository.go`
+- `backend/internal/store/postgres_admin_rbac_repository_test.go`
+
+### 修复内容
+
+1. `ListAdminRoles` bounded 语义统一
+   - Postgres `ListAdminRoles(product)` 现在按参数选择 query limit：
+     - `product == ''`：保持全局列表总上限 200（普通角色 199 + 全局 `super_admin` 1）
+     - `product != ''`：允许返回最多 200 个当前产品普通角色，并继续携带全局 `super_admin`
+   - service scoped 默认请求仍会过滤掉全局 `super_admin`，因此普通产品管理员默认列表可稳定拿到 200 个普通角色；与 `GetAdminRole` 的可见范围一致，不再出现“详情可见但第 200 个角色列表缺失”。
+
+2. `ReplaceUserAdminRoles` SQLMock 顺序修复
+   - 补齐 `TestPostgresRepositoryReplaceUserAdminRolesIsIdempotentAndProtectsLastSuperAdmin` 里 last-super 分支的真实查询顺序：
+     - `loadAssignableRolesForUpdateQuery`
+     - `loadActiveMembershipsQuery`
+     - `loadUserAdminRolesForUpdateQuery`
+     - `countOtherGlobalSuperAdminsQuery`
+   - 没有放宽 matcher，也没有删除测试，直接对齐当前 repository 的真实行为。
+
+### 本次新增/补强验证
+
+- service 边界：scoped 默认 product 请求会保留 200 个普通角色，而 global 默认列表仍保持总上限 200
+- store 边界：Postgres product-specific 列表允许 `200 ordinary + 1 global super_admin`
+- store SQLMock：last-super protection 分支严格覆盖当前 normalize/role/membership/query 顺序
+
+### 本次实际执行命令与结果
+
+1. `gofmt -w backend/internal/service/admin_rbac_test.go backend/internal/store/postgres_admin_rbac_repository.go backend/internal/store/postgres_admin_rbac_repository_test.go`
+   - 结果：PASS
+2. `cd backend && go test ./internal/service -run 'AdminRBAC|RBAC' -count=1`
+   - 结果：PASS
+3. `cd backend && go test ./internal/store -run 'AdminRBAC|RBAC' -count=1`
+   - 结果：PASS
+4. `git diff --check`
+   - 结果：PASS

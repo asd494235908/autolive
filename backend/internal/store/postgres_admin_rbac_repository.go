@@ -269,13 +269,20 @@ func (s *PostgresRepository) ListAdminRoles(ctx context.Context, product control
 	operationCtx, cancel := s.operationContext(ctx)
 	defer cancel()
 
-	rows, err := s.db.QueryContext(operationCtx, listAdminRolesQuery, string(product), adminRBACScopedRoleLimit)
+	rows, err := s.db.QueryContext(operationCtx, listAdminRolesQuery, string(product), adminRBACRoleListQueryLimit(product))
 	if err != nil {
 		return nil, postgresOperationError(operationCtx, fmt.Errorf("list normalized admin roles: %w", err))
 	}
 	defer rows.Close()
 
 	return collectAdminRoleRecords(operationCtx, rows)
+}
+
+func adminRBACRoleListQueryLimit(product controlplane.ProductCode) int {
+	if product == "" {
+		return adminRBACScopedRoleLimit
+	}
+	return adminRBACListLimit
 }
 
 func (s *PostgresRepository) GetAdminRole(ctx context.Context, code string) (AdminRoleRecord, error) {
