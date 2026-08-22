@@ -17,7 +17,8 @@ var _ AdminRBACRepository = (*PostgresRepository)(nil)
 var ErrNormalizedAdminRBACRepositoryRequired = errors.New("normalized admin rbac repository is required")
 
 const (
-	listAdminPermissionsQuery          = `SELECT code FROM admin_permissions ORDER BY code`
+	adminRBACListLimit                 = 200
+	listAdminPermissionsQuery          = `SELECT code FROM admin_permissions ORDER BY code LIMIT $1`
 	getAdminAuthorizationUserQuery     = `SELECT role, status FROM users WHERE id = $1 LIMIT 1`
 	getAdminAuthorizationBindingsQuery = `
 		SELECT uar.role_code, uar.product, arp.permission_code
@@ -40,6 +41,7 @@ const (
 			ON rp.role_code = r.code
 		WHERE ($1 = '' OR r.code = 'super_admin' OR r.product = $1)
 		ORDER BY r.code ASC, r.product ASC, rp.permission_code ASC
+		LIMIT $2
 	`
 	getAdminRoleQuery = `
 		SELECT r.code, r.product, r.name, r.built_in, rp.permission_code
@@ -64,12 +66,25 @@ const (
 		SELECT $1, permission_code, $3
 		FROM UNNEST($2::text[]) AS permission_code
 	`
-	updateAdminRoleQuery              = `UPDATE admin_roles SET name = $2, updated_at = $3 WHERE code = $1`
-	deleteAdminRolePermissionsQuery   = `DELETE FROM admin_role_permissions WHERE role_code = $1`
-	deleteAdminRoleQuery              = `DELETE FROM admin_roles WHERE code = $1`
-	loadUserAdminRolesForUpdateQuery  = `SELECT role_code, product FROM user_admin_roles WHERE user_id = $1 FOR UPDATE`
-	listUserAdminRolesQuery           = `SELECT role_code, product FROM user_admin_roles WHERE user_id = $1 ORDER BY COALESCE(product, ''), role_code`
-	listUserAdminRolesFilteredQuery   = `SELECT role_code, product FROM user_admin_roles WHERE user_id = $1 AND ($2 = '' OR product IS NULL OR product = $2) ORDER BY COALESCE(product, ''), role_code`
+	updateAdminRoleQuery             = `UPDATE admin_roles SET name = $2, updated_at = $3 WHERE code = $1`
+	deleteAdminRolePermissionsQuery  = `DELETE FROM admin_role_permissions WHERE role_code = $1`
+	deleteAdminRoleQuery             = `DELETE FROM admin_roles WHERE code = $1`
+	loadUserAdminRolesForUpdateQuery = `SELECT role_code, product FROM user_admin_roles WHERE user_id = $1 FOR UPDATE`
+	listUserAdminRolesQuery          = `
+		SELECT role_code, product
+		FROM user_admin_roles
+		WHERE user_id = $1
+		ORDER BY COALESCE(product, ''), role_code
+		LIMIT $2
+	`
+	listUserAdminRolesFilteredQuery = `
+		SELECT role_code, product
+		FROM user_admin_roles
+		WHERE user_id = $1
+		  AND ($2 = '' OR product IS NULL OR product = $2)
+		ORDER BY COALESCE(product, ''), role_code
+		LIMIT $3
+	`
 	deleteUserAdminRolesQuery         = `DELETE FROM user_admin_roles WHERE user_id = $1`
 	loadAssignableRolesForUpdateQuery = `
 		SELECT code, product, built_in
@@ -115,7 +130,7 @@ func (s *PostgresRepository) ListAdminPermissions(ctx context.Context) ([]contro
 	operationCtx, cancel := s.operationContext(ctx)
 	defer cancel()
 
-	rows, err := s.db.QueryContext(operationCtx, listAdminPermissionsQuery)
+	rows, err := s.db.QueryContext(operationCtx, listAdminPermissionsQuery, adminRBACListLimit)
 	if err != nil {
 		return nil, postgresOperationError(operationCtx, err)
 	}
@@ -236,7 +251,7 @@ func (s *PostgresRepository) ListAdminRoles(ctx context.Context, product control
 	operationCtx, cancel := s.operationContext(ctx)
 	defer cancel()
 
-	rows, err := s.db.QueryContext(operationCtx, listAdminRolesQuery, string(product))
+	rows, err := s.db.QueryContext(operationCtx, listAdminRolesQuery, string(product), adminRBACListLimit)
 	if err != nil {
 		return nil, postgresOperationError(operationCtx, fmt.Errorf("list normalized admin roles: %w", err))
 	}
@@ -455,10 +470,15 @@ func (s *PostgresRepository) ListUserAdminRoles(ctx context.Context, userID stri
 
 	operationCtx, cancel := s.operationContext(ctx)
 	defer cancel()
-	if _, err := s.GetUserByID(operationCtx, userID); err != nil {
+	user, err := s.GetUserByID(operationCtx, userID)
+	if err != nil {
 		return nil, err
 	}
-	return listUserAdminRolesByQuery(operationCtx, s.db, listUserAdminRolesFilteredQuery, userID, string(product))
+	assignments, err := listUserAdminRolesByQuery(operationCtx, s.db, listUserAdminRolesFilteredQuery, userID, string(product), adminRBACListLimit)
+	if err != nil {
+		return nil, err
+	}
+	return withCompatibilityLocalSuperAdmin(user, assignments), nil
 }
 
 func (s *PostgresRepository) ReplaceUserAdminRoles(ctx context.Context, record UserAdminRoleReplaceRecord) ([]controlplane.AdminRoleAssignment, error) {
@@ -506,7 +526,7 @@ func (s *PostgresRepository) ReplaceUserAdminRoles(ctx context.Context, record U
 		if storedFingerprint != record.Fingerprint || storedResourceID != record.UserID {
 			return nil, controlplane.ErrIdempotencyConflict
 		}
-		return listUserAdminRolesByQuery(operationCtx, tx, listUserAdminRolesQuery, record.UserID)
+		return listUserAdminRolesByQuery(operationCtx, tx, listUserAdminRolesQuery, record.UserID, adminRBACListLimit)
 	}
 
 	normalizedAssignments, err := s.normalizeUserAdminRoleAssignmentsTx(operationCtx, tx, record.UserID, record.Assignments)
@@ -702,6 +722,24 @@ func listUserAdminRolesByQuery(ctx context.Context, queryer interface {
 	return assignments, nil
 }
 
+func withCompatibilityLocalSuperAdmin(user controlplane.UserSummary, assignments []controlplane.AdminRoleAssignment) []controlplane.AdminRoleAssignment {
+	if !compatibilityLocalSuperAdmin(user) {
+		return assignments
+	}
+	global := controlplane.AdminRoleAssignment{
+		UserID:   user.ID,
+		RoleCode: controlplane.BuiltinAdminRoleSuperAdmin,
+	}
+	for _, assignment := range assignments {
+		if assignment.RoleCode == global.RoleCode && assignment.Product == "" {
+			return assignments
+		}
+	}
+	result := append(append([]controlplane.AdminRoleAssignment(nil), assignments...), global)
+	sortAdminRoleAssignments(result)
+	return result
+}
+
 func (s *PostgresRepository) normalizeUserAdminRoleAssignmentsTx(ctx context.Context, tx *sql.Tx, userID string, assignments []controlplane.AdminRoleAssignment) ([]controlplane.AdminRoleAssignment, error) {
 	roleCodes := make([]string, 0)
 	roleCodeSet := map[string]struct{}{}
@@ -778,6 +816,7 @@ func loadAssignableRoles(ctx context.Context, tx *sql.Tx, roleCodes []string) (m
 	if len(roleCodes) == 0 {
 		return map[string]assignableRoleDetail{}, nil
 	}
+	sort.Strings(roleCodes)
 	rows, err := tx.QueryContext(ctx, loadAssignableRolesForUpdateQuery, pq.Array(roleCodes))
 	if err != nil {
 		return nil, postgresOperationError(ctx, fmt.Errorf("load normalized assignable admin roles: %w", err))
