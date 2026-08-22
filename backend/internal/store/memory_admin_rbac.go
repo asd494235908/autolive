@@ -2,9 +2,11 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"autoLive/backend/internal/controlplane"
 )
@@ -118,6 +120,10 @@ func (s *MemoryStore) CreateAdminRole(ctx context.Context, record AdminRoleWrite
 	if err != nil {
 		return AdminRoleRecord{}, err
 	}
+	record.Audit, err = normalizeOptionalAuditInputForProduct(record.Audit, role.Product)
+	if err != nil {
+		return AdminRoleRecord{}, err
+	}
 
 	var created AdminRoleRecord
 	err = s.Run(ctx, func(state *State) error {
@@ -130,6 +136,7 @@ func (s *MemoryStore) CreateAdminRole(ctx context.Context, record AdminRoleWrite
 		}); err != nil {
 			return err
 		} else if replayed {
+			recordMemoryAdminRBACSuccessAudit(state, s.Now(), record.Audit, role.Code)
 			created = existingRole
 			return nil
 		}
@@ -146,6 +153,7 @@ func (s *MemoryStore) CreateAdminRole(ctx context.Context, record AdminRoleWrite
 		}
 		state.AdminRolePermissions[role.Code] = append([]controlplane.PermissionCode(nil), role.Permissions...)
 		storeAdminRBACIdempotency(state, record.Scope, record.IdempotencyKey, record.Fingerprint, role.Code)
+		recordMemoryAdminRBACSuccessAudit(state, s.Now(), record.Audit, role.Code)
 		created, _ = memoryAdminRoleRecord(state, role.Code)
 		return nil
 	})
@@ -157,6 +165,10 @@ func (s *MemoryStore) UpdateAdminRole(ctx context.Context, record AdminRoleWrite
 		return AdminRoleRecord{}, err
 	}
 	role, err := normalizeAdminRoleWriteRecord(record)
+	if err != nil {
+		return AdminRoleRecord{}, err
+	}
+	record.Audit, err = normalizeOptionalAuditInputForProduct(record.Audit, role.Product)
 	if err != nil {
 		return AdminRoleRecord{}, err
 	}
@@ -172,6 +184,7 @@ func (s *MemoryStore) UpdateAdminRole(ctx context.Context, record AdminRoleWrite
 		}); err != nil {
 			return err
 		} else if replayed {
+			recordMemoryAdminRBACSuccessAudit(state, s.Now(), record.Audit, role.Code)
 			updated = existingRole
 			return nil
 		}
@@ -195,6 +208,7 @@ func (s *MemoryStore) UpdateAdminRole(ctx context.Context, record AdminRoleWrite
 		}
 		state.AdminRolePermissions[role.Code] = append([]controlplane.PermissionCode(nil), role.Permissions...)
 		storeAdminRBACIdempotency(state, record.Scope, record.IdempotencyKey, record.Fingerprint, role.Code)
+		recordMemoryAdminRBACSuccessAudit(state, s.Now(), record.Audit, role.Code)
 		updated, _ = memoryAdminRoleRecord(state, role.Code)
 		return nil
 	})
@@ -219,12 +233,17 @@ func (s *MemoryStore) DeleteAdminRole(ctx context.Context, record AdminRoleDelet
 		}); err != nil {
 			return err
 		} else if replayed {
+			recordMemoryAdminRBACSuccessAudit(state, s.Now(), record.Audit, record.Code)
 			return nil
 		}
 
 		role, ok := state.AdminRoles[record.Code]
 		if !ok {
 			return controlplane.ErrAdminRoleNotFound
+		}
+		audit, err := normalizeOptionalAuditInputForProduct(record.Audit, role.Product)
+		if err != nil {
+			return err
 		}
 		if role.BuiltIn {
 			return controlplane.ErrAdminBuiltInRoleImmutable
@@ -237,6 +256,7 @@ func (s *MemoryStore) DeleteAdminRole(ctx context.Context, record AdminRoleDelet
 		delete(state.AdminRoles, record.Code)
 		delete(state.AdminRolePermissions, record.Code)
 		storeAdminRBACIdempotency(state, record.Scope, record.IdempotencyKey, record.Fingerprint, record.Code)
+		recordMemoryAdminRBACSuccessAudit(state, s.Now(), audit, record.Code)
 		return nil
 	})
 }
@@ -275,6 +295,16 @@ func (s *MemoryStore) ReplaceUserAdminRoles(ctx context.Context, record UserAdmi
 	if record.Scope == "" || record.IdempotencyKey == "" || record.Fingerprint == "" || record.UserID == "" {
 		return nil, controlplane.ErrInvalidRequest
 	}
+	if strings.TrimSpace(record.Audit.Action) != "" {
+		if !record.Audit.Product.Valid() {
+			return nil, controlplane.ErrInvalidRequest
+		}
+		var err error
+		record.Audit, err = normalizeAuditInputForProduct(record.Audit, record.Audit.Product)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	var assignments []controlplane.AdminRoleAssignment
 	err := s.Run(ctx, func(state *State) error {
@@ -290,6 +320,7 @@ func (s *MemoryStore) ReplaceUserAdminRoles(ctx context.Context, record UserAdmi
 		}); err != nil {
 			return err
 		} else if replayed {
+			recordMemoryAdminRBACSuccessAudit(state, s.Now(), record.Audit, record.UserID)
 			assignments = listUserAdminRolesFromState(state, record.UserID, "")
 			return nil
 		}
@@ -312,6 +343,7 @@ func (s *MemoryStore) ReplaceUserAdminRoles(ctx context.Context, record UserAdmi
 			state.UserAdminRoles[key] = assignment
 		}
 		storeAdminRBACIdempotency(state, record.Scope, record.IdempotencyKey, record.Fingerprint, record.UserID)
+		recordMemoryAdminRBACSuccessAudit(state, s.Now(), record.Audit, record.UserID)
 		assignments = listUserAdminRolesFromState(state, record.UserID, "")
 		return nil
 	})
@@ -522,6 +554,39 @@ func storeAdminRBACIdempotency(state *State, scope string, idempotencyKey string
 	state.IdempotencyRecords[memoryIdempotencyKey(scope, idempotencyKey)] = IdempotencyRecord{
 		Fingerprint: fingerprint,
 		ResourceID:  resourceID,
+	}
+}
+
+func recordMemoryAdminRBACSuccessAudit(state *State, now time.Time, input controlplane.AuditLogInput, targetID string) {
+	if strings.TrimSpace(input.Action) == "" {
+		return
+	}
+	if input.RequestID != "" {
+		for _, auditLog := range state.AuditLogs {
+			if auditLog.RequestID == input.RequestID {
+				return
+			}
+		}
+	}
+	targetID = strings.TrimSpace(targetID)
+	if targetID == "" {
+		targetID = strings.TrimSpace(input.TargetID)
+	}
+	state.SequenceCounters["audit"]++
+	id := fmt.Sprintf("audit_%08d", state.SequenceCounters["audit"])
+	state.AuditLogs[id] = controlplane.AuditLog{
+		ID:          id,
+		Product:     input.Product,
+		ActorUserID: input.ActorUserID,
+		DeviceID:    input.DeviceID,
+		Action:      input.Action,
+		TargetType:  input.TargetType,
+		TargetID:    targetID,
+		Outcome:     input.Outcome,
+		StatusCode:  input.StatusCode,
+		ErrorCode:   input.ErrorCode,
+		RequestID:   input.RequestID,
+		CreatedAt:   now.UTC().Format(time.RFC3339),
 	}
 }
 

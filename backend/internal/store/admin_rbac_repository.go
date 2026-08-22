@@ -18,6 +18,7 @@ type AdminRoleWriteRecord struct {
 	Scope          string
 	IdempotencyKey string
 	Fingerprint    string
+	Audit          controlplane.AuditLogInput
 	Role           AdminRoleRecord
 }
 
@@ -25,6 +26,7 @@ type AdminRoleDeleteRecord struct {
 	Scope          string
 	IdempotencyKey string
 	Fingerprint    string
+	Audit          controlplane.AuditLogInput
 	Code           string
 }
 
@@ -32,6 +34,7 @@ type UserAdminRoleReplaceRecord struct {
 	Scope          string
 	IdempotencyKey string
 	Fingerprint    string
+	Audit          controlplane.AuditLogInput
 	UserID         string
 	Assignments    []controlplane.AdminRoleAssignment
 }

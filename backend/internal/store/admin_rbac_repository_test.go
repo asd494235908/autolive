@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -351,6 +353,74 @@ func TestMemoryStoreReplaceUserAdminRolesFailedAttemptDoesNotConsumeIdempotency(
 	}
 }
 
+func TestMemoryStoreAdminRBACMutationsRecordSuccessAuditAndDeduplicateReplay(t *testing.T) {
+	repository := newAdminRBACMemoryStore(t)
+
+	_, err := repository.CreateAdminRole(context.Background(), AdminRoleWriteRecord{
+		Scope:          "control-plane-state",
+		IdempotencyKey: "create-admin-role:audit",
+		Fingerprint:    "fp-audit",
+		Audit: controlplane.AuditLogInput{
+			Product:     controlplane.ProductAutoLive,
+			ActorUserID: "usr_global",
+			Action:      "POST /api/v1/admin/roles",
+			TargetType:  "admin_role",
+			Outcome:     "success",
+			StatusCode:  201,
+			RequestID:   "req-admin-rbac-audit",
+		},
+		Role: AdminRoleRecord{
+			Code:        "audit_ops_autolive",
+			Product:     controlplane.ProductAutoLive,
+			Name:        "request-body-secret",
+			Permissions: []controlplane.PermissionCode{"users.read"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAdminRole(first) error = %v", err)
+	}
+
+	_, err = repository.CreateAdminRole(context.Background(), AdminRoleWriteRecord{
+		Scope:          "control-plane-state",
+		IdempotencyKey: "create-admin-role:audit",
+		Fingerprint:    "fp-audit",
+		Audit: controlplane.AuditLogInput{
+			Product:     controlplane.ProductAutoLive,
+			ActorUserID: "usr_global",
+			Action:      "POST /api/v1/admin/roles",
+			TargetType:  "admin_role",
+			Outcome:     "success",
+			StatusCode:  201,
+			RequestID:   "req-admin-rbac-audit",
+		},
+		Role: AdminRoleRecord{
+			Code:        "audit_ops_autolive",
+			Product:     controlplane.ProductAutoLive,
+			Name:        "request-body-secret",
+			Permissions: []controlplane.PermissionCode{"users.read"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAdminRole(replay) error = %v", err)
+	}
+
+	logs := listAdminRBACMemoryAuditLogs(t, repository)
+	if len(logs) != 1 {
+		t.Fatalf("audit logs = %#v, want exactly one deduplicated success entry", logs)
+	}
+	if logs[0].TargetID != "audit_ops_autolive" || logs[0].Outcome != "success" || logs[0].RequestID != "req-admin-rbac-audit" {
+		t.Fatalf("audit log = %+v", logs[0])
+	}
+
+	raw, err := json.Marshal(logs)
+	if err != nil {
+		t.Fatalf("marshal audit logs: %v", err)
+	}
+	if text := string(raw); strings.Contains(text, "request-body-secret") || strings.Contains(text, "users.read") {
+		t.Fatalf("audit logs leaked role body or permissions: %s", text)
+	}
+}
+
 func newAdminRBACMemoryStore(t *testing.T) *MemoryStore {
 	t.Helper()
 	return NewMemoryStore(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) })
@@ -395,4 +465,24 @@ func adminRoleCodes(roles []AdminRoleRecord) []string {
 		codes = append(codes, role.Code)
 	}
 	return codes
+}
+
+func listAdminRBACMemoryAuditLogs(t *testing.T, repository *MemoryStore) []controlplane.AuditLog {
+	t.Helper()
+	var logs []controlplane.AuditLog
+	if err := repository.Run(context.Background(), func(state *State) error {
+		for _, auditLog := range state.AuditLogs {
+			logs = append(logs, auditLog)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("list audit logs: %v", err)
+	}
+	slices.SortFunc(logs, func(a, b controlplane.AuditLog) int {
+		if a.CreatedAt != b.CreatedAt {
+			return strings.Compare(a.CreatedAt, b.CreatedAt)
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	return logs
 }

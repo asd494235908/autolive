@@ -320,6 +320,10 @@ func (s *PostgresRepository) CreateAdminRole(ctx context.Context, record AdminRo
 	if err != nil {
 		return AdminRoleRecord{}, err
 	}
+	record.Audit, err = normalizeOptionalAuditInputForProduct(record.Audit, role.Product)
+	if err != nil {
+		return AdminRoleRecord{}, err
+	}
 
 	operationCtx, cancel := s.operationContext(ctx)
 	defer cancel()
@@ -340,7 +344,19 @@ func (s *PostgresRepository) CreateAdminRole(ctx context.Context, record AdminRo
 		if storedFingerprint != record.Fingerprint || storedResourceID != role.Code {
 			return AdminRoleRecord{}, controlplane.ErrIdempotencyConflict
 		}
-		return s.loadAdminRoleTx(operationCtx, tx, role.Code)
+		replayedRole, err := s.loadAdminRoleTx(operationCtx, tx, role.Code)
+		if err != nil {
+			return AdminRoleRecord{}, err
+		}
+		if err := enqueueAdminRBACAuditTx(operationCtx, tx, s, record.Audit, replayedRole.Code); err != nil {
+			return AdminRoleRecord{}, err
+		}
+		if strings.TrimSpace(record.Audit.Action) != "" {
+			if err := tx.Commit(); err != nil {
+				return AdminRoleRecord{}, postgresCommitError(operationCtx, "commit idempotent normalized admin role creation", err)
+			}
+		}
+		return replayedRole, nil
 	}
 
 	now := s.Now()
@@ -348,6 +364,9 @@ func (s *PostgresRepository) CreateAdminRole(ctx context.Context, record AdminRo
 		return AdminRoleRecord{}, translateAdminRoleWriteError(operationCtx, fmt.Errorf("insert normalized admin role: %w", err))
 	}
 	if err := replaceAdminRolePermissionsTx(operationCtx, tx, role.Code, role.Permissions, now); err != nil {
+		return AdminRoleRecord{}, err
+	}
+	if err := enqueueAdminRBACAuditTx(operationCtx, tx, s, record.Audit, role.Code); err != nil {
 		return AdminRoleRecord{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -364,6 +383,10 @@ func (s *PostgresRepository) UpdateAdminRole(ctx context.Context, record AdminRo
 		return AdminRoleRecord{}, controlplane.ErrInvalidRequest
 	}
 	role, err := normalizeAdminRoleWriteRecord(record)
+	if err != nil {
+		return AdminRoleRecord{}, err
+	}
+	record.Audit, err = normalizeOptionalAuditInputForProduct(record.Audit, role.Product)
 	if err != nil {
 		return AdminRoleRecord{}, err
 	}
@@ -398,7 +421,19 @@ func (s *PostgresRepository) UpdateAdminRole(ctx context.Context, record AdminRo
 		if storedFingerprint != record.Fingerprint || storedResourceID != role.Code {
 			return AdminRoleRecord{}, controlplane.ErrIdempotencyConflict
 		}
-		return s.loadAdminRoleTx(operationCtx, tx, role.Code)
+		replayedRole, err := s.loadAdminRoleTx(operationCtx, tx, role.Code)
+		if err != nil {
+			return AdminRoleRecord{}, err
+		}
+		if err := enqueueAdminRBACAuditTx(operationCtx, tx, s, record.Audit, replayedRole.Code); err != nil {
+			return AdminRoleRecord{}, err
+		}
+		if strings.TrimSpace(record.Audit.Action) != "" {
+			if err := tx.Commit(); err != nil {
+				return AdminRoleRecord{}, postgresCommitError(operationCtx, "commit idempotent normalized admin role update", err)
+			}
+		}
+		return replayedRole, nil
 	}
 
 	now := s.Now()
@@ -409,6 +444,9 @@ func (s *PostgresRepository) UpdateAdminRole(ctx context.Context, record AdminRo
 		return AdminRoleRecord{}, postgresOperationError(operationCtx, fmt.Errorf("delete normalized admin role permissions: %w", err))
 	}
 	if err := replaceAdminRolePermissionsTx(operationCtx, tx, role.Code, role.Permissions, now); err != nil {
+		return AdminRoleRecord{}, err
+	}
+	if err := enqueueAdminRBACAuditTx(operationCtx, tx, s, record.Audit, role.Code); err != nil {
 		return AdminRoleRecord{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -447,6 +485,10 @@ func (s *PostgresRepository) DeleteAdminRole(ctx context.Context, record AdminRo
 	if err != nil {
 		return err
 	}
+	record.Audit, err = normalizeOptionalAuditInputForProduct(record.Audit, role.Product)
+	if err != nil {
+		return err
+	}
 	if role.BuiltIn {
 		return controlplane.ErrAdminBuiltInRoleImmutable
 	}
@@ -459,11 +501,22 @@ func (s *PostgresRepository) DeleteAdminRole(ctx context.Context, record AdminRo
 		if storedFingerprint != record.Fingerprint || storedResourceID != record.Code {
 			return controlplane.ErrIdempotencyConflict
 		}
+		if err := enqueueAdminRBACAuditTx(operationCtx, tx, s, record.Audit, record.Code); err != nil {
+			return err
+		}
+		if strings.TrimSpace(record.Audit.Action) != "" {
+			if err := tx.Commit(); err != nil {
+				return postgresCommitError(operationCtx, "commit idempotent normalized admin role delete", err)
+			}
+		}
 		return nil
 	}
 
 	if _, err := tx.ExecContext(operationCtx, deleteAdminRoleQuery, record.Code); err != nil {
 		return translateAdminRoleDeleteError(operationCtx, fmt.Errorf("delete normalized admin role: %w", err))
+	}
+	if err := enqueueAdminRBACAuditTx(operationCtx, tx, s, record.Audit, record.Code); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return postgresCommitError(operationCtx, "commit normalized admin role delete", err)
@@ -513,6 +566,16 @@ func (s *PostgresRepository) ReplaceUserAdminRoles(ctx context.Context, record U
 	if record.Scope == "" || record.IdempotencyKey == "" || record.Fingerprint == "" || record.UserID == "" {
 		return nil, controlplane.ErrInvalidRequest
 	}
+	if strings.TrimSpace(record.Audit.Action) != "" {
+		if !record.Audit.Product.Valid() {
+			return nil, controlplane.ErrInvalidRequest
+		}
+		var err error
+		record.Audit, err = normalizeAuditInputForProduct(record.Audit, record.Audit.Product)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -548,6 +611,14 @@ func (s *PostgresRepository) ReplaceUserAdminRoles(ctx context.Context, record U
 		if err != nil {
 			return nil, err
 		}
+		if err := enqueueAdminRBACAuditTx(operationCtx, tx, s, record.Audit, record.UserID); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(record.Audit.Action) != "" {
+			if err := tx.Commit(); err != nil {
+				return nil, postgresCommitError(operationCtx, "commit idempotent normalized user admin role replacement", err)
+			}
+		}
 		return withCompatibilityLocalSuperAdmin(user, assignments), nil
 	}
 
@@ -576,10 +647,13 @@ func (s *PostgresRepository) ReplaceUserAdminRoles(ctx context.Context, record U
 	if err := insertUserAdminRolesTx(operationCtx, tx, record.UserID, normalizedAssignments, s.Now()); err != nil {
 		return nil, err
 	}
+	if err := enqueueAdminRBACAuditTx(operationCtx, tx, s, record.Audit, record.UserID); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, postgresCommitError(operationCtx, "commit normalized user admin role replacement", err)
 	}
-	return normalizedAssignments, nil
+	return withCompatibilityLocalSuperAdmin(user, normalizedAssignments), nil
 }
 
 func collectAdminRoleRecords(ctx context.Context, rows *sql.Rows) ([]AdminRoleRecord, error) {
@@ -678,6 +752,19 @@ func replaceAdminRolePermissionsTx(ctx context.Context, tx *sql.Tx, code string,
 	}
 	if _, err := tx.ExecContext(ctx, replaceAdminRolePermissionsQuery, code, pq.Array(raw), now); err != nil {
 		return postgresOperationError(ctx, fmt.Errorf("replace normalized admin role permissions: %w", err))
+	}
+	return nil
+}
+
+func enqueueAdminRBACAuditTx(ctx context.Context, tx *sql.Tx, repository *PostgresRepository, audit controlplane.AuditLogInput, targetID string) error {
+	if strings.TrimSpace(audit.Action) == "" {
+		return nil
+	}
+	if strings.TrimSpace(audit.TargetID) == "" {
+		audit.TargetID = strings.TrimSpace(targetID)
+	}
+	if err := repository.enqueueAuditOutboxTx(ctx, tx, audit, repository.Now()); err != nil {
+		return postgresOperationError(ctx, fmt.Errorf("enqueue normalized admin rbac audit: %w", err))
 	}
 	return nil
 }

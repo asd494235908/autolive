@@ -385,6 +385,43 @@ func TestAdminRBACReplaceUserAdminRolesIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestAdminRBACListAdminRolesScopedAdminHidesGlobalSuperAdmin(t *testing.T) {
+	repository := newAdminRBACServiceMemoryStore()
+	svc := NewControlPlaneWithRepository(repository)
+
+	seedAdminRBACServiceUser(t, repository, controlplane.UserSummary{ID: "usr_scoped_reader", Username: "reader", Role: controlplane.RoleUser, Status: controlplane.UserStatusActive, CreatedAt: "2026-08-22T00:00:00Z"})
+	seedAdminRBACServiceUser(t, repository, controlplane.UserSummary{ID: "usr_global_reader", Username: "global", Role: controlplane.RoleUser, Status: controlplane.UserStatusActive, CreatedAt: "2026-08-22T00:00:00Z"})
+	seedAdminRBACServiceMembership(t, repository, controlplane.UserProductMembership{UserID: "usr_scoped_reader", Product: controlplane.ProductAutoLive, Status: "active"})
+	seedAdminRBACServiceRole(t, repository, store.AdminRoleRecord{
+		Code:        "roles_reader_auto",
+		Product:     controlplane.ProductAutoLive,
+		Name:        "AutoLive Role Reader",
+		Permissions: []controlplane.PermissionCode{"roles.read"},
+	})
+	seedAdminRBACServiceAssignments(t, repository, "usr_scoped_reader",
+		controlplane.AdminRoleAssignment{UserID: "usr_scoped_reader", RoleCode: "roles_reader_auto", Product: controlplane.ProductAutoLive},
+	)
+	seedAdminRBACServiceAssignments(t, repository, "usr_global_reader",
+		controlplane.AdminRoleAssignment{UserID: "usr_global_reader", RoleCode: controlplane.BuiltinAdminRoleSuperAdmin},
+	)
+
+	roles, err := svc.ListAdminRoles(context.Background(), controlplane.Actor{UserID: "usr_scoped_reader", Product: controlplane.ProductAutoLive}, "")
+	if err != nil {
+		t.Fatalf("ListAdminRoles(scoped) error = %v", err)
+	}
+	if len(roles) != 1 || roles[0].Code != "roles_reader_auto" {
+		t.Fatalf("ListAdminRoles(scoped) = %#v, want only scoped ordinary role", roles)
+	}
+
+	globalRoles, err := svc.ListAdminRoles(context.Background(), controlplane.Actor{UserID: "usr_global_reader", Product: controlplane.ProductAutoLive}, "")
+	if err != nil {
+		t.Fatalf("ListAdminRoles(global) error = %v", err)
+	}
+	if len(globalRoles) != 2 || !slices.Equal([]string{globalRoles[0].Code, globalRoles[1].Code}, []string{"roles_reader_auto", controlplane.BuiltinAdminRoleSuperAdmin}) {
+		t.Fatalf("ListAdminRoles(global) = %#v", globalRoles)
+	}
+}
+
 func TestAdminRBACCreateAdminRoleWithAuditRedactsRequestBody(t *testing.T) {
 	repository := newAdminRBACServiceMemoryStore()
 	svc := NewControlPlaneWithRepository(repository)

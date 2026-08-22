@@ -84,6 +84,9 @@ func (s *ControlPlane) ListAdminRoles(ctx context.Context, actor controlplane.Ac
 	if err != nil {
 		return nil, err
 	}
+	if !auth.GlobalSuperAdmin {
+		roles = filterAdminRoleRecordsByProduct(roles, targetProduct)
+	}
 	return mapAdminRoleRecords(roles), nil
 }
 
@@ -117,9 +120,8 @@ func (s *ControlPlane) CreateAdminRoleWithAudit(ctx context.Context, actor contr
 	targetCode := strings.TrimSpace(input.Code)
 	auditProduct := auditProductForRole(actor.Product, input.Product)
 	defer func() {
-		auditErr := s.recordAdminRBACAudit(ctx, auditProduct, audit, "admin_role", targetCode, err)
-		if err == nil && auditErr != nil {
-			err = auditErr
+		if err != nil {
+			_ = s.recordAdminRBACAudit(ctx, auditProduct, audit, "admin_role", targetCode, err)
 		}
 	}()
 
@@ -165,6 +167,7 @@ func (s *ControlPlane) CreateAdminRoleWithAudit(ctx context.Context, actor contr
 		Scope:          "control-plane-state",
 		IdempotencyKey: fmt.Sprintf("create-admin-role:%s:%s:%s", spec.Product, spec.Code, idempotencyKey),
 		Fingerprint:    fingerprint,
+		Audit:          adminRBACSuccessAudit(auditProductForRole(actor.Product, spec.Product), audit, "admin_role", spec.Code),
 		Role: store.AdminRoleRecord{
 			Code:        spec.Code,
 			Product:     spec.Product,
@@ -186,9 +189,8 @@ func (s *ControlPlane) UpdateAdminRoleWithAudit(ctx context.Context, actor contr
 	targetCode := strings.TrimSpace(code)
 	auditProduct := auditProductForRole(actor.Product, input.Product)
 	defer func() {
-		auditErr := s.recordAdminRBACAudit(ctx, auditProduct, audit, "admin_role", targetCode, err)
-		if err == nil && auditErr != nil {
-			err = auditErr
+		if err != nil {
+			_ = s.recordAdminRBACAudit(ctx, auditProduct, audit, "admin_role", targetCode, err)
 		}
 	}()
 
@@ -242,6 +244,7 @@ func (s *ControlPlane) UpdateAdminRoleWithAudit(ctx context.Context, actor contr
 		Scope:          "control-plane-state",
 		IdempotencyKey: fmt.Sprintf("update-admin-role:%s:%s:%s", spec.Product, spec.Code, idempotencyKey),
 		Fingerprint:    fingerprint,
+		Audit:          adminRBACSuccessAudit(auditProductForRole(actor.Product, spec.Product), audit, "admin_role", spec.Code),
 		Role: store.AdminRoleRecord{
 			Code:        spec.Code,
 			Product:     spec.Product,
@@ -263,9 +266,8 @@ func (s *ControlPlane) DeleteAdminRoleWithAudit(ctx context.Context, actor contr
 	targetCode := strings.TrimSpace(code)
 	auditProduct := auditProductForRole(actor.Product, "")
 	defer func() {
-		auditErr := s.recordAdminRBACAudit(ctx, auditProduct, audit, "admin_role", targetCode, err)
-		if err == nil && auditErr != nil {
-			err = auditErr
+		if err != nil {
+			_ = s.recordAdminRBACAudit(ctx, auditProduct, audit, "admin_role", targetCode, err)
 		}
 	}()
 
@@ -302,6 +304,7 @@ func (s *ControlPlane) DeleteAdminRoleWithAudit(ctx context.Context, actor contr
 		Scope:          "control-plane-state",
 		IdempotencyKey: fmt.Sprintf("delete-admin-role:%s:%s:%s", role.Product, role.Code, idempotencyKey),
 		Fingerprint:    fingerprint,
+		Audit:          adminRBACSuccessAudit(auditProductForRole(actor.Product, role.Product), audit, "admin_role", role.Code),
 		Code:           role.Code,
 	})
 }
@@ -344,9 +347,8 @@ func (s *ControlPlane) ReplaceUserAdminRolesWithAudit(ctx context.Context, actor
 	targetUserID := strings.TrimSpace(userID)
 	auditProduct := auditProductForRole(actor.Product, product)
 	defer func() {
-		auditErr := s.recordAdminRBACAudit(ctx, auditProduct, audit, "admin_role_assignment", targetUserID, err)
-		if err == nil && auditErr != nil {
-			err = auditErr
+		if err != nil {
+			_ = s.recordAdminRBACAudit(ctx, auditProduct, audit, "admin_role_assignment", targetUserID, err)
 		}
 	}()
 
@@ -405,6 +407,7 @@ func (s *ControlPlane) ReplaceUserAdminRolesWithAudit(ctx context.Context, actor
 		Scope:          "control-plane-state",
 		IdempotencyKey: fmt.Sprintf("replace-user-admin-roles:%s:%s:%s", targetUserID, scopeLabel, idempotencyKey),
 		Fingerprint:    fingerprint,
+		Audit:          adminRBACSuccessAudit(auditProductForRole(actor.Product, scopeProduct), audit, "admin_role_assignment", targetUserID),
 		UserID:         targetUserID,
 		Assignments:    mergedAssignments,
 	})
@@ -555,6 +558,16 @@ func permissionsSubset(target []controlplane.PermissionCode, owned []controlplan
 	return true
 }
 
+func filterAdminRoleRecordsByProduct(records []store.AdminRoleRecord, product controlplane.ProductCode) []store.AdminRoleRecord {
+	filtered := make([]store.AdminRoleRecord, 0, len(records))
+	for _, record := range records {
+		if record.Product == product {
+			filtered = append(filtered, record)
+		}
+	}
+	return filtered
+}
+
 func mapAdminRoleRecords(records []store.AdminRoleRecord) []AdminRoleView {
 	result := make([]AdminRoleView, 0, len(records))
 	for _, record := range records {
@@ -571,6 +584,27 @@ func mapAdminRoleRecord(record store.AdminRoleRecord) AdminRoleView {
 		BuiltIn:     record.BuiltIn,
 		Permissions: append([]controlplane.PermissionCode(nil), record.Permissions...),
 	}
+}
+
+func adminRBACSuccessAudit(product controlplane.ProductCode, audit controlplane.AuditLogInput, targetType, targetID string) controlplane.AuditLogInput {
+	if strings.TrimSpace(audit.Action) == "" {
+		return controlplane.AuditLogInput{}
+	}
+	entry := controlplane.AuditLogInput{
+		Product:     auditProductForRole(product, product),
+		ActorUserID: strings.TrimSpace(audit.ActorUserID),
+		DeviceID:    strings.TrimSpace(audit.DeviceID),
+		Action:      strings.TrimSpace(audit.Action),
+		TargetType:  targetType,
+		TargetID:    strings.TrimSpace(targetID),
+		RequestID:   strings.TrimSpace(audit.RequestID),
+		Outcome:     "success",
+		StatusCode:  audit.StatusCode,
+	}
+	if entry.StatusCode <= 0 {
+		entry.StatusCode = 200
+	}
+	return entry
 }
 
 func (s *ControlPlane) normalizeDesiredAssignments(ctx context.Context, repository store.AdminRBACRepository, auth controlplane.AdminAuthorization, userID string, scopeProduct controlplane.ProductCode, globalScope bool, assignments []controlplane.AdminRoleAssignment) ([]controlplane.AdminRoleAssignment, error) {

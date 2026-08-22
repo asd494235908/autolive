@@ -214,12 +214,24 @@ func TestPostgresRepositoryAdminRoleCRUDUsesNormalizedTransactions(t *testing.T)
 	`)).
 		WithArgs("ops_autolive", pq.Array([]string{"devices.read", "users.read"}), now).
 		WillReturnResult(sqlmock.NewResult(1, 2))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).
+		WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-create-role", sqlmock.AnyArg(), now).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
 	created, err := repository.CreateAdminRole(context.Background(), AdminRoleWriteRecord{
 		Scope:          "control-plane-state",
 		IdempotencyKey: "create-admin-role:auto",
 		Fingerprint:    "fp-create",
+		Audit: controlplane.AuditLogInput{
+			ActorUserID: "usr_global",
+			Product:     controlplane.ProductAutoLive,
+			Action:      "POST /api/v1/admin/roles",
+			TargetType:  "admin_role",
+			Outcome:     "success",
+			StatusCode:  201,
+			RequestID:   "req-create-role",
+		},
 		Role: AdminRoleRecord{
 			Code:        "ops_autolive",
 			Product:     controlplane.ProductAutoLive,
@@ -325,12 +337,24 @@ func TestPostgresRepositoryAdminRoleCRUDUsesNormalizedTransactions(t *testing.T)
 	`)).
 		WithArgs("ops_autolive", pq.Array([]string{"devices.manage", "users.read"}), now).
 		WillReturnResult(sqlmock.NewResult(1, 2))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).
+		WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-update-role", sqlmock.AnyArg(), now).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
 	updated, err := repository.UpdateAdminRole(context.Background(), AdminRoleWriteRecord{
 		Scope:          "control-plane-state",
 		IdempotencyKey: "update-admin-role:auto",
 		Fingerprint:    "fp-update",
+		Audit: controlplane.AuditLogInput{
+			ActorUserID: "usr_global",
+			Product:     controlplane.ProductAutoLive,
+			Action:      "PATCH /api/v1/admin/roles/ops_autolive",
+			TargetType:  "admin_role",
+			Outcome:     "success",
+			StatusCode:  200,
+			RequestID:   "req-update-role",
+		},
 		Role: AdminRoleRecord{
 			Code:        "ops_autolive",
 			Product:     controlplane.ProductAutoLive,
@@ -362,13 +386,25 @@ func TestPostgresRepositoryAdminRoleCRUDUsesNormalizedTransactions(t *testing.T)
 	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM admin_roles WHERE code = $1")).
 		WithArgs("ops_autolive").
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).
+		WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-delete-role", sqlmock.AnyArg(), now).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
 	if err := repository.DeleteAdminRole(context.Background(), AdminRoleDeleteRecord{
 		Scope:          "control-plane-state",
 		IdempotencyKey: "delete-admin-role:auto",
 		Fingerprint:    "fp-delete",
-		Code:           "ops_autolive",
+		Audit: controlplane.AuditLogInput{
+			ActorUserID: "usr_global",
+			Product:     controlplane.ProductAutoLive,
+			Action:      "DELETE /api/v1/admin/roles/ops_autolive",
+			TargetType:  "admin_role",
+			Outcome:     "success",
+			StatusCode:  200,
+			RequestID:   "req-delete-role",
+		},
+		Code: "ops_autolive",
 	}); err != nil {
 		t.Fatalf("DeleteAdminRole() error = %v", err)
 	}
@@ -466,7 +502,16 @@ func TestPostgresRepositoryReplaceUserAdminRolesReplayAddsCompatibilityLocalSupe
 		Scope:          "control-plane-state",
 		IdempotencyKey: "replace-user-admin-roles:usr_local_admin:replay",
 		Fingerprint:    "fp-local-replay",
-		UserID:         "usr_local_admin",
+		Audit: controlplane.AuditLogInput{
+			ActorUserID: "usr_global",
+			Product:     controlplane.ProductAutoLive,
+			Action:      "PUT /api/v1/admin/users/usr_local_admin/roles",
+			TargetType:  "admin_role_assignment",
+			Outcome:     "success",
+			StatusCode:  200,
+			RequestID:   "req-local-replay",
+		},
+		UserID: "usr_local_admin",
 	}
 
 	mock.ExpectBegin()
@@ -491,11 +536,106 @@ func TestPostgresRepositoryReplaceUserAdminRolesReplayAddsCompatibilityLocalSupe
 		WithArgs("usr_local_admin", adminRBACListLimit).
 		WillReturnRows(sqlmock.NewRows([]string{"role_code", "product"}).
 			AddRow("ops_autolive", controlplane.ProductAutoLive))
-	mock.ExpectRollback()
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).
+		WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-local-replay", sqlmock.AnyArg(), now).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
 
 	assignments, err := repository.ReplaceUserAdminRoles(context.Background(), record)
 	if err != nil {
 		t.Fatalf("ReplaceUserAdminRoles(replay local admin) error = %v", err)
+	}
+	want := []controlplane.AdminRoleAssignment{
+		{UserID: "usr_local_admin", RoleCode: controlplane.BuiltinAdminRoleSuperAdmin},
+		{UserID: "usr_local_admin", RoleCode: "ops_autolive", Product: controlplane.ProductAutoLive},
+	}
+	if !slices.Equal(assignments, want) {
+		t.Fatalf("assignments = %#v, want %#v", assignments, want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestPostgresRepositoryReplaceUserAdminRolesSuccessAddsCompatibilityLocalSuperAdmin(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, func() time.Time { return now }, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock")).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, username, role, status, created_at FROM users WHERE id = $1 FOR UPDATE")).
+		WithArgs("usr_local_admin").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "username", "role", "status", "created_at"}).
+			AddRow("usr_local_admin", "local", controlplane.RoleAdmin, controlplane.UserStatusActive, now))
+	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO idempotency_records (scope, idempotency_key, fingerprint, resource_id, created_at)")).
+		WithArgs("control-plane-state", "replace-user-admin-roles:usr_local_admin", "fp-local-success", "usr_local_admin", now).
+		WillReturnRows(sqlmock.NewRows([]string{"fingerprint", "resource_id"}).AddRow("fp-local-success", "usr_local_admin"))
+	mock.ExpectQuery(regexp.QuoteMeta(`
+		SELECT code, product, built_in
+		FROM admin_roles
+		WHERE code = ANY($1)
+		FOR UPDATE
+	`)).
+		WithArgs(pq.Array([]string{"ops_autolive"})).
+		WillReturnRows(sqlmock.NewRows([]string{"code", "product", "built_in"}).
+			AddRow("ops_autolive", controlplane.ProductAutoLive, false))
+	mock.ExpectQuery(regexp.QuoteMeta(`
+		SELECT product
+		FROM user_products
+		WHERE user_id = $1
+		  AND status = 'active'
+		  AND product = ANY($2)
+	`)).
+		WithArgs("usr_local_admin", pq.Array([]string{string(controlplane.ProductAutoLive)})).
+		WillReturnRows(sqlmock.NewRows([]string{"product"}).
+			AddRow(controlplane.ProductAutoLive))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT role_code, product FROM user_admin_roles WHERE user_id = $1 FOR UPDATE")).
+		WithArgs("usr_local_admin").
+		WillReturnRows(sqlmock.NewRows([]string{"role_code", "product"}))
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM user_admin_roles WHERE user_id = $1")).
+		WithArgs("usr_local_admin").
+		WillReturnResult(sqlmock.NewResult(1, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`
+		INSERT INTO user_admin_roles (user_id, role_code, product, created_at)
+		SELECT $1, assignment.role_code, assignment.product, $4
+		FROM UNNEST($2::text[], $3::text[]) AS assignment(role_code, product)
+	`)).
+		WithArgs("usr_local_admin", pq.Array([]string{"ops_autolive"}), pq.Array([]string{string(controlplane.ProductAutoLive)}), now).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_outbox (")).
+		WithArgs(sqlmock.AnyArg(), controlplane.ProductAutoLive, "audit-request:req-local-success", sqlmock.AnyArg(), now).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	assignments, err := repository.ReplaceUserAdminRoles(context.Background(), UserAdminRoleReplaceRecord{
+		Scope:          "control-plane-state",
+		IdempotencyKey: "replace-user-admin-roles:usr_local_admin",
+		Fingerprint:    "fp-local-success",
+		Audit: controlplane.AuditLogInput{
+			ActorUserID: "usr_global",
+			Product:     controlplane.ProductAutoLive,
+			Action:      "PUT /api/v1/admin/users/usr_local_admin/roles",
+			TargetType:  "admin_role_assignment",
+			Outcome:     "success",
+			StatusCode:  200,
+			RequestID:   "req-local-success",
+		},
+		UserID: "usr_local_admin",
+		Assignments: []controlplane.AdminRoleAssignment{
+			{UserID: "usr_local_admin", RoleCode: "ops_autolive", Product: controlplane.ProductAutoLive},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReplaceUserAdminRoles(success local admin) error = %v", err)
 	}
 	want := []controlplane.AdminRoleAssignment{
 		{UserID: "usr_local_admin", RoleCode: controlplane.BuiltinAdminRoleSuperAdmin},
