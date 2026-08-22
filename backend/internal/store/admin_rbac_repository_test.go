@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -103,6 +104,67 @@ func TestMemoryStoreAdminRBACRoleCRUDAndListFiltering(t *testing.T) {
 	}
 	if _, err := repository.GetAdminRole(context.Background(), "ops_douyin"); !errors.Is(err, controlplane.ErrAdminRoleNotFound) {
 		t.Fatalf("GetAdminRole(deleted) error = %v, want role not found", err)
+	}
+}
+
+func TestMemoryStoreAdminRBACListAdminRolesUsesBoundedSemantics(t *testing.T) {
+	repository := newAdminRBACMemoryStore(t)
+
+	for i := 0; i < adminRBACListLimit+5; i++ {
+		createRoleForTest(t, repository, AdminRoleRecord{
+			Code:        fmt.Sprintf("role_%03d", i),
+			Product:     controlplane.ProductAutoLive,
+			Name:        fmt.Sprintf("Role %03d", i),
+			Permissions: []controlplane.PermissionCode{"devices.read", "users.read"},
+		})
+	}
+	for i := 0; i < 3; i++ {
+		createRoleForTest(t, repository, AdminRoleRecord{
+			Code:        fmt.Sprintf("douyin_%03d", i),
+			Product:     controlplane.ProductDouyinDesktop,
+			Name:        fmt.Sprintf("Douyin %03d", i),
+			Permissions: []controlplane.PermissionCode{"devices.manage"},
+		})
+	}
+
+	globalRoles, err := repository.ListAdminRoles(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListAdminRoles(global) error = %v", err)
+	}
+	if len(globalRoles) != adminRBACListLimit {
+		t.Fatalf("len(globalRoles) = %d, want %d", len(globalRoles), adminRBACListLimit)
+	}
+	if globalRoles[0].Code != "douyin_000" {
+		t.Fatalf("globalRoles[0] = %+v, want douyin_000", globalRoles[0])
+	}
+	if globalRoles[len(globalRoles)-1].Code != controlplane.BuiltinAdminRoleSuperAdmin {
+		t.Fatalf("globalRoles[last] = %+v, want super_admin", globalRoles[len(globalRoles)-1])
+	}
+	if slices.ContainsFunc(globalRoles, func(role AdminRoleRecord) bool { return role.Code == "role_199" }) {
+		t.Fatalf("globalRoles unexpectedly contains role_199: %#v", adminRoleCodes(globalRoles))
+	}
+
+	productRoles, err := repository.ListAdminRoles(context.Background(), controlplane.ProductAutoLive)
+	if err != nil {
+		t.Fatalf("ListAdminRoles(product) error = %v", err)
+	}
+	if len(productRoles) != adminRBACListLimit+1 {
+		t.Fatalf("len(productRoles) = %d, want %d", len(productRoles), adminRBACListLimit+1)
+	}
+	if productRoles[0].Code != "role_000" {
+		t.Fatalf("productRoles[0] = %+v, want role_000", productRoles[0])
+	}
+	if productRoles[199].Code != "role_199" {
+		t.Fatalf("productRoles[199] = %+v, want role_199", productRoles[199])
+	}
+	if productRoles[200].Code != controlplane.BuiltinAdminRoleSuperAdmin {
+		t.Fatalf("productRoles[200] = %+v, want super_admin", productRoles[200])
+	}
+	if slices.ContainsFunc(productRoles, func(role AdminRoleRecord) bool { return role.Code == "role_200" }) {
+		t.Fatalf("productRoles unexpectedly contains role_200: %#v", adminRoleCodes(productRoles))
+	}
+	if !slices.Equal(productRoles[0].Permissions, []controlplane.PermissionCode{"devices.read", "users.read"}) {
+		t.Fatalf("productRoles[0].Permissions = %#v", productRoles[0].Permissions)
 	}
 }
 

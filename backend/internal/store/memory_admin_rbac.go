@@ -73,16 +73,34 @@ func (s *MemoryStore) ListAdminRoles(ctx context.Context, product controlplane.P
 
 	var roles []AdminRoleRecord
 	err := s.Run(ctx, func(state *State) error {
-		items := make([]AdminRoleRecord, 0, len(state.AdminRoles))
+		ordinaryRoles := make([]AdminRoleRecord, 0, len(state.AdminRoles))
+		var globalSuperAdmin *AdminRoleRecord
 		for code := range state.AdminRoles {
 			role, ok := memoryAdminRoleRecord(state, code)
 			if !ok {
 				continue
 			}
-			if product != "" && role.Code != controlplane.BuiltinAdminRoleSuperAdmin && role.Product != product {
+			if role.Code == controlplane.BuiltinAdminRoleSuperAdmin && role.Product == "" {
+				roleCopy := role
+				globalSuperAdmin = &roleCopy
 				continue
 			}
-			items = append(items, role)
+			if product != "" && role.Product != product {
+				continue
+			}
+			ordinaryRoles = append(ordinaryRoles, role)
+		}
+		sortAdminRoleRecords(ordinaryRoles)
+		limit := adminRBACScopedRoleLimit
+		if product != "" {
+			limit = adminRBACListLimit
+		}
+		if len(ordinaryRoles) > limit {
+			ordinaryRoles = ordinaryRoles[:limit]
+		}
+		items := append([]AdminRoleRecord(nil), ordinaryRoles...)
+		if globalSuperAdmin != nil {
+			items = append(items, *globalSuperAdmin)
 		}
 		sortAdminRoleRecords(items)
 		roles = append([]AdminRoleRecord(nil), items...)

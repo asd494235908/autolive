@@ -6,6 +6,11 @@ import (
 	"autoLive/backend/internal/controlplane"
 )
 
+const (
+	adminRBACListLimit       = 200
+	adminRBACScopedRoleLimit = adminRBACListLimit - 1
+)
+
 type AdminRoleRecord struct {
 	Code        string                        `json:"code"`
 	Product     controlplane.ProductCode      `json:"product"`

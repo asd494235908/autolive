@@ -17,8 +17,6 @@ var _ AdminRBACRepository = (*PostgresRepository)(nil)
 var ErrNormalizedAdminRBACRepositoryRequired = errors.New("normalized admin rbac repository is required")
 
 const (
-	adminRBACListLimit                 = 200
-	adminRBACScopedRoleLimit           = adminRBACListLimit - 1
 	listAdminPermissionsQuery          = `SELECT code FROM admin_permissions ORDER BY code LIMIT $1`
 	getAdminAuthorizationUserQuery     = `SELECT role, status FROM users WHERE id = $1 LIMIT 1`
 	getAdminAuthorizationBindingsQuery = `

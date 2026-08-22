@@ -152,3 +152,44 @@
    - 结果：PASS
 4. `git diff --check`
    - 结果：PASS
+
+## 2026-08-22 Task 4 最后一个 Important 修复
+
+### 本次改动文件
+
+- `backend/internal/store/admin_rbac_repository.go`
+- `backend/internal/store/admin_rbac_repository_test.go`
+- `backend/internal/store/memory_admin_rbac.go`
+- `backend/internal/store/postgres_admin_rbac_repository.go`
+
+### 修复内容
+
+1. Memory `ListAdminRoles` 改为有界且与当前 Postgres/服务边界一致
+   - 共享上限常量移动到 `backend/internal/store/admin_rbac_repository.go`
+     - `adminRBACListLimit = 200`
+     - `adminRBACScopedRoleLimit = 199`
+   - Memory 现在按范围截断并保留全局 `super_admin` 槽位：
+     - `product == ''`：最多返回 200 条（199 普通角色 + 1 个全局 `super_admin`）
+     - `product != ''`：最多返回 200 个当前产品普通角色，并保留全局 `super_admin`（最多 201 条）
+   - 返回顺序保持稳定排序，角色权限保持完整聚合，不再无界返回全部匹配角色。
+
+2. Postgres 常量改为复用共享定义
+   - 删除 `postgres_admin_rbac_repository.go` 私有的 list-limit 常量，改为直接使用 store 共享常量，避免 Memory/Postgres 各自漂移。
+
+### 本次新增/补强验证
+
+- 新增真实 `MemoryStore.ListAdminRoles` 的 201+ 角色边界测试，不依赖替身：
+  - 全局列表会截断到 `199 ordinary + super_admin`
+  - 产品列表会截断到 `200 ordinary + super_admin`
+  - 截断后仍保持稳定排序与完整权限
+
+### 本次实际执行命令与结果
+
+1. `gofmt -w backend/internal/store/admin_rbac_repository.go backend/internal/store/memory_admin_rbac.go backend/internal/store/postgres_admin_rbac_repository.go backend/internal/store/admin_rbac_repository_test.go`
+   - 结果：PASS
+2. `cd backend && go test ./internal/service -run 'AdminRBAC|RBAC' -count=1`
+   - 结果：PASS
+3. `cd backend && go test ./internal/store -run 'AdminRBAC|RBAC' -count=1`
+   - 结果：PASS
+4. `git diff --check`
+   - 结果：PASS
