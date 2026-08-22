@@ -134,6 +134,7 @@ func TestOrdinaryAdminCannotAccessGlobalUserAuthorizationOperations(t *testing.T
 		{name: "disable user", method: http.MethodPost, path: "/api/v1/admin/users/usr_shared/disable"},
 		{name: "update user", method: http.MethodPatch, path: "/api/v1/admin/users/usr_shared", body: map[string]any{}},
 		{name: "reset password", method: http.MethodPost, path: "/api/v1/admin/users/usr_shared/reset-password", body: map[string]any{}},
+		{name: "create user", method: http.MethodPost, path: "/api/v1/admin/users", body: map[string]any{"username": "ordinary-created", "password": "ordinary-created-password", "role": "user"}},
 	} {
 		t.Run(endpoint.name, func(t *testing.T) {
 			response := doJSON(t, handler, endpoint.method, endpoint.path, endpoint.body, ordinaryToken, "ordinary-admin-guard")
@@ -141,6 +142,45 @@ func TestOrdinaryAdminCannotAccessGlobalUserAuthorizationOperations(t *testing.T
 				t.Fatalf("ordinary admin %s status = %d, want %d; body=%s", endpoint.name, response.Code, http.StatusForbidden, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestBuiltinLocalAdminCanCreateUpdateAndDisableUser(t *testing.T) {
+	handler, localToken, _ := newProductScopeIntegrationRouter(t)
+	created := doJSON(t, handler, http.MethodPost, "/api/v1/admin/users", map[string]any{
+		"username": "local-managed-user",
+		"password": "local-managed-password",
+		"role":     "user",
+	}, localToken, "local-create-managed-user")
+	if created.Code != http.StatusCreated {
+		t.Fatalf("local admin create status = %d, want %d; body=%s", created.Code, http.StatusCreated, created.Body.String())
+	}
+	var createPayload userEnvelope
+	decodeJSON(t, created.Body.Bytes(), &createPayload)
+	if createPayload.User.ID == "" || createPayload.User.Username != "local-managed-user" || createPayload.User.Status != controlplane.UserStatusActive {
+		t.Fatalf("created user = %+v", createPayload.User)
+	}
+
+	updated := doJSON(t, handler, http.MethodPatch, "/api/v1/admin/users/"+createPayload.User.ID, map[string]any{
+		"username": "local-managed-user-renamed",
+	}, localToken, "local-update-managed-user")
+	if updated.Code != http.StatusOK {
+		t.Fatalf("local admin update status = %d, want %d; body=%s", updated.Code, http.StatusOK, updated.Body.String())
+	}
+	var updatePayload userEnvelope
+	decodeJSON(t, updated.Body.Bytes(), &updatePayload)
+	if updatePayload.User.Username != "local-managed-user-renamed" || updatePayload.User.Status != controlplane.UserStatusActive {
+		t.Fatalf("updated user = %+v", updatePayload.User)
+	}
+
+	disabled := doJSON(t, handler, http.MethodPost, "/api/v1/admin/users/"+createPayload.User.ID+"/disable", nil, localToken, "local-disable-managed-user")
+	if disabled.Code != http.StatusOK {
+		t.Fatalf("local admin disable status = %d, want %d; body=%s", disabled.Code, http.StatusOK, disabled.Body.String())
+	}
+	var disablePayload userEnvelope
+	decodeJSON(t, disabled.Body.Bytes(), &disablePayload)
+	if disablePayload.User.Status != controlplane.UserStatusDisabled {
+		t.Fatalf("disabled user = %+v", disablePayload.User)
 	}
 }
 

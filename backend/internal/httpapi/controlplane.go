@@ -250,6 +250,10 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("POST /api/v1/admin/users", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		if !isBuiltinLocalAdmin(actor) {
+			writeAppError(w, r, controlplane.ErrLocalAdminRequired)
+			return
+		}
 		var input controlplane.CreateUserInput
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)

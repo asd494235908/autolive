@@ -208,7 +208,10 @@ export interface paths {
         /** 查询用户列表 */
         get: operations["listAdminUsers"];
         put?: never;
-        /** 创建用户 */
+        /**
+         * 创建用户
+         * @description 仅内建本地管理员可调用；创建全局用户身份。
+         */
         post: operations["createAdminUser"];
         delete?: never;
         options?: never;
@@ -242,7 +245,7 @@ export interface paths {
         };
         /**
          * 查询用户授权与软额度摘要
-         * @description 返回设备、活动租约、活动模型账号和客户端自报日用量；当前没有供应商权威用户额度。
+         * @description 仅内建本地管理员可调用；返回设备、活动租约、活动模型账号和客户端自报日用量；当前没有供应商权威用户额度。
          */
         get: operations["getAdminUserAuthorizationSummary"];
         put?: never;
@@ -268,7 +271,7 @@ export interface paths {
         head?: never;
         /**
          * 更新用户模型授权与服务端记录用量门禁
-         * @description 空模型列表表示允许所有已登记模型；daily_token_limit 只约束服务端已接收的客户端用量记录，不是供应商权威计费或未来用量预占。
+         * @description 仅内建本地管理员可调用；空模型列表表示允许所有已登记模型；daily_token_limit 只约束服务端已接收的客户端用量记录，不是供应商权威计费或未来用量预占。
          */
         patch: operations["updateAdminUserAuthorization"];
         trace?: never;
@@ -282,7 +285,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 禁用用户 */
+        /**
+         * 禁用用户
+         * @description 仅内建本地管理员可调用。
+         */
         post: operations["disableAdminUser"];
         delete?: never;
         options?: never;
@@ -303,7 +309,10 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        /** 编辑用户 */
+        /**
+         * 编辑用户
+         * @description 仅内建本地管理员可调用；该操作会修改全局用户身份。
+         */
         patch: operations["updateAdminUser"];
         trace?: never;
     };
@@ -316,7 +325,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 重置用户密码 */
+        /**
+         * 重置用户密码
+         * @description 仅内建本地管理员可调用。
+         */
         post: operations["resetAdminUserPassword"];
         delete?: never;
         options?: never;

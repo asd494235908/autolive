@@ -192,6 +192,7 @@ func TestOpenAPIAdminListGetsDeclareBadRequest(t *testing.T) {
 		"/api/v1/admin/model-pool",
 		"/api/v1/admin/model-usage",
 		"/api/v1/admin/model-leases",
+		"/api/v1/admin/audit-logs",
 	}
 	for _, path := range want {
 		var operation struct {
