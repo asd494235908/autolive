@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/fs"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -59,6 +60,43 @@ func TestEmbeddedMigrationsUseVersionedUpSQLFiles(t *testing.T) {
 	}
 }
 
+func TestEmbeddedMigrationsAreContiguousAndAppendOnly(t *testing.T) {
+	entries, err := fs.ReadDir(FS, ".")
+	if err != nil {
+		t.Fatalf("fs.ReadDir() error = %v", err)
+	}
+
+	versionByFile := regexp.MustCompile(`^(\d{4})_.+\.up\.sql$`)
+	seen := make(map[int]string, len(entries))
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		matches := versionByFile.FindStringSubmatch(entry.Name())
+		if matches == nil {
+			t.Fatalf("migration %s must match 4-digit versioned .up.sql naming", entry.Name())
+		}
+		version, err := strconv.Atoi(matches[1])
+		if err != nil {
+			t.Fatalf("parse migration version from %s: %v", entry.Name(), err)
+		}
+		if prior, ok := seen[version]; ok {
+			t.Fatalf("duplicate migration version %04d in %s and %s", version, prior, entry.Name())
+		}
+		seen[version] = entry.Name()
+	}
+
+	for version := 1; version <= LatestVersion; version++ {
+		if _, ok := seen[version]; !ok {
+			t.Fatalf("missing migration version %04d; embedded catalog must be contiguous from 0001 to %04d", version, LatestVersion)
+		}
+	}
+	if len(seen) != LatestVersion {
+		t.Fatalf("embedded migration version count = %d, want %d", len(seen), LatestVersion)
+	}
+}
+
 func TestLatestVersionMatchesEmbeddedCatalog(t *testing.T) {
 	entries, err := fs.ReadDir(FS, ".")
 	if err != nil {
@@ -66,12 +104,6 @@ func TestLatestVersionMatchesEmbeddedCatalog(t *testing.T) {
 	}
 	if len(entries) != LatestVersion {
 		t.Fatalf("embedded migration count = %d, want latest version %d", len(entries), LatestVersion)
-	}
-}
-
-func TestLatestVersionIsProductIsolationMigration23(t *testing.T) {
-	if LatestVersion != 23 {
-		t.Fatalf("LatestVersion = %d, want 23", LatestVersion)
 	}
 }
 
