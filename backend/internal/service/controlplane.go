@@ -754,6 +754,27 @@ func (s *ControlPlane) ListUsersPage(ctx context.Context, page, pageSize int) ([
 	return items[start:end], len(items), nil
 }
 
+func (s *ControlPlane) ListUsersPageForProduct(ctx context.Context, page, pageSize int, product controlplane.ProductCode) ([]controlplane.UserSummary, int, error) {
+	if product == "" {
+		return s.ListUsersPage(ctx, page, pageSize)
+	}
+	if !product.Valid() {
+		return nil, 0, controlplane.ErrInvalidRequest
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	if reader, ok := s.repository.(store.ProductUserPageReader); ok {
+		result, err := reader.ListUsersPageForProduct(ctx, offset, pageSize, product)
+		if err != nil {
+			return nil, 0, err
+		}
+		return result.Items, result.Total, nil
+	}
+	return nil, 0, store.ErrNormalizedUserPageReaderRequired
+}
+
 func (s *ControlPlane) CreateUser(ctx context.Context, idempotencyKey string, input controlplane.CreateUserInput) (controlplane.UserSummary, error) {
 	if err := checkContext(ctx); err != nil {
 		return controlplane.UserSummary{}, err
@@ -1137,6 +1158,32 @@ func (s *ControlPlane) ListDevicesPage(ctx context.Context, page, pageSize int) 
 		items[index] = decorateDeviceSummary(items[index], now)
 	}
 	return items, total, nil
+}
+
+func (s *ControlPlane) ListDevicesPageForProduct(ctx context.Context, page, pageSize int, product controlplane.ProductCode) ([]controlplane.DeviceSummary, int, error) {
+	if product == "" {
+		return s.ListDevicesPage(ctx, page, pageSize)
+	}
+	if !product.Valid() {
+		return nil, 0, controlplane.ErrInvalidRequest
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	reader, ok := s.repository.(store.ProductUserPageReader)
+	if !ok {
+		return nil, 0, store.ErrNormalizedUserPageReaderRequired
+	}
+	result, err := reader.ListDevicesPageForProduct(ctx, offset, pageSize, product)
+	if err != nil {
+		return nil, 0, err
+	}
+	now := s.repository.Now()
+	for index := range result.Items {
+		result.Items[index] = decorateDeviceSummary(result.Items[index], now)
+	}
+	return result.Items, result.Total, nil
 }
 
 func (s *ControlPlane) GetDevice(ctx context.Context, deviceID string) (controlplane.DeviceSummary, error) {
@@ -1748,6 +1795,51 @@ func (s *ControlPlane) ListModelPoolAccountsPage(ctx context.Context, page, page
 		return result.Items, result.Total, nil
 	}
 	items, err := s.ListModelPoolAccounts(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	start, end := pageWindow(len(items), offset, pageSize)
+	return items[start:end], len(items), nil
+}
+
+func (s *ControlPlane) ListModelPoolAccountsPageForProduct(ctx context.Context, page, pageSize int, product controlplane.ProductCode) ([]controlplane.ModelPoolAccountSummary, int, error) {
+	if product == "" {
+		return s.ListModelPoolAccountsPage(ctx, page, pageSize)
+	}
+	if !product.Valid() {
+		return nil, 0, controlplane.ErrInvalidRequest
+	}
+	offset, err := pageOffset(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	if reader, ok := s.repository.(store.ProductModelPoolPageReader); ok {
+		result, err := reader.ListModelPoolAccountsPageForProduct(ctx, offset, pageSize, product)
+		if err != nil {
+			return nil, 0, err
+		}
+		now := s.repository.Now()
+		for index := range result.Items {
+			normalizeModelPoolAccountSummary(&result.Items[index], now)
+		}
+		return result.Items, result.Total, nil
+	}
+	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
+		return nil, 0, store.ErrNormalizedModelPoolPageReaderRequired
+	}
+	items, err := withState(ctx, s.repository, func(state *store.State) ([]controlplane.ModelPoolAccountSummary, error) {
+		now := s.repository.Now()
+		result := make([]controlplane.ModelPoolAccountSummary, 0, len(state.ModelPoolAccounts))
+		for _, account := range state.ModelPoolAccounts {
+			storedProduct, ok := strictStoredProduct(account.Product)
+			if !ok || storedProduct != product {
+				continue
+			}
+			result = append(result, decorateModelPoolAccount(state, account, now))
+		}
+		slices.SortFunc(result, func(a, b controlplane.ModelPoolAccountSummary) int { return strings.Compare(a.ID, b.ID) })
+		return result, nil
+	})
 	if err != nil {
 		return nil, 0, err
 	}

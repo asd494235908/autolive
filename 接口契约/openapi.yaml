@@ -449,6 +449,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/AdminProduct'
       responses:
         '200':
           description: 用户分页列表
@@ -773,6 +774,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/AdminProduct'
       responses:
         '200':
           description: 设备分页列表
@@ -918,6 +920,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/AdminProduct'
       responses:
         '200':
           description: 激活码分页列表
@@ -1024,6 +1027,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/AdminProduct'
       responses:
         '200':
           description: 模型池摘要列表
@@ -1280,6 +1284,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/AdminProduct'
         - name: provider
           in: query
           schema:
@@ -1348,6 +1353,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/AdminProduct'
         - name: status
           in: query
           schema:
@@ -1487,6 +1493,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/AdminProduct'
         - name: actor_user_id
           in: query
           schema:
@@ -1683,6 +1690,12 @@ components:
         minimum: 1
         maximum: 200
         default: 20
+    AdminProduct:
+      name: product
+      in: query
+      description: 内建跨产品管理员省略时查询全部产品；其他管理员仅可查询认证会话所属产品。
+      schema:
+        $ref: '#/components/schemas/ProductCode'
   responses:
     BadRequest:
       description: 请求参数不合法

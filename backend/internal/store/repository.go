@@ -359,6 +359,14 @@ type UserPageReader interface {
 	ListDevicesForUserPage(ctx context.Context, userID string, offset, limit int) (DevicePage, error)
 }
 
+// ProductUserPageReader applies an already-authorized product scope to admin
+// pages. An empty product means the HTTP boundary granted the built-in global
+// administrator scope; repositories must never treat it as client authority.
+type ProductUserPageReader interface {
+	ListUsersPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (UserPage, error)
+	ListDevicesPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (DevicePage, error)
+}
+
 // UserRepository owns normalized user writes without exposing the legacy
 // control-plane snapshot to callers. PasswordHash is already bcrypt-derived
 // at the service boundary and must never be logged or returned.
@@ -559,6 +567,10 @@ type AuditFilteredPageReader interface {
 
 type ModelPoolPageReader interface {
 	ListModelPoolAccountsPage(ctx context.Context, offset, limit int) (ModelPoolPage, error)
+}
+
+type ProductModelPoolPageReader interface {
+	ListModelPoolAccountsPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (ModelPoolPage, error)
 }
 
 // ModelPoolHealthPageReader returns only accounts that are currently eligible

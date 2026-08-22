@@ -204,6 +204,36 @@ func (s *PostgresRepository) ListUsersPage(ctx context.Context, offset, limit in
 	})
 }
 
+func (s *PostgresRepository) ListUsersPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (UserPage, error) {
+	if !product.Valid() || s.modelReadSource != ModelReadSourceNormalized {
+		return UserPage{}, controlplane.ErrInvalidRequest
+	}
+	if err := validatePageWindow(offset, limit); err != nil {
+		return UserPage{}, err
+	}
+	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (UserPage, error) {
+		var page UserPage
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users u JOIN user_products up ON up.user_id = u.id WHERE up.product = $1 AND up.status = 'active'`, product).Scan(&page.Total); err != nil {
+			return UserPage{}, err
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT u.id, u.username, u.role, u.status, u.created_at FROM users u JOIN user_products up ON up.user_id = u.id WHERE up.product = $1 AND up.status = 'active' ORDER BY u.id LIMIT $2 OFFSET $3`, product, limit, offset)
+		if err != nil {
+			return UserPage{}, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var item controlplane.UserSummary
+			var createdAt time.Time
+			if err := rows.Scan(&item.ID, &item.Username, &item.Role, &item.Status, &createdAt); err != nil {
+				return UserPage{}, err
+			}
+			item.CreatedAt = createdAt.UTC().Format(time.RFC3339)
+			page.Items = append(page.Items, item)
+		}
+		return page, rows.Err()
+	})
+}
+
 func (s *PostgresRepository) ListDevicesPage(ctx context.Context, offset, limit int) (DevicePage, error) {
 	if err := validatePageWindow(offset, limit); err != nil {
 		return DevicePage{}, err
@@ -229,6 +259,32 @@ func (s *PostgresRepository) ListDevicesPage(ctx context.Context, offset, limit 
 			return DevicePage{}, err
 		}
 		rows, err := tx.QueryContext(ctx, devicePageQuery+` ORDER BY id LIMIT $1 OFFSET $2`, limit, offset)
+		if err != nil {
+			return DevicePage{}, err
+		}
+		defer rows.Close()
+		items, err := scanDeviceRows(rows)
+		if err != nil {
+			return DevicePage{}, err
+		}
+		page.Items = items
+		return page, nil
+	})
+}
+
+func (s *PostgresRepository) ListDevicesPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (DevicePage, error) {
+	if !product.Valid() || s.modelReadSource != ModelReadSourceNormalized {
+		return DevicePage{}, controlplane.ErrInvalidRequest
+	}
+	if err := validatePageWindow(offset, limit); err != nil {
+		return DevicePage{}, err
+	}
+	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (DevicePage, error) {
+		var page DevicePage
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM devices WHERE product = $1`, product).Scan(&page.Total); err != nil {
+			return DevicePage{}, err
+		}
+		rows, err := tx.QueryContext(ctx, devicePageQuery+` WHERE product = $1 ORDER BY id LIMIT $2 OFFSET $3`, product, limit, offset)
 		if err != nil {
 			return DevicePage{}, err
 		}
@@ -589,6 +645,44 @@ func (s *PostgresRepository) ListModelPoolAccountsPage(ctx context.Context, offs
 		if err != nil {
 			return ModelPoolPage{}, err
 		}
+		return page, nil
+	})
+}
+
+func (s *PostgresRepository) ListModelPoolAccountsPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (ModelPoolPage, error) {
+	if !product.Valid() || s.modelReadSource != ModelReadSourceNormalized {
+		return ModelPoolPage{}, controlplane.ErrInvalidRequest
+	}
+	if err := validatePageWindow(offset, limit); err != nil {
+		return ModelPoolPage{}, err
+	}
+	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (ModelPoolPage, error) {
+		var page ModelPoolPage
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_accounts WHERE product = $1`, product).Scan(&page.Total); err != nil {
+			return ModelPoolPage{}, err
+		}
+		now := s.Now()
+		dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		dayEnd := dayStart.Add(24 * time.Hour)
+		rows, err := tx.QueryContext(ctx, `
+			SELECT a.id, a.product, a.provider, a.model, a.base_url, a.secret_ref, a.status,
+			       a.priority, a.concurrency_limit, a.daily_token_limit, a.cooldown_until,
+			       (SELECT COUNT(*) FROM model_leases l WHERE l.account_id = a.id AND l.product = a.product AND l.status = 'active' AND l.expires_at > $1),
+			       COALESCE((SELECT SUM(u.total_tokens) FROM model_usage_records u WHERE u.account_id = a.id AND u.product = a.product AND u.created_at >= $2 AND u.created_at < $3), 0),
+			       t.payload, t.created_at
+			  FROM model_accounts a
+			  LEFT JOIN LATERAL (SELECT payload, created_at FROM model_pool_test_results WHERE account_id = a.id AND product = a.product ORDER BY created_at DESC, id DESC LIMIT 1) t ON TRUE
+			 WHERE a.product = $4
+			 ORDER BY a.id LIMIT $5 OFFSET $6
+		`, now, dayStart, dayEnd, product, limit, offset)
+		if err != nil {
+			return ModelPoolPage{}, err
+		}
+		items, err := scanModelPoolAccountRows(rows)
+		if err != nil {
+			return ModelPoolPage{}, err
+		}
+		page.Items = items
 		return page, nil
 	})
 }

@@ -167,12 +167,17 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/admin/users", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		product, err := resolveAdminProductScope(r, actor)
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		pageNumber, pageSize, err := pageParams(r)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
 		}
-		items, total, err := svc.ListUsersPage(r.Context(), pageNumber, pageSize)
+		items, total, err := svc.ListUsersPageForProduct(r.Context(), pageNumber, pageSize, product)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -307,12 +312,17 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/admin/devices", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		product, err := resolveAdminProductScope(r, actor)
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		pageNumber, pageSize, err := pageParams(r)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
 		}
-		items, total, err := svc.ListDevicesPage(r.Context(), pageNumber, pageSize)
+		items, total, err := svc.ListDevicesPageForProduct(r.Context(), pageNumber, pageSize, product)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -380,12 +390,23 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/admin/activation-codes", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		product, err := resolveAdminProductScope(r, actor)
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		page, pageSize, err := pageParams(r)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
 		}
-		items, total, err := svc.ListActivationCodesPageForProduct(r.Context(), page, pageSize, actor.Product)
+		var items []controlplane.ActivationCode
+		var total int
+		if product == "" {
+			items, total, err = svc.ListActivationCodesPage(r.Context(), page, pageSize)
+		} else {
+			items, total, err = svc.ListActivationCodesPageForProduct(r.Context(), page, pageSize, product)
+		}
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -438,12 +459,17 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/admin/model-pool", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		product, err := resolveAdminProductScope(r, actor)
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		pageNumber, pageSize, err := pageParams(r)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
 		}
-		items, total, err := svc.ListModelPoolAccountsPage(r.Context(), pageNumber, pageSize)
+		items, total, err := svc.ListModelPoolAccountsPageForProduct(r.Context(), pageNumber, pageSize, product)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -754,12 +780,17 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/admin/model-usage", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		product, err := resolveAdminProductScope(r, actor)
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		pageNumber, pageSize, err := pageParams(r)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
 		}
-		items, total, err := svc.ListModelUsagePageWithOptions(r.Context(), pageNumber, pageSize, modelUsageListOptions(r))
+		items, total, err := svc.ListModelUsagePageWithOptions(r.Context(), pageNumber, pageSize, modelUsageListOptions(r, product))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -772,12 +803,17 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/admin/model-leases", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		product, err := resolveAdminProductScope(r, actor)
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		pageNumber, pageSize, err := pageParams(r)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
 		}
-		items, total, err := svc.ListModelLeasesPageWithOptions(r.Context(), pageNumber, pageSize, modelLeaseListOptions(r))
+		items, total, err := svc.ListModelLeasesPageWithOptions(r.Context(), pageNumber, pageSize, modelLeaseListOptions(r, product))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -821,12 +857,17 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 	}))
 
 	mux.Handle("GET /api/v1/admin/audit-logs", auth.requireAdmin(func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
+		product, err := resolveAdminProductScope(r, actor)
+		if err != nil {
+			writeAppError(w, r, err)
+			return
+		}
 		pageNumber, pageSize, err := pageParams(r)
 		if err != nil {
 			writeAppError(w, r, err)
 			return
 		}
-		items, total, err := svc.ListAuditLogsPageWithOptions(r.Context(), pageNumber, pageSize, auditLogListOptions(r))
+		items, total, err := svc.ListAuditLogsPageWithOptions(r.Context(), pageNumber, pageSize, auditLogListOptions(r, product))
 		if err != nil {
 			writeAppError(w, r, err)
 			return
@@ -915,9 +956,35 @@ func pageParams(r *http.Request) (int, int, error) {
 	return page, pageSize, nil
 }
 
-func modelLeaseListOptions(r *http.Request) service.ModelLeaseListOptions {
+func resolveAdminProductScope(r *http.Request, actor controlplane.Actor) (controlplane.ProductCode, error) {
+	values, exists := r.URL.Query()["product"]
+	if len(values) > 1 {
+		return "", controlplane.ErrInvalidRequest
+	}
+	localAdmin := actor.UserID == "usr_local_admin" && actor.Role == "admin"
+	if !exists {
+		if localAdmin {
+			return "", nil
+		}
+		if !actor.Product.Valid() {
+			return "", controlplane.ErrForbidden
+		}
+		return actor.Product, nil
+	}
+	product, err := controlplane.ParseProductCode(values[0])
+	if err != nil {
+		return "", controlplane.ErrInvalidRequest
+	}
+	if localAdmin || product == actor.Product {
+		return product, nil
+	}
+	return "", controlplane.ErrForbidden
+}
+
+func modelLeaseListOptions(r *http.Request, product controlplane.ProductCode) service.ModelLeaseListOptions {
 	query := r.URL.Query()
 	return service.ModelLeaseListOptions{
+		Product:   product,
 		Status:    query.Get("status"),
 		Provider:  query.Get("provider"),
 		Model:     query.Get("model"),
@@ -928,9 +995,10 @@ func modelLeaseListOptions(r *http.Request) service.ModelLeaseListOptions {
 	}
 }
 
-func modelUsageListOptions(r *http.Request) service.ModelUsageListOptions {
+func modelUsageListOptions(r *http.Request, product controlplane.ProductCode) service.ModelUsageListOptions {
 	query := r.URL.Query()
 	return service.ModelUsageListOptions{
+		Product:       product,
 		Provider:      query.Get("provider"),
 		Model:         query.Get("model"),
 		UserID:        query.Get("user_id"),
@@ -942,9 +1010,10 @@ func modelUsageListOptions(r *http.Request) service.ModelUsageListOptions {
 	}
 }
 
-func auditLogListOptions(r *http.Request) service.AuditLogListOptions {
+func auditLogListOptions(r *http.Request, product controlplane.ProductCode) service.AuditLogListOptions {
 	query := r.URL.Query()
 	return service.AuditLogListOptions{
+		Product:       product,
 		ActorUserID:   query.Get("actor_user_id"),
 		DeviceID:      query.Get("device_id"),
 		Action:        query.Get("action"),

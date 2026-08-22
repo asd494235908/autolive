@@ -3,11 +3,33 @@ package store
 import (
 	"context"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"autoLive/backend/internal/controlplane"
 )
+
+func memoryResourceProduct(product controlplane.ProductCode) controlplane.ProductCode {
+	if product.Valid() {
+		return product
+	}
+	return controlplane.ProductAutoLive
+}
+
+func memoryUserHasProduct(state *State, userID string, product controlplane.ProductCode) bool {
+	hasMemberships := false
+	for _, membership := range state.UserProducts {
+		if membership.UserID != userID {
+			continue
+		}
+		hasMemberships = true
+		if membership.Product == product && membership.Status == "active" {
+			return true
+		}
+	}
+	return !hasMemberships && product == controlplane.ProductAutoLive
+}
 
 // MemoryStore 是 PostgreSQL 接入前的进程内测试实现；进程退出后所有状态都会丢失。
 type MemoryStore struct {
@@ -198,6 +220,30 @@ func (s *MemoryStore) ListUsersPage(ctx context.Context, offset, limit int) (Use
 	return page, err
 }
 
+func (s *MemoryStore) ListUsersPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (UserPage, error) {
+	if product != "" && !product.Valid() {
+		return UserPage{}, controlplane.ErrInvalidRequest
+	}
+	if product == "" {
+		return s.ListUsersPage(ctx, offset, limit)
+	}
+	var page UserPage
+	err := s.Run(ctx, func(state *State) error {
+		items := make([]controlplane.UserSummary, 0, len(state.Users))
+		for _, item := range state.Users {
+			if memoryUserHasProduct(state, item.ID, product) {
+				items = append(items, item)
+			}
+		}
+		slices.SortFunc(items, func(a, b controlplane.UserSummary) int { return strings.Compare(a.ID, b.ID) })
+		page.Total = len(items)
+		start, end := pageWindow(page.Total, offset, limit)
+		page.Items = append([]controlplane.UserSummary(nil), items[start:end]...)
+		return nil
+	})
+	return page, err
+}
+
 func (s *MemoryStore) ListDevicesPage(ctx context.Context, offset, limit int) (DevicePage, error) {
 	if err := validatePageWindow(offset, limit); err != nil {
 		return DevicePage{}, err
@@ -217,6 +263,30 @@ func (s *MemoryStore) ListDevicesPage(ctx context.Context, offset, limit int) (D
 			}
 			return 0
 		})
+		page.Total = len(items)
+		start, end := pageWindow(page.Total, offset, limit)
+		page.Items = append([]controlplane.DeviceSummary(nil), items[start:end]...)
+		return nil
+	})
+	return page, err
+}
+
+func (s *MemoryStore) ListDevicesPageForProduct(ctx context.Context, offset, limit int, product controlplane.ProductCode) (DevicePage, error) {
+	if product != "" && !product.Valid() {
+		return DevicePage{}, controlplane.ErrInvalidRequest
+	}
+	if product == "" {
+		return s.ListDevicesPage(ctx, offset, limit)
+	}
+	var page DevicePage
+	err := s.Run(ctx, func(state *State) error {
+		items := make([]controlplane.DeviceSummary, 0, len(state.Devices))
+		for _, item := range state.Devices {
+			if memoryResourceProduct(item.Product) == product {
+				items = append(items, item)
+			}
+		}
+		slices.SortFunc(items, func(a, b controlplane.DeviceSummary) int { return strings.Compare(a.ID, b.ID) })
 		page.Total = len(items)
 		start, end := pageWindow(page.Total, offset, limit)
 		page.Items = append([]controlplane.DeviceSummary(nil), items[start:end]...)
