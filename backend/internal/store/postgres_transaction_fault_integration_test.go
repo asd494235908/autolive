@@ -57,8 +57,10 @@ func TestPostgresNormalizedActivationRejectsConflictingSessionBindingWithoutResi
 		Fingerprint:        fixture.IdempotencyPrefix + "binding-conflict-fingerprint",
 		AccessTokenHash:    fixture.AccessTokenHashes[0],
 		UserID:             fixture.UserID,
+		Product:            controlplane.ProductAutoLive,
 		ActivationCodeHash: fixture.CodeHash,
 		Device: controlplane.DeviceRegistration{
+			Product:  controlplane.ProductAutoLive,
 			DeviceID: fixture.DeviceIDs[0], DeviceName: "conflicting-device",
 			Platform: "integration", AppVersion: "test",
 		},
@@ -118,8 +120,10 @@ func TestPostgresNormalizedActivationCancellationWhileWaitingForMutationLockLeav
 			Fingerprint:        fixture.IdempotencyPrefix + "cancelled-fingerprint",
 			AccessTokenHash:    fixture.AccessTokenHashes[0],
 			UserID:             fixture.UserID,
+			Product:            controlplane.ProductAutoLive,
 			ActivationCodeHash: fixture.CodeHash,
 			Device: controlplane.DeviceRegistration{
+				Product:  controlplane.ProductAutoLive,
 				DeviceID: fixture.DeviceIDs[0], DeviceName: "cancelled-device",
 				Platform: "integration", AppVersion: "test",
 			},
@@ -194,8 +198,10 @@ func TestPostgresNormalizedActivationConnectionTerminationWhileWaitingLeavesNoRe
 			Fingerprint:        fixture.IdempotencyPrefix + "terminated-fingerprint",
 			AccessTokenHash:    fixture.AccessTokenHashes[0],
 			UserID:             fixture.UserID,
+			Product:            controlplane.ProductAutoLive,
 			ActivationCodeHash: fixture.CodeHash,
 			Device: controlplane.DeviceRegistration{
+				Product:  controlplane.ProductAutoLive,
 				DeviceID: fixture.DeviceIDs[0], DeviceName: "terminated-device",
 				Platform: "integration", AppVersion: "test",
 			},
@@ -285,8 +291,10 @@ func TestPostgresNormalizedActivationCommitResponseLossPreservesDurableState(t *
 		Fingerprint:        fixture.IdempotencyPrefix + "commit-response-loss-fingerprint",
 		AccessTokenHash:    fixture.AccessTokenHashes[0],
 		UserID:             fixture.UserID,
+		Product:            controlplane.ProductAutoLive,
 		ActivationCodeHash: fixture.CodeHash,
 		Device: controlplane.DeviceRegistration{
+			Product:  controlplane.ProductAutoLive,
 			DeviceID: fixture.DeviceIDs[0], DeviceName: "commit-response-loss-device",
 			Platform: "integration", AppVersion: "test",
 		},

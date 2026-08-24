@@ -9,7 +9,7 @@
     "build": "vite build",
     "api:generate": "openapi-typescript ../接口契约/openapi.yaml -o src/api/openapi.generated.ts",
     "api:check": "openapi-typescript ../接口契约/openapi.yaml -o src/api/openapi.generated.ts --check",
-    "test": "tsx --test src/api/client-contract.test.mjs src/features/model-pool/modelPoolIdempotency.test.mjs src/features/auth/session.test.mjs src/features/activation-codes/activationCodeExpiry.test.mjs src/features/admin-rbac/adminRbac.test.mjs",
+    "test": "tsx --test src/api/client-contract.test.mjs src/features/model-pool/modelPoolIdempotency.test.mjs src/features/auth/session.test.mjs src/features/auth/login.test.mjs src/features/activation-codes/activationCodeExpiry.test.mjs src/features/admin-rbac/adminRbac.test.mjs",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"
   },

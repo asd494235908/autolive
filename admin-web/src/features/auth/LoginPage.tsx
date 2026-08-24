@@ -6,14 +6,18 @@ import { apiClient, ApiClientError } from '../../api/client';
 import type { LoginRequest, LoginResponse } from '../../types/api';
 import { saveSession } from './session';
 
+type LoginFormValues = Pick<LoginRequest, 'username' | 'password'>;
+
 export function LoginPage() {
   const [feedback, setFeedback] = useState<string | null>(null);
-  const [form] = Form.useForm<LoginRequest>();
+  const [form] = Form.useForm<LoginFormValues>();
   const navigate = useNavigate();
 
   const loginMutation = useMutation({
-    mutationFn: async (values: LoginRequest) =>
-      apiClient.post<LoginResponse>('/api/v1/auth/login', { body: values }),
+    mutationFn: async (values: LoginFormValues) =>
+      apiClient.post<LoginResponse>('/api/v1/auth/login', {
+        body: { ...values, product: 'autolive' }
+      }),
     onSuccess: (response) => {
       saveSession({ tokens: response.tokens, user: response.user });
       navigate('/', { replace: true });
@@ -55,7 +59,7 @@ export function LoginPage() {
 
           {feedback ? <Alert type="warning" showIcon message={feedback} /> : null}
 
-          <Form<LoginRequest>
+          <Form<LoginFormValues>
             form={form}
             layout="vertical"
             initialValues={{ username: '', password: '' }}

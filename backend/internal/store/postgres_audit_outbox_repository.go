@@ -136,13 +136,6 @@ func (s *PostgresRepository) DispatchAuditOutbox(ctx context.Context, batchSize 
 			_ = rows.Close()
 			return 0, postgresOperationError(operationCtx, fmt.Errorf("scan audit outbox: %w", err))
 		}
-		if _, err := tx.ExecContext(operationCtx, `
-			UPDATE audit_outbox SET status = 'processing', updated_at = $2
-			WHERE id = $1
-		`, item.id, now); err != nil {
-			_ = rows.Close()
-			return 0, postgresOperationError(operationCtx, fmt.Errorf("claim audit outbox row: %w", err))
-		}
 		claimed = append(claimed, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -151,6 +144,14 @@ func (s *PostgresRepository) DispatchAuditOutbox(ctx context.Context, batchSize 
 	}
 	if err := rows.Close(); err != nil {
 		return 0, postgresOperationError(operationCtx, fmt.Errorf("close audit outbox rows: %w", err))
+	}
+	for _, item := range claimed {
+		if _, err := tx.ExecContext(operationCtx, `
+			UPDATE audit_outbox SET status = 'processing', updated_at = $2
+			WHERE id = $1
+		`, item.id, now); err != nil {
+			return 0, postgresOperationError(operationCtx, fmt.Errorf("claim audit outbox row: %w", err))
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, postgresCommitError(operationCtx, "commit audit outbox claims", err)

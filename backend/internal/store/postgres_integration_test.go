@@ -305,8 +305,10 @@ func TestPostgresNormalizedActivationRedeemIsSingleWinnerAcrossRepositories(t *t
 				Fingerprint:        fmt.Sprintf("activation-race-fingerprint-%d", index),
 				AccessTokenHash:    accessTokens[index],
 				UserID:             userID,
+				Product:            controlplane.ProductAutoLive,
 				ActivationCodeHash: activationHash,
 				Device: controlplane.DeviceRegistration{
+					Product:  controlplane.ProductAutoLive,
 					DeviceID: deviceIDs[index], DeviceName: fmt.Sprintf("race-device-%d", index),
 					Platform: "integration", AppVersion: "test",
 				},
@@ -344,8 +346,10 @@ func TestPostgresNormalizedActivationRedeemIsSingleWinnerAcrossRepositories(t *t
 		Fingerprint:        fmt.Sprintf("activation-race-fingerprint-%d", winnerIndex),
 		AccessTokenHash:    accessTokens[winnerIndex],
 		UserID:             userID,
+		Product:            controlplane.ProductAutoLive,
 		ActivationCodeHash: activationHash,
 		Device: controlplane.DeviceRegistration{
+			Product:  controlplane.ProductAutoLive,
 			DeviceID: deviceIDs[winnerIndex], DeviceName: fmt.Sprintf("race-device-%d", winnerIndex),
 			Platform: "integration", AppVersion: "test",
 		},
@@ -409,8 +413,10 @@ func TestPostgresNormalizedActivationRejectsExpiredOrRevokedCodes(t *testing.T) 
 				Fingerprint:        fixture.IdempotencyPrefix + "fingerprint",
 				AccessTokenHash:    fixture.AccessTokenHashes[0],
 				UserID:             fixture.UserID,
+				Product:            controlplane.ProductAutoLive,
 				ActivationCodeHash: fixture.CodeHash,
 				Device: controlplane.DeviceRegistration{
+					Product:  controlplane.ProductAutoLive,
 					DeviceID: fixture.DeviceIDs[0], DeviceName: "activation-edge-device",
 					Platform: "integration", AppVersion: "test",
 				},
@@ -479,8 +485,10 @@ func TestPostgresNormalizedActivationRejectsCommittedRedeemAndIdempotencyConflic
 		Fingerprint:        winnerFingerprint,
 		AccessTokenHash:    fixture.AccessTokenHashes[0],
 		UserID:             fixture.UserID,
+		Product:            controlplane.ProductAutoLive,
 		ActivationCodeHash: fixture.CodeHash,
 		Device: controlplane.DeviceRegistration{
+			Product:  controlplane.ProductAutoLive,
 			DeviceID: fixture.DeviceIDs[0], DeviceName: "activation-winner",
 			Platform: "integration", AppVersion: "test",
 		},
@@ -498,8 +506,10 @@ func TestPostgresNormalizedActivationRejectsCommittedRedeemAndIdempotencyConflic
 		Fingerprint:        fixture.IdempotencyPrefix + "duplicate-fingerprint",
 		AccessTokenHash:    fixture.AccessTokenHashes[1],
 		UserID:             fixture.UserID,
+		Product:            controlplane.ProductAutoLive,
 		ActivationCodeHash: fixture.CodeHash,
 		Device: controlplane.DeviceRegistration{
+			Product:  controlplane.ProductAutoLive,
 			DeviceID: fixture.DeviceIDs[1], DeviceName: "activation-duplicate",
 			Platform: "integration", AppVersion: "test",
 		},
@@ -518,8 +528,10 @@ func TestPostgresNormalizedActivationRejectsCommittedRedeemAndIdempotencyConflic
 		Fingerprint:        fixture.IdempotencyPrefix + "different-fingerprint",
 		AccessTokenHash:    fixture.AccessTokenHashes[0],
 		UserID:             fixture.UserID,
+		Product:            controlplane.ProductAutoLive,
 		ActivationCodeHash: fixture.CodeHash,
 		Device: controlplane.DeviceRegistration{
+			Product:  controlplane.ProductAutoLive,
 			DeviceID: fixture.DeviceIDs[0], DeviceName: "activation-winner",
 			Platform: "integration", AppVersion: "test",
 		},
@@ -570,8 +582,10 @@ func TestPostgresNormalizedActivationBindsConfiguredDeviceCount(t *testing.T) {
 			Fingerprint:        fixture.IdempotencyPrefix + fmt.Sprintf("fingerprint-%d", index),
 			AccessTokenHash:    fixture.AccessTokenHashes[index],
 			UserID:             fixture.UserID,
+			Product:            controlplane.ProductAutoLive,
 			ActivationCodeHash: fixture.CodeHash,
 			Device: controlplane.DeviceRegistration{
+				Product:  controlplane.ProductAutoLive,
 				DeviceID: fixture.DeviceIDs[index], DeviceName: "multi-device",
 				Platform: "integration", AppVersion: "test",
 			},
@@ -648,6 +662,7 @@ func seedPostgresActivationFixture(t *testing.T, database *sql.DB, ctx context.C
 		defer cancel()
 		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM auth_sessions WHERE user_id = $1`, fixture.UserID)
 		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM idempotency_records WHERE scope = $1 AND idempotency_key LIKE $2`, "control-plane-state", fixture.IdempotencyPrefix+"%")
+		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM audit_outbox WHERE payload->>'RequestID' LIKE $1`, fixture.IdempotencyPrefix+"%")
 		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM activation_codes WHERE id = $1`, fixture.CodeID)
 		for _, deviceID := range fixture.DeviceIDs {
 			_, _ = database.ExecContext(cleanupCtx, `DELETE FROM devices WHERE id = $1`, deviceID)
