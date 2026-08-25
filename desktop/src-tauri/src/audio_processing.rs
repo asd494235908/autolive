@@ -1,17 +1,17 @@
-use crate::research_params::{AudioResearchParams, ParameterValidationError};
+use crate::media_effect_params::{AudioEffectParams, ParameterValidationError};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AudioProcessingProfile {
     pub parameters_version: String,
-    pub params: AudioResearchParams,
+    pub params: AudioEffectParams,
 }
 
 impl Default for AudioProcessingProfile {
     fn default() -> Self {
         Self {
             parameters_version: "audio_processing_v1".to_owned(),
-            params: AudioResearchParams::default(),
+            params: AudioEffectParams::default(),
         }
     }
 }

@@ -64,7 +64,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 激活当前设备 */
+        /**
+         * 按账号授权绑定当前设备
+         * @description 桌面端账号密码登录成功后自动调用；服务端按登录账号的有效激活授权和设备额度完成绑定，客户端不提交激活码明文。
+         */
         post: operations["clientActivate"];
         delete?: never;
         options?: never;
@@ -431,7 +434,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 作废激活码 */
+        /** 作废账号激活授权 */
         post: operations["revokeActivationCode"];
         delete?: never;
         options?: never;
@@ -913,7 +916,7 @@ export interface components {
             /** @enum {string} */
             playback_state?: "idle" | "playing" | "paused" | "error";
             last_seen_at: components["schemas"]["Timestamp"];
-            /** @description 当前设备绑定的激活码到期时间；未绑定或历史数据缺失时省略 */
+            /** @description 当前设备绑定的账号授权到期时间；未绑定或历史数据缺失时省略 */
             activation_expires_at?: components["schemas"]["Timestamp"] | null;
         };
         LoginRequest: {
@@ -943,7 +946,6 @@ export interface components {
             success: true;
         };
         ActivateDeviceRequest: {
-            activation_code: string;
             device: components["schemas"]["DeviceRegistration"];
         };
         DeviceRegistration: {
@@ -1207,13 +1209,16 @@ export interface components {
             pagination: components["schemas"]["Pagination"];
         };
         CreateActivationCodeRequest: {
+            /** @description 创建时绑定的登录账号；设备只能由该账号自动占用授权额度 */
+            user_id: components["schemas"]["Id"];
             expires_at: components["schemas"]["Timestamp"];
-            /** @default 1 */
             max_devices: number;
         };
         ActivationCode: {
             id: components["schemas"]["Id"];
             product: components["schemas"]["ProductCode"];
+            /** @description 创建激活授权时绑定的登录账号；迁移后被安全作废的历史未分配记录可缺省 */
+            user_id?: components["schemas"]["Id"];
             status: components["schemas"]["ActivationCodeStatus"];
             expires_at: components["schemas"]["Timestamp"];
             max_devices: number;
@@ -1221,11 +1226,11 @@ export interface components {
             bound_devices: number;
             /** @description 脱敏后的激活码前缀，不包含完整明文 */
             code_prefix?: string;
-            /** @description 核销设备所属用户；仅核销后返回 */
+            /** @description 首次绑定设备所属用户；仅作为历史兼容与审计事实 */
             used_by_user_id?: components["schemas"]["Id"];
-            /** @description 核销设备；仅核销后返回 */
+            /** @description 首次绑定的设备；仅作为历史兼容与审计事实 */
             used_by_device_id?: components["schemas"]["Id"];
-            /** @description 核销时间；仅核销后返回 */
+            /** @description 首次绑定时间；仅作为历史兼容与审计事实 */
             used_at?: components["schemas"]["Timestamp"];
             /** @description 仅创建响应中出现一次，列表与查询接口必须为 null */
             plain_code?: string | null;
@@ -1576,7 +1581,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description 激活成功 */
+            /** @description 当前设备已按账号授权绑定成功 */
             200: {
                 headers: {
                     "X-Request-Id": components["headers"]["X-Request-Id"];
@@ -2246,7 +2251,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 设备进入待激活状态；重新绑定需要新的激活码 */
+            /** @description 设备进入待授权状态并释放已知设备槽位；后续账号密码登录时由服务端按该账号的有效授权自动重新绑定 */
             200: {
                 headers: {
                     "X-Request-Id": components["headers"]["X-Request-Id"];
@@ -2350,7 +2355,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 激活码已作废；已核销或已过期激活码不能作废 */
+            /** @description 激活授权已作废，不能再绑定新设备；已绑定设备不受影响 */
             200: {
                 headers: {
                     "X-Request-Id": components["headers"]["X-Request-Id"];

@@ -197,12 +197,11 @@ func TestDeviceFlowsUseTransactionalSessionBindingRunner(t *testing.T) {
 	if err := svc.EnsureLocalAdmin(ctx, "admin"); err != nil {
 		t.Fatalf("EnsureLocalAdmin() error = %v", err)
 	}
-	code, err := svc.CreateActivationCode(ctx, "transactional-activation", controlplane.CreateActivationCodeInput{ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
+	_, err := svc.CreateActivationCode(ctx, "transactional-activation", controlplane.CreateActivationCodeInput{UserID: "usr_local_admin", ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
 	if err != nil {
 		t.Fatalf("CreateActivationCode() error = %v", err)
 	}
 	device, err := svc.ActivateDeviceWithSessionBinding(ctx, "transactional-activate", "usr_local_admin", "access_hash", controlplane.ActivateDeviceInput{
-		ActivationCode: *code.PlainCode,
 		Device: controlplane.DeviceRegistration{
 			DeviceID: "dev_transactional01", DeviceName: "Transactional Device", Platform: "windows", AppVersion: "1.0.0",
 		},
@@ -231,13 +230,12 @@ func TestActivateDeviceWithSessionBindingUsesNormalizedActivator(t *testing.T) {
 	repository := &normalizedDeviceActivatorStub{MemoryStore: store.NewMemoryStore(func() time.Time { return now })}
 	svc := NewControlPlaneWithRepository(repository)
 	device, err := svc.ActivateDeviceWithSessionBinding(context.Background(), "normalized-activate", "usr_1", "access-hash", controlplane.ActivateDeviceInput{
-		ActivationCode: "code_0123456789",
-		Device:         controlplane.DeviceRegistration{DeviceID: "dev_normalized01", DeviceName: "Demo", Platform: "windows", AppVersion: "1.0.0"},
+		Device: controlplane.DeviceRegistration{DeviceID: "dev_normalized01", DeviceName: "Demo", Platform: "windows", AppVersion: "1.0.0"},
 	})
 	if err != nil {
 		t.Fatalf("ActivateDeviceWithSessionBinding() error = %v", err)
 	}
-	if device.ID != "dev_normalized01" || repository.record.AccessTokenHash != "access-hash" || repository.record.ActivationCodeHash == "" || repository.record.Scope != "control-plane-state" || repository.record.IdempotencyKey != "activate-device:usr_1:normalized-activate" {
+	if device.ID != "dev_normalized01" || repository.record.AccessTokenHash != "access-hash" || repository.record.UserID != "usr_1" || repository.record.Scope != "control-plane-state" || repository.record.IdempotencyKey != "activate-device:usr_1:normalized-activate" {
 		t.Fatalf("normalized activation route = device=%+v record=%+v", device, repository.record)
 	}
 }
@@ -265,8 +263,7 @@ func TestNormalizedSessionBindingPassesSuccessAuditIntoTransaction(t *testing.T)
 	activationService := NewControlPlaneWithRepository(activationRepository)
 	activationAudit := controlplane.AuditLogInput{Action: "POST /api/v1/client/activate", TargetType: "device", TargetID: "dev_audit01", Outcome: "success", StatusCode: 200, RequestID: "req-audit-activate"}
 	if _, err := activationService.ActivateDeviceWithSessionBindingAndAudit(context.Background(), "activate-audit", "usr_1", "access-hash", controlplane.ActivateDeviceInput{
-		ActivationCode: "code_0123456789",
-		Device:         controlplane.DeviceRegistration{DeviceID: "dev_audit01", DeviceName: "Demo", Platform: "windows", AppVersion: "1.0.0"},
+		Device: controlplane.DeviceRegistration{DeviceID: "dev_audit01", DeviceName: "Demo", Platform: "windows", AppVersion: "1.0.0"},
 	}, activationAudit); err != nil {
 		t.Fatalf("ActivateDeviceWithSessionBindingAndAudit() error = %v", err)
 	}

@@ -1,12 +1,13 @@
 //! 从最终混音 PCM 提取有界的低频诊断快照。
 
+use crate::audio_feature_analysis::{AudioFeatureAnalyzer, MAX_MFCC_DIMENSIONS};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const LOW_FREQUENCY_DIAGNOSTIC_POINTS: usize = 96;
 pub const LOW_FREQUENCY_DIAGNOSTIC_CUTOFF_HZ: f32 = 180.0;
 const DIAGNOSTIC_WINDOW_MS: u32 = 120;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioLowFrequencyDiagnosticSnapshot {
     pub sequence: u64,
     pub captured_at_ms: u64,
@@ -17,6 +18,12 @@ pub struct AudioLowFrequencyDiagnosticSnapshot {
     pub peak_dbfs: f32,
     pub low_band_rms_dbfs: f32,
     pub cutoff_hz: f32,
+    pub mfcc: Vec<f32>,
+    pub mfcc_available: bool,
+    pub noise_floor_dbfs: f32,
+    pub snr_db: Option<f32>,
+    pub formants_hz: [Option<f32>; 3],
+    pub current_formant_hz: Option<f32>,
     pub has_pcm: bool,
 }
 
@@ -32,6 +39,12 @@ impl AudioLowFrequencyDiagnosticSnapshot {
             peak_dbfs: -140.0,
             low_band_rms_dbfs: -140.0,
             cutoff_hz: LOW_FREQUENCY_DIAGNOSTIC_CUTOFF_HZ,
+            mfcc: vec![0.0; usize::from(MAX_MFCC_DIMENSIONS)],
+            mfcc_available: false,
+            noise_floor_dbfs: -140.0,
+            snr_db: None,
+            formants_hz: [None; 3],
+            current_formant_hz: None,
             has_pcm: false,
         }
     }
@@ -56,6 +69,7 @@ pub struct LowFrequencyDiagnosticAnalyzer {
     sequence: u64,
     published_frame_count: u64,
     last_pcm_at_ms: u64,
+    feature_analyzer: AudioFeatureAnalyzer,
 }
 
 impl LowFrequencyDiagnosticAnalyzer {
@@ -87,6 +101,10 @@ impl LowFrequencyDiagnosticAnalyzer {
             sequence: 0,
             published_frame_count: 0,
             last_pcm_at_ms: 0,
+            feature_analyzer: AudioFeatureAnalyzer::new_stereo_output(
+                sample_rate_hz,
+                MAX_MFCC_DIMENSIONS,
+            ),
         }
     }
 
@@ -105,10 +123,12 @@ impl LowFrequencyDiagnosticAnalyzer {
         self.sequence = self.sequence.wrapping_add(1);
         self.published_frame_count = 0;
         self.last_pcm_at_ms = 0;
+        self.feature_analyzer.reset();
     }
 
     /// 观察已经完成混音并准备写入输出环缓的交错 PCM。
     pub fn observe_stereo_pcm(&mut self, samples: &[f32]) {
+        self.feature_analyzer.observe_interleaved_pcm(samples);
         let mut captured_frames = 0_u64;
         for frame in samples.chunks_exact(2) {
             let left = finite_sample(frame[0]);
@@ -142,6 +162,7 @@ impl LowFrequencyDiagnosticAnalyzer {
     }
 
     pub fn snapshot(&mut self) -> AudioLowFrequencyDiagnosticSnapshot {
+        let features = self.feature_analyzer.snapshot();
         let mut line = [0.0; LOW_FREQUENCY_DIAGNOSTIC_POINTS];
         let scale = self
             .line
@@ -187,6 +208,12 @@ impl LowFrequencyDiagnosticAnalyzer {
             peak_dbfs: amplitude_dbfs(peak),
             low_band_rms_dbfs: dbfs(low_sum_square, captured_frame_count),
             cutoff_hz: LOW_FREQUENCY_DIAGNOSTIC_CUTOFF_HZ,
+            mfcc: features.mfcc,
+            mfcc_available: features.mfcc_available,
+            noise_floor_dbfs: features.noise_floor_dbfs,
+            snr_db: features.snr_db,
+            formants_hz: features.formants_hz,
+            current_formant_hz: features.current_formant_hz,
             has_pcm: self.total_frames > 0,
         }
     }

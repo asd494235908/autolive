@@ -28,12 +28,14 @@ func (s *PostgresRepository) GetActivationExpiry(ctx context.Context, userID, de
 	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (*time.Time, error) {
 		var expiresAt time.Time
 		err := tx.QueryRowContext(ctx, `
-			SELECT expires_at
-			FROM activation_codes
-			WHERE used_by_user_id = $1 AND used_by_device_id = $2 AND status = $3
-			ORDER BY used_at DESC NULLS LAST, id DESC
+			SELECT ac.expires_at
+			FROM activation_device_bindings AS binding
+			JOIN activation_codes AS ac ON ac.id = binding.activation_code_id
+			WHERE binding.user_id = $1 AND binding.device_id = $2
+			  AND ac.bound_user_id = $1
+			ORDER BY binding.bound_at DESC, ac.id DESC
 			LIMIT 1
-		`, userID, deviceID, controlplane.ActivationCodeStatusUsed).Scan(&expiresAt)
+		`, userID, deviceID).Scan(&expiresAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -55,17 +57,17 @@ func (s *PostgresRepository) GetActivationExpiryForProduct(ctx context.Context, 
 		return nil, controlplane.ErrDeviceNotFound
 	}
 	return runPostgresReadPage(s, ctx, func(ctx context.Context, tx *sql.Tx) (*time.Time, error) {
-		condition, productArgs := normalizedProductFilter("product", product, 4)
 		query := `
-			SELECT expires_at
-			FROM activation_codes
-			WHERE used_by_user_id = $1 AND used_by_device_id = $2 AND status = $3 AND ` + condition + `
-			ORDER BY used_at DESC NULLS LAST, id DESC
+			SELECT ac.expires_at
+			FROM activation_device_bindings AS binding
+			JOIN activation_codes AS ac ON ac.id = binding.activation_code_id
+			WHERE binding.user_id = $1 AND binding.device_id = $2 AND binding.product = $3
+			  AND ac.bound_user_id = $1 AND ac.product = $3
+			ORDER BY binding.bound_at DESC, ac.id DESC
 			LIMIT 1
 		`
-		args := append([]any{userID, deviceID, controlplane.ActivationCodeStatusUsed}, productArgs...)
 		var expiresAt time.Time
-		err := tx.QueryRowContext(ctx, query, args...).Scan(&expiresAt)
+		err := tx.QueryRowContext(ctx, query, userID, deviceID, product).Scan(&expiresAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}

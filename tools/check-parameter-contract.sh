@@ -18,7 +18,10 @@ required_video_patterns=(
   '细节增强'
   '动态裁剪'
   'X/Y 空间偏移'
+  '像素扰动'
   '像素级缩放'
+  '帧率扰动'
+  '帧内/帧间扰动'
 )
 
 for pattern in "${required_video_patterns[@]}"; do
@@ -28,8 +31,8 @@ for pattern in "${required_video_patterns[@]}"; do
   }
 done
 
-if printf '%s' "$current_video_section" | rg -q '像素扰动|帧率微扰|65Hz|20000Hz|band_weight'; then
-  echo "当前视频参数表仍包含研究或实验参数" >&2
+if printf '%s' "$current_video_section" | rg -q '研究参数|实验参数'; then
+  echo "当前视频参数表仍使用已废弃的研究或实验命名" >&2
   exit 1
 fi
 
@@ -40,7 +43,7 @@ for pattern in '输入增益' '输出增益' '响度' '三段 EQ' '音高' '播�
   }
 done
 
-for pattern in '本版本不开发实时话术幻化' '像素扰动仅作现有实现兼容' '研究分析参数不属于当前产品'; do
+for pattern in '本版本不开发实时话术幻化' '参考图中的音频、视频、高级视觉、挂件、切片、检测和修复参数全部属于正式产品需求' '65–20000Hz 明确是视频空间频段'; do
   rg -q --fixed-strings "$pattern" "$contract" || {
     echo "参数契约缺少当前范围声明: $pattern" >&2
     exit 1

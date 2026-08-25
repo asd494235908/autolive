@@ -23,7 +23,6 @@ func TestNormalizedDeviceMutationsFailClosedWithoutTransactionalRepositories(t *
 	now := repository.Now()
 	heartbeat := controlplane.HeartbeatInput{DeviceID: "device_1", SentAt: now}
 	activation := controlplane.ActivateDeviceInput{
-		ActivationCode: "activation-code",
 		Device: controlplane.DeviceRegistration{
 			DeviceID: "device_1", DeviceName: "Studio", Platform: "windows", AppVersion: "1.0.0",
 		},

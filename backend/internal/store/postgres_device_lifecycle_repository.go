@@ -125,6 +125,29 @@ func (s *PostgresRepository) mutateDeviceLifecycle(ctx context.Context, record D
 		return controlplane.DeviceSummary{}, err
 	}
 	if unbind {
+		var activationCodeID string
+		bindingErr := tx.QueryRowContext(operationCtx, `
+			SELECT activation_code_id
+			FROM activation_device_bindings
+			WHERE device_id = $1 AND product = $2
+			FOR UPDATE
+		`, record.DeviceID, record.Product).Scan(&activationCodeID)
+		if bindingErr != nil && !errors.Is(bindingErr, sql.ErrNoRows) {
+			return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("lock activation device binding for unbind: %w", bindingErr))
+		}
+		if activationCodeID != "" {
+			if _, err := tx.ExecContext(operationCtx, `DELETE FROM activation_device_bindings WHERE device_id = $1`, record.DeviceID); err != nil {
+				return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("delete activation device binding: %w", err))
+			}
+			if _, err := tx.ExecContext(operationCtx, `
+				UPDATE activation_codes
+				SET bound_devices = GREATEST(bound_devices - 1, 0),
+				    status = CASE WHEN status = $2 AND expires_at > $3 THEN $4 ELSE status END
+				WHERE id = $1 AND product = $5
+			`, activationCodeID, controlplane.ActivationCodeStatusUsed, now, controlplane.ActivationCodeStatusActive, record.Product); err != nil {
+				return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("release activation device capacity: %w", err))
+			}
+		}
 		updateQuery := `UPDATE devices SET user_id = NULL, status = $2 WHERE id = $1`
 		updateArgs := []any{record.DeviceID, controlplane.DeviceStatusPendingActivation}
 		if explicitProduct {

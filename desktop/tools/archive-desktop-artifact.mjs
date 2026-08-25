@@ -18,6 +18,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readDesktopVersion } from './desktop-version.mjs';
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const WINDOWS_PORTABLE_AMBIENT_FILES = Object.freeze([
+  'low-level-room-tone.wav',
+  'LICENSE.txt',
+]);
 
 export function archiveDesktopArtifacts({
   targetTriple = process.env.AUTOLIVE_TARGET_TRIPLE?.trim() || detectTargetTriple(),
@@ -34,6 +38,7 @@ export function archiveDesktopArtifacts({
   embeddedResourceDir = resolveDesktopPath(
     process.env.AUTOLIVE_EMBEDDED_RESOURCE_DIR || 'src-tauri/embedded-runtime-resources',
   ),
+  ambientResourceDir = resolveDesktopPath('src-tauri/ambient'),
   packageRoot = resolveDesktopPath(process.env.AUTOLIVE_PACKAGE_ROOT || 'package'),
   createPortableZip = process.env.AUTOLIVE_SKIP_PORTABLE_ZIP !== '1',
 } = {}) {
@@ -44,6 +49,7 @@ export function archiveDesktopArtifacts({
   const destination = join(packageRoot, readDesktopVersion().release, targetTriple);
   if (targetTriple === 'x86_64-pc-windows-msvc') {
     archiveWindowsArtifacts({
+      ambientResourceDir,
       bundleSourceDir,
       createPortableZip,
       destination,
@@ -59,6 +65,7 @@ export function archiveDesktopArtifacts({
 }
 
 function archiveWindowsArtifacts({
+  ambientResourceDir,
   bundleSourceDir,
   createPortableZip,
   destination,
@@ -71,6 +78,7 @@ function archiveWindowsArtifacts({
   rmSync(destination, { force: true, recursive: true });
   mkdirSync(destination, { recursive: true });
   archiveWindowsPortable({
+    ambientResourceDir,
     createPortableZip,
     destination,
     embeddedResourceDir,
@@ -82,6 +90,7 @@ function archiveWindowsArtifacts({
 }
 
 function archiveWindowsPortable({
+  ambientResourceDir,
   createPortableZip,
   destination,
   embeddedResourceDir,
@@ -101,6 +110,7 @@ function archiveWindowsPortable({
 
   const manifest = readResourceManifest(manifestPath, targetTriple);
   validateEmbeddedResources(embeddedResourceDir, manifest.files, false);
+  const ambientFiles = requirePortableAmbientFiles(ambientResourceDir);
 
   mkdirSync(destination, { recursive: true });
   const portableRoot = join(destination, 'portable');
@@ -113,6 +123,11 @@ function archiveWindowsPortable({
     const stagedResources = join(stagingRoot, 'embedded-runtime-resources');
     cpSync(embeddedResourceDir, stagedResources, { recursive: true, dereference: true });
     validateEmbeddedResources(stagedResources, manifest.files, true);
+    const stagedAmbient = join(stagingRoot, 'ambient');
+    mkdirSync(stagedAmbient, { recursive: true });
+    for (const { name, source } of ambientFiles) {
+      cpSync(source, join(stagedAmbient, name));
+    }
     // PortAudio 运行时 DLL + 许可文案（与 EXE 同目录，便于加载）。
     const portaudioDll = resolveDesktopPath('src-tauri/portaudio/portaudio_x64.dll');
     const portaudioLicense = resolveDesktopPath('src-tauri/portaudio/LICENSE.txt');
@@ -135,6 +150,20 @@ function archiveWindowsPortable({
   }
 
   if (createPortableZip) createWindowsPortableZip(destination);
+}
+
+function requirePortableAmbientFiles(ambientResourceDir) {
+  const sourceRoot = resolve(ambientResourceDir);
+  if (!isDirectory(sourceRoot)) {
+    throw new Error(`找不到内置环境声资源目录：${sourceRoot}`);
+  }
+  return WINDOWS_PORTABLE_AMBIENT_FILES.map((name) => {
+    const source = resolve(sourceRoot, name);
+    if (dirname(source) !== sourceRoot || !isFile(source)) {
+      throw new Error(`内置环境声资源缺失：${name}`);
+    }
+    return { name, source };
+  });
 }
 
 function readResourceManifest(manifestPath, targetTriple) {
@@ -301,6 +330,9 @@ function requireInstallerFiles(bundleSourceDir, targetTriple) {
     throw new Error(`找不到 Tauri bundle 目录：${bundleSourceDir}`);
   }
   const installers = findInstallerFiles(bundleSourceDir, targetTriple);
+  if (targetTriple === 'x86_64-pc-windows-msvc' && installers.length !== 1) {
+    throw new Error(`Windows NSIS 源目录必须恰好一个 EXE，发现 ${installers.length} 个`);
+  }
   if (installers.length === 0) {
     throw new Error(`找不到 ${targetTriple} 的用户安装文件`);
   }

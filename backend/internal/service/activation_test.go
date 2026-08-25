@@ -20,6 +20,7 @@ func TestActivateDeviceConcurrentSingleUseAndIdempotentReplay(t *testing.T) {
 		t.Fatalf("EnsureLocalAdmin() error = %v", err)
 	}
 	code, err := svc.CreateActivationCode(ctx, "activation-concurrent-code", controlplane.CreateActivationCodeInput{
+		UserID:      "usr_local_admin",
 		ExpiresAt:  now.Add(time.Hour),
 		MaxDevices: 1,
 	})
@@ -48,7 +49,6 @@ func TestActivateDeviceConcurrentSingleUseAndIdempotentReplay(t *testing.T) {
 			defer wait.Done()
 			<-start
 			device, activateErr := svc.ActivateDevice(ctx, test.key, "usr_local_admin", controlplane.ActivateDeviceInput{
-				ActivationCode: *code.PlainCode,
 				Device: controlplane.DeviceRegistration{
 					DeviceID:   test.deviceID,
 					DeviceName: "Concurrent Device",
@@ -71,8 +71,8 @@ func TestActivateDeviceConcurrentSingleUseAndIdempotentReplay(t *testing.T) {
 			continue
 		}
 		failures++
-		if !controlplane.IsErrorCode(item.err, "ACTIVATION_CODE_USED") {
-			t.Fatalf("concurrent loser error = %v, want ACTIVATION_CODE_USED", item.err)
+		if !controlplane.IsErrorCode(item.err, "DEVICE_LIMIT_EXCEEDED") {
+			t.Fatalf("concurrent loser error = %v, want DEVICE_LIMIT_EXCEEDED", item.err)
 		}
 	}
 	if winner.err != nil || winner.device.ID == "" || failures != 1 {
@@ -80,7 +80,6 @@ func TestActivateDeviceConcurrentSingleUseAndIdempotentReplay(t *testing.T) {
 	}
 
 	replay, err := svc.ActivateDevice(ctx, winner.key, "usr_local_admin", controlplane.ActivateDeviceInput{
-		ActivationCode: *code.PlainCode,
 		Device: controlplane.DeviceRegistration{
 			DeviceID:   winner.device.ID,
 			DeviceName: "Concurrent Device",
@@ -125,7 +124,7 @@ func TestRevokeActivationCodeClearsPlaintextFromMemoryState(t *testing.T) {
 	if err := svc.EnsureLocalAdmin(ctx, "admin"); err != nil {
 		t.Fatalf("EnsureLocalAdmin() error = %v", err)
 	}
-	code, err := svc.CreateActivationCode(ctx, "activation-revoke-code", controlplane.CreateActivationCodeInput{ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
+	code, err := svc.CreateActivationCode(ctx, "activation-revoke-code", controlplane.CreateActivationCodeInput{UserID: "usr_local_admin", ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
 	if err != nil || code.PlainCode == nil {
 		t.Fatalf("CreateActivationCode() = %+v, error = %v", code, err)
 	}
@@ -144,8 +143,18 @@ func TestRevokeActivationCodeClearsPlaintextFromMemoryState(t *testing.T) {
 
 func TestProductActivationCodeCreateAndRevokeStayInProduct(t *testing.T) {
 	now := time.Now().UTC()
-	svc := NewControlPlane(store.NewMemoryStore(func() time.Time { return now }))
-	code, err := svc.CreateActivationCodeForProduct(context.Background(), controlplane.ProductDouyinDesktop, "product-create-code", controlplane.CreateActivationCodeInput{ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
+	repository := store.NewMemoryStore(func() time.Time { return now })
+	svc := NewControlPlane(repository)
+	if err := svc.EnsureLocalAdmin(context.Background(), "admin"); err != nil {
+		t.Fatalf("EnsureLocalAdmin() error = %v", err)
+	}
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.UserProducts["usr_local_admin:douyin_desktop"] = controlplane.UserProductMembership{UserID: "usr_local_admin", Product: controlplane.ProductDouyinDesktop, Status: "active"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed product membership: %v", err)
+	}
+	code, err := svc.CreateActivationCodeForProduct(context.Background(), controlplane.ProductDouyinDesktop, "product-create-code", controlplane.CreateActivationCodeInput{UserID: "usr_local_admin", ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
 	if err != nil {
 		t.Fatalf("CreateActivationCodeForProduct() error = %v", err)
 	}

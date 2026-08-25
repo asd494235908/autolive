@@ -227,9 +227,42 @@ func TestMigration23ForeignKeyContractCoversAllProductReferences(t *testing.T) {
 	}
 }
 
-func TestLatestVersionIsAdminRBACMigration24(t *testing.T) {
-	if LatestVersion != 24 {
-		t.Fatalf("LatestVersion = %d, want 24", LatestVersion)
+func TestLatestVersionIsAccountActivationMigration25(t *testing.T) {
+	if LatestVersion != 25 {
+		t.Fatalf("LatestVersion = %d, want 25", LatestVersion)
+	}
+}
+
+func TestMigration25BindsActivationAuthorizationToAccountAndDevice(t *testing.T) {
+	payload, err := fs.ReadFile(FS, "0025_激活授权绑定账号与设备.up.sql")
+	if err != nil {
+		t.Fatalf("read migration 0025: %v", err)
+	}
+	sql := string(payload)
+	for _, fragment := range []string{
+		"ADD COLUMN IF NOT EXISTS bound_user_id",
+		"SET bound_user_id = used_by_user_id",
+		"SET status = 'revoked'",
+		"activation_codes_bound_user_product_fkey",
+		"CREATE TABLE IF NOT EXISTS activation_device_bindings",
+		"FOREIGN KEY (user_id, product) REFERENCES user_products(user_id, product)",
+		"uq_activation_codes_binding_identity",
+		"uq_devices_binding_identity",
+		"FOREIGN KEY (activation_code_id, product, user_id)",
+		"REFERENCES activation_codes(id, product, bound_user_id)",
+		"FOREIGN KEY (device_id, product, user_id)",
+		"REFERENCES devices(id, product, user_id)",
+		"GROUP BY used_by_device_id",
+		"HAVING COUNT(*) = 1",
+		"ON CONFLICT (device_id) DO NOTHING",
+		"idx_activation_codes_account_capacity",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0025 is missing account activation fragment %q", fragment)
+		}
+	}
+	if strings.Contains(sql, "SET bound_devices =") {
+		t.Fatal("migration 0025 must preserve unknown historical occupied capacity")
 	}
 }
 

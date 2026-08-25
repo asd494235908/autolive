@@ -23,7 +23,7 @@ func (r *normalizedActivationWriterRepository) CreateActivationCode(_ context.Co
 	r.called = true
 	r.record = record
 	plainCode := record.PlainCode
-	return controlplane.ActivationCode{ID: "ac_direct", Status: controlplane.ActivationCodeStatusActive, ExpiresAt: record.ExpiresAt.UTC().Format(time.RFC3339), MaxDevices: record.MaxDevices, CodePrefix: record.CodePrefix, PlainCode: &plainCode}, nil
+	return controlplane.ActivationCode{ID: "ac_direct", UserID: record.UserID, Status: controlplane.ActivationCodeStatusActive, ExpiresAt: record.ExpiresAt.UTC().Format(time.RFC3339), MaxDevices: record.MaxDevices, CodePrefix: record.CodePrefix, PlainCode: &plainCode}, nil
 }
 
 func (r *normalizedActivationWriterRepository) RevokeActivationCode(_ context.Context, _, _, _, codeID string) (controlplane.ActivationCode, error) {
@@ -36,11 +36,11 @@ func TestCreateActivationCodeUsesNormalizedRepositoryWriter(t *testing.T) {
 	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
 	repository := &normalizedActivationWriterRepository{MemoryStore: store.NewMemoryStore(func() time.Time { return now })}
 	svc := NewControlPlaneWithRepository(repository)
-	code, err := svc.CreateActivationCode(context.Background(), "activation-key", controlplane.CreateActivationCodeInput{ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
+	code, err := svc.CreateActivationCode(context.Background(), "activation-key", controlplane.CreateActivationCodeInput{UserID: "usr_local_admin", ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
 	if err != nil {
 		t.Fatalf("CreateActivationCode() error = %v", err)
 	}
-	if !repository.called || code.ID != "ac_direct" || repository.record.CodeHash == "" || repository.record.PlainCode == "" || repository.record.CodePrefix == "" {
+	if !repository.called || code.ID != "ac_direct" || repository.record.UserID != "usr_local_admin" || repository.record.CodeHash == "" || repository.record.PlainCode == "" || repository.record.CodePrefix == "" {
 		t.Fatalf("normalized activation writer = called %t code %+v record %+v", repository.called, code, repository.record)
 	}
 }

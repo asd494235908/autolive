@@ -7,12 +7,16 @@
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use autolive_signalsmith_stretch::{QualityPitchConfig, QualityPitchProcessor};
+
+use crate::audio_pcm_effects::{AudioPcmEffectConfig, AudioPcmEffectProcessor};
+use crate::background_process::background_command;
 use crate::cancellation::CancellationToken;
 
 type DecoderProcessSlot = Arc<Mutex<Option<Child>>>;
@@ -30,6 +34,10 @@ const REALTIME_READ_RATE_HEADROOM_RATIO: f64 = 1.1;
 // 最低 2x；显式变速超过 1x 时再增加 1x 源时间余量，保证经过 atempo 后仍能追赶。
 // 500ms 初始突发、有界 channel 和预缓冲上限继续限制内存与 CPU。
 const CANDIDATE_MIN_READ_RATE: f64 = 2.0;
+// 3 秒周期必须覆盖多支路/特征滤镜冷启动和源文件 EOF 重启；用户素材 30 轮压力测试的
+// 最小稳定组合是 3x + 1 秒初始突发，只用于周期 N+1，不扩大普通恢复的 CPU 突发。
+const SHORT_CYCLE_MIN_READ_RATE: f64 = 3.0;
+const SHORT_CYCLE_INITIAL_BURST_SECONDS: &str = "1.0";
 // 候选提交需要 30ms 交叉淡化加 100ms 淡化后连续 PCM。
 pub const AUDIO_CROSSFADE_MS: usize = 30;
 pub const AUDIO_POST_CROSSFADE_TAIL_MS: usize = 100;
@@ -58,6 +66,7 @@ struct AudioMixerLoopContext {
 enum DecoderPacing {
     RealTime,
     CatchUp,
+    ShortCycle,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +87,24 @@ impl AudioMixerTrack {
             .lock()
             .map(|samples| samples.len())
             .unwrap_or(0)
+    }
+
+    pub(crate) fn peak_in_first(&self, sample_count: usize) -> Result<Option<f32>, String> {
+        let samples = self
+            .samples
+            .lock()
+            .map_err(|_| "音轨 PCM 缓冲锁已损坏".to_owned())?;
+        if sample_count == 0 || samples.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            samples
+                .iter()
+                .take(sample_count)
+                .filter(|sample| sample.is_finite())
+                .map(|sample| sample.abs())
+                .fold(0.0_f32, f32::max),
+        ))
     }
 
     pub(crate) fn take_exact(&self, sample_count: usize) -> Result<Option<Vec<f32>>, String> {
@@ -146,6 +173,76 @@ impl AudioMixerTask {
         seek_position_ms: u64,
         timeline_start_position_ms: u64,
         filter_graph: Option<String>,
+        quality_pitch: Option<QualityPitchConfig>,
+        pcm_effects: Option<AudioPcmEffectConfig>,
+        ambient_source_path: Option<PathBuf>,
+        playback_rate: f64,
+        minimum_ready_ms: usize,
+        prebuffer_started_at: Instant,
+    ) -> Result<Self, String> {
+        Self::start_catch_up_candidate(
+            ffmpeg_path,
+            source_path,
+            sample_rate_hz,
+            seek_position_ms,
+            timeline_start_position_ms,
+            filter_graph,
+            quality_pitch,
+            pcm_effects,
+            ambient_source_path,
+            DecoderPacing::CatchUp,
+            playback_rate,
+            minimum_ready_ms,
+            prebuffer_started_at,
+        )
+    }
+
+    /// 为 3–5 秒普通声音周期预热 N+1；使用经素材压力验证的最小额外突发，
+    /// 但保持与普通 CatchUp 相同的动态水位、容量和取消边界。
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_short_cycle_candidate_with_filter_and_variant_count(
+        ffmpeg_path: PathBuf,
+        source_path: PathBuf,
+        sample_rate_hz: u32,
+        seek_position_ms: u64,
+        timeline_start_position_ms: u64,
+        filter_graph: Option<String>,
+        quality_pitch: Option<QualityPitchConfig>,
+        pcm_effects: Option<AudioPcmEffectConfig>,
+        ambient_source_path: Option<PathBuf>,
+        playback_rate: f64,
+        minimum_ready_ms: usize,
+        prebuffer_started_at: Instant,
+    ) -> Result<Self, String> {
+        Self::start_catch_up_candidate(
+            ffmpeg_path,
+            source_path,
+            sample_rate_hz,
+            seek_position_ms,
+            timeline_start_position_ms,
+            filter_graph,
+            quality_pitch,
+            pcm_effects,
+            ambient_source_path,
+            DecoderPacing::ShortCycle,
+            playback_rate,
+            minimum_ready_ms,
+            prebuffer_started_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_catch_up_candidate(
+        ffmpeg_path: PathBuf,
+        source_path: PathBuf,
+        sample_rate_hz: u32,
+        seek_position_ms: u64,
+        timeline_start_position_ms: u64,
+        filter_graph: Option<String>,
+        quality_pitch: Option<QualityPitchConfig>,
+        pcm_effects: Option<AudioPcmEffectConfig>,
+        ambient_source_path: Option<PathBuf>,
+        decoder_pacing: DecoderPacing,
         playback_rate: f64,
         minimum_ready_ms: usize,
         prebuffer_started_at: Instant,
@@ -158,7 +255,10 @@ impl AudioMixerTask {
             seek_position_ms,
             timeline_start_position_ms,
             filter_graph,
-            DecoderPacing::CatchUp,
+            quality_pitch,
+            pcm_effects,
+            ambient_source_path,
+            decoder_pacing,
             playback_rate,
             CandidatePrebufferPolicy::CatchUp { minimum_ready_ms },
             minimum_ready_ms,
@@ -176,6 +276,9 @@ impl AudioMixerTask {
         seek_position_ms: u64,
         timeline_start_position_ms: u64,
         filter_graph: Option<String>,
+        quality_pitch: Option<QualityPitchConfig>,
+        pcm_effects: Option<AudioPcmEffectConfig>,
+        ambient_source_path: Option<PathBuf>,
         playback_rate: f64,
         buffer_ms: usize,
         minimum_commit_tail_ms: usize,
@@ -188,6 +291,9 @@ impl AudioMixerTask {
             seek_position_ms,
             timeline_start_position_ms,
             filter_graph,
+            quality_pitch,
+            pcm_effects,
+            ambient_source_path,
             DecoderPacing::RealTime,
             playback_rate,
             CandidatePrebufferPolicy::FixedWindow { buffer_ms },
@@ -205,6 +311,9 @@ impl AudioMixerTask {
         seek_position_ms: u64,
         timeline_start_position_ms: u64,
         filter_graph: Option<String>,
+        quality_pitch: Option<QualityPitchConfig>,
+        pcm_effects: Option<AudioPcmEffectConfig>,
+        ambient_source_path: Option<PathBuf>,
         decoder_pacing: DecoderPacing,
         playback_rate: f64,
         candidate_prebuffer_policy: CandidatePrebufferPolicy,
@@ -212,6 +321,9 @@ impl AudioMixerTask {
         prebuffer_started_at: Instant,
     ) -> Result<Self, String> {
         validate_audio_source(&ffmpeg_path, &source_path)?;
+        if let Some(path) = ambient_source_path.as_deref() {
+            validate_auxiliary_audio_source(path)?;
+        }
         let sample_rate_hz = match sample_rate_hz {
             44_100 | 48_000 => sample_rate_hz,
             _ => autolive_portaudio_output::DEFAULT_SAMPLE_RATE_HZ,
@@ -248,6 +360,9 @@ impl AudioMixerTask {
                     sample_rate_hz,
                     seek_position_ms,
                     filter_graph.as_deref(),
+                    quality_pitch,
+                    pcm_effects,
+                    ambient_source_path.as_deref(),
                     decoder_process_slot,
                     decoder_pacing,
                     playback_rate,
@@ -408,6 +523,19 @@ fn validate_audio_source(ffmpeg_path: &Path, source_path: &Path) -> Result<(), S
     Ok(())
 }
 
+fn validate_auxiliary_audio_source(source_path: &Path) -> Result<(), String> {
+    const ALLOWED_EXTENSIONS: [&str; 6] = ["mp3", "wav", "m4a", "aac", "ogg", "flac"];
+    let extension_allowed = source_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|extension| ALLOWED_EXTENSIONS.contains(&extension.as_str()));
+    if !source_path.is_file() || !extension_allowed {
+        return Err("环境声素材必须是可读的 mp3、wav、m4a、aac、ogg 或 flac 文件".to_owned());
+    }
+    Ok(())
+}
+
 // 解码线程入口显式接收其拥有/借用的资源，避免再造只使用一次的上下文容器。
 #[allow(clippy::too_many_arguments)]
 fn decode_audio_loop(
@@ -419,10 +547,39 @@ fn decode_audio_loop(
     sample_rate_hz: u32,
     start_position_ms: u64,
     filter_graph: Option<&str>,
+    quality_pitch: Option<QualityPitchConfig>,
+    pcm_effects: Option<AudioPcmEffectConfig>,
+    ambient_source_path: Option<&Path>,
     decoder_process: DecoderProcessSlot,
     decoder_pacing: DecoderPacing,
     playback_rate: f64,
 ) {
+    let mut quality_pitch = match quality_pitch
+        .map(|config| QualityPitchProcessor::new(config, sample_rate_hz, OUTPUT_CHANNELS))
+        .transpose()
+    {
+        Ok(processor) => processor,
+        Err(error) => {
+            set_failure(
+                failure,
+                AudioMixerFailure::Runtime(format!("初始化高质量变调处理器失败：{error}")),
+            );
+            return;
+        }
+    };
+    let mut pcm_effects = match pcm_effects
+        .map(|config| AudioPcmEffectProcessor::new(config, sample_rate_hz, OUTPUT_CHANNELS))
+        .transpose()
+    {
+        Ok(processor) => processor,
+        Err(error) => {
+            set_failure(
+                failure,
+                AudioMixerFailure::Runtime(format!("初始化 PCM 特征效果失败：{error}")),
+            );
+            return;
+        }
+    };
     let mut first_loop = true;
     while !cancellation.is_cancelled() {
         let start_seconds = if first_loop {
@@ -430,7 +587,7 @@ fn decode_audio_loop(
         } else {
             "0".to_owned()
         };
-        let mut command = Command::new(ffmpeg_path);
+        let mut command = background_command(ffmpeg_path);
         command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
         match decoder_pacing {
             DecoderPacing::RealTime => {
@@ -441,10 +598,25 @@ fn decode_audio_loop(
                 let read_rate = format!("{:.3}", candidate_ffmpeg_read_rate(playback_rate));
                 command.args(["-readrate", &read_rate, "-readrate_initial_burst", "0.5"]);
             }
+            DecoderPacing::ShortCycle => {
+                let read_rate = format!("{:.3}", short_cycle_ffmpeg_read_rate(playback_rate));
+                command.args([
+                    "-readrate",
+                    &read_rate,
+                    "-readrate_initial_burst",
+                    SHORT_CYCLE_INITIAL_BURST_SECONDS,
+                ]);
+            }
         }
         command
             .args(decoder_input_seek_args(&start_seconds))
-            .arg(source_path)
+            .arg(source_path);
+        if let Some(ambient_source_path) = ambient_source_path {
+            command
+                .args(["-stream_loop", "-1", "-i"])
+                .arg(ambient_source_path);
+        }
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -509,7 +681,7 @@ fn decode_audio_loop(
 
         let mut bytes = vec![0_u8; DECODE_BUFFER_BYTES];
         let mut pending = Vec::with_capacity(PCM_FRAME_BYTES);
-        let mut emitted_samples = 0_usize;
+        let mut decoded_samples = 0_usize;
         loop {
             if cancellation.is_cancelled() {
                 terminate_decoder_process(&decoder_process);
@@ -538,7 +710,45 @@ fn decode_audio_loop(
             if samples.is_empty() {
                 continue;
             }
-            emitted_samples += samples.len();
+            decoded_samples += samples.len();
+            let samples = match quality_pitch.as_mut() {
+                Some(processor) => match processor.process_interleaved(&samples) {
+                    Ok(processed) => processed,
+                    Err(error) => {
+                        set_failure(
+                            failure,
+                            AudioMixerFailure::Runtime(format!("高质量变调处理失败：{error}")),
+                        );
+                        terminate_decoder_process(&decoder_process);
+                        let _ = join_stderr_reader(stderr_reader);
+                        return;
+                    }
+                },
+                None => samples,
+            };
+            // Signalsmith 会在前导延迟尚未填满时合法返回空块；空块不是 PCM，
+            // 不能送入要求非空输入的 MFCC/SNR 特征处理器。
+            if samples.is_empty() {
+                continue;
+            }
+            let samples = match pcm_effects.as_mut() {
+                Some(processor) => match processor.process_interleaved(&samples) {
+                    Ok(processed) => processed,
+                    Err(error) => {
+                        set_failure(
+                            failure,
+                            AudioMixerFailure::Runtime(format!("PCM 特征效果处理失败：{error}")),
+                        );
+                        terminate_decoder_process(&decoder_process);
+                        let _ = join_stderr_reader(stderr_reader);
+                        return;
+                    }
+                },
+                None => samples,
+            };
+            if samples.is_empty() {
+                continue;
+            }
             if !send_samples_with_cancellation(cancellation, &sender, samples) {
                 terminate_decoder_process(&decoder_process);
                 let _ = join_stderr_reader(stderr_reader);
@@ -580,12 +790,12 @@ fn decode_audio_loop(
             );
             return;
         }
-        if emitted_samples == 0 {
-            set_failure(
-                failure,
-                AudioMixerFailure::Ffmpeg("FFmpeg 音频解码未输出 PCM 数据".to_owned()),
-            );
-            return;
+        if decoded_samples == 0 {
+            // 从接近 EOF 的媒体时钟启动时，FFmpeg 可以正常退出但尚未输出样本。
+            // 下一轮从源开头重试；候选仍未 ready，因此 WebView/旧轨继续出声。
+            first_loop = false;
+            thread::sleep(Duration::from_millis(50));
+            continue;
         }
         first_loop = false;
     }
@@ -744,6 +954,10 @@ fn candidate_prebuffer_limit_ms(policy: CandidatePrebufferPolicy) -> usize {
         }
         CandidatePrebufferPolicy::FixedWindow { buffer_ms } => buffer_ms,
     }
+}
+
+fn short_cycle_ffmpeg_read_rate(playback_rate: f64) -> f64 {
+    SHORT_CYCLE_MIN_READ_RATE.max(candidate_ffmpeg_read_rate(playback_rate))
 }
 
 fn candidate_readiness_samples(
@@ -970,17 +1184,71 @@ fn set_failure(failure: &Arc<Mutex<Option<AudioMixerFailure>>>, reason: AudioMix
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use autolive_signalsmith_stretch::QualityPitchConfig;
 
     use super::{
         append_prebuffer, candidate_ffmpeg_read_rate, candidate_prebuffer_limit_ms,
         candidate_readiness_samples, candidate_required_prebuffer_samples, decoder_input_seek_args,
         prebuffer_skip_samples, process_audio_bus, realtime_ffmpeg_read_rate,
-        sanitize_error_detail, send_samples_with_cancellation, take_complete_stereo_samples,
-        trim_prebuffer_to_position, AudioMixerTrack, CandidatePrebufferPolicy,
+        sanitize_error_detail, send_samples_with_cancellation, short_cycle_ffmpeg_read_rate,
+        stereo_samples_for_ms, take_complete_stereo_samples, trim_prebuffer_to_position,
+        AudioMixerTask, AudioMixerTrack, CandidatePrebufferPolicy, AUDIO_CANDIDATE_COMMIT_TAIL_MS,
+        SHORT_CYCLE_INITIAL_BURST_SECONDS, SWITCH_CATCH_UP_MAX_MS,
     };
+    use crate::audio_pcm_effects::AudioPcmEffectConfig;
     use crate::cancellation::CancellationToken;
+    use crate::media_audio_effects::{MfccOperation, MfccRuntimePlan};
+
+    fn generated_user_audio_fixture(ffmpeg: &Path, name: &str) -> (PathBuf, PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "autolive-user-audio-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create user audio fixture directory");
+        let path = root.join("selected.wav");
+        let status = crate::background_process::background_command(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=1",
+                "-ac",
+                "2",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&path)
+            .status()
+            .expect("generate user audio fixture");
+        assert!(status.success());
+        (root, path)
+    }
+
+    fn wait_until_ready(task: &AudioMixerTask, timeout: Duration) -> Result<(), String> {
+        let started_at = Instant::now();
+        while started_at.elapsed() < timeout {
+            if let Some(reason) = task.failure() {
+                return Err(reason);
+            }
+            if task.is_ready() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err("candidate did not produce continuous PCM before timeout".to_owned())
+    }
 
     #[test]
     fn realtime_producer_keeps_bounded_headroom_across_playback_rates() {
@@ -996,12 +1264,116 @@ mod tests {
     }
 
     #[test]
+    fn quality_pitch_warmup_does_not_send_empty_pcm_to_feature_processing() {
+        let Some(ffmpeg) = std::env::var_os("AUTOLIVE_TEST_FFMPEG") else {
+            return;
+        };
+        let ffmpeg = PathBuf::from(ffmpeg);
+        let (fixture_root, audio_fixture) = generated_user_audio_fixture(&ffmpeg, "quality-pitch");
+        let mut task = AudioMixerTask::start_scheduled_candidate_with_filter_and_variant_count(
+            ffmpeg,
+            audio_fixture,
+            44_100,
+            0,
+            0,
+            None,
+            Some(QualityPitchConfig {
+                pitch_shift_semitones: -0.018,
+                formant_shift_percent: 0.105,
+            }),
+            Some(AudioPcmEffectConfig {
+                mfcc: Some(MfccRuntimePlan {
+                    dimensions: 12,
+                    shift_percent: -0.16,
+                    operation: MfccOperation::ShiftAndReconstruct,
+                }),
+                snr: None,
+            }),
+            None,
+            1.0,
+            130,
+            130,
+            Instant::now(),
+        )
+        .expect("candidate should start");
+
+        let result = wait_until_ready(&task, Duration::from_secs(3));
+        task.stop_preserving_output();
+        let _ = std::fs::remove_dir_all(fixture_root);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn clean_zero_pcm_seek_restarts_from_source_beginning_without_hard_failure() {
+        let Some(ffmpeg) = std::env::var_os("AUTOLIVE_TEST_FFMPEG") else {
+            return;
+        };
+        let ffmpeg = PathBuf::from(ffmpeg);
+        let (fixture_root, audio_fixture) = generated_user_audio_fixture(&ffmpeg, "seek-restart");
+        let mut task = AudioMixerTask::start_scheduled_candidate_with_filter_and_variant_count(
+            ffmpeg,
+            audio_fixture,
+            44_100,
+            3_600_000,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1.0,
+            130,
+            130,
+            Instant::now(),
+        )
+        .expect("candidate should start");
+
+        let result = wait_until_ready(&task, Duration::from_secs(3));
+        task.stop_preserving_output();
+        let _ = std::fs::remove_dir_all(fixture_root);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
     fn candidate_decoder_read_rate_stays_ahead_after_atempo() {
         assert_eq!(candidate_ffmpeg_read_rate(0.5), 2.0);
         assert_eq!(candidate_ffmpeg_read_rate(1.0), 2.0);
         assert_eq!(candidate_ffmpeg_read_rate(1.5), 2.5);
         assert_eq!(candidate_ffmpeg_read_rate(2.0), 3.0);
         assert_eq!(candidate_ffmpeg_read_rate(f64::NAN), 2.0);
+    }
+
+    #[test]
+    fn short_cycle_decoder_uses_the_smallest_measured_stable_burst() {
+        assert_eq!(short_cycle_ffmpeg_read_rate(0.5), 3.0);
+        assert_eq!(short_cycle_ffmpeg_read_rate(1.0), 3.0);
+        assert_eq!(short_cycle_ffmpeg_read_rate(1.5), 3.0);
+        assert_eq!(short_cycle_ffmpeg_read_rate(2.0), 3.0);
+        assert_eq!(short_cycle_ffmpeg_read_rate(3.0), 4.0);
+        assert_eq!(short_cycle_ffmpeg_read_rate(f64::NAN), 3.0);
+        assert_eq!(SHORT_CYCLE_INITIAL_BURST_SECONDS, "1.0");
+    }
+
+    #[test]
+    fn three_second_cycle_needs_catch_up_headroom_before_becoming_ready() {
+        let policy = CandidatePrebufferPolicy::CatchUp {
+            minimum_ready_ms: AUDIO_CANDIDATE_COMMIT_TAIL_MS,
+        };
+        let max_buffer_ms = SWITCH_CATCH_UP_MAX_MS + AUDIO_CANDIDATE_COMMIT_TAIL_MS;
+        let max_samples = stereo_samples_for_ms(48_000, max_buffer_ms);
+
+        assert_eq!(
+            candidate_readiness_samples(48_000, 0, max_samples, policy),
+            stereo_samples_for_ms(48_000, AUDIO_CANDIDATE_COMMIT_TAIL_MS)
+        );
+        assert_eq!(
+            candidate_readiness_samples(48_000, 3_000, max_samples, policy),
+            stereo_samples_for_ms(48_000, 3_000 + AUDIO_CANDIDATE_COMMIT_TAIL_MS)
+        );
+        assert_eq!(
+            candidate_readiness_samples(48_000, 5_000, max_samples, policy),
+            max_samples
+        );
+        assert_eq!(candidate_prebuffer_limit_ms(policy), max_buffer_ms);
     }
 
     #[test]

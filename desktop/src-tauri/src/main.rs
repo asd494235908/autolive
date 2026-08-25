@@ -4,29 +4,32 @@ mod audio_cycle_switch;
 mod auth_session;
 mod commands;
 
-use auth_session::{delete_refresh_token, load_refresh_token, store_refresh_token};
+use auth_session::{
+    delete_auth_form_credential, delete_refresh_token, load_auth_form_credential,
+    load_refresh_token, store_auth_form_credential, store_refresh_token,
+};
 use autolive_desktop_core::runtime_resource_task::{
     handle_runtime_resource_exit, RuntimeResourceTaskShutdown,
 };
 use commands::{
-    cancel_audio_cycle_candidate, cancel_research_analysis, cancel_runtime_resource_install,
-    cancel_speech_to_speech_worker, cleanup_local_caches_command, clear_runtime_resources,
-    close_final_effect_window, commit_audio_cycle_candidate, commit_audio_variant_candidate,
+    cancel_audio_cycle_candidate, cancel_runtime_resource_install, cancel_speech_to_speech_worker,
+    cleanup_local_caches_command, clear_runtime_resources, close_final_effect_window,
+    commit_audio_cycle_candidate, commit_audio_variant_candidate,
     commit_audio_variant_candidate_if_due, commit_media_processing_if_ready,
-    complete_playback_loop, direct_model_chat, discard_audio_variant_candidate,
-    get_audio_cycle_diagnostic, get_audio_output_backend_status, get_default_local_research_params,
-    get_device_runtime_info, get_media_engine_capabilities, get_research_status,
-    get_research_worker_capabilities, get_runtime_resource_status, get_snapshot,
-    get_speech_to_speech_worker_capabilities, import_runtime_resource_directory,
-    install_runtime_resources, list_audio_output_devices, open_final_effect_window, pause_playback,
-    pause_portaudio_interlude, play_portaudio_test_tone, prepare_audio_cycle_candidate,
-    probe_local_mp4, probe_local_video, resize_final_effect_window, restore_original_audio,
-    resume_playback, resume_portaudio_interlude, set_audio_output_backend,
+    complete_playback_item, complete_playback_loop, direct_model_chat,
+    discard_audio_variant_candidate, get_audio_cycle_diagnostic, get_audio_output_backend_status,
+    get_default_media_effect_params, get_device_runtime_info, get_media_engine_capabilities,
+    get_runtime_resource_status, get_snapshot, get_speech_to_speech_worker_capabilities,
+    import_runtime_resource_directory, install_runtime_resources, list_audio_output_devices,
+    open_final_effect_window, pause_playback, pause_portaudio_interlude, play_portaudio_test_tone,
+    prepare_audio_cycle_candidate, prepare_webview_interlude, probe_local_mp4, probe_local_video,
+    probe_local_videos, release_webview_interlude_cache, resize_final_effect_window,
+    restore_original_audio, resume_playback, resume_portaudio_interlude, set_audio_output_backend,
     set_audio_processing_profile, set_interlude_config, set_processing_switches,
     stage_audio_variant_candidate, start_media_processing, start_playback,
-    start_portaudio_interlude, start_research_analysis, start_speech_to_speech_worker,
-    stop_playback, stop_portaudio_interlude, sync_audio_output_source, update_playback_position,
-    validate_local_research_params, AppState,
+    start_portaudio_interlude, start_speech_to_speech_worker, stop_playback,
+    stop_portaudio_interlude, sync_audio_output_source, update_playback_position,
+    validate_media_effect_params, AppState,
 };
 use std::process::ExitCode;
 use std::time::Duration;
@@ -39,6 +42,7 @@ fn main() -> ExitCode {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             probe_local_video,
+            probe_local_videos,
             probe_local_mp4,
             get_device_runtime_info,
             get_media_engine_capabilities,
@@ -52,6 +56,8 @@ fn main() -> ExitCode {
             cancel_audio_cycle_candidate,
             play_portaudio_test_tone,
             start_portaudio_interlude,
+            prepare_webview_interlude,
+            release_webview_interlude_cache,
             pause_portaudio_interlude,
             resume_portaudio_interlude,
             stop_portaudio_interlude,
@@ -60,24 +66,21 @@ fn main() -> ExitCode {
             cancel_runtime_resource_install,
             import_runtime_resource_directory,
             clear_runtime_resources,
-            get_research_worker_capabilities,
-            get_research_status,
             cleanup_local_caches_command,
             get_speech_to_speech_worker_capabilities,
-            get_default_local_research_params,
+            get_default_media_effect_params,
             start_playback,
             pause_playback,
             resume_playback,
             update_playback_position,
             stop_playback,
             complete_playback_loop,
+            complete_playback_item,
             commit_media_processing_if_ready,
             set_processing_switches,
             set_audio_processing_profile,
             set_interlude_config,
             start_media_processing,
-            start_research_analysis,
-            cancel_research_analysis,
             stage_audio_variant_candidate,
             start_speech_to_speech_worker,
             cancel_speech_to_speech_worker,
@@ -86,10 +89,13 @@ fn main() -> ExitCode {
             commit_audio_variant_candidate_if_due,
             discard_audio_variant_candidate,
             get_snapshot,
-            validate_local_research_params,
+            validate_media_effect_params,
             store_refresh_token,
             load_refresh_token,
             delete_refresh_token,
+            store_auth_form_credential,
+            load_auth_form_credential,
+            delete_auth_form_credential,
             open_final_effect_window,
             close_final_effect_window,
             resize_final_effect_window,
@@ -106,12 +112,14 @@ fn main() -> ExitCode {
     app.run(|app_handle, event| {
         if let RunEvent::ExitRequested { code, .. } = event {
             let state = app_handle.state::<AppState>();
-            let shutdown = state.shutdown_runtime_resources(Duration::from_secs(3));
+            let shutdown = state.shutdown_all(Duration::from_secs(3));
             match &shutdown {
                 Ok(RuntimeResourceTaskShutdown::TimedOut) => {
-                    eprintln!("runtime resource task did not stop within the 3 second exit budget");
+                    eprintln!(
+                        "desktop background tasks did not stop within the 3 second exit budget"
+                    );
                 }
-                Err(error) => eprintln!("failed to stop runtime resource task: {error}"),
+                Err(error) => eprintln!("failed to stop desktop background tasks: {error}"),
                 Ok(RuntimeResourceTaskShutdown::Idle | RuntimeResourceTaskShutdown::Joined) => {}
             }
             let exit_code = code.unwrap_or(0);
@@ -155,6 +163,26 @@ mod tests {
         assert!(config.contains("\"resources\""));
         assert!(config.contains("runtime-resources.json"));
         assert!(config.contains("embedded-runtime-resources"));
+        let config: serde_json::Value =
+            serde_json::from_str(&config).expect("tauri.conf.json should be valid JSON");
+        let resources = config["bundle"]["resources"]
+            .as_array()
+            .expect("bundle resources should be an array");
+        assert!(resources
+            .iter()
+            .any(|resource| resource.as_str() == Some("ambient/low-level-room-tone.wav")));
+        assert!(resources
+            .iter()
+            .any(|resource| resource.as_str() == Some("ambient/LICENSE.txt")));
+    }
+
+    #[test]
+    fn webview_interlude_processing_command_is_registered() {
+        let source = include_str!("main.rs");
+
+        assert!(source.contains("prepare_webview_interlude,"));
+        assert!(source.contains("release_webview_interlude_cache,"));
+        assert!(source.contains("start_portaudio_interlude,"));
     }
 
     #[test]

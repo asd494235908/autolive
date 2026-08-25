@@ -104,5 +104,11 @@ export function isAudioCycleResultMessage(value: unknown): value is AudioCycleRe
     && ['prepare', 'commit', 'cancel'].includes(message.action ?? '')
     && Number.isSafeInteger(message.candidate_id)
     && typeof message.accepted === 'boolean'
-    && typeof message.committed === 'boolean';
+    && typeof message.committed === 'boolean'
+    && (message.reason === null || typeof message.reason === 'string')
+    && (message.error_code == null || typeof message.error_code === 'string');
+}
+
+export function isExpectedAudioCycleSkipCode(code: string | null | undefined): boolean {
+  return code === 'audio_mixer_candidate_silent' || code === 'audio_mixer_candidate_stale';
 }

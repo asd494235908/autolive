@@ -1,10 +1,12 @@
 import { spawnSync } from 'node:child_process';
+import { rmSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { archiveDesktopArtifacts, detectTargetTriple } from './archive-desktop-artifact.mjs';
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const bundleRoot = resolve(desktopRoot, 'src-tauri', 'target', 'release', 'bundle');
 export const TEST_CONTROL_PLANE_BASE_URL = 'http://101.96.208.132:9090';
 
 export function applyBuildProfile(profile = process.argv.includes('--profile=test') ? 'test' : '') {
@@ -32,9 +34,21 @@ export function tauriBuildArguments(
   return argumentsList;
 }
 
+export function cleanBundleOutputForTarget(targetTriple, root = bundleRoot) {
+  if (targetTriple !== 'x86_64-pc-windows-msvc') return null;
+  const resolvedRoot = resolve(root);
+  const outputDirectory = resolve(resolvedRoot, 'nsis');
+  if (dirname(outputDirectory) !== resolvedRoot) {
+    throw new Error(`拒绝清理 bundle 根目录之外的路径：${outputDirectory}`);
+  }
+  rmSync(outputDirectory, { force: true, recursive: true });
+  return outputDirectory;
+}
+
 export function buildDesktopArtifacts(
   targetTriple = process.env.AUTOLIVE_TARGET_TRIPLE?.trim() || detectTargetTriple(),
 ) {
+  cleanBundleOutputForTarget(targetTriple);
   const result = spawnSync('tauri', tauriBuildArguments(targetTriple), {
     cwd: desktopRoot,
     shell: process.platform === 'win32',

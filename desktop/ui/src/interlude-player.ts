@@ -4,9 +4,17 @@ export const INTERLUDE_LIMITS = {
   intervalMinMs: { min: 500, max: 60_000 },
   volumeDb: { min: -60, max: 12 },
   duckingDepthDb: { min: -60, max: 0 },
-  duckingAttackMs: { min: 5, max: 1_000 },
-  duckingReleaseMs: { min: 10, max: 3_000 },
+  duckingAttackMs: { min: 0, max: 1_000 },
+  duckingReleaseMs: { min: 0, max: 3_000 },
 } as const;
+
+export function interludeIntervalMsToSeconds(milliseconds: number) {
+  return milliseconds / 1_000;
+}
+
+export function interludeIntervalSecondsToMs(seconds: number) {
+  return Math.round(seconds * 1_000);
+}
 
 type ResolveBaseAudioSourceInput = {
   realtimeVariantActive: boolean;

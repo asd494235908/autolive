@@ -56,4 +56,22 @@ test('allows choosing activation capacity and shows binding progress', () => {
   assert.match(pageSource, /InputNumber/);
   assert.match(pageSource, /max_devices:\s*values\.max_devices/);
   assert.match(pageSource, /bound_devices/);
+  assert.match(pageSource, /\['active', 'used'\]\.includes\(record\.status\)/);
+});
+
+test('requires choosing an active account in the current product before creation', () => {
+  assert.match(pageSource, /apiClient\.get<UserListResponse>\('\/api\/v1\/admin\/users'/);
+  assert.match(pageSource, /page_size:\s*200/);
+  assert.match(pageSource, /product:\s*authorization\.product/);
+  assert.match(pageSource, /authorization\.can\('users\.read'\)/);
+  assert.match(pageSource, /disabled=\{!canCreateActivationCodes\}/);
+  assert.match(pageSource, /缺少账号读取权限/);
+  assert.match(pageSource, /绑定账号加载失败/);
+  assert.match(pageSource, /user\.status === 'active'/);
+  assert.match(pageSource, /<Select/);
+  assert.match(pageSource, /showSearch/);
+  assert.match(pageSource, /optionFilterProp="label"/);
+  assert.match(pageSource, /user_id:\s*values\.user_id/);
+  assert.match(pageSource, /dataIndex:\s*'user_id'/);
+  assert.match(pageSource, /最多登录设备数/);
 });

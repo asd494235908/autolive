@@ -19,7 +19,7 @@ func TestTask4ActivationCodeProductMismatchDoesNotConsumeCapacity(t *testing.T) 
 		state.Users["usr_product01"] = controlplane.UserSummary{ID: "usr_product01", Status: controlplane.UserStatusActive}
 		state.ActivationCodes["code_product01"] = store.ActivationCodeRecord{
 			ActivationCode: controlplane.ActivationCode{
-				ID: "code_product01", Product: controlplane.ProductAutoLive,
+				ID: "code_product01", Product: controlplane.ProductAutoLive, UserID: "usr_product01",
 				Status: controlplane.ActivationCodeStatusActive, ExpiresAt: now.Add(time.Hour).Format(time.RFC3339),
 				MaxDevices: 1,
 			},
@@ -32,7 +32,6 @@ func TestTask4ActivationCodeProductMismatchDoesNotConsumeCapacity(t *testing.T) 
 	}
 
 	_, err := svc.ActivateDevice(ctx, "activate-product-mismatch", "usr_product01", controlplane.ActivateDeviceInput{
-		ActivationCode: "AUTO-CODE-01",
 		Device: controlplane.DeviceRegistration{
 			Product: controlplane.ProductDouyinDesktop, DeviceID: "dev_product01",
 			DeviceName: "desktop", Platform: "windows", AppVersion: "2.0.0",
@@ -189,6 +188,23 @@ func TestTask4AuditTargetProductMismatchIsRejected(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTask4AuditAcceptsLegacyAutoliveDeviceWithoutProduct(t *testing.T) {
+	repository := store.NewMemoryStore(time.Now)
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Devices["dev_legacy"] = controlplane.DeviceSummary{ID: "dev_legacy", UserID: "usr_legacy", Status: controlplane.DeviceStatusActive}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := NewControlPlane(repository).RecordAuditForProduct(context.Background(), controlplane.ProductAutoLive, controlplane.AuditLogInput{
+		DeviceID: "dev_legacy", Action: "POST /api/v1/client/heartbeat", TargetType: "device", TargetID: "dev_legacy", Outcome: "failure", StatusCode: 400,
+	})
+	if err != nil {
+		t.Fatalf("RecordAuditForProduct() error = %v", err)
 	}
 }
 

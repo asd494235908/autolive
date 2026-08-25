@@ -198,6 +198,11 @@ func (s *PostgresRepository) deliverAuditOutboxRow(ctx context.Context, outboxID
 		return postgresOperationError(operationCtx, err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	input, err = clearMissingFailureAuditDeviceReference(operationCtx, tx, input)
+	if err != nil {
+		_ = tx.Rollback()
+		return s.markAuditOutboxRetry(ctx, outboxID, err, now)
+	}
 	auditID := "audit_" + strings.TrimPrefix(outboxID, "audit_outbox_")
 	if _, err := tx.ExecContext(operationCtx, `
 		INSERT INTO audit_logs (

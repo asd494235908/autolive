@@ -18,7 +18,9 @@ async function loadCspNonceModule() {
 test('HTML 入口在 React 执行前提供静态启动反馈', async () => {
   const source = await readSource('../index.html');
 
+  assert.match(source, /<title>GpAutoLive<\/title>/);
   assert.match(source, /id="startup-splash"/);
+  assert.match(source, /class="startup-splash-title">GpAutoLive<\/div>/);
   assert.match(source, /正在启动桌面端/);
   assert.match(source, /startup-splash-spinner/);
   assert.match(source, /animation/);
@@ -45,11 +47,17 @@ test('主窗口锁定 body 滚动，避免懒加载期间出现白闪和页面�
 });
 
 test('Tauri 主窗口使用参考图尺寸、深色背景和无原生装饰', async () => {
-  const source = await readFile(new URL('../../src-tauri/tauri.conf.json', import.meta.url), 'utf8');
+  const [source, commands] = await Promise.all([
+    readFile(new URL('../../src-tauri/tauri.conf.json', import.meta.url), 'utf8'),
+    readFile(new URL('../../src-tauri/src/commands.rs', import.meta.url), 'utf8'),
+  ]);
   const config = JSON.parse(source);
   const mainWindow = config.app.windows.find((window) => window.label === 'main');
 
   assert.ok(mainWindow);
+  assert.equal(config.productName, 'GpAutoLive');
+  assert.equal(mainWindow.title, 'GpAutoLive');
+  assert.match(commands, /\.title\("GpAutoLive 最终效果"\)/);
   assert.equal(mainWindow.width, 1728);
   assert.equal(mainWindow.height, 1044);
   assert.equal(mainWindow.minWidth, 960);
@@ -123,7 +131,7 @@ test('Ant Design 根外壳由延迟加载的 App 自己拥有', async () => {
   assert.match(source, /<AntApp>/);
 });
 
-test('导入视频使用单一同步 guard 覆盖选择和探测，不打开窗口不自动播放', async () => {
+test('导入视频使用单一同步 guard 原子提交有序多选池，不打开窗口不自动播放', async () => {
   const source = await readSource('App.tsx');
   const importVideo = source.slice(
     source.indexOf('async function importVideo'),
@@ -138,8 +146,13 @@ test('导入视频使用单一同步 guard 覆盖选择和探测，不打开窗�
   );
   assert.match(
     importVideo,
-    /try \{[\s\S]*await open\([\s\S]*probe_local_video[\s\S]*get_snapshot/,
+    /try \{[\s\S]*await open\(\{[\s\S]*multiple:\s*true[\s\S]*probe_local_videos[\s\S]*request:\s*\{\s*paths\s*\}/,
   );
+  assert.match(
+    importVideo,
+    /Array\.isArray\(selection\)[\s\S]*typeof selection === 'string'[\s\S]*\[selection\]/,
+  );
+  assert.doesNotMatch(importVideo, /probe_local_video['"]/);
   assert.doesNotMatch(importVideo, /openFinalEffectWindowFromHome|start_playback/);
   assert.match(
     importVideo,
@@ -149,16 +162,17 @@ test('导入视频使用单一同步 guard 覆盖选择和探测，不打开窗�
 });
 
 test('导入按钮在完整导入链路中显示 loading 并禁止重复点击', async () => {
-  const source = await readSource('App.tsx');
-  const onClick = source.indexOf('onClick={() => void importVideo()}');
-  assert.notEqual(onClick, -1);
-  const buttonStart = source.lastIndexOf('<Button', onClick);
-  const importButton = source.slice(buttonStart, source.indexOf('</Button>', onClick));
+  const [source, pool] = await Promise.all([
+    readSource('App.tsx'),
+    readSource('desktop/playback-pool-panel.tsx'),
+  ]);
 
-  assert.match(importButton, /loading=\{importVideoBusy\}/);
-  assert.match(importButton, /disabled=\{importVideoBusy \|\| runtimeResourceBusy\}/);
-  assert.match(importButton, /导入视频/);
-  assert.doesNotMatch(importButton, /导入视频并播放/);
+  assert.match(source, /importBusy=\{importVideoBusy\}/);
+  assert.match(source, /importDisabled=\{importVideoBusy \|\| runtimeResourceBusy\}/);
+  assert.match(pool, /loading=\{importBusy\}/);
+  assert.match(pool, /disabled=\{importDisabled\}/);
+  assert.match(pool, /导入视频/);
+  assert.doesNotMatch(pool, /导入视频并播放/);
 });
 
 test('主页提供独立播放按钮，有源即可反复点击', async () => {
@@ -190,7 +204,7 @@ test('启动不恢复上次导入的视频，必须由用户手动选择文件',
   assert.doesNotMatch(finalEffectVideo, /autoPlay/);
   assert.match(importVideo, /async function importVideo\(\)/);
   assert.match(importVideo, /const selection = await open\(/);
-  assert.match(importVideo, /probe_local_video[\s\S]*get_snapshot/);
+  assert.match(importVideo, /probe_local_videos[\s\S]*request:\s*\{\s*paths\s*\}/);
   assert.doesNotMatch(importVideo, /openFinalEffectWindowFromHome|start_playback/);
   assert.doesNotMatch(importVideo, /voice|model|worker|prepare/i);
 });
@@ -213,7 +227,7 @@ test('导入视频先确保 media，资源就绪后再探测，不自动播放',
     source.indexOf('function updateInterludeDraft'),
   );
 
-  assert.match(importVideo, /ensureRuntimeResources\('media',[\s\S]*probe_local_video[\s\S]*get_snapshot/);
+  assert.match(importVideo, /ensureRuntimeResources\('media',[\s\S]*probe_local_videos[\s\S]*request:\s*\{\s*paths\s*\}/);
   assert.doesNotMatch(importVideo, /openFinalEffectWindowFromHome|start_playback/);
   assert.match(source, /pendingRuntimeActionRef/);
   assert.match(source, /token/);
@@ -232,9 +246,10 @@ test('导入文件选择器只开放确认的视频扩展名', async () => {
     ['mp4', 'mov', 'mkv', 'avi', 'webm', 'm4v', 'ts', 'm2ts', 'flv', 'wmv', '3gp'],
   );
   assert.match(source, /filters: \[\{ name: '视频文件', extensions: \[\.\.\.SUPPORTED_VIDEO_EXTENSIONS\] \}\]/);
+  assert.match(source, /multiple:\s*true/);
 });
 
-test('高级声音抽屉展示 FFmpeg 参数且主窗口不暴露实时话术', async () => {
+test('高级声音抽屉展示本地 DSP 参数且主窗口不暴露实时话术', async () => {
   const source = await readSource('App.tsx');
   const capability = await readSource('audio-processing-capabilities.ts');
   for (const field of ['input_gain_db', 'output_gain_db', 'loudness_adjustment_db', 'low_eq_db', 'mid_eq_db', 'high_eq_db', 'noise_reduction_percent', 'phase_perturbation_percent', 'vibrato_frequency_hz', 'environment_noise_percent', 'sample_rate_hz', 'output_bitrate_kbps']) {
@@ -242,7 +257,8 @@ test('高级声音抽屉展示 FFmpeg 参数且主窗口不暴露实时话术', 
   }
   assert.match(source, /title="高级声音设置"/);
   assert.match(source, /audioCapabilityRows/);
-  assert.match(source, /row\.key !== 'spectral_perturbation_percent'/);
+  assert.doesNotMatch(source, /row\.key !== 'spectral_perturbation_percent'/);
+  assert.match(source, /<MediaParameterPanels/);
   assert.match(source, /应用声音参数/);
   assert.doesNotMatch(source.slice(source.indexOf('function DesktopApp()')), /实时话术幻化/);
   assert.match(source, /ariaLabel="声音周期最小秒"/);
@@ -252,6 +268,24 @@ test('高级声音抽屉展示 FFmpeg 参数且主窗口不暴露实时话术', 
   assert.doesNotMatch(source, /title="声音处理参数"/);
   assert.doesNotMatch(source, /aria-label="音频 MFCC 维度"/);
   assert.doesNotMatch(source, /aria-label="音频音色库"/);
+});
+
+test('声音预设随机化会把完整抽样值写回当前参数并刷新只读展示', async () => {
+  const source = await readSource('App.tsx');
+  const commitStart = source.indexOf('function commitAudioCycleSample');
+  const commit = source.slice(commitStart, source.indexOf('function sampleAndCommitAudioCycle', commitStart));
+  const samplerStart = source.indexOf('function sampleAndCommitAudioCycle');
+  const sampler = source.slice(samplerStart, source.indexOf('function applyAudioCycleSample', samplerStart));
+  const rerollStart = source.indexOf('function rerollSubtleAudioParams');
+  const reroll = source.slice(rerollStart, source.indexOf('const sourceMediaPool', rerollStart));
+
+  assert.ok(commitStart >= 0 && samplerStart >= 0 && rerollStart >= 0);
+  assert.match(sampler, /sampleAudioCycle\(audioValuePresetIdsRef\.current/);
+  assert.match(sampler, /commitAudioCycleSample\(/);
+  assert.match(commit, /mediaEffectParamsRef\.current\s*=\s*\{[\s\S]*?audio:\s*\{[\s\S]*?\.\.\.sample\.values/);
+  assert.match(commit, /setMediaEffectParams\(\(current\)\s*=>[\s\S]*?audio:\s*\{[\s\S]*?\.\.\.sample\.values/);
+  assert.match(reroll, /applyAudioCycleSample\(true\)/);
+  assert.match(source, /value=\{mediaEffectParams\.audio\}/);
 });
 
 test('停止或暂停播放时停止实时参数调度', async () => {
@@ -316,8 +350,10 @@ test('已有视频的媒体处理先确保 media 并只恢复一次', async () =
   const source = await readSource('App.tsx');
   const mediaProcessing = source.slice(
     source.indexOf('async function applyMediaProcessing'),
-    source.indexOf('async function startResearchAnalysis'),
+    source.indexOf('async function cleanupLocalCaches'),
   );
 
   assert.match(mediaProcessing, /ensureRuntimeResources\('media',[\s\S]*start_media_processing/);
+  assert.match(mediaProcessing, /ambient_sound_path:\s*scope\s*===\s*'video'\s*\?\s*null\s*:\s*ambientSoundPath/);
+  assert.doesNotMatch(mediaProcessing, /ambientSelection\.status\s*===\s*'missing'/);
 });

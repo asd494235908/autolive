@@ -29,7 +29,6 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 	record.AccessTokenHash = strings.TrimSpace(record.AccessTokenHash)
 	record.UserID = strings.TrimSpace(record.UserID)
 	record.Product = controlplane.ProductCode(strings.TrimSpace(string(record.Product)))
-	record.ActivationCodeHash = strings.TrimSpace(record.ActivationCodeHash)
 	record.Device.Product = controlplane.ProductCode(strings.TrimSpace(string(record.Device.Product)))
 	record.Device.DeviceID = strings.TrimSpace(record.Device.DeviceID)
 	record.Device.DeviceName = strings.TrimSpace(record.Device.DeviceName)
@@ -38,7 +37,7 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 	if !record.Product.Valid() || !record.Device.Product.Valid() {
 		return controlplane.DeviceSummary{}, controlplane.ErrInvalidRequest
 	}
-	if record.Scope == "" || record.IdempotencyKey == "" || record.Fingerprint == "" || record.AccessTokenHash == "" || record.UserID == "" || record.ActivationCodeHash == "" || record.Device.DeviceID == "" || record.Device.DeviceName == "" || record.Device.Platform == "" || record.Device.AppVersion == "" {
+	if record.Scope == "" || record.IdempotencyKey == "" || record.Fingerprint == "" || record.AccessTokenHash == "" || record.UserID == "" || record.Device.DeviceID == "" || record.Device.DeviceName == "" || record.Device.Platform == "" || record.Device.AppVersion == "" {
 		return controlplane.DeviceSummary{}, errors.New("normalized device activation arguments are incomplete")
 	}
 	if record.Product != record.Device.Product {
@@ -77,36 +76,11 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 		return controlplane.DeviceSummary{}, ErrSessionDeviceBindingConflict
 	}
 
-	existingDevice, exists, err := s.loadDeviceForUpdateWithProduct(operationCtx, tx, record.Device.DeviceID, record.Product)
+	existingDevice, exists, err := s.loadDeviceForUpdate(operationCtx, tx, record.Device.DeviceID)
 	if err != nil {
 		return controlplane.DeviceSummary{}, err
 	}
 	if exists && existingDevice.Product != record.Product {
-		return controlplane.DeviceSummary{}, controlplane.ErrForbidden
-	}
-
-	var codeID, codeStatus string
-	var codeProduct sql.NullString
-	var expiresAt sql.NullTime
-	var maxDevices, boundDevices int
-	codeQuery := `
-		SELECT id, product, status, expires_at, max_devices, bound_devices
-		FROM activation_codes
-		WHERE code_hash = $1 AND `
-	productCondition, productArgs := normalizedProductFilter("product", record.Product, 2)
-	codeQuery += productCondition + "\n\t\tFOR UPDATE\n\t"
-	codeArgs := append([]any{record.ActivationCodeHash}, productArgs...)
-	if err := tx.QueryRowContext(operationCtx, codeQuery, codeArgs...).Scan(&codeID, &codeProduct, &codeStatus, &expiresAt, &maxDevices, &boundDevices); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeNotFound
-		}
-		return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("lock normalized activation code by hash: %w", err))
-	}
-	storedCodeProduct, err := normalizedStoredProduct(codeProduct)
-	if err != nil {
-		return controlplane.DeviceSummary{}, err
-	}
-	if storedCodeProduct != record.Product {
 		return controlplane.DeviceSummary{}, controlplane.ErrForbidden
 	}
 
@@ -125,24 +99,76 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 		if storedFingerprint != record.Fingerprint {
 			return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyConflict
 		}
-		device, err := s.loadDeviceSummaryWithProduct(operationCtx, tx, storedResourceID, record.Product)
-		if err != nil {
-			return controlplane.DeviceSummary{}, err
+		if storedResourceID != record.Device.DeviceID {
+			return controlplane.DeviceSummary{}, controlplane.ErrIdempotencyConflict
+		}
+		if !exists {
+			return controlplane.DeviceSummary{}, controlplane.ErrDeviceNotFound
+		}
+		if existingDevice.UserID != "" && existingDevice.UserID != record.UserID {
+			return controlplane.DeviceSummary{}, controlplane.ErrDeviceBindingConflict
 		}
 		if currentDeviceID == "" {
-			if err := bindAuthenticatedSession(operationCtx, tx, record.AccessTokenHash, record.Device.DeviceID, record.Product); err != nil {
+			user, err := s.loadUserForUpdate(operationCtx, tx, record.UserID)
+			if err != nil {
+				return controlplane.DeviceSummary{}, err
+			}
+			if user.Status != controlplane.UserStatusActive {
+				return controlplane.DeviceSummary{}, controlplane.ErrUserDisabled
+			}
+			var membershipStatus string
+			if err := tx.QueryRowContext(operationCtx, `
+				SELECT status
+				FROM user_products
+				WHERE user_id = $1 AND product = $2
+				FOR KEY SHARE
+			`, record.UserID, record.Product).Scan(&membershipStatus); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return controlplane.DeviceSummary{}, controlplane.ErrForbidden
+				}
+				return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("read idempotent activation product membership: %w", err))
+			}
+			if membershipStatus != "active" {
+				return controlplane.DeviceSummary{}, controlplane.ErrForbidden
+			}
+			if existingDevice.Status == controlplane.DeviceStatusDisabled {
+				return controlplane.DeviceSummary{}, controlplane.ErrDeviceDisabled
+			}
+			if existingDevice.Status != controlplane.DeviceStatusActive || existingDevice.UserID != record.UserID {
+				return controlplane.DeviceSummary{}, controlplane.ErrDeviceBindingConflict
+			}
+		}
+		var replayExpiry sql.NullTime
+		replayErr := tx.QueryRowContext(operationCtx, `
+			SELECT ac.expires_at
+			FROM activation_device_bindings AS binding
+			JOIN activation_codes AS ac ON ac.id = binding.activation_code_id
+			WHERE binding.device_id = $1 AND binding.user_id = $2 AND binding.product = $3
+		`, record.Device.DeviceID, record.UserID, record.Product).Scan(&replayExpiry)
+		if replayErr != nil && !errors.Is(replayErr, sql.ErrNoRows) {
+			return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("load idempotent activation expiry: %w", replayErr))
+		}
+		if currentDeviceID == "" {
+			if !replayExpiry.Valid {
+				return controlplane.DeviceSummary{}, controlplane.ErrAccountActivationRequired
+			}
+			if !s.Now().Before(replayExpiry.Time) {
+				return controlplane.DeviceSummary{}, controlplane.ErrAccountActivationExpired
+			}
+		}
+		if replayExpiry.Valid {
+			expiresAt := replayExpiry.Time.UTC().Format(time.RFC3339)
+			existingDevice.ActivationExpiresAt = &expiresAt
+		}
+		if currentDeviceID == "" {
+			if err := bindAuthenticatedSession(operationCtx, tx, record.AccessTokenHash, existingDevice.ID, record.Product); err != nil {
 				return controlplane.DeviceSummary{}, err
 			}
 		}
-		if strings.TrimSpace(record.Audit.Action) != "" {
-			if err := s.enqueueAuditOutboxTx(operationCtx, tx, record.Audit, s.Now()); err != nil {
-				return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("enqueue activation audit: %w", err))
-			}
-		}
 		if err := tx.Commit(); err != nil {
-			return controlplane.DeviceSummary{}, postgresCommitError(operationCtx, "commit idempotent device activation", err)
+			return controlplane.DeviceSummary{}, postgresCommitError(operationCtx, "commit idempotent normalized device activation", err)
 		}
-		return device, nil
+		return existingDevice, nil
 	}
 
 	user, err := s.loadUserForUpdate(operationCtx, tx, record.UserID)
@@ -152,28 +178,113 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 	if user.Status != controlplane.UserStatusActive {
 		return controlplane.DeviceSummary{}, controlplane.ErrUserDisabled
 	}
+	var membershipStatus string
+	if err := tx.QueryRowContext(operationCtx, `
+		SELECT status
+		FROM user_products
+		WHERE user_id = $1 AND product = $2
+		FOR KEY SHARE
+	`, record.UserID, record.Product).Scan(&membershipStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return controlplane.DeviceSummary{}, controlplane.ErrForbidden
+		}
+		return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("read activation product membership: %w", err))
+	}
+	if membershipStatus != "active" {
+		return controlplane.DeviceSummary{}, controlplane.ErrForbidden
+	}
 
 	if exists {
 		if !(existingDevice.Status == controlplane.DeviceStatusPendingActivation && existingDevice.UserID == "") {
-			if existingDevice.UserID != record.UserID || existingDevice.Status == controlplane.DeviceStatusDisabled {
-				return controlplane.DeviceSummary{}, controlplane.ErrForbidden
+			if existingDevice.Status == controlplane.DeviceStatusDisabled && existingDevice.UserID == record.UserID {
+				return controlplane.DeviceSummary{}, controlplane.ErrDeviceDisabled
 			}
-			return controlplane.DeviceSummary{}, controlplane.ErrDeviceBindingConflict
+			if existingDevice.UserID != record.UserID {
+				return controlplane.DeviceSummary{}, controlplane.ErrDeviceBindingConflict
+			}
 		}
 	}
 
 	now := s.Now()
-	if !expiresAt.Valid || !now.Before(expiresAt.Time) {
-		return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeExpired
+	var oldCodeID string
+	err = tx.QueryRowContext(operationCtx, `
+		SELECT activation_code_id
+		FROM activation_device_bindings
+		WHERE device_id = $1 AND product = $2 AND user_id = $3
+		FOR UPDATE
+	`, record.Device.DeviceID, record.Product, record.UserID).Scan(&oldCodeID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("lock existing activation device binding: %w", err))
 	}
-	switch codeStatus {
-	case controlplane.ActivationCodeStatusRevoked:
-		return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeRevoked
-	case controlplane.ActivationCodeStatusUsed:
-		return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeAlreadyUsed
+
+	var codeID, codeStatus string
+	var expiresAt time.Time
+	var maxDevices, boundDevices int
+	usesExistingBinding := false
+	if oldCodeID != "" && exists && existingDevice.UserID == record.UserID && existingDevice.Status == controlplane.DeviceStatusActive {
+		var boundUserID string
+		var codeProduct controlplane.ProductCode
+		if err := tx.QueryRowContext(operationCtx, `
+			SELECT bound_user_id, product, status, expires_at, max_devices, bound_devices
+			FROM activation_codes
+			WHERE id = $1
+			FOR UPDATE
+		`, oldCodeID).Scan(&boundUserID, &codeProduct, &codeStatus, &expiresAt, &maxDevices, &boundDevices); err != nil {
+			return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("lock bound account activation: %w", err))
+		}
+		if boundUserID == record.UserID && codeProduct == record.Product && now.Before(expiresAt) {
+			codeID = oldCodeID
+			usesExistingBinding = true
+		}
 	}
-	if maxDevices < 1 || boundDevices >= maxDevices {
-		return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeAlreadyUsed
+
+	if !usesExistingBinding {
+		rows, err := tx.QueryContext(operationCtx, `
+			SELECT id, status, expires_at, max_devices, bound_devices
+			FROM activation_codes
+			WHERE bound_user_id = $1 AND product = $2 AND status <> $3
+			ORDER BY expires_at ASC, id ASC
+			FOR UPDATE
+		`, record.UserID, record.Product, controlplane.ActivationCodeStatusRevoked)
+		if err != nil {
+			return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("lock account activations: %w", err))
+		}
+		hasExpired := false
+		hasCurrent := false
+		for rows.Next() {
+			var candidateID, candidateStatus string
+			var candidateExpiresAt time.Time
+			var candidateMaxDevices, candidateBoundDevices int
+			if err := rows.Scan(&candidateID, &candidateStatus, &candidateExpiresAt, &candidateMaxDevices, &candidateBoundDevices); err != nil {
+				_ = rows.Close()
+				return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("scan account activation: %w", err))
+			}
+			if !now.Before(candidateExpiresAt) || candidateStatus == controlplane.ActivationCodeStatusExpired {
+				hasExpired = true
+				continue
+			}
+			hasCurrent = true
+			if codeID == "" && candidateMaxDevices > 0 && candidateBoundDevices < candidateMaxDevices {
+				codeID, codeStatus, expiresAt, maxDevices, boundDevices = candidateID, candidateStatus, candidateExpiresAt, candidateMaxDevices, candidateBoundDevices
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("iterate account activations: %w", err))
+		}
+		if err := rows.Close(); err != nil {
+			return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("close account activation rows: %w", err))
+		}
+		if codeID == "" {
+			switch {
+			case hasCurrent:
+				return controlplane.DeviceSummary{}, controlplane.ErrDeviceLimitExceeded
+			case hasExpired:
+				return controlplane.DeviceSummary{}, controlplane.ErrAccountActivationExpired
+			default:
+				return controlplane.DeviceSummary{}, controlplane.ErrAccountActivationRequired
+			}
+		}
 	}
 
 	device := controlplane.DeviceSummary{
@@ -186,7 +297,7 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 		Status:     controlplane.DeviceStatusActive,
 		LastSeenAt: now.Format(time.RFC3339),
 	}
-	activationExpiresAt := expiresAt.Time.UTC().Format(time.RFC3339)
+	activationExpiresAt := expiresAt.UTC().Format(time.RFC3339)
 	device.ActivationExpiresAt = &activationExpiresAt
 	if exists {
 		if _, err := tx.ExecContext(operationCtx, `
@@ -202,17 +313,41 @@ func (s *PostgresRepository) ActivateDeviceWithSessionBinding(ctx context.Contex
 	`, device.ID, device.UserID, device.Product, "state-device/"+device.ID, device.DeviceName, device.Platform, device.AppVersion, device.Status, now); err != nil {
 		return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("insert normalized activated device: %w", err))
 	}
-	newBoundDevices := boundDevices + 1
-	newStatus := controlplane.ActivationCodeStatusActive
-	if newBoundDevices >= maxDevices {
-		newStatus = controlplane.ActivationCodeStatusUsed
-	}
-	if _, err := tx.ExecContext(operationCtx, `
-		UPDATE activation_codes
-		SET status = $2, bound_devices = $3, used_at = COALESCE(used_at, $4), used_by_user_id = COALESCE(used_by_user_id, $5), used_by_device_id = COALESCE(used_by_device_id, $6)
-		WHERE id = $1 AND product = $7
-	`, codeID, newStatus, newBoundDevices, now, record.UserID, device.ID, record.Product); err != nil {
-		return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("redeem normalized activation code: %w", err))
+	if !usesExistingBinding {
+		if oldCodeID != "" {
+			if _, err := tx.ExecContext(operationCtx, `
+				UPDATE activation_codes
+				SET bound_devices = GREATEST(bound_devices - 1, 0),
+				    status = CASE WHEN status = $2 AND expires_at > $3 THEN $4 ELSE status END
+				WHERE id = $1
+			`, oldCodeID, controlplane.ActivationCodeStatusUsed, now, controlplane.ActivationCodeStatusActive); err != nil {
+				return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("release prior account activation slot: %w", err))
+			}
+			if _, err := tx.ExecContext(operationCtx, `DELETE FROM activation_device_bindings WHERE device_id = $1`, device.ID); err != nil {
+				return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("remove prior activation device binding: %w", err))
+			}
+			if oldCodeID == codeID && boundDevices > 0 {
+				boundDevices--
+			}
+		}
+		if _, err := tx.ExecContext(operationCtx, `
+			INSERT INTO activation_device_bindings (activation_code_id, device_id, product, user_id, bound_at)
+			VALUES ($1, $2, $3, $4, $5)
+		`, codeID, device.ID, record.Product, record.UserID, now); err != nil {
+			return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("bind device to account activation: %w", err))
+		}
+		newBoundDevices := boundDevices + 1
+		newStatus := controlplane.ActivationCodeStatusActive
+		if newBoundDevices >= maxDevices {
+			newStatus = controlplane.ActivationCodeStatusUsed
+		}
+		if _, err := tx.ExecContext(operationCtx, `
+			UPDATE activation_codes
+			SET status = $2, bound_devices = $3, used_at = COALESCE(used_at, $4), used_by_user_id = COALESCE(used_by_user_id, $5), used_by_device_id = COALESCE(used_by_device_id, $6)
+			WHERE id = $1 AND product = $7 AND bound_user_id = $5
+		`, codeID, newStatus, newBoundDevices, now, record.UserID, device.ID, record.Product); err != nil {
+			return controlplane.DeviceSummary{}, postgresOperationError(operationCtx, fmt.Errorf("consume account activation capacity: %w", err))
+		}
 	}
 	if currentDeviceID == "" {
 		if err := bindAuthenticatedSession(operationCtx, tx, record.AccessTokenHash, device.ID, record.Product); err != nil {

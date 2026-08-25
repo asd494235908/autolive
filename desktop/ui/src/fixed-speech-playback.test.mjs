@@ -100,7 +100,7 @@ test('导入视频只探测，不打开窗口不播放也不准备语音资源',
     source.indexOf('function updateInterludeDraft'),
   );
 
-  assert.match(importVideo, /probe_local_video[\s\S]*get_snapshot/);
+  assert.match(importVideo, /probe_local_videos[\s\S]*request:\s*\{\s*paths\s*\}/);
   assert.doesNotMatch(importVideo, /openFinalEffectWindowFromHome|start_playback/);
   assert.doesNotMatch(importVideo, /voice|model|worker/i);
 });

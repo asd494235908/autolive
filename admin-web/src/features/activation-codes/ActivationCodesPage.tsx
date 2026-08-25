@@ -11,6 +11,7 @@ import {
   InputNumber,
   Modal,
   Result,
+  Select,
   Space,
   Table,
   Typography
@@ -27,15 +28,24 @@ import type {
   ActivationCode,
   ActivationCodeEnvelope,
   ActivationCodeListResponse,
-  CreateActivationCodeRequest
+  CreateActivationCodeRequest,
+  UserListResponse
 } from '../../types/api';
+
+type CreateActivationCodeFormValues = {
+  user_id: string;
+  expires_at: Dayjs;
+  max_devices: number;
+};
 
 export function ActivationCodesPage() {
   const authorization = useAdminAuthorization();
   const canManageActivationCodes = authorization.can('activation_codes.manage');
+  const canReadUsers = authorization.can('users.read');
+  const canCreateActivationCodes = canManageActivationCodes && canReadUsers;
   const { message, modal } = App.useApp();
   const queryClient = useQueryClient();
-  const [form] = Form.useForm<{ expires_at: Dayjs; max_devices: number }>();
+  const [form] = Form.useForm<CreateActivationCodeFormValues>();
   const [createOpen, setCreateOpen] = useState(false);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
@@ -56,6 +66,31 @@ export function ActivationCodesPage() {
         query: { page, page_size: pageSize }
       })
   });
+
+  const activationCodeUsersQuery = useQuery({
+    queryKey: ['admin-users', 'activation-code-picker', authorization.product],
+    queryFn: () => {
+      if (authorization.product === null) {
+        throw new Error('当前产品范围尚未就绪');
+      }
+
+      return apiClient.get<UserListResponse>('/api/v1/admin/users', {
+        query: { page: 1, page_size: 200, product: authorization.product }
+      });
+    },
+    enabled: createOpen && canReadUsers && authorization.product !== null
+  });
+
+  const activationCodeUserOptions = useMemo(
+    () =>
+      (activationCodeUsersQuery.data?.items ?? [])
+        .filter((user) => user.status === 'active')
+        .map((user) => ({
+          label: `${user.username}（${user.id}）`,
+          value: user.id
+        })),
+    [activationCodeUsersQuery.data?.items]
+  );
 
   const createActivationCodeMutation = useMutation({
     mutationFn: (values: CreateActivationCodeRequest) =>
@@ -140,8 +175,13 @@ export function ActivationCodesPage() {
         render: (_value: unknown, record: ActivationCode) =>
           `${record.bound_devices ?? 0} / ${record.max_devices}`
       },
+      {
+        title: '绑定账号',
+        dataIndex: 'user_id',
+        key: 'user_id',
+        render: (value?: string) => value || '历史未分配（已作废）'
+      },
       { title: '脱敏前缀', dataIndex: 'code_prefix', key: 'code_prefix', render: (value?: string) => value || '未生成' },
-      { title: '核销用户', dataIndex: 'used_by_user_id', key: 'used_by_user_id', render: (value?: string) => value || '未核销' },
       { title: '核销设备', dataIndex: 'used_by_device_id', key: 'used_by_device_id', render: (value?: string) => value || '未核销' },
       {
         title: '核销时间',
@@ -153,15 +193,19 @@ export function ActivationCodesPage() {
         title: '操作',
         key: 'actions',
         render: (_value: unknown, record: ActivationCode) => (
-            <Button
-              danger
-              type="link"
-              disabled={!canManageActivationCodes || record.status !== 'active' || revokeActivationCodeMutation.isPending}
+          <Button
+            danger
+            type="link"
+            disabled={
+              !canManageActivationCodes ||
+              !['active', 'used'].includes(record.status) ||
+              revokeActivationCodeMutation.isPending
+            }
             loading={revokingCodeId === record.id}
             onClick={() => {
               modal.confirm({
                 title: '确认作废激活码？',
-                content: '作废后该激活码不能再绑定设备，已绑定设备不受影响。',
+                content: '作废后该账号授权不能再绑定新设备，已绑定设备不受影响。',
                 okText: '确认作废',
                 cancelText: '取消',
                 okButtonProps: { danger: true },
@@ -177,7 +221,7 @@ export function ActivationCodesPage() {
         )
       }
     ],
-    [modal, revokeActivationCodeMutation.isPending, revokingCodeId]
+    [canManageActivationCodes, modal, revokeActivationCodeMutation.isPending, revokingCodeId]
   );
 
   return (
@@ -188,14 +232,28 @@ export function ActivationCodesPage() {
             激活码管理
           </Typography.Title>
           <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-            对齐 `/api/v1/admin/activation-codes` 的列表、创建和作废接口；作废只影响未核销激活码。
+            激活码创建时绑定账号并设置最多登录设备数；作废后不能再绑定新设备。
           </Typography.Paragraph>
         </div>
 
-        <Button type="primary" disabled={!canManageActivationCodes} onClick={() => setCreateOpen(true)}>
+        <Button
+          type="primary"
+          disabled={!canCreateActivationCodes}
+          title={canManageActivationCodes && !canReadUsers ? '创建激活码还需要 users.read 权限' : undefined}
+          onClick={() => setCreateOpen(true)}
+        >
           创建激活码
         </Button>
       </Space>
+
+      {canManageActivationCodes && !canReadUsers ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="缺少账号读取权限"
+          description="创建激活码需要从当前产品的启用账号中选择绑定对象，请联系管理员补充 users.read 权限。"
+        />
+      ) : null}
 
       {activationCodesQuery.isError && activationCodesQuery.error instanceof ApiClientError && activationCodesQuery.error.status === 403 ? (
         <Result
@@ -264,6 +322,13 @@ export function ActivationCodesPage() {
         title="创建激活码"
         open={createOpen}
         confirmLoading={createActivationCodeMutation.isPending}
+        okButtonProps={{
+          disabled:
+            !canCreateActivationCodes ||
+            activationCodeUsersQuery.isLoading ||
+            activationCodeUsersQuery.isError ||
+            activationCodeUserOptions.length === 0
+        }}
         onCancel={() => {
           if (!createActivationCodeMutation.isPending) {
             setCreateOpen(false);
@@ -272,13 +337,45 @@ export function ActivationCodesPage() {
         onOk={() => {
           void form.validateFields().then((values) =>
             createActivationCodeMutation.mutate({
+              user_id: values.user_id,
               expires_at: values.expires_at.toISOString(),
               max_devices: values.max_devices
             })
           );
         }}
       >
-        <Form<{ expires_at: Dayjs; max_devices: number }> form={form} layout="vertical">
+        {activationCodeUsersQuery.isError ? (
+          <Alert
+            type="error"
+            showIcon
+            message="绑定账号加载失败"
+            description={
+              activationCodeUsersQuery.error instanceof ApiClientError
+                ? `${activationCodeUsersQuery.error.message}${activationCodeUsersQuery.error.requestId ? `（request_id：${activationCodeUsersQuery.error.requestId}）` : ''}`
+                : '当前产品的账号列表暂时无法加载'
+            }
+            action={<Button onClick={() => void activationCodeUsersQuery.refetch()}>重试</Button>}
+            style={{ marginBottom: 16 }}
+          />
+        ) : null}
+        <Form<CreateActivationCodeFormValues> form={form} layout="vertical">
+          <Form.Item
+            label="绑定账号"
+            name="user_id"
+            rules={[{ required: true, message: '请选择绑定账号' }]}
+          >
+            <Select
+              showSearch
+              optionFilterProp="label"
+              loading={activationCodeUsersQuery.isLoading}
+              disabled={!canReadUsers || activationCodeUsersQuery.isError}
+              options={activationCodeUserOptions}
+              placeholder="请选择当前产品的启用账号"
+              notFoundContent={
+                activationCodeUsersQuery.isLoading ? '账号加载中...' : '暂无可绑定的启用账号'
+              }
+            />
+          </Form.Item>
           <Form.Item
             label="过期时间"
             name="expires_at"
@@ -293,10 +390,10 @@ export function ActivationCodesPage() {
             />
           </Form.Item>
           <Form.Item
-            label="可绑定设备数"
+            label="最多登录设备数"
             name="max_devices"
             initialValue={1}
-            rules={[{ required: true, message: '请输入可绑定设备数' }]}
+            rules={[{ required: true, message: '请输入最多登录设备数' }]}
           >
             <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
           </Form.Item>

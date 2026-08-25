@@ -1,19 +1,19 @@
 use autolive_desktop_core::cancellation::CancellationToken;
+use autolive_desktop_core::media_effect_params::{
+    AudioEffectParams, NaturalVoiceMode, VideoEffectParams,
+};
 #[cfg(unix)]
 use autolive_desktop_core::media_engine::probe_media_engine_with_paths;
 use autolive_desktop_core::media_engine::{
     build_media_render_args, configured_media_engine_paths_with_resource_dir, render_media,
     MediaEngineError, MediaRenderRequest,
 };
-use autolive_desktop_core::research_params::{
-    AudioResearchParams, NaturalVoiceMode, VideoResearchParams,
-};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-type AudioParameterCase = (&'static str, fn(&mut AudioResearchParams));
+type AudioParameterCase = (&'static str, fn(&mut AudioEffectParams));
 
 struct TestDir(PathBuf);
 
@@ -55,10 +55,10 @@ fn request(directory: &TestDir) -> MediaRenderRequest {
         video_processing_enabled: true,
         audio_processing_enabled: true,
         source_audio_sample_rate_hz: Some(48_000),
-        video: VideoResearchParams::default(),
-        audio: AudioResearchParams::default(),
+        video: VideoEffectParams::default(),
+        audio: AudioEffectParams::default(),
         audio_variants: Vec::new(),
-        research: Default::default(),
+        advanced: Default::default(),
         timeout_seconds: 2,
     }
 }
@@ -136,7 +136,7 @@ fn render_plan_reencodes_video_when_video_processing_is_enabled() {
     assert!(!values.windows(2).any(|pair| pair == ["-c:v", "copy"]));
     assert!(values.iter().any(|value| value == "-vf"));
     assert!(values.iter().any(|value| value == "-filter_complex"));
-    assert!(audio_graph(&values).contains("loudnorm=I=-16:TP=-1.5:LRA=11"));
+    assert!(!audio_graph(&values).contains("loudnorm="));
     let vf = values
         .windows(2)
         .find(|pair| pair[0] == "-vf")
@@ -260,24 +260,15 @@ fn render_accepts_pitch_shift_with_fallback_sample_rate() {
 }
 
 #[test]
-fn render_rejects_unmapped_audio_parameters() {
+fn offline_render_rejects_pcm_runtime_or_missing_input_audio_parameters() {
     let directory = TestDir::new();
-    let cases: [AudioParameterCase; 6] = [
-        ("audio.natural_voice_mode", |audio| {
-            audio.natural_voice_mode = NaturalVoiceMode::NaturalDynamic
-        }),
+    let cases: [AudioParameterCase; 3] = [
         ("audio.ambient_sound_mix_percent", |audio| {
             audio.ambient_sound_mix_percent = 1.0
         }),
-        ("audio.dry_wet_percent", |audio| audio.dry_wet_percent = 1.0),
-        ("audio.mfcc_shift_percent", |audio| {
-            audio.mfcc_shift_percent = 1.0
-        }),
+        ("audio 的 MFCC/SNR", |audio| audio.mfcc_shift_percent = 1.0),
         ("audio.formant_shift_percent", |audio| {
             audio.formant_shift_percent = 1.0
-        }),
-        ("audio.spectral_perturbation_percent", |audio| {
-            audio.spectral_perturbation_percent = 1.0
         }),
     ];
 
@@ -286,12 +277,53 @@ fn render_rejects_unmapped_audio_parameters() {
         fs::write(&input.input_mp4_path, b"source").expect("source should be written");
         configure(&mut input.audio);
 
-        let error = build_media_render_args(&input).expect_err("unmapped parameter should fail");
+        let error = build_media_render_args(&input)
+            .expect_err("offline-only render boundary should reject missing runtime support");
         assert!(
             matches!(&error, MediaEngineError::InvalidParameters { message } if message.contains(field)),
             "{field}: {error:?}"
         );
     }
+}
+
+#[test]
+fn render_maps_natural_dynamic_and_dry_wet_audio_effects() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.audio.natural_voice_mode = NaturalVoiceMode::NaturalDynamic;
+    input.audio.dry_wet_percent = 25.0;
+
+    let args = build_media_render_args(&input).expect("mapped effects should build");
+    let values = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let graph = audio_graph(&values);
+    assert!(graph.contains("volume='1+0.012000*sin"), "{graph}");
+    assert!(
+        graph.contains("[dry0][wet0]amix=inputs=2:weights=0.750000 0.250000"),
+        "{graph}"
+    );
+}
+
+#[test]
+fn render_maps_spectral_and_high_frequency_audio_perturbation() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.audio.spectral_perturbation_percent = 1.0;
+    input.audio.high_frequency_perturbation_enabled = true;
+    input.audio.high_frequency_perturbation_strength_percent = 4.0;
+
+    let args = build_media_render_args(&input).expect("frequency effects should be mapped");
+    let joined = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(joined.matches("afftfilt=").count() >= 2, "{joined}");
+    assert!(joined.contains("gte(b/nb\\,0.25)"), "{joined}");
 }
 
 #[test]
@@ -355,7 +387,7 @@ fn render_maps_environment_noise_with_ffmpeg_native_mix() {
 
     assert!(graph.contains("anoisesrc=color=white:amplitude="));
     assert!(graph.contains("amix=inputs=2:weights=0.920000 0.080000:duration=first"));
-    assert!(graph.contains("loudnorm=I=-16:TP=-1.5:LRA=11"));
+    assert!(!graph.contains("loudnorm="));
     assert!(graph.contains("aresample="));
     assert!(values
         .windows(2)
@@ -387,7 +419,7 @@ fn render_normalizes_unknown_source_sample_rate_to_48000() {
 }
 
 #[test]
-fn render_guards_non_finite_audio_before_loudnorm_and_aac() {
+fn render_guards_non_finite_audio_before_the_source_relative_output_bus() {
     let directory = TestDir::new();
     let input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
@@ -401,11 +433,12 @@ fn render_guards_non_finite_audio_before_loudnorm_and_aac() {
     let finite_guard = filter
         .find("aeval=exprs=if(isnan(val(0))")
         .expect("non-finite audio guard should be present");
-    let loudnorm = filter
-        .find("loudnorm=I=-16:TP=-1.5:LRA=11")
-        .expect("loudnorm should be present");
+    let highpass = filter
+        .find("highpass=f=50")
+        .expect("output highpass should be present");
 
-    assert!(finite_guard < loudnorm);
+    assert!(finite_guard < highpass);
+    assert!(!filter.contains("loudnorm="));
     assert!(filter.contains("isinf(val(0))"));
     assert!(filter.contains("isnan(val(1))"));
 }
@@ -415,11 +448,11 @@ fn render_generates_environment_noise_inside_each_audio_variant_branch() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    let branch_a = AudioResearchParams {
+    let branch_a = AudioEffectParams {
         environment_noise_percent: 8.0,
         ..Default::default()
     };
-    let branch_b = AudioResearchParams {
+    let branch_b = AudioEffectParams {
         environment_noise_percent: 12.0,
         ..Default::default()
     };
@@ -433,8 +466,8 @@ fn render_generates_environment_noise_inside_each_audio_variant_branch() {
     let graph = audio_graph(&values);
 
     assert_eq!(graph.match_indices("anoisesrc=color=white").count(), 2);
-    assert!(graph.contains("[dry0][noise0]amix=inputs=2"));
-    assert!(graph.contains("[dry1][noise1]amix=inputs=2"));
+    assert!(graph.contains("[processed0][noise0]amix=inputs=2"));
+    assert!(graph.contains("[processed1][noise1]amix=inputs=2"));
     assert!(!graph.contains("environment_noise_percent"));
 }
 
@@ -443,7 +476,7 @@ fn render_rejects_more_than_four_audio_variants_at_the_media_boundary() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    input.audio_variants = vec![AudioResearchParams::default(); 5];
+    input.audio_variants = vec![AudioEffectParams::default(); 5];
 
     let error = build_media_render_args(&input).expect_err("five variants must be rejected");
     assert!(
@@ -458,7 +491,7 @@ fn render_validates_each_audio_variant_range_and_finite_value() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    let invalid = AudioResearchParams {
+    let invalid = AudioEffectParams {
         pitch_shift_semitones: f64::NAN,
         ..Default::default()
     };
@@ -473,43 +506,88 @@ fn render_validates_each_audio_variant_range_and_finite_value() {
 }
 
 #[test]
-fn render_rejects_unmapped_parameter_inside_audio_variant() {
+fn render_maps_dry_wet_parameter_inside_audio_variant() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    let invalid = AudioResearchParams {
+    let variant = AudioEffectParams {
         dry_wet_percent: 1.0,
         ..Default::default()
     };
-    input.audio_variants = vec![invalid];
+    input.audio_variants = vec![variant];
 
-    let error = build_media_render_args(&input).expect_err("unmapped variant field must fail");
-    assert!(
-        matches!(&error, MediaEngineError::InvalidParameters { message }
-            if message.contains("audio_variants[0].dry_wet_percent")),
-        "{error:?}"
-    );
+    let args = build_media_render_args(&input).expect("mapped variant field should build");
+    let values = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(audio_graph(&values).contains("[dry0][wet0]amix=inputs=2"));
 }
 
 #[test]
-fn render_rejects_unmapped_audio_variant_when_processing_is_disabled() {
+fn render_accepts_valid_audio_variant_when_processing_is_disabled() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
     input.audio_processing_enabled = false;
-    let invalid = AudioResearchParams {
+    let variant = AudioEffectParams {
         dry_wet_percent: 1.0,
         ..Default::default()
     };
-    input.audio_variants = vec![invalid];
+    input.audio_variants = vec![variant];
 
-    let error = build_media_render_args(&input)
-        .expect_err("unmapped variant must fail even when audio processing is disabled");
-    assert!(
-        matches!(&error, MediaEngineError::InvalidParameters { message }
-            if message.contains("audio_variants[0].dry_wet_percent")),
-        "{error:?}"
-    );
+    let args = build_media_render_args(&input)
+        .expect("valid inactive audio configuration should remain serializable");
+    assert!(!args.iter().any(|value| value == "-filter_complex"));
+}
+
+#[test]
+fn render_maps_advanced_visual_wave_effects() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.advanced.wave_intensity = 0.5;
+
+    let args = build_media_render_args(&input).expect("advanced visual effect should be mapped");
+    let joined = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(joined.contains("geq=lum="), "{joined}");
+    assert!(joined.contains("sin(2*PI*20"), "{joined}");
+}
+
+#[test]
+fn render_combines_picture_in_picture_local_blur_and_audio_in_one_graph() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.video.color_space_conversion_enabled = true;
+    input.video.color_space_conversion_strength_percent = 25.0;
+    input.advanced.local_blur_enabled = true;
+    input.advanced.picture_in_picture_enabled = true;
+
+    let args = build_media_render_args(&input).expect("branching video effects should be mapped");
+    let values = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let graph = audio_graph(&values);
+    for fragment in [
+        "[0:v:0]",
+        "colorspace=iall=bt601-6-625:all=bt709",
+        "gblur=sigma=",
+        "overlay=x=",
+        "[vout]",
+        "[0:a:0]",
+        "[aout]",
+    ] {
+        assert!(graph.contains(fragment), "{fragment}: {graph}");
+    }
+    assert!(values.windows(2).any(|pair| pair == ["-map", "[vout]"]));
+    assert!(values.windows(2).any(|pair| pair == ["-map", "[aout]"]));
+    assert!(!values.iter().any(|value| value == "-vf"));
 }
 
 #[test]
@@ -517,11 +595,11 @@ fn render_mixes_audio_variants_to_single_bus_with_equal_weights() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    let branch_a = AudioResearchParams {
+    let branch_a = AudioEffectParams {
         low_eq_db: 0.4,
         ..Default::default()
     };
-    let branch_b = AudioResearchParams {
+    let branch_b = AudioEffectParams {
         high_eq_db: 0.5,
         ..Default::default()
     };
@@ -541,7 +619,7 @@ fn render_mixes_audio_variants_to_single_bus_with_equal_weights() {
     assert!(graph.contains("asplit=2"));
     assert!(graph.contains("amix=inputs=2:weights=0.500000 0.500000:duration=first"));
     assert!(graph.contains("highpass=f=50"));
-    assert!(graph.contains("loudnorm=I=-16:TP=-1.5:LRA=11"));
+    assert!(!graph.contains("loudnorm="));
     assert!(graph.contains("aresample="));
     assert!(values
         .windows(2)
@@ -550,11 +628,11 @@ fn render_mixes_audio_variants_to_single_bus_with_equal_weights() {
 }
 
 #[test]
-fn render_uses_final_loudness_chain_for_single_audio_variant() {
+fn render_uses_source_relative_output_chain_for_single_audio_variant() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    let only = AudioResearchParams {
+    let only = AudioEffectParams {
         mid_eq_db: 0.3,
         ..Default::default()
     };
@@ -571,7 +649,7 @@ fn render_uses_final_loudness_chain_for_single_audio_variant() {
     assert!(filter.contains("amix=inputs=1:weights=1.000000:duration=first"));
     assert!(filter.contains("highpass=f=50"));
     assert!(filter.contains("adenorm=level=-351:type=ac"));
-    assert!(filter.contains("loudnorm=I=-16:TP=-1.5:LRA=11"));
+    assert!(!filter.contains("loudnorm="));
     assert!(filter.contains("aresample="));
     assert!(
         filter.contains("aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[aout]")
@@ -590,11 +668,8 @@ fn render_uses_final_loudness_chain_for_single_audio_variant() {
         .find("amix=inputs=1")
         .expect("final amix should exist");
     let highpass = filter.find("highpass=f=50").expect("highpass should exist");
-    let loudnorm = filter
-        .find("loudnorm=I=-16:TP=-1.5:LRA=11")
-        .expect("loudnorm should exist");
     let aresample = filter.find("aresample=").expect("aresample should exist");
-    assert!(amix < highpass && highpass < loudnorm && loudnorm < aresample);
+    assert!(amix < highpass && highpass < aresample);
     assert!(filter.contains("equalizer=f=1000"));
     assert!(!values.iter().any(|value| value == "-af"));
 }

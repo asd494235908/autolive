@@ -25,7 +25,7 @@ test('desktop page exposes the approved three-column layout contract', async () 
   const hiddenVideo = app.slice(hiddenVideoStart, hiddenVideoEnd);
   assert.match(hiddenVideo, /aria-hidden="true"/);
   assert.match(hiddenVideo, /position: 'fixed'/);
-  assert.match(app, /视频处理 · 实时参数/);
+  assert.match(app, /音视频处理 · 实时参数/);
   assert.doesNotMatch(app.slice(app.indexOf('function DesktopApp()')), /实时话术幻化/);
   assert.match(app, /aria-label="声音处理"/);
   assert.match(app, /aria-label="视频处理"/);
@@ -34,18 +34,85 @@ test('desktop page exposes the approved three-column layout contract', async () 
   assert.match(app, /video_processing_status/);
   assert.match(app, /audio_processing_status/);
   assert.match(app, /applyMediaProcessing\('video'\)/);
-  assert.match(app, /applyMediaProcessing\('audio'\)/);
+  assert.match(app, /audioSettingsApplyScope/);
   assert.match(app, /applyMediaProcessing\('both'\)/);
   assert.match(app, /audioCapabilityRows/);
-  assert.match(app, /row\.key !== 'spectral_perturbation_percent'/);
-  assert.match(app, /scope === 'video'[\s\S]*videoProcessingEnabled && !audioProcessingEnabled/);
-  assert.match(app, /scope === 'audio'[\s\S]*audioProcessingEnabled && !videoProcessingEnabled/);
+  assert.match(app, /<MediaParameterPanels/);
+  assert.doesNotMatch(app, /row\.key !== 'spectral_perturbation_percent'/);
+  assert.match(app, /scope === 'video'[\s\S]*videoProcessingEnabledRef\.current && !audioProcessingEnabledRef\.current/);
+  assert.match(app, /scope === 'audio'[\s\S]*audioProcessingEnabledRef\.current && !videoProcessingEnabledRef\.current/);
   assert.match(app, /scopeEnabled = scope === 'video'/);
   assert.match(app, /<ConfigProvider\b/);
   assert.match(app, /<AntApp>/);
   assert.match(css, /grid-template-columns:\s*320px minmax\(0,\s*1fr\) 272px/);
+  assert.match(css, /@media\s*\(max-width:\s*1199px\)/);
   assert.match(css, /@media\s*\(max-width:\s*900px\)/);
   assert.match(css, /grid-template-columns:\s*minmax\(0,\s*1fr\)/);
+});
+
+test('高级声音应用在视频开启时复用音视频处理且不被视频开关禁用', async () => {
+  const app = await readFile(appPath, 'utf8');
+  const drawerStart = app.indexOf('title="高级声音设置"');
+  const drawerEnd = app.indexOf('</FeatureDrawer>', drawerStart);
+  const drawer = app.slice(drawerStart, drawerEnd);
+
+  assert.ok(drawerStart >= 0 && drawerEnd > drawerStart);
+  assert.match(app, /const audioSettingsApplyScope: MediaProcessingScope = videoProcessingEnabled \? 'both' : 'audio';/);
+  assert.match(drawer, /applyMediaProcessing\(audioSettingsApplyScope, undefined, true\)/);
+  assert.match(drawer, /loading=\{mediaProcessingBusy === audioSettingsApplyScope\}/);
+  assert.match(drawer, /audioSettingsApplyScope === 'both' \? '音视频同时应用' : '应用声音参数'/);
+
+  const applyCallIndex = drawer.indexOf('applyMediaProcessing(audioSettingsApplyScope, undefined, true)');
+  const buttonStart = drawer.lastIndexOf('<Button', applyCallIndex);
+  const buttonEnd = drawer.indexOf('</Button>', applyCallIndex);
+  const button = drawer.slice(buttonStart, buttonEnd);
+  assert.doesNotMatch(button, /videoProcessingEnabled/);
+  assert.match(button, /runtimeResourceBusy/);
+});
+
+test('高级声音人工应用提示保存成功且自动周期保持静默', async () => {
+  const app = await readFile(appPath, 'utf8');
+  const applyStart = app.indexOf('async function applyMediaProcessing');
+  const applyEnd = app.indexOf('async function flushPendingMediaApply', applyStart);
+  const apply = app.slice(applyStart, applyEnd);
+  const schedulerStart = app.indexOf('function schedulePeriodMediaRender');
+  const schedulerEnd = app.indexOf('schedulePeriodRenderRef.current = schedulePeriodMediaRender', schedulerStart);
+  const scheduler = app.slice(schedulerStart, schedulerEnd);
+
+  assert.ok(applyStart >= 0 && applyEnd > applyStart);
+  assert.match(apply, /showSaveSuccess = false/);
+  assert.match(apply, /if \(showSaveSuccess\) void messageApi\.success\('保存成功'\)/);
+  assert.match(scheduler, /applyMediaProcessing\(scope, params\)/);
+  assert.doesNotMatch(scheduler, /showSaveSuccess|, true/);
+});
+
+test('主参数面板同时展示视频与声音周期的真实进度', async () => {
+  const app = await readFile(appPath, 'utf8');
+  const panelTitleIndex = app.indexOf('title="音视频处理 · 实时参数"');
+  const panelStart = app.lastIndexOf('<DesktopPanel', panelTitleIndex);
+  const panelEnd = app.indexOf('</DesktopPanel>', panelStart);
+  const panel = app.slice(panelStart, panelEnd);
+
+  assert.ok(panelTitleIndex >= 0 && panelStart >= 0 && panelEnd > panelStart);
+  assert.match(
+    app,
+    /const nextVideoPlan\s*=\s*videoFuturePlansRef\.current\?\.\[0\][\s\S]*?const runtimeProgressPercent\s*=\s*!nextVideoPlan\s*\|\|\s*nextVideoPlan\.periodMediaMs\s*<=\s*0[\s\S]*?Math\.max\(0,\s*Math\.min\(100,[\s\S]*?nextVideoPlan\.periodMediaMs\s*-\s*runtimeRemainingMs[\s\S]*?nextVideoPlan\.periodMediaMs/,
+  );
+  assert.match(
+    app,
+    /const nextAudioPlan\s*=\s*audioFuturePlansRef\.current\?\.\[0\][\s\S]*?const audioProgressPercent\s*=\s*!nextAudioPlan\s*\|\|\s*nextAudioPlan\.periodMediaMs\s*<=\s*0[\s\S]*?Math\.max\(0,\s*Math\.min\(100,[\s\S]*?nextAudioPlan\.periodMediaMs\s*-\s*audioRemainingMs[\s\S]*?nextAudioPlan\.periodMediaMs/,
+  );
+  assert.match(panel, /视频周期[\s\S]*?videoPeriodRange[\s\S]*?runtimeCycle/);
+  assert.match(panel, /percent=\{runtimeProgressPercent\}/);
+  assert.match(panel, /status=\{runtimeActive\s*&&\s*nextVideoPlan\s*\?\s*'active'\s*:\s*'normal'\}/);
+  assert.match(panel, /声音周期[\s\S]*?audioPeriodRange[\s\S]*?audioVariationCycle/);
+  assert.match(
+    panel,
+    /<Tag color=\{getProcessingStatusColor\(audioProcessingStatus\)\}>\{getProcessingStatusLabel\(audioProcessingStatus\)\}<\/Tag>/,
+  );
+  assert.match(panel, /percent=\{audioProgressPercent\}/);
+  assert.match(panel, /status=\{audioPeriodActive\s*&&\s*nextAudioPlan\s*\?\s*'active'\s*:\s*'normal'\}/);
+  assert.match(app, /desktop-status-line"><span>声音周期<\/span>/);
 });
 
 test('PortAudio Host API selector shows ASIO and only enables it when an ASIO device is enumerated', async () => {
@@ -55,7 +122,7 @@ test('PortAudio Host API selector shows ASIO and only enables it when an ASIO de
   );
   const deviceLoad = app.slice(
     app.indexOf("invoke<AudioOutputDevice[]>('list_audio_output_devices')"),
-    app.indexOf("invoke<ResearchParams>('get_default_local_research_params')"),
+    app.indexOf("invoke<MediaEffectParams>('get_default_media_effect_params')"),
   );
   const deviceOptions = app.slice(
     app.indexOf('options={audioOutputDevices'),
@@ -144,10 +211,55 @@ test('处理候选槽切换使用 30ms 双向 Gain ramp，并在失败时保留�
   assert.match(candidateEffect, /if \(!processedAudioPlayingRef\.current\) restoreDryAudioOutput\(\)/);
 });
 
+test('最终效果窗口切源时对称释放媒体监听器和候选切换定时器', async () => {
+  const app = await readFile(appPath, 'utf8');
+  const sourceRestoreAt = app.indexOf('const resumeAt = resolvePlaybackResumePosition(');
+  const sourceEffect = app.slice(
+    app.lastIndexOf('useEffect(() => {', sourceRestoreAt),
+    app.indexOf('function restoreDryAudioOutput', sourceRestoreAt),
+  );
+  const candidateEffect = app.slice(
+    app.indexOf('useEffect(() => {', app.indexOf('function restoreDryAudioOutput')),
+    app.indexOf('// 真轨失效回干声'),
+  );
+  const candidateCleanup = candidateEffect.slice(candidateEffect.lastIndexOf('return () => {'));
+
+  assert.match(sourceEffect, /video\.removeEventListener\('loadedmetadata', restore\)/);
+  for (const eventName of ['loadedmetadata', 'error', 'seeked', 'playing', 'timeupdate']) {
+    assert.match(
+      candidateCleanup,
+      new RegExp(`standby\\.removeEventListener\\('${eventName}'`),
+      `${eventName} listener must be removed by the effect cleanup`,
+    );
+  }
+  assert.match(candidateCleanup, /window\.clearTimeout\(audibleFallbackTimer\)/);
+  assert.match(candidateCleanup, /window\.clearTimeout\(crossfadeTimer\)/);
+  assert.doesNotMatch(candidateCleanup, /standby\.pause\(\)|active\.pause\(\)/);
+});
+
 test('声音 N+1/N+2 只预选参数，提交成功后才升级当前快照，且 PortAudio 不创建 ScriptProcessor', async () => {
   const app = await readFile(appPath, 'utf8');
-  const sampleCalls = [...app.matchAll(/sampleAudioCycle\(/g)];
-  assert.equal(sampleCalls.length, 2, 'App 只允许当前轮提交和未来计划构建直接抽样');
+  const finalEffectWindow = app.slice(
+    app.indexOf('function FinalEffectWindow()'),
+    app.indexOf('function DesktopApp('),
+  );
+  const interludeAudioResolver = finalEffectWindow.slice(
+    finalEffectWindow.indexOf('function resolveInterludeAudioCycle('),
+    finalEffectWindow.indexOf('async function startInterludePlayback('),
+  );
+  const desktopApp = app.slice(app.indexOf('function DesktopApp('));
+  assert.equal(
+    [...finalEffectWindow.matchAll(/sampleAudioCycle\(/g)].length,
+    2,
+    '最终效果窗口只允许固定和随机两个互斥分支抽样',
+  );
+  assert.equal([...interludeAudioResolver.matchAll(/sampleAudioCycle\(/g)].length, 2);
+  assert.match(interludeAudioResolver, /if \(selectionMode === 'fixed'\) \{[\s\S]*return sample;[\s\S]*const periodic/);
+  assert.equal(
+    [...desktopApp.matchAll(/sampleAudioCycle\(/g)].length,
+    2,
+    '普通声音只允许当前轮提交和未来计划构建直接抽样',
+  );
   assert.match(app, /function sampleAndCommitAudioCycle\(/);
   const commitStart = app.indexOf('function commitAudioCycleSample');
   const commitEnd = app.indexOf('function sampleAndCommitAudioCycle', commitStart);
@@ -158,18 +270,20 @@ test('声音 N+1/N+2 只预选参数，提交成功后才升级当前快照，�
   assert.ok(commitStart >= 0 && commitEnd > commitStart);
   assert.ok(planStart >= 0 && planEnd > planStart);
   assert.match(commit, /appendAudioCycleSnapshot\([\s\S]*at:\s*new Date\(\)\.toISOString\(\)/);
+  assert.match(commit, /setAudioActivePresetIds\(sample\.presetIds\)/);
   assert.doesNotMatch(plan, /appendAudioCycleSnapshot|audioCycleSampleRef\.current\s*=/);
+  assert.doesNotMatch(plan, /setAudioActivePresetIds/);
   assert.match(app, /target_absolute_position_ms:\s*plan\.targetAbsolutePositionMs/);
   assert.doesNotMatch(app, /target_at_ms|remainingWallMs/);
   assert.match(app, /invoke<PrepareAudioCycleCandidateResult>\('prepare_audio_cycle_candidate'/);
   assert.match(app, /invoke<CommitAudioCycleCandidateResult>\('commit_audio_cycle_candidate'/);
   assert.match(app, /'cancel_audio_cycle_candidate'/);
   assert.match(app, /Math\.round\(video\.currentTime \* 1_000\)/);
-  const initialStart = app.indexOf("void invoke<ResearchParams>('get_default_local_research_params')");
+  const initialStart = app.indexOf("void invoke<MediaEffectParams>('get_default_media_effect_params')");
   const initialEnd = app.indexOf('return () => {', initialStart);
   const initial = app.slice(initialStart, initialEnd);
   const reset = app.slice(
-    app.indexOf('async function resetResearchParams'),
+    app.indexOf('async function resetMediaEffectParams'),
     app.indexOf('function rerollSubtleAudioParams'),
   );
   const switchUpdate = app.slice(
@@ -198,6 +312,17 @@ test('声音 N+1/N+2 只预选参数，提交成功后才升级当前快照，�
     /audioOutputBackend\?\.preferred_portaudio[\s\S]*audioOutputBackend\.hardware_state === 'active'[\s\S]*clearRetryTimer\(\);[\s\S]*return;/,
     '活动 PortAudio 的源同步只由最终效果窗负责，主窗不能并发抢占候选',
   );
+});
+
+test('媒体效果参数使用正式模型和 IPC', async () => {
+  const app = await readFile(appPath, 'utf8');
+  const parameterTypes = await readFile(new URL('./media-parameter-panels/media-parameter-types.ts', import.meta.url), 'utf8');
+
+  assert.match(app, /import \{ AudioParameterControls, MediaParameterPanels, type MediaEffectParams \}/);
+  assert.match(parameterTypes, /export interface MediaEffectParams/);
+  assert.match(parameterTypes, /advanced: AdvancedEffectParams/);
+  assert.match(app, /invoke<MediaEffectParams>\('get_default_media_effect_params'\)/);
+  assert.match(app, /invoke<MediaParameterValidationResult>\('validate_media_effect_params'/);
 });
 
 test('PortAudio 普通播放只有 audio_cycle_output 一个 PCM 生产者', async () => {
@@ -255,6 +380,19 @@ test('本周期声音预设可点击打开抽屉并展示完整参数值', async
   assert.match(app, /当前声音预设/);
   assert.match(app, /AUDIO_PRESET_FIELD_DEFINITIONS\.map/);
   assert.match(app, /preset\.values\[field\.key\]/);
+});
+
+test('主页右栏展示实际多轨状态和当前声音预设名称', async () => {
+  const app = await readFile(appPath, 'utf8');
+  const panelStart = app.indexOf('<DesktopPanel title="普通声音处理"');
+  const panelEnd = app.indexOf('</DesktopPanel>', panelStart);
+  const panel = app.slice(panelStart, panelEnd);
+
+  assert.ok(panelStart >= 0 && panelEnd > panelStart);
+  assert.match(panel, /<span>多轨与预设<\/span>[\s\S]*\{actualAudioMixLabel\}/);
+  assert.match(panel, /<span>当前预设<\/span>[\s\S]*activeAudioPresets\.map/);
+  assert.match(panel, /\{preset\.label\}/);
+  assert.match(panel, /等待首轮/);
 });
 
 test('生成缓存删除需要确认且 PortAudio 源同步保持最新请求串行', async () => {

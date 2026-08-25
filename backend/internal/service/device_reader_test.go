@@ -97,6 +97,25 @@ func TestGetClientProfileForProductRejectsMemoryDeviceProductMismatchWithoutMuta
 	}
 }
 
+func TestGetClientProfileForProductAcceptsLegacyAutoliveDeviceWithoutProduct(t *testing.T) {
+	repository := store.NewMemoryStore(time.Now)
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Users["usr_1"] = controlplane.UserSummary{ID: "usr_1", Role: controlplane.RoleUser, Status: controlplane.UserStatusActive}
+		state.Devices["dev_1"] = controlplane.DeviceSummary{ID: "dev_1", UserID: "usr_1", Status: controlplane.DeviceStatusActive}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy profile state: %v", err)
+	}
+
+	profile, err := NewControlPlaneWithRepository(repository).GetClientProfileForProduct(context.Background(), "usr_1", "dev_1", controlplane.ProductAutoLive)
+	if err != nil {
+		t.Fatalf("GetClientProfileForProduct() error = %v", err)
+	}
+	if profile.Product != controlplane.ProductAutoLive || profile.Device.ID != "dev_1" || profile.Device.Product != controlplane.ProductAutoLive {
+		t.Fatalf("profile = %+v", profile)
+	}
+}
+
 func TestNormalizedUserMutationFailsClosedWithoutRepository(t *testing.T) {
 	repository := &normalizedReadOnlyRepository{MemoryStore: store.NewMemoryStore(time.Now)}
 	svc := NewControlPlaneWithRepository(repository)

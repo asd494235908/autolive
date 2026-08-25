@@ -32,6 +32,7 @@ var normalizedCutoverTables = []string{
 	"user_authorization_policies",
 	"devices",
 	"activation_codes",
+	"activation_device_bindings",
 	"auth_sessions",
 	"model_accounts",
 	"model_account_secrets",

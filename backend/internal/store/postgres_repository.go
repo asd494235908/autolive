@@ -1539,7 +1539,7 @@ func (s *PostgresRepository) loadNormalized(ctx context.Context, tx *sql.Tx) (*S
 	}
 
 	activationCodes, err := tx.QueryContext(ctx, `
-		SELECT id, code_hash, code_prefix, status, expires_at, used_at,
+		SELECT id, product, bound_user_id, code_hash, code_prefix, status, expires_at, used_at,
 		       used_by_user_id, used_by_device_id, max_devices, bound_devices
 		FROM activation_codes
 		ORDER BY id
@@ -1549,18 +1549,23 @@ func (s *PostgresRepository) loadNormalized(ctx context.Context, tx *sql.Tx) (*S
 	}
 	for activationCodes.Next() {
 		var (
-			id, codeHash, codePrefix, status string
-			expiresAt, usedAt                sql.NullTime
-			usedByUserID, usedByDeviceID     sql.NullString
-			maxDevices, boundDevices         int
+			id, codeHash, codePrefix, status                   string
+			expiresAt, usedAt                                  sql.NullTime
+			product, boundUserID, usedByUserID, usedByDeviceID sql.NullString
+			maxDevices, boundDevices                           int
 		)
-		if err := activationCodes.Scan(&id, &codeHash, &codePrefix, &status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &maxDevices, &boundDevices); err != nil {
+		if err := activationCodes.Scan(&id, &product, &boundUserID, &codeHash, &codePrefix, &status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &maxDevices, &boundDevices); err != nil {
+			_ = activationCodes.Close()
+			return nil, err
+		}
+		storedProduct, err := normalizedStoredProduct(product)
+		if err != nil {
 			_ = activationCodes.Close()
 			return nil, err
 		}
 		record := ActivationCodeRecord{
 			ActivationCode: controlplane.ActivationCode{
-				ID: id, Status: status, CodePrefix: codePrefix, MaxDevices: maxDevices, BoundDevices: boundDevices,
+				ID: id, Product: storedProduct, UserID: boundUserID.String, Status: status, CodePrefix: codePrefix, MaxDevices: maxDevices, BoundDevices: boundDevices,
 				UsedByUserID: usedByUserID.String, UsedByDeviceID: usedByDeviceID.String,
 			},
 			CodePrefix: codePrefix, UsedByUserID: usedByUserID.String,
@@ -1581,6 +1586,30 @@ func (s *PostgresRepository) loadNormalized(ctx context.Context, tx *sql.Tx) (*S
 		return nil, err
 	}
 	if err := activationCodes.Close(); err != nil {
+		return nil, err
+	}
+
+	activationBindings, err := tx.QueryContext(ctx, `
+		SELECT activation_code_id, device_id
+		FROM activation_device_bindings
+		ORDER BY device_id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	for activationBindings.Next() {
+		var activationCodeID, deviceID string
+		if err := activationBindings.Scan(&activationCodeID, &deviceID); err != nil {
+			_ = activationBindings.Close()
+			return nil, err
+		}
+		state.ActivationDeviceBindings[deviceID] = activationCodeID
+	}
+	if err := activationBindings.Err(); err != nil {
+		_ = activationBindings.Close()
+		return nil, err
+	}
+	if err := activationBindings.Close(); err != nil {
 		return nil, err
 	}
 
@@ -1827,6 +1856,7 @@ func verifyNormalizedRowCounts(ctx context.Context, tx *sql.Tx, snapshot *State)
 		{"user_authorization_policies", `SELECT COUNT(*) FROM user_authorization_policies`, len(snapshot.UserAuthorizationPolicies)},
 		{"devices", `SELECT COUNT(*) FROM devices`, len(snapshot.Devices)},
 		{"activation_codes", `SELECT COUNT(*) FROM activation_codes`, len(snapshot.ActivationCodes)},
+		{"activation_device_bindings", `SELECT COUNT(*) FROM activation_device_bindings`, len(snapshot.ActivationDeviceBindings)},
 		{"model_accounts", `SELECT COUNT(*) FROM model_accounts`, len(snapshot.ModelPoolAccounts)},
 		{"model_leases", `SELECT COUNT(*) FROM model_leases`, len(snapshot.ModelLeases)},
 		{"model_usage_records", `SELECT COUNT(*) FROM model_usage_records`, len(snapshot.ModelUsageRecords)},
@@ -1883,6 +1913,39 @@ func splitSequenceID(value string) (string, int, bool) {
 }
 
 func (s *PostgresRepository) syncReferenceRows(ctx context.Context, tx *sql.Tx, state *State) error {
+	type priorActivationBinding struct {
+		activationCodeID string
+		product          controlplane.ProductCode
+		userID           string
+		boundAt          time.Time
+	}
+	priorBindings := make(map[string]priorActivationBinding)
+	// Returning the deleted rows allows parent records to be updated safely while
+	// preserving bound_at for bindings whose ownership did not change.
+	rows, err := tx.QueryContext(ctx, `
+		DELETE FROM activation_device_bindings
+		RETURNING activation_code_id, device_id, product, user_id, bound_at
+	`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var activationCodeID, deviceID, userID string
+		var product controlplane.ProductCode
+		var boundAt time.Time
+		if err := rows.Scan(&activationCodeID, &deviceID, &product, &userID, &boundAt); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		priorBindings[deviceID] = priorActivationBinding{activationCodeID: activationCodeID, product: product, userID: userID, boundAt: boundAt.UTC()}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 	for id, user := range state.Users {
 		passwordHash := string(state.UserCredentialHashes[id])
 		if passwordHash == "" {
@@ -1923,10 +1986,10 @@ func (s *PostgresRepository) syncReferenceRows(ctx context.Context, tx *sql.Tx, 
 			userID = device.UserID
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO devices (id, user_id, device_key, device_name, platform, client_version, status, disk_free_bytes, memory_total_bytes, memory_available_bytes, cpu_logical_cores, runtime_os_name, runtime_os_version, kernel_version, current_media_name, playback_state, last_heartbeat_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NULLIF($17, '')::timestamptz)
-			ON CONFLICT (id) DO UPDATE SET user_id = EXCLUDED.user_id, device_name = EXCLUDED.device_name, platform = EXCLUDED.platform, client_version = EXCLUDED.client_version, status = EXCLUDED.status, disk_free_bytes = EXCLUDED.disk_free_bytes, memory_total_bytes = EXCLUDED.memory_total_bytes, memory_available_bytes = EXCLUDED.memory_available_bytes, cpu_logical_cores = EXCLUDED.cpu_logical_cores, runtime_os_name = EXCLUDED.runtime_os_name, runtime_os_version = EXCLUDED.runtime_os_version, kernel_version = EXCLUDED.kernel_version, current_media_name = EXCLUDED.current_media_name, playback_state = EXCLUDED.playback_state, last_heartbeat_at = EXCLUDED.last_heartbeat_at
-		`, id, userID, "state-device/"+id, device.DeviceName, device.Platform, device.AppVersion, device.Status, device.DiskFreeBytes, device.MemoryTotalBytes, device.MemoryAvailableBytes, device.CPULogicalCores, device.RuntimeOSName, device.RuntimeOSVersion, device.KernelVersion, device.CurrentMediaName, device.PlaybackState, device.LastSeenAt); err != nil {
+			INSERT INTO devices (id, user_id, product, device_key, device_name, platform, client_version, status, disk_free_bytes, memory_total_bytes, memory_available_bytes, cpu_logical_cores, runtime_os_name, runtime_os_version, kernel_version, current_media_name, playback_state, last_heartbeat_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NULLIF($18, '')::timestamptz)
+			ON CONFLICT (id) DO UPDATE SET user_id = EXCLUDED.user_id, product = EXCLUDED.product, device_name = EXCLUDED.device_name, platform = EXCLUDED.platform, client_version = EXCLUDED.client_version, status = EXCLUDED.status, disk_free_bytes = EXCLUDED.disk_free_bytes, memory_total_bytes = EXCLUDED.memory_total_bytes, memory_available_bytes = EXCLUDED.memory_available_bytes, cpu_logical_cores = EXCLUDED.cpu_logical_cores, runtime_os_name = EXCLUDED.runtime_os_name, runtime_os_version = EXCLUDED.runtime_os_version, kernel_version = EXCLUDED.kernel_version, current_media_name = EXCLUDED.current_media_name, playback_state = EXCLUDED.playback_state, last_heartbeat_at = EXCLUDED.last_heartbeat_at
+		`, id, userID, compatibilityStoredProduct(device.Product), "state-device/"+id, device.DeviceName, device.Platform, device.AppVersion, device.Status, device.DiskFreeBytes, device.MemoryTotalBytes, device.MemoryAvailableBytes, device.CPULogicalCores, device.RuntimeOSName, device.RuntimeOSVersion, device.KernelVersion, device.CurrentMediaName, device.PlaybackState, device.LastSeenAt); err != nil {
 			return err
 		}
 	}
@@ -1959,11 +2022,40 @@ func (s *PostgresRepository) syncReferenceRows(ctx context.Context, tx *sql.Tx, 
 				usedByUserID = device.UserID
 			}
 		}
+		boundUserID := strings.TrimSpace(record.ActivationCode.UserID)
+		status := record.ActivationCode.Status
+		if boundUserID == "" && (status == controlplane.ActivationCodeStatusActive || status == controlplane.ActivationCodeStatusUsed) {
+			status = controlplane.ActivationCodeStatusRevoked
+			record.ActivationCode.Status = status
+			state.ActivationCodes[id] = record
+		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO activation_codes (id, code_hash, code_prefix, status, created_at, expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices)
-			VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, $5, $6, NULLIF($7, ''), NULLIF($8, ''), $9, $10)
-			ON CONFLICT (id) DO UPDATE SET code_hash = EXCLUDED.code_hash, code_prefix = EXCLUDED.code_prefix, status = EXCLUDED.status, expires_at = EXCLUDED.expires_at, used_by_user_id = EXCLUDED.used_by_user_id, used_by_device_id = EXCLUDED.used_by_device_id, max_devices = EXCLUDED.max_devices, bound_devices = EXCLUDED.bound_devices
-		`, id, digest, prefix, record.ActivationCode.Status, expiresAt, usedAt, usedByUserID, record.UsedByDeviceID, max(1, record.ActivationCode.MaxDevices), max(0, record.ActivationCode.BoundDevices)); err != nil {
+			INSERT INTO activation_codes (id, product, bound_user_id, code_hash, code_prefix, status, created_at, expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices)
+			VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, CURRENT_TIMESTAMP, $7, $8, NULLIF($9, ''), NULLIF($10, ''), $11, $12)
+			ON CONFLICT (id) DO UPDATE SET product = EXCLUDED.product, bound_user_id = EXCLUDED.bound_user_id, code_hash = EXCLUDED.code_hash, code_prefix = EXCLUDED.code_prefix, status = EXCLUDED.status, expires_at = EXCLUDED.expires_at, used_by_user_id = EXCLUDED.used_by_user_id, used_by_device_id = EXCLUDED.used_by_device_id, max_devices = EXCLUDED.max_devices, bound_devices = EXCLUDED.bound_devices
+		`, id, compatibilityStoredProduct(record.ActivationCode.Product), boundUserID, digest, prefix, status, expiresAt, usedAt, usedByUserID, record.UsedByDeviceID, max(1, record.ActivationCode.MaxDevices), max(0, record.ActivationCode.BoundDevices)); err != nil {
+			return err
+		}
+	}
+	for deviceID, activationCodeID := range state.ActivationDeviceBindings {
+		device, deviceExists := state.Devices[deviceID]
+		record, codeExists := state.ActivationCodes[activationCodeID]
+		if !deviceExists || !codeExists || device.UserID == "" || record.ActivationCode.UserID == "" {
+			delete(state.ActivationDeviceBindings, deviceID)
+			continue
+		}
+		product := compatibilityStoredProduct(device.Product)
+		if product != compatibilityStoredProduct(record.ActivationCode.Product) || device.UserID != record.ActivationCode.UserID {
+			return fmt.Errorf("activation binding %s has mismatched account or product", deviceID)
+		}
+		boundAt := s.Now()
+		if prior, ok := priorBindings[deviceID]; ok && prior.activationCodeID == activationCodeID && prior.product == product && prior.userID == device.UserID {
+			boundAt = prior.boundAt
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO activation_device_bindings (activation_code_id, device_id, product, user_id, bound_at)
+			VALUES ($1, $2, $3, $4, $5)
+		`, activationCodeID, deviceID, product, device.UserID, boundAt); err != nil {
 			return err
 		}
 	}

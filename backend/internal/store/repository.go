@@ -167,7 +167,6 @@ type DeviceActivationRecord struct {
 	AccessTokenHash    string
 	UserID             string
 	Product            controlplane.ProductCode
-	ActivationCodeHash string
 	Device             controlplane.DeviceRegistration
 	// Audit is optional for compatibility callers. Normalized HTTP activation
 	// supplies the prevalidated success event so it is committed with the
@@ -479,6 +478,7 @@ type UserUpdateRecord struct {
 
 type ActivationCodeCreateRecord struct {
 	Product    controlplane.ProductCode
+	UserID     string
 	PlainCode  string
 	CodeHash   string
 	CodePrefix string

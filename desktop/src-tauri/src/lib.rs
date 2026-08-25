@@ -1,33 +1,41 @@
+pub mod ambient_sound;
 pub mod audio_cycle_output;
+pub mod audio_feature_analysis;
 pub mod audio_mixer;
 pub mod audio_output_diagnostic;
 pub mod audio_output_health;
+pub mod audio_pcm_effects;
 pub mod audio_processing;
 pub mod background_process;
+pub mod bounded_io;
 pub mod cancellation;
 pub mod direct_model;
 pub mod errors;
 pub mod hashing;
 pub mod interlude_player;
+pub mod media_audio_effects;
+pub mod media_effect_params;
 pub mod media_engine;
 pub mod media_library;
-pub mod research_params;
-pub mod research_worker;
+pub mod media_video_effects;
 pub mod runtime_resource_task;
 pub mod runtime_resources;
 pub mod speech_to_speech;
 pub mod speech_to_speech_worker;
+pub mod webview_interlude_cache;
 pub mod window_sizing;
 
 use crate::audio_processing::AudioProcessingProfile;
 use crate::errors::PlaybackError;
 use crate::interlude_player::{resolve_effective_audio_source, InterludeSnapshot};
+use crate::media_effect_params::{AudioEffectParams, ParameterValidationError};
 use crate::media_library::SourceMediaDto;
-use crate::research_params::{AudioResearchParams, ParameterValidationError};
 use crate::speech_to_speech::{
     AudioTrackInput, AudioVariantCandidate, CandidateValidationError, SpeechToSpeechContext,
 };
 use serde::{Deserialize, Serialize};
+
+pub const MAX_SOURCE_MEDIA_POOL_ITEMS: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlaybackState {
@@ -39,14 +47,14 @@ pub enum PlaybackState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedAudioStreamConfiguration {
-    params: AudioResearchParams,
-    variants: Vec<AudioResearchParams>,
+    params: AudioEffectParams,
+    variants: Vec<AudioEffectParams>,
 }
 
 impl ValidatedAudioStreamConfiguration {
     pub fn new(
-        params: AudioResearchParams,
-        variants: Vec<AudioResearchParams>,
+        params: AudioEffectParams,
+        variants: Vec<AudioEffectParams>,
     ) -> Result<Self, Vec<ParameterValidationError>> {
         let mut errors = Vec::new();
         if let Err(mut params_errors) = params.validate() {
@@ -80,7 +88,7 @@ impl ValidatedAudioStreamConfiguration {
         Ok(Self { params, variants })
     }
 
-    fn into_parts(self) -> (AudioResearchParams, Vec<AudioResearchParams>) {
+    fn into_parts(self) -> (AudioEffectParams, Vec<AudioEffectParams>) {
         (self.params, self.variants)
     }
 }
@@ -91,6 +99,9 @@ pub struct PlaybackSnapshot {
     pub playback_generation: u64,
     pub playback_state: PlaybackState,
     pub source_media: Option<SourceMediaDto>,
+    pub source_media_pool: Vec<SourceMediaDto>,
+    pub source_media_index: usize,
+    pub playback_pool_cycle: u64,
     pub loop_index: u64,
     pub current_position_ms: u64,
     pub current_video_source: Option<String>,
@@ -115,6 +126,8 @@ pub struct PlaybackSnapshot {
     pub pending_audio_start_at_ms: Option<u64>,
     pub pending_audio_duration_ms: Option<u64>,
     pub audio_processing_parameters_version: String,
+    pub audio_stream_params: AudioEffectParams,
+    pub audio_stream_variants: Vec<AudioEffectParams>,
     pub audio_stream_variant_count: usize,
     pub audio_stream_revision: u64,
     pub audio_processing_status: String,
@@ -130,6 +143,9 @@ pub struct PlaybackCore {
     playback_generation: u64,
     playback_state: PlaybackState,
     source_media: Option<SourceMediaDto>,
+    source_media_pool: Vec<SourceMediaDto>,
+    source_media_index: usize,
+    playback_pool_cycle: u64,
     loop_index: u64,
     current_video_source: Option<String>,
     current_video_reference: Option<String>,
@@ -149,7 +165,7 @@ pub struct PlaybackCore {
     fallback_reason: Option<String>,
     pending_audio_candidate: Option<AudioVariantCandidate>,
     audio_processing_profile: AudioProcessingProfile,
-    audio_stream_variants: Vec<AudioResearchParams>,
+    audio_stream_variants: Vec<AudioEffectParams>,
     audio_stream_revision: u64,
     audio_processing_status: String,
     interlude_snapshot: InterludeSnapshot,
@@ -163,6 +179,9 @@ impl Default for PlaybackCore {
             playback_generation: 0,
             playback_state: PlaybackState::Ready,
             source_media: None,
+            source_media_pool: Vec::new(),
+            source_media_index: 0,
+            playback_pool_cycle: 0,
             loop_index: 0,
             current_video_source: None,
             current_video_reference: None,
@@ -210,10 +229,36 @@ impl PlaybackCore {
         }
     }
 
-    pub fn set_source(&mut self, mut source_media: SourceMediaDto) {
-        source_media.mp4_sha256 = None;
-        source_media.mp4_hash_status = "disabled".to_owned();
-        self.source_media = Some(source_media);
+    pub fn set_source(&mut self, source_media: SourceMediaDto) {
+        self.replace_source_pool(vec![source_media]);
+    }
+
+    pub fn set_source_pool(
+        &mut self,
+        source_media_pool: Vec<SourceMediaDto>,
+    ) -> Result<(), PlaybackError> {
+        if source_media_pool.is_empty() {
+            return Err(PlaybackError::SourceMediaPoolEmpty);
+        }
+        if source_media_pool.len() > MAX_SOURCE_MEDIA_POOL_ITEMS {
+            return Err(PlaybackError::SourceMediaPoolTooLarge {
+                max: MAX_SOURCE_MEDIA_POOL_ITEMS,
+                actual: source_media_pool.len(),
+            });
+        }
+        self.replace_source_pool(source_media_pool);
+        Ok(())
+    }
+
+    fn replace_source_pool(&mut self, mut source_media_pool: Vec<SourceMediaDto>) {
+        for source_media in &mut source_media_pool {
+            source_media.mp4_sha256 = None;
+            source_media.mp4_hash_status = "disabled".to_owned();
+        }
+        self.source_media = source_media_pool.first().cloned();
+        self.source_media_pool = source_media_pool;
+        self.source_media_index = 0;
+        self.playback_pool_cycle = 0;
         self.loop_index = 0;
         self.playback_generation = self.playback_generation.wrapping_add(1);
         self.playback_state = PlaybackState::Ready;
@@ -390,7 +435,7 @@ impl PlaybackCore {
     pub fn set_audio_processing_profile(
         &mut self,
         profile: AudioProcessingProfile,
-    ) -> Result<(), Vec<crate::research_params::ParameterValidationError>> {
+    ) -> Result<(), Vec<crate::media_effect_params::ParameterValidationError>> {
         profile.validate()?;
         let changed = self.audio_processing_profile != profile;
         self.audio_processing_profile = profile;
@@ -406,9 +451,9 @@ impl PlaybackCore {
 
     pub fn set_audio_stream_configuration(
         &mut self,
-        params: AudioResearchParams,
-        variants: Vec<AudioResearchParams>,
-    ) -> Result<(), Vec<crate::research_params::ParameterValidationError>> {
+        params: AudioEffectParams,
+        variants: Vec<AudioEffectParams>,
+    ) -> Result<(), Vec<crate::media_effect_params::ParameterValidationError>> {
         let configuration = ValidatedAudioStreamConfiguration::new(params, variants)?;
         self.commit_validated_audio_stream_configuration(configuration);
         Ok(())
@@ -424,7 +469,7 @@ impl PlaybackCore {
         self.audio_stream_revision = self.audio_stream_revision.wrapping_add(1);
     }
 
-    pub fn audio_stream_configuration(&self) -> (AudioResearchParams, Vec<AudioResearchParams>) {
+    pub fn audio_stream_configuration(&self) -> (AudioEffectParams, Vec<AudioEffectParams>) {
         (
             self.audio_processing_profile.params.clone(),
             self.audio_stream_variants.clone(),
@@ -458,6 +503,13 @@ impl PlaybackCore {
             source_media.mp4_sha256 = Some(mp4_sha256);
             source_media.mp4_hash_status = "ready".to_owned();
         }
+        if let Some(source_media) = self.source_media_pool.get_mut(self.source_media_index) {
+            source_media.mp4_sha256 = self
+                .source_media
+                .as_ref()
+                .and_then(|source| source.mp4_sha256.clone());
+            source_media.mp4_hash_status = "ready".to_owned();
+        }
     }
 
     pub fn set_mp4_hash_failed_for_generation(&mut self, generation: u64) {
@@ -465,6 +517,10 @@ impl PlaybackCore {
             return;
         }
         if let Some(source_media) = self.source_media.as_mut() {
+            source_media.mp4_sha256 = None;
+            source_media.mp4_hash_status = "failed".to_owned();
+        }
+        if let Some(source_media) = self.source_media_pool.get_mut(self.source_media_index) {
             source_media.mp4_sha256 = None;
             source_media.mp4_hash_status = "failed".to_owned();
         }
@@ -649,15 +705,45 @@ impl PlaybackCore {
         self.fallback_reason = None;
     }
 
-    pub fn complete_loop(&mut self) -> Result<(), PlaybackError> {
+    pub fn complete_item(&mut self) -> Result<bool, PlaybackError> {
         self.require_source()?;
+        if self.source_media_pool.len() > 1 {
+            self.source_media_index = (self.source_media_index + 1) % self.source_media_pool.len();
+            if self.source_media_index == 0 {
+                self.playback_pool_cycle = self.playback_pool_cycle.saturating_add(1);
+            }
+            self.source_media = self.source_media_pool.get(self.source_media_index).cloned();
+            self.playback_generation = self.playback_generation.wrapping_add(1);
+            self.loop_index = 0;
+            self.playback_state = PlaybackState::Playing;
+            self.current_position_ms = 0;
+            self.reset_audio_to_original();
+            self.reset_video_to_original();
+            self.pending_video_reference = None;
+            self.pending_video_sha256 = None;
+            self.pending_audio_candidate = None;
+            self.worker_status = "unavailable".to_owned();
+            self.fallback_reason = None;
+            self.audio_processing_status = self.audio_processing_status_for("unavailable");
+            self.video_processing_status = if self.video_processing_enabled {
+                "unavailable".to_owned()
+            } else {
+                "disabled".to_owned()
+            };
+            return Ok(true);
+        }
         self.loop_index = self.loop_index.saturating_add(1);
+        self.playback_pool_cycle = self.playback_pool_cycle.saturating_add(1);
         self.playback_state = PlaybackState::Playing;
         self.pending_audio_candidate = None;
         self.current_position_ms = 0;
         self.reset_audio_to_original();
         self.commit_pending_video();
-        Ok(())
+        Ok(false)
+    }
+
+    pub fn complete_loop(&mut self) -> Result<(), PlaybackError> {
+        self.complete_item().map(|_| ())
     }
 
     #[must_use]
@@ -672,6 +758,9 @@ impl PlaybackCore {
             playback_generation: self.playback_generation,
             playback_state: self.playback_state,
             source_media: self.source_media.clone(),
+            source_media_pool: self.source_media_pool.clone(),
+            source_media_index: self.source_media_index,
+            playback_pool_cycle: self.playback_pool_cycle,
             loop_index: self.loop_index,
             current_position_ms: self.current_position_ms,
             current_video_source: self.current_video_source.clone(),
@@ -712,6 +801,8 @@ impl PlaybackCore {
                 .audio_processing_profile
                 .parameters_version
                 .clone(),
+            audio_stream_params: self.audio_processing_profile.params.clone(),
+            audio_stream_variants: self.audio_stream_variants.clone(),
             audio_stream_variant_count: self.effective_audio_stream_variant_count(),
             audio_stream_revision: self.audio_stream_revision,
             audio_processing_status: self.audio_processing_status.clone(),
@@ -784,10 +875,12 @@ impl PlaybackCore {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlaybackCore, PlaybackState, ValidatedAudioStreamConfiguration};
+    use super::{
+        PlaybackCore, PlaybackState, ValidatedAudioStreamConfiguration, MAX_SOURCE_MEDIA_POOL_ITEMS,
+    };
     use crate::audio_processing::AudioProcessingProfile;
+    use crate::media_effect_params::AudioEffectParams;
     use crate::media_library::SourceMediaDto;
-    use crate::research_params::AudioResearchParams;
     use crate::speech_to_speech::{AudioTrackInput, AudioVariantCandidate, SpeechToSpeechContext};
 
     fn source() -> SourceMediaDto {
@@ -804,6 +897,92 @@ mod tests {
             mp4_sha256: Some("a".repeat(64)),
             mp4_hash_status: "ready".to_owned(),
         }
+    }
+
+    fn source_named(file_name: &str) -> SourceMediaDto {
+        SourceMediaDto {
+            source_path: format!("/tmp/{file_name}"),
+            file_name: file_name.to_owned(),
+            ..source()
+        }
+    }
+
+    #[test]
+    fn playback_pool_advances_in_order_and_wraps_to_the_first_source() {
+        let mut core = PlaybackCore::default();
+        core.set_source_pool(vec![source_named("first.mp4"), source_named("second.mp4")])
+            .expect("two sources should be accepted");
+        core.set_processing_switches(true, true, false);
+        core.start().expect("pool should start");
+        let initial_generation = core.snapshot().playback_generation;
+        core.current_video_source = Some("processed".to_owned());
+        core.current_video_reference = Some("/tmp/processed.mp4".to_owned());
+        core.current_video_sha256 = Some("b".repeat(64));
+        core.pending_video_reference = Some("/tmp/pending.mp4".to_owned());
+        core.pending_video_sha256 = Some("c".repeat(64));
+
+        assert!(core.complete_item().expect("first item should complete"));
+        let second = core.snapshot();
+        assert_eq!(second.playback_generation, initial_generation + 1);
+        assert_eq!(second.source_media_index, 1);
+        assert_eq!(
+            second.source_media.expect("second source").file_name,
+            "second.mp4"
+        );
+        assert_eq!(second.loop_index, 0);
+        assert_eq!(second.playback_pool_cycle, 0);
+        assert!(second.video_processing_enabled);
+        assert!(second.audio_processing_enabled);
+        assert_eq!(second.current_video_source.as_deref(), Some("original"));
+        assert_eq!(
+            second.current_video_reference.as_deref(),
+            Some("/tmp/second.mp4")
+        );
+        assert!(second.pending_video_reference.is_none());
+        assert_eq!(second.current_audio_source.as_deref(), Some("original"));
+
+        assert!(core.complete_item().expect("second item should complete"));
+        let wrapped = core.snapshot();
+        assert_eq!(wrapped.playback_generation, initial_generation + 2);
+        assert_eq!(wrapped.source_media_index, 0);
+        assert_eq!(
+            wrapped.source_media.expect("first source").file_name,
+            "first.mp4"
+        );
+        assert_eq!(wrapped.loop_index, 0);
+        assert_eq!(wrapped.playback_pool_cycle, 1);
+    }
+
+    #[test]
+    fn single_source_completion_keeps_generation_and_increments_loop_and_pool_cycle() {
+        let mut core = PlaybackCore::default();
+        core.set_source(source());
+        core.start().expect("source should start");
+        let generation = core.snapshot().playback_generation;
+
+        assert!(!core.complete_item().expect("single item should loop"));
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.playback_generation, generation);
+        assert_eq!(snapshot.loop_index, 1);
+        assert_eq!(snapshot.playback_pool_cycle, 1);
+        assert_eq!(snapshot.source_media_index, 0);
+        assert_eq!(snapshot.source_media_pool.len(), 1);
+    }
+
+    #[test]
+    fn source_pool_rejects_empty_or_more_than_one_hundred_items_without_replacing_current_pool() {
+        let mut core = PlaybackCore::default();
+        core.set_source(source());
+        let before = core.snapshot();
+
+        assert!(core.set_source_pool(Vec::new()).is_err());
+        assert!(core
+            .set_source_pool(vec![source(); MAX_SOURCE_MEDIA_POOL_ITEMS + 1])
+            .is_err());
+
+        let after = core.snapshot();
+        assert_eq!(after.source_media_pool, before.source_media_pool);
+        assert_eq!(after.playback_generation, before.playback_generation);
     }
 
     #[test]
@@ -864,8 +1043,8 @@ mod tests {
         assert_eq!(core.snapshot().audio_stream_variant_count, 1);
 
         core.set_audio_stream_configuration(
-            AudioResearchParams::default(),
-            vec![AudioResearchParams::default(); 3],
+            AudioEffectParams::default(),
+            vec![AudioEffectParams::default(); 3],
         )
         .expect("audio stream configuration should be valid");
         assert_eq!(core.snapshot().audio_stream_variant_count, 3);
@@ -879,8 +1058,8 @@ mod tests {
         let mut core = PlaybackCore::default();
         let revision = core.snapshot().audio_stream_revision;
         let configuration = ValidatedAudioStreamConfiguration::new(
-            AudioResearchParams::default(),
-            vec![AudioResearchParams::default(); 2],
+            AudioEffectParams::default(),
+            vec![AudioEffectParams::default(); 2],
         )
         .expect("configuration should be valid");
 
@@ -890,11 +1069,97 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_exposes_exact_committed_audio_stream_configuration() {
+        let mut core = PlaybackCore::default();
+        let params = AudioEffectParams {
+            input_gain_db: 1.25,
+            playback_speed: 1.1,
+            ..Default::default()
+        };
+        let variants = vec![
+            AudioEffectParams {
+                low_eq_db: 2.0,
+                ..params.clone()
+            },
+            AudioEffectParams {
+                high_eq_db: -3.0,
+                ..params.clone()
+            },
+        ];
+
+        core.commit_validated_audio_stream_configuration(
+            ValidatedAudioStreamConfiguration::new(params.clone(), variants.clone())
+                .expect("configuration should be valid"),
+        );
+
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.audio_stream_params, params);
+        assert_eq!(snapshot.audio_stream_variants, variants);
+    }
+
+    #[test]
+    fn uncommitted_or_invalid_audio_configuration_does_not_change_snapshot() {
+        let mut core = PlaybackCore::default();
+        core.set_audio_stream_configuration(
+            AudioEffectParams {
+                output_gain_db: -1.0,
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+        .expect("initial configuration should be valid");
+        let before = core.snapshot();
+        let _pending = ValidatedAudioStreamConfiguration::new(
+            AudioEffectParams {
+                input_gain_db: 2.0,
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+        .expect("configuration should be valid");
+        let invalid = ValidatedAudioStreamConfiguration::new(
+            AudioEffectParams {
+                playback_speed: 0.0,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        assert!(invalid.is_err());
+        let after = core.snapshot();
+        assert_eq!(after.audio_stream_params, before.audio_stream_params);
+        assert_eq!(after.audio_stream_variants, before.audio_stream_variants);
+        assert_eq!(after.audio_stream_revision, before.audio_stream_revision);
+    }
+
+    #[test]
+    fn stop_preserves_committed_audio_configuration_and_leaves_runtime_status() {
+        let mut core = PlaybackCore::default();
+        core.set_source(source());
+        core.set_processing_switches(false, true, false);
+        let params = AudioEffectParams {
+            output_gain_db: 1.5,
+            ..Default::default()
+        };
+        let variants = vec![params.clone()];
+        core.set_audio_stream_configuration(params.clone(), variants.clone())
+            .expect("configuration should be valid");
+        core.mark_audio_processing_runtime();
+        assert_eq!(core.snapshot().audio_processing_status, "runtime");
+
+        core.stop();
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.audio_processing_status, "unavailable");
+        assert_eq!(snapshot.audio_stream_params, params);
+        assert_eq!(snapshot.audio_stream_variants, variants);
+    }
+
+    #[test]
     fn changed_audio_processing_profile_invalidates_stream_revision() {
         let mut core = PlaybackCore::default();
         let revision = core.snapshot().audio_stream_revision;
         let profile = AudioProcessingProfile {
-            params: AudioResearchParams {
+            params: AudioEffectParams {
                 input_gain_db: 1.0,
                 ..Default::default()
             },
@@ -913,8 +1178,8 @@ mod tests {
     #[test]
     fn audio_configuration_rejects_more_than_four_variants() {
         let result = ValidatedAudioStreamConfiguration::new(
-            AudioResearchParams::default(),
-            vec![AudioResearchParams::default(); 5],
+            AudioEffectParams::default(),
+            vec![AudioEffectParams::default(); 5],
         );
 
         assert!(result.is_err());

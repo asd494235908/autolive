@@ -442,8 +442,7 @@ func validateAuditTargetProduct(state *store.State, input controlplane.AuditLogI
 				return controlplane.ErrForbidden
 			}
 		} else {
-			storedProduct, valid := strictStoredProduct(device.Product)
-			if !valid || storedProduct != product {
+			if effectiveStoredProduct(device.Product) != product {
 				return controlplane.ErrForbidden
 			}
 		}
@@ -458,7 +457,7 @@ func validateAuditTargetProduct(state *store.State, input controlplane.AuditLogI
 		knownTarget = true
 		var item controlplane.DeviceSummary
 		item, found = state.Devices[input.TargetID]
-		target = item.Product
+		target = effectiveStoredProduct(item.Product)
 	case "model_lease":
 		knownTarget = true
 		var item controlplane.ModelLease
@@ -1691,6 +1690,7 @@ func (s *ControlPlane) getClientProfile(ctx context.Context, userID, deviceID st
 		if err != nil {
 			return controlplane.ClientProfile{}, err
 		}
+		device.Product = effectiveStoredProduct(device.Product)
 		if product != "" && device.Product != product {
 			return controlplane.ClientProfile{}, controlplane.ErrForbidden
 		}
@@ -3616,18 +3616,18 @@ func (s *ControlPlane) createActivationCode(ctx context.Context, product control
 	if !validIdempotencyKey(idempotencyKey) {
 		return controlplane.ActivationCode{}, controlplane.ErrIdempotencyKeyRequired
 	}
-	if input.MaxDevices == 0 {
-		input.MaxDevices = 1
-	}
-	if input.MaxDevices < 1 || input.MaxDevices > controlplane.MaxActivationCodeDevices || input.ExpiresAt.IsZero() || !input.ExpiresAt.After(s.repository.Now()) {
+	input.UserID = strings.TrimSpace(input.UserID)
+	if !idPattern.MatchString(input.UserID) || input.MaxDevices < 1 || input.MaxDevices > controlplane.MaxActivationCodeDevices || input.ExpiresAt.IsZero() || !input.ExpiresAt.After(s.repository.Now()) {
 		return controlplane.ActivationCode{}, controlplane.ErrInvalidRequest
 	}
 	fingerprint, err := fingerprintValue(struct {
 		Product    controlplane.ProductCode `json:"product"`
+		UserID     string                   `json:"user_id"`
 		ExpiresAt  string                   `json:"expires_at"`
 		MaxDevices int                      `json:"max_devices"`
 	}{
 		Product:    product,
+		UserID:     input.UserID,
 		ExpiresAt:  input.ExpiresAt.UTC().Format(time.RFC3339),
 		MaxDevices: input.MaxDevices,
 	})
@@ -3644,7 +3644,7 @@ func (s *ControlPlane) createActivationCode(ctx context.Context, product control
 			return controlplane.ActivationCode{}, controlplane.NewError(http.StatusInternalServerError, "RANDOM_GENERATION_FAILED", "无法生成激活码")
 		}
 		record := store.ActivationCodeCreateRecord{
-			Product: product, PlainCode: plainCode, CodeHash: secretDigest(plainCode), CodePrefix: plainCode[:12], ExpiresAt: input.ExpiresAt, MaxDevices: input.MaxDevices, CreatedAt: s.repository.Now(),
+			Product: product, UserID: input.UserID, PlainCode: plainCode, CodeHash: secretDigest(plainCode), CodePrefix: plainCode[:12], ExpiresAt: input.ExpiresAt, MaxDevices: input.MaxDevices, CreatedAt: s.repository.Now(),
 		}
 		if strictProduct {
 			productWriter, ok := s.repository.(store.ProductActivationRepository)
@@ -3677,6 +3677,16 @@ func (s *ControlPlane) createActivationCode(ctx context.Context, product control
 			record.ActivationCode.CodePrefix = record.CodePrefix
 			return record.ActivationCode, nil
 		}
+		user, ok := state.Users[input.UserID]
+		if !ok {
+			return controlplane.ActivationCode{}, controlplane.ErrUserNotFound
+		}
+		if user.Status != controlplane.UserStatusActive {
+			return controlplane.ActivationCode{}, controlplane.ErrUserDisabled
+		}
+		if !stateUserHasActiveProduct(state, input.UserID, product) {
+			return controlplane.ActivationCode{}, controlplane.ErrForbidden
+		}
 
 		id := nextID(state, "ac")
 		plainCode, err := randomToken("code_", 18)
@@ -3686,6 +3696,7 @@ func (s *ControlPlane) createActivationCode(ctx context.Context, product control
 		code := controlplane.ActivationCode{
 			ID:           id,
 			Product:      product,
+			UserID:       input.UserID,
 			Status:       controlplane.ActivationCodeStatusActive,
 			ExpiresAt:    input.ExpiresAt.UTC().Format(time.RFC3339),
 			MaxDevices:   input.MaxDevices,
@@ -3849,6 +3860,20 @@ func decorateActivationCode(state *store.State, record store.ActivationCodeRecor
 	return code
 }
 
+func stateUserHasActiveProduct(state *store.State, userID string, product controlplane.ProductCode) bool {
+	hasMembership := false
+	for _, membership := range state.UserProducts {
+		if membership.UserID != userID {
+			continue
+		}
+		hasMembership = true
+		if membership.Product == product && membership.Status == "active" {
+			return true
+		}
+	}
+	return !hasMembership && product == controlplane.ProductAutoLive
+}
+
 func (s *ControlPlane) RevokeActivationCode(ctx context.Context, idempotencyKey, codeID string) (controlplane.ActivationCode, error) {
 	return s.revokeActivationCode(ctx, controlplane.ProductAutoLive, idempotencyKey, codeID, false)
 }
@@ -3919,7 +3944,7 @@ func (s *ControlPlane) revokeActivationCode(ctx context.Context, product control
 		if strictProduct && (!ok || storedProduct != product) {
 			return controlplane.ActivationCode{}, controlplane.ErrForbidden
 		}
-		if record.ActivationCode.Status != controlplane.ActivationCodeStatusActive && record.ActivationCode.Status != controlplane.ActivationCodeStatusRevoked {
+		if record.ActivationCode.Status != controlplane.ActivationCodeStatusActive && record.ActivationCode.Status != controlplane.ActivationCodeStatusUsed && record.ActivationCode.Status != controlplane.ActivationCodeStatusRevoked {
 			return controlplane.ActivationCode{}, controlplane.ErrActivationCodeStateConflict
 		}
 		record.ActivationCode.Status = controlplane.ActivationCodeStatusRevoked
@@ -4011,15 +4036,14 @@ func (s *ControlPlane) activateDeviceWithSessionBinding(ctx context.Context, ide
 			return controlplane.DeviceSummary{}, err
 		}
 		device, err := activator.ActivateDeviceWithSessionBinding(ctx, store.DeviceActivationRecord{
-			Scope:              "control-plane-state",
-			IdempotencyKey:     "activate-device:" + userID + ":" + idempotencyKey,
-			Fingerprint:        fingerprint,
-			AccessTokenHash:    accessTokenHash,
-			UserID:             userID,
-			Product:            input.Device.Product,
-			ActivationCodeHash: secretDigest(input.ActivationCode),
-			Device:             input.Device,
-			Audit:              audit,
+			Scope:           "control-plane-state",
+			IdempotencyKey:  "activate-device:" + userID + ":" + idempotencyKey,
+			Fingerprint:     fingerprint,
+			AccessTokenHash: accessTokenHash,
+			UserID:          userID,
+			Product:         input.Device.Product,
+			Device:          input.Device,
+			Audit:           audit,
 		})
 		if errors.Is(err, store.ErrSessionDeviceBindingConflict) {
 			return controlplane.DeviceSummary{}, controlplane.ErrDeviceBindingConflict
@@ -4080,38 +4104,46 @@ func (s *ControlPlane) activateDeviceWithRunner(ctx context.Context, idempotency
 		if user.Status != controlplane.UserStatusActive {
 			return controlplane.DeviceSummary{}, controlplane.ErrUserDisabled
 		}
-		if existing, exists := state.Devices[input.Device.DeviceID]; exists {
-			if effectiveStoredProduct(existing.Product) != input.Device.Product {
-				return controlplane.DeviceSummary{}, controlplane.ErrForbidden
-			}
-			if existing.Status == controlplane.DeviceStatusPendingActivation && existing.UserID == "" {
-				// 允许管理员解除绑定后的同一设备使用新激活码重新绑定。
-			} else {
-				if existing.UserID != userID || existing.Status == controlplane.DeviceStatusDisabled {
-					return controlplane.DeviceSummary{}, controlplane.ErrForbidden
-				}
-				return controlplane.DeviceSummary{}, controlplane.ErrDeviceBindingConflict
-			}
-		}
-		codeID, ok := state.ActivationCodeIndex[secretDigest(input.ActivationCode)]
-		if !ok {
-			return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeNotFound
-		}
-		record := state.ActivationCodes[codeID]
-		if effectiveStoredProduct(record.ActivationCode.Product) != input.Device.Product {
+		if !stateUserHasActiveProduct(state, userID, input.Device.Product) {
 			return controlplane.DeviceSummary{}, controlplane.ErrForbidden
 		}
-		expiresAt, _ := time.Parse(time.RFC3339, record.ActivationCode.ExpiresAt)
-		if !s.repository.Now().Before(expiresAt) {
-			record.ActivationCode.Status = controlplane.ActivationCodeStatusExpired
-			state.ActivationCodes[codeID] = record
-			return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeExpired
+		existingDevice, deviceExists := state.Devices[input.Device.DeviceID]
+		if deviceExists {
+			if effectiveStoredProduct(existingDevice.Product) != input.Device.Product {
+				return controlplane.DeviceSummary{}, controlplane.ErrForbidden
+			}
+			if existingDevice.Status != controlplane.DeviceStatusPendingActivation || existingDevice.UserID != "" {
+				if existingDevice.Status == controlplane.DeviceStatusDisabled && existingDevice.UserID == userID {
+					return controlplane.DeviceSummary{}, controlplane.ErrDeviceDisabled
+				}
+				if existingDevice.UserID != userID {
+					return controlplane.DeviceSummary{}, controlplane.ErrDeviceBindingConflict
+				}
+				if codeID := state.ActivationDeviceBindings[existingDevice.ID]; codeID != "" {
+					record, ok := state.ActivationCodes[codeID]
+					expiresAt, parseErr := time.Parse(time.RFC3339, record.ActivationCode.ExpiresAt)
+					if ok && parseErr == nil && record.ActivationCode.UserID == userID && effectiveStoredProduct(record.ActivationCode.Product) == input.Device.Product && s.repository.Now().Before(expiresAt) {
+						existingDevice.DeviceName = strings.TrimSpace(input.Device.DeviceName)
+						existingDevice.Platform = strings.TrimSpace(input.Device.Platform)
+						existingDevice.AppVersion = strings.TrimSpace(input.Device.AppVersion)
+						existingDevice.ActivationExpiresAt = formatActivationExpiryString(record.ActivationCode.ExpiresAt)
+						state.Devices[existingDevice.ID] = existingDevice
+						state.IdempotencyRecords[scope] = store.IdempotencyRecord{Fingerprint: fingerprint, ResourceID: existingDevice.ID}
+						return existingDevice, nil
+					}
+				}
+			}
 		}
-		if record.ActivationCode.Status == controlplane.ActivationCodeStatusRevoked {
-			return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeRevoked
+		codeID, record, selectionErr := selectAccountActivationCode(state, userID, input.Device.Product, s.repository.Now())
+		if selectionErr != nil {
+			return controlplane.DeviceSummary{}, selectionErr
 		}
-		if record.ActivationCode.Status == controlplane.ActivationCodeStatusUsed || record.ActivationCode.BoundDevices >= record.ActivationCode.MaxDevices {
-			return controlplane.DeviceSummary{}, controlplane.ErrActivationCodeAlreadyUsed
+		if oldCodeID := state.ActivationDeviceBindings[input.Device.DeviceID]; oldCodeID != "" && oldCodeID != codeID {
+			oldRecord := state.ActivationCodes[oldCodeID]
+			if oldRecord.ActivationCode.BoundDevices > 0 {
+				oldRecord.ActivationCode.BoundDevices--
+			}
+			state.ActivationCodes[oldCodeID] = oldRecord
 		}
 
 		now := s.repository.Now().Format(time.RFC3339)
@@ -4127,6 +4159,7 @@ func (s *ControlPlane) activateDeviceWithRunner(ctx context.Context, idempotency
 			ActivationExpiresAt: formatActivationExpiryString(record.ActivationCode.ExpiresAt),
 		}
 		state.Devices[device.ID] = device
+		state.ActivationDeviceBindings[device.ID] = codeID
 		record.ActivationCode.BoundDevices++
 		if record.ActivationCode.BoundDevices >= record.ActivationCode.MaxDevices {
 			record.ActivationCode.Status = controlplane.ActivationCodeStatusUsed
@@ -4152,6 +4185,48 @@ func (s *ControlPlane) activateDeviceWithRunner(ctx context.Context, idempotency
 		return controlplane.DeviceSummary{}, err
 	}
 	return decorateDeviceSummary(device, s.repository.Now()), nil
+}
+
+func selectAccountActivationCode(state *store.State, userID string, product controlplane.ProductCode, now time.Time) (string, store.ActivationCodeRecord, error) {
+	type candidate struct {
+		id        string
+		record    store.ActivationCodeRecord
+		expiresAt time.Time
+	}
+	candidates := make([]candidate, 0)
+	hasExpired := false
+	hasCurrent := false
+	for id, record := range state.ActivationCodes {
+		code := record.ActivationCode
+		if code.UserID != userID || effectiveStoredProduct(code.Product) != product || code.Status == controlplane.ActivationCodeStatusRevoked {
+			continue
+		}
+		expiresAt, err := time.Parse(time.RFC3339, code.ExpiresAt)
+		if err != nil || !now.Before(expiresAt) {
+			hasExpired = true
+			continue
+		}
+		hasCurrent = true
+		if code.MaxDevices > 0 && code.BoundDevices < code.MaxDevices {
+			candidates = append(candidates, candidate{id: id, record: record, expiresAt: expiresAt})
+		}
+	}
+	if len(candidates) > 0 {
+		slices.SortFunc(candidates, func(a, b candidate) int {
+			if order := a.expiresAt.Compare(b.expiresAt); order != 0 {
+				return order
+			}
+			return strings.Compare(a.id, b.id)
+		})
+		return candidates[0].id, candidates[0].record, nil
+	}
+	if hasCurrent {
+		return "", store.ActivationCodeRecord{}, controlplane.ErrDeviceLimitExceeded
+	}
+	if hasExpired {
+		return "", store.ActivationCodeRecord{}, controlplane.ErrAccountActivationExpired
+	}
+	return "", store.ActivationCodeRecord{}, controlplane.ErrAccountActivationRequired
 }
 
 func (s *ControlPlane) DisableDevice(ctx context.Context, idempotencyKey, deviceID string) (controlplane.DeviceSummary, error) {
@@ -4319,6 +4394,17 @@ func (s *ControlPlane) unbindDevice(ctx context.Context, product controlplane.Pr
 			return state.Devices[existing.ResourceID], nil
 		}
 		releaseActiveModelLeasesForDeviceForProduct(state, deviceID, s.repository.Now(), product)
+		if codeID := state.ActivationDeviceBindings[deviceID]; codeID != "" {
+			record := state.ActivationCodes[codeID]
+			if record.ActivationCode.BoundDevices > 0 {
+				record.ActivationCode.BoundDevices--
+			}
+			if record.ActivationCode.Status == controlplane.ActivationCodeStatusUsed && record.ActivationCode.BoundDevices < record.ActivationCode.MaxDevices {
+				record.ActivationCode.Status = controlplane.ActivationCodeStatusActive
+			}
+			state.ActivationCodes[codeID] = record
+			delete(state.ActivationDeviceBindings, deviceID)
+		}
 		device.UserID = ""
 		device.Status = controlplane.DeviceStatusPendingActivation
 		state.Devices[device.ID] = device
@@ -4345,6 +4431,12 @@ func decorateDeviceSummary(device controlplane.DeviceSummary, now time.Time) con
 }
 
 func activationExpiryForDevice(state *store.State, userID, deviceID string) *string {
+	if codeID := state.ActivationDeviceBindings[deviceID]; codeID != "" {
+		record, ok := state.ActivationCodes[codeID]
+		if ok && record.ActivationCode.UserID == userID {
+			return formatActivationExpiryString(record.ActivationCode.ExpiresAt)
+		}
+	}
 	for _, record := range state.ActivationCodes {
 		if record.UsedByUserID == userID && record.UsedByDeviceID == deviceID {
 			return formatActivationExpiryString(record.ActivationCode.ExpiresAt)

@@ -1,14 +1,14 @@
-//! 本地研究参数契约。
+//! 本地媒体效果参数契约。
 //!
 //! 本模块只描述可序列化的参数、默认值和边界校验，不执行媒体处理，也不生成
 //! 随机值。字段名中的 `_ms`、`_hz`、`_px`、`_percent` 等后缀是机器可读的单位
-//! 语义；研究参数的实际算法、版本和随机种子由后续处理阶段另行记录。
+//! 语义；实际算法、版本和随机种子由对应媒体处理阶段另行记录。
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// 视频视觉调制实验固定使用的频段集合，单位为 Hz。
+/// 视频视觉调制固定使用的频段集合，单位为 Hz。
 pub const VISUAL_BAND_FREQUENCIES_HZ: [u32; 12] = [
     65, 92, 131, 188, 267, 381, 544, 777, 1110, 1585, 2263, 20_000,
 ];
@@ -17,7 +17,7 @@ pub const VISUAL_BAND_FREQUENCIES_HZ: [u32; 12] = [
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NaturalVoiceMode {
-    /// 保持源音频，不做变声实验。
+    /// 保持源音频，不做变声处理。
     #[default]
     Original,
     /// 允许后续本地处理器按周期产生自然动态参数。
@@ -43,10 +43,10 @@ pub struct ParameterValidationError {
     pub message: String,
 }
 
-/// 音频研究参数。
+/// 音频效果参数。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct AudioResearchParams {
+pub struct AudioEffectParams {
     /// 自然真人模式，单位为枚举值。
     pub natural_voice_mode: NaturalVoiceMode,
     /// 随机变声周期，单位为毫秒；范围 500–60,000 ms。
@@ -113,9 +113,17 @@ pub struct AudioResearchParams {
     pub output_bitrate_kbps: u16,
     /// 音色库资源 ID，无物理单位；None 表示跟随源音色。
     pub voice_library_id: Option<String>,
+    /// 高频音频扰动开关；只处理 6kHz 以上频段，不改变话术内容。
+    pub high_frequency_perturbation_enabled: bool,
+    /// 高频音频扰动变化间隔，单位为毫秒；范围 500–60,000 ms。
+    pub high_frequency_perturbation_interval_ms: u64,
+    /// 高频音频扰动强度，单位为百分比；范围 0–20%。
+    pub high_frequency_perturbation_strength_percent: f64,
+    /// 高频音频扰动目标电平，单位为 dB；范围 -60–0 dB。
+    pub high_frequency_perturbation_level_db: f64,
 }
 
-impl Default for AudioResearchParams {
+impl Default for AudioEffectParams {
     fn default() -> Self {
         Self {
             natural_voice_mode: NaturalVoiceMode::Original,
@@ -151,14 +159,18 @@ impl Default for AudioResearchParams {
             sample_rate_hz: None,
             output_bitrate_kbps: 192,
             voice_library_id: None,
+            high_frequency_perturbation_enabled: false,
+            high_frequency_perturbation_interval_ms: 12_000,
+            high_frequency_perturbation_strength_percent: 0.0,
+            high_frequency_perturbation_level_db: -32.0,
         }
     }
 }
 
-/// 视频研究参数；所有空间值针对输出画面，单位在字段名中明确。
+/// 视频效果参数；所有空间值针对输出画面，单位在字段名中明确。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct VideoResearchParams {
+pub struct VideoEffectParams {
     /// 亮度偏移，单位为百分比；范围 -100–100%。
     pub brightness_percent: f64,
     /// 饱和度，单位为百分比；范围 0–200%。
@@ -199,9 +211,33 @@ pub struct VideoResearchParams {
     pub space_y_offset_px: f64,
     /// 色域转换强度，单位为百分比；范围 0–100%。
     pub color_space_conversion_strength_percent: f64,
+    /// 色域转换开关；关闭时强度值只保留配置，不进入滤镜链。
+    pub color_space_conversion_enabled: bool,
+    /// 水平翻转开关。
+    pub horizontal_flip_enabled: bool,
+    /// 垂直翻转开关。
+    pub vertical_flip_enabled: bool,
+    /// 画面旋转角度，单位为度；范围 -180–180°。
+    pub rotation_degrees: f64,
+    /// 暗角强度，单位为百分比；范围 0–100%。
+    pub vignette_percent: f64,
+    /// 高光调整，单位为百分比；范围 -100–100%。
+    pub highlights_percent: f64,
+    /// 阴影调整，单位为百分比；范围 -100–100%。
+    pub shadows_percent: f64,
+    /// 红色通道保护开关；启用后后续色彩调制保持源红色通道。
+    pub red_channel_lock_enabled: bool,
+    /// 画面边缘柔化强度，单位为百分比；范围 0–100%。
+    pub edge_softness_percent: f64,
+    /// 图像修复开关；用于温和的去噪与细节恢复，不改变内容语义。
+    pub image_repair_enabled: bool,
+    /// 图像修复强度，单位为百分比；范围 0–100%。
+    pub image_repair_strength_percent: f64,
+    /// 帧率动态锁定开关；启用后输出时间基统一到源平均帧率。
+    pub frame_rate_lock_enabled: bool,
 }
 
-impl Default for VideoResearchParams {
+impl Default for VideoEffectParams {
     fn default() -> Self {
         Self {
             brightness_percent: 0.0,
@@ -224,14 +260,26 @@ impl Default for VideoResearchParams {
             space_x_offset_px: 0.0,
             space_y_offset_px: 0.0,
             color_space_conversion_strength_percent: 0.0,
+            color_space_conversion_enabled: false,
+            horizontal_flip_enabled: false,
+            vertical_flip_enabled: false,
+            rotation_degrees: 0.0,
+            vignette_percent: 0.0,
+            highlights_percent: 0.0,
+            shadows_percent: 0.0,
+            red_channel_lock_enabled: false,
+            edge_softness_percent: 0.0,
+            image_repair_enabled: false,
+            image_repair_strength_percent: 0.0,
+            frame_rate_lock_enabled: false,
         }
     }
 }
 
-/// 视频视觉调制、研究挂件和切片实验参数。
+/// 高级视觉调制、挂件和切片效果参数。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ResearchExperimentParams {
+pub struct AdvancedEffectParams {
     /// 固定视觉频段到权重倍数的映射，键单位为 Hz，值单位为倍数；每个固定频段都必须存在。
     pub band_weights: BTreeMap<u32, f64>,
     /// 目标视觉调制频率，单位为 Hz；None 表示关闭。
@@ -274,9 +322,51 @@ pub struct ResearchExperimentParams {
     pub slice_min_length_ms: u64,
     /// 切片触发间隔，单位为毫秒；范围 5,000–120,000 ms，且不得短于切片长度。
     pub slice_trigger_interval_ms: u64,
+    /// 随机几何挂件开关。
+    pub random_graphic_enabled: bool,
+    /// 单次显示的随机几何挂件数量，单位为个；范围 1–32 个。
+    pub random_graphic_count: u8,
+    /// 画中画切片开关；复用当前源视频，不读取第二个外部文件。
+    pub picture_in_picture_enabled: bool,
+    /// 画中画宽度占主画面宽度比例，单位为百分比；范围 10–50%。
+    pub picture_in_picture_scale_percent: f64,
+    /// 画中画透明度，单位为百分比；范围 0–100%。
+    pub picture_in_picture_opacity_percent: f64,
+    /// 画中画旋转角度，单位为度；范围 -15–15°。
+    pub picture_in_picture_rotation_degrees: f64,
+    /// 画中画像素扰动幅度，单位为像素；范围 0–4 px。
+    pub picture_in_picture_pixel_jitter_px: f64,
+    /// 画中画时间轴锁定开关；启用时切片与主画面使用同一时间基。
+    pub picture_in_picture_timeline_locked: bool,
+    /// 局部模糊开关。
+    pub local_blur_enabled: bool,
+    /// 局部模糊区域宽度占画面宽度比例，单位为百分比；范围 5–50%。
+    pub local_blur_region_percent: f64,
+    /// 局部模糊半径，单位为像素；范围 0.1–16 px。
+    pub local_blur_radius_px: f64,
+    /// 局部模糊触发间隔，单位为毫秒；范围 500–60,000 ms。
+    pub local_blur_interval_ms: u64,
+    /// 边缘填充开关。
+    pub edge_fill_enabled: bool,
+    /// 边缘羽化强度，单位为百分比；范围 0–100%。
+    pub edge_feather_percent: f64,
+    /// 变换平滑开关。
+    pub transform_smoothing_enabled: bool,
+    /// 变换平滑时长，单位为毫秒；范围 50–5,000 ms。
+    pub transform_smoothing_duration_ms: u64,
+    /// 高光扰动开关。
+    pub highlight_perturbation_enabled: bool,
+    /// 高光扰动间隔，单位为毫秒；范围 500–60,000 ms。
+    pub highlight_perturbation_interval_ms: u64,
+    /// 异步旋转开关。
+    pub asynchronous_rotation_enabled: bool,
+    /// 异步旋转最小角度，单位为度；范围 -15–15°。
+    pub asynchronous_rotation_min_degrees: f64,
+    /// 异步旋转最大角度，单位为度；范围 -15–15°，不得小于最小角度。
+    pub asynchronous_rotation_max_degrees: f64,
 }
 
-impl Default for ResearchExperimentParams {
+impl Default for AdvancedEffectParams {
     fn default() -> Self {
         let band_weights = VISUAL_BAND_FREQUENCIES_HZ
             .iter()
@@ -306,34 +396,55 @@ impl Default for ResearchExperimentParams {
             slice_length_ms: 5_000,
             slice_min_length_ms: 10_000,
             slice_trigger_interval_ms: 15_000,
+            random_graphic_enabled: false,
+            random_graphic_count: 4,
+            picture_in_picture_enabled: false,
+            picture_in_picture_scale_percent: 24.0,
+            picture_in_picture_opacity_percent: 100.0,
+            picture_in_picture_rotation_degrees: 0.0,
+            picture_in_picture_pixel_jitter_px: 0.0,
+            picture_in_picture_timeline_locked: true,
+            local_blur_enabled: false,
+            local_blur_region_percent: 20.0,
+            local_blur_radius_px: 2.0,
+            local_blur_interval_ms: 10_000,
+            edge_fill_enabled: false,
+            edge_feather_percent: 0.0,
+            transform_smoothing_enabled: false,
+            transform_smoothing_duration_ms: 800,
+            highlight_perturbation_enabled: false,
+            highlight_perturbation_interval_ms: 10_000,
+            asynchronous_rotation_enabled: false,
+            asynchronous_rotation_min_degrees: -1.0,
+            asynchronous_rotation_max_degrees: 1.0,
         }
     }
 }
 
-/// 本地研究参数根模型。
+/// 本地媒体效果参数根模型。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
-pub struct LocalResearchParams {
-    /// 音频研究参数。
-    pub audio: AudioResearchParams,
-    /// 视频研究参数。
-    pub video: VideoResearchParams,
-    /// 视觉频段、挂件和切片研究参数。
-    pub research: ResearchExperimentParams,
+pub struct MediaEffectParams {
+    /// 音频效果参数。
+    pub audio: AudioEffectParams,
+    /// 视频效果参数。
+    pub video: VideoEffectParams,
+    /// 高级视觉频段、挂件和切片效果参数。
+    pub advanced: AdvancedEffectParams,
 }
 
-impl LocalResearchParams {
+impl MediaEffectParams {
     /// 校验完整参数树；成功只表示数据满足契约，不表示媒体处理已实现。
     pub fn validate(&self) -> Result<(), Vec<ParameterValidationError>> {
         let mut errors = Vec::new();
         self.audio.validate_into(&mut errors);
         self.video.validate_into(&mut errors);
-        self.research.validate_into(&mut errors);
+        self.advanced.validate_into(&mut errors);
         finish_validation(errors)
     }
 }
 
-impl AudioResearchParams {
+impl AudioEffectParams {
     /// 校验音频参数范围和音色库 ID 基本格式。
     pub fn validate(&self) -> Result<(), Vec<ParameterValidationError>> {
         let mut errors = Vec::new();
@@ -342,13 +453,13 @@ impl AudioResearchParams {
     }
 
     fn validate_into(&self, errors: &mut Vec<ParameterValidationError>) {
-        // 前端按用户区间随机抽本轮时长后写入；硬范围 1–60 s。
+        // 前端按用户区间随机抽本轮时长后写入；硬范围 0.5–60 s。
         validate_u64_range(
             errors,
             "audio.random_change_period_ms",
             "ms",
             self.random_change_period_ms,
-            1_000,
+            500,
             60_000,
         );
         validate_range(
@@ -586,10 +697,34 @@ impl AudioResearchParams {
                 message: "音色库 ID 不能为空且长度不能超过 128 个字节".to_owned(),
             });
         }
+        validate_u64_range(
+            errors,
+            "audio.high_frequency_perturbation_interval_ms",
+            "ms",
+            self.high_frequency_perturbation_interval_ms,
+            500,
+            60_000,
+        );
+        validate_range(
+            errors,
+            "audio.high_frequency_perturbation_strength_percent",
+            "%",
+            self.high_frequency_perturbation_strength_percent,
+            0.0,
+            20.0,
+        );
+        validate_range(
+            errors,
+            "audio.high_frequency_perturbation_level_db",
+            "dB",
+            self.high_frequency_perturbation_level_db,
+            -60.0,
+            0.0,
+        );
     }
 }
 
-impl VideoResearchParams {
+impl VideoEffectParams {
     /// 校验视频参数范围；不执行重新编码或滤镜处理。
     pub fn validate(&self) -> Result<(), Vec<ParameterValidationError>> {
         let mut errors = Vec::new();
@@ -758,10 +893,58 @@ impl VideoResearchParams {
             0.0,
             100.0,
         );
+        validate_range(
+            errors,
+            "video.rotation_degrees",
+            "°",
+            self.rotation_degrees,
+            -180.0,
+            180.0,
+        );
+        validate_range(
+            errors,
+            "video.vignette_percent",
+            "%",
+            self.vignette_percent,
+            0.0,
+            100.0,
+        );
+        validate_range(
+            errors,
+            "video.highlights_percent",
+            "%",
+            self.highlights_percent,
+            -100.0,
+            100.0,
+        );
+        validate_range(
+            errors,
+            "video.shadows_percent",
+            "%",
+            self.shadows_percent,
+            -100.0,
+            100.0,
+        );
+        validate_range(
+            errors,
+            "video.edge_softness_percent",
+            "%",
+            self.edge_softness_percent,
+            0.0,
+            100.0,
+        );
+        validate_range(
+            errors,
+            "video.image_repair_strength_percent",
+            "%",
+            self.image_repair_strength_percent,
+            0.0,
+            100.0,
+        );
     }
 }
 
-impl ResearchExperimentParams {
+impl AdvancedEffectParams {
     /// 校验固定频段、视觉调制和挂件/切片参数。
     pub fn validate(&self) -> Result<(), Vec<ParameterValidationError>> {
         let mut errors = Vec::new();
@@ -773,7 +956,7 @@ impl ResearchExperimentParams {
         for frequency_hz in self.band_weights.keys().copied() {
             if !VISUAL_BAND_FREQUENCIES_HZ.contains(&frequency_hz) {
                 errors.push(ParameterValidationError {
-                    field: "research.band_weights".to_owned(),
+                    field: "advanced.band_weights".to_owned(),
                     code: "unknown_frequency_band".to_owned(),
                     unit: "Hz".to_owned(),
                     value: Some(frequency_hz as f64),
@@ -787,14 +970,14 @@ impl ResearchExperimentParams {
             match self.band_weights.get(&frequency_hz) {
                 Some(weight) => validate_range(
                     errors,
-                    &format!("research.band_weights.{frequency_hz}"),
+                    &format!("advanced.band_weights.{frequency_hz}"),
                     "倍",
                     *weight,
                     0.5,
                     1.5,
                 ),
                 None => errors.push(ParameterValidationError {
-                    field: "research.band_weights".to_owned(),
+                    field: "advanced.band_weights".to_owned(),
                     code: "missing_frequency_band".to_owned(),
                     unit: "Hz".to_owned(),
                     value: Some(frequency_hz as f64),
@@ -806,7 +989,7 @@ impl ResearchExperimentParams {
         }
         validate_optional_range(
             errors,
-            "research.target_frequency_hz",
+            "advanced.target_frequency_hz",
             "Hz",
             self.target_frequency_hz,
             65.0,
@@ -814,7 +997,7 @@ impl ResearchExperimentParams {
         );
         validate_optional_range(
             errors,
-            "research.core_frequency_hz",
+            "advanced.core_frequency_hz",
             "Hz",
             self.core_frequency_hz,
             65.0,
@@ -822,7 +1005,7 @@ impl ResearchExperimentParams {
         );
         if self.target_frequency_hz.is_none() && self.core_frequency_hz.is_some() {
             errors.push(ParameterValidationError {
-                field: "research.core_frequency_hz".to_owned(),
+                field: "advanced.core_frequency_hz".to_owned(),
                 code: "invalid_relation".to_owned(),
                 unit: "Hz".to_owned(),
                 value: self.core_frequency_hz,
@@ -833,7 +1016,7 @@ impl ResearchExperimentParams {
         }
         validate_range(
             errors,
-            "research.wave_intensity",
+            "advanced.wave_intensity",
             "归一化",
             self.wave_intensity,
             0.0,
@@ -841,7 +1024,7 @@ impl ResearchExperimentParams {
         );
         validate_range(
             errors,
-            "research.wave_level",
+            "advanced.wave_level",
             "归一化",
             self.wave_level,
             0.0,
@@ -849,7 +1032,7 @@ impl ResearchExperimentParams {
         );
         validate_u32_range(
             errors,
-            "research.wave_grain_count",
+            "advanced.wave_grain_count",
             "个",
             self.wave_grain_count,
             1,
@@ -857,7 +1040,7 @@ impl ResearchExperimentParams {
         );
         validate_range(
             errors,
-            "research.dynamic_eq_threshold",
+            "advanced.dynamic_eq_threshold",
             "归一化刻度",
             self.dynamic_eq_threshold,
             0.0,
@@ -865,7 +1048,7 @@ impl ResearchExperimentParams {
         );
         validate_range(
             errors,
-            "research.channel_offset_percent",
+            "advanced.channel_offset_percent",
             "%",
             self.channel_offset_percent,
             -10.0,
@@ -873,7 +1056,7 @@ impl ResearchExperimentParams {
         );
         validate_u8_range(
             errors,
-            "research.space_dimension",
+            "advanced.space_dimension",
             "维",
             self.space_dimension,
             1,
@@ -881,7 +1064,7 @@ impl ResearchExperimentParams {
         );
         validate_range(
             errors,
-            "research.frequency_space_x_offset_px",
+            "advanced.frequency_space_x_offset_px",
             "px",
             self.frequency_space_x_offset_px,
             -10.0,
@@ -889,7 +1072,7 @@ impl ResearchExperimentParams {
         );
         validate_range(
             errors,
-            "research.frequency_space_y_offset_px",
+            "advanced.frequency_space_y_offset_px",
             "px",
             self.frequency_space_y_offset_px,
             -10.0,
@@ -897,7 +1080,7 @@ impl ResearchExperimentParams {
         );
         validate_range(
             errors,
-            "research.frame_perturbation_probability_percent",
+            "advanced.frame_perturbation_probability_percent",
             "%",
             self.frame_perturbation_probability_percent,
             0.0,
@@ -905,7 +1088,7 @@ impl ResearchExperimentParams {
         );
         validate_range(
             errors,
-            "research.random_graphic_opacity_percent",
+            "advanced.random_graphic_opacity_percent",
             "%",
             self.random_graphic_opacity_percent,
             0.0,
@@ -913,7 +1096,7 @@ impl ResearchExperimentParams {
         );
         validate_range(
             errors,
-            "research.random_graphic_size_px",
+            "advanced.random_graphic_size_px",
             "px",
             self.random_graphic_size_px,
             1.0,
@@ -921,7 +1104,7 @@ impl ResearchExperimentParams {
         );
         validate_u8_range(
             errors,
-            "research.abstract_face_count",
+            "advanced.abstract_face_count",
             "个",
             self.abstract_face_count,
             0,
@@ -929,7 +1112,7 @@ impl ResearchExperimentParams {
         );
         validate_range(
             errors,
-            "research.abstract_face_size_percent",
+            "advanced.abstract_face_size_percent",
             "%/width",
             self.abstract_face_size_percent,
             1.0,
@@ -937,7 +1120,7 @@ impl ResearchExperimentParams {
         );
         validate_range(
             errors,
-            "research.abstract_face_opacity_percent",
+            "advanced.abstract_face_opacity_percent",
             "%",
             self.abstract_face_opacity_percent,
             0.0,
@@ -945,7 +1128,7 @@ impl ResearchExperimentParams {
         );
         validate_range(
             errors,
-            "research.overlay_offset_px",
+            "advanced.overlay_offset_px",
             "px",
             self.overlay_offset_px,
             -10.0,
@@ -953,7 +1136,7 @@ impl ResearchExperimentParams {
         );
         validate_u64_range(
             errors,
-            "research.slice_length_ms",
+            "advanced.slice_length_ms",
             "ms",
             self.slice_length_ms,
             500,
@@ -961,7 +1144,7 @@ impl ResearchExperimentParams {
         );
         validate_u64_range(
             errors,
-            "research.slice_min_length_ms",
+            "advanced.slice_min_length_ms",
             "ms",
             self.slice_min_length_ms,
             1_000,
@@ -969,7 +1152,7 @@ impl ResearchExperimentParams {
         );
         validate_u64_range(
             errors,
-            "research.slice_trigger_interval_ms",
+            "advanced.slice_trigger_interval_ms",
             "ms",
             self.slice_trigger_interval_ms,
             5_000,
@@ -977,13 +1160,128 @@ impl ResearchExperimentParams {
         );
         if self.slice_trigger_interval_ms < self.slice_length_ms {
             errors.push(ParameterValidationError {
-                field: "research.slice_trigger_interval_ms".to_owned(),
+                field: "advanced.slice_trigger_interval_ms".to_owned(),
                 code: "invalid_relation".to_owned(),
                 unit: "ms".to_owned(),
                 value: Some(self.slice_trigger_interval_ms as f64),
                 min: Some(self.slice_length_ms as f64),
                 max: None,
                 message: "切片触发间隔不能短于切片长度".to_owned(),
+            });
+        }
+        validate_u8_range(
+            errors,
+            "advanced.random_graphic_count",
+            "个",
+            self.random_graphic_count,
+            1,
+            32,
+        );
+        validate_range(
+            errors,
+            "advanced.picture_in_picture_scale_percent",
+            "%",
+            self.picture_in_picture_scale_percent,
+            10.0,
+            50.0,
+        );
+        validate_range(
+            errors,
+            "advanced.picture_in_picture_opacity_percent",
+            "%",
+            self.picture_in_picture_opacity_percent,
+            0.0,
+            100.0,
+        );
+        validate_range(
+            errors,
+            "advanced.picture_in_picture_rotation_degrees",
+            "°",
+            self.picture_in_picture_rotation_degrees,
+            -15.0,
+            15.0,
+        );
+        validate_range(
+            errors,
+            "advanced.picture_in_picture_pixel_jitter_px",
+            "px",
+            self.picture_in_picture_pixel_jitter_px,
+            0.0,
+            4.0,
+        );
+        validate_range(
+            errors,
+            "advanced.local_blur_region_percent",
+            "%",
+            self.local_blur_region_percent,
+            5.0,
+            50.0,
+        );
+        validate_range(
+            errors,
+            "advanced.local_blur_radius_px",
+            "px",
+            self.local_blur_radius_px,
+            0.1,
+            16.0,
+        );
+        validate_u64_range(
+            errors,
+            "advanced.local_blur_interval_ms",
+            "ms",
+            self.local_blur_interval_ms,
+            500,
+            60_000,
+        );
+        validate_range(
+            errors,
+            "advanced.edge_feather_percent",
+            "%",
+            self.edge_feather_percent,
+            0.0,
+            100.0,
+        );
+        validate_u64_range(
+            errors,
+            "advanced.transform_smoothing_duration_ms",
+            "ms",
+            self.transform_smoothing_duration_ms,
+            50,
+            5_000,
+        );
+        validate_u64_range(
+            errors,
+            "advanced.highlight_perturbation_interval_ms",
+            "ms",
+            self.highlight_perturbation_interval_ms,
+            500,
+            60_000,
+        );
+        validate_range(
+            errors,
+            "advanced.asynchronous_rotation_min_degrees",
+            "°",
+            self.asynchronous_rotation_min_degrees,
+            -15.0,
+            15.0,
+        );
+        validate_range(
+            errors,
+            "advanced.asynchronous_rotation_max_degrees",
+            "°",
+            self.asynchronous_rotation_max_degrees,
+            -15.0,
+            15.0,
+        );
+        if self.asynchronous_rotation_min_degrees > self.asynchronous_rotation_max_degrees {
+            errors.push(ParameterValidationError {
+                field: "advanced.asynchronous_rotation_max_degrees".to_owned(),
+                code: "invalid_relation".to_owned(),
+                unit: "°".to_owned(),
+                value: Some(self.asynchronous_rotation_max_degrees),
+                min: Some(self.asynchronous_rotation_min_degrees),
+                max: Some(15.0),
+                message: "异步旋转最大角度不能小于最小角度".to_owned(),
             });
         }
     }
@@ -1090,25 +1388,25 @@ fn validate_u16_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioResearchParams, LocalResearchParams, VideoResearchParams, VISUAL_BAND_FREQUENCIES_HZ,
+        AudioEffectParams, MediaEffectParams, VideoEffectParams, VISUAL_BAND_FREQUENCIES_HZ,
     };
 
     #[test]
     fn default_parameters_are_serializable_and_valid() {
-        let params = LocalResearchParams::default();
+        let params = MediaEffectParams::default();
 
         assert!(params.validate().is_ok());
 
         let encoded = serde_json::to_string(&params).expect("default params should serialize");
-        let decoded: LocalResearchParams =
+        let decoded: MediaEffectParams =
             serde_json::from_str(&encoded).expect("serialized params should deserialize");
         assert_eq!(decoded, params);
     }
 
     #[test]
     fn normal_values_are_accepted() {
-        let params = LocalResearchParams {
-            audio: AudioResearchParams {
+        let params = MediaEffectParams {
+            audio: AudioEffectParams {
                 random_change_period_ms: 4_000,
                 pitch_shift_semitones: -1.5,
                 spectral_perturbation_percent: 4.0,
@@ -1119,9 +1417,9 @@ mod tests {
                 current_formant_hz: Some(120.0),
                 filter_q: 0.8,
                 voice_library_id: Some("source".to_owned()),
-                ..AudioResearchParams::default()
+                ..AudioEffectParams::default()
             },
-            video: VideoResearchParams {
+            video: VideoEffectParams {
                 brightness_percent: 5.0,
                 saturation_percent: 105.0,
                 blur_radius_px: 1.0,
@@ -1139,17 +1437,35 @@ mod tests {
                 space_x_offset_px: 1.0,
                 space_y_offset_px: -1.0,
                 color_space_conversion_strength_percent: 10.0,
-                ..VideoResearchParams::default()
+                ..VideoEffectParams::default()
             },
-            ..LocalResearchParams::default()
+            ..MediaEffectParams::default()
         };
 
         assert!(params.validate().is_ok());
     }
 
     #[test]
+    fn random_change_period_accepts_500_ms_boundary() {
+        let mut params = AudioEffectParams {
+            random_change_period_ms: 500,
+            ..Default::default()
+        };
+
+        assert!(params.validate().is_ok());
+
+        params.random_change_period_ms = 499;
+        let errors = params.validate().expect_err("499 ms should be rejected");
+        assert!(errors.iter().any(|error| {
+            error.field == "audio.random_change_period_ms"
+                && error.min == Some(500.0)
+                && error.max == Some(60_000.0)
+        }));
+    }
+
+    #[test]
     fn ordinary_audio_processing_defaults_and_ranges_are_enforced() {
-        let defaults = AudioResearchParams::default();
+        let defaults = AudioEffectParams::default();
         assert_eq!(defaults.playback_speed, 1.0);
         assert_eq!(defaults.low_eq_db, 0.0);
         assert_eq!(defaults.mid_eq_db, 0.0);
@@ -1191,17 +1507,17 @@ mod tests {
             [65, 92, 131, 188, 267, 381, 544, 777, 1110, 1585, 2263, 20_000]
         );
 
-        let params = LocalResearchParams::default();
-        let frequencies: Vec<_> = params.research.band_weights.keys().copied().collect();
+        let params = MediaEffectParams::default();
+        let frequencies: Vec<_> = params.advanced.band_weights.keys().copied().collect();
         assert_eq!(frequencies, VISUAL_BAND_FREQUENCIES_HZ);
     }
 
     #[test]
     fn out_of_range_values_return_structured_errors() {
-        let mut params = LocalResearchParams::default();
+        let mut params = MediaEffectParams::default();
         params.audio.pitch_shift_semitones = 3.0;
         params.video.brightness_percent = -101.0;
-        params.research.band_weights.insert(64, 1.0);
+        params.advanced.band_weights.insert(64, 1.0);
 
         let errors = params.validate().expect_err("invalid params should fail");
 
@@ -1216,7 +1532,7 @@ mod tests {
                 && error.unit == "%"
         }));
         assert!(errors.iter().any(|error| {
-            error.field == "research.band_weights"
+            error.field == "advanced.band_weights"
                 && error.code == "unknown_frequency_band"
                 && error.unit == "Hz"
         }));
@@ -1224,18 +1540,60 @@ mod tests {
 
     #[test]
     fn slice_trigger_interval_cannot_be_shorter_than_slice() {
-        let mut params = LocalResearchParams::default();
-        params.research.slice_length_ms = 10_000;
-        params.research.slice_trigger_interval_ms = 5_000;
+        let mut params = MediaEffectParams::default();
+        params.advanced.slice_length_ms = 10_000;
+        params.advanced.slice_trigger_interval_ms = 5_000;
 
         let errors = params
             .validate()
             .expect_err("invalid slice timing should fail");
 
         assert!(errors.iter().any(|error| {
-            error.field == "research.slice_trigger_interval_ms"
+            error.field == "advanced.slice_trigger_interval_ms"
                 && error.code == "invalid_relation"
                 && error.unit == "ms"
+        }));
+    }
+
+    #[test]
+    fn newly_formalized_effect_ranges_are_enforced() {
+        let mut params = MediaEffectParams::default();
+        params.audio.high_frequency_perturbation_strength_percent = 20.1;
+        params.video.rotation_degrees = 180.1;
+        params.advanced.picture_in_picture_scale_percent = 9.9;
+        params.advanced.picture_in_picture_opacity_percent = 100.1;
+
+        let errors = params
+            .validate()
+            .expect_err("out-of-range formal effect params should be rejected");
+        assert!(errors
+            .iter()
+            .any(|error| { error.field == "audio.high_frequency_perturbation_strength_percent" }));
+        assert!(errors
+            .iter()
+            .any(|error| error.field == "video.rotation_degrees"));
+        assert!(errors
+            .iter()
+            .any(|error| { error.field == "advanced.picture_in_picture_scale_percent" }));
+        assert!(errors.iter().any(|error| {
+            error.field == "advanced.picture_in_picture_opacity_percent"
+                && error.code == "out_of_range"
+        }));
+    }
+
+    #[test]
+    fn asynchronous_rotation_range_must_be_ordered() {
+        let mut params = MediaEffectParams::default();
+        params.advanced.asynchronous_rotation_min_degrees = 2.0;
+        params.advanced.asynchronous_rotation_max_degrees = -2.0;
+
+        let errors = params
+            .advanced
+            .validate()
+            .expect_err("reversed rotation range should be rejected");
+        assert!(errors.iter().any(|error| {
+            error.field == "advanced.asynchronous_rotation_max_degrees"
+                && error.code == "invalid_relation"
         }));
     }
 }

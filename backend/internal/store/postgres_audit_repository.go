@@ -36,6 +36,10 @@ func (s *PostgresRepository) RecordAudit(ctx context.Context, input controlplane
 	if err := validateNormalizedAuditTargetProduct(operationCtx, tx, input); err != nil {
 		return err
 	}
+	input, err = clearMissingFailureAuditDeviceReference(operationCtx, tx, input)
+	if err != nil {
+		return err
+	}
 	id, err := newRepositoryID("audit")
 	if err != nil {
 		return postgresOperationError(operationCtx, fmt.Errorf("generate normalized audit id: %w", err))
@@ -52,6 +56,22 @@ func (s *PostgresRepository) RecordAudit(ctx context.Context, input controlplane
 		return postgresCommitError(operationCtx, "commit normalized audit", err)
 	}
 	return nil
+}
+
+func clearMissingFailureAuditDeviceReference(ctx context.Context, tx *sql.Tx, input controlplane.AuditLogInput) (controlplane.AuditLogInput, error) {
+	if input.Outcome != "failure" || input.DeviceID == "" {
+		return input, nil
+	}
+	var deviceID string
+	err := tx.QueryRowContext(ctx, "SELECT id FROM devices WHERE id = $1 AND product = $2 LIMIT 1", input.DeviceID, input.Product).Scan(&deviceID)
+	if err == nil {
+		return input, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		input.DeviceID = ""
+		return input, nil
+	}
+	return controlplane.AuditLogInput{}, postgresOperationError(ctx, fmt.Errorf("validate failure audit device reference: %w", err))
 }
 
 func normalizeAuditInput(input controlplane.AuditLogInput) (controlplane.AuditLogInput, error) {

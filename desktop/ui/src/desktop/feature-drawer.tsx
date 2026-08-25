@@ -32,12 +32,14 @@ export function FeatureDrawer({
       width={`min(${width}px, 100vw)`}
       open={open}
       onClose={onClose}
+      autoFocus
+      keyboard
       destroyOnHidden
       footer={footer ? <div className="feature-drawer-footer">{footer}</div> : undefined}
       styles={{
-        header: { padding: '14px 16px', background: '#17171c', borderBottomColor: '#303139' },
-        body: { padding: 12, background: '#0f0f14' },
-        footer: { padding: '10px 16px', background: '#17171c', borderTopColor: '#303139' },
+        header: { flex: '0 0 auto', padding: '14px 16px', background: '#17171c', borderBottomColor: '#303139' },
+        body: { minHeight: 0, padding: 12, overflowY: 'auto', background: '#0f0f14' },
+        footer: { flex: '0 0 auto', padding: '10px 16px', background: '#17171c', borderTopColor: '#303139' },
         mask: { background: 'rgba(0, 0, 0, 0.64)' },
       }}
     >

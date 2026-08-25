@@ -18,9 +18,8 @@ export type PlaybackMediaStateMessage = {
 };
 
 export type PlaybackMediaControlMessage =
-  | { version: 1; type: 'playback-media-control'; action: 'seek'; current_time: number }
+  | { version: 1; type: 'playback-media-control'; action: 'seek'; current_time: number; playback_generation: number }
   | { version: 1; type: 'playback-media-control'; action: 'set-volume'; volume: number }
-  | { version: 1; type: 'playback-media-control'; action: 'set-playback-rate'; playback_rate: number }
   | { version: 1; type: 'playback-media-control'; action: 'toggle-muted' };
 
 export type AudioSyncClock = {
@@ -37,16 +36,17 @@ export type PlaybackCommand =
   | 'stop_playback'
   | 'start_playback';
 
+export type PlaybackPositionCheckpoint = {
+  playbackGeneration: number;
+  positionSec: number;
+};
+
 function isFiniteNonNegative(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
 function isVolume(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
-}
-
-function isPlaybackRate(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0.5 && value <= 2;
 }
 
 function isSafeNonNegativeInteger(value: unknown): value is number {
@@ -99,10 +99,53 @@ export function isPlaybackMediaControlMessage(value: unknown): value is Playback
   if (!value || typeof value !== 'object') return false;
   const record = value as Record<string, unknown>;
   if (record.version !== 1 || record.type !== 'playback-media-control') return false;
-  if (record.action === 'seek') return isFiniteNonNegative(record.current_time);
+  if (record.action === 'seek') {
+    return isFiniteNonNegative(record.current_time)
+      && isSafeNonNegativeInteger(record.playback_generation);
+  }
   if (record.action === 'set-volume') return isVolume(record.volume);
-  if (record.action === 'set-playback-rate') return isPlaybackRate(record.playback_rate);
   return record.action === 'toggle-muted';
+}
+
+export function shouldApplyPlaybackSeek(
+  message: PlaybackMediaControlMessage,
+  currentPlaybackGeneration: number | null | undefined,
+): boolean {
+  return message.action === 'seek'
+    && isSafeNonNegativeInteger(currentPlaybackGeneration)
+    && message.playback_generation === currentPlaybackGeneration;
+}
+
+export function capturePlaybackPosition(
+  current: PlaybackPositionCheckpoint | null,
+  input: {
+    playbackGeneration: number;
+    loadedPlaybackGeneration: number | null;
+    positionSec: number;
+    transitionInFlight: boolean;
+  },
+): PlaybackPositionCheckpoint | null {
+  if (
+    input.transitionInFlight
+    || input.loadedPlaybackGeneration !== input.playbackGeneration
+    || !Number.isFinite(input.positionSec)
+    || input.positionSec < 0
+  ) {
+    return current;
+  }
+  return {
+    playbackGeneration: input.playbackGeneration,
+    positionSec: input.positionSec,
+  };
+}
+
+export function resolvePlaybackResumePosition(
+  checkpoint: PlaybackPositionCheckpoint | null,
+  playbackGeneration: number | null | undefined,
+): number {
+  return checkpoint && checkpoint.playbackGeneration === playbackGeneration
+    ? checkpoint.positionSec
+    : 0;
 }
 
 export function clampMediaTime(value: number, duration: number): number {

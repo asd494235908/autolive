@@ -1,3 +1,4 @@
+use crate::bounded_io::{read_to_end_bounded, BoundedReadError};
 use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,6 +17,10 @@ const RELEASE: &str = "v0.1.0";
 const RUNTIME_RESOURCES_DIRECTORY: &str = "runtime-resources";
 const EMBEDDED_RESOURCE_DIRECTORY: &str = "embedded-runtime-resources";
 const MAX_HTTP_REQUESTS: usize = 3;
+const MAX_RUNTIME_MANIFEST_BYTES: usize = 256 * 1024;
+const MAX_RUNTIME_MANIFEST_FILES: usize = 16;
+const MAX_RUNTIME_MANIFEST_PATH_BYTES: usize = 512;
+const MAX_RUNTIME_MANIFEST_DECLARED_BYTES: u64 = 1024 * 1024 * 1024;
 const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(50)];
 const SUPPORTED_TARGETS: [&str; 3] = [
     "x86_64-apple-darwin",
@@ -110,6 +115,11 @@ impl RuntimeResourceManifest {
         bytes: &[u8],
         mode: ValidationMode,
     ) -> Result<Self, ManifestValidationError> {
+        if bytes.len() > MAX_RUNTIME_MANIFEST_BYTES {
+            return Err(ManifestValidationError(format!(
+                "manifest exceeds {MAX_RUNTIME_MANIFEST_BYTES} byte limit"
+            )));
+        }
         let manifest: Self = serde_json::from_slice(bytes)
             .map_err(|error| ManifestValidationError(format!("invalid manifest JSON: {error}")))?;
         manifest.validate(&mode)?;
@@ -138,9 +148,29 @@ impl RuntimeResourceManifest {
                 "manifest must contain files".to_owned(),
             ));
         }
+        if self.files.len() > MAX_RUNTIME_MANIFEST_FILES {
+            return Err(ManifestValidationError(format!(
+                "manifest contains more than {MAX_RUNTIME_MANIFEST_FILES} files"
+            )));
+        }
+        let declared_bytes = self.files.iter().try_fold(0_u64, |total, file| {
+            total.checked_add(file.size_bytes).ok_or_else(|| {
+                ManifestValidationError("manifest declared size overflows u64".to_owned())
+            })
+        })?;
+        if declared_bytes > MAX_RUNTIME_MANIFEST_DECLARED_BYTES {
+            return Err(ManifestValidationError(format!(
+                "manifest declares more than {MAX_RUNTIME_MANIFEST_DECLARED_BYTES} bytes"
+            )));
+        }
 
         let mut paths = HashSet::with_capacity(self.files.len());
         for file in &self.files {
+            if file.relative_path.len() > MAX_RUNTIME_MANIFEST_PATH_BYTES {
+                return Err(ManifestValidationError(format!(
+                    "manifest path exceeds {MAX_RUNTIME_MANIFEST_PATH_BYTES} bytes"
+                )));
+            }
             if file.sha256.len() != 64
                 || !file
                     .sha256
@@ -364,8 +394,17 @@ fn read_production_manifest(
     expected_target: &str,
 ) -> Result<RuntimeResourceManifest, ResourceInstallError> {
     let manifest_path = resource_dir.join("runtime-resources.json");
-    let manifest_bytes = fs::read(&manifest_path)
-        .map_err(|error| io_error("read manifest", &manifest_path, error))?;
+    let manifest_file = File::open(&manifest_path)
+        .map_err(|error| io_error("open manifest", &manifest_path, error))?;
+    let manifest_bytes = read_to_end_bounded(manifest_file, MAX_RUNTIME_MANIFEST_BYTES).map_err(
+        |error| match error {
+            BoundedReadError::Io(error) => io_error("read manifest", &manifest_path, error),
+            BoundedReadError::LimitExceeded { limit } => ResourceInstallError::Manifest(format!(
+                "runtime resource manifest {} exceeds {limit} byte limit",
+                manifest_path.display()
+            )),
+        },
+    )?;
     let manifest =
         RuntimeResourceManifest::parse_and_validate(&manifest_bytes, ValidationMode::Production)
             .map_err(|error| {
@@ -1650,14 +1689,82 @@ mod tests {
     use super::{
         remove_capability_entry, ManifestComponent, ManifestFile, ResourceInstallError,
         RuntimeResourceComponent, RuntimeResourceInstaller, RuntimeResourceManifest,
-        RuntimeResourceState, RuntimeResourceStatus, PRODUCTION_BASE_URL, RELEASE,
+        RuntimeResourceState, RuntimeResourceStatus, ValidationMode, MAX_RUNTIME_MANIFEST_BYTES,
+        PRODUCTION_BASE_URL, RELEASE,
     };
     use cap_std::{ambient_authority, fs::Dir};
+    use serde_json::json;
     use std::ffi::OsStr;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn manifest_bytes(files: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "release": RELEASE,
+            "target": "aarch64-apple-darwin",
+            "base_url": PRODUCTION_BASE_URL,
+            "files": files
+        }))
+        .expect("manifest fixture should serialize")
+    }
+
+    fn manifest_file(relative_path: String, size_bytes: u64) -> serde_json::Value {
+        json!({
+            "component": "media",
+            "relative_path": relative_path,
+            "size_bytes": size_bytes,
+            "sha256": "00".repeat(32),
+            "executable": true
+        })
+    }
+
+    #[test]
+    fn manifest_limits_input_to_256_kib() {
+        let mut bytes = manifest_bytes(json!([manifest_file(
+            "aarch64-apple-darwin/binaries/ffmpeg".to_owned(),
+            1,
+        )]));
+        bytes.resize(MAX_RUNTIME_MANIFEST_BYTES + 1, b' ');
+
+        let error = RuntimeResourceManifest::parse_and_validate(&bytes, ValidationMode::Production)
+            .expect_err("oversized manifest must be rejected before parsing");
+        assert!(error.to_string().contains("262144 byte limit"));
+    }
+
+    #[test]
+    fn manifest_limits_file_count_path_length_and_declared_size() {
+        let files = (0..17)
+            .map(|index| manifest_file(format!("aarch64-apple-darwin/binaries/ffmpeg-{index}"), 1))
+            .collect::<Vec<_>>();
+        let error = RuntimeResourceManifest::parse_and_validate(
+            &manifest_bytes(json!(files)),
+            ValidationMode::Production,
+        )
+        .expect_err("17 files must be rejected");
+        assert!(error.to_string().contains("more than 16 files"));
+
+        let prefix = "aarch64-apple-darwin/binaries/";
+        let path = format!("{prefix}{}", "a".repeat(513 - prefix.len()));
+        let error = RuntimeResourceManifest::parse_and_validate(
+            &manifest_bytes(json!([manifest_file(path, 1)])),
+            ValidationMode::Production,
+        )
+        .expect_err("513-byte path must be rejected");
+        assert!(error.to_string().contains("512 bytes"));
+
+        let error = RuntimeResourceManifest::parse_and_validate(
+            &manifest_bytes(json!([manifest_file(
+                "aarch64-apple-darwin/binaries/ffmpeg".to_owned(),
+                1024_u64 * 1024 * 1024 + 1,
+            )])),
+            ValidationMode::Production,
+        )
+        .expect_err("declared size above one GiB must be rejected");
+        assert!(error.to_string().contains("1073741824 bytes"));
+    }
 
     #[test]
     fn capability_entry_removal_handles_files_directories_and_keeps_both_errors() {

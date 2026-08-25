@@ -49,8 +49,9 @@ export function getOrCreateDeviceId(storage?: Storage | null): string {
 
 export function buildDeviceRegistration(deviceId: string, appVersion = __APP_VERSION__) {
   return {
+    product: 'autolive' as const,
     device_id: deviceId,
-    device_name: 'autoLive Desktop',
+    device_name: 'GPAL Desktop',
     platform: typeof navigator !== 'undefined' ? navigator.platform || 'desktop' : 'desktop',
     app_version: appVersion,
     ...(typeof navigator !== 'undefined' && navigator.userAgent ? { os_version: navigator.userAgent.slice(0, 256) } : {}),

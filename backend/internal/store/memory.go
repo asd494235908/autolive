@@ -52,6 +52,7 @@ type State struct {
 	Devices                   map[string]controlplane.DeviceSummary
 	ActivationCodes           map[string]ActivationCodeRecord
 	ActivationCodeIndex       map[string]string
+	ActivationDeviceBindings  map[string]string
 	ModelPoolAccounts         map[string]controlplane.ModelPoolAccountSummary
 	ModelLeases               map[string]controlplane.ModelLease
 	ModelUsageRecords         map[string]controlplane.ModelUsageRecord
@@ -102,6 +103,7 @@ func NewState() *State {
 		Devices:                   map[string]controlplane.DeviceSummary{},
 		ActivationCodes:           map[string]ActivationCodeRecord{},
 		ActivationCodeIndex:       map[string]string{},
+		ActivationDeviceBindings:  map[string]string{},
 		ModelPoolAccounts:         map[string]controlplane.ModelPoolAccountSummary{},
 		ModelLeases:               map[string]controlplane.ModelLease{},
 		ModelUsageRecords:         map[string]controlplane.ModelUsageRecord{},
@@ -155,6 +157,9 @@ func ensureStateMaps(state *State) *State {
 	}
 	if state.ActivationCodeIndex == nil {
 		state.ActivationCodeIndex = defaults.ActivationCodeIndex
+	}
+	if state.ActivationDeviceBindings == nil {
+		state.ActivationDeviceBindings = defaults.ActivationDeviceBindings
 	}
 	if state.ModelPoolAccounts == nil {
 		state.ModelPoolAccounts = defaults.ModelPoolAccounts

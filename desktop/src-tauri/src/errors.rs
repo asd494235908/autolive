@@ -7,6 +7,11 @@ use crate::PlaybackState;
 pub enum PlaybackError {
     EmptyWindowId,
     SourceMediaRequired,
+    SourceMediaPoolEmpty,
+    SourceMediaPoolTooLarge {
+        max: usize,
+        actual: usize,
+    },
     InvalidMediaProcessingOutput,
     StaleMediaProcessing,
     InvalidTransition {
@@ -24,6 +29,10 @@ impl Display for PlaybackError {
         match self {
             Self::EmptyWindowId => f.write_str("播放窗口标识不能为空"),
             Self::SourceMediaRequired => f.write_str("请先导入一个源视频"),
+            Self::SourceMediaPoolEmpty => f.write_str("播放池至少需要一个源视频"),
+            Self::SourceMediaPoolTooLarge { max, actual } => {
+                write!(f, "播放池最多允许 {max} 个源视频，实际收到 {actual} 个")
+            }
             Self::InvalidMediaProcessingOutput => f.write_str("媒体处理输出无效"),
             Self::StaleMediaProcessing => f.write_str("媒体处理结果已过期"),
             Self::WindowAlreadyBound {

@@ -11,24 +11,14 @@ func TestUnbindDeviceUsesUnboundResponseWithoutUserID(t *testing.T) {
 	token := loginForTest(t, handler)
 
 	create := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
+		"user_id":     "usr_local_admin",
 		"expires_at":  testActivationExpiresAt(),
 		"max_devices": 1,
 	}, token, "unbind-contract-code")
 	if create.Code != http.StatusCreated {
 		t.Fatalf("create activation code status = %d, want %d; body=%s", create.Code, http.StatusCreated, create.Body.String())
 	}
-	var codePayload struct {
-		ActivationCode struct {
-			PlainCode string `json:"plain_code"`
-		} `json:"activation_code"`
-	}
-	decodeJSON(t, create.Body.Bytes(), &codePayload)
-	if codePayload.ActivationCode.PlainCode == "" {
-		t.Fatal("activation response did not include one-time plain code")
-	}
-
 	activate := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", map[string]any{
-		"activation_code": codePayload.ActivationCode.PlainCode,
 		"device": map[string]any{
 			"product":     "autolive",
 			"device_id":   "dev_unbind1",
@@ -65,20 +55,14 @@ func TestDeviceActivationAuditUsesDeviceTargetWithoutPlainCode(t *testing.T) {
 	handler := newTestRouter(t)
 	token := loginForTest(t, handler)
 	create := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
+		"user_id":     "usr_local_admin",
 		"expires_at":  testActivationExpiresAt(),
 		"max_devices": 1,
 	}, token, "audit-activation-code")
 	if create.Code != http.StatusCreated {
 		t.Fatalf("create activation code status = %d, want %d; body=%s", create.Code, http.StatusCreated, create.Body.String())
 	}
-	var codePayload struct {
-		ActivationCode struct {
-			PlainCode string `json:"plain_code"`
-		} `json:"activation_code"`
-	}
-	decodeJSON(t, create.Body.Bytes(), &codePayload)
 	activate := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", map[string]any{
-		"activation_code": codePayload.ActivationCode.PlainCode,
 		"device": map[string]any{
 			"product":     "autolive",
 			"device_id":   "dev_audit_activation",
@@ -109,5 +93,41 @@ func TestDeviceActivationAuditUsesDeviceTargetWithoutPlainCode(t *testing.T) {
 		if _, leaked := item["activation_code"]; leaked {
 			t.Fatalf("device activation audit leaked activation code: %v", item)
 		}
+	}
+}
+
+func TestRevokeFullAccountAuthorizationAllowsUsedStatus(t *testing.T) {
+	handler := newTestRouter(t)
+	token := loginForTest(t, handler)
+	create := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
+		"user_id":     "usr_local_admin",
+		"expires_at":  testActivationExpiresAt(),
+		"max_devices": 1,
+	}, token, "revoke-full-code")
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create activation code status = %d, want %d; body=%s", create.Code, http.StatusCreated, create.Body.String())
+	}
+	var created activationCodeEnvelope
+	decodeJSON(t, create.Body.Bytes(), &created)
+	activate := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", map[string]any{
+		"device": map[string]any{
+			"product":     "autolive",
+			"device_id":   "dev_revoke_full",
+			"device_name": "Revoked Device",
+			"platform":    "windows",
+			"app_version": "1.0.0",
+		},
+	}, token, "revoke-full-activate")
+	if activate.Code != http.StatusOK {
+		t.Fatalf("activate status = %d, want %d; body=%s", activate.Code, http.StatusOK, activate.Body.String())
+	}
+	revoke := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes/"+created.ActivationCode.ID+"/revoke", nil, token, "revoke-full-request")
+	if revoke.Code != http.StatusOK {
+		t.Fatalf("revoke used authorization status = %d, want %d; body=%s", revoke.Code, http.StatusOK, revoke.Body.String())
+	}
+	var revoked activationCodeEnvelope
+	decodeJSON(t, revoke.Body.Bytes(), &revoked)
+	if revoked.ActivationCode.Status != "revoked" {
+		t.Fatalf("revoke used authorization response = %+v", revoked.ActivationCode)
 	}
 }

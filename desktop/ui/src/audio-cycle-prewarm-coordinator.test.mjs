@@ -88,3 +88,27 @@ test('prepare 消息只接受绝对媒体时间目标，不接受旧墙钟字段
     target_at_ms: Date.now(),
   }), false);
 });
+
+test('候选数字静音作为已接受的跳过结果携带稳定原因码', () => {
+  const skipped = {
+    version: 1,
+    type: 'audio-cycle-result',
+    action: 'commit',
+    candidate_id: 7,
+    accepted: true,
+    committed: false,
+    reason: '候选音轨首段为数字静音，保持当前音轨',
+    error_code: 'audio_mixer_candidate_silent',
+  };
+
+  assert.equal(coordinator.isAudioCycleResultMessage(skipped), true);
+  assert.equal(coordinator.isAudioCycleResultMessage({ ...skipped, error_code: 7 }), false);
+  assert.equal(coordinator.isAudioCycleResultMessage({ ...skipped, reason: {} }), false);
+});
+
+test('候选数字静音和过期代次是预期跳过，真实故障仍需展示', () => {
+  assert.equal(coordinator.isExpectedAudioCycleSkipCode('audio_mixer_candidate_silent'), true);
+  assert.equal(coordinator.isExpectedAudioCycleSkipCode('audio_mixer_candidate_stale'), true);
+  assert.equal(coordinator.isExpectedAudioCycleSkipCode('audio_mixer_crossfade_failed'), false);
+  assert.equal(coordinator.isExpectedAudioCycleSkipCode(null), false);
+});

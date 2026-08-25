@@ -68,6 +68,7 @@ export function ControlPlaneHeartbeat({
         }
       }
       const request: HeartbeatRequestDto = {
+        product: 'autolive',
         device_id: deviceId,
         sent_at: new Date().toISOString(),
         status: {

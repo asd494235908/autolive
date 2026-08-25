@@ -42,7 +42,7 @@ export type RefreshTokenResponseDto = OpenAPISchemas['RefreshTokenResponse'];
 export type LogoutRequestDto = OpenAPISchemas['LogoutRequest'];
 export type LogoutResponseDto = OpenAPISchemas['LogoutResponse'];
 export type DeviceRegistrationDto = OpenAPISchemas['DeviceRegistration'];
-export type ActivateDeviceRequestDto = OpenAPISchemas['ActivateDeviceRequest'];
+export type ActivateDeviceRequestDto = Pick<OpenAPISchemas['ActivateDeviceRequest'], 'device'>;
 export type ActivateDeviceResponseDto = OpenAPISchemas['ActivateDeviceResponse'];
 export type ClientProfileResponseDto = OpenAPISchemas['ClientProfileResponse'];
 export type HeartbeatRequestDto = OpenAPISchemas['HeartbeatRequest'];
@@ -65,7 +65,51 @@ export class ControlPlaneError extends Error {
     this.details = input.details;
   }
 }
-async function parseJsonSafely(response: Response): Promise<unknown> { const text = await response.text(); if (!text) return null; try { return JSON.parse(text) as unknown } catch { return text } }
+const CONTROL_PLANE_MAX_RESPONSE_BYTES = 1024 * 1024;
+
+function createResponseTooLargeError(requestId: string) {
+  return new ControlPlaneError({
+    code: 'CONTROL_PLANE_RESPONSE_TOO_LARGE',
+    message: '控制面响应超过 1 MiB 限制',
+    status: 502,
+    requestId,
+  });
+}
+
+async function readBoundedResponseText(response: Response, requestId: string): Promise<string> {
+  const contentLength = response.headers.get('content-length')?.trim();
+  if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > CONTROL_PLANE_MAX_RESPONSE_BYTES) {
+    await response.body?.cancel().catch(() => undefined);
+    throw createResponseTooLargeError(requestId);
+  }
+  if (!response.body) return '';
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > CONTROL_PLANE_MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw createResponseTooLargeError(requestId);
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function parseJsonSafely(response: Response, requestId: string): Promise<unknown> {
+  const text = await readBoundedResponseText(response, requestId);
+  if (!text) return null;
+  try { return JSON.parse(text) as unknown } catch { return text }
+}
 function createRequestId() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
   return `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
@@ -95,7 +139,7 @@ async function requestJson<T>(path: string, init: { method: 'GET' | 'POST'; body
     throw new ControlPlaneError({ code: 'NETWORK_ERROR', message: '网络异常，暂时无法连接到控制面', status: 0, requestId });
   }
   finally { clearTimeout(timeout) }
-  const payload = await parseJsonSafely(response);
+  const payload = await parseJsonSafely(response, requestId);
   if (!response.ok) {
     if (response.status === 503 && allowAuditRetry && init.method !== 'GET' && init.idempotencyKey && isRecord(payload) && payload.code === 'AUDIT_UNAVAILABLE') {
       return requestJson<T>(path, init, allowAuthRefresh, false);

@@ -1,12 +1,15 @@
 > 本文件是本项目的 Rust 开发约束。它基于外部规范整理，适用于本项目实际技术栈；如与用户当前要求、仓库事实或 `AGENTS.md` 冲突，以优先级更高的规则为准。
 >
-> 产品范围同步（2026-08-19）：本版本不开发实时话术幻化。Rust/Tauri 不得新增或开放 speech-to-speech、VAD/ASR/LLM/TTS、实时话术候选换轨或对应模型租约入口；历史兼容代码不得作为当前入口调用。
+> 产品范围同步（2026-08-24）：本版本不开发实时话术幻化。Rust/Tauri 不得新增或开放 speech-to-speech、VAD/ASR/LLM/TTS、实时话术候选换轨或对应模型租约入口。参考图中的媒体效果参数全部属于正式需求；未映射算法必须保持“待实现/未接入”。
 
 ## 本项目补充约束
 
 - Rust/Tauri 客户端遇到成熟、维护中且与当前版本兼容的 Crate 或官方 SDK 已经解决的能力时，必须优先使用，不得自行重新编写同类 HTTP、序列化、鉴权、加密、异步、文件、媒体播放或系统集成工具。
 - 只有现有成熟方案无法满足明确需求时，才允许自行实现；实现前必须记录原因、边界、测试方式和后续替换路径。
 - 新增 Crate 必须有真实调用点、版本策略、许可证和安全评估，不得为“以后可能用”保留依赖。
+- 当前媒体契约只使用 `MediaEffectParams`、`AudioEffectParams`、`VideoEffectParams`、`AdvancedEffectParams`、`get_default_media_effect_params`、`validate_media_effect_params`；旧 `research_*` 模块、报告 Worker 和 IPC 已移除，禁止重新引入别名或兼容调用。
+- `validate_media_effect_params` 只证明结构、有限值、范围和组合合法，不证明 FFmpeg/DSP/视觉算法已映射。每个字段必须能被归入“已实现并生效”“已有模型待接入”“正式需求但缺失”，Worker 对未接入字段必须返回结构化不可用状态，不得静默忽略或伪造运行成功。
+- 大多数基础音视频效果优先沿用现有 FFmpeg + Rust 调度；引入 ONNX Runtime、OpenCV、Rubber Band、RNNoise、Essentia 等依赖前必须有明确字段调用点、模型/质量基线、许可证与移除路径，不得仅因参数已正式化就预先加入依赖。
 
 # Rust AI 开发规范
 

@@ -169,6 +169,7 @@ type DeviceRegistration struct {
 type ActivationCode struct {
 	ID             string      `json:"id"`
 	Product        ProductCode `json:"product"`
+	UserID         string      `json:"user_id,omitempty"`
 	Status         string      `json:"status"`
 	ExpiresAt      string      `json:"expires_at"`
 	MaxDevices     int         `json:"max_devices"`
@@ -374,11 +375,11 @@ type ChangeLocalAdminPasswordInput struct {
 }
 
 type CreateActivationCodeInput struct {
+	UserID     string    `json:"user_id"`
 	ExpiresAt  time.Time `json:"expires_at"`
-	MaxDevices int       `json:"max_devices,omitempty"`
+	MaxDevices int       `json:"max_devices"`
 }
 
 type ActivateDeviceInput struct {
-	ActivationCode string             `json:"activation_code"`
-	Device         DeviceRegistration `json:"device"`
+	Device DeviceRegistration `json:"device"`
 }

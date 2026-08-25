@@ -15,7 +15,7 @@ export function DesktopTopbar() {
     <header className="desktop-topbar" data-tauri-drag-region>
       <div className="desktop-brand" data-tauri-drag-region>
         <img className="desktop-brand-icon" src="/app-icon.png" alt="" data-tauri-drag-region />
-        <span className="desktop-brand-name" data-tauri-drag-region>autoLive</span>
+        <span className="desktop-brand-name" data-tauri-drag-region>GpAutoLive</span>
         <span className="desktop-brand-subtitle" data-tauri-drag-region>本地单视频循环引擎</span>
       </div>
       <DesktopWindowControls />

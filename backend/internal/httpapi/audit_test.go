@@ -29,6 +29,7 @@ func TestAdminAuditLogsCaptureAuthenticatedMutationWithoutRequestBody(t *testing
 	token := loginForTest(t, handler)
 
 	createRec := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
+		"user_id":     "usr_local_admin",
 		"expires_at":  testActivationExpiresAt(),
 		"max_devices": 1,
 	}, token, "audit-create-code")

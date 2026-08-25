@@ -28,8 +28,18 @@ test('设备标识跨启动稳定且与钥匙串命名约束兼容', async () =>
 
   assert.equal(first, second);
   assert.match(first, /^desktop-[A-Za-z0-9-]+$/);
-  assert.equal(buildDeviceRegistration(first).device_id, first);
-  assert.equal(buildDeviceRegistration(first).device_name, 'autoLive Desktop');
+  assert.deepEqual(
+    {
+      product: buildDeviceRegistration(first).product,
+      device_id: buildDeviceRegistration(first).device_id,
+      device_name: buildDeviceRegistration(first).device_name,
+    },
+    {
+      product: 'autolive',
+      device_id: first,
+      device_name: 'GPAL Desktop',
+    },
+  );
 });
 
 test('超出钥匙串命名上限的旧标识会被替换', async () => {

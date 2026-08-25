@@ -30,6 +30,7 @@ pub fn handle_runtime_resource_exit(
 pub struct RuntimeResourceTask {
     status: Arc<Mutex<RuntimeResourceStatus>>,
     cancel: Arc<AtomicBool>,
+    shutting_down: AtomicBool,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -48,6 +49,7 @@ impl Default for RuntimeResourceTask {
                 error: None,
             })),
             cancel: Arc::new(AtomicBool::new(false)),
+            shutting_down: AtomicBool::new(false),
             worker: Mutex::new(None),
         }
     }
@@ -176,7 +178,7 @@ impl RuntimeResourceTask {
     }
 
     pub fn shutdown(&self, budget: Duration) -> Result<RuntimeResourceTaskShutdown, String> {
-        self.cancel.store(true, Ordering::Release);
+        self.begin_shutdown()?;
         let deadline = Instant::now() + budget;
         loop {
             {
@@ -201,12 +203,22 @@ impl RuntimeResourceTask {
         }
     }
 
+    pub fn begin_shutdown(&self) -> Result<(), String> {
+        let _worker = self.lock_worker()?;
+        self.shutting_down.store(true, Ordering::Release);
+        self.cancel.store(true, Ordering::Release);
+        Ok(())
+    }
+
     fn start_operation(
         &self,
         initial: RuntimeResourceStatus,
         operation: impl FnOnce(Arc<AtomicBool>, StatusUpdate) -> Result<(), String> + Send + 'static,
     ) -> Result<RuntimeResourceStatus, String> {
         let mut worker = self.lock_worker()?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("应用正在退出，不再接受新的运行资源任务".to_owned());
+        }
         self.reap_finished_locked(&mut worker)?;
         if worker.is_some() {
             return Ok(self.lock_status()?.clone());
@@ -569,6 +581,25 @@ mod tests {
             RuntimeResourceTaskShutdown::Joined
         );
         assert!(!task.worker_is_owned().expect("worker should be reaped"));
+    }
+
+    #[test]
+    fn shutdown_gate_rejects_a_late_runtime_resource_task() {
+        let task = RuntimeResourceTask::default();
+        assert_eq!(
+            task.shutdown(Duration::ZERO)
+                .expect("idle shutdown should succeed"),
+            RuntimeResourceTaskShutdown::Idle
+        );
+
+        let error = task
+            .start_operation(checking_status(), move |_cancel, _update| Ok(()))
+            .expect_err("shutdown gate must reject a late task");
+
+        assert!(error.contains("正在退出"));
+        assert!(!task
+            .worker_is_owned()
+            .expect("no worker should be installed"));
     }
 
     #[test]

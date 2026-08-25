@@ -1,0 +1,21 @@
+{
+  "name": "gpautolive-desktop-prototype",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && node scripts/prepare-sites-build.mjs",
+    "preview": "vite preview",
+    "test": "node --test tests/prototype-contract.test.mjs",
+    "test:sites": "node --test tests/sites-worker.test.mjs"
+  },
+  "dependencies": {
+    "@ant-design/icons": "5.6.1",
+    "@vitejs/plugin-react": "5.0.4",
+    "antd": "5.27.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "vite": "6.4.2"
+  }
+}

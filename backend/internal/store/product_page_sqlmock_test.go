@@ -29,9 +29,9 @@ func TestPostgresRepositoryProductScopedPagesKeepProductInCountAndListPredicates
 		expectNormalizedPageCoverage(mock)
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM activation_codes WHERE product = $1")).WithArgs(product).
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-		mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, code_prefix")).WithArgs(controlplane.ActivationCodeStatusActive, now, controlplane.ActivationCodeStatusExpired, product, 20, 0).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "product", "code_prefix", "status", "expires_at", "used_at", "used_by_user_id", "used_by_device_id", "max_devices", "bound_devices"}).
-				AddRow("ac_douyin", product, "code_douyin", controlplane.ActivationCodeStatusActive, now.Add(time.Hour), nil, nil, nil, 1, 0))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, bound_user_id, code_prefix")).WithArgs(controlplane.ActivationCodeStatusActive, now, controlplane.ActivationCodeStatusExpired, controlplane.ActivationCodeStatusUsed, product, 20, 0).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "product", "bound_user_id", "code_prefix", "status", "expires_at", "used_at", "used_by_user_id", "used_by_device_id", "max_devices", "bound_devices"}).
+				AddRow("ac_douyin", product, "usr_douyin", "code_douyin", controlplane.ActivationCodeStatusActive, now.Add(time.Hour), nil, nil, nil, 1, 0))
 		mock.ExpectCommit()
 
 		page, err := repository.ListActivationCodesPageForProduct(context.Background(), 0, 20, controlplane.ProductDouyinDesktop)

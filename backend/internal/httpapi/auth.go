@@ -82,8 +82,6 @@ const actorContextKey authContextKey = "actor"
 const deviceContextKey authContextKey = "device"
 const adminAuthorizationContextKey authContextKey = "admin_authorization"
 
-const legacyClientCompatibilityHeader = "X-Client-Compatibility"
-
 type authenticator struct {
 	mu           sync.Mutex
 	controlPlane *service.ControlPlane
@@ -136,7 +134,7 @@ func loginHandler(auth *authenticator) http.Handler {
 			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "登录请求格式无效")
 			return
 		}
-		product, err := loginProduct(r, request.Product)
+		product, err := loginProduct(request.Product)
 		if err != nil {
 			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "登录请求格式无效")
 			return
@@ -447,8 +445,8 @@ func newToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(token[:]), nil
 }
 
-func loginProduct(r *http.Request, raw string) (controlplane.ProductCode, error) {
-	if strings.TrimSpace(raw) == "" && strings.EqualFold(strings.TrimSpace(r.Header.Get(legacyClientCompatibilityHeader)), "legacy") {
+func loginProduct(raw string) (controlplane.ProductCode, error) {
+	if strings.TrimSpace(raw) == "" {
 		return controlplane.ProductAutoLive, nil
 	}
 	return controlplane.ParseProductCode(raw)

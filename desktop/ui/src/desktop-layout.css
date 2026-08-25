@@ -95,7 +95,7 @@
 .desktop-panel-fill { min-height: 0; flex: 1 1 auto; }
 .desktop-source-pool { min-height: 460px; flex: 0 0 460px; }
 .desktop-output-panel { min-height: 120px; }
-.desktop-audio-panel { min-height: 544px; flex: 0 0 544px; }
+.desktop-audio-panel { height: auto; }
 
 .desktop-status-strip { flex: 0 0 auto; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
 .desktop-status-card { min-width: 0; height: 78px; min-height: 78px; overflow: hidden; border: 1px solid #303139; border-radius: 10px; background: #17171c; }
@@ -107,29 +107,20 @@
 .desktop-status-yellow strong { color: #f4c34d; }
 .desktop-status-card small { overflow: hidden; color: #70717b; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 
-.desktop-parameter-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 8px; }
-.desktop-metric-section-title { grid-column: 1 / -1; margin: 4px 0 0; color: #9a9ba5; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; }
-.parameter-metric-card { min-width: 0; height: 82px; min-height: 82px; overflow: hidden; border: 1px solid #363740; border-radius: 10px; background: #202126; }
-.parameter-metric-card-flash-0 { animation: parameter-metric-flash-even 220ms ease-out; }
-.parameter-metric-card-flash-1 { animation: parameter-metric-flash-odd 220ms ease-out; }
-@keyframes parameter-metric-flash-even {
-  50% { border-color: #31d7aa; box-shadow: 0 0 0 1px rgba(49, 215, 170, 0.28), 0 0 10px rgba(49, 215, 170, 0.16); }
-}
-@keyframes parameter-metric-flash-odd {
-  50% { border-color: #31d7aa; box-shadow: 0 0 0 1px rgba(49, 215, 170, 0.28), 0 0 10px rgba(49, 215, 170, 0.16); }
-}
-.parameter-metric-label { display: flex; align-items: center; gap: 6px; color: #d7d7dc; font-size: 10px; font-weight: 600; }
-.parameter-metric-value { display: block; overflow: hidden; margin-top: 1px; color: #f6f6f8; font-size: 19px; line-height: 20px; text-overflow: ellipsis; white-space: nowrap; }
-.parameter-metric-value span { margin-left: 2px; color: #7f808a; font-size: 9px; font-weight: 500; }
-.parameter-metric-card small { display: block; overflow: hidden; color: #696a73; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
-
-.desktop-source-item { padding: 10px; border: 1px solid rgba(49, 215, 170, 0.5); border-left: 3px solid #31d7aa; border-radius: 10px; background: rgba(49, 215, 170, 0.08); }
-.desktop-source-item strong, .desktop-source-item small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.desktop-source-item small, .desktop-muted { color: #9a9ba5; font-size: 10px; }
+.desktop-source-list { min-height: 0; }
+.desktop-source-item { padding: 10px; border: 1px solid #303139; border-left: 3px solid #5ea2ff; border-radius: 10px; background: rgba(94, 162, 255, 0.06); }
+.desktop-source-item-active { border-color: rgba(49, 215, 170, 0.62); border-left-color: #31d7aa; background: rgba(49, 215, 170, 0.08); }
+.desktop-source-item-content { display: grid; gap: 4px; min-width: 0; width: 100%; }
+.desktop-source-item-content > * { min-width: 0; }
+.desktop-muted { color: #9a9ba5; font-size: 10px; }
+.desktop-source-current { display: grid; gap: 10px; min-height: 0; }
+.desktop-source-current > .desktop-source-list { max-height: 350px; overflow: hidden auto; }
+.desktop-source-list-drawer { max-height: calc(100vh - 140px); overflow: hidden auto; }
+.desktop-source-empty { display: grid; min-height: 300px; place-content: center; margin: 0; padding: 24px 12px; }
+.desktop-source-replace { width: 100%; }
 .desktop-control-row, .desktop-inline-between, .desktop-status-line { display: flex; align-items: center; gap: 8px; }
 .desktop-inline-between, .desktop-status-line { justify-content: space-between; }
 .desktop-control-row + .desktop-control-row, .desktop-status-line + .desktop-status-line { margin-top: 10px; }
-.desktop-rate-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px; }
 .desktop-period-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .desktop-number-field { min-width: 0; display: grid; grid-template-columns: auto minmax(62px, 1fr) auto; align-items: center; gap: 6px; }
 .desktop-number-label, .desktop-number-unit { color: #8b8c95; font-size: 10px; white-space: nowrap; }
@@ -176,14 +167,25 @@
 .feature-drawer-inline-feedback { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .desktop-auth-gate { box-sizing: border-box; display: grid; min-height: 100vh; place-items: center; padding: 24px; background: #0b0b0f; }
 .desktop-auth-page { width: 100vw; height: 100vh; overflow: hidden; color: #f6f6f8; background: #0b0b0f; }
-.desktop-auth-page .desktop-auth-gate { min-height: calc(100vh - 36px); }
+.desktop-auth-page .desktop-auth-gate { height: calc(100vh - 36px); min-height: 0; overflow: hidden auto; }
 .desktop-auth-card { width: min(100%, 440px); border: 1px solid #303139; background: #17171c; box-shadow: 0 18px 60px rgba(0, 0, 0, 0.28); }
-.desktop-login-header { display: flex; flex-direction: column; align-items: center; gap: 12px; margin: 4px 0 24px; text-align: center; }
-.desktop-login-logo { width: 64px; height: 64px; object-fit: contain; border-radius: 16px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28); }
+.desktop-access-card { width: min(100%, 560px); }
+.desktop-login-header { display: flex; align-items: center; gap: 14px; margin: 4px 0 20px; }
+.desktop-login-logo { width: 56px; height: 56px; flex: 0 0 auto; object-fit: contain; border-radius: 14px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28); }
 .desktop-login-title { margin: 0 !important; color: #f6f6f8 !important; }
-.desktop-auth-session-warning { position: fixed; z-index: 1000; top: 44px; left: 50%; width: min(560px, calc(100vw - 32px)); transform: translateX(-50%); }
-.desktop-auth-session-expiry { position: fixed; z-index: 1000; top: 44px; right: 16px; max-width: calc(100vw - 32px); }
-.desktop-auth-session-controls { position: fixed; z-index: 1001; top: 4px; right: 140px; display: flex; align-items: center; gap: 8px; }
+.desktop-access-section { min-width: 0; }
+.desktop-access-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.desktop-auth-notices { display: grid; gap: 12px; }
+.desktop-auth-notices:empty { display: none; }
+.desktop-access-section-heading h4 { margin: 0 0 2px; color: #f2f2f5; }
+.desktop-auth-memory-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: -4px; }
+.desktop-auth-memory-help { margin: 6px 0 0; color: #9a9ba5; font-size: 11px; line-height: 16px; }
+.desktop-auth-device-id { display: block; overflow-wrap: anywhere; margin-top: 8px; font-size: 11px; }
+.desktop-auth-actions { width: 100%; margin-top: 22px; }
+/* 页面级状态层必须低于 Ant Design Drawer/Modal 等弹层。 */
+.desktop-auth-session-warning { position: fixed; z-index: 20; top: 44px; left: 50%; width: min(560px, calc(100vw - 32px)); transform: translateX(-50%); }
+.desktop-auth-session-expiry { position: fixed; z-index: 20; top: 44px; right: 16px; max-width: calc(100vw - 32px); }
+.desktop-auth-session-controls { position: fixed; z-index: 21; top: 4px; right: 140px; display: flex; align-items: center; gap: 8px; }
 
 @media (max-width: 1280px) {
   .desktop-workspace { grid-template-columns: 280px minmax(0, 1fr) 240px; }
@@ -191,13 +193,16 @@
   .desktop-status-card strong { font-size: 15px; }
 }
 
-@media (max-width: 900px) {
+@media (max-width: 1199px) {
   .desktop-page { overflow: auto; }
   .desktop-page-content { height: auto; min-height: calc(100vh - 70px); overflow: visible; }
   .desktop-workspace { height: auto; grid-template-columns: minmax(0, 1fr); grid-template-areas: "source" "video" "audio-output"; overflow: visible; }
   .desktop-column { overflow: visible; }
+  .desktop-status-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 900px) {
   .desktop-status-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .desktop-parameter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .feature-drawer-checkbox-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
@@ -206,8 +211,4 @@
   .feature-drawer-footer { justify-content: stretch; }
   .feature-drawer-footer > button { flex: 1 1 auto; }
   .feature-drawer-footer-split > button { flex: 1 1 auto; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .parameter-metric-card-flash-0, .parameter-metric-card-flash-1 { animation: none; }
 }

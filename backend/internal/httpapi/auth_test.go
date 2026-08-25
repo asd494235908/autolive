@@ -385,26 +385,26 @@ func TestLoginRejectsMissingOrDisabledProductMembership(t *testing.T) {
 	}
 }
 
-func TestLoginRequiresProductUnlessExplicitLegacyCompatibility(t *testing.T) {
+func TestLoginDefaultsMissingProductToAutoliveAndRejectsInvalidProduct(t *testing.T) {
 	auth := newAuthenticator(service.NewControlPlane(store.NewMemoryStore(time.Now)), AuthConfig{
 		Username: "admin",
 		Password: "correct-password",
 	})
 
-	strictRecorder := httptest.NewRecorder()
-	strictRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(
+	missingRecorder := httptest.NewRecorder()
+	missingRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(
 		`{"username":"admin","password":"correct-password"}`,
 	))
-	loginHandler(auth).ServeHTTP(strictRecorder, strictRequest)
-	if strictRecorder.Code != http.StatusBadRequest {
-		t.Fatalf("strict login status = %d, want %d", strictRecorder.Code, http.StatusBadRequest)
+	loginHandler(auth).ServeHTTP(missingRecorder, missingRequest)
+	if missingRecorder.Code != http.StatusOK {
+		t.Fatalf("missing product login status = %d, want %d; body=%s", missingRecorder.Code, http.StatusOK, missingRecorder.Body.String())
 	}
-	var strictError ErrorResponse
-	if err := json.Unmarshal(strictRecorder.Body.Bytes(), &strictError); err != nil {
-		t.Fatalf("decode strict login error: %v", err)
+	var missing loginResponse
+	if err := json.Unmarshal(missingRecorder.Body.Bytes(), &missing); err != nil {
+		t.Fatalf("decode missing product login response: %v", err)
 	}
-	if strictError.Code != "INVALID_REQUEST" {
-		t.Fatalf("strict login error code = %q, want INVALID_REQUEST", strictError.Code)
+	if got := auth.sessions[hashToken(missing.Tokens.AccessToken)].Actor.Product; got != controlplane.ProductAutoLive {
+		t.Fatalf("missing product session product = %q, want %q", got, controlplane.ProductAutoLive)
 	}
 
 	invalidRecorder := httptest.NewRecorder()
@@ -416,22 +416,6 @@ func TestLoginRequiresProductUnlessExplicitLegacyCompatibility(t *testing.T) {
 		t.Fatalf("invalid product login status = %d, want %d", invalidRecorder.Code, http.StatusBadRequest)
 	}
 
-	legacyRecorder := httptest.NewRecorder()
-	legacyRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(
-		`{"username":"admin","password":"correct-password"}`,
-	))
-	legacyRequest.Header.Set("X-Client-Compatibility", "legacy")
-	loginHandler(auth).ServeHTTP(legacyRecorder, legacyRequest)
-	if legacyRecorder.Code != http.StatusOK {
-		t.Fatalf("legacy login status = %d, want %d; body=%s", legacyRecorder.Code, http.StatusOK, legacyRecorder.Body.String())
-	}
-	var legacy loginResponse
-	if err := json.Unmarshal(legacyRecorder.Body.Bytes(), &legacy); err != nil {
-		t.Fatalf("decode legacy login response: %v", err)
-	}
-	if got := auth.sessions[hashToken(legacy.Tokens.AccessToken)].Actor.Product; got != controlplane.ProductAutoLive {
-		t.Fatalf("legacy session product = %q, want %q", got, controlplane.ProductAutoLive)
-	}
 }
 
 func TestRequireBearerRestoresPersistedSessionProduct(t *testing.T) {
@@ -481,7 +465,6 @@ func TestProductMismatchIsRejectedBeforeActivationOrHeartbeatBinding(t *testing.
 	login := loginTokensForTest(t, handler, `{"username":"admin","password":"correct-password","product":"douyin_desktop"}`)
 
 	activation := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", map[string]any{
-		"activation_code": "code_01234567",
 		"device": map[string]any{
 			"product":     "autolive",
 			"device_id":   "dev_product01",
@@ -508,6 +491,60 @@ func TestProductMismatchIsRejectedBeforeActivationOrHeartbeatBinding(t *testing.
 	defer sessionStore.mu.Unlock()
 	if session := sessionStore.byAccess[hashToken(login.AccessToken)]; session.DeviceID != "" {
 		t.Fatalf("mismatched product requests bound device %q", session.DeviceID)
+	}
+}
+
+func TestLegacyAutoliveHeartbeatWithoutProductUsesAuthenticatedProduct(t *testing.T) {
+	repository := store.NewMemoryStore(time.Now)
+	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("v1.0.0", nil, AuthConfig{
+		Username: "admin",
+		Password: "correct-password",
+	}, repository, store.NewMemorySecretStore(), newTestSessionStore(), true)
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Devices["dev_legacy01"] = controlplane.DeviceSummary{
+			ID: "dev_legacy01", UserID: "usr_local_admin", Product: controlplane.ProductAutoLive,
+			Status: controlplane.DeviceStatusActive,
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	login := loginTokensForTest(t, handler, `{"username":"admin","password":"correct-password","product":"autolive"}`)
+
+	heartbeat := doJSON(t, handler, http.MethodPost, "/api/v1/client/heartbeat", map[string]any{
+		"device_id": "dev_legacy01",
+		"sent_at":   time.Now().UTC().Format(time.RFC3339),
+		"status":    map[string]any{"disk_free_bytes": 1024},
+	}, login.AccessToken, "heartbeat-legacy-missing-product")
+	if heartbeat.Code != http.StatusOK {
+		t.Fatalf("legacy heartbeat status = %d, want %d; body=%s", heartbeat.Code, http.StatusOK, heartbeat.Body.String())
+	}
+}
+
+func TestHeartbeatWithoutProductRejectsNonLegacyProduct(t *testing.T) {
+	repository := store.NewMemoryStore(time.Now)
+	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("v1.0.0", nil, AuthConfig{
+		Username: "admin",
+		Password: "correct-password",
+	}, repository, store.NewMemorySecretStore(), newTestSessionStore(), true)
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Devices["dev_douyin01"] = controlplane.DeviceSummary{
+			ID: "dev_douyin01", UserID: "usr_local_admin", Product: controlplane.ProductDouyinDesktop,
+			Status: controlplane.DeviceStatusActive,
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	login := loginTokensForTest(t, handler, `{"username":"admin","password":"correct-password","product":"douyin_desktop"}`)
+
+	heartbeat := doJSON(t, handler, http.MethodPost, "/api/v1/client/heartbeat", map[string]any{
+		"device_id": "dev_douyin01",
+		"sent_at":   time.Now().UTC().Format(time.RFC3339),
+		"status":    map[string]any{"disk_free_bytes": 1024},
+	}, login.AccessToken, "heartbeat-douyin-missing-product")
+	if heartbeat.Code != http.StatusBadRequest {
+		t.Fatalf("douyin heartbeat status = %d, want %d; body=%s", heartbeat.Code, http.StatusBadRequest, heartbeat.Body.String())
 	}
 }
 
@@ -540,20 +577,14 @@ func TestClientProfileReturnsActorAndDeviceProduct(t *testing.T) {
 	handler := newTestRouter(t)
 	token := loginForTest(t, handler)
 	create := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
+		"user_id":     "usr_local_admin",
 		"expires_at":  testActivationExpiresAt(),
 		"max_devices": 1,
 	}, token, "profile-product-code")
 	if create.Code != http.StatusCreated {
 		t.Fatalf("create activation code status = %d, want %d; body=%s", create.Code, http.StatusCreated, create.Body.String())
 	}
-	var codePayload struct {
-		ActivationCode struct {
-			PlainCode string `json:"plain_code"`
-		} `json:"activation_code"`
-	}
-	decodeJSON(t, create.Body.Bytes(), &codePayload)
 	activate := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", map[string]any{
-		"activation_code": codePayload.ActivationCode.PlainCode,
 		"device": map[string]any{
 			"product":     "autolive",
 			"device_id":   "dev_profile_product",

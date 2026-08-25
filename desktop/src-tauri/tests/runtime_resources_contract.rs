@@ -766,13 +766,16 @@ fn reports_io_error_when_an_untrusted_partial_cannot_be_deleted() {
 }
 
 #[test]
-fn rejects_install_when_declared_files_exceed_available_disk_space() {
+fn rejects_manifest_before_disk_check_when_declared_files_exceed_one_gibibyte() {
     let fixture = RangeFixture::new(FILE_BYTES);
-    let harness = InstallerHarness::with_manifest_values(&fixture, u64::MAX, &sha256(FILE_BYTES));
+    let root = TestDir::new("declared-size-limit");
+    let manifest = test_manifest(&fixture.base_url(), u64::MAX, &sha256(FILE_BYTES));
+    let result = RuntimeResourceInstaller::for_test(&manifest, root.path(), &fixture.base_url());
 
     assert!(matches!(
-        harness.install(),
-        Err(ResourceInstallError::DiskRequirementOverflow)
+        result,
+        Err(ResourceInstallError::Manifest(message))
+            if message.contains("1073741824 bytes")
     ));
     assert_eq!(fixture.request_count(), 0);
 }

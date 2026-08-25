@@ -16,7 +16,7 @@ func TestNormalizedActivationMutationsFailClosedWithoutRepository(t *testing.T) 
 	service := NewControlPlaneWithRepository(repository)
 	ctx := context.Background()
 
-	if _, err := service.CreateActivationCode(ctx, "create-code", controlplane.CreateActivationCodeInput{ExpiresAt: now.Add(time.Hour)}); !errors.Is(err, store.ErrNormalizedActivationRepositoryRequired) {
+	if _, err := service.CreateActivationCode(ctx, "create-code", controlplane.CreateActivationCodeInput{UserID: "usr_local_admin", ExpiresAt: now.Add(time.Hour), MaxDevices: 1}); !errors.Is(err, store.ErrNormalizedActivationRepositoryRequired) {
 		t.Fatalf("CreateActivationCode() error = %v, want normalized activation repository requirement", err)
 	}
 	if _, err := service.RevokeActivationCode(ctx, "revoke-code", "code_1"); !errors.Is(err, store.ErrNormalizedActivationRepositoryRequired) {

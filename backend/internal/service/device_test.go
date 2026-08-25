@@ -17,6 +17,7 @@ func TestRecordHeartbeatPersistsCurrentMediaAndPlaybackState(t *testing.T) {
 		t.Fatalf("EnsureLocalAdmin() error = %v", err)
 	}
 	code, err := svc.CreateActivationCode(ctx, "heartbeat-code", controlplane.CreateActivationCodeInput{
+		UserID:      "usr_local_admin",
 		ExpiresAt:  now.Add(time.Hour),
 		MaxDevices: 1,
 	})
@@ -27,7 +28,6 @@ func TestRecordHeartbeatPersistsCurrentMediaAndPlaybackState(t *testing.T) {
 		t.Fatal("CreateActivationCode() returned no plain code")
 	}
 	device, err := svc.ActivateDevice(ctx, "heartbeat-device", "usr_local_admin", controlplane.ActivateDeviceInput{
-		ActivationCode: *code.PlainCode,
 		Device: controlplane.DeviceRegistration{
 			DeviceID:   "dev_heartbeat01",
 			DeviceName: "Test Device",
@@ -90,13 +90,12 @@ func TestDisableDeviceReleasesLeases(t *testing.T) {
 	if err := svc.EnsureLocalAdmin(ctx, "admin"); err != nil {
 		t.Fatalf("EnsureLocalAdmin() error = %v", err)
 	}
-	code, err := svc.CreateActivationCode(ctx, "disable-device-code", controlplane.CreateActivationCodeInput{ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
+	_, err := svc.CreateActivationCode(ctx, "disable-device-code", controlplane.CreateActivationCodeInput{UserID: "usr_local_admin", ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
 	if err != nil {
 		t.Fatalf("CreateActivationCode() error = %v", err)
 	}
 	device, err := svc.ActivateDevice(ctx, "disable-device-device", "usr_local_admin", controlplane.ActivateDeviceInput{
-		ActivationCode: *code.PlainCode,
-		Device:         controlplane.DeviceRegistration{DeviceID: "dev_disable01", DeviceName: "Test Device", Platform: "windows", AppVersion: "1.0.0"},
+		Device: controlplane.DeviceRegistration{DeviceID: "dev_disable01", DeviceName: "Test Device", Platform: "windows", AppVersion: "1.0.0"},
 	})
 	if err != nil {
 		t.Fatalf("ActivateDevice() error = %v", err)
@@ -135,7 +134,7 @@ func TestActivationCodeListExposesRedactedUsageDetails(t *testing.T) {
 	if err := svc.EnsureLocalAdmin(ctx, "admin"); err != nil {
 		t.Fatalf("EnsureLocalAdmin() error = %v", err)
 	}
-	code, err := svc.CreateActivationCode(ctx, "activation-details-code", controlplane.CreateActivationCodeInput{ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
+	code, err := svc.CreateActivationCode(ctx, "activation-details-code", controlplane.CreateActivationCodeInput{UserID: "usr_local_admin", ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
 	if err != nil {
 		t.Fatalf("CreateActivationCode() error = %v", err)
 	}
@@ -147,8 +146,7 @@ func TestActivationCodeListExposesRedactedUsageDetails(t *testing.T) {
 		t.Fatalf("unactivated code details = %+v", items)
 	}
 	device, err := svc.ActivateDevice(ctx, "activation-details-device", "usr_local_admin", controlplane.ActivateDeviceInput{
-		ActivationCode: *code.PlainCode,
-		Device:         controlplane.DeviceRegistration{DeviceID: "dev_activation01", DeviceName: "Details Device", Platform: "windows", AppVersion: "1.0.0"},
+		Device: controlplane.DeviceRegistration{DeviceID: "dev_activation01", DeviceName: "Details Device", Platform: "windows", AppVersion: "1.0.0"},
 	})
 	if err != nil {
 		t.Fatalf("ActivateDevice() error = %v", err)

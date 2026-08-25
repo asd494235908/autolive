@@ -124,7 +124,8 @@ paths:
   /api/v1/client/activate:
     post:
       tags: [Client]
-      summary: 激活当前设备
+      summary: 按账号授权绑定当前设备
+      description: 桌面端账号密码登录成功后自动调用；服务端按登录账号的有效激活授权和设备额度完成绑定，客户端不提交激活码明文。
       operationId: clientActivate
       security:
         - bearerAuth: []
@@ -138,7 +139,7 @@ paths:
               $ref: '#/components/schemas/ActivateDeviceRequest'
       responses:
         '200':
-          description: 激活成功
+          description: 当前设备已按账号授权绑定成功
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
@@ -922,7 +923,7 @@ paths:
         - $ref: '#/components/parameters/IdempotencyKeyHeader'
       responses:
         '200':
-          description: 设备进入待激活状态；重新绑定需要新的激活码
+          description: 设备进入待授权状态并释放已知设备槽位；后续账号密码登录时由服务端按该账号的有效授权自动重新绑定
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
@@ -1026,7 +1027,7 @@ paths:
   /api/v1/admin/activation-codes/{code_id}/revoke:
     post:
       tags: [Admin]
-      summary: 作废激活码
+      summary: 作废账号激活授权
       operationId: revokeActivationCode
       security:
         - bearerAuth: []
@@ -1039,7 +1040,7 @@ paths:
         - $ref: '#/components/parameters/IdempotencyKeyHeader'
       responses:
         '200':
-          description: 激活码已作废；已核销或已过期激活码不能作废
+          description: 激活授权已作废，不能再绑定新设备；已绑定设备不受影响
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
@@ -2678,7 +2679,7 @@ components:
           allOf:
             - $ref: '#/components/schemas/Timestamp'
           nullable: true
-          description: 当前设备绑定的激活码到期时间；未绑定或历史数据缺失时省略
+          description: 当前设备绑定的账号授权到期时间；未绑定或历史数据缺失时省略
     LoginRequest:
       type: object
       additionalProperties: false
@@ -2741,12 +2742,8 @@ components:
     ActivateDeviceRequest:
       type: object
       additionalProperties: false
-      required: [activation_code, device]
+      required: [device]
       properties:
-        activation_code:
-          type: string
-          minLength: 8
-          maxLength: 128
         device:
           $ref: '#/components/schemas/DeviceRegistration'
     DeviceRegistration:
@@ -3366,15 +3363,17 @@ components:
     CreateActivationCodeRequest:
       type: object
       additionalProperties: false
-      required: [expires_at]
+      required: [user_id, expires_at, max_devices]
       properties:
+        user_id:
+          $ref: '#/components/schemas/Id'
+          description: 创建时绑定的登录账号；设备只能由该账号自动占用授权额度
         expires_at:
           $ref: '#/components/schemas/Timestamp'
         max_devices:
           type: integer
           minimum: 1
           maximum: 100
-          default: 1
     ActivationCode:
       type: object
       additionalProperties: false
@@ -3384,6 +3383,9 @@ components:
           $ref: '#/components/schemas/Id'
         product:
           $ref: '#/components/schemas/ProductCode'
+        user_id:
+          $ref: '#/components/schemas/Id'
+          description: 创建激活授权时绑定的登录账号；迁移后被安全作废的历史未分配记录可缺省
         status:
           $ref: '#/components/schemas/ActivationCodeStatus'
         expires_at:
@@ -3401,13 +3403,13 @@ components:
           description: 脱敏后的激活码前缀，不包含完整明文
         used_by_user_id:
           $ref: '#/components/schemas/Id'
-          description: 核销设备所属用户；仅核销后返回
+          description: 首次绑定设备所属用户；仅作为历史兼容与审计事实
         used_by_device_id:
           $ref: '#/components/schemas/Id'
-          description: 核销设备；仅核销后返回
+          description: 首次绑定的设备；仅作为历史兼容与审计事实
         used_at:
           $ref: '#/components/schemas/Timestamp'
-          description: 核销时间；仅核销后返回
+          description: 首次绑定时间；仅作为历史兼容与审计事实
         plain_code:
           type:
             - string

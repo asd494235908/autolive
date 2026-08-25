@@ -52,13 +52,12 @@ func TestPostgresNormalizedActivationRejectsConflictingSessionBindingWithoutResi
 	idempotencyKey := fixture.IdempotencyPrefix + "binding-conflict"
 	auditRequestID := fixture.IdempotencyPrefix + "binding-conflict-audit"
 	_, err = repository.ActivateDeviceWithSessionBinding(ctx, DeviceActivationRecord{
-		Scope:              "control-plane-state",
-		IdempotencyKey:     idempotencyKey,
-		Fingerprint:        fixture.IdempotencyPrefix + "binding-conflict-fingerprint",
-		AccessTokenHash:    fixture.AccessTokenHashes[0],
-		UserID:             fixture.UserID,
-		Product:            controlplane.ProductAutoLive,
-		ActivationCodeHash: fixture.CodeHash,
+		Scope:           "control-plane-state",
+		IdempotencyKey:  idempotencyKey,
+		Fingerprint:     fixture.IdempotencyPrefix + "binding-conflict-fingerprint",
+		AccessTokenHash: fixture.AccessTokenHashes[0],
+		UserID:          fixture.UserID,
+		Product:         controlplane.ProductAutoLive,
 		Device: controlplane.DeviceRegistration{
 			Product:  controlplane.ProductAutoLive,
 			DeviceID: fixture.DeviceIDs[0], DeviceName: "conflicting-device",
@@ -115,13 +114,12 @@ func TestPostgresNormalizedActivationCancellationWhileWaitingForMutationLockLeav
 	result := make(chan error, 1)
 	go func() {
 		_, activationErr := repository.ActivateDeviceWithSessionBinding(attemptCtx, DeviceActivationRecord{
-			Scope:              "control-plane-state",
-			IdempotencyKey:     idempotencyKey,
-			Fingerprint:        fixture.IdempotencyPrefix + "cancelled-fingerprint",
-			AccessTokenHash:    fixture.AccessTokenHashes[0],
-			UserID:             fixture.UserID,
-			Product:            controlplane.ProductAutoLive,
-			ActivationCodeHash: fixture.CodeHash,
+			Scope:           "control-plane-state",
+			IdempotencyKey:  idempotencyKey,
+			Fingerprint:     fixture.IdempotencyPrefix + "cancelled-fingerprint",
+			AccessTokenHash: fixture.AccessTokenHashes[0],
+			UserID:          fixture.UserID,
+			Product:         controlplane.ProductAutoLive,
 			Device: controlplane.DeviceRegistration{
 				Product:  controlplane.ProductAutoLive,
 				DeviceID: fixture.DeviceIDs[0], DeviceName: "cancelled-device",
@@ -193,13 +191,12 @@ func TestPostgresNormalizedActivationConnectionTerminationWhileWaitingLeavesNoRe
 	result := make(chan error, 1)
 	go func() {
 		_, activationErr := repository.ActivateDeviceWithSessionBinding(attemptCtx, DeviceActivationRecord{
-			Scope:              "control-plane-state",
-			IdempotencyKey:     idempotencyKey,
-			Fingerprint:        fixture.IdempotencyPrefix + "terminated-fingerprint",
-			AccessTokenHash:    fixture.AccessTokenHashes[0],
-			UserID:             fixture.UserID,
-			Product:            controlplane.ProductAutoLive,
-			ActivationCodeHash: fixture.CodeHash,
+			Scope:           "control-plane-state",
+			IdempotencyKey:  idempotencyKey,
+			Fingerprint:     fixture.IdempotencyPrefix + "terminated-fingerprint",
+			AccessTokenHash: fixture.AccessTokenHashes[0],
+			UserID:          fixture.UserID,
+			Product:         controlplane.ProductAutoLive,
 			Device: controlplane.DeviceRegistration{
 				Product:  controlplane.ProductAutoLive,
 				DeviceID: fixture.DeviceIDs[0], DeviceName: "terminated-device",
@@ -286,13 +283,12 @@ func TestPostgresNormalizedActivationCommitResponseLossPreservesDurableState(t *
 	auditRequestID := fixture.IdempotencyPrefix + "commit-response-loss-audit"
 	proxy.ArmCommitDrop()
 	_, err = repository.ActivateDeviceWithSessionBinding(ctx, DeviceActivationRecord{
-		Scope:              "control-plane-state",
-		IdempotencyKey:     idempotencyKey,
-		Fingerprint:        fixture.IdempotencyPrefix + "commit-response-loss-fingerprint",
-		AccessTokenHash:    fixture.AccessTokenHashes[0],
-		UserID:             fixture.UserID,
-		Product:            controlplane.ProductAutoLive,
-		ActivationCodeHash: fixture.CodeHash,
+		Scope:           "control-plane-state",
+		IdempotencyKey:  idempotencyKey,
+		Fingerprint:     fixture.IdempotencyPrefix + "commit-response-loss-fingerprint",
+		AccessTokenHash: fixture.AccessTokenHashes[0],
+		UserID:          fixture.UserID,
+		Product:         controlplane.ProductAutoLive,
 		Device: controlplane.DeviceRegistration{
 			Product:  controlplane.ProductAutoLive,
 			DeviceID: fixture.DeviceIDs[0], DeviceName: "commit-response-loss-device",

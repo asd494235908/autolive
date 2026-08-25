@@ -1,8 +1,8 @@
 # Phase 3：激活码安全管理
 
 Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-production-readiness.md)
-状态：Not Started
-最后更新：2026-08-22
+状态：In Progress（账号归属与基础设备槽位已落地；密文重显、容量修改和设备切换未实施）
+最后更新：2026-08-24
 
 ## 目标
 
@@ -30,7 +30,7 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 ### 包含
 
 - `activation_code_secrets` 独立表、AAD/key id/version 和多密钥读取。
-- `activation_code_device_bindings` 的 slot 与历史未知状态。
+- 复用当前 `activation_device_bindings` 的账号授权设备槽位事实，后续补齐历史未知状态与详情能力，不再创建同义绑定表。
 - 详情、reveal、容量 PATCH 和 binding switch API。
 - React 激活码详情中的绑定列表、容量修改、二次认证重显和切换设备交互。
 - 核销、解绑、到期、会话和租约路径的绑定事实同步。
@@ -42,12 +42,12 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 
 ## 实施清单
 
-- [ ] 先写迁移和 PostgreSQL 集成失败测试：密文事务、历史状态、slot 唯一约束和回填。
+- [x] 先写基础绑定迁移契约、服务事务和 PostgreSQL SQLMock 故障测试：账号归属、slot 唯一约束、已知设备回填和历史未分配授权安全作废；真实 PostgreSQL 并发/故障注入、密文事务与历史未知占位仍待后续测试。
 - [ ] 提取 AAD-capable AES-GCM codec，为激活码创建专用 SecretStore，不写入 `model_account_secrets`。
 - [ ] 实现 active key id + key ring 配置、启动校验、读旧写新和密钥移除门禁。
-- [ ] 创建激活码时同事务写哈希、元数据、密文、幂等和审计 Outbox。
+- [ ] 当前创建已要求绑定账号并写哈希、元数据、设备上限、幂等和审计 Outbox；独立密文写入仍待实现。
 - [ ] 实现 reveal POST：管理员二次验证、专用限流、`no-store/private`、审计失败不返回明文。
-- [ ] 实现 binding detail/backfill：首台设备可证明回填，其余 slot 记为 `legacy_unknown`。
+- [ ] 当前基础 backfill 已恢复可证明的首台/已知设备绑定；其余历史 slot 的 `legacy_unknown` 占位和管理详情仍待实现。
 - [ ] 实现容量状态机：1～100、不低于已核销、过期/作废拒绝、上调后重新可核销。
 - [ ] 激活码创建时固定 product，核销时必须与会话 product 一致；设备槽位不能跨产品切换。
 - [ ] 商业化 Phase 4 上线后，激活码核销与订阅席位占用在同一产品短事务中协调；无有效席位不得仅凭激活码获得权益。
@@ -86,3 +86,4 @@ Parent PRD：[PRD：服务端商业化与生产就绪](../prd-server-commercial-
 - 2026-08-21：选定独立激活码加密表，本轮未开始实施。
 - 2026-08-22：纳入 React 激活码安全管理页和固定权限点。
 - 2026-08-22：纳入激活码 product 归属，并与产品订阅席位明确分离。
+- 2026-08-24：基础能力改为创建时绑定账号、桌面账号密码登录后自动占用设备槽位；落地 `activation_device_bindings` 作为当前事实表，同设备重试不重复占位、解绑释放、禁用保留。此阶段后续只扩展密文重显、容量调整、绑定详情和设备切换，不再建立第二张同义绑定表。

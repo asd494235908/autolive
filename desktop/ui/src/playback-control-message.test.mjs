@@ -91,9 +91,16 @@ test('accepts a valid media state and rejects malformed values', async () => {
 });
 
 test('validates control actions and clamps media values', async () => {
-  const { isPlaybackMediaControlMessage, clampMediaTime, clampVolume, formatMediaTime } =
+  const {
+    isPlaybackMediaControlMessage,
+    shouldApplyPlaybackSeek,
+    clampMediaTime,
+    clampVolume,
+    formatMediaTime,
+  } =
     await loadTypeScriptModule('playback-control-message.ts', [
       'isPlaybackMediaControlMessage',
+      'shouldApplyPlaybackSeek',
       'clampMediaTime',
       'clampVolume',
       'formatMediaTime',
@@ -103,29 +110,50 @@ test('validates control actions and clamps media values', async () => {
     type: 'playback-media-control',
     action: 'seek',
     current_time: 4,
+    playback_generation: 3,
   }), true);
   assert.equal(isPlaybackMediaControlMessage({
     version: 1,
     type: 'playback-media-control',
     action: 'seek',
-    current_time: -1,
+    current_time: 4,
   }), false);
-  for (const playbackRate of [0.5, 1, 1.5, 2]) {
-    assert.equal(isPlaybackMediaControlMessage({
-      version: 1,
-      type: 'playback-media-control',
-      action: 'set-playback-rate',
-      playback_rate: playbackRate,
-    }), true);
-  }
-  for (const playbackRate of [0.49, 2.01, Number.NaN, Number.POSITIVE_INFINITY]) {
-    assert.equal(isPlaybackMediaControlMessage({
-      version: 1,
-      type: 'playback-media-control',
-      action: 'set-playback-rate',
-      playback_rate: playbackRate,
-    }), false);
-  }
+  assert.equal(isPlaybackMediaControlMessage({
+    version: 1,
+    type: 'playback-media-control',
+    action: 'seek',
+    current_time: -1,
+    playback_generation: 3,
+  }), false);
+  assert.equal(isPlaybackMediaControlMessage({
+    version: 1,
+    type: 'playback-media-control',
+    action: 'seek',
+    current_time: 4,
+    playback_generation: -1,
+  }), false);
+  const seek = {
+    version: 1,
+    type: 'playback-media-control',
+    action: 'seek',
+    current_time: 4,
+    playback_generation: 3,
+  };
+  assert.equal(shouldApplyPlaybackSeek(seek, 3), true);
+  assert.equal(shouldApplyPlaybackSeek(seek, 4), false);
+  assert.equal(shouldApplyPlaybackSeek(seek, undefined), false);
+  assert.equal(isPlaybackMediaControlMessage({
+    version: 1,
+    type: 'playback-media-control',
+    action: 'set-volume',
+    volume: 0.5,
+  }), true);
+  assert.equal(isPlaybackMediaControlMessage({
+    version: 1,
+    type: 'playback-media-control',
+    action: 'set-playback-rate',
+    playback_rate: 1.5,
+  }), false);
   assert.equal(clampMediaTime(-1, 10), 0);
   assert.equal(clampMediaTime(20, 10), 10);
   assert.equal(clampVolume(2), 1);
@@ -180,7 +208,7 @@ test('the final-effect video does not enable browser-native controls', async () 
   assert.doesNotMatch(source, /<video[\s\S]*?\bcontrols\b[\s\S]*?\/>/);
 });
 
-test('the home page exposes media controls through the existing UI', async () => {
+test('the home page exposes media controls but no manual playback-rate control', async () => {
   const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
   assert.match(source, /Slider/);
   assert.match(source, /播放进度/);
@@ -188,6 +216,46 @@ test('the home page exposes media controls through the existing UI', async () =>
   assert.match(source, /静音/);
   assert.match(source, /画中画/);
   assert.match(source, /pictureInPictureVideoRef/);
-  assert.match(source, /action: 'set-playback-rate'/);
-  assert.match(source, /video\.playbackRate = message\.playback_rate/);
+  assert.doesNotMatch(source, /action: 'set-playback-rate'/);
+  assert.doesNotMatch(source, /video\.playbackRate = message\.playback_rate/);
+  assert.match(source, /playback_generation: mediaState\.playback_generation/);
+  assert.match(source, /shouldApplyPlaybackSeek\(message, snapshotRef\.current\?\.playback_generation\)/);
+});
+
+test('does not carry an old video position into the next playback generation', async () => {
+  const { capturePlaybackPosition, resolvePlaybackResumePosition } = await loadTypeScriptModule(
+    'playback-control-message.ts',
+    ['capturePlaybackPosition', 'resolvePlaybackResumePosition'],
+  );
+  const previous = { playbackGeneration: 7, positionSec: 215 };
+  const ignored = capturePlaybackPosition(previous, {
+    playbackGeneration: 8,
+    loadedPlaybackGeneration: 7,
+    positionSec: 215,
+    transitionInFlight: false,
+  });
+  assert.deepEqual(ignored, previous);
+  assert.equal(resolvePlaybackResumePosition(ignored, 8), 0);
+
+  const current = capturePlaybackPosition(ignored, {
+    playbackGeneration: 8,
+    loadedPlaybackGeneration: 8,
+    positionSec: 3.5,
+    transitionInFlight: false,
+  });
+  assert.deepEqual(current, { playbackGeneration: 8, positionSec: 3.5 });
+  assert.equal(resolvePlaybackResumePosition(current, 8), 3.5);
+  assert.equal(resolvePlaybackResumePosition(current, 9), 0);
+});
+
+test('stale audio candidates are recovered or advanced without a global error', async () => {
+  const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+  assert.match(
+    source,
+    /function isTransientAudioCandidateCode[\s\S]*audio_candidate_stale[\s\S]*audio_mixer_candidate_superseded/,
+  );
+  assert.match(
+    source,
+    /event\.data\.reason\s*&&\s*!isTransientAudioCandidateCode\(event\.data\.error_code\)/,
+  );
 });

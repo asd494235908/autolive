@@ -21,8 +21,8 @@ fn imported_source_video_is_registered_with_tauri_asset_scope() {
         .find("allow_local_playback_asset_file(")
         .expect("the validated source video should enter the asset scope");
     let state_commit = command
-        .find("playback.set_source(result.source.clone())")
-        .expect("the validated source video should be committed");
+        .find(".set_source_pool(sources)")
+        .expect("the validated source video pool should be committed atomically");
 
     assert!(
         registration < state_commit,
@@ -73,5 +73,22 @@ fn interlude_audio_files_are_registered_before_the_catalog_is_exposed() {
     assert!(
         registration < state_commit,
         "asset scope registration must succeed before interlude files reach the WebView"
+    );
+}
+
+#[test]
+fn saving_interlude_config_does_not_stop_the_active_segment() {
+    let source = std::fs::read_to_string("src/commands.rs")
+        .expect("commands.rs should be readable from the crate root");
+    let command = command_body(
+        &source,
+        "pub fn set_interlude_config(",
+        "#[tauri::command]\npub async fn start_portaudio_interlude(",
+    );
+
+    assert!(command.contains("playback.set_interlude_snapshot(snapshot.clone())"));
+    assert!(
+        !command.contains("stop_interlude_mixer"),
+        "saved settings apply to the next segment and must not interrupt the active interlude"
     );
 }

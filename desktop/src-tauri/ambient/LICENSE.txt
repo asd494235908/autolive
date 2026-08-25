@@ -1,0 +1,8 @@
+GpAutoLive bundled low-level room tone
+
+The file low-level-room-tone.wav was generated locally for this project with
+FFmpeg's built-in anoisesrc filter. It contains no third-party recording and is
+distributed under the same license terms as this project.
+
+Generation command (FFmpeg 8.0):
+ffmpeg -f lavfi -i "anoisesrc=color=pink:amplitude=0.0004:sample_rate=48000:duration=4" -af "volume=-12dB" -ac 2 -c:a pcm_s16le low-level-room-tone.wav

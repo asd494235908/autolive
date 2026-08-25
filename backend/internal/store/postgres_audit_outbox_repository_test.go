@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"net/http"
 	"regexp"
 	"strings"
 	"testing"
@@ -12,6 +14,46 @@ import (
 	"autoLive/backend/internal/controlplane"
 	"github.com/DATA-DOG/go-sqlmock"
 )
+
+func TestPostgresAuditOutboxFailureClearsMissingDeviceForeignKey(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 8, 25, 18, 30, 0, 0, time.UTC)
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, func() time.Time { return now }, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+	payload, err := json.Marshal(controlplane.AuditLogInput{
+		Product: controlplane.ProductAutoLive, DeviceID: "dev_missing", Action: "POST /api/v1/client/activate",
+		TargetType: "device", TargetID: "dev_missing", RequestID: "req-missing-device", Outcome: "failure",
+		StatusCode: http.StatusNotFound, ErrorCode: "DEVICE_NOT_FOUND",
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM devices WHERE id = $1 AND product = $2 LIMIT 1")).
+		WithArgs("dev_missing", controlplane.ProductAutoLive).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_logs (")).
+		WithArgs("audit_missing", controlplane.ProductAutoLive, "", "", "POST /api/v1/client/activate", "device", "dev_missing", "req-missing-device", "failure", http.StatusNotFound, "DEVICE_NOT_FOUND", now).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE audit_outbox\n\t\tSET status = 'sent'")).
+		WithArgs("audit_outbox_missing", now).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	if err := repository.deliverAuditOutboxRow(context.Background(), "audit_outbox_missing", payload, sql.NullString{String: string(controlplane.ProductAutoLive), Valid: true}, now); err != nil {
+		t.Fatalf("deliverAuditOutboxRow() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
 
 func TestPostgresRepositoryRecordAuditWithOutboxDeliversOnce(t *testing.T) {
 	database, mock, err := sqlmock.New()

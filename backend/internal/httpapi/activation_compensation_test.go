@@ -21,7 +21,7 @@ func TestActivateBindsBeforeBusinessMutationWhenSessionStoreFails(t *testing.T) 
 	)
 	token := loginForTest(t, handler)
 	adminCode := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
-		"expires_at": testActivationExpiresAt(), "max_devices": 1,
+		"user_id": "usr_local_admin", "expires_at": testActivationExpiresAt(), "max_devices": 1,
 	}, token, "activation-prepare-1")
 	if adminCode.Code != http.StatusCreated {
 		t.Fatalf("create activation code status = %d; body=%s", adminCode.Code, adminCode.Body.String())
@@ -36,8 +36,7 @@ func TestActivateBindsBeforeBusinessMutationWhenSessionStoreFails(t *testing.T) 
 	sessions.updateErr = errors.New("session store unavailable")
 	sessions.mu.Unlock()
 	response := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", controlplane.ActivateDeviceInput{
-		ActivationCode: *codeEnvelope.ActivationCode.PlainCode,
-		Device:         controlplane.DeviceRegistration{Product: controlplane.ProductAutoLive, DeviceID: "dev_bindfail1", DeviceName: "Test", Platform: "windows", AppVersion: "1.0.0"},
+		Device: controlplane.DeviceRegistration{Product: controlplane.ProductAutoLive, DeviceID: "dev_bindfail1", DeviceName: "Test", Platform: "windows", AppVersion: "1.0.0"},
 	}, token, "activation-bind-failure")
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("activation with unavailable session store status = %d; body=%s", response.Code, response.Body.String())
@@ -66,10 +65,9 @@ func TestActivateCompensatesNewSessionBindingWhenBusinessFails(t *testing.T) {
 	)
 	token := loginForTest(t, handler)
 	response := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", controlplane.ActivateDeviceInput{
-		ActivationCode: "missing-code-123",
-		Device:         controlplane.DeviceRegistration{Product: controlplane.ProductAutoLive, DeviceID: "dev_compens1", DeviceName: "Test", Platform: "windows", AppVersion: "1.0.0"},
+		Device: controlplane.DeviceRegistration{Product: controlplane.ProductAutoLive, DeviceID: "dev_compens1", DeviceName: "Test", Platform: "windows", AppVersion: "1.0.0"},
 	}, token, "activation-compensation")
-	if response.Code != http.StatusNotFound {
+	if response.Code != http.StatusForbidden {
 		t.Fatalf("activation business failure status = %d; body=%s", response.Code, response.Body.String())
 	}
 
@@ -87,8 +85,8 @@ func TestActivateCompensatesNewSessionBindingWhenBusinessFails(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode error response: %v", err)
 	}
-	if body["code"] != "ACTIVATION_CODE_NOT_FOUND" {
-		t.Fatalf("error code = %v, want ACTIVATION_CODE_NOT_FOUND", body["code"])
+	if body["code"] != "ACCOUNT_ACTIVATION_REQUIRED" {
+		t.Fatalf("error code = %v, want ACCOUNT_ACTIVATION_REQUIRED", body["code"])
 	}
 }
 

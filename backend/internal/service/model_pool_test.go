@@ -780,14 +780,6 @@ func modelPoolTestHTTPClient(t *testing.T, provider *httptest.Server) (*http.Cli
 	return &http.Client{Transport: transport}, resolver
 }
 
-func derefModelPoolTestString(t *testing.T, value *string) string {
-	t.Helper()
-	if value == nil {
-		t.Fatal("expected non-nil string pointer")
-	}
-	return *value
-}
-
 func TestModelPoolSummaryTracksLeasesAndDailyUsageAndStopsAtQuota(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	svc := NewControlPlane(store.NewMemoryStore(func() time.Time { return now }))
@@ -795,13 +787,12 @@ func TestModelPoolSummaryTracksLeasesAndDailyUsageAndStopsAtQuota(t *testing.T) 
 		t.Fatalf("EnsureLocalAdmin() error = %v", err)
 	}
 	ctx := context.Background()
-	code, err := svc.CreateActivationCode(ctx, "quota-code-1", controlplane.CreateActivationCodeInput{ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
+	_, err := svc.CreateActivationCode(ctx, "quota-code-1", controlplane.CreateActivationCodeInput{UserID: "usr_local_admin", ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
 	if err != nil {
 		t.Fatalf("CreateActivationCode() error = %v", err)
 	}
 	device, err := svc.ActivateDevice(ctx, "quota-device-1", "usr_local_admin", controlplane.ActivateDeviceInput{
-		ActivationCode: derefModelPoolTestString(t, code.PlainCode),
-		Device:         controlplane.DeviceRegistration{DeviceID: "dev_quota01", DeviceName: "MacBook", Platform: "macOS", AppVersion: "0.1.0"},
+		Device: controlplane.DeviceRegistration{DeviceID: "dev_quota01", DeviceName: "MacBook", Platform: "macOS", AppVersion: "0.1.0"},
 	})
 	if err != nil {
 		t.Fatalf("ActivateDevice() error = %v", err)
@@ -861,13 +852,12 @@ func TestRecordDirectLLMCallValidatesLeaseAndIsIdempotent(t *testing.T) {
 	if err := svc.EnsureLocalAdmin(context.Background(), "admin"); err != nil {
 		t.Fatalf("EnsureLocalAdmin() error = %v", err)
 	}
-	code, err := svc.CreateActivationCode(context.Background(), "direct-call-code", controlplane.CreateActivationCodeInput{ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
+	_, err := svc.CreateActivationCode(context.Background(), "direct-call-code", controlplane.CreateActivationCodeInput{UserID: "usr_local_admin", ExpiresAt: now.Add(time.Hour), MaxDevices: 1})
 	if err != nil {
 		t.Fatalf("CreateActivationCode() error = %v", err)
 	}
 	device, err := svc.ActivateDevice(context.Background(), "direct-call-device", "usr_local_admin", controlplane.ActivateDeviceInput{
-		ActivationCode: derefModelPoolTestString(t, code.PlainCode),
-		Device:         controlplane.DeviceRegistration{DeviceID: "dev_direct01", DeviceName: "MacBook", Platform: "macOS", AppVersion: "0.1.0"},
+		Device: controlplane.DeviceRegistration{DeviceID: "dev_direct01", DeviceName: "MacBook", Platform: "macOS", AppVersion: "0.1.0"},
 	})
 	if err != nil {
 		t.Fatalf("ActivateDevice() error = %v", err)
@@ -1078,7 +1068,8 @@ func TestModelLeaseLifecycleChecksOwnershipAndReleaseIdempotency(t *testing.T) {
 		t.Fatalf("CreateUser() second user error = %v", err)
 	}
 
-	code, err := svc.CreateActivationCode(ctx, "lease-code", controlplane.CreateActivationCodeInput{
+	_, err := svc.CreateActivationCode(ctx, "lease-code", controlplane.CreateActivationCodeInput{
+		UserID:      "usr_00000001",
 		ExpiresAt:  now.Add(time.Hour),
 		MaxDevices: 1,
 	})
@@ -1086,7 +1077,6 @@ func TestModelLeaseLifecycleChecksOwnershipAndReleaseIdempotency(t *testing.T) {
 		t.Fatalf("CreateActivationCode() error = %v", err)
 	}
 	device, err := svc.ActivateDevice(ctx, "lease-device", "usr_00000001", controlplane.ActivateDeviceInput{
-		ActivationCode: derefModelPoolTestString(t, code.PlainCode),
 		Device: controlplane.DeviceRegistration{
 			DeviceID:   "dev_lease001",
 			DeviceName: "MacBook",
@@ -1269,7 +1259,8 @@ func TestModelLeaseConcurrencyDisabledAccountAndLazyExpiryRecycle(t *testing.T) 
 	}
 	ctx := context.Background()
 
-	code1, err := svc.CreateActivationCode(ctx, "lease-code-1", controlplane.CreateActivationCodeInput{
+	_, err := svc.CreateActivationCode(ctx, "lease-code-1", controlplane.CreateActivationCodeInput{
+		UserID:      "usr_local_admin",
 		ExpiresAt:  startNow.Add(time.Hour),
 		MaxDevices: 1,
 	})
@@ -1277,7 +1268,6 @@ func TestModelLeaseConcurrencyDisabledAccountAndLazyExpiryRecycle(t *testing.T) 
 		t.Fatalf("CreateActivationCode() error = %v", err)
 	}
 	device1, err := svc.ActivateDevice(ctx, "lease-device-1", "usr_local_admin", controlplane.ActivateDeviceInput{
-		ActivationCode: derefModelPoolTestString(t, code1.PlainCode),
 		Device: controlplane.DeviceRegistration{
 			DeviceID:   "dev_expiry001",
 			DeviceName: "MacBook",
@@ -1289,7 +1279,8 @@ func TestModelLeaseConcurrencyDisabledAccountAndLazyExpiryRecycle(t *testing.T) 
 		t.Fatalf("ActivateDevice() first error = %v", err)
 	}
 
-	code2, err := svc.CreateActivationCode(ctx, "lease-code-2", controlplane.CreateActivationCodeInput{
+	_, err = svc.CreateActivationCode(ctx, "lease-code-2", controlplane.CreateActivationCodeInput{
+		UserID:      "usr_local_admin",
 		ExpiresAt:  startNow.Add(time.Hour),
 		MaxDevices: 1,
 	})
@@ -1297,7 +1288,6 @@ func TestModelLeaseConcurrencyDisabledAccountAndLazyExpiryRecycle(t *testing.T) 
 		t.Fatalf("CreateActivationCode() second error = %v", err)
 	}
 	device2, err := svc.ActivateDevice(ctx, "lease-device-2", "usr_local_admin", controlplane.ActivateDeviceInput{
-		ActivationCode: derefModelPoolTestString(t, code2.PlainCode),
 		Device: controlplane.DeviceRegistration{
 			DeviceID:   "dev_expiry002",
 			DeviceName: "MacBook 2",

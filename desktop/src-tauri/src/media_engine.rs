@@ -1,9 +1,16 @@
+use crate::audio_pcm_effects::AudioPcmEffectConfig;
 use crate::background_process::background_command;
+use crate::bounded_io::{read_to_end_bounded, BoundedReadError};
 use crate::cancellation::CancellationToken;
 use crate::errors::FileHashError;
 use crate::hashing::hash_file_at_path;
+use crate::media_audio_effects::{build_offline_audio_effect_plan, MfccOperation};
+use crate::media_effect_params::{AdvancedEffectParams, AudioEffectParams, VideoEffectParams};
 use crate::media_library::SUPPORTED_SOURCE_VIDEO_EXTENSIONS;
-use crate::research_params::{AudioResearchParams, ResearchExperimentParams, VideoResearchParams};
+use crate::media_video_effects::{
+    build_media_video_complex_effect_plan, build_media_video_effect_plan,
+};
+use autolive_signalsmith_stretch::QualityPitchConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
@@ -24,6 +31,7 @@ const MEDIA_ENGINE_RESOURCE_DIR: &str = "binaries";
 const MEDIA_ENGINE_CAPABILITY_PROBE_TIMEOUT_MS: u64 = 10_000;
 const FALLBACK_H264_ENCODER: &str = "libopenh264";
 const MAX_MEDIA_STDERR_BYTES: usize = 64 * 1024;
+const MAX_PROBE_STDOUT_BYTES: usize = 512 * 1024;
 const DEFAULT_AUDIO_OUTPUT_SAMPLE_RATE_HZ: u32 = 48_000;
 const MIN_AUDIO_CONTENT_PEAK_DB: f64 = -80.0;
 const AUDIO_FINITE_GUARD_FILTER: &str =
@@ -34,6 +42,14 @@ const H264_ENCODER_CANDIDATES_COMMON: &[&str] = &["h264_nvenc", "h264_amf", "h26
 const H264_ENCODER_WINDOWS_EXTRA: &[&str] = &["h264_mf"];
 // ponytail: 按 ffmpeg 路径缓存首选；失败后清缓存再探。
 static SELECTED_H264_ENCODER: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioStreamFilterPlan {
+    pub filter_graph: String,
+    pub quality_pitch: Option<QualityPitchConfig>,
+    pub pcm_effects: Option<AudioPcmEffectConfig>,
+    pub requires_ambient_input: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaEngineStatus {
@@ -149,11 +165,11 @@ pub struct MediaRenderRequest {
     pub video_processing_enabled: bool,
     pub audio_processing_enabled: bool,
     pub source_audio_sample_rate_hz: Option<u32>,
-    pub video: VideoResearchParams,
-    pub audio: AudioResearchParams,
+    pub video: VideoEffectParams,
+    pub audio: AudioEffectParams,
     /// 多虚拟轨音频参数；空表示使用 `audio`，最多允许四条支路。
-    pub audio_variants: Vec<AudioResearchParams>,
-    pub research: ResearchExperimentParams,
+    pub audio_variants: Vec<AudioEffectParams>,
+    pub advanced: AdvancedEffectParams,
     pub timeout_seconds: u64,
 }
 
@@ -190,6 +206,10 @@ pub enum MediaEngineError {
     SpawnFailed {
         path: String,
         message: String,
+    },
+    ProbeOutputTooLarge {
+        path: String,
+        limit_bytes: usize,
     },
     Failed {
         code: Option<i32>,
@@ -237,6 +257,12 @@ impl Display for MediaEngineError {
             Self::OutputConflict { path } => write!(formatter, "媒体输出已存在，拒绝覆盖：{path}"),
             Self::SpawnFailed { path, message } => {
                 write!(formatter, "媒体引擎启动失败：{path}；{message}")
+            }
+            Self::ProbeOutputTooLarge { path, limit_bytes } => {
+                write!(
+                    formatter,
+                    "媒体引擎探测输出超过上限：{path}；limit={limit_bytes} bytes"
+                )
             }
             Self::Failed { code, stderr } => {
                 write!(
@@ -289,6 +315,43 @@ pub fn probe_media_engine_with_paths(
     })
 }
 
+/// 在把本地环境声交给长生命周期 PCM 任务前，先解码一个短片段。
+/// 这里只验证真实音频流可解码，不把文件内容读入当前进程。
+pub fn validate_audio_input_decodable(
+    ffmpeg_path: &Path,
+    input_path: &Path,
+    timeout_ms: u64,
+) -> Result<(), MediaEngineError> {
+    if !input_path.is_file() {
+        return Err(MediaEngineError::InvalidInput {
+            path: input_path.display().to_string(),
+        });
+    }
+    let args: Vec<std::ffi::OsString> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+        "-i".into(),
+        input_path.as_os_str().to_owned(),
+        "-map".into(),
+        "0:a:0".into(),
+        "-t".into(),
+        "0.250".into(),
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+    ];
+    let (status, _) = run_command_with_timeout(ffmpeg_path, args, timeout_ms.max(1))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(MediaEngineError::InvalidInput {
+            path: input_path.display().to_string(),
+        })
+    }
+}
+
 pub fn build_media_render_args(
     request: &MediaRenderRequest,
 ) -> Result<Vec<std::ffi::OsString>, MediaEngineError> {
@@ -314,16 +377,30 @@ fn build_media_render_args_with_video_encoder(
         "-y".into(),
         "-i".into(),
         request.input_mp4_path.clone().into_os_string(),
-        "-map".into(),
-        "0:v:0?".into(),
     ];
+    let filter_option_index = args.len();
+    let mut complex_graph_parts = Vec::with_capacity(2);
 
     if request.video_processing_enabled {
-        args.extend(["-vf".into(), video_filter(&request.video).into()]);
+        let filter_plan = video_filter(&request.video, &request.advanced)?;
+        if let Some(graph) = filter_plan.complex_graph {
+            complex_graph_parts.push(graph);
+            args.extend(["-map".into(), "[vout]".into()]);
+        } else {
+            args.extend([
+                "-map".into(),
+                "0:v:0?".into(),
+                "-vf".into(),
+                filter_plan.serial_filter.into(),
+            ]);
+        }
+        if filter_plan.requires_variable_frame_rate {
+            args.extend(["-fps_mode".into(), "vfr".into()]);
+        }
         let encoder = video_encoder.unwrap_or(FALLBACK_H264_ENCODER);
         args.extend(video_encoder_codec_args(encoder));
     } else {
-        args.extend(["-c:v".into(), "copy".into()]);
+        args.extend(["-map".into(), "0:v:0?".into(), "-c:v".into(), "copy".into()]);
     }
 
     if request.audio_processing_enabled {
@@ -333,15 +410,15 @@ fn build_media_render_args_with_video_encoder(
             request.source_audio_sample_rate_hz,
             request.audio.sample_rate_hz,
         );
-        let graph = audio_mix_filter_complex(
+        complex_graph_parts.push(audio_mix_filter_complex(
+            &request.audio,
             &variants,
             request.source_audio_sample_rate_hz,
             Some(output_sample_rate_hz),
             false,
-        )?;
+            false,
+        )?);
         args.extend([
-            "-filter_complex".into(),
-            graph.into(),
             "-map".into(),
             "[aout]".into(),
             "-c:a".into(),
@@ -355,6 +432,16 @@ fn build_media_render_args_with_video_encoder(
         ]);
     } else {
         args.extend(["-map".into(), "0:a:0?".into(), "-c:a".into(), "copy".into()]);
+    }
+
+    if !complex_graph_parts.is_empty() {
+        args.splice(
+            filter_option_index..filter_option_index,
+            [
+                "-filter_complex".into(),
+                complex_graph_parts.join(";").into(),
+            ],
+        );
     }
 
     if request.audio_processing_enabled {
@@ -629,6 +716,16 @@ fn validate_request_shape(request: &MediaRenderRequest) -> Result<(), MediaEngin
                     .collect::<Vec<_>>()
                     .join("；"),
             })?;
+        request
+            .advanced
+            .validate()
+            .map_err(|errors| MediaEngineError::InvalidParameters {
+                message: errors
+                    .iter()
+                    .map(|error| error.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("；"),
+            })?;
     }
     if request.audio_variants.len() > MAX_AUDIO_VARIANTS {
         return Err(MediaEngineError::InvalidParameters {
@@ -655,71 +752,30 @@ fn validate_request_shape(request: &MediaRenderRequest) -> Result<(), MediaEngin
 
 fn validate_filter_support(request: &MediaRenderRequest) -> Result<(), MediaEngineError> {
     if request.video_processing_enabled {
-        let defaults = VideoResearchParams::default();
-        let unsupported = [
-            (
-                "video.crop_edge_smoothing",
-                request.video.crop_edge_smoothing,
-                defaults.crop_edge_smoothing,
-            ),
-            (
-                "video.frame_rate_jitter_percent",
-                request.video.frame_rate_jitter_percent,
-                defaults.frame_rate_jitter_percent,
-            ),
-            (
-                "video.frame_rate_perturbation_frequency_hz",
-                request.video.frame_rate_perturbation_frequency_hz,
-                defaults.frame_rate_perturbation_frequency_hz,
-            ),
-            (
-                "video.frame_rate_perturbation_amplitude_fps",
-                request.video.frame_rate_perturbation_amplitude_fps,
-                defaults.frame_rate_perturbation_amplitude_fps,
-            ),
-            (
-                "video.frame_inner_perturbation_percent",
-                request.video.frame_inner_perturbation_percent,
-                defaults.frame_inner_perturbation_percent,
-            ),
-            (
-                "video.frame_inter_perturbation_percent",
-                request.video.frame_inter_perturbation_percent,
-                defaults.frame_inter_perturbation_percent,
-            ),
-            (
-                "video.color_space_conversion_strength_percent",
-                request.video.color_space_conversion_strength_percent,
-                defaults.color_space_conversion_strength_percent,
-            ),
-        ];
-        if let Some((field, value, _default)) = unsupported
-            .into_iter()
-            .find(|(_, value, default)| (value - default).abs() > f64::EPSILON)
-        {
-            return Err(MediaEngineError::InvalidParameters {
-                message: format!("当前媒体 Worker 尚未映射参数 {field}={value}"),
-            });
-        }
+        build_media_video_effect_plan(&request.video, &request.advanced).map_err(|error| {
+            MediaEngineError::InvalidParameters {
+                message: error.to_string(),
+            }
+        })?;
     }
     if request.audio_processing_enabled {
-        validate_audio_filter_support(&request.audio, "audio")?;
+        validate_audio_filter_support(&request.audio, "audio", false, false)?;
     }
     // variants 是 IPC 输入的一部分；即使当前关闭声音处理，也不能借此绕过
     // 未映射参数校验，避免后续切换开关后把非法预设带入媒体链。
     for (index, audio) in request.audio_variants.iter().enumerate() {
-        validate_audio_filter_support(audio, &format!("audio_variants[{index}]"))?;
-    }
-    if request.video_processing_enabled && request.research != ResearchExperimentParams::default() {
-        return Err(MediaEngineError::InvalidParameters {
-            message: "当前媒体 Worker 尚未映射视觉频段、挂件和切片研究参数".to_owned(),
-        });
+        validate_audio_filter_support(
+            audio,
+            &format!("audio_variants[{index}]"),
+            !request.audio_processing_enabled,
+            false,
+        )?;
     }
     Ok(())
 }
 
 fn validate_audio_params(
-    audio: &AudioResearchParams,
+    audio: &AudioEffectParams,
     field_prefix: &str,
 ) -> Result<(), MediaEngineError> {
     audio
@@ -737,84 +793,58 @@ fn validate_audio_params(
 }
 
 fn validate_audio_filter_support(
-    audio: &AudioResearchParams,
+    audio: &AudioEffectParams,
     field_prefix: &str,
+    allow_pcm_runtime: bool,
+    ambient_input_available: bool,
 ) -> Result<(), MediaEngineError> {
-    let defaults = AudioResearchParams::default();
-    if audio.natural_voice_mode != defaults.natural_voice_mode {
+    let defaults = AudioEffectParams::default();
+    let plan = build_offline_audio_effect_plan(audio).map_err(|errors| {
+        MediaEngineError::InvalidParameters {
+            message: errors
+                .into_iter()
+                .map(|error| error.message)
+                .collect::<Vec<_>>()
+                .join("；"),
+        }
+    })?;
+    if plan.ambient_sound_mix.is_some() && !ambient_input_available {
         return Err(MediaEngineError::InvalidParameters {
-            message: format!("当前媒体 Worker 尚未映射参数 {field_prefix}.natural_voice_mode"),
+            message: format!(
+                "{field_prefix}.ambient_sound_mix_percent 需要选择并验证真实环境声素材"
+            ),
         });
     }
-    if audio.voice_library_id != defaults.voice_library_id {
-        return Err(MediaEngineError::InvalidParameters {
-            message: format!("当前媒体 Worker 尚未映射参数 {field_prefix}.voice_library_id"),
-        });
-    }
-    // random_change_period_ms 仅驱动前端预览调度，不进 FFmpeg，不得当 unsupported 拦截。
-    let unsupported = [
-        (
-            "spectral_perturbation_percent",
-            audio.spectral_perturbation_percent,
-            defaults.spectral_perturbation_percent,
-        ),
-        (
-            "mfcc_shift_percent",
-            audio.mfcc_shift_percent,
-            defaults.mfcc_shift_percent,
-        ),
-        (
-            "ambient_sound_mix_percent",
-            audio.ambient_sound_mix_percent,
-            defaults.ambient_sound_mix_percent,
-        ),
-        (
-            "dry_wet_percent",
-            audio.dry_wet_percent,
-            defaults.dry_wet_percent,
-        ),
-        (
-            "mfcc_dimensions",
-            audio.mfcc_dimensions as f64,
-            defaults.mfcc_dimensions as f64,
-        ),
-        (
-            "snr_variation_db",
-            audio.snr_variation_db,
-            defaults.snr_variation_db,
-        ),
-        (
-            "formant_shift_percent",
-            audio.formant_shift_percent,
-            defaults.formant_shift_percent,
-        ),
-        (
-            "spectrum_blind_spot_percent",
-            audio.spectrum_blind_spot_percent,
-            defaults.spectrum_blind_spot_percent,
-        ),
-    ];
-    if let Some((field, value, _default)) = unsupported
-        .into_iter()
-        .find(|(_, value, default)| (value - default).abs() > f64::EPSILON)
+    if !allow_pcm_runtime
+        && (plan.snr.is_some()
+            || plan
+                .analysis
+                .mfcc
+                .as_ref()
+                .is_some_and(|mfcc| mfcc.operation == MfccOperation::ShiftAndReconstruct))
     {
         return Err(MediaEngineError::InvalidParameters {
-            message: format!("当前媒体 Worker 尚未映射参数 {field_prefix}.{field}={value}"),
+            message: format!(
+                "{field_prefix} 的 MFCC/SNR 参数只允许进入 PortAudio 混音后 PCM 处理链"
+            ),
         });
     }
-    for (field, value, default) in [
-        ("snr_target_db", audio.snr_target_db, defaults.snr_target_db),
-        (
-            "current_formant_hz",
-            audio.current_formant_hz,
-            defaults.current_formant_hz,
-        ),
-    ] {
-        if value != default {
-            return Err(MediaEngineError::InvalidParameters {
-                message: format!("当前媒体 Worker 尚未映射参数 {field_prefix}.{field}={value:?}"),
-            });
-        }
+    if !allow_pcm_runtime
+        && (audio.formant_shift_percent - defaults.formant_shift_percent).abs() > f64::EPSILON
+    {
+        return Err(MediaEngineError::InvalidParameters {
+            message: format!(
+                "当前媒体 Worker 尚未映射参数 {field_prefix}.formant_shift_percent={}",
+                audio.formant_shift_percent
+            ),
+        });
+    }
+    if audio.current_formant_hz != defaults.current_formant_hz {
+        return Err(MediaEngineError::InvalidParameters {
+            message: format!(
+                "{field_prefix}.current_formant_hz 是最终混音 PCM 的只读测量值，不能作为效果输入"
+            ),
+        });
     }
     Ok(())
 }
@@ -1081,10 +1111,48 @@ where
             path: path.display().to_string(),
             message: error.to_string(),
         })?;
+    let Some(stdout) = child.stdout.take() else {
+        terminate_child(&mut child);
+        return Err(MediaEngineError::SpawnFailed {
+            path: path.display().to_string(),
+            message: "媒体引擎未提供 stdout 管道".to_owned(),
+        });
+    };
+    let mut stdout_reader = match thread::Builder::new()
+        .name("media-probe-stdout".to_owned())
+        .spawn(move || read_to_end_bounded(stdout, MAX_PROBE_STDOUT_BYTES))
+    {
+        Ok(reader) => Some(reader),
+        Err(error) => {
+            terminate_child(&mut child);
+            return Err(MediaEngineError::SpawnFailed {
+                path: path.display().to_string(),
+                message: format!("启动探测 stdout 读取线程失败：{error}"),
+            });
+        }
+    };
+    let mut captured_stdout = None;
     let started = Instant::now();
     let status = loop {
+        if stdout_reader
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            match join_probe_stdout(path, &mut stdout_reader) {
+                Ok(stdout) => captured_stdout = Some(stdout),
+                Err(error) => {
+                    terminate_child(&mut child);
+                    return Err(error);
+                }
+            }
+        }
         if started.elapsed() >= Duration::from_millis(timeout_ms) {
             terminate_child(&mut child);
+            if let Err(error @ MediaEngineError::ProbeOutputTooLarge { .. }) =
+                join_probe_stdout(path, &mut stdout_reader)
+            {
+                return Err(error);
+            }
             return Err(MediaEngineError::EngineUnavailable {
                 reason: format!("{} 探测超时：{}ms", path.display(), timeout_ms),
             });
@@ -1094,6 +1162,7 @@ where
             Ok(None) => thread::sleep(Duration::from_millis(10)),
             Err(error) => {
                 terminate_child(&mut child);
+                let _ = join_probe_stdout(path, &mut stdout_reader);
                 return Err(MediaEngineError::SpawnFailed {
                     path: path.display().to_string(),
                     message: error.to_string(),
@@ -1101,15 +1170,37 @@ where
             }
         }
     };
-    let mut stdout = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_end(&mut stdout)
-            .map_err(|error| MediaEngineError::SpawnFailed {
-                path: path.display().to_string(),
-                message: error.to_string(),
-            })?;
-    }
+    let stdout = match captured_stdout {
+        Some(stdout) => stdout,
+        None => join_probe_stdout(path, &mut stdout_reader)?,
+    };
     Ok((status, stdout))
+}
+
+fn join_probe_stdout(
+    path: &Path,
+    reader: &mut Option<thread::JoinHandle<Result<Vec<u8>, BoundedReadError>>>,
+) -> Result<Vec<u8>, MediaEngineError> {
+    let Some(reader) = reader.take() else {
+        return Ok(Vec::new());
+    };
+    match reader.join() {
+        Ok(Ok(stdout)) => Ok(stdout),
+        Ok(Err(BoundedReadError::LimitExceeded { limit })) => {
+            Err(MediaEngineError::ProbeOutputTooLarge {
+                path: path.display().to_string(),
+                limit_bytes: limit,
+            })
+        }
+        Ok(Err(BoundedReadError::Io(error))) => Err(MediaEngineError::SpawnFailed {
+            path: path.display().to_string(),
+            message: format!("读取探测 stdout 失败：{error}"),
+        }),
+        Err(_) => Err(MediaEngineError::SpawnFailed {
+            path: path.display().to_string(),
+            message: "读取探测 stdout 的线程异常退出".to_owned(),
+        }),
+    }
 }
 
 /// 选择可用 H.264 编码器（本机探测，不写死硬件）：
@@ -1252,7 +1343,16 @@ fn video_encoder_codec_args(encoder: &str) -> Vec<std::ffi::OsString> {
     }
 }
 
-fn video_filter(video: &VideoResearchParams) -> String {
+struct VideoFilterPlan {
+    serial_filter: String,
+    complex_graph: Option<String>,
+    requires_variable_frame_rate: bool,
+}
+
+fn video_filter(
+    video: &VideoEffectParams,
+    advanced: &AdvancedEffectParams,
+) -> Result<VideoFilterPlan, MediaEngineError> {
     // 当前打包 FFmpeg 无 eq/boxblur；用 lutyuv + hue + gblur 等价映射。
     let brightness = (video.brightness_percent / 100.0).clamp(-1.0, 1.0);
     let contrast = (video.contrast_percent / 100.0).clamp(0.0, 2.0);
@@ -1266,22 +1366,39 @@ fn video_filter(video: &VideoResearchParams) -> String {
             video.hue_rotation_degrees
         ));
     }
+    if video.highlights_percent.abs() > f64::EPSILON || video.shadows_percent.abs() > f64::EPSILON {
+        let highlights = video.highlights_percent / 100.0 * 32.0;
+        let shadows = video.shadows_percent / 100.0 * 32.0;
+        let curve =
+            format!("clip(val+({shadows:.6}*(1-val/255)+{highlights:.6}*(val/255))\\,0\\,255)");
+        let red = if video.red_channel_lock_enabled {
+            "val".to_owned()
+        } else {
+            curve.clone()
+        };
+        filters.push(format!("lutrgb=r='{red}':g='{curve}':b='{curve}'"));
+    }
+    if video.vignette_percent > f64::EPSILON {
+        let angle = video.vignette_percent / 100.0 * std::f64::consts::FRAC_PI_2;
+        filters.push(format!("vignette=angle={angle:.8}:eval=init"));
+    }
     if video.blur_radius_px > 0.0 {
         filters.push(format!("gblur=sigma={:.6}", video.blur_radius_px.max(0.01)));
     }
-    let detail_strength = (video.sharpen_percent + video.detail_enhancement_percent) / 100.0;
-    if detail_strength > 0.0 {
-        filters.push(format!("unsharp=5:5:{detail_strength:.6}"));
+    let mut combined_unsharp = 0.0;
+    if video.image_repair_enabled && video.image_repair_strength_percent > f64::EPSILON {
+        combined_unsharp += video.image_repair_strength_percent / 250.0;
+        if video.image_repair_strength_percent > 1.0 {
+            let strength = 1.0 + video.image_repair_strength_percent / 25.0;
+            filters.push(format!("nlmeans=s={strength:.6}:p=7:r=9"));
+        }
+    }
+    combined_unsharp += (video.sharpen_percent + video.detail_enhancement_percent) / 100.0;
+    if combined_unsharp > 0.0 {
+        filters.push(format!("unsharp=5:5:{combined_unsharp:.6}"));
     }
     if video.noise_percent > 0.0 {
         filters.push(format!("noise=alls={:.6}:allf=t+u", video.noise_percent));
-    }
-    if video.dynamic_crop_percent > 0.0 {
-        let crop = video.dynamic_crop_percent / 100.0;
-        filters.push(format!(
-            "crop=iw*(1-{double_crop:.6}):ih*(1-{double_crop:.6}):iw*{crop:.6}+iw*{crop:.6}*sin(n*0.07):ih*{crop:.6}+ih*{crop:.6}*cos(n*0.09),scale=iw/(1-{double_crop:.6}):ih/(1-{double_crop:.6})",
-            double_crop = crop * 2.0,
-        ));
     }
     let offset_x = video.space_x_offset_px.round();
     let offset_y = video.space_y_offset_px.round();
@@ -1306,10 +1423,35 @@ fn video_filter(video: &VideoResearchParams) -> String {
         let scale = video.pixel_scale_percent / 100.0;
         filters.push(format!("scale=iw*{scale:.6}:ih*{scale:.6}"));
     }
-    filters.join(",")
+    if video.horizontal_flip_enabled {
+        filters.push("hflip".to_owned());
+    }
+    if video.vertical_flip_enabled {
+        filters.push("vflip".to_owned());
+    }
+    if video.rotation_degrees.abs() > f64::EPSILON {
+        let radians = video.rotation_degrees.to_radians();
+        filters.push(format!(
+            "rotate=angle={radians:.10}:ow=iw:oh=ih:fillcolor=black"
+        ));
+    }
+    let supplementary = build_media_video_effect_plan(video, advanced).map_err(|error| {
+        MediaEngineError::InvalidParameters {
+            message: error.to_string(),
+        }
+    })?;
+    filters.extend(supplementary.filters);
+    let serial_filter = filters.join(",");
+    let complex_graph = build_media_video_complex_effect_plan(&serial_filter, video, advanced)
+        .map(|plan| plan.graph);
+    Ok(VideoFilterPlan {
+        serial_filter,
+        complex_graph,
+        requires_variable_frame_rate: supplementary.requires_variable_frame_rate,
+    })
 }
 
-fn effective_audio_variants(request: &MediaRenderRequest) -> Vec<AudioResearchParams> {
+fn effective_audio_variants(request: &MediaRenderRequest) -> Vec<AudioEffectParams> {
     if request.audio_variants.is_empty() {
         vec![request.audio.clone()]
     } else {
@@ -1318,7 +1460,7 @@ fn effective_audio_variants(request: &MediaRenderRequest) -> Vec<AudioResearchPa
 }
 
 fn effective_audio_output_sample_rate_hz(
-    variants: &[AudioResearchParams],
+    variants: &[AudioEffectParams],
     source_sample_rate_hz: Option<u32>,
     preferred_output_sample_rate_hz: Option<u32>,
 ) -> u32 {
@@ -1335,27 +1477,29 @@ fn effective_audio_output_sample_rate_hz(
 /// 单个音频支路的效果链；支路之间的环境噪声混合由
 /// `audio_mix_filter_complex` 通过独立 `anoisesrc` 完成。
 fn audio_branch_filter(
-    audio: &AudioResearchParams,
+    audio: &AudioEffectParams,
     source_sample_rate_hz: Option<u32>,
     realtime: bool,
-) -> String {
+) -> Result<String, MediaEngineError> {
     // 某些容器只声明声道数而没有标准 channel layout（FFmpeg 会显示为
     // `1 channels` 等）。native AAC 无法为这种布局初始化编码器，会返回
     // EINVAL 并导致输出出现 audio:0KiB。每条支路先归一到 AAC 可接受的
     // float/stereo 总线；这也与 PortAudio 的双声道出口保持一致。
     // aeval 将解码器或支路滤镜产生的 NaN/Infinity 转为 0，避免把非法
-    // 浮点样本继续送入 loudnorm/AAC。最终渲染仍由 FFmpeg 成功状态决定。
-    format!(
+    // 浮点样本继续送入输出总线/AAC。最终渲染仍由 FFmpeg 成功状态决定。
+    Ok(format!(
         "aformat=sample_fmts=fltp:channel_layouts=stereo,{AUDIO_FINITE_GUARD_FILTER},{}",
-        audio_filter(audio, source_sample_rate_hz, realtime)
-    )
+        audio_filter(audio, source_sample_rate_hz, realtime)?
+    ))
 }
 
 fn audio_mix_filter_complex(
-    variants: &[AudioResearchParams],
+    main_audio: &AudioEffectParams,
+    variants: &[AudioEffectParams],
     source_sample_rate_hz: Option<u32>,
     preferred_output_sample_rate_hz: Option<u32>,
     realtime: bool,
+    ambient_input_available: bool,
 ) -> Result<String, MediaEngineError> {
     if variants.is_empty() {
         return Err(MediaEngineError::InvalidParameters {
@@ -1363,7 +1507,7 @@ fn audio_mix_filter_complex(
         });
     }
     let k = variants.len();
-    let mut parts = Vec::with_capacity(k * 3 + 2);
+    let mut parts = Vec::with_capacity(k * 6 + 5);
     let split_labels = (0..k).map(|index| format!("a{index}")).collect::<Vec<_>>();
     parts.push(format!(
         "[0:a:0]asplit={k}{}",
@@ -1375,8 +1519,31 @@ fn audio_mix_filter_complex(
     let mut mixed_inputs = String::new();
     let mut weights = Vec::with_capacity(k);
     for (index, audio) in variants.iter().enumerate() {
-        let branch = audio_branch_filter(audio, source_sample_rate_hz, realtime);
-        parts.push(format!("[a{index}]{branch}[dry{index}]"));
+        let branch = audio_branch_filter(audio, source_sample_rate_hz, realtime)?;
+        parts.push(format!("[a{index}]{branch}[processed{index}]"));
+        let branch_input = if let Some(mix) = build_offline_audio_effect_plan(audio)
+            .map_err(|errors| MediaEngineError::InvalidParameters {
+                message: errors
+                    .into_iter()
+                    .map(|error| error.message)
+                    .collect::<Vec<_>>()
+                    .join("；"),
+            })?
+            .dry_wet_mix
+        {
+            // 额外湿声支路使用两级短反射；0% 时不创建支路，保持既有声音效果不变。
+            parts.push(format!(
+                "[processed{index}]asplit=2[dry{index}][wet_in{index}];[wet_in{index}]aecho=0.8:0.9:60|120:0.35|0.20[wet{index}];{}",
+                mix.ffmpeg_complex_graph_fragment(
+                    &format!("dry{index}"),
+                    &format!("wet{index}"),
+                    &format!("dry_wet{index}"),
+                )
+            ));
+            format!("dry_wet{index}")
+        } else {
+            format!("processed{index}")
+        };
         if audio.environment_noise_percent > f64::EPSILON {
             let ratio = (audio.environment_noise_percent / 100.0).clamp(0.0, 1.0);
             let amplitude = 10_f64
@@ -1386,10 +1553,10 @@ fn audio_mix_filter_complex(
             // 噪声源独立于每个支路，并由该支路自己的 amix 真正混入。
             // 源时长由 duration=first 裁切，避免短片尾部被噪声源延长。
             parts.push(format!(
-                "anoisesrc=color=white:amplitude={amplitude:.6}:d=86400[noise{index}];[dry{index}][noise{index}]amix=inputs=2:weights={dry_weight:.6} {ratio:.6}:duration=first:dropout_transition=0[b{index}]"
+                "anoisesrc=color=white:amplitude={amplitude:.6}:d=86400[noise{index}];[{branch_input}][noise{index}]amix=inputs=2:weights={dry_weight:.6} {ratio:.6}:duration=first:dropout_transition=0[b{index}]"
             ));
         } else {
-            parts.push(format!("[dry{index}]anull[b{index}]"));
+            parts.push(format!("[{branch_input}]anull[b{index}]"));
         }
         mixed_inputs.push_str(&format!("[b{index}]"));
         weights.push(format!("{:.6}", 1.0 / k as f64));
@@ -1399,10 +1566,37 @@ fn audio_mix_filter_complex(
         source_sample_rate_hz,
         preferred_output_sample_rate_hz,
     );
-    // 最终总线固定为：等权混音 → 高通 → 动态响度标准化 → 采样率归一化。
     parts.push(format!(
-        "{mixed_inputs}amix=inputs={k}:weights={}:duration=first:dropout_transition=0,{AUDIO_FINITE_GUARD_FILTER},highpass=f=50,adenorm=level=-351:type=ac,loudnorm=I=-16:TP=-1.5:LRA=11:linear=false:print_format=none,aresample={output_sample_rate_hz}:async=1:first_pts=0,aformat=sample_fmts=fltp:sample_rates={output_sample_rate_hz}:channel_layouts=stereo[aout]",
+        "{mixed_inputs}amix=inputs={k}:weights={}:duration=first:dropout_transition=0[variant_bus]",
         weights.join(" "),
+    ));
+    let final_input = if let Some(mix) = build_offline_audio_effect_plan(main_audio)
+        .map_err(|errors| MediaEngineError::InvalidParameters {
+            message: errors
+                .into_iter()
+                .map(|error| error.message)
+                .collect::<Vec<_>>()
+                .join("；"),
+        })?
+        .ambient_sound_mix
+    {
+        if !ambient_input_available {
+            return Err(MediaEngineError::InvalidParameters {
+                message: "环境声混合已启用，但没有经校验的真实环境声输入".to_owned(),
+            });
+        }
+        parts.push(format!(
+            "[1:a:0]aformat=sample_fmts=fltp:channel_layouts=stereo,aresample={output_sample_rate_hz}:async=1:first_pts=0[ambient];{}",
+            mix.ffmpeg_complex_graph_fragment("variant_bus", "ambient", "ambient_bus")
+        ));
+        "ambient_bus"
+    } else {
+        "variant_bus"
+    };
+    // 保留源素材相对响度；低感知预设只应用自身的微小增益，不能固定归一到 -16 LUFS。
+    // PortAudio 出口继续在最终 PCM 总线上执行 true-peak 保护。
+    parts.push(format!(
+        "[{final_input}]{AUDIO_FINITE_GUARD_FILTER},highpass=f=50,adenorm=level=-351:type=ac,aresample={output_sample_rate_hz}:async=1:first_pts=0,aformat=sample_fmts=fltp:sample_rates={output_sample_rate_hz}:channel_layouts=stereo[aout]",
     ));
     Ok(parts.join(";"))
 }
@@ -1412,13 +1606,29 @@ fn audio_mix_filter_complex(
 /// 输出标签固定为 `[aout]`，调用方应将其映射到 PCM 输出；滤镜图保证
 /// `fltp`、双声道、有限值保护，并将常用输出采样率归一到 44.1kHz/48kHz。
 pub fn build_audio_stream_filter_graph(
-    audio: &AudioResearchParams,
-    audio_variants: &[AudioResearchParams],
+    audio: &AudioEffectParams,
+    audio_variants: &[AudioEffectParams],
     source_audio_sample_rate_hz: Option<u32>,
     output_sample_rate_hz: u32,
-) -> Result<String, MediaEngineError> {
+) -> Result<AudioStreamFilterPlan, MediaEngineError> {
+    build_audio_stream_filter_graph_with_ambient(
+        audio,
+        audio_variants,
+        source_audio_sample_rate_hz,
+        output_sample_rate_hz,
+        false,
+    )
+}
+
+pub fn build_audio_stream_filter_graph_with_ambient(
+    audio: &AudioEffectParams,
+    audio_variants: &[AudioEffectParams],
+    source_audio_sample_rate_hz: Option<u32>,
+    output_sample_rate_hz: u32,
+    ambient_input_available: bool,
+) -> Result<AudioStreamFilterPlan, MediaEngineError> {
     validate_audio_params(audio, "audio")?;
-    validate_audio_filter_support(audio, "audio")?;
+    validate_audio_filter_support(audio, "audio", true, ambient_input_available)?;
     if !matches!(output_sample_rate_hz, 44_100 | 48_000) {
         return Err(MediaEngineError::InvalidParameters {
             message: format!(
@@ -1443,22 +1653,64 @@ pub fn build_audio_stream_filter_graph(
         for (index, variant) in variants.iter().enumerate() {
             let field_prefix = format!("audio_variants[{index}]");
             validate_audio_params(variant, &field_prefix)?;
-            validate_audio_filter_support(variant, &field_prefix)?;
+            validate_audio_filter_support(variant, &field_prefix, true, ambient_input_available)?;
+            if (variant.pitch_shift_semitones - audio.pitch_shift_semitones).abs() > f64::EPSILON
+                || (variant.formant_shift_percent - audio.formant_shift_percent).abs()
+                    > f64::EPSILON
+                || variant.mfcc_shift_percent != audio.mfcc_shift_percent
+                || variant.mfcc_dimensions != audio.mfcc_dimensions
+                || variant.snr_target_db != audio.snr_target_db
+                || variant.snr_variation_db != audio.snr_variation_db
+                || variant.ambient_sound_mix_percent != audio.ambient_sound_mix_percent
+            {
+                return Err(MediaEngineError::InvalidParameters {
+                    message: format!(
+                        "{field_prefix} 的音高、共振峰、MFCC、SNR 和环境声参数必须与主 audio 一致；这些效果位于多支路混音后的总线"
+                    ),
+                });
+            }
         }
     }
-    audio_mix_filter_complex(
+    let filter_graph = audio_mix_filter_complex(
+        audio,
         variants,
         source_audio_sample_rate_hz,
         Some(output_sample_rate_hz),
         true,
-    )
+        ambient_input_available,
+    )?;
+    let quality_pitch = (audio.pitch_shift_semitones.abs() > f64::EPSILON
+        || audio.formant_shift_percent.abs() > f64::EPSILON)
+        .then_some(QualityPitchConfig {
+            pitch_shift_semitones: audio.pitch_shift_semitones,
+            formant_shift_percent: audio.formant_shift_percent,
+        });
+    let offline_plan = build_offline_audio_effect_plan(audio).map_err(|errors| {
+        MediaEngineError::InvalidParameters {
+            message: errors
+                .into_iter()
+                .map(|error| error.message)
+                .collect::<Vec<_>>()
+                .join("；"),
+        }
+    })?;
+    let pcm_effects = AudioPcmEffectConfig {
+        mfcc: offline_plan.analysis.mfcc,
+        snr: offline_plan.snr,
+    };
+    Ok(AudioStreamFilterPlan {
+        filter_graph,
+        quality_pitch,
+        pcm_effects: pcm_effects.is_active().then_some(pcm_effects),
+        requires_ambient_input: offline_plan.ambient_sound_mix.is_some(),
+    })
 }
 
 fn audio_filter(
-    audio: &AudioResearchParams,
+    audio: &AudioEffectParams,
     source_sample_rate_hz: Option<u32>,
     realtime: bool,
-) -> String {
+) -> Result<String, MediaEngineError> {
     let gain_db = audio.input_gain_db + audio.output_gain_db + audio.loudness_adjustment_db;
     let mut filters = vec![format!("volume={gain_db:.6}dB")];
     for (frequency_hz, gain_db) in [
@@ -1473,7 +1725,7 @@ fn audio_filter(
             ));
         }
     }
-    if audio.pitch_shift_semitones.abs() > f64::EPSILON {
+    if audio.pitch_shift_semitones.abs() > f64::EPSILON && !realtime {
         // ponytail: 无探测采样率时回退 48k，避免微扰音高整次失败
         let source_sample_rate_hz = source_sample_rate_hz.unwrap_or(48_000);
         let factor = 2_f64.powf(audio.pitch_shift_semitones / 12.0);
@@ -1508,10 +1760,17 @@ fn audio_filter(
         filters.push(format!("afftdn=nr={reduction_db:.6}"));
     }
     if audio.phase_perturbation_percent.abs() > f64::EPSILON {
-        // FFmpeg aphaser 的 decay 上限是 0.99；参数契约的 20% 仍表示最大实验强度。
+        // FFmpeg aphaser 的 decay 上限是 0.99；参数契约的 20% 仍表示最大效果强度。
         let depth = (audio.phase_perturbation_percent.abs() / 20.0).clamp(0.0, 0.99);
+        // aphaser 默认 0.4/0.74 增益会把低感知微扰整体衰减约 10dB；仅强效果
+        // 使用默认防削波增益，1% 以内保持源素材相对响度。
+        let (input_gain, output_gain) = if audio.phase_perturbation_percent.abs() <= 1.0 {
+            ("1.0", "1.0")
+        } else {
+            ("0.4", "0.74")
+        };
         filters.push(format!(
-            "aphaser=in_gain=0.4:out_gain=0.74:delay=3:decay={depth:.6}:speed=0.5"
+            "aphaser=in_gain={input_gain}:out_gain={output_gain}:delay=3:decay={depth:.6}:speed=0.5"
         ));
     }
     if audio.vibrato_depth_percent > 0.0 {
@@ -1521,12 +1780,22 @@ fn audio_filter(
             audio.vibrato_frequency_hz
         ));
     }
+    let supplementary = build_offline_audio_effect_plan(audio).map_err(|errors| {
+        MediaEngineError::InvalidParameters {
+            message: errors
+                .into_iter()
+                .map(|error| error.message)
+                .collect::<Vec<_>>()
+                .join("；"),
+        }
+    })?;
+    filters.extend(supplementary.serial_filters);
     if let Some(sample_rate_hz) = audio.sample_rate_hz {
         if Some(sample_rate_hz) != source_sample_rate_hz {
             filters.push(format!("aresample={sample_rate_hz}"));
         }
     }
-    filters.join(",")
+    Ok(filters.join(","))
 }
 
 fn cleanup(path: &Path) {
@@ -1582,19 +1851,153 @@ fn join_stderr_reader(reader: &mut Option<thread::JoinHandle<Option<String>>>) -
 mod tests {
     use super::{
         audio_mix_filter_complex, build_audio_stream_filter_graph,
+        build_audio_stream_filter_graph_with_ambient,
         configured_media_engine_paths_with_resource_dir, packaged_media_engine_paths,
-        parse_max_volume_db, target_triple, validate_audio_probe_output, AUDIO_FINITE_GUARD_FILTER,
+        parse_max_volume_db, run_command_with_timeout, target_triple,
+        validate_audio_input_decodable, validate_audio_probe_output, video_filter,
+        MediaEngineError, AUDIO_FINITE_GUARD_FILTER, MAX_PROBE_STDOUT_BYTES,
     };
-    use crate::research_params::AudioResearchParams;
+    use crate::media_effect_params::{
+        AdvancedEffectParams, AudioEffectParams, NaturalVoiceMode, VideoEffectParams,
+    };
     use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
+    use std::process::Stdio;
     use std::sync::Mutex;
 
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    const OVERSIZED_PROBE_FIXTURE_ENV: &str = "AUTOLIVE_OVERSIZED_PROBE_FIXTURE";
+
+    #[test]
+    fn automatic_low_strength_image_repair_uses_lightweight_filter() {
+        let video = VideoEffectParams {
+            image_repair_enabled: true,
+            image_repair_strength_percent: 0.2,
+            ..VideoEffectParams::default()
+        };
+
+        let plan = video_filter(&video, &AdvancedEffectParams::default()).expect("video filter");
+        assert!(!plan.serial_filter.contains("atadenoise="));
+        assert!(!plan.serial_filter.contains("hqdn3d="));
+        assert!(!plan.serial_filter.contains("nlmeans="));
+        assert!(plan.serial_filter.contains("unsharp=5:5:0.000800"));
+
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            let resource_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("embedded-runtime-resources")
+                .join(target_triple());
+            let (ffmpeg, _) = packaged_media_engine_paths(&resource_root)
+                .expect("embedded FFmpeg path should resolve");
+            let output = super::background_command(ffmpeg)
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=size=16x16:rate=5:duration=1",
+                    "-vf",
+                ])
+                .arg(&plan.serial_filter)
+                .args(["-frames:v", "1", "-f", "null", "-"])
+                .output()
+                .expect("embedded FFmpeg should start");
+            assert!(
+                output.status.success(),
+                "embedded FFmpeg rejected low-strength image repair: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_high_strength_image_repair_keeps_nlmeans() {
+        let video = VideoEffectParams {
+            image_repair_enabled: true,
+            image_repair_strength_percent: 10.0,
+            ..VideoEffectParams::default()
+        };
+
+        let plan = video_filter(&video, &AdvancedEffectParams::default()).expect("video filter");
+        assert!(plan.serial_filter.contains("nlmeans="));
+        assert!(!plan.serial_filter.contains("hqdn3d="));
+    }
+
+    #[test]
+    fn low_strength_image_repair_scales_detail_amount() {
+        let filter_at = |strength| {
+            video_filter(
+                &VideoEffectParams {
+                    image_repair_enabled: true,
+                    image_repair_strength_percent: strength,
+                    ..VideoEffectParams::default()
+                },
+                &AdvancedEffectParams::default(),
+            )
+            .expect("video filter")
+            .serial_filter
+        };
+
+        assert!(filter_at(0.2).contains("unsharp=5:5:0.000800"));
+        assert!(filter_at(0.8).contains("unsharp=5:5:0.003200"));
+    }
+
+    #[test]
+    fn image_repair_and_detail_share_one_unsharp_pass() {
+        let video = VideoEffectParams {
+            image_repair_enabled: true,
+            image_repair_strength_percent: 0.2,
+            sharpen_percent: 0.2,
+            detail_enhancement_percent: 0.2,
+            ..VideoEffectParams::default()
+        };
+
+        let plan = video_filter(&video, &AdvancedEffectParams::default()).expect("video filter");
+        assert_eq!(plan.serial_filter.matches("unsharp=").count(), 1);
+    }
+
+    #[test]
+    fn oversized_probe_child_fixture() {
+        if std::env::var_os(OVERSIZED_PROBE_FIXTURE_ENV).is_none() {
+            return;
+        }
+        std::io::stdout()
+            .write_all(&vec![b'x'; MAX_PROBE_STDOUT_BYTES + 1])
+            .expect("fixture stdout should be writable");
+    }
+
+    #[test]
+    fn probe_stdout_is_read_concurrently_and_rejected_above_limit() {
+        let _guard = TEST_ENV_LOCK.lock().expect("test environment lock");
+        let executable = std::env::current_exe().expect("test executable should resolve");
+        std::env::set_var(OVERSIZED_PROBE_FIXTURE_ENV, "1");
+        let result = run_command_with_timeout(
+            &executable,
+            [
+                "--exact",
+                "media_engine::tests::oversized_probe_child_fixture",
+                "--nocapture",
+            ],
+            5_000,
+        );
+        std::env::remove_var(OVERSIZED_PROBE_FIXTURE_ENV);
+
+        assert!(matches!(
+            result,
+            Err(MediaEngineError::ProbeOutputTooLarge {
+                limit_bytes: MAX_PROBE_STDOUT_BYTES,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn realtime_audio_filter_graph_supports_common_portaudio_rates() {
-        let audio = AudioResearchParams::default();
+        let audio = AudioEffectParams::default();
         let explicit_variants = [audio.clone()];
         let fallback_graph = build_audio_stream_filter_graph(&audio, &[], Some(48_000), 48_000)
             .expect("empty variants should fall back to the primary audio profile");
@@ -1619,11 +2022,19 @@ mod tests {
                 build_audio_stream_filter_graph(&audio, &[], Some(48_000), output_sample_rate_hz)
                     .expect("default audio profile should build a realtime filter graph");
 
-            assert!(graph.contains("aformat=sample_fmts=fltp:channel_layouts=stereo"));
-            assert!(graph.contains(&format!(
+            assert!(graph
+                .filter_graph
+                .contains("aformat=sample_fmts=fltp:channel_layouts=stereo"));
+            assert!(graph.filter_graph.contains(&format!(
                 "sample_rates={output_sample_rate_hz}:channel_layouts=stereo[aout]"
             )));
-            assert!(graph.matches(AUDIO_FINITE_GUARD_FILTER).count() >= 2);
+            assert!(
+                graph
+                    .filter_graph
+                    .matches(AUDIO_FINITE_GUARD_FILTER)
+                    .count()
+                    >= 2
+            );
         }
         assert!(build_audio_stream_filter_graph(&audio, &[], Some(48_000), 96_000).is_err());
 
@@ -1639,24 +2050,205 @@ mod tests {
     }
 
     #[test]
+    fn realtime_audio_bus_does_not_force_low_perception_profiles_to_fixed_lufs() {
+        let audio = AudioEffectParams {
+            voice_library_id: Some("gpal-subtle-p01".to_owned()),
+            loudness_adjustment_db: -0.037,
+            input_gain_db: -0.06,
+            output_gain_db: 0.045,
+            ..Default::default()
+        };
+
+        let graph = build_audio_stream_filter_graph(&audio, &[], Some(44_100), 44_100)
+            .expect("low-perception profile should build")
+            .filter_graph;
+
+        assert!(graph.contains("volume=-0.052000dB"));
+        assert!(
+            !graph.contains("loudnorm="),
+            "fixed loudness normalization destroys source-relative level: {graph}"
+        );
+    }
+
+    #[test]
+    fn subtle_phase_perturbation_does_not_apply_the_phaser_default_attenuation() {
+        let subtle = AudioEffectParams {
+            phase_perturbation_percent: 0.42,
+            ..Default::default()
+        };
+        let obvious = AudioEffectParams {
+            phase_perturbation_percent: 8.0,
+            ..Default::default()
+        };
+
+        let subtle_graph = build_audio_stream_filter_graph(&subtle, &[], Some(48_000), 48_000)
+            .expect("subtle phase graph")
+            .filter_graph;
+        let obvious_graph = build_audio_stream_filter_graph(&obvious, &[], Some(48_000), 48_000)
+            .expect("obvious phase graph")
+            .filter_graph;
+
+        assert!(subtle_graph.contains("aphaser=in_gain=1.0:out_gain=1.0"));
+        assert!(obvious_graph.contains("aphaser=in_gain=0.4:out_gain=0.74"));
+    }
+
+    #[test]
     fn realtime_fade_out_does_not_buffer_a_full_source_pass() {
-        let audio = AudioResearchParams {
+        let audio = AudioEffectParams {
             fade_out_ms: 1_000,
             ..Default::default()
         };
 
         let realtime_graph = build_audio_stream_filter_graph(&audio, &[], Some(48_000), 48_000)
             .expect("realtime fade-out configuration should still build");
-        assert!(!realtime_graph.contains("areverse"));
+        assert!(!realtime_graph.filter_graph.contains("areverse"));
 
         let offline_graph = audio_mix_filter_complex(
+            &audio,
             std::slice::from_ref(&audio),
             Some(48_000),
             Some(48_000),
             false,
+            false,
         )
         .expect("offline finite-input graph should build");
         assert!(offline_graph.contains("areverse"));
+    }
+
+    #[test]
+    fn realtime_pitch_uses_quality_bus_and_rejects_divergent_variants() {
+        let audio = AudioEffectParams {
+            pitch_shift_semitones: 1.0,
+            formant_shift_percent: 2.0,
+            playback_speed: 1.25,
+            ..Default::default()
+        };
+        let plan = build_audio_stream_filter_graph(
+            &audio,
+            std::slice::from_ref(&audio),
+            Some(48_000),
+            48_000,
+        )
+        .expect("matching quality pitch profile should build");
+        assert_eq!(
+            plan.quality_pitch,
+            Some(super::QualityPitchConfig {
+                pitch_shift_semitones: 1.0,
+                formant_shift_percent: 2.0,
+            })
+        );
+        assert!(!plan.filter_graph.contains("asetrate="));
+        assert!(plan.filter_graph.contains("atempo=1.250000"));
+
+        let divergent = AudioEffectParams {
+            pitch_shift_semitones: 0.5,
+            ..audio.clone()
+        };
+        assert!(build_audio_stream_filter_graph(
+            &audio,
+            std::slice::from_ref(&divergent),
+            Some(48_000),
+            48_000,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn realtime_plan_connects_all_supplementary_audio_runtime_boundaries() {
+        let audio = AudioEffectParams {
+            natural_voice_mode: NaturalVoiceMode::NaturalDynamic,
+            voice_library_id: Some("local-voice-a".to_owned()),
+            mfcc_shift_percent: 8.0,
+            mfcc_dimensions: 20,
+            snr_target_db: Some(24.0),
+            snr_variation_db: -2.0,
+            spectrum_blind_spot_percent: 2.0,
+            dry_wet_percent: 25.0,
+            ambient_sound_mix_percent: 40.0,
+            ..Default::default()
+        };
+
+        assert!(build_audio_stream_filter_graph(&audio, &[], Some(48_000), 48_000).is_err());
+        let plan =
+            build_audio_stream_filter_graph_with_ambient(&audio, &[], Some(48_000), 48_000, true)
+                .expect("validated ambient input should complete the realtime plan");
+
+        assert!(plan.requires_ambient_input);
+        assert!(plan.pcm_effects.is_some());
+        for fragment in [
+            "volume='1+0.012000*sin",
+            "equalizer=f=",
+            "bandreject=f=8000.000000",
+            "[dry0][wet0]amix=inputs=2:weights=0.750000 0.250000",
+            "[1:a:0]aformat=",
+            "[variant_bus][ambient]amix=inputs=2:weights=0.600000 0.400000",
+        ] {
+            assert!(
+                plan.filter_graph.contains(fragment),
+                "{fragment}: {}",
+                plan.filter_graph
+            );
+        }
+    }
+
+    #[test]
+    fn packaged_ffmpeg_accepts_realtime_dry_wet_and_real_ambient_graph() {
+        let Some(ffmpeg) = std::env::var_os("AUTOLIVE_TEST_FFMPEG") else {
+            return;
+        };
+        let audio = AudioEffectParams {
+            dry_wet_percent: 25.0,
+            ambient_sound_mix_percent: 40.0,
+            ..Default::default()
+        };
+        let graph =
+            build_audio_stream_filter_graph_with_ambient(&audio, &[], Some(48_000), 48_000, true)
+                .expect("graph")
+                .filter_graph;
+        let output = super::background_command(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=0.2",
+                "-f",
+                "lavfi",
+                "-i",
+                "anoisesrc=sample_rate=48000:duration=0.2",
+                "-filter_complex",
+                &graph,
+                "-map",
+                "[aout]",
+                "-f",
+                "null",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run packaged FFmpeg");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn packaged_ffmpeg_decodes_the_bundled_low_level_ambient_resource() {
+        let Some(ffmpeg) = std::env::var_os("AUTOLIVE_TEST_FFMPEG") else {
+            return;
+        };
+        validate_audio_input_decodable(
+            std::path::Path::new(&ffmpeg),
+            std::path::Path::new("ambient/low-level-room-tone.wav"),
+            5_000,
+        )
+        .expect("bundled ambient WAV should contain a decodable audio stream");
     }
 
     #[test]

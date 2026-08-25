@@ -1,74 +1,134 @@
-import { LockOutlined, ReloadOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
-import { Alert, Button, Card, Form, Input, Result, Space, Spin, Typography } from 'antd';
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { ReloadOutlined } from '@ant-design/icons';
+import { Alert, Button, Result, Space, Spin, Typography } from 'antd';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
+import {
+  clearRememberedLogin,
+  saveRememberedLogin,
+} from '../authFormMemory';
 import { buildDeviceRegistration, getOrCreateDeviceId } from '../deviceIdentity';
 import {
   ControlPlaneSession,
   getControlPlaneErrorMessage,
   type ControlPlaneSessionSnapshot,
 } from '../controlPlaneSession';
+import { isConfirmedDesktopAccess } from '../controlPlaneGatePolicy';
+import {
+  ControlPlaneAccessPanel,
+  type AccessFormValues,
+  type AccessSubmitResult,
+  type CredentialNotice,
+} from './control-plane-access-panel';
 import { ControlPlaneHeartbeat } from './control-plane-heartbeat';
-import { DesktopTopbar } from './desktop-shell';
 
-type LoginFormValues = {
-  username: string;
-  password: string;
-};
+const CREDENTIAL_SUCCESS_NOTICE_DURATION_MS = 4_000;
 
-type ActivationFormValues = {
-  activationCode: string;
-};
+function useCredentialNotice() {
+  const [notice, setNotice] = useState<CredentialNotice>(null);
+
+  useEffect(() => {
+    if (notice?.type !== 'success') return;
+    const timer = window.setTimeout(() => {
+      setNotice((current) => current === notice ? null : current);
+    }, CREDENTIAL_SUCCESS_NOTICE_DURATION_MS);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  return [notice, setNotice] as const;
+}
 
 export function ControlPlaneGate({ children }: { children: ReactNode }) {
   const deviceId = useMemo(() => getOrCreateDeviceId(), []);
   const [session] = useState(() => new ControlPlaneSession());
   const [snapshot, setSnapshot] = useState<ControlPlaneSessionSnapshot>(() => session.getSnapshot());
+  const [credentialNotice, setCredentialNotice] = useCredentialNotice();
+  const [accessBusy, setAccessBusy] = useState(false);
+  const accessSubmitInFlightRef = useRef(false);
 
   useEffect(() => {
     const unsubscribe = session.subscribe(setSnapshot);
-    void session.restore(deviceId);
+    void session.restore(buildDeviceRegistration(deviceId));
     return () => {
       unsubscribe();
       session.dispose();
     };
   }, [deviceId, session]);
 
-  if (snapshot.status === 'loading') {
+  const handleAccess = async (values: AccessFormValues): Promise<AccessSubmitResult> => {
+    if (accessSubmitInFlightRef.current) {
+      return { status: session.getSnapshot().status };
+    }
+    accessSubmitInFlightRef.current = true;
+    setAccessBusy(true);
+    setCredentialNotice(null);
+
+    const username = values.username.trim();
+    const successMessages: string[] = [];
+    const warningMessages: string[] = [];
+
+    try {
+      const result = await session.login(username, values.password, buildDeviceRegistration(deviceId));
+      if (result.accessToken) {
+        try {
+          if (values.rememberLogin) {
+            await saveRememberedLogin(deviceId, username, values.password);
+            successMessages.push('账号和密码已保存到当前设备的安全凭据库。');
+          } else {
+            await clearRememberedLogin(deviceId);
+          }
+        } catch (error) {
+          warningMessages.push(getControlPlaneErrorMessage(error, '账号和密码保存失败，本次登录仍然有效。'));
+        }
+      }
+
+      publishCredentialNotice(successMessages, warningMessages, setCredentialNotice);
+      return {
+        status: result.status,
+        errorMessage: result.error
+          ? getControlPlaneErrorMessage(
+              result.error,
+              result.status === 'activation_required' ? '设备授权失败' : '登录失败',
+            )
+          : undefined,
+      };
+    } finally {
+      accessSubmitInFlightRef.current = false;
+      setAccessBusy(false);
+    }
+  };
+
+  const handleLogout = () => {
+    setCredentialNotice(null);
+    void session.logout();
+  };
+
+  const accessPanel = (
+    <ControlPlaneAccessPanel
+      snapshot={snapshot}
+      deviceId={deviceId}
+      busy={accessBusy}
+      credentialNotice={credentialNotice}
+      onCredentialNotice={setCredentialNotice}
+      onSubmit={handleAccess}
+    />
+  );
+
+  if (snapshot.status === 'loading' && !accessBusy) {
     return (
       <main className="desktop-auth-gate" aria-live="polite">
-        <Spin size="large" tip="正在校验桌面端会话…" />
+        <Space direction="vertical" align="center" size="middle">
+          <Spin size="large" />
+          <Typography.Text type="secondary">正在校验桌面端会话…</Typography.Text>
+        </Space>
       </main>
     );
   }
 
-  if (snapshot.status === 'unauthenticated') {
+  if (snapshot.status === 'unauthenticated' || snapshot.status === 'activation_required' || accessBusy) {
     return (
       <Routes>
-        <Route
-          path="/login"
-          element={<LoginPanel snapshot={snapshot} onSubmit={(values) => void session.login(values.username, values.password, deviceId)} />}
-        />
+        <Route path="/login" element={accessPanel} />
         <Route path="*" element={<Navigate to="/login" replace />} />
-      </Routes>
-    );
-  }
-
-  if (snapshot.status === 'activation_required') {
-    return (
-      <Routes>
-        <Route path="/login" element={<Navigate to="/" replace />} />
-        <Route
-          path="*"
-          element={
-            <ActivationPanel
-              snapshot={snapshot}
-              deviceId={deviceId}
-              onSubmit={(activationCode) => void session.activate(activationCode, buildDeviceRegistration(deviceId))}
-              onLogout={() => void session.logout()}
-            />
-          }
-        />
       </Routes>
     );
   }
@@ -81,20 +141,34 @@ export function ControlPlaneGate({ children }: { children: ReactNode }) {
           status="error"
           title="控制面暂时不可用"
           subTitle={getControlPlaneErrorMessage(snapshot.error, '无法完成桌面端启动校验，请检查服务端地址和网络连接。')}
-          extra={<Button type="primary" icon={<ReloadOutlined />} onClick={() => void session.restore(deviceId)}>重新连接</Button>}
+          extra={<Button type="primary" icon={<ReloadOutlined />} onClick={() => void session.restore(buildDeviceRegistration(deviceId))}>重新连接</Button>}
         />
       </main>
+    );
+  }
+
+  if (!isConfirmedDesktopAccess(snapshot.user, snapshot.device, deviceId)) {
+    return (
+      <Routes>
+        <Route path="/login" element={accessPanel} />
+        <Route path="*" element={<Navigate to="/login" replace />} />
+      </Routes>
     );
   }
 
   return (
     <>
       <ControlPlaneHeartbeat session={session} snapshot={snapshot} />
-      {snapshot.warning ? <Alert className="desktop-auth-session-warning" type="warning" showIcon message={snapshot.warning} /> : null}
+      {snapshot.warning || credentialNotice ? (
+        <Space className="desktop-auth-session-warning" direction="vertical" size="small">
+          {snapshot.warning ? <Alert type="warning" showIcon message={snapshot.warning} /> : null}
+          {credentialNotice ? <Alert type={credentialNotice.type} showIcon message={credentialNotice.message} /> : null}
+        </Space>
+      ) : null}
       <div className="desktop-auth-session-controls">
         <Typography.Text type="secondary">{snapshot.user?.username ?? '已登录'}</Typography.Text>
-        <ActivationExpiryStatus expiresAt={snapshot.device?.activation_expires_at} />
-        <Button size="small" onClick={() => void session.logout()}>退出登录</Button>
+        <AuthorizationExpiryStatus expiresAt={snapshot.device?.activation_expires_at} />
+        <Button size="small" onClick={handleLogout}>退出登录</Button>
       </div>
       <Routes>
         <Route path="/login" element={<Navigate to="/" replace />} />
@@ -104,7 +178,21 @@ export function ControlPlaneGate({ children }: { children: ReactNode }) {
   );
 }
 
-function ActivationExpiryStatus({ expiresAt }: { expiresAt?: string | null }) {
+function publishCredentialNotice(
+  successMessages: string[],
+  warningMessages: string[],
+  setNotice: (notice: CredentialNotice) => void,
+) {
+  if (warningMessages.length > 0) {
+    setNotice({ type: 'warning', message: warningMessages.join(' ') });
+    return;
+  }
+  if (successMessages.length > 0) {
+    setNotice({ type: 'success', message: successMessages.join(' ') });
+  }
+}
+
+function AuthorizationExpiryStatus({ expiresAt }: { expiresAt?: string | null }) {
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -113,11 +201,11 @@ function ActivationExpiryStatus({ expiresAt }: { expiresAt?: string | null }) {
   }, []);
 
   if (!expiresAt) {
-    return <Typography.Text className="desktop-auth-session-expiry" type="warning">激活码剩余有效期：暂不可用</Typography.Text>;
+    return <Typography.Text className="desktop-auth-session-expiry" type="warning">账号授权剩余有效期：暂不可用</Typography.Text>;
   }
   const expiresAtMs = Date.parse(expiresAt);
   if (!Number.isFinite(expiresAtMs)) {
-    return <Typography.Text className="desktop-auth-session-expiry" type="warning">激活码有效期：暂不可用</Typography.Text>;
+    return <Typography.Text className="desktop-auth-session-expiry" type="warning">账号授权有效期：暂不可用</Typography.Text>;
   }
 
   const remainingMs = expiresAtMs - now;
@@ -132,87 +220,7 @@ function ActivationExpiryStatus({ expiresAt }: { expiresAt?: string | null }) {
 
   return (
     <Typography.Text className="desktop-auth-session-expiry" type={type} aria-live="polite">
-      激活码剩余有效期：{remaining}（{new Date(expiresAtMs).toLocaleString()} 到期）
+      账号授权剩余有效期：{remaining}（{new Date(expiresAtMs).toLocaleString()} 到期）
     </Typography.Text>
-  );
-}
-
-function LoginPanel({
-  snapshot,
-  onSubmit,
-}: {
-  snapshot: ControlPlaneSessionSnapshot;
-  onSubmit: (values: LoginFormValues) => void;
-}) {
-  return (
-    <div className="desktop-auth-page">
-      <DesktopTopbar />
-      <main className="desktop-auth-gate">
-        <Card className="desktop-auth-card" bordered={false}>
-          <div className="desktop-login-header">
-            <img className="desktop-login-logo" src="/app-icon.png" alt="autoLive 产品 Logo" />
-            <Typography.Title className="desktop-login-title" level={3}>欢迎登录</Typography.Title>
-          </div>
-          <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-            <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-              登录后还需要绑定当前设备。服务端加密主密钥不会进入桌面端。
-            </Typography.Paragraph>
-            {snapshot.warning ? <Alert type="warning" showIcon message={snapshot.warning} /> : null}
-            {snapshot.error ? <Alert type="error" showIcon message={getControlPlaneErrorMessage(snapshot.error, '登录失败')} /> : null}
-            <Form<LoginFormValues> layout="vertical" onFinish={onSubmit} requiredMark={false}>
-              <Form.Item label="账号" name="username" rules={[{ required: true, message: '请输入账号' }]}>
-                <Input autoComplete="username" prefix={<LockOutlined />} placeholder="请输入账号" />
-              </Form.Item>
-              <Form.Item label="密码" name="password" rules={[{ required: true, message: '请输入密码' }]}>
-                <Input.Password autoComplete="current-password" placeholder="请输入密码" />
-              </Form.Item>
-              <Button type="primary" htmlType="submit" block>登录并继续</Button>
-            </Form>
-          </Space>
-        </Card>
-      </main>
-    </div>
-  );
-}
-
-function ActivationPanel({
-  snapshot,
-  deviceId,
-  onSubmit,
-  onLogout,
-}: {
-  snapshot: ControlPlaneSessionSnapshot;
-  deviceId: string;
-  onSubmit: (activationCode: string) => void;
-  onLogout: () => void;
-}) {
-  return (
-    <main className="desktop-auth-gate">
-      <Card className="desktop-auth-card" title="激活当前设备" bordered={false}>
-        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-          <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-            当前账号已登录，请输入一次性激活码绑定此设备后使用本地播放功能。
-          </Typography.Paragraph>
-          <Alert
-            type="info"
-            showIcon
-            icon={<SafetyCertificateOutlined />}
-            message="设备标识已生成"
-            description={<Typography.Text code copyable>{deviceId}</Typography.Text>}
-          />
-          {snapshot.warning ? <Alert type="warning" showIcon message={snapshot.warning} /> : null}
-          {snapshot.error ? <Alert type="error" showIcon message={getControlPlaneErrorMessage(snapshot.error, '设备激活失败')} /> : null}
-          <Form<ActivationFormValues> layout="vertical" onFinish={(values) => onSubmit(values.activationCode.trim())} requiredMark={false}>
-            <Form.Item label="激活码" name="activationCode" rules={[{ required: true, message: '请输入激活码' }]}>
-              <Input autoComplete="one-time-code" placeholder="请输入一次性激活码" />
-            </Form.Item>
-            <Space style={{ width: '100%' }}>
-              <Button type="primary" htmlType="submit">绑定设备</Button>
-              <Button onClick={onLogout}>退出登录</Button>
-            </Space>
-          </Form>
-        </Space>
-      </Card>
-    </main>
   );
 }

@@ -1,0 +1,14 @@
+[package]
+name = "autolive-signalsmith-stretch"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Bounded interleaved-PCM adapter for Signalsmith Stretch."
+
+[build-dependencies]
+cc = "=1.4.2"
+
+[lints.rust]
+# 原生 FFI 仅限本 crate；主 crate 继续 forbid。
+unsafe_code = "allow"

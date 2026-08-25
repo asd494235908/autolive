@@ -17,6 +17,9 @@ use crate::audio_output_diagnostic::{
 };
 
 const OUTPUT_CHANNELS: usize = 2;
+const DIGITAL_SILENCE_PEAK: f32 = 0.000_000_1;
+const AUDIBLE_REFERENCE_PEAK: f32 = 0.001;
+pub const AUDIO_CANDIDATE_DIGITAL_SILENCE_ERROR: &str = "候选音轨首段为数字静音，保持当前音轨";
 type CrossfadePair = (Vec<f32>, Vec<f32>);
 const OUTPUT_CHUNK_FRAMES: usize = 512;
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
@@ -469,7 +472,10 @@ impl AudioCycleOutputControl {
     }
 
     pub fn diagnostic(&self) -> Option<AudioLowFrequencyDiagnosticSnapshot> {
-        self.diagnostic.lock().ok().map(|diagnostic| *diagnostic)
+        self.diagnostic
+            .lock()
+            .ok()
+            .map(|diagnostic| diagnostic.clone())
     }
 
     fn request(
@@ -761,6 +767,12 @@ fn output_loop(
                         .send(Err("交叉淡化期间当前音轨已经不存在".to_owned()));
                     continue;
                 };
+                if let Err(error) =
+                    validate_candidate_signal(old, &switch.next, minimum_candidate_samples)
+                {
+                    let _ = switch.response.send(Err(error));
+                    continue;
+                }
                 let vacant_samples = output
                     .ring_capacity_samples()
                     .saturating_sub(output.ring_len_samples());
@@ -932,6 +944,22 @@ fn refill_pending_output_from_current(
 ) -> Result<(), String> {
     if pending_output.is_empty() {
         pending_output.extend(current.take_up_to(output_chunk_samples)?);
+    }
+    Ok(())
+}
+
+fn validate_candidate_signal(
+    current: &AudioMixerTrack,
+    candidate: &AudioMixerTrack,
+    probe_samples: usize,
+) -> Result<(), String> {
+    let current_available = current.available_samples();
+    let current_peak = current.peak_in_first(probe_samples)?.unwrap_or(0.0);
+    let candidate_peak = candidate.peak_in_first(probe_samples)?.unwrap_or(0.0);
+    if candidate_peak <= DIGITAL_SILENCE_PEAK
+        && (current_available < probe_samples || current_peak >= AUDIBLE_REFERENCE_PEAK)
+    {
+        return Err(AUDIO_CANDIDATE_DIGITAL_SILENCE_ERROR.to_owned());
     }
     Ok(())
 }
@@ -1215,8 +1243,8 @@ mod tests {
     use super::{
         apply_interlude_mix, build_test_tone, estimate_media_position_ms, linear_crossfade,
         mix_pending_output_once, refill_pending_output_from_current, stereo_samples_for_ms,
-        take_crossfade_pair_or_fade_in, validate_resume_request, AudioInterludeMixConfig,
-        AudioMixerTrack, AudioTestTone, InterludeMixState, TimelineAnchor,
+        take_crossfade_pair_or_fade_in, validate_candidate_signal, validate_resume_request,
+        AudioInterludeMixConfig, AudioMixerTrack, AudioTestTone, InterludeMixState, TimelineAnchor,
         AUDIO_CYCLE_CROSSFADE_MS,
     };
     use std::collections::VecDeque;
@@ -1301,6 +1329,39 @@ mod tests {
     }
 
     #[test]
+    fn audible_current_rejects_a_digitally_silent_candidate_without_consuming_either_track() {
+        let current = AudioMixerTrack::from_samples(VecDeque::from([0.25; 16]));
+        let candidate = AudioMixerTrack::from_samples(VecDeque::from([0.0; 16]));
+
+        assert!(validate_candidate_signal(&current, &candidate, 16).is_err());
+        assert_eq!(current.available_samples(), 16);
+        assert_eq!(candidate.available_samples(), 16);
+    }
+
+    #[test]
+    fn candidate_signal_guard_allows_real_silence_and_a_delayed_fade_in() {
+        let silent_current = AudioMixerTrack::from_samples(VecDeque::from([0.0; 16]));
+        let silent_candidate = AudioMixerTrack::from_samples(VecDeque::from([0.0; 16]));
+        assert!(validate_candidate_signal(&silent_current, &silent_candidate, 16).is_ok());
+
+        let audible_current = AudioMixerTrack::from_samples(VecDeque::from([0.25; 16]));
+        let mut fade_in = vec![0.0; 8];
+        fade_in.extend([0.01; 8]);
+        let fade_in_candidate = AudioMixerTrack::from_samples(VecDeque::from(fade_in));
+        assert!(validate_candidate_signal(&audible_current, &fade_in_candidate, 16).is_ok());
+    }
+
+    #[test]
+    fn missing_current_probe_does_not_authorize_a_silent_candidate() {
+        let depleted_current = AudioMixerTrack::from_samples(VecDeque::new());
+        let silent_candidate = AudioMixerTrack::from_samples(VecDeque::from([0.0; 16]));
+
+        assert!(validate_candidate_signal(&depleted_current, &silent_candidate, 16).is_err());
+        assert_eq!(depleted_current.available_samples(), 0);
+        assert_eq!(silent_candidate.available_samples(), 16);
+    }
+
+    #[test]
     fn test_tone_is_bounded_stereo_pcm() {
         let tone = build_test_tone(
             44_100,
@@ -1370,6 +1431,26 @@ mod tests {
                 release_ms: 1,
             },
             1_000,
+        );
+        state.begin_release();
+        let mut main = vec![0.4, 0.4];
+
+        assert!(!apply_interlude_mix(&mut main, &mut state).unwrap());
+        assert_eq!(main, vec![0.4, 0.4]);
+    }
+
+    #[test]
+    fn interlude_zero_release_restores_the_main_track_immediately() {
+        let track = AudioMixerTrack::from_samples(VecDeque::from([0.4; 8]));
+        let mut state = InterludeMixState::new(
+            track,
+            AudioInterludeMixConfig {
+                volume_gain: 0.5,
+                duck_gain: 0.5,
+                attack_ms: 0,
+                release_ms: 0,
+            },
+            48_000,
         );
         state.begin_release();
         let mut main = vec![0.4, 0.4];

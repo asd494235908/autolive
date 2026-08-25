@@ -17,16 +17,24 @@ func TestPostgresNormalizedActivationPageReadsRedactedRows(t *testing.T) {
 	suffix := now.UnixNano()
 	expiredID := fmt.Sprintf("activation_reader_expired_%d", suffix)
 	activeID := fmt.Sprintf("activation_reader_active_%d", suffix)
+	userID := fmt.Sprintf("activation_reader_user_%d", suffix)
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
 		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM activation_codes WHERE id IN ($1, $2)`, expiredID, activeID)
+		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM users WHERE id = $1`, userID)
 	})
 	if _, err := database.ExecContext(ctx, `
-		INSERT INTO activation_codes (id, code_hash, code_prefix, status, created_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6), ($7, $8, $9, $10, $11, $12)
-	`, expiredID, "hash/"+expiredID, "code_expired", controlplane.ActivationCodeStatusActive, now.Add(-2*time.Hour), now.Add(-time.Hour),
-		activeID, "hash/"+activeID, "code_active", controlplane.ActivationCodeStatusActive, now, now.Add(time.Hour)); err != nil {
+		INSERT INTO users (id, username, password_hash, role, status, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`, userID, "activation-reader-"+fmt.Sprint(suffix), "$2a$10$integration-hash", controlplane.RoleUser, controlplane.UserStatusActive, now); err != nil {
+		t.Fatalf("seed activation reader user: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `
+		INSERT INTO activation_codes (id, bound_user_id, code_hash, code_prefix, status, created_at, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7), ($8, $9, $10, $11, $12, $13, $14)
+	`, expiredID, userID, "hash/"+expiredID, "code_expired", controlplane.ActivationCodeStatusActive, now.Add(-2*time.Hour), now.Add(-time.Hour),
+		activeID, userID, "hash/"+activeID, "code_active", controlplane.ActivationCodeStatusActive, now, now.Add(time.Hour)); err != nil {
 		t.Fatalf("seed activation codes: %v", err)
 	}
 	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, func() time.Time { return now }, nil, ModelReadSourceNormalized)

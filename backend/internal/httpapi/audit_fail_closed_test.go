@@ -39,6 +39,7 @@ func TestAuditFailureFailsClosedWithoutLeakingBusinessResponse(t *testing.T) {
 	repository.failAudit = true
 
 	failed := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
+		"user_id":     "usr_local_admin",
 		"expires_at":  now.Add(time.Hour).Format(time.RFC3339),
 		"max_devices": 1,
 	}, token, "audit-fail-closed")
@@ -56,6 +57,7 @@ func TestAuditFailureFailsClosedWithoutLeakingBusinessResponse(t *testing.T) {
 
 	repository.failAudit = false
 	retry := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
+		"user_id":     "usr_local_admin",
 		"expires_at":  now.Add(time.Hour).Format(time.RFC3339),
 		"max_devices": 1,
 	}, token, "audit-fail-closed")

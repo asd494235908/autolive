@@ -192,15 +192,15 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 	}, token, "idem-model-account-2")
 
 	codeRec := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
+		"user_id":     "usr_local_admin",
 		"expires_at":  testActivationExpiresAt(),
 		"max_devices": 1,
 	}, token, "idem-model-lease-code")
-	var codePayload map[string]any
-	decodeJSON(t, codeRec.Body.Bytes(), &codePayload)
-	plainCode := codePayload["activation_code"].(map[string]any)["plain_code"].(string)
+	if codeRec.Code != http.StatusCreated {
+		t.Fatalf("create activation code status = %d, want %d, body=%s", codeRec.Code, http.StatusCreated, codeRec.Body.String())
+	}
 
 	activateRec := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", map[string]any{
-		"activation_code": plainCode,
 		"device": map[string]any{
 			"product":     "autolive",
 			"device_id":   "dev_model_lease_1",

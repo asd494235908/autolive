@@ -1,3 +1,19 @@
+import {
+  DEFAULT_AUDIO_VALUE_PRESET_IDS,
+  getAudioValuePreset,
+  isSelectableAudioValuePresetId,
+} from './audio-value-presets';
+import type { SubtleAudioSample } from './audio-value-presets';
+
+export {
+  AUDIO_PRESET_FIELDS,
+  AUDIO_VALUE_PRESETS,
+  DEFAULT_AUDIO_VALUE_PRESET_IDS,
+  getAudioValuePreset,
+  sanitizeAudioPresetValues,
+} from './audio-value-presets';
+export type { AudioValuePreset, SubtleAudioSample } from './audio-value-presets';
+
 export type RuntimeBaseParameters = {
   audio_gain_db: number;
   audio_low_eq_db: number;
@@ -51,47 +67,8 @@ export const DEFAULT_VIDEO_VARIATION_PERIOD_MS = DEFAULT_VIDEO_PERIOD_MIN_MS;
 export const MIN_VIDEO_VARIATION_PERIOD_MS = PERIOD_HARD_MIN_MS;
 export const MAX_VIDEO_VARIATION_PERIOD_MS = PERIOD_HARD_MAX_MS;
 
-const VIDEO_BRIGHTNESS_MIN = -100;
-const VIDEO_BRIGHTNESS_MAX = 100;
-const VIDEO_CONTRAST_MIN = 0;
-const VIDEO_CONTRAST_MAX = 200;
-const VIDEO_SATURATION_MIN = 0;
-const VIDEO_SATURATION_MAX = 200;
-const VIDEO_HUE_MIN = -180;
-const VIDEO_HUE_MAX = 180;
-const VIDEO_BLUR_MIN = 0;
-const VIDEO_BLUR_MAX = 8;
-const VIDEO_PIXEL_SCALE_MIN = 95;
-const VIDEO_PIXEL_SCALE_MAX = 105;
-const VIDEO_SPACE_OFFSET_MIN = -4;
-const VIDEO_SPACE_OFFSET_MAX = 4;
-
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
-}
-
-function finiteOrZero(value: number): number {
-  return Number.isFinite(value) ? value : 0;
-}
-
-function cycleWave(cycle: number, phase: number): number {
-  return Math.sin(cycle * 1.61803398875 + phase);
-}
-
-function previewValue(
-  baseValue: number,
-  minimum: number,
-  maximum: number,
-  cycle: number,
-  amplitude: number,
-  phase: number,
-): number {
-  const safeBaseValue = finiteOrZero(baseValue);
-  if (safeBaseValue < minimum || safeBaseValue > maximum) {
-    return clamp(safeBaseValue, minimum, maximum);
-  }
-
-  return clamp(safeBaseValue + cycleWave(cycle, phase) * amplitude, minimum, maximum);
 }
 
 function normalizePeriodMs(
@@ -180,164 +157,15 @@ export function isRuntimeVariationDue(
   return nowMs - lastChangeMs >= effectivePeriodMs;
 }
 
-/** 一套完整声音参数值（约 20 项，不含采样率/码率/播放速度）。 */
-export type SubtleAudioSample = {
-  pitch_shift_semitones: number;
-  input_gain_db: number;
-  output_gain_db: number;
-  loudness_adjustment_db: number;
-  low_eq_db: number;
-  mid_eq_db: number;
-  high_eq_db: number;
-  filter_q: number;
-  phase_perturbation_percent: number;
-  vibrato_frequency_hz: number;
-  vibrato_depth_percent: number;
-  reverb_wet_percent: number;
-  noise_reduction_percent: number;
-  environment_noise_percent: number;
-  environment_noise_dbfs: number;
-  fade_in_ms: number;
-  fade_out_ms: number;
-  dry_wet_percent: number;
-  ambient_sound_mix_percent: number;
-  spectral_perturbation_percent: number;
-};
-
-export type AudioValuePreset = {
-  id: string;
-  label: string;
-  values: SubtleAudioSample;
-};
-
 function roundTo(value: number, digits: number): number {
   const scale = 10 ** digits;
   return Math.round(value * scale) / scale;
 }
 
-const AUDIO_PRESET_DEFAULTS: SubtleAudioSample = {
-  pitch_shift_semitones: 0,
-  input_gain_db: 0,
-  output_gain_db: 0,
-  loudness_adjustment_db: 0,
-  low_eq_db: 0,
-  mid_eq_db: 0,
-  high_eq_db: 0,
-  filter_q: 1,
-  phase_perturbation_percent: 0,
-  vibrato_frequency_hz: 5,
-  vibrato_depth_percent: 0,
-  reverb_wet_percent: 0,
-  noise_reduction_percent: 0,
-  environment_noise_percent: 0,
-  environment_noise_dbfs: -48,
-  fade_in_ms: 0,
-  fade_out_ms: 0,
-  dry_wet_percent: 0,
-  ambient_sound_mix_percent: 0,
-  spectral_perturbation_percent: 0,
-};
-
 function finiteClamp(value: number, fallback: number, minimum: number, maximum: number): number {
   return Number.isFinite(value) ? Math.min(maximum, Math.max(minimum, value)) : fallback;
 }
 
-/** 预设进入 IPC 前的安全边界；未映射字段固定为默认值。 */
-export function sanitizeAudioPresetValues(values: SubtleAudioSample): SubtleAudioSample {
-  return {
-    ...values,
-    pitch_shift_semitones: finiteClamp(values.pitch_shift_semitones, 0, -2, 2),
-    input_gain_db: finiteClamp(values.input_gain_db, 0, -6, 6),
-    output_gain_db: finiteClamp(values.output_gain_db, 0, -6, 6),
-    loudness_adjustment_db: finiteClamp(values.loudness_adjustment_db, 0, -6, 6),
-    low_eq_db: finiteClamp(values.low_eq_db, 0, -12, 12),
-    mid_eq_db: finiteClamp(values.mid_eq_db, 0, -12, 12),
-    high_eq_db: finiteClamp(values.high_eq_db, 0, -12, 12),
-    filter_q: finiteClamp(values.filter_q, 1, 0.3, 10),
-    phase_perturbation_percent: finiteClamp(values.phase_perturbation_percent, 0, -20, 20),
-    vibrato_frequency_hz: finiteClamp(values.vibrato_frequency_hz, 5, 3, 8),
-    vibrato_depth_percent: finiteClamp(values.vibrato_depth_percent, 0, 0, 3),
-    reverb_wet_percent: finiteClamp(values.reverb_wet_percent, 0, 0, 20),
-    noise_reduction_percent: finiteClamp(values.noise_reduction_percent, 0, 0, 100),
-    environment_noise_percent: finiteClamp(values.environment_noise_percent, 0, 0, 100),
-    environment_noise_dbfs: finiteClamp(values.environment_noise_dbfs, -48, -60, -20),
-    fade_in_ms: Math.round(finiteClamp(values.fade_in_ms, 0, 0, 10_000)),
-    fade_out_ms: Math.round(finiteClamp(values.fade_out_ms, 0, 0, 10_000)),
-    dry_wet_percent: 0,
-    ambient_sound_mix_percent: 0,
-    spectral_perturbation_percent: 0,
-  };
-}
-
-function audioValues(partial: Partial<SubtleAudioSample>): SubtleAudioSample {
-  return sanitizeAudioPresetValues({
-    ...AUDIO_PRESET_DEFAULTS,
-    ...partial,
-  });
-}
-
-/** 每个预设=完整 20 参数值；勾选多个后周期随机抽一套应用。 */
-export const AUDIO_VALUE_PRESETS: readonly AudioValuePreset[] = [
-  { id: 'p01', label: '1. 自然平直', values: audioValues({}) },
-  { id: 'p02', label: '2. 微抬增益', values: audioValues({ input_gain_db: 0.18, output_gain_db: 0.12, loudness_adjustment_db: 0.15 }) },
-  { id: 'p03', label: '3. 微降增益', values: audioValues({ input_gain_db: -0.16, output_gain_db: -0.1, loudness_adjustment_db: -0.12 }) },
-  { id: 'p04', label: '4. 暖低频', values: audioValues({ low_eq_db: 0.45, mid_eq_db: -0.1, high_eq_db: -0.2, filter_q: 1.05 }) },
-  { id: 'p05', label: '5. 亮高频', values: audioValues({ low_eq_db: -0.15, mid_eq_db: 0.1, high_eq_db: 0.5, filter_q: 1.08 }) },
-  { id: 'p06', label: '6. 中频突出', values: audioValues({ mid_eq_db: 0.4, low_eq_db: -0.1, high_eq_db: -0.1, filter_q: 1.12 }) },
-  { id: 'p07', label: '7. 轻上移音高', values: audioValues({ pitch_shift_semitones: 0.05, vibrato_depth_percent: 0.12, vibrato_frequency_hz: 5.1 }) },
-  { id: 'p08', label: '8. 轻下移音高', values: audioValues({ pitch_shift_semitones: -0.05, vibrato_depth_percent: 0.1, vibrato_frequency_hz: 4.8 }) },
-  { id: 'p09', label: '9. 轻颤音', values: audioValues({ vibrato_frequency_hz: 5.4, vibrato_depth_percent: 0.28, phase_perturbation_percent: 0.8 }) },
-  // ponytail: 预设只写 FFmpeg 已映射字段；dry_wet/ambient_sound_mix/spectral 未映射，非 0 会拒渲染
-  { id: 'p10', label: '10. 相位微扰', values: audioValues({ phase_perturbation_percent: 1.8 }) },
-  { id: 'p11', label: '11. 轻混响', values: audioValues({ reverb_wet_percent: 1.1, fade_in_ms: 12, fade_out_ms: 16 }) },
-  { id: 'p12', label: '12. 干声收紧', values: audioValues({ reverb_wet_percent: 0.2, noise_reduction_percent: 1.2 }) },
-  { id: 'p13', label: '13. 轻降噪', values: audioValues({ noise_reduction_percent: 1.6, high_eq_db: -0.15 }) },
-  { id: 'p14', label: '14. 底噪纹理', values: audioValues({ environment_noise_percent: 0.55, environment_noise_dbfs: -49 }) },
-  { id: 'p15', label: '15. 淡入淡出', values: audioValues({ fade_in_ms: 22, fade_out_ms: 26, loudness_adjustment_db: -0.08 }) },
-  { id: 'p16', label: '16. 自然微变', values: audioValues({ pitch_shift_semitones: 0.03, input_gain_db: 0.1, output_gain_db: 0.08, loudness_adjustment_db: 0.1, low_eq_db: 0.2, mid_eq_db: -0.05, high_eq_db: 0.15 }) },
-  { id: 'p17', label: '17. 音色着色', values: audioValues({ low_eq_db: 0.25, mid_eq_db: 0.2, high_eq_db: 0.35, filter_q: 1.1, reverb_wet_percent: 0.7, vibrato_depth_percent: 0.15 }) },
-  { id: 'p18', label: '18. 空间感', values: audioValues({ reverb_wet_percent: 1.3, phase_perturbation_percent: 1.2, fade_in_ms: 14, fade_out_ms: 18 }) },
-  { id: 'p19', label: '19. 调制组合', values: audioValues({ vibrato_frequency_hz: 5.6, vibrato_depth_percent: 0.3, phase_perturbation_percent: 1.5 }) },
-  { id: 'p20', label: '20. 综合微扰', values: audioValues({ pitch_shift_semitones: -0.02, input_gain_db: 0.12, output_gain_db: -0.05, loudness_adjustment_db: 0.08, low_eq_db: 0.18, mid_eq_db: -0.12, high_eq_db: 0.22, filter_q: 1.06, phase_perturbation_percent: 1.1, vibrato_frequency_hz: 5.2, vibrato_depth_percent: 0.18, reverb_wet_percent: 0.6, noise_reduction_percent: 0.8, environment_noise_percent: 0.25, environment_noise_dbfs: -50, fade_in_ms: 10, fade_out_ms: 12 }) },
-  // ponytail: 听感验收用；直接顶契约上限，故意夸张
-  { id: 'p21', label: '21. 明显加轨', values: audioValues({
-    pitch_shift_semitones: 2.0,
-    input_gain_db: 4.0,
-    output_gain_db: 3.0,
-    loudness_adjustment_db: 3.0,
-    low_eq_db: 10.0,
-    mid_eq_db: -8.0,
-    high_eq_db: 10.0,
-    filter_q: 6.0,
-    phase_perturbation_percent: 20,
-    vibrato_frequency_hz: 7.5,
-    vibrato_depth_percent: 3.0,
-    reverb_wet_percent: 20,
-    environment_noise_percent: 55,
-    environment_noise_dbfs: -22,
-    fade_in_ms: 180,
-    fade_out_ms: 220,
-  }) },
-  { id: 'p22', label: '22. 明显变调与空间（手动）', values: audioValues({
-    pitch_shift_semitones: 2.0,
-    low_eq_db: -6.0,
-    mid_eq_db: 5.0,
-    high_eq_db: 6.0,
-    filter_q: 2.2,
-    phase_perturbation_percent: 8.0,
-    vibrato_frequency_hz: 6.8,
-    vibrato_depth_percent: 2.5,
-    reverb_wet_percent: 12.0,
-  }) },
-] as const;
-
-// p21 仅保留为手动验收项；p22 可显式选择，但两者都不进入默认随机池。
-const SELECTABLE_AUDIO_VALUE_PRESET_IDS: readonly string[] = AUDIO_VALUE_PRESETS
-  .filter((preset) => preset.id !== 'p21')
-  .map((preset) => preset.id);
-export const DEFAULT_AUDIO_VALUE_PRESET_IDS: readonly string[] = AUDIO_VALUE_PRESETS
-  .filter((preset) => preset.id !== 'p21' && preset.id !== 'p22')
-  .map((preset) => preset.id);
 
 export const AUDIO_MIX_PICK_HARD_MAX = 4;
 export const DEFAULT_AUDIO_MIX_PICK_MIN = 1;
@@ -354,10 +182,6 @@ export function normalizeAudioMixPickMin(value: number, pickMax: number): number
   return Math.min(max, Math.max(1, Math.round(value)));
 }
 
-export function getAudioValuePreset(id: string): AudioValuePreset {
-  return AUDIO_VALUE_PRESETS.find((preset) => preset.id === id) ?? AUDIO_VALUE_PRESETS[0];
-}
-
 /** 从不放回抽样中选出 k 个预设 ID。 */
 export function pickAudioPresetIds(
   selectedPresetIds: readonly string[],
@@ -366,9 +190,7 @@ export function pickAudioPresetIds(
   random = Math.random,
   previousPresetIds: readonly string[] = [],
 ): string[] {
-  const pool = [...new Set(selectedPresetIds)].filter((id) =>
-    SELECTABLE_AUDIO_VALUE_PRESET_IDS.includes(id),
-  );
+  const pool = [...new Set(selectedPresetIds)].filter(isSelectableAudioValuePresetId);
   if (pool.length === 0) return [];
   // 候选超过 1 套时禁止与上一周期重叠；这样 A → B → A 可以，A → A 不可以。
   // 如果本轮要求的轨数超过剩余候选数，缩小本轮轨数，不重新引入上一周期的预设。
@@ -454,7 +276,6 @@ function mulberry32(seed: number): () => number {
     return ((next ^ (next >>> 14)) >>> 0) / 4294967296;
   };
 }
-
 /**
  * 周期抽样。
  * mixEnabled=false 或 max=1：只抽 1 套。
@@ -488,7 +309,13 @@ export function sampleAudioCycle(
     options.previousPresetIds,
   );
   if (presetIds.length === 0) {
-    return { presetIds: [], values: audioValues({}), variants: [], weights: [], seed };
+    return {
+      presetIds: [],
+      values: { ...getAudioValuePreset('p01').values },
+      variants: [],
+      weights: [],
+      seed,
+    };
   }
   // 保留预设原值；未映射字段由 Rust 边界明确拒绝，不能在这里静默改写。
   const variants = presetIds.map((id) => ({ ...getAudioValuePreset(id).values }));
@@ -617,7 +444,7 @@ export function loadAudioMixSession(storage?: StorageLike | null): AudioMixSessi
     const parsed = JSON.parse(raw) as Partial<AudioMixSession>;
     if (!Array.isArray(parsed.selectedPresetIds)) return null;
     const selectedPresetIds = [...new Set(parsed.selectedPresetIds.map(String))].filter((id) =>
-      SELECTABLE_AUDIO_VALUE_PRESET_IDS.includes(id),
+      isSelectableAudioValuePresetId(id),
     );
     const pickMax = normalizeAudioMixPickMax(Number(parsed.pickMax));
     const pickMin = normalizeAudioMixPickMin(Number(parsed.pickMin), pickMax);
@@ -639,7 +466,7 @@ export function saveAudioMixSession(session: AudioMixSession, storage?: StorageL
   const pickMax = normalizeAudioMixPickMax(session.pickMax);
   const pickMin = normalizeAudioMixPickMin(session.pickMin, pickMax);
   const selectedPresetIds = [...new Set(session.selectedPresetIds.map(String))].filter((id) =>
-    SELECTABLE_AUDIO_VALUE_PRESET_IDS.includes(id),
+    isSelectableAudioValuePresetId(id),
   );
   target.setItem(
     AUDIO_MIX_SESSION_STORAGE_KEY,
@@ -652,31 +479,7 @@ export function saveAudioMixSession(session: AudioMixSession, storage?: StorageL
   );
 }
 
-/** FFmpeg 尚未映射的声音字段；非默认值必须显式提示并由 Rust 边界拒绝。 */
-export const UNMAPPED_AUDIO_PRESET_FIELDS = [
-  'dry_wet_percent',
-  'ambient_sound_mix_percent',
-  'spectral_perturbation_percent',
-] as const;
-
-export type UnmappedAudioPresetField = (typeof UNMAPPED_AUDIO_PRESET_FIELDS)[number];
-
-export const UNMAPPED_AUDIO_PRESET_FIELD_LABELS: Record<UnmappedAudioPresetField, string> = {
-  dry_wet_percent: '干湿比',
-  ambient_sound_mix_percent: '环境声混合',
-  spectral_perturbation_percent: '频谱微扰',
-};
-
-export function getUnsupportedAudioPresetFields(
-  values: Partial<Pick<SubtleAudioSample, UnmappedAudioPresetField>>,
-): UnmappedAudioPresetField[] {
-  return UNMAPPED_AUDIO_PRESET_FIELDS.filter((field) => {
-    const value = values[field];
-    return value !== undefined && (!Number.isFinite(value) || Math.abs(value) > Number.EPSILON);
-  });
-}
-
-/** 把虚拟轨微扰叠到完整 audio 参数上；采样率/码率/播放速度/周期等跟主轨。 */
+/** 把虚拟轨预设叠到完整 audio 参数上；共同时间轴和混音后总线字段由主预设统一。 */
 export function buildAudioVariantsFromCycle<T extends Record<string, unknown>>(
   baseAudio: T,
   sample: Pick<AudioCycleSample, 'variants'>,
@@ -684,6 +487,17 @@ export function buildAudioVariantsFromCycle<T extends Record<string, unknown>>(
   return sample.variants.map((variant) => ({
     ...baseAudio,
     ...variant,
+    playback_speed: baseAudio.playback_speed,
+    sample_rate_hz: baseAudio.sample_rate_hz,
+    output_bitrate_kbps: baseAudio.output_bitrate_kbps,
+    pitch_shift_semitones: baseAudio.pitch_shift_semitones,
+    formant_shift_percent: baseAudio.formant_shift_percent,
+    mfcc_shift_percent: baseAudio.mfcc_shift_percent,
+    mfcc_dimensions: baseAudio.mfcc_dimensions,
+    snr_target_db: baseAudio.snr_target_db,
+    snr_variation_db: baseAudio.snr_variation_db,
+    ambient_sound_mix_percent: baseAudio.ambient_sound_mix_percent,
+    current_formant_hz: null,
   }));
 }
 
@@ -695,7 +509,7 @@ export function sampleSubtleAudioParams(
   return sampleAudioCycle(selectedPresetIds, { mixEnabled: false, random }).values;
 }
 
-/** 与音频同周期的视频研究参数微扰；写入 researchParams.video 后实时预览/应用共用。 */
+/** 与音频同周期的视频效果微调；写入 mediaEffectParams.video 后实时预览/应用共用。 */
 export type SubtleVideoSample = {
   brightness_percent: number;
   contrast_percent: number;
@@ -749,7 +563,7 @@ export function sampleSubtleVideoParams(random = Math.random): SubtleVideoSample
     detail_enhancement_percent: roundTo(inRange(0, 2), 2),
     dynamic_crop_percent: roundTo(inRange(0, 0.3), 2),
     pixel_jitter_px: roundTo(inRange(0, 0.2), 2),
-    // 以下字段 Worker 未映射：必须保持默认
+    // 自动周期目前不主动改变这些参数；用户手动配置仍会进入已接入 Worker。
     crop_edge_smoothing: 0.5,
     frame_rate_jitter_percent: 0,
     frame_rate_perturbation_frequency_hz: 0.1,
@@ -763,170 +577,12 @@ export function sampleSubtleVideoParams(random = Math.random): SubtleVideoSample
 export function sanitizeMappedVideoSample(values: SubtleVideoSample): SubtleVideoSample {
   return {
     ...values,
-    crop_edge_smoothing: 0.5,
-    frame_rate_jitter_percent: 0,
-    frame_rate_perturbation_frequency_hz: 0.1,
-    frame_rate_perturbation_amplitude_fps: 0,
-    frame_inner_perturbation_percent: 0,
-    frame_inter_perturbation_percent: 0,
-    color_space_conversion_strength_percent: 0,
-  };
-}
-
-const VISUAL_BANDS_HZ = [65, 92, 131, 188, 267, 381, 544, 777, 1110, 1585, 2263, 20_000] as const;
-
-/** 视觉调制/挂件/切片微扰；写入 researchParams.research。 */
-export type SubtleResearchSample = {
-  band_weights: Record<string, number>;
-  target_frequency_hz: number | null;
-  core_frequency_hz: number | null;
-  wave_intensity: number;
-  wave_level: number;
-  wave_grain_count: number;
-  dynamic_eq_threshold: number;
-  channel_offset_percent: number;
-  space_dimension: number;
-  frequency_space_x_offset_px: number;
-  frequency_space_y_offset_px: number;
-  frame_perturbation_probability_percent: number;
-  random_graphic_opacity_percent: number;
-  random_graphic_size_px: number;
-  abstract_face_count: number;
-  abstract_face_size_percent: number;
-  abstract_face_opacity_percent: number;
-  overlay_offset_px: number;
-  slice_length_ms: number;
-  slice_min_length_ms: number;
-  slice_trigger_interval_ms: number;
-};
-
-export function sampleSubtleResearchParams(random = Math.random): SubtleResearchSample {
-  const inRange = (min: number, max: number) => min + random() * (max - min);
-  const band_weights: Record<string, number> = {};
-  for (const hz of VISUAL_BANDS_HZ) {
-    band_weights[String(hz)] = roundTo(inRange(0.95, 1.05), 3);
-  }
-  const target = roundTo(inRange(65, 200), 1);
-  const sliceLength = Math.round(inRange(500, 5_000));
-  const sliceTrigger = Math.max(sliceLength, Math.round(inRange(5_000, 30_000)));
-  return {
-    band_weights,
-    target_frequency_hz: target,
-    core_frequency_hz: target,
-    wave_intensity: roundTo(inRange(0, 0.15), 3),
-    wave_level: roundTo(inRange(0, 0.15), 3),
-    wave_grain_count: Math.round(inRange(10, 40)),
-    dynamic_eq_threshold: roundTo(inRange(8, 12), 2),
-    channel_offset_percent: roundTo(inRange(-1, 1), 2),
-    space_dimension: 2,
-    frequency_space_x_offset_px: roundTo(inRange(-1, 1), 2),
-    frequency_space_y_offset_px: roundTo(inRange(-1, 1), 2),
-    frame_perturbation_probability_percent: roundTo(inRange(0, 2), 2),
-    random_graphic_opacity_percent: roundTo(inRange(0, 5), 2),
-    random_graphic_size_px: roundTo(inRange(2, 8), 1),
-    abstract_face_count: Math.round(inRange(0, 2)),
-    abstract_face_size_percent: roundTo(inRange(1, 3), 2),
-    abstract_face_opacity_percent: roundTo(inRange(0, 5), 2),
-    overlay_offset_px: roundTo(inRange(-1, 1), 2),
-    slice_length_ms: sliceLength,
-    slice_min_length_ms: Math.max(1_000, Math.round(inRange(1_000, 15_000))),
-    slice_trigger_interval_ms: sliceTrigger,
-  };
-}
-
-export function buildRuntimePreviewParameters(
-  baseParameters: RuntimeBaseParameters,
-  cycle: number,
-): RuntimePreviewParameters {
-  const safeCycle = Number.isFinite(cycle) ? cycle : 0;
-
-  return {
-    // 音频参数只作为 FFmpeg 处理请求的快照传递；周期调度只改变视频预览，
-    // 避免在播放器端用 Web Audio 伪造“实时声音效果”。
-    audio_gain_db: clamp(finiteOrZero(baseParameters.audio_gain_db), -6, 6),
-    audio_low_eq_db: clamp(finiteOrZero(baseParameters.audio_low_eq_db), -12, 12),
-    audio_mid_eq_db: clamp(finiteOrZero(baseParameters.audio_mid_eq_db), -12, 12),
-    audio_high_eq_db: clamp(finiteOrZero(baseParameters.audio_high_eq_db), -12, 12),
-    audio_input_gain_db: baseParameters.audio_input_gain_db,
-    audio_output_gain_db: baseParameters.audio_output_gain_db,
-    audio_loudness_adjustment_db: baseParameters.audio_loudness_adjustment_db,
-    audio_pitch_shift_semitones: baseParameters.audio_pitch_shift_semitones,
-    audio_playback_speed: baseParameters.audio_playback_speed,
-    audio_fade_in_ms: baseParameters.audio_fade_in_ms,
-    audio_fade_out_ms: baseParameters.audio_fade_out_ms,
-    audio_reverb_wet_percent: baseParameters.audio_reverb_wet_percent,
-    audio_noise_reduction_percent: baseParameters.audio_noise_reduction_percent,
-    audio_phase_perturbation_percent: baseParameters.audio_phase_perturbation_percent,
-    audio_vibrato_frequency_hz: baseParameters.audio_vibrato_frequency_hz,
-    audio_vibrato_depth_percent: baseParameters.audio_vibrato_depth_percent,
-    audio_environment_noise_percent: baseParameters.audio_environment_noise_percent,
-    audio_environment_noise_dbfs: baseParameters.audio_environment_noise_dbfs,
-    audio_filter_q: baseParameters.audio_filter_q,
-    audio_sample_rate_hz: baseParameters.audio_sample_rate_hz,
-    audio_output_bitrate_kbps: baseParameters.audio_output_bitrate_kbps,
-    video_brightness_percent: previewValue(
-      baseParameters.video_brightness_percent,
-      VIDEO_BRIGHTNESS_MIN,
-      VIDEO_BRIGHTNESS_MAX,
-      safeCycle,
-      12,
-      0.3,
-    ),
-    video_contrast_percent: previewValue(
-      baseParameters.video_contrast_percent,
-      VIDEO_CONTRAST_MIN,
-      VIDEO_CONTRAST_MAX,
-      safeCycle,
-      10,
-      1.1,
-    ),
-    video_saturation_percent: previewValue(
-      baseParameters.video_saturation_percent,
-      VIDEO_SATURATION_MIN,
-      VIDEO_SATURATION_MAX,
-      safeCycle,
-      10,
-      2.2,
-    ),
-    video_hue_rotation_degrees: previewValue(
-      baseParameters.video_hue_rotation_degrees,
-      VIDEO_HUE_MIN,
-      VIDEO_HUE_MAX,
-      safeCycle,
-      12,
-      2.8,
-    ),
-    video_blur_radius_px: previewValue(
-      baseParameters.video_blur_radius_px,
-      VIDEO_BLUR_MIN,
-      VIDEO_BLUR_MAX,
-      safeCycle,
-      1,
-      0.7,
-    ),
-    video_pixel_scale_percent: previewValue(
-      baseParameters.video_pixel_scale_percent,
-      VIDEO_PIXEL_SCALE_MIN,
-      VIDEO_PIXEL_SCALE_MAX,
-      safeCycle,
-      2,
-      1.7,
-    ),
-    video_space_x_offset_px: previewValue(
-      baseParameters.video_space_x_offset_px,
-      VIDEO_SPACE_OFFSET_MIN,
-      VIDEO_SPACE_OFFSET_MAX,
-      safeCycle,
-      2,
-      2.5,
-    ),
-    video_space_y_offset_px: previewValue(
-      baseParameters.video_space_y_offset_px,
-      VIDEO_SPACE_OFFSET_MIN,
-      VIDEO_SPACE_OFFSET_MAX,
-      safeCycle,
-      2,
-      3.4,
-    ),
+    crop_edge_smoothing: finiteClamp(values.crop_edge_smoothing, 0.5, 0, 1),
+    frame_rate_jitter_percent: finiteClamp(values.frame_rate_jitter_percent, 0, 0, 2),
+    frame_rate_perturbation_frequency_hz: finiteClamp(values.frame_rate_perturbation_frequency_hz, 0.1, 0.01, 2),
+    frame_rate_perturbation_amplitude_fps: finiteClamp(values.frame_rate_perturbation_amplitude_fps, 0, 0, 2),
+    frame_inner_perturbation_percent: finiteClamp(values.frame_inner_perturbation_percent, 0, 0, 2),
+    frame_inter_perturbation_percent: finiteClamp(values.frame_inter_perturbation_percent, 0, 0, 20),
+    color_space_conversion_strength_percent: finiteClamp(values.color_space_conversion_strength_percent, 0, 0, 100),
   };
 }

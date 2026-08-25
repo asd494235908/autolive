@@ -466,6 +466,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 
 	mux.Handle("POST /api/v1/admin/activation-codes", auth.requirePermission("activation_codes.manage", func(w http.ResponseWriter, r *http.Request, actor controlplane.Actor) {
 		var request struct {
+			UserID     string `json:"user_id"`
 			ExpiresAt  string `json:"expires_at"`
 			MaxDevices int    `json:"max_devices"`
 		}
@@ -479,6 +480,7 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 			return
 		}
 		code, err := svc.CreateActivationCodeForProduct(r.Context(), actor.Product, r.Header.Get("Idempotency-Key"), controlplane.CreateActivationCodeInput{
+			UserID:     request.UserID,
 			ExpiresAt:  expiresAt,
 			MaxDevices: request.MaxDevices,
 		})
@@ -687,6 +689,9 @@ func registerControlPlaneRoutes(mux *http.ServeMux, svc *service.ControlPlane, a
 		if err := decodeJSONBody(r, &input); err != nil {
 			writeAppError(w, r, controlplane.ErrInvalidRequest)
 			return
+		}
+		if input.Product == "" && actor.Product == controlplane.ProductAutoLive {
+			input.Product = actor.Product
 		}
 		if err := requireActorProduct(actor, input.Product); err != nil {
 			writeAppError(w, r, err)

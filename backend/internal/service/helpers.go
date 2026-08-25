@@ -111,7 +111,7 @@ func validateHeartbeatInput(input controlplane.HeartbeatInput) error {
 }
 
 func validateActivateDeviceInput(input controlplane.ActivateDeviceInput) error {
-	if len(input.ActivationCode) < 8 || len(input.ActivationCode) > 128 || !idPattern.MatchString(input.Device.DeviceID) {
+	if !idPattern.MatchString(input.Device.DeviceID) {
 		return controlplane.ErrInvalidRequest
 	}
 	if strings.TrimSpace(input.Device.DeviceName) == "" || len(input.Device.DeviceName) > 128 || strings.TrimSpace(input.Device.Platform) == "" || len(input.Device.Platform) > 64 || strings.TrimSpace(input.Device.AppVersion) == "" || len(input.Device.AppVersion) > 64 || len(input.Device.OSVersion) > 128 {

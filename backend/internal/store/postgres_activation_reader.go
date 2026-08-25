@@ -30,14 +30,14 @@ func (s *PostgresRepository) ListActivationCodesPage(ctx context.Context, offset
 			return ActivationCodePage{}, err
 		}
 		rows, err := tx.QueryContext(ctx, `
-			SELECT id, product, code_prefix,
-			       CASE WHEN status = $1 AND expires_at IS NOT NULL AND expires_at <= $2
+			SELECT id, product, bound_user_id, code_prefix,
+			       CASE WHEN status IN ($1, $4) AND expires_at IS NOT NULL AND expires_at <= $2
 			            THEN $3 ELSE status END AS status,
 			       expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices
 			FROM activation_codes
 			ORDER BY id
-			LIMIT $4 OFFSET $5
-		`, controlplane.ActivationCodeStatusActive, now, controlplane.ActivationCodeStatusExpired, limit, offset)
+			LIMIT $5 OFFSET $6
+		`, controlplane.ActivationCodeStatusActive, now, controlplane.ActivationCodeStatusExpired, controlplane.ActivationCodeStatusUsed, limit, offset)
 		if err != nil {
 			return ActivationCodePage{}, err
 		}
@@ -70,15 +70,15 @@ func (s *PostgresRepository) ListActivationCodesPageForProduct(ctx context.Conte
 			return ActivationCodePage{}, err
 		}
 		rows, err := tx.QueryContext(ctx, `
-			SELECT id, product, code_prefix,
-			       CASE WHEN status = $1 AND expires_at IS NOT NULL AND expires_at <= $2
+			SELECT id, product, bound_user_id, code_prefix,
+			       CASE WHEN status IN ($1, $4) AND expires_at IS NOT NULL AND expires_at <= $2
 			            THEN $3 ELSE status END AS status,
 			       expires_at, used_at, used_by_user_id, used_by_device_id, max_devices, bound_devices
 			FROM activation_codes
-			WHERE product = $4
+			WHERE product = $5
 			ORDER BY id
-			LIMIT $5 OFFSET $6
-		`, controlplane.ActivationCodeStatusActive, now, controlplane.ActivationCodeStatusExpired, product, limit, offset)
+			LIMIT $6 OFFSET $7
+		`, controlplane.ActivationCodeStatusActive, now, controlplane.ActivationCodeStatusExpired, controlplane.ActivationCodeStatusUsed, product, limit, offset)
 		if err != nil {
 			return ActivationCodePage{}, err
 		}
@@ -99,13 +99,13 @@ func (s *PostgresRepository) ListActivationCodesPageForProduct(ctx context.Conte
 
 func scanActivationCodeRow(scanner interface{ Scan(dest ...any) error }) (controlplane.ActivationCode, error) {
 	var (
-		code                         controlplane.ActivationCode
-		product                      sql.NullString
-		expiresAt, usedAt            sql.NullTime
-		usedByUserID, usedByDeviceID sql.NullString
-		maxDevices, boundDevices     int
+		code                                      controlplane.ActivationCode
+		product                                   sql.NullString
+		expiresAt, usedAt                         sql.NullTime
+		boundUserID, usedByUserID, usedByDeviceID sql.NullString
+		maxDevices, boundDevices                  int
 	)
-	if err := scanner.Scan(&code.ID, &product, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &maxDevices, &boundDevices); err != nil {
+	if err := scanner.Scan(&code.ID, &product, &boundUserID, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &maxDevices, &boundDevices); err != nil {
 		return controlplane.ActivationCode{}, err
 	}
 	var err error
@@ -115,6 +115,7 @@ func scanActivationCodeRow(scanner interface{ Scan(dest ...any) error }) (contro
 	}
 	code.MaxDevices = maxDevices
 	code.BoundDevices = boundDevices
+	code.UserID = boundUserID.String
 	if expiresAt.Valid {
 		code.ExpiresAt = expiresAt.Time.UTC().Format(time.RFC3339)
 	}
@@ -128,12 +129,12 @@ func scanActivationCodeRow(scanner interface{ Scan(dest ...any) error }) (contro
 
 func scanActivationCodeRowForProduct(scanner interface{ Scan(dest ...any) error }, product controlplane.ProductCode) (controlplane.ActivationCode, error) {
 	var (
-		code                         controlplane.ActivationCode
-		storedProduct                string
-		expiresAt, usedAt            sql.NullTime
-		usedByUserID, usedByDeviceID sql.NullString
+		code                                      controlplane.ActivationCode
+		storedProduct                             string
+		expiresAt, usedAt                         sql.NullTime
+		boundUserID, usedByUserID, usedByDeviceID sql.NullString
 	)
-	if err := scanner.Scan(&code.ID, &storedProduct, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &code.MaxDevices, &code.BoundDevices); err != nil {
+	if err := scanner.Scan(&code.ID, &storedProduct, &boundUserID, &code.CodePrefix, &code.Status, &expiresAt, &usedAt, &usedByUserID, &usedByDeviceID, &code.MaxDevices, &code.BoundDevices); err != nil {
 		return controlplane.ActivationCode{}, err
 	}
 	parsedProduct, err := controlplane.ParseProductCode(storedProduct)
@@ -141,6 +142,7 @@ func scanActivationCodeRowForProduct(scanner interface{ Scan(dest ...any) error 
 		return controlplane.ActivationCode{}, controlplane.ErrForbidden
 	}
 	code.Product = parsedProduct
+	code.UserID = boundUserID.String
 	if expiresAt.Valid {
 		code.ExpiresAt = expiresAt.Time.UTC().Format(time.RFC3339)
 	}

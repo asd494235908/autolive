@@ -12,10 +12,18 @@ async function loadTypeScriptModule(fileName, exports) {
   return Object.fromEntries(exports.map((name) => [name, module[name]]));
 }
 
-const { shouldIgnoreLoopBoundaryPause, shouldRestartPlayback } = await loadTypeScriptModule('playback-loop.ts', [
+const { shouldIgnoreLoopBoundaryPause, shouldRestartPlayback, shouldRestartCurrentSourceImmediately } = await loadTypeScriptModule('playback-loop.ts', [
   'shouldIgnoreLoopBoundaryPause',
   'shouldRestartPlayback',
+  'shouldRestartCurrentSourceImmediately',
 ]);
+
+test('只有单项池可以在后端完成响应前即时重播当前源', () => {
+  assert.equal(shouldRestartCurrentSourceImmediately(0), false);
+  assert.equal(shouldRestartCurrentSourceImmediately(1), true);
+  assert.equal(shouldRestartCurrentSourceImmediately(2), false);
+  assert.equal(shouldRestartCurrentSourceImmediately(10), false);
+});
 
 test('自然结束产生的 pause 不得暂停后端音频出口', () => {
   assert.equal(
@@ -36,6 +44,18 @@ test('自然结束产生的 pause 不得暂停后端音频出口', () => {
     shouldIgnoreLoopBoundaryPause({
       suppressMediaEvent: false,
       ended: false,
+      currentTime: 9.98,
+      duration: 10,
+    }),
+    true,
+    'WebView2 先发 pause、后更新 ended 时，也必须识别为自然结束',
+  );
+  assert.equal(
+    shouldIgnoreLoopBoundaryPause({
+      suppressMediaEvent: false,
+      ended: false,
+      currentTime: 9.9,
+      duration: 10,
     }),
     false,
   );
@@ -43,8 +63,8 @@ test('自然结束产生的 pause 不得暂停后端音频出口', () => {
 
 test('循环 seek 前先占住 pause 事件，并在最终效果窗使用边界判断', async () => {
   const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
-  const restartStart = source.indexOf('function restartToNextLoop');
-  const restartEnd = source.indexOf('function restartAtBoundary', restartStart);
+  const restartStart = source.indexOf('function restartCurrentPlayback');
+  const restartEnd = source.indexOf('function restartToNextLoop', restartStart);
   const restartSource = source.slice(restartStart, restartEnd);
 
   assert.ok(restartStart >= 0 && restartEnd > restartStart);
@@ -58,16 +78,16 @@ test('循环 seek 前先占住 pause 事件，并在最终效果窗使用边界�
   );
   assert.match(
     source,
-    /shouldIgnoreLoopBoundaryPause\(\{\s*suppressMediaEvent: suppressMediaEventRef\.current,\s*ended: event\.currentTarget\.ended,/,
+    /shouldIgnoreLoopBoundaryPause\(\{\s*suppressMediaEvent: suppressMediaEventRef\.current,\s*ended: event\.currentTarget\.ended,\s*currentTime: event\.currentTarget\.currentTime,\s*duration: event\.currentTarget\.duration,/,
   );
 });
 
-test('循环提交成功后必须按新轮次零点显式重锚 PortAudio', async () => {
+test('播放项完成后应用权威快照，换源不预先重播旧源', async () => {
   const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
   const restartStart = source.indexOf('function restartToNextLoop');
   const restartEnd = source.indexOf('function restartAtBoundary', restartStart);
   const restartSource = source.slice(restartStart, restartEnd);
-  const completeLoop = restartSource.indexOf("invoke<PlaybackSnapshot>('complete_playback_loop'");
+  const completeLoop = restartSource.indexOf("invoke<PlaybackItemCompletionResult>('complete_playback_item'");
   const applySnapshot = restartSource.indexOf('applyPlayerSnapshot(nextSnapshot)', completeLoop);
   const reanchorPortAudio = restartSource.indexOf(
     'syncAudioOutputSourceLatest(false, true)',
@@ -76,6 +96,14 @@ test('循环提交成功后必须按新轮次零点显式重锚 PortAudio', asyn
 
   assert.ok(restartStart >= 0 && restartEnd > restartStart);
   assert.ok(completeLoop >= 0);
+  assert.match(restartSource, /playback_generation:\s*currentSnapshot\.playback_generation/);
+  assert.match(restartSource, /loop_index:\s*currentSnapshot\.loop_index/);
+  assert.match(restartSource, /source_media_index:\s*currentSnapshot\.source_media_index/);
+  assert.match(restartSource, /if \(restartImmediately\)[\s\S]*restartCurrentPlayback/);
+  const cancelBeforeCompletion = restartSource.indexOf('cancelFixedSpeech');
+  const clearBeforeCompletion = restartSource.indexOf('clearInterludePlayback');
+  assert.ok(cancelBeforeCompletion >= 0 && cancelBeforeCompletion < completeLoop);
+  assert.ok(clearBeforeCompletion > cancelBeforeCompletion && clearBeforeCompletion < completeLoop);
   assert.ok(applySnapshot > completeLoop);
   assert.ok(
     reanchorPortAudio > applySnapshot,
@@ -126,7 +154,7 @@ test('循环提交失败时保留 Tauri 返回的真实原因', async () => {
   const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
   assert.match(
     source,
-    /setPlaybackError\(getDisplayErrorMessage\(cause, '播放轮次同步失败，已保持本地循环。'\)\)/,
+    /setPlaybackError\(getDisplayErrorMessage\(cause, '播放项切换失败，已重播当前视频。'\)\)/,
   );
 });
 

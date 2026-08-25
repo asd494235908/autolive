@@ -1,10 +1,14 @@
 #[cfg(test)]
 mod tests {
     use super::{
-        DelegatedAccessCredential, DirectChatMessage, DirectChatRequest, DirectLeaseDescriptor,
-        DirectLeaseSession, DirectModelError,
+        parse_chat_response, read_direct_model_response, DelegatedAccessCredential,
+        DirectChatMessage, DirectChatRequest, DirectLeaseDescriptor, DirectLeaseSession,
+        DirectModelError, MAX_DIRECT_MODEL_CHOICES, MAX_DIRECT_MODEL_CONTENT_BYTES,
+        MAX_DIRECT_MODEL_FINISH_REASON_BYTES, MAX_DIRECT_MODEL_MODEL_BYTES,
+        MAX_DIRECT_MODEL_RESPONSE_BYTES,
     };
-    use std::io::{Read, Write};
+    use serde_json::json;
+    use std::io::{Cursor, Read, Write};
     use std::net::TcpListener;
     use std::thread;
     use std::time::{Duration, SystemTime};
@@ -85,6 +89,72 @@ mod tests {
             super::validate_chat_request(&request),
             Err(DirectModelError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn direct_response_reader_rejects_limit_plus_one_byte() {
+        let result = read_direct_model_response(
+            Cursor::new(vec![0_u8; MAX_DIRECT_MODEL_RESPONSE_BYTES + 1]),
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(DirectModelError::InvalidResponse(message))
+                if message.contains("超过")
+        ));
+    }
+
+    #[test]
+    fn direct_response_reader_rejects_oversized_content_length_before_reading() {
+        let result = read_direct_model_response(
+            Cursor::new(Vec::<u8>::new()),
+            Some(MAX_DIRECT_MODEL_RESPONSE_BYTES as u64 + 1),
+        );
+        assert!(matches!(
+            result,
+            Err(DirectModelError::InvalidResponse(message))
+                if message.contains("超过")
+        ));
+    }
+
+    #[test]
+    fn direct_response_fields_have_independent_limits() {
+        let oversized_model = serde_json::to_vec(&json!({
+            "model": "m".repeat(MAX_DIRECT_MODEL_MODEL_BYTES + 1),
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        }))
+        .expect("model fixture should serialize");
+        assert!(parse_chat_response(&oversized_model).is_err());
+
+        let choices = (0..=MAX_DIRECT_MODEL_CHOICES)
+            .map(|_| json!({"message": {"content": "ok"}, "finish_reason": "stop"}))
+            .collect::<Vec<_>>();
+        let oversized_choices = serde_json::to_vec(&json!({
+            "model": "model",
+            "choices": choices
+        }))
+        .expect("choices fixture should serialize");
+        assert!(parse_chat_response(&oversized_choices).is_err());
+
+        let oversized_content = serde_json::to_vec(&json!({
+            "model": "model",
+            "choices": [{
+                "message": {"content": "x".repeat(MAX_DIRECT_MODEL_CONTENT_BYTES + 1)},
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("content fixture should serialize");
+        assert!(parse_chat_response(&oversized_content).is_err());
+
+        let oversized_finish_reason = serde_json::to_vec(&json!({
+            "model": "model",
+            "choices": [{
+                "message": {"content": "ok"},
+                "finish_reason": "x".repeat(MAX_DIRECT_MODEL_FINISH_REASON_BYTES + 1)
+            }]
+        }))
+        .expect("finish reason fixture should serialize");
+        assert!(parse_chat_response(&oversized_finish_reason).is_err());
     }
 
     #[test]
@@ -172,10 +242,18 @@ mod tests {
         assert_eq!(result.usage.expect("usage should exist").total_tokens, 13);
     }
 }
+use crate::bounded_io::{read_to_end_bounded, BoundedReadError};
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::time::{Duration, SystemTime};
+
+const MAX_DIRECT_MODEL_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DIRECT_MODEL_MODEL_BYTES: usize = 256;
+const MAX_DIRECT_MODEL_CHOICES: usize = 16;
+const MAX_DIRECT_MODEL_CONTENT_BYTES: usize = 512 * 1024;
+const MAX_DIRECT_MODEL_FINISH_REASON_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegatedAccessCredential {
@@ -348,25 +426,9 @@ impl DirectLeaseSession {
                 status: status.as_u16(),
             });
         }
-        let payload = response
-            .json::<OpenAIChatResponse>()
-            .map_err(|error| DirectModelError::InvalidResponse(error.to_string()))?;
-        let choice = payload
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| DirectModelError::InvalidResponse("响应缺少 choices".to_owned()))?;
-        let text = choice
-            .message
-            .content
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| DirectModelError::InvalidResponse("响应缺少模型文本".to_owned()))?;
-        Ok(DirectChatResult {
-            text,
-            model: payload.model,
-            finish_reason: choice.finish_reason,
-            usage: payload.usage,
-        })
+        let content_length = response.content_length();
+        let response_bytes = read_direct_model_response(response, content_length)?;
+        parse_chat_response(&response_bytes)
     }
 
     fn ensure_live(&self, now: SystemTime) -> Result<(), DirectModelError> {
@@ -375,6 +437,73 @@ impl DirectLeaseSession {
         }
         Ok(())
     }
+}
+
+fn read_direct_model_response(
+    reader: impl Read,
+    content_length: Option<u64>,
+) -> Result<Vec<u8>, DirectModelError> {
+    if content_length.is_some_and(|length| length > MAX_DIRECT_MODEL_RESPONSE_BYTES as u64) {
+        return Err(response_too_large_error());
+    }
+    read_to_end_bounded(reader, MAX_DIRECT_MODEL_RESPONSE_BYTES).map_err(|error| match error {
+        BoundedReadError::LimitExceeded { .. } => response_too_large_error(),
+        BoundedReadError::Io(error) => {
+            DirectModelError::InvalidResponse(format!("读取模型响应失败：{error}"))
+        }
+    })
+}
+
+fn response_too_large_error() -> DirectModelError {
+    DirectModelError::InvalidResponse(format!(
+        "模型响应超过 {} 字节上限",
+        MAX_DIRECT_MODEL_RESPONSE_BYTES
+    ))
+}
+
+fn parse_chat_response(bytes: &[u8]) -> Result<DirectChatResult, DirectModelError> {
+    let payload = serde_json::from_slice::<OpenAIChatResponse>(bytes)
+        .map_err(|error| DirectModelError::InvalidResponse(error.to_string()))?;
+    if payload.model.trim().is_empty() || payload.model.len() > MAX_DIRECT_MODEL_MODEL_BYTES {
+        return Err(DirectModelError::InvalidResponse(
+            "响应 model 为空或超过 256 字节".to_owned(),
+        ));
+    }
+    if payload.choices.is_empty() || payload.choices.len() > MAX_DIRECT_MODEL_CHOICES {
+        return Err(DirectModelError::InvalidResponse(
+            "响应 choices 数量必须在 1 到 16 之间".to_owned(),
+        ));
+    }
+    if payload.choices.iter().any(|choice| {
+        choice
+            .message
+            .content
+            .as_ref()
+            .is_some_and(|content| content.len() > MAX_DIRECT_MODEL_CONTENT_BYTES)
+            || choice
+                .finish_reason
+                .as_ref()
+                .is_some_and(|reason| reason.len() > MAX_DIRECT_MODEL_FINISH_REASON_BYTES)
+    }) {
+        return Err(DirectModelError::InvalidResponse(
+            "响应 content 或 finish_reason 超过长度上限".to_owned(),
+        ));
+    }
+    let mut choices = payload.choices.into_iter();
+    let choice = choices
+        .next()
+        .ok_or_else(|| DirectModelError::InvalidResponse("响应缺少 choices".to_owned()))?;
+    let text = choice
+        .message
+        .content
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| DirectModelError::InvalidResponse("响应缺少模型文本".to_owned()))?;
+    Ok(DirectChatResult {
+        text,
+        model: payload.model,
+        finish_reason: choice.finish_reason,
+        usage: payload.usage,
+    })
 }
 
 fn validate_base_url(value: &str) -> Result<(), DirectModelError> {

@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"autoLive/backend/internal/controlplane"
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
@@ -25,7 +24,7 @@ func TestPostgresRepositoryGetActivationExpiryReadsBoundCodeExpiry(t *testing.T)
 
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT expires_at")).WithArgs("usr_1", "dev_1", controlplane.ActivationCodeStatusUsed).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT ac.expires_at")).WithArgs("usr_1", "dev_1").
 		WillReturnRows(sqlmock.NewRows([]string{"expires_at"}).AddRow(expiresAt))
 	mock.ExpectCommit()
 

@@ -1,11 +1,12 @@
 use crate::background_process::background_command;
+use crate::bounded_io::{read_to_end_bounded, BoundedReadError};
 use crate::cancellation::CancellationToken;
 use crate::media_engine::{packaged_media_engine_paths, FFMPEG_PATH_ENV, FFPROBE_PATH_ENV};
 use crate::speech_to_speech::{
     SpeechToSpeechContext, SpeechToSpeechResult, SpeechToSpeechWorkerCapabilities,
 };
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +19,7 @@ use std::os::unix::process::CommandExt;
 pub const SPEECH_TO_SPEECH_WORKER_ENV: &str = "AUTOLIVE_SPEECH_TO_SPEECH_WORKER";
 pub const SPEECH_TO_SPEECH_WORKER_TIMEOUT_MS: u64 = 2_000;
 const MAX_SPEECH_TO_SPEECH_WORKER_TIMEOUT_MS: u64 = 120_000;
+const MAX_WORKER_JSON_BYTES: usize = 1024 * 1024;
 
 static CAPABILITY_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -216,12 +218,18 @@ fn probe_speech_to_speech_worker_for_resource_dir(
         }
     }
 
-    let content = fs::read_to_string(&capability_output).map_err(|_| {
-        cleanup(&capability_output);
-        SpeechToSpeechWorkerError::CapabilityOutputMissing
-    })?;
+    let content = read_worker_json(&capability_output);
     cleanup(&capability_output);
-    let capabilities = serde_json::from_str::<SpeechToSpeechWorkerCapabilities>(&content)
+    let content = match content {
+        Ok(content) => content,
+        Err(BoundedReadError::Io(_)) => {
+            return Err(SpeechToSpeechWorkerError::CapabilityOutputMissing)
+        }
+        Err(BoundedReadError::LimitExceeded { .. }) => {
+            return Err(SpeechToSpeechWorkerError::CapabilityOutputInvalid)
+        }
+    };
+    let capabilities = serde_json::from_slice::<SpeechToSpeechWorkerCapabilities>(&content)
         .map_err(|_| SpeechToSpeechWorkerError::CapabilityOutputInvalid)?;
     capabilities
         .validate()
@@ -464,8 +472,13 @@ fn read_result(path: &Path) -> Result<SpeechToSpeechResult, SpeechToSpeechWorker
     if !path.is_file() {
         return Err(SpeechToSpeechWorkerError::OutputMissing);
     }
-    let content = fs::read_to_string(path).map_err(|_| SpeechToSpeechWorkerError::OutputInvalid)?;
-    serde_json::from_str(&content).map_err(|_| SpeechToSpeechWorkerError::OutputInvalid)
+    let content = read_worker_json(path).map_err(|_| SpeechToSpeechWorkerError::OutputInvalid)?;
+    serde_json::from_slice(&content).map_err(|_| SpeechToSpeechWorkerError::OutputInvalid)
+}
+
+fn read_worker_json(path: &Path) -> Result<Vec<u8>, BoundedReadError> {
+    let file = File::open(path).map_err(BoundedReadError::Io)?;
+    read_to_end_bounded(file, MAX_WORKER_JSON_BYTES)
 }
 
 fn cleanup(path: &Path) {
@@ -516,4 +529,29 @@ fn terminate_child(child: &mut std::process::Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_result, SpeechToSpeechWorkerError, MAX_WORKER_JSON_BYTES};
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn worker_result_rejects_json_above_one_mibibyte() {
+        let path = std::env::temp_dir().join(format!(
+            "autolive-speech-result-limit-{}-{}.json",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, vec![b' '; MAX_WORKER_JSON_BYTES + 1])
+            .expect("oversized worker fixture should be written");
+
+        let result = read_result(&path);
+        let _ = fs::remove_file(path);
+
+        assert_eq!(result, Err(SpeechToSpeechWorkerError::OutputInvalid));
+    }
 }

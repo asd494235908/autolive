@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6,13 +7,17 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { tauriBuildArguments } from './build-desktop-artifact.mjs';
+import {
+  cleanBundleOutputForTarget,
+  tauriBuildArguments,
+} from './build-desktop-artifact.mjs';
 import { archiveDesktopArtifacts } from './archive-desktop-artifact.mjs';
 import { readDesktopVersion } from './desktop-version.mjs';
 
 const configPath = fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url));
 const nsisHooksPath = fileURLToPath(new URL('../src-tauri/windows/hooks.nsh', import.meta.url));
 const packageJsonPath = fileURLToPath(new URL('../ui/package.json', import.meta.url));
+const buildScriptPath = fileURLToPath(new URL('./build-desktop-artifact.mjs', import.meta.url));
 const workflowPath = fileURLToPath(
   new URL('../../.github/workflows/desktop-package.yml', import.meta.url),
 );
@@ -68,7 +73,13 @@ test('Tauri 打包运行资源清单和内嵌媒体资源树', () => {
   assert.ok(config.bundle.resources.includes('embedded-runtime-resources'));
   assert.ok(config.bundle.resources.includes('portaudio/portaudio_x64.dll'));
   assert.ok(config.bundle.resources.includes('portaudio/LICENSE.txt'));
+  assert.ok(config.bundle.resources.includes('signalsmith-stretch/LICENSE.txt'));
+  assert.ok(config.bundle.resources.includes('signalsmith-linear/LICENSE.txt'));
   assert.equal(config.bundle.windows.nsis.installerHooks, './windows/hooks.nsh');
+  assert.deepEqual(config.bundle.windows.webviewInstallMode, {
+    type: 'offlineInstaller',
+    silent: true,
+  });
 });
 
 test('NSIS 安装后将 PortAudio DLL 放到 EXE 同目录并在卸载前清理', () => {
@@ -92,6 +103,34 @@ test('Windows 生成 NSIS 安装 EXE', () => {
   ]);
 });
 
+test('Windows 构建前只清理当前 NSIS bundle 输出目录', () => {
+  const root = mkdtempSync(join(tmpdir(), 'autolive-bundle-cleanup-'));
+  const releaseRoot = join(root, 'target', 'release');
+  const bundleRoot = join(releaseRoot, 'bundle');
+  const nsisDir = join(bundleRoot, 'nsis');
+  const msiDir = join(bundleRoot, 'msi');
+  mkdirSync(nsisDir, { recursive: true });
+  mkdirSync(msiDir, { recursive: true });
+  writeFileSync(join(nsisDir, 'stale-setup.exe'), 'stale');
+  writeFileSync(join(msiDir, 'keep.msi'), 'keep');
+  writeFileSync(join(releaseRoot, 'keep.exe'), 'keep');
+
+  assert.equal(
+    cleanBundleOutputForTarget('x86_64-pc-windows-msvc', bundleRoot),
+    nsisDir,
+  );
+  assert.equal(existsSync(nsisDir), false);
+  assert.equal(existsSync(join(msiDir, 'keep.msi')), true);
+  assert.equal(existsSync(join(releaseRoot, 'keep.exe')), true);
+
+  const buildScript = readFileSync(buildScriptPath, 'utf8');
+  const buildFunction = buildScript.slice(buildScript.indexOf('export function buildDesktopArtifacts'));
+  assertInOrder(buildFunction, [
+    'cleanBundleOutputForTarget(targetTriple)',
+    "spawnSync('tauri'",
+  ]);
+});
+
 test('macOS 仍可通过环境变量选择单一原生 bundle 类型', () => {
   const previous = process.env.AUTOLIVE_BUNDLES;
   process.env.AUTOLIVE_BUNDLES = 'dmg';
@@ -111,11 +150,17 @@ test('macOS 仍可通过环境变量选择单一原生 bundle 类型', () => {
 
 test('Windows 归档器同时交付 NSIS EXE 与 media-only portable', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-media-package-'));
+  const ambientResourceDir = join(root, 'ambient');
   const relativePath = 'x86_64-pc-windows-msvc/binaries/ffmpeg.exe';
   const fixture = createWindowsArchiveFixture(root, [{ relative_path: relativePath, content: 'ffmpeg' }]);
+  mkdirSync(ambientResourceDir, { recursive: true });
+  writeFileSync(join(ambientResourceDir, 'low-level-room-tone.wav'), 'room-tone');
+  writeFileSync(join(ambientResourceDir, 'LICENSE.txt'), 'ambient-license');
+  writeFileSync(join(ambientResourceDir, 'unexpected.tmp'), 'must-not-be-copied');
   const destination = archiveDesktopArtifacts({
     targetTriple: 'x86_64-pc-windows-msvc',
     ...fixture,
+    ambientResourceDir,
     packageRoot: join(root, 'package'),
     createPortableZip: process.platform === 'win32',
   });
@@ -129,6 +174,15 @@ test('Windows 归档器同时交付 NSIS EXE 与 media-only portable', () => {
     'ffmpeg',
   );
   assert.equal(readFileSync(join(destination, 'nsis', 'autolive-setup.exe'), 'utf8'), 'nsis-installer');
+  assert.equal(
+    readFileSync(join(destination, 'portable', 'ambient', 'low-level-room-tone.wav'), 'utf8'),
+    'room-tone',
+  );
+  assert.equal(
+    readFileSync(join(destination, 'portable', 'ambient', 'LICENSE.txt'), 'utf8'),
+    'ambient-license',
+  );
+  assert.equal(existsSync(join(destination, 'portable', 'ambient', 'unexpected.tmp')), false);
   assert.equal(existsSync(join(destination, 'msi')), false);
   assert.equal(existsSync(join(destination, 'portable', 'embedded-runtime-resources', 'common')), false);
   if (process.platform === 'win32') {
@@ -137,7 +191,53 @@ test('Windows 归档器同时交付 NSIS EXE 与 media-only portable', () => {
       `autolive-desktop-core_${readDesktopVersion().version}_x64-portable-with-resources.zip`,
     );
     assert.equal(readFileSync(archive).subarray(0, 2).toString('ascii'), 'PK');
+    const listing = spawnSync('tar.exe', ['-tf', archive], { encoding: 'utf8' });
+    assert.equal(listing.status, 0, listing.stderr);
+    assert.match(listing.stdout, /portable\/ambient\/low-level-room-tone\.wav/);
+    assert.match(listing.stdout, /portable\/ambient\/LICENSE\.txt/);
+    assert.doesNotMatch(listing.stdout, /unexpected\.tmp/);
   }
+});
+
+test('Windows portable 归档缺少固定环境声资源时失败', () => {
+  const root = mkdtempSync(join(tmpdir(), 'autolive-media-package-'));
+  const ambientResourceDir = join(root, 'ambient');
+  const fixture = createWindowsArchiveFixture(root, [{
+    relative_path: 'x86_64-pc-windows-msvc/binaries/ffmpeg.exe',
+    content: 'ffmpeg',
+  }]);
+  mkdirSync(ambientResourceDir, { recursive: true });
+  writeFileSync(join(ambientResourceDir, 'low-level-room-tone.wav'), 'room-tone');
+
+  assert.throws(
+    () => archiveDesktopArtifacts({
+      targetTriple: 'x86_64-pc-windows-msvc',
+      ...fixture,
+      ambientResourceDir,
+      packageRoot: join(root, 'package'),
+      createPortableZip: false,
+    }),
+    /内置环境声资源缺失.*LICENSE\.txt/,
+  );
+});
+
+test('Windows 归档器拒绝 NSIS 目录中的多个 EXE', () => {
+  const root = mkdtempSync(join(tmpdir(), 'autolive-media-package-'));
+  const fixture = createWindowsArchiveFixture(root, [{
+    relative_path: 'x86_64-pc-windows-msvc/binaries/ffmpeg.exe',
+    content: 'ffmpeg',
+  }]);
+  writeFileSync(join(fixture.bundleSourceDir, 'nsis', 'stale-setup.exe'), 'stale-installer');
+
+  assert.throws(
+    () => archiveDesktopArtifacts({
+      targetTriple: 'x86_64-pc-windows-msvc',
+      ...fixture,
+      packageRoot: join(root, 'package'),
+      createPortableZip: false,
+    }),
+    /Windows NSIS.*恰好一个 EXE.*2 个/,
+  );
 });
 
 test('Windows 归档器缺少正式 Tauri EXE 时失败', () => {

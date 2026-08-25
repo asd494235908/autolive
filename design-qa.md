@@ -1,100 +1,87 @@
-# 桌面主界面设计 QA
+# 桌面端参数预览设计 QA
 
-## 对比基线
+> 2026-08-24 当前最新满宽、自动网格、卡片内容、逐卡颜色与高亮动效决策：参数内容区填满桌面中栏实际可用宽度，不设置约 `880px`、`860–900px` 或其他固定最大宽度，宽中栏两侧不得因参数容器上限留下大面积空白。外层保持双主栏，左栏为普通视频与高级视觉、右栏为普通声音；每个主栏内部卡网格根据实际可用宽度自动决定列数并自然换行，不限制每排卡片数量，也不设置固定列数或卡宽。极窄时外层双主栏按 DOM 顺序降为单列，全程不横向裁剪。普通参数卡固定为统一 `80px` 高度，只显示参数名、当前值/进度和“已接入 / 正式需求待实现 / 待确认”三态标签，不显示底部范围、单位、接入情况或待实现原因说明句。固定视觉频段权重固定为独立 `196px` 高度、跨满所属栏，完整显示三列且不得裁剪。范围、默认值和能力状态事实仍保留在正式契约、校验及媒体边界中。每张参数卡或独立参数模块分别从《媒体参数范围与默认值》的参考图五色色板分配自己的颜色，不再按普通视频、高级视觉、普通声音大分类固定一种颜色；五色可以循环复用，分配顺序应尽量避免视觉上相邻的卡片同色，且单次挂载期内每卡颜色保持稳定。挂载后显示 `value` 实际变化时按该卡自己的颜色执行一次约 `900ms` 高亮：先短暂增强，再平滑淡出；初始挂载、相同值、仅重排和普通重渲染不触发，`prefers-reduced-motion: reduce` 下禁用。算法状态仍只由三态文字表达，颜色不表达算法状态，三态不等于编辑权限。
+>
+> 2026-08-24 当前最新双周期状态决策：主参数区必须同时显示视频周期与声音周期两个状态模块。两者分别显示现有配置范围、真实变化次数，并以各自同一条真实 N+1 计划的目标时间和周期长度计算进度；声音状态标签读取真实 `audio processing status`。独立模式各自推进，联动模式仍分别显示两条状态但共用同一个真实联动目标。处理关闭、播放暂停、对应周期未启用或真实计划缺失时进度为 `0` 且保持非活动，次数沿用现有调度器状态。本决策只调整状态投影，不修改调度、范围、默认值或后端算法。
+>
+> 下方约 `880px`/`860–900px` 居中、`172px/196px` 旧普通卡宽、固定/目标 `270–290px`、“每卡占满整栏、每横排左右两张”、“每栏两卡、整行最多四卡、先固定降栏内单列”、“说明文字至少 `12px` 且显示状态原因”、按普通视频/高级视觉/普通声音大分类固定一种颜色、约 `290ms` 瞬时闪动、主状态只显示视频周期、参数三栏及既有截图只记录此前实现和验收历史，已被当前决策覆盖，不能作为新布局、逐卡颜色、高亮动效与双周期状态的通过证据。当前契约仍需重新执行自动化与真实 Tauri 宽屏/窄屏截图验收；本次调整不扩展实时话术幻化。
 
-- source visual truth path: `C:/Users/asd49/xwechat_files/wxid_rud357apqrci12_129a/temp/RWTemp/2026-08/615eea485d41d697d0197cc66da82d52/5674d45c92993262e575e8f2a419d76c.png`
-- implementation screenshot path: `E:/aotlve/artifacts/design-qa/implementation-final-1728x1044.jpg`
-- full-view comparison evidence: `E:/aotlve/artifacts/design-qa/comparison-final.png`
-- viewport: `1728 × 1044` CSS px，device scale factor `1`
-- source pixels: `1728 × 1075`，对比时裁掉底部 31px 系统任务栏，归一化为 `1728 × 1044`
-- implementation pixels: `1728 × 1044`
-- state: 参考图为已导入/运行态；浏览器实现证据为无 Tauri IPC 的真实空态。只比较应用自有的框架、比例、密度、字体层级、颜色和控件位置，不把两种运行状态的业务数值差异误报为视觉缺陷。
+## 当前契约验收（待复验）
 
-## Findings
+- [ ] 参数内容区填满桌面中栏实际可用宽度，不受约 `880px`、`860–900px` 或其他最大宽度限制，宽中栏两侧没有由参数容器上限造成的大面积空白；外层桌面工作区三栏不变，参数区内部保持双主栏“左：普通视频 + 高级视觉 / 右：普通声音”，每个主栏内部卡网格根据实际可用宽度自动决定列数并自然换行，不限制每排卡片数量。
+- [ ] 逐步放大和缩小时验证栏内网格列数同步增加或减少，极窄时外层双主栏按“普通视频 → 高级视觉 → 普通声音”的 DOM 顺序降为单列；所有状态均不设置固定列数或固定/目标 `270–290px` 卡宽、不产生横向裁剪。普通参数卡固定为统一 `80px` 高度，只显示参数名、当前值/进度和三态标签，不存在底部范围、单位、接入情况或待实现原因说明句；固定视觉频段权重卡固定为独立 `196px` 高度、跨满所属栏并完整显示三列，不能裁剪。
+- [ ] 参数范围、默认值和能力状态定义继续由正式契约、校验及媒体边界持有；隐藏卡内说明句不能改变进度归一化、三态标签或未接入值拒绝语义。
+- [ ] 每张参数卡或独立参数模块分别从参考图五色色板分配自己的颜色，不按普通视频、高级视觉、普通声音大分类共用固定色；允许五色循环复用，检查分配顺序尽量避免视觉相邻卡片同色。同次挂载期间重新渲染、值更新和排序均不改变既有逐卡颜色映射。
+- [ ] 参数卡挂载后显示 `value` 实际变化时只执行一次约 `900ms` 的该卡自身颜色高亮，视觉过程为短暂增强后平滑淡出；不得继续使用约 `290ms` 的瞬时闪动。初始挂载、相同值、仅重排和普通重渲染不触发，`prefers-reduced-motion: reduce` 下保持静止。
+- [ ] “已接入 / 正式需求待实现 / 待确认”三态文字完整可见，颜色不替代状态，三态不决定主面板编辑权限。
+- [ ] 主参数区同屏持续显示视频周期和声音周期两个状态模块；两者分别显示既有配置范围、当前真实变化次数，并以各自同一条真实 N+1 计划的目标时间和周期长度计算进度。声音状态标签与真实 `audio processing status` 一致，不复用视频标签或本地倒计时推断。
+- [ ] 独立模式下视频周期与声音周期各自推进；联动模式下两条状态保持可见并引用同一个真实联动目标。分别关闭视频/声音处理、暂停播放、关闭对应周期或清除真实计划时，进度为 `0` 且非活动，次数按现有调度器状态显示；确认不因轮询、重渲染或前端计时器伪造变化，范围、默认值、调度和后端算法未改变。
+- [ ] 在真实 Tauri `1920px`、`960px` 及 Windows `125%/150%` 缩放下重新捕获对比图，并记录自动化、构建与交互结果。
 
-- 无剩余 P0/P1/P2 视觉问题。
-- 字体与排版：实现采用 `Inter / Segoe UI / Microsoft YaHei UI` 回退链，字号、粗细和紧凑数字层级与参考图一致；中文小字在 100% 缩放下无异常换行。数据卡使用稳定的单行截断，避免数值跳动。
-- 间距与布局：最终实测工作区 `1704 × 984`、外边距 `12px`、栏距 `12px`；三栏宽度为 `320px / 1088px / 272px`。状态卡 `78px`、参数卡 `82px`、左侧素材池 `460px`、右侧输出卡最小高度 `120px`、声音卡 `544px`，与参考图主要分区和密度对齐。
-- 颜色与视觉 Token：深色基底、卡片层级、细边框及青/蓝/粉/黄状态色与参考图同一视觉语言；状态除颜色外同时有文字和进度表达。未使用渐变或修改 Ant Design 内部选择器。
-- 图片与图标：顶栏使用仓库真实应用图标；操作图标统一来自 `@ant-design/icons`，没有 emoji、手绘 SVG、CSS 图形或占位图替代。
-- 文案与内容：参考图中的 OBS/RTMP、检测规避、研究频段和实时话术幻化均按本项目产品边界替换为单源播放、基础视频参数、普通声音状态、实际音频出口和只读诊断；这是已确认的产品范围映射，不是视觉遗漏。
-- 响应式：`900 × 900` 验证为素材 → 视频/参数 → 声音/输出的单列顺序，页面宽度和根滚动宽度均为 `900px`，无横向溢出。
-- 交互与可访问性：关键图标按钮有 `aria-label`，DOM/键盘顺序与视觉职责一致，禁用、加载、空态和错误态使用 Ant Design 语义组件；抽屉保留关闭路径。浏览器最终刷新未产生新的运行时错误或 Ant Design 弃用告警。
+## 历史对比证据（已被当前决策覆盖）
 
-## Focused region comparison
+- source visual truth path:
+  - `C:\Users\asd49\xwechat_files\wxid_rud357apqrci12_129a\temp\RWTemp\2026-08\615eea485d41d697d0197cc66da82d52\561db9c711ff30f746b8738c087bf3d5.png`
+  - `C:\Users\asd49\AppData\Local\Temp\codex-clipboard-2373c116-c21a-415d-b696-7372540467f0.png`
+  - `C:\Users\asd49\AppData\Local\Temp\codex-clipboard-91bef011-a438-46b5-9be4-44fb7b9e7931.png`
+- implementation screenshot path:
+  - `E:\aotlve\artifacts\design-qa\media-parameters-wide-1920x1032.jpg`
+  - `E:\aotlve\artifacts\design-qa\media-parameters-narrow-960x1032.jpg`
+- combined full comparison path: `E:\aotlve\artifacts\design-qa\full-comparison-source-top-implementation-bottom.png`
+- combined focused comparison path: `E:\aotlve\artifacts\design-qa\focused-progress-comparison-source-top-implementation-bottom.png`
+- viewport: 1920 × 1032 与 960 × 1032 CSS px 的真实 Tauri 主窗口。
+- source pixels: 整页参考 1728 × 1075；进度卡局部参考 363 × 138。
+- implementation pixels: 宽屏 1920 × 1032；窄屏 960 × 1032；进度卡局部裁切 292 × 114。
+- density normalization: 均按 Windows 1× 逻辑像素捕获。全景比较把宽屏实现等比缩至 1728 × 929 后与 1728 × 1075 参考纵向拼接；局部比较把实现卡片等比放大到 363 × 142 后与 363 × 138 参考纵向拼接。
+- state: Windows 深色主题、真实 Tauri WebView、已登录主页、未导入素材、参数面板只读默认值；分别检查最大化宽屏和系统半屏 960 px 最小宽度。
 
-- 中栏状态条与参数网格：在 `comparison-final.png` 中逐项核对六张状态卡、七列网格、卡片高度、标签/大数值/进度层级；细节清晰，无需额外放大裁片。
-- 左栏与右栏：同一合成图中核对素材池、播放控制、输出入口、声音诊断和处理步骤的顶部位置及高度。输出卡使用 `120px` 最小高度并允许内容自适应，右栏仍按输出、声音诊断、处理引擎的顺序保持参考图节奏，未再出现按钮或说明文字裁切。
+**Historical Findings**
 
-## Comparison history
+- 无 P0/P1/P2 问题。分段进度已从 Ant Design 默认宽块改为显式紧凑尺寸，末段完整收在卡片内，没有裁切、越界或水平滚动。
+- 无 P0/P1/P2 问题。普通视频、普通声音、高级视觉仍在同一参数面板内保持三栏；960 px 窗口仅重排外围工作区，没有破坏参数三栏。
+- 无 P0/P1/P2 问题。青、橙、紫、品红、黄按分类/分组分配，绿色“已接入”和橙色“正式需求待实现”继续表达状态，不与装饰色混淆。
 
-1. Pass 1（`comparison-pass1.png`）：发现 P1 信息密度偏低。状态卡约 `97.7px`、视频参数卡 `120px`，左侧素材区和右侧声音诊断区明显短于参考图，中栏首屏留白过多。
-2. 修复：状态卡压缩为 `78px`；参数卡重排为 `82px`；将真实普通声音参数状态和已选预设加入同尺寸只读卡片；素材池固定为 `460px`；声音卡补齐采样率、帧数、RMS、峰值、低频 RMS 和截止频率诊断；右栏按参考图重排为 `96px + 544px`。
-3. Final（`comparison-final.png`）：在同一 `1728 × 1044` 视口重新捕获并合成对比，早期 P1 均已消除。最终 56 张真实能力卡形成与参考图相当的首屏密度，无 P0/P1/P2 残留。
+**Historical Required Fidelity Surfaces**
 
-## Open Questions
+- Fonts and typography: 沿用现有桌面端字体和 Ant Design 文字层级；紧凑卡片标题允许自然换行，状态标签不会挤出卡片。
+- Spacing and layout rhythm: 卡片内边距、卡片间距和分组间距同步收紧；宽屏保持高密度，960 px 外围区域纵向排列后仍可滚动到完整参数面板。
+- Colors and visual tokens: 只使用 Ant Design 公开主题令牌的 cyan/orange/purple/magenta/yellow；背景、边框和状态色继续使用既有语义令牌。
+- Image quality and asset fidelity: 参数页没有需替换的图片资产；分段进度使用成熟的 Ant Design `Progress`，没有新增手绘 SVG、CSS 图形或位图替代控件。
+- Copy and content: 仍明确区分“已接入”“正式需求待实现”“待确认”；待实现说明改为“主面板始终只读”，不再把只读误写为暂时限制。
+- Accessibility: 每条进度只保留 Ant Design 自身的单一 `progressbar` 语义，并提供包含名称、当前值和范围的 `aria-label`；没有嵌套重复角色。
 
-- 浏览器无法访问 Tauri 本地文件/IPC，因此最终证据是产品真实空态。已导入视频后的动态数值、波形和最终效果窗口仍需 Windows Tauri 实机冒烟；这属于运行环境验证，不是当前视觉阻塞。
+**Historical Full-view Comparison Evidence**
 
-## Implementation Checklist
+- `full-comparison-source-top-implementation-bottom.png` 把参考整页与真实 Tauri 宽屏实现放在同一图中检查。实现遵循用户已确认的“三个正式分类三栏”信息结构，因此不复制参考图的七列小卡网格；高密度、多色分组和深色层级保持同一视觉方向。
+- 1920 px 宽屏未见卡片、进度块或状态标签越界；右侧输出区和左侧播放区没有被中央参数区覆盖。
 
-- [x] 同尺寸全屏合成对比
-- [x] P1 密度和主要分区比例修复
-- [x] 字体、间距、颜色、图片/图标、文案五项表面检查
-- [x] 900px 窄屏无横向溢出
-- [x] 浏览器控制台最终刷新无新增错误
-- [x] 保持本地预览运行并标记为可交付
+**Historical Focused Region Comparison Evidence**
 
-## Follow-up Polish
+- `focused-progress-comparison-source-top-implementation-bottom.png` 同时展示参考“饱和度”卡与实现“亮度”卡。两者均为无手柄矩形分段，已达范围和未达范围清楚区分。
+- 实现的 16 段数值进度实际总宽约 94 px，在 960 px 窗口的最窄卡片内仍完整可见；末段没有通过 `overflow: hidden` 伪装截断。
 
-- P3：在真实 Windows Tauri/WebView2 中导入一段视频后，再补一张运行态截图，可进一步核对长文件名截断、实时波形和状态值变化时的稳定性。
+**Comparison History**
 
-final result: passed
+1. 代码审查发现 Ant Design `steps` 默认单块约 14 px，旧实现即使修改高度仍会越界；同时发现用裁切隐藏末段会造成范围误读。
+2. 修复为公开 `size={[4, 6]}`/`size={[5, 5]}`、固定步数和 2 px 步间距约束，并删除进度容器裁切。
+3. 首次真实宽屏检查确认多色卡片和末段完整；随后用 Windows 半屏贴靠在 960 × 1032 复查外围响应式与参数三栏，未发现新的 P0/P1/P2 问题。
 
-## 声音抽屉增量设计 QA（2026-08-20）
+**Historical Primary Interactions And Runtime Evidence**
 
-### 对比证据
+- 在真实 Tauri 开发窗口执行激活、三栏滚动、Windows 半屏贴靠、960 px 窄屏滚动和最大化恢复。
+- `pnpm test`：229/229 通过；新增契约覆盖公开紧凑尺寸、总宽上限、五色色系、只读文案和单一 ARIA 角色。
+- `pnpm build`：通过；Vite HMR 终端没有出现本次改动引起的编译错误。构建仍有既存的单块大于 500 kB 提示。
 
-- source visual truth paths:
-  - `E:/aotlve/artifacts/drawer-optimization/01-advanced-before.png`
-  - `E:/aotlve/artifacts/drawer-optimization/02-interlude-before.png`
-  - `E:/aotlve/artifacts/drawer-optimization/03-fixed-speech-before.png`
-- implementation screenshot paths:
-  - `E:/aotlve/artifacts/drawer-optimization/01-advanced-after-1280x720.png`
-  - `E:/aotlve/artifacts/drawer-optimization/01-advanced-after-bottom-1280x720.png`
-  - `E:/aotlve/artifacts/drawer-optimization/02-interlude-after-1280x720.png`
-  - `E:/aotlve/artifacts/drawer-optimization/03-fixed-speech-after-1280x720.png`
-- narrow viewport evidence:
-  - `E:/aotlve/artifacts/drawer-optimization/01-advanced-after-600x720.png`
-  - `E:/aotlve/artifacts/drawer-optimization/02-interlude-after-600x720.png`
-  - `E:/aotlve/artifacts/drawer-optimization/03-fixed-speech-after-600x720.png`
-- full-view comparison evidence:
-  - `E:/aotlve/artifacts/drawer-optimization/01-advanced-comparison.png`
-  - `E:/aotlve/artifacts/drawer-optimization/02-interlude-comparison.png`
-  - `E:/aotlve/artifacts/drawer-optimization/03-fixed-speech-comparison.png`
-- viewports: `1280 × 720` 与 `600 × 720` CSS px，device scale factor `1`；同组 source / implementation 使用相同尺寸和空态。
+**Historical Implementation Checklist**
 
-### Findings
+- [x] 缩小分段方块并保证完整显示。
+- [x] 用五种参考色系丰富分类和分组。
+- [x] 状态色与装饰色保持不同语义。
+- [x] 960 px 最小宽度下外围布局可用、参数三栏保留。
+- [x] 同步测试、产品需求、架构、参数契约和长任务计划。
 
-- 无剩余 P0/P1/P2 视觉问题。
-- 字体与排版：标题改为“主标题 + 真实能力说明”的双行结构，分区标题使用语义化三级标题；表单字段都保留持续可见标签，不再依赖 placeholder 说明用途。
-- 间距与布局：高级声音使用 `760px` 响应式宽度，插话和固定话术使用 `560px`；正文独立滚动，头部和底部操作区固定。高级预设按 `4 / 2 / 1` 列降级，参数状态在窄屏使用单列，未产生横向溢出。
-- 颜色与视觉 Token：移除原高级抽屉的紫色大面积底色，统一到主工作台的深色中性表面、边框和遮罩层；次要文字对比度提高到 `#9a9ba5`，状态同时有文字说明，不依赖颜色区分。
-- 图片与图标：继续使用 Ant Design 图标和公开组件 API；没有 emoji、手绘 SVG、CSS 图形或 `.ant-*` 内部样式覆盖。
-- 文案与内容：高级声音只表达普通声音处理、PortAudio 实际出口、预设和参数生效状态；插话只表达本地目录、间隔、音量和原声 duck；固定话术只表达系统本地语音朗读。没有引入实时话术幻化、模型租约或研究参数。
-- 交互：逐一验证三个入口打开/关闭；高级抽屉滚动到“缓存管理”时底部操作区保持可见；关闭后重新打开回到顶部；固定话术删除使用二次确认，取消按钮改为语义明确的“停止朗读”；`600px` 下底栏可换行且字段单列。
-- 可访问性：状态摘要使用 `aria-live="polite"`，分区标题层级明确，交互控件沿用 Ant Design 键盘和焦点语义；浏览器复验的 warn/error 控制台日志为空。
+**Historical Follow-up Polish**
 
-### Comparison history
+- P3：尚未在 Windows 125%/150% 系统缩放下保存独立截图；当前逻辑尺寸、文本换行和进度总宽已有静态约束，风险较低。
 
-1. Baseline：高级声音被默认紫色主题占据，长内容与操作按钮一起滚动；插话参数缺少分组；固定话术主要依赖 placeholder，取消/删除语义不清。
-2. Implementation：抽取共享 `FeatureDrawer`、`FeatureDrawerSection` 和 `FeatureDrawerField`，统一宽度、头部状态摘要、卡片分区、独立滚动正文和固定底栏。
-3. Code-director review：发现高级参数状态在 `1280px` 视口被 Ant Design 断点渲染为三列，以及关闭重开后保留底部滚动位置；已将所有断点明确收敛为两列/窄屏一列，并启用 `destroyOnHidden`，同时将分区标题修正为语义化 `h3`。
-4. Final：在 `1280 × 720` 与 `600 × 720` 重新打开、滚动和截图对比，未发现新的 P0/P1/P2；浏览器控制台无 warn/error。
-
-### Evidence limitations
-
-- 浏览器空态没有用户自建固定话术预设，无法在运行时点击删除确认；该路径已由静态契约测试覆盖。
-- 浏览器无法连接 Windows Tauri 的真实音频设备，因此 PortAudio 出口和实际朗读仍需桌面端有设备环境时冒烟；不影响当前抽屉布局与交互验收。
-
-final result: passed
+historical result: passed; current contract: pending revalidation

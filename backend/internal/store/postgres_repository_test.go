@@ -15,6 +15,10 @@ import (
 	"github.com/lib/pq"
 )
 
+func emptyActivationBindingRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"activation_code_id", "device_id", "product", "user_id", "bound_at"})
+}
+
 func TestPostgresRepositoryCreateUserWritesNormalizedDomainAndIdempotency(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	if err != nil {
@@ -369,6 +373,7 @@ func TestPostgresRepositoryRunCommitsCurrentStateInOneTransaction(t *testing.T) 
 		WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow([]byte(`{"version":1,"state":{}}`)))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, secret_ref FROM model_accounts")).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "secret_ref"}))
+	mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM activation_device_bindings RETURNING activation_code_id, device_id, product, user_id, bound_at")).WillReturnRows(emptyActivationBindingRows())
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO users (")).
 		WithArgs("user_1", "user", "!configured-outside-control-plane!", "user", "active", "2026-08-13T00:00:00Z").
 		WillReturnResult(sqlmock.NewResult(1, 1))
@@ -414,6 +419,7 @@ func TestPostgresRepositoryRunWithSessionBindingCommitsBindingAndStateTogether(t
 		WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow([]byte(`{"version":1,"state":{}}`)))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, secret_ref FROM model_accounts")).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "secret_ref"}))
+	mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM activation_device_bindings RETURNING activation_code_id, device_id, product, user_id, bound_at")).WillReturnRows(emptyActivationBindingRows())
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE control_plane_state")).
 		WithArgs(sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
@@ -426,6 +432,92 @@ func TestPostgresRepositoryRunWithSessionBindingCommitsBindingAndStateTogether(t
 	}); err != nil {
 		t.Fatalf("RunWithSessionBinding() error = %v", err)
 	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestPostgresRepositorySyncReferenceRowsPreservesBindingTimeAndCapacity(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	boundAt := now.Add(-24 * time.Hour)
+	expiresAt := now.Add(24 * time.Hour)
+	repository, err := NewPostgresRepository(database, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+	state := &State{
+		Devices: map[string]controlplane.DeviceSummary{
+			"dev_1": {ID: "dev_1", UserID: "usr_1", Product: controlplane.ProductDouyinDesktop, DeviceName: "Demo", Platform: "windows", AppVersion: "1.0.0", Status: controlplane.DeviceStatusActive},
+		},
+		ActivationCodes: map[string]ActivationCodeRecord{
+			"ac_1": {ActivationCode: controlplane.ActivationCode{ID: "ac_1", Product: controlplane.ProductDouyinDesktop, UserID: "usr_1", Status: controlplane.ActivationCodeStatusActive, ExpiresAt: expiresAt.Format(time.RFC3339), MaxDevices: 5, BoundDevices: 3}, CodePrefix: "code_123456"},
+		},
+		ActivationCodeIndex:      map[string]string{"digest-1": "ac_1"},
+		ActivationDeviceBindings: map[string]string{"dev_1": "ac_1"},
+	}
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM activation_device_bindings RETURNING activation_code_id, device_id, product, user_id, bound_at")).WillReturnRows(
+		sqlmock.NewRows([]string{"activation_code_id", "device_id", "product", "user_id", "bound_at"}).AddRow("ac_1", "dev_1", string(controlplane.ProductDouyinDesktop), "usr_1", boundAt),
+	)
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO devices (id, user_id, product, device_key")).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO activation_codes (id, product, bound_user_id, code_hash")).WithArgs("ac_1", controlplane.ProductDouyinDesktop, "usr_1", "digest-1", "code_123456", controlplane.ActivationCodeStatusActive, expiresAt, nil, "", "", 5, 3).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO activation_device_bindings (activation_code_id, device_id, product, user_id, bound_at)")).WithArgs("ac_1", "dev_1", controlplane.ProductDouyinDesktop, "usr_1", boundAt).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectRollback()
+	tx, err := database.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	if err := repository.syncReferenceRows(context.Background(), tx, state); err != nil {
+		t.Fatalf("syncReferenceRows() error = %v", err)
+	}
+	if state.ActivationCodes["ac_1"].ActivationCode.BoundDevices != 3 {
+		t.Fatalf("bound_devices was recomputed: %+v", state.ActivationCodes["ac_1"])
+	}
+	_ = tx.Rollback()
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestPostgresRepositorySyncReferenceRowsRevokesLegacyUnassignedLiveCode(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(24 * time.Hour)
+	repository, err := NewPostgresRepository(database, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+	state := &State{
+		ActivationCodes: map[string]ActivationCodeRecord{
+			"ac_legacy": {ActivationCode: controlplane.ActivationCode{ID: "ac_legacy", Status: controlplane.ActivationCodeStatusActive, ExpiresAt: expiresAt.Format(time.RFC3339), MaxDevices: 5, BoundDevices: 3}, CodePrefix: "legacy_"},
+		},
+		ActivationCodeIndex:      map[string]string{"legacy-digest": "ac_legacy"},
+		ActivationDeviceBindings: map[string]string{},
+	}
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM activation_device_bindings RETURNING activation_code_id, device_id, product, user_id, bound_at")).WillReturnRows(emptyActivationBindingRows())
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO activation_codes (id, product, bound_user_id, code_hash")).WithArgs("ac_legacy", controlplane.ProductAutoLive, "", "legacy-digest", "legacy_", controlplane.ActivationCodeStatusRevoked, expiresAt, nil, "", "", 5, 3).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectRollback()
+	tx, err := database.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	if err := repository.syncReferenceRows(context.Background(), tx, state); err != nil {
+		t.Fatalf("syncReferenceRows() error = %v", err)
+	}
+	if code := state.ActivationCodes["ac_legacy"].ActivationCode; code.Status != controlplane.ActivationCodeStatusRevoked || code.UserID != "" || code.BoundDevices != 3 {
+		t.Fatalf("legacy activation projection = %+v", code)
+	}
+	_ = tx.Rollback()
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)
 	}
@@ -967,6 +1059,7 @@ func TestPostgresRepositoryCompensatesSecretAfterSnapshotFailure(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow([]byte(`{"version":1,"state":{}}`)))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, secret_ref FROM model_accounts")).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "secret_ref"}))
+	mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM activation_device_bindings RETURNING activation_code_id, device_id, product, user_id, bound_at")).WillReturnRows(emptyActivationBindingRows())
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO model_accounts (")).
 		WithArgs("mpa_new", "openai", "rewrite", "https://example.com", "model-account/new", "active", 0, 1, 0, nil, 0, 0).
 		WillReturnResult(sqlmock.NewResult(1, 1))
@@ -1009,6 +1102,7 @@ func TestPostgresRepositoryPreservesSecretAfterUnknownCommitOutcome(t *testing.T
 		WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow([]byte(`{"version":1,"state":{}}`)))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, secret_ref FROM model_accounts")).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "secret_ref"}))
+	mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM activation_device_bindings RETURNING activation_code_id, device_id, product, user_id, bound_at")).WillReturnRows(emptyActivationBindingRows())
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO model_accounts (")).
 		WithArgs("mpa_new", "openai", "rewrite", "https://example.com", "model-account/new", "active", 0, 1, 0, nil, 0, 0).
 		WillReturnResult(sqlmock.NewResult(1, 1))
@@ -1066,7 +1160,8 @@ func TestPostgresRepositoryNormalizedModeLoadsDomainTablesUnderAdvisoryLock(t *t
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, username, password_hash, role, status, created_at")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT user_id, allowed_models, daily_token_limit, updated_at")).WillReturnRows(sqlmock.NewRows([]string{"user_id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, product, device_name, platform, client_version, status")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, code_hash, code_prefix, status, expires_at, used_at")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, bound_user_id, code_hash, code_prefix, status, expires_at, used_at")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT activation_code_id, device_id FROM activation_device_bindings")).WillReturnRows(sqlmock.NewRows([]string{"activation_code_id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, provider, model, base_url, secret_ref, status, priority")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, account_id, user_id, device_id, purpose, status, expires_at")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, lease_id, client_call_id, request_id, provider, model")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
@@ -1074,6 +1169,7 @@ func TestPostgresRepositoryNormalizedModeLoadsDomainTablesUnderAdvisoryLock(t *t
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT idempotency_key, fingerprint, resource_id")).WillReturnRows(sqlmock.NewRows([]string{"idempotency_key"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, actor_user_id, device_id, action, resource_type")).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT status FROM normalized_backfill_state WHERE id = TRUE FOR SHARE")).WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("completed"))
+	mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM activation_device_bindings RETURNING activation_code_id, device_id, product, user_id, bound_at")).WillReturnRows(emptyActivationBindingRows())
 	mock.ExpectCommit()
 
 	if err := repository.Run(context.Background(), func(state *State) error {
@@ -1120,8 +1216,11 @@ func TestPostgresRepositoryNormalizedModeRestoresDomainFields(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id, product, device_name, platform, client_version, status")).WillReturnRows(
 		sqlmock.NewRows([]string{"id", "user_id", "product", "device_name", "platform", "client_version", "status", "disk_free_bytes", "memory_total_bytes", "memory_available_bytes", "cpu_logical_cores", "runtime_os_name", "runtime_os_version", "kernel_version", "current_media_name", "playback_state", "last_heartbeat_at"}).AddRow("dev_00000007", "usr_00000007", string(controlplane.ProductAutoLive), "Studio", "windows", "1.2.3", "active", int64(10), int64(20), int64(15), 8, "Windows", "11", "kernel", "demo.mp4", "playing", now),
 	)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, code_hash, code_prefix, status, expires_at, used_at")).WillReturnRows(
-		sqlmock.NewRows([]string{"id", "code_hash", "code_prefix", "status", "expires_at", "used_at", "used_by_user_id", "used_by_device_id", "max_devices", "bound_devices"}).AddRow("ac_00000007", "digest", "AUTO-ABCD", "used", now.Add(time.Hour), usedAt, "usr_00000007", "dev_00000007", 1, 1),
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, product, bound_user_id, code_hash, code_prefix, status, expires_at, used_at")).WillReturnRows(
+		sqlmock.NewRows([]string{"id", "product", "bound_user_id", "code_hash", "code_prefix", "status", "expires_at", "used_at", "used_by_user_id", "used_by_device_id", "max_devices", "bound_devices"}).AddRow("ac_00000007", string(controlplane.ProductDouyinDesktop), "usr_00000007", "digest", "AUTO-ABCD", "used", now.Add(time.Hour), usedAt, "usr_00000007", "dev_00000007", 2, 2),
+	)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT activation_code_id, device_id FROM activation_device_bindings")).WillReturnRows(
+		sqlmock.NewRows([]string{"activation_code_id", "device_id"}).AddRow("ac_00000007", "dev_00000007"),
 	)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, provider, model, base_url, secret_ref, status, priority")).WillReturnRows(
 		sqlmock.NewRows([]string{"id", "provider", "model", "base_url", "secret_ref", "status", "priority", "concurrency_limit", "daily_token_limit", "cooldown_until"}).AddRow("mpa_00000007", "openai", "rewrite", "https://example.com/v1", "model-account/7", "active", 2, 3, 1000, nil),
@@ -1158,6 +1257,9 @@ func TestPostgresRepositoryNormalizedModeRestoresDomainFields(t *testing.T) {
 	if loaded.Devices["dev_00000007"].CurrentMediaName != "demo.mp4" || loaded.Devices["dev_00000007"].PlaybackState != "playing" {
 		t.Fatalf("device playback fields were not restored: %+v", loaded.Devices["dev_00000007"])
 	}
+	if loaded.ActivationCodes["ac_00000007"].ActivationCode.Product != controlplane.ProductDouyinDesktop || loaded.ActivationCodes["ac_00000007"].ActivationCode.UserID != "usr_00000007" || loaded.ActivationCodes["ac_00000007"].ActivationCode.BoundDevices != 2 || loaded.ActivationDeviceBindings["dev_00000007"] != "ac_00000007" {
+		t.Fatalf("activation ownership fields were not restored: %+v / %+v", loaded.ActivationCodes["ac_00000007"], loaded.ActivationDeviceBindings)
+	}
 	if loaded.ModelPoolAccounts["mpa_00000007"].SecretRef != "model-account/7" || loaded.ModelPoolAccounts["mpa_00000007"].ActiveLeases != 1 {
 		t.Fatalf("model account fields were not restored: %+v", loaded.ModelPoolAccounts["mpa_00000007"])
 	}
@@ -1192,11 +1294,13 @@ func TestPostgresRepositoryBackfillNormalizedUsesAdvisoryLockAndCommits(t *testi
 		sqlmock.NewRows([]string{"state"}).AddRow([]byte(`{"version":1,"state":{}}`)),
 	)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, secret_ref FROM model_accounts")).WillReturnRows(sqlmock.NewRows([]string{"id", "secret_ref"}))
+	mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM activation_device_bindings RETURNING activation_code_id, device_id, product, user_id, bound_at")).WillReturnRows(emptyActivationBindingRows())
 	for _, query := range []string{
 		"SELECT COUNT(*) FROM users",
 		"SELECT COUNT(*) FROM user_authorization_policies",
 		"SELECT COUNT(*) FROM devices",
 		"SELECT COUNT(*) FROM activation_codes",
+		"SELECT COUNT(*) FROM activation_device_bindings",
 		"SELECT COUNT(*) FROM model_accounts",
 		"SELECT COUNT(*) FROM model_leases",
 		"SELECT COUNT(*) FROM model_usage_records",

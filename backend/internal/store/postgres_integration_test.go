@@ -253,9 +253,9 @@ func TestPostgresNormalizedActivationRedeemIsSingleWinnerAcrossRepositories(t *t
 		t.Fatalf("seed activation race user: %v", err)
 	}
 	if _, err := database.ExecContext(ctx, `
-		INSERT INTO activation_codes (id, code_hash, code_prefix, status, created_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, activationID, activationHash, "race_", controlplane.ActivationCodeStatusActive, now, now.Add(time.Hour)); err != nil {
+		INSERT INTO activation_codes (id, bound_user_id, code_hash, code_prefix, status, created_at, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`, activationID, userID, activationHash, "race_", controlplane.ActivationCodeStatusActive, now, now.Add(time.Hour)); err != nil {
 		t.Fatalf("seed activation race code: %v", err)
 	}
 	for index := range accessTokens {
@@ -272,6 +272,7 @@ func TestPostgresNormalizedActivationRedeemIsSingleWinnerAcrossRepositories(t *t
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
 		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM auth_sessions WHERE user_id = $1`, userID)
+		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM activation_device_bindings WHERE activation_code_id = $1`, activationID)
 		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM activation_codes WHERE id = $1`, activationID)
 		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM idempotency_records WHERE scope = $1 AND idempotency_key LIKE $2`, "control-plane-state", fmt.Sprintf("activate-device:%d:%%", suffix))
 		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM devices WHERE id IN ($1, $2)`, deviceIDs[0], deviceIDs[1])
@@ -300,13 +301,12 @@ func TestPostgresNormalizedActivationRedeemIsSingleWinnerAcrossRepositories(t *t
 			defer waitGroup.Done()
 			<-start
 			device, err := repository.ActivateDeviceWithSessionBinding(ctx, DeviceActivationRecord{
-				Scope:              "control-plane-state",
-				IdempotencyKey:     fmt.Sprintf("activate-device:%d:%d", suffix, index),
-				Fingerprint:        fmt.Sprintf("activation-race-fingerprint-%d", index),
-				AccessTokenHash:    accessTokens[index],
-				UserID:             userID,
-				Product:            controlplane.ProductAutoLive,
-				ActivationCodeHash: activationHash,
+				Scope:           "control-plane-state",
+				IdempotencyKey:  fmt.Sprintf("activate-device:%d:%d", suffix, index),
+				Fingerprint:     fmt.Sprintf("activation-race-fingerprint-%d", index),
+				AccessTokenHash: accessTokens[index],
+				UserID:          userID,
+				Product:         controlplane.ProductAutoLive,
 				Device: controlplane.DeviceRegistration{
 					Product:  controlplane.ProductAutoLive,
 					DeviceID: deviceIDs[index], DeviceName: fmt.Sprintf("race-device-%d", index),
@@ -331,8 +331,8 @@ func TestPostgresNormalizedActivationRedeemIsSingleWinnerAcrossRepositories(t *t
 			winnerDeviceID = result.device.ID
 			continue
 		}
-		if !errors.Is(result.err, controlplane.ErrActivationCodeAlreadyUsed) {
-			t.Fatalf("concurrent activation error = %v, want already-used loser", result.err)
+		if !errors.Is(result.err, controlplane.ErrDeviceLimitExceeded) {
+			t.Fatalf("concurrent activation error = %v, want device-limit loser", result.err)
 		}
 		losers++
 	}
@@ -341,13 +341,12 @@ func TestPostgresNormalizedActivationRedeemIsSingleWinnerAcrossRepositories(t *t
 	}
 	replayRepository := repositories[(winnerIndex+1)%len(repositories)]
 	replayedDevice, err := replayRepository.ActivateDeviceWithSessionBinding(ctx, DeviceActivationRecord{
-		Scope:              "control-plane-state",
-		IdempotencyKey:     fmt.Sprintf("activate-device:%d:%d", suffix, winnerIndex),
-		Fingerprint:        fmt.Sprintf("activation-race-fingerprint-%d", winnerIndex),
-		AccessTokenHash:    accessTokens[winnerIndex],
-		UserID:             userID,
-		Product:            controlplane.ProductAutoLive,
-		ActivationCodeHash: activationHash,
+		Scope:           "control-plane-state",
+		IdempotencyKey:  fmt.Sprintf("activate-device:%d:%d", suffix, winnerIndex),
+		Fingerprint:     fmt.Sprintf("activation-race-fingerprint-%d", winnerIndex),
+		AccessTokenHash: accessTokens[winnerIndex],
+		UserID:          userID,
+		Product:         controlplane.ProductAutoLive,
 		Device: controlplane.DeviceRegistration{
 			Product:  controlplane.ProductAutoLive,
 			DeviceID: deviceIDs[winnerIndex], DeviceName: fmt.Sprintf("race-device-%d", winnerIndex),
@@ -390,13 +389,13 @@ func TestPostgresNormalizedActivationRejectsExpiredOrRevokedCodes(t *testing.T) 
 			name:      "expired",
 			status:    controlplane.ActivationCodeStatusActive,
 			expiresAt: now.Add(-time.Minute),
-			wantError: controlplane.ErrActivationCodeExpired,
+			wantError: controlplane.ErrAccountActivationExpired,
 		},
 		{
 			name:      "revoked",
 			status:    controlplane.ActivationCodeStatusRevoked,
 			expiresAt: now.Add(time.Hour),
-			wantError: controlplane.ErrActivationCodeRevoked,
+			wantError: controlplane.ErrAccountActivationRequired,
 		},
 	}
 	for _, testCase := range cases {
@@ -408,13 +407,12 @@ func TestPostgresNormalizedActivationRejectsExpiredOrRevokedCodes(t *testing.T) 
 			}
 
 			_, err = repository.ActivateDeviceWithSessionBinding(ctx, DeviceActivationRecord{
-				Scope:              "control-plane-state",
-				IdempotencyKey:     fixture.IdempotencyPrefix + "redeem",
-				Fingerprint:        fixture.IdempotencyPrefix + "fingerprint",
-				AccessTokenHash:    fixture.AccessTokenHashes[0],
-				UserID:             fixture.UserID,
-				Product:            controlplane.ProductAutoLive,
-				ActivationCodeHash: fixture.CodeHash,
+				Scope:           "control-plane-state",
+				IdempotencyKey:  fixture.IdempotencyPrefix + "redeem",
+				Fingerprint:     fixture.IdempotencyPrefix + "fingerprint",
+				AccessTokenHash: fixture.AccessTokenHashes[0],
+				UserID:          fixture.UserID,
+				Product:         controlplane.ProductAutoLive,
 				Device: controlplane.DeviceRegistration{
 					Product:  controlplane.ProductAutoLive,
 					DeviceID: fixture.DeviceIDs[0], DeviceName: "activation-edge-device",
@@ -480,13 +478,12 @@ func TestPostgresNormalizedActivationRejectsCommittedRedeemAndIdempotencyConflic
 	winnerKey := fixture.IdempotencyPrefix + "winner"
 	winnerFingerprint := fixture.IdempotencyPrefix + "winner-fingerprint"
 	winner, err := repository.ActivateDeviceWithSessionBinding(ctx, DeviceActivationRecord{
-		Scope:              "control-plane-state",
-		IdempotencyKey:     winnerKey,
-		Fingerprint:        winnerFingerprint,
-		AccessTokenHash:    fixture.AccessTokenHashes[0],
-		UserID:             fixture.UserID,
-		Product:            controlplane.ProductAutoLive,
-		ActivationCodeHash: fixture.CodeHash,
+		Scope:           "control-plane-state",
+		IdempotencyKey:  winnerKey,
+		Fingerprint:     winnerFingerprint,
+		AccessTokenHash: fixture.AccessTokenHashes[0],
+		UserID:          fixture.UserID,
+		Product:         controlplane.ProductAutoLive,
 		Device: controlplane.DeviceRegistration{
 			Product:  controlplane.ProductAutoLive,
 			DeviceID: fixture.DeviceIDs[0], DeviceName: "activation-winner",
@@ -501,21 +498,20 @@ func TestPostgresNormalizedActivationRejectsCommittedRedeemAndIdempotencyConflic
 	}
 
 	_, err = repository.ActivateDeviceWithSessionBinding(ctx, DeviceActivationRecord{
-		Scope:              "control-plane-state",
-		IdempotencyKey:     fixture.IdempotencyPrefix + "duplicate",
-		Fingerprint:        fixture.IdempotencyPrefix + "duplicate-fingerprint",
-		AccessTokenHash:    fixture.AccessTokenHashes[1],
-		UserID:             fixture.UserID,
-		Product:            controlplane.ProductAutoLive,
-		ActivationCodeHash: fixture.CodeHash,
+		Scope:           "control-plane-state",
+		IdempotencyKey:  fixture.IdempotencyPrefix + "duplicate",
+		Fingerprint:     fixture.IdempotencyPrefix + "duplicate-fingerprint",
+		AccessTokenHash: fixture.AccessTokenHashes[1],
+		UserID:          fixture.UserID,
+		Product:         controlplane.ProductAutoLive,
 		Device: controlplane.DeviceRegistration{
 			Product:  controlplane.ProductAutoLive,
 			DeviceID: fixture.DeviceIDs[1], DeviceName: "activation-duplicate",
 			Platform: "integration", AppVersion: "test",
 		},
 	})
-	if !errors.Is(err, controlplane.ErrActivationCodeAlreadyUsed) {
-		t.Fatalf("second activation error = %v, want already-used", err)
+	if !errors.Is(err, controlplane.ErrDeviceLimitExceeded) {
+		t.Fatalf("second activation error = %v, want device limit exceeded", err)
 	}
 
 	restartedRepository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, func() time.Time { return now }, nil, ModelReadSourceNormalized)
@@ -523,13 +519,12 @@ func TestPostgresNormalizedActivationRejectsCommittedRedeemAndIdempotencyConflic
 		t.Fatalf("restarted repository constructor: %v", err)
 	}
 	_, err = restartedRepository.ActivateDeviceWithSessionBinding(ctx, DeviceActivationRecord{
-		Scope:              "control-plane-state",
-		IdempotencyKey:     winnerKey,
-		Fingerprint:        fixture.IdempotencyPrefix + "different-fingerprint",
-		AccessTokenHash:    fixture.AccessTokenHashes[0],
-		UserID:             fixture.UserID,
-		Product:            controlplane.ProductAutoLive,
-		ActivationCodeHash: fixture.CodeHash,
+		Scope:           "control-plane-state",
+		IdempotencyKey:  winnerKey,
+		Fingerprint:     fixture.IdempotencyPrefix + "different-fingerprint",
+		AccessTokenHash: fixture.AccessTokenHashes[0],
+		UserID:          fixture.UserID,
+		Product:         controlplane.ProductAutoLive,
 		Device: controlplane.DeviceRegistration{
 			Product:  controlplane.ProductAutoLive,
 			DeviceID: fixture.DeviceIDs[0], DeviceName: "activation-winner",
@@ -577,13 +572,12 @@ func TestPostgresNormalizedActivationBindsConfiguredDeviceCount(t *testing.T) {
 	}
 	for index := range fixture.DeviceIDs {
 		device, activateErr := repository.ActivateDeviceWithSessionBinding(ctx, DeviceActivationRecord{
-			Scope:              "control-plane-state",
-			IdempotencyKey:     fixture.IdempotencyPrefix + fmt.Sprintf("redeem-%d", index),
-			Fingerprint:        fixture.IdempotencyPrefix + fmt.Sprintf("fingerprint-%d", index),
-			AccessTokenHash:    fixture.AccessTokenHashes[index],
-			UserID:             fixture.UserID,
-			Product:            controlplane.ProductAutoLive,
-			ActivationCodeHash: fixture.CodeHash,
+			Scope:           "control-plane-state",
+			IdempotencyKey:  fixture.IdempotencyPrefix + fmt.Sprintf("redeem-%d", index),
+			Fingerprint:     fixture.IdempotencyPrefix + fmt.Sprintf("fingerprint-%d", index),
+			AccessTokenHash: fixture.AccessTokenHashes[index],
+			UserID:          fixture.UserID,
+			Product:         controlplane.ProductAutoLive,
 			Device: controlplane.DeviceRegistration{
 				Product:  controlplane.ProductAutoLive,
 				DeviceID: fixture.DeviceIDs[index], DeviceName: "multi-device",
@@ -640,9 +634,9 @@ func seedPostgresActivationFixture(t *testing.T, database *sql.DB, ctx context.C
 		maxDevices = configuredMaxDevices[0]
 	}
 	if _, err := database.ExecContext(ctx, `
-		INSERT INTO activation_codes (id, code_hash, code_prefix, status, created_at, expires_at, max_devices, bound_devices)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 0)
-	`, fixture.CodeID, fixture.CodeHash, "edge_", status, now, expiresAt, maxDevices); err != nil {
+		INSERT INTO activation_codes (id, bound_user_id, code_hash, code_prefix, status, created_at, expires_at, max_devices, bound_devices)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0)
+	`, fixture.CodeID, fixture.UserID, fixture.CodeHash, "edge_", status, now, expiresAt, maxDevices); err != nil {
 		t.Fatalf("seed activation edge code: %v", err)
 	}
 	for index := range fixture.AccessTokenHashes {
@@ -663,6 +657,7 @@ func seedPostgresActivationFixture(t *testing.T, database *sql.DB, ctx context.C
 		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM auth_sessions WHERE user_id = $1`, fixture.UserID)
 		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM idempotency_records WHERE scope = $1 AND idempotency_key LIKE $2`, "control-plane-state", fixture.IdempotencyPrefix+"%")
 		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM audit_outbox WHERE payload->>'RequestID' LIKE $1`, fixture.IdempotencyPrefix+"%")
+		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM activation_device_bindings WHERE activation_code_id = $1`, fixture.CodeID)
 		_, _ = database.ExecContext(cleanupCtx, `DELETE FROM activation_codes WHERE id = $1`, fixture.CodeID)
 		for _, deviceID := range fixture.DeviceIDs {
 			_, _ = database.ExecContext(cleanupCtx, `DELETE FROM devices WHERE id = $1`, deviceID)

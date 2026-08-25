@@ -14,11 +14,19 @@ const 接近结束阈值秒 = 0.05;
 export function shouldIgnoreLoopBoundaryPause({
   suppressMediaEvent,
   ended,
+  currentTime,
+  duration,
 }: {
   suppressMediaEvent: boolean;
   ended: boolean;
+  currentTime?: number;
+  duration?: number;
 }): boolean {
-  return suppressMediaEvent || ended;
+  return suppressMediaEvent || 已到播放边界({ ended, currentTime, duration });
+}
+
+export function shouldRestartCurrentSourceImmediately(sourceCount: number): boolean {
+  return Number.isSafeInteger(sourceCount) && sourceCount === 1;
 }
 
 function 读取当前重启令牌({
@@ -43,6 +51,19 @@ function 读取上次重启令牌({
 
 function 令牌有效(令牌: string | number | null): 令牌 is string | number {
   return typeof 令牌 === 'string' ? 令牌.length > 0 : Number.isFinite(令牌);
+}
+
+function 已到播放边界({
+  ended,
+  currentTime,
+  duration,
+}: Pick<播放重启判断输入, 'ended' | 'currentTime' | 'duration'>): boolean {
+  return ended || (
+    Number.isFinite(currentTime) &&
+    Number.isFinite(duration) &&
+    (duration as number) > 0 &&
+    (currentTime as number) >= (duration as number) - 接近结束阈值秒
+  );
 }
 
 export function shouldRestartPlayback({
@@ -76,14 +97,5 @@ export function shouldRestartPlayback({
     return false;
   }
 
-  if (ended) {
-    return true;
-  }
-
-  return (
-    Number.isFinite(currentTime) &&
-    Number.isFinite(duration) &&
-    (duration as number) > 0 &&
-    (currentTime as number) >= (duration as number) - 接近结束阈值秒
-  );
+  return 已到播放边界({ ended, currentTime, duration });
 }

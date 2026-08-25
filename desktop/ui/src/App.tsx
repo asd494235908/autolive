@@ -14,14 +14,12 @@ import {
   SoundOutlined,
   StopOutlined,
   ThunderboltOutlined,
-  UnorderedListOutlined,
-  UploadOutlined,
 } from '@ant-design/icons';
-import { App as AntApp, Alert, Button, Card, Checkbox, ConfigProvider, Descriptions, Drawer, Input, InputNumber, Layout, Popconfirm, Progress, Select, Slider, Space, Steps, Switch, Tag, Typography, theme as antdTheme } from 'antd';
+import { App as AntApp, Alert, Button, Card, Checkbox, ConfigProvider, Descriptions, Drawer, Empty, Input, InputNumber, Layout, Popconfirm, Progress, Select, Slider, Space, Steps, Switch, Tag, Typography, theme as antdTheme } from 'antd';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { SyntheticEvent } from 'react';
 import { HashRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom';
-import { buildInterludeScheduleKey, chooseInterludeIndex, INTERLUDE_LIMITS, nextInterludeAtMs, resolvePlaybackAudioSource, shouldPauseInterlude } from './interlude-player';
+import { buildInterludeScheduleKey, chooseInterludeIndex, interludeIntervalMsToSeconds, interludeIntervalSecondsToMs, INTERLUDE_LIMITS, nextInterludeAtMs, resolvePlaybackAudioSource, shouldPauseInterlude } from './interlude-player';
 import type { BaseAudioSource } from './interlude-player';
 import {
   AUDIO_MIX_PICK_HARD_MAX,
@@ -32,9 +30,6 @@ import {
   AUDIO_PARAM_CROSSFADE_SEC,
   buildAudioFxSignature,
   buildAudioVariantsFromCycle,
-  buildRuntimePreviewParameters,
-  getUnsupportedAudioPresetFields,
-  UNMAPPED_AUDIO_PRESET_FIELD_LABELS,
   loadAudioMixSession,
   PERIOD_HARD_MAX_MS,
   PERIOD_HARD_MIN_MS,
@@ -46,19 +41,17 @@ import {
   loadVideoPeriodRange,
   sampleAudioCycle,
   samplePeriodMsInRange,
-  sampleVideoCycle,
-  sampleSubtleVideoParams,
-  sanitizeMappedVideoSample,
   saveAudioMixSession,
   saveAudioPeriodRange,
   saveVideoPeriodRange,
 } from './runtime-parameter-scheduler';
-import type { AudioCycleSample, PeriodRangeMs, RuntimeBaseParameters, RuntimePreviewParameters, SubtleAudioSample, SubtleVideoSample } from './runtime-parameter-scheduler';
+import type { AudioCycleSample, PeriodRangeMs, RuntimeBaseParameters, RuntimePreviewParameters, SubtleAudioSample } from './runtime-parameter-scheduler';
 import { appendAudioCycleSnapshot } from './audioCycleSnapshot';
 import {
   createAudioCycleCandidatePlan,
   getAudioCycleCoordinatorAction,
   isAudioCycleCommandMessage,
+  isExpectedAudioCycleSkipCode,
   isAudioCycleResultMessage,
   updateAudioCycleCandidateStatus,
 } from './audio-cycle-prewarm-coordinator';
@@ -75,7 +68,9 @@ import {
   intersectPeriodRanges,
 } from './media-cycle-planner';
 import type { MediaCyclePlan, MediaCycleQueue, MediaCycleSeed } from './media-cycle-planner';
-import { buildAudioCapabilityRows } from './audio-processing-capabilities';
+import { AudioParameterControls, MediaParameterPanels, type MediaEffectParams } from './media-parameter-panels';
+import { sampleAutomaticVideoParameters } from './video-parameter-randomizer';
+import { buildAudioCapabilityRows, resolveAudioStreamBranches } from './audio-processing-capabilities';
 import {
   classifyAudioOutputSync,
   clearResolvedPortAudioSyncError,
@@ -86,10 +81,14 @@ import {
   shouldKeepPortAudioCycleScheduling,
 } from './audio-output-recovery';
 import { resolveSynchronizedVideoPlaybackRate } from './audio-playback-sync';
-import { shouldIgnoreLoopBoundaryPause, shouldRestartPlayback } from './playback-loop';
-import { buildFinalEffectWindowResizeKey } from './final-effect-window-size';
-import { clampMediaTime, clampVolume, createAudioSyncClock, formatMediaTime, isPlaybackMediaControlMessage, isPlaybackMediaStateMessage, shouldIssuePlaybackCommand } from './playback-control-message';
-import type { AudioSyncClock, PlaybackMediaControlMessage, PlaybackMediaStateMessage } from './playback-control-message';
+import { shouldIgnoreLoopBoundaryPause, shouldRestartCurrentSourceImmediately, shouldRestartPlayback } from './playback-loop';
+import {
+  buildFinalEffectMediaIdentity,
+  buildFinalEffectWindowResizeKey,
+  isFinalEffectMediaIdentityCurrent,
+} from './final-effect-window-size';
+import { capturePlaybackPosition, clampMediaTime, clampVolume, createAudioSyncClock, formatMediaTime, isPlaybackMediaControlMessage, isPlaybackMediaStateMessage, resolvePlaybackResumePosition, shouldApplyPlaybackSeek, shouldIssuePlaybackCommand } from './playback-control-message';
+import type { AudioSyncClock, PlaybackMediaControlMessage, PlaybackMediaStateMessage, PlaybackPositionCheckpoint } from './playback-control-message';
 import { scheduleAfterInitialPaint } from './startup-scheduler';
 import { getDisplayErrorMessage } from './errorDisplay';
 import {
@@ -124,10 +123,8 @@ import { CompactNumberField } from './desktop/compact-number-field';
 import { ControlPlaneGate } from './desktop/control-plane-gate';
 import { DesktopPanel } from './desktop/desktop-panel';
 import { FeatureDrawer, FeatureDrawerField, FeatureDrawerSection } from './desktop/feature-drawer';
-import { advanceMetricFlashTokens, getChangedMetricKeys, getNewlyActivePresetIds } from './desktop/metric-change-flash';
-import type { MetricValueSnapshot } from './desktop/metric-change-flash';
-import { ParameterMetricCard, ReadOnlyMetricCard } from './desktop/parameter-metric-card';
 import { DesktopColumn, DesktopShell } from './desktop/desktop-shell';
+import { PlaybackPoolPanel, type PlaybackPoolSource } from './desktop/playback-pool-panel';
 import { DesktopStatusStrip } from './desktop/status-strip';
 import type { DesktopStatusItem } from './desktop/status-strip';
 import './desktop-layout.css';
@@ -170,6 +167,12 @@ type AudioCycleDiagnosticSnapshot = {
   peak_dbfs: number;
   low_band_rms_dbfs: number;
   cutoff_hz: number;
+  mfcc: number[];
+  mfcc_available: boolean;
+  noise_floor_dbfs: number;
+  snr_db: number | null;
+  formants_hz: Array<number | null>;
+  current_formant_hz: number | null;
   has_pcm: boolean;
 };
 
@@ -186,6 +189,12 @@ type DiagnosticMessage = {
   peak_dbfs: number | null;
   low_band_rms_dbfs: number | null;
   cutoff_hz: number | null;
+  mfcc: number[];
+  mfcc_available: boolean;
+  noise_floor_dbfs: number | null;
+  snr_db: number | null;
+  formants_hz: Array<number | null>;
+  current_formant_hz: number | null;
   waveform?: number[];
   spectrum?: number[];
   sent_at_ms: number;
@@ -240,29 +249,15 @@ type PictureInPictureVideo = HTMLVideoElement & {
   requestPictureInPicture?: () => Promise<unknown>;
 };
 
-type MediaProbeResult = {
-  canonical_path: string;
-  source: {
-    source_path: string;
-    file_name: string;
-    file_size_bytes: number;
-    duration_ms: number | null;
-    width: number | null;
-    height: number | null;
-    frame_rate_fps: number | null;
-    audio_sample_rate_hz: number | null;
-    audio_channel_count: number | null;
-    mp4_sha256: string | null;
-    mp4_hash_status: 'disabled' | 'pending' | 'ready' | 'failed';
-  };
-};
-
 type PlaybackSnapshot = {
   playback_generation: number;
   playback_state: string;
   loop_index: number;
   current_position_ms: number;
-  source_media: MediaProbeResult['source'] | null;
+  source_media: PlaybackPoolSource | null;
+  source_media_pool: PlaybackPoolSource[];
+  source_media_index: number | null;
+  playback_pool_cycle: number;
   current_video_source: string | null;
   current_video_reference: string | null;
   current_video_sha256: string | null;
@@ -287,6 +282,8 @@ type PlaybackSnapshot = {
   pending_audio_duration_ms: number | null;
   audio_processing_parameters_version: string;
   audio_stream_variant_count?: number | null;
+  audio_stream_params?: MediaEffectParams['audio'] | null;
+  audio_stream_variants?: MediaEffectParams['audio'][];
   audio_stream_revision: number;
   audio_processing_status: string;
   audio_processing_runtime: boolean;
@@ -294,9 +291,23 @@ type PlaybackSnapshot = {
   interlude?: InterludeSnapshot | null;
 };
 
+type PlaybackItemCompletionResult = {
+  snapshot: PlaybackSnapshot;
+  source_changed: boolean;
+};
+
 type InterludeSnapshot = {
   enabled: boolean;
   directory: string | null;
+  audio_selection_mode?: InterludeAudioSelectionMode;
+  audio_fixed_preset_id?: string;
+  audio_preset_ids?: string[];
+  audio_mix_enabled?: boolean;
+  audio_mix_pick_min?: number;
+  audio_mix_pick_max?: number;
+  audio_variation_mode?: InterludeAudioVariationMode;
+  audio_variation_period_min_ms?: number;
+  audio_variation_period_max_ms?: number;
   audio_files: string[];
   audio_count: number;
   status: string;
@@ -309,15 +320,41 @@ type InterludeSnapshot = {
   ducking_release_ms: number;
 };
 
+type InterludeAudioSelectionMode = 'fixed' | 'random';
+type InterludeAudioVariationMode = 'each_playback' | 'periodic';
+
 type InterludeConfigDraft = {
   enabled: boolean;
   directory: string | null;
+  audioSelectionMode: InterludeAudioSelectionMode;
+  audioFixedPresetId: string;
+  audioPresetIds: string[];
+  audioMixEnabled: boolean;
+  audioMixPickMin: number;
+  audioMixPickMax: number;
+  audioVariationMode: InterludeAudioVariationMode;
+  audioVariationPeriodMinMs: number;
+  audioVariationPeriodMaxMs: number;
   intervalMinMs: number;
   intervalMaxMs: number;
   volumeDb: number;
   duckingDepthDb: number;
   duckingAttackMs: number;
   duckingReleaseMs: number;
+};
+
+type PrepareWebViewInterludeResult = {
+  state: 'processed' | 'original_fallback';
+  path: string;
+  output_size_bytes: number | null;
+  ambient_sound_source: string | null;
+  reason_code: string | null;
+  reason: string | null;
+};
+
+type ReleaseWebViewInterludeCacheResult = {
+  released: boolean;
+  removed: boolean;
 };
 
 type SpeechToSpeechWorkerCapabilities = {
@@ -443,13 +480,14 @@ type CommitAudioCycleCandidateResult = {
   candidate_id: number;
   committed: boolean;
   reason: string | null;
+  reason_code: string | null;
   snapshot: PlaybackSnapshot;
 };
 
 type PlannedAudioCyclePayload = {
   sample: AudioCycleSample;
-  audio: ResearchParams['audio'];
-  audioVariants: ResearchParams['audio'][];
+  audio: MediaEffectParams['audio'];
+  audioVariants: MediaEffectParams['audio'][];
   periodMs: number;
 };
 
@@ -462,7 +500,8 @@ type PendingAudioCyclePayload = PlannedAudioCyclePayload & {
 
 type PlannedVideoCyclePayload = {
   seed: number;
-  sample: SubtleVideoSample;
+  video: MediaEffectParams['video'];
+  advanced: MediaEffectParams['advanced'];
   periodMs: number;
 };
 
@@ -490,87 +529,9 @@ type CacheCleanupResult = {
   remaining_bytes: number;
 };
 
-type ResearchParams = {
-  audio: {
-    natural_voice_mode: 'original' | 'natural_dynamic';
-    random_change_period_ms: number;
-    pitch_shift_semitones: number;
-    spectral_perturbation_percent: number;
-    environment_noise_percent: number;
-    environment_noise_dbfs: number;
-    phase_perturbation_percent: number;
-    mfcc_shift_percent: number;
-    loudness_adjustment_db: number;
-    input_gain_db: number;
-    output_gain_db: number;
-    playback_speed: number;
-    low_eq_db: number;
-    mid_eq_db: number;
-    high_eq_db: number;
-    noise_reduction_percent: number;
-    ambient_sound_mix_percent: number;
-    fade_in_ms: number;
-    fade_out_ms: number;
-    dry_wet_percent: number;
-    reverb_wet_percent: number;
-    mfcc_dimensions: number;
-    snr_variation_db: number;
-    formant_shift_percent: number;
-    vibrato_frequency_hz: number;
-    vibrato_depth_percent: number;
-    spectrum_blind_spot_percent: number;
-    snr_target_db: number | null;
-    current_formant_hz: number | null;
-    filter_q: number;
-    sample_rate_hz: number | null;
-    output_bitrate_kbps: number;
-    voice_library_id: string | null;
-  };
-  video: {
-    brightness_percent: number;
-    contrast_percent: number;
-    saturation_percent: number;
-    blur_radius_px: number;
-    hue_rotation_degrees: number;
-    sharpen_percent: number;
-    noise_percent: number;
-    detail_enhancement_percent: number;
-    crop_edge_smoothing: number;
-    frame_rate_jitter_percent: number;
-    frame_rate_perturbation_frequency_hz: number;
-    frame_rate_perturbation_amplitude_fps: number;
-    pixel_scale_percent: number;
-    pixel_jitter_px: number;
-    dynamic_crop_percent: number;
-    frame_inner_perturbation_percent: number;
-    frame_inter_perturbation_percent: number;
-    space_x_offset_px: number;
-    space_y_offset_px: number;
-    color_space_conversion_strength_percent: number;
-  };
-  research: {
-    band_weights: Record<string, number>;
-    target_frequency_hz: number | null;
-    core_frequency_hz: number | null;
-    wave_intensity: number;
-    wave_level: number;
-    wave_grain_count: number;
-    dynamic_eq_threshold: number;
-    channel_offset_percent: number;
-    space_dimension: number;
-    frequency_space_x_offset_px: number;
-    frequency_space_y_offset_px: number;
-    frame_perturbation_probability_percent: number;
-    random_graphic_opacity_percent: number;
-    random_graphic_size_px: number;
-    abstract_face_count: number;
-    abstract_face_size_percent: number;
-    abstract_face_opacity_percent: number;
-    overlay_offset_px: number;
-    slice_length_ms: number;
-    slice_min_length_ms: number;
-    slice_trigger_interval_ms: number;
-  };
+type MediaParameterValidationResult = {
+  valid: boolean;
+  errors: Array<{ field: string; message: string }>;
 };
 
 const RUNTIME_PARAMETER_FIELDS: Array<keyof RuntimePreviewParameters> = [
@@ -652,6 +613,16 @@ function isDiagnosticMessage(value: unknown): value is DiagnosticMessage {
     nullableFiniteNumber(record.peak_dbfs) &&
     nullableFiniteNumber(record.low_band_rms_dbfs) &&
     nullableFiniteNumber(record.cutoff_hz) &&
+    nullableFiniteNumber(record.noise_floor_dbfs) &&
+    nullableFiniteNumber(record.snr_db) &&
+    nullableFiniteNumber(record.current_formant_hz) &&
+    typeof record.mfcc_available === 'boolean' &&
+    Array.isArray(record.mfcc) &&
+    record.mfcc.length <= 40 &&
+    record.mfcc.every((coefficient) => typeof coefficient === 'number' && Number.isFinite(coefficient)) &&
+    Array.isArray(record.formants_hz) &&
+    record.formants_hz.length === 3 &&
+    record.formants_hz.every(nullableFiniteNumber) &&
     typeof record.sent_at_ms === 'number' &&
     Number.isFinite(record.sent_at_ms) &&
     validSamples(record.line, DIAGNOSTIC_LINE_SAMPLE_COUNT) &&
@@ -679,11 +650,27 @@ function isAudioCycleDiagnosticSnapshot(value: unknown): value is AudioCycleDiag
     && Array.isArray(record.line)
     && (record.line.length === 0 || record.line.length === DIAGNOSTIC_LINE_SAMPLE_COUNT)
     && record.line.every((sample) => typeof sample === 'number' && Number.isFinite(sample) && sample >= -1 && sample <= 1)
-    && ['rms_dbfs', 'peak_dbfs', 'low_band_rms_dbfs', 'cutoff_hz'].every(
+    && ['rms_dbfs', 'peak_dbfs', 'low_band_rms_dbfs', 'cutoff_hz', 'noise_floor_dbfs'].every(
       (field) => typeof record[field] === 'number' && Number.isFinite(record[field]),
     )
+    && (record.snr_db === null || (typeof record.snr_db === 'number' && Number.isFinite(record.snr_db)))
+    && (record.current_formant_hz === null || (typeof record.current_formant_hz === 'number' && Number.isFinite(record.current_formant_hz)))
+    && typeof record.mfcc_available === 'boolean'
+    && Array.isArray(record.mfcc)
+    && record.mfcc.length <= 40
+    && record.mfcc.every((coefficient) => typeof coefficient === 'number' && Number.isFinite(coefficient))
+    && Array.isArray(record.formants_hz)
+    && record.formants_hz.length === 3
+    && record.formants_hz.every((formant) => formant === null || (typeof formant === 'number' && Number.isFinite(formant)))
     && typeof record.has_pcm === 'boolean'
   );
+}
+
+function isTransientAudioCandidateCode(code: string | null | undefined): boolean {
+  return code === 'audio_candidate_target_invalid'
+    || code === 'audio_candidate_stale'
+    || code === 'audio_mixer_candidate_stale'
+    || code === 'audio_mixer_candidate_superseded';
 }
 
 function drawDiagnosticCanvas(canvas: HTMLCanvasElement | null, samples: number[], stroke: string, fill: string) {
@@ -778,30 +765,60 @@ function formatAudioPreviewValue(value: number | null | undefined, unit = '', di
 const AUDIO_PRESET_FIELD_DEFINITIONS: readonly {
   key: keyof SubtleAudioSample;
   label: string;
-  unit: string;
-  digits: number;
+  unit?: string;
+  digits?: number;
 }[] = [
+  { key: 'natural_voice_mode', label: '自然真人模式' },
   { key: 'pitch_shift_semitones', label: '音高', unit: '半音', digits: 3 },
+  { key: 'spectral_perturbation_percent', label: '频谱微扰', unit: '%', digits: 3 },
+  { key: 'environment_noise_percent', label: '环境噪声', unit: '%', digits: 3 },
+  { key: 'environment_noise_dbfs', label: '环境噪声电平', unit: 'dBFS', digits: 3 },
+  { key: 'mfcc_shift_percent', label: 'MFCC 偏移', unit: '%', digits: 3 },
+  { key: 'phase_perturbation_percent', label: '相位扰动', unit: '%', digits: 3 },
+  { key: 'loudness_adjustment_db', label: '响度调整', unit: 'dB', digits: 3 },
   { key: 'input_gain_db', label: '输入增益', unit: 'dB', digits: 3 },
   { key: 'output_gain_db', label: '输出增益', unit: 'dB', digits: 3 },
-  { key: 'loudness_adjustment_db', label: '响度调整', unit: 'dB', digits: 3 },
+  { key: 'playback_speed', label: '播放速度', unit: 'x', digits: 3 },
   { key: 'low_eq_db', label: '低频 EQ', unit: 'dB', digits: 3 },
   { key: 'mid_eq_db', label: '中频 EQ', unit: 'dB', digits: 3 },
   { key: 'high_eq_db', label: '高频 EQ', unit: 'dB', digits: 3 },
-  { key: 'filter_q', label: '滤波 Q', unit: '', digits: 3 },
-  { key: 'phase_perturbation_percent', label: '相位扰动', unit: '%', digits: 3 },
-  { key: 'vibrato_frequency_hz', label: '颤音频率', unit: 'Hz', digits: 3 },
-  { key: 'vibrato_depth_percent', label: '颤音深度', unit: '%', digits: 3 },
-  { key: 'reverb_wet_percent', label: '轻混响', unit: '%', digits: 3 },
   { key: 'noise_reduction_percent', label: '降噪', unit: '%', digits: 3 },
-  { key: 'environment_noise_percent', label: '环境噪声', unit: '%', digits: 3 },
-  { key: 'environment_noise_dbfs', label: '环境噪声电平', unit: 'dBFS', digits: 3 },
+  { key: 'ambient_sound_mix_percent', label: '环境声混合', unit: '%', digits: 3 },
   { key: 'fade_in_ms', label: '淡入', unit: 'ms', digits: 3 },
   { key: 'fade_out_ms', label: '淡出', unit: 'ms', digits: 3 },
   { key: 'dry_wet_percent', label: '干湿比', unit: '%', digits: 3 },
-  { key: 'ambient_sound_mix_percent', label: '环境声混合', unit: '%', digits: 3 },
-  { key: 'spectral_perturbation_percent', label: '频谱微扰', unit: '%', digits: 3 },
+  { key: 'reverb_wet_percent', label: '轻混响', unit: '%', digits: 3 },
+  { key: 'mfcc_dimensions', label: 'MFCC 维度', unit: '阶', digits: 0 },
+  { key: 'snr_variation_db', label: 'SNR 浮动', unit: 'dB', digits: 3 },
+  { key: 'formant_shift_percent', label: '共振峰偏移', unit: '%', digits: 3 },
+  { key: 'vibrato_frequency_hz', label: '颤音频率', unit: 'Hz', digits: 3 },
+  { key: 'vibrato_depth_percent', label: '颤音深度', unit: '%', digits: 3 },
+  { key: 'spectrum_blind_spot_percent', label: '频谱盲区', unit: '%', digits: 3 },
+  { key: 'snr_target_db', label: '目标信噪比', unit: 'dB', digits: 3 },
+  { key: 'filter_q', label: '滤波 Q', digits: 3 },
+  { key: 'sample_rate_hz', label: '输出采样率', unit: 'Hz', digits: 0 },
+  { key: 'output_bitrate_kbps', label: '输出码率', unit: 'kbps', digits: 0 },
+  { key: 'voice_library_id', label: '音色库 ID' },
+  { key: 'high_frequency_perturbation_enabled', label: '高频扰动' },
+  { key: 'high_frequency_perturbation_interval_ms', label: '高频扰动间隔', unit: 'ms', digits: 0 },
+  { key: 'high_frequency_perturbation_strength_percent', label: '高频扰动强度', unit: '%', digits: 3 },
+  { key: 'high_frequency_perturbation_level_db', label: '高频扰动电平', unit: 'dB', digits: 3 },
 ];
+
+function formatAudioPresetFieldValue(
+  key: keyof SubtleAudioSample,
+  value: SubtleAudioSample[keyof SubtleAudioSample],
+  unit = '',
+  digits = 3,
+) {
+  if (value === null) return key === 'snr_target_db' ? '自动（源素材基线）' : '跟随源素材';
+  if (typeof value === 'boolean') return value ? '开启' : '关闭';
+  if (typeof value === 'string') {
+    if (key === 'natural_voice_mode') return value === 'natural_dynamic' ? '自然动态' : '保持原声';
+    return value;
+  }
+  return formatAudioPreviewValue(value, unit, digits);
+}
 
 function getPlaybackDisplayLabel(state: PlaybackDisplayState) {
   switch (state) {
@@ -849,16 +866,52 @@ function getEffectiveAudioSource(snapshot: PlaybackSnapshot | null): BaseAudioSo
   });
 }
 
+function playbackVideoUrl(snapshot: PlaybackSnapshot | null | undefined): string | null {
+  const useProcessedVideo = snapshot?.current_video_source === 'processed'
+    && Boolean(snapshot.current_video_reference);
+  return toAssetUrl(
+    useProcessedVideo
+      ? snapshot.current_video_reference
+      : (snapshot?.source_media?.source_path ?? null),
+  );
+}
+
+const INTERLUDE_AUDIO_PRESET_IDS = new Set(AUDIO_VALUE_PRESETS.map((preset) => preset.id));
+
+function normalizeInterludeAudioPresetIds(values?: readonly string[] | null): string[] {
+  const presetIds = [...new Set(values ?? [])].filter((id) => INTERLUDE_AUDIO_PRESET_IDS.has(id));
+  return presetIds.length > 0 ? presetIds : [...DEFAULT_AUDIO_VALUE_PRESET_IDS];
+}
+
 function buildInterludeDraft(interlude?: InterludeSnapshot | null): InterludeConfigDraft {
+  const audioMixPickMax = normalizeAudioMixPickMax(
+    interlude?.audio_mix_pick_max ?? DEFAULT_AUDIO_MIX_PICK_MAX,
+  );
+  const audioVariationPeriod = normalizeAudioPeriodRange(
+    interlude?.audio_variation_period_min_ms ?? 8_000,
+    interlude?.audio_variation_period_max_ms ?? 15_000,
+  );
   return {
     enabled: interlude?.enabled ?? false,
     directory: interlude?.directory ?? null,
+    audioSelectionMode: interlude?.audio_selection_mode === 'fixed' ? 'fixed' : 'random',
+    audioFixedPresetId: normalizeInterludeAudioPresetIds([interlude?.audio_fixed_preset_id ?? 'p01'])[0],
+    audioPresetIds: normalizeInterludeAudioPresetIds(interlude?.audio_preset_ids),
+    audioMixEnabled: interlude?.audio_mix_enabled ?? false,
+    audioMixPickMin: normalizeAudioMixPickMin(
+      interlude?.audio_mix_pick_min ?? DEFAULT_AUDIO_MIX_PICK_MIN,
+      audioMixPickMax,
+    ),
+    audioMixPickMax,
+    audioVariationMode: interlude?.audio_variation_mode === 'periodic' ? 'periodic' : 'each_playback',
+    audioVariationPeriodMinMs: audioVariationPeriod.minMs,
+    audioVariationPeriodMaxMs: audioVariationPeriod.maxMs,
     intervalMinMs: interlude?.interval_min_ms ?? 8_000,
     intervalMaxMs: interlude?.interval_max_ms ?? 13_000,
     volumeDb: interlude?.volume_db ?? 0,
     duckingDepthDb: interlude?.ducking_depth_db ?? -12,
-    duckingAttackMs: interlude?.ducking_attack_ms ?? 120,
-    duckingReleaseMs: interlude?.ducking_release_ms ?? 240,
+    duckingAttackMs: interlude?.ducking_attack_ms ?? 50,
+    duckingReleaseMs: interlude?.ducking_release_ms ?? 250,
   };
 }
 
@@ -918,7 +971,9 @@ function FinalEffectWindow() {
   const interludeAudioUrlRef = useRef<string | null>(null);
   const interludePortAudioRef = useRef(false);
   const interludeStartingRef = useRef(false);
+  const webviewInterludeCachePathRef = useRef<string | null>(null);
   const interludeOperationRef = useRef(0);
+  const interludeReleaseMsRef = useRef(0);
   const audioDiagnosticsReadyRef = useRef(false);
   const realtimeAudioPlayingRef = useRef(false);
   const loopSourceKeyRef = useRef<string | null>(null);
@@ -932,13 +987,18 @@ function FinalEffectWindow() {
   const lastRustPositionSyncAtRef = useRef(0);
   const loopSyncPromiseRef = useRef<Promise<void> | null>(null);
   const lastRestartTokenRef = useRef<string | number | null>(null);
-  // ponytail: src 一切换 currentTime 先归零；用 ref 保住续播点
-  const playbackPositionSecRef = useRef(0);
+  // 续播点只属于已经完成 metadata 加载的播放代次，旧 video 的迟到事件不得污染下一项。
+  const playbackPositionRef = useRef<PlaybackPositionCheckpoint | null>(null);
+  const loadedPlaybackGenerationRef = useRef<number | null>(null);
   const [processedAudioUrl, setProcessedAudioUrl] = useState<string | null>(null);
   const [processedAudioReady, setProcessedAudioReady] = useState(false);
   const interludeScheduleKeyRef = useRef<string | null>(null);
   const nextInterludeAtMsRef = useRef<number | null>(null);
   const lastInterludeIndexRef = useRef<number | null>(null);
+  const interludeAudioCycleRef = useRef<AudioCycleSample | null>(null);
+  const interludeAudioVariationConfigKeyRef = useRef<string | null>(null);
+  const nextInterludeAudioVariationAtMsRef = useRef<number | null>(null);
+  const lastInterludeAudioPresetIdsRef = useRef<string[]>([]);
   const interludeActiveRef = useRef(false);
   const interludePausedRef = useRef(false);
   const interludeStopTimerRef = useRef<number | null>(null);
@@ -948,13 +1008,12 @@ function FinalEffectWindow() {
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [fixedSpeechActive, setFixedSpeechActive] = useState(false);
   const [interludeAudioUrl, setInterludeAudioUrl] = useState<string | null>(null);
-  const [runtimeParameters, setRuntimeParameters] = useState<RuntimePreviewParameters | null>(null);
-  const [runtimeVideoProcessingEnabled, setRuntimeVideoProcessingEnabled] = useState(false);
   const nextSegmentStartRef = useRef<number | null>(null);
   const scheduleGenerationRef = useRef<number | null>(null);
   const scheduleLoopRef = useRef<number | null>(null);
   const snapshotRef = useRef<PlaybackSnapshot | null>(null);
   const finalEffectResizeKeyRef = useRef<string | null>(null);
+  const finalEffectResizeQueueRef = useRef<Promise<void>>(Promise.resolve());
   const workerAvailableRef = useRef(false);
   const [audioDiagnosticsReady, setAudioDiagnosticsReady] = useState(false);
   const [portAudioHardwareEnabled, setPortAudioHardwareEnabled] = useState(false);
@@ -964,6 +1023,29 @@ function FinalEffectWindow() {
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [finalEffectResizeError, setFinalEffectResizeError] = useState<string | null>(null);
   const portAudioSourcePath = resolvePortAudioSourcePath(snapshot);
+  const finalEffectMediaIdentity = buildFinalEffectMediaIdentity({
+    playbackGeneration: snapshot?.playback_generation,
+    sourceIdentity: sourceUrl,
+  });
+
+  function isCurrentFinalEffectVideo(
+    video: HTMLVideoElement,
+    expectedIdentity: string | null,
+    allowUnselectedCurrentSource = false,
+  ): boolean {
+    const currentSnapshot = snapshotRef.current;
+    const currentSourceUrl = playbackVideoUrl(currentSnapshot);
+    return isFinalEffectMediaIdentityCurrent(expectedIdentity, {
+      playbackGeneration: currentSnapshot?.playback_generation,
+      sourceIdentity: currentSourceUrl,
+    })
+      && currentSourceUrl !== null
+      && video.getAttribute('src') === currentSourceUrl
+      && (
+        video.currentSrc === currentSourceUrl
+        || (allowUnselectedCurrentSource && video.currentSrc.length === 0)
+      );
+  }
 
   useEffect(() => {
     const html = document.documentElement;
@@ -1000,6 +1082,7 @@ function FinalEffectWindow() {
 
   function applyPlayerSnapshot(nextSnapshot: PlaybackSnapshot) {
     snapshotSyncVersionRef.current += 1;
+    snapshotRef.current = nextSnapshot;
     setSnapshot(nextSnapshot);
   }
 
@@ -1185,7 +1268,57 @@ function FinalEffectWindow() {
     if (interludeStopTimerRef.current !== null) {
       window.clearTimeout(interludeStopTimerRef.current);
       interludeStopTimerRef.current = null;
+      const interludeAudio = interludeAudioRef.current;
+      if (interludeAudio) {
+        interludeAudio.pause();
+        interludeAudio.currentTime = 0;
+        interludeAudio.removeAttribute('src');
+        interludeAudio.load();
+      }
+      interludeAudioUrlRef.current = null;
+      setInterludeAudioUrl(null);
+      releaseCurrentWebViewInterludeCache();
     }
+  }
+
+  function releaseWebViewInterludeCache(processedPath: string) {
+    void invoke<ReleaseWebViewInterludeCacheResult>('release_webview_interlude_cache', {
+      request: { path: processedPath },
+    }).catch(() => undefined);
+  }
+
+  function releaseCurrentWebViewInterludeCache() {
+    const processedPath = webviewInterludeCachePathRef.current;
+    webviewInterludeCachePathRef.current = null;
+    if (processedPath) releaseWebViewInterludeCache(processedPath);
+  }
+
+  function shutdownInterludePlayback() {
+    const shouldStopPortAudio = interludePortAudioRef.current || interludeStartingRef.current;
+    interludeOperationRef.current += 1;
+    if (shouldStopPortAudio) {
+      void invoke<void>('stop_portaudio_interlude').catch(() => undefined);
+    }
+    if (interludeStopTimerRef.current !== null) {
+      window.clearTimeout(interludeStopTimerRef.current);
+      interludeStopTimerRef.current = null;
+    }
+    const interludeAudio = interludeAudioRef.current;
+    if (interludeAudio) {
+      interludeAudio.pause();
+      interludeAudio.removeAttribute('src');
+      interludeAudio.load();
+    }
+    interludeAudioUrlRef.current = null;
+    interludeStartingRef.current = false;
+    interludePortAudioRef.current = false;
+    interludeActiveRef.current = false;
+    interludePausedRef.current = false;
+    interludeReleaseMsRef.current = 0;
+    interludeGainLevelRef.current = 0;
+    duckGainLevelRef.current = 1;
+    nextInterludeAtMsRef.current = null;
+    releaseCurrentWebViewInterludeCache();
   }
 
   function clearInterludePlayback(options?: {
@@ -1194,7 +1327,7 @@ function FinalEffectWindow() {
     resetIndex?: boolean;
     clearSource?: boolean;
   }) {
-    const releaseMs = options?.releaseMs ?? 0;
+    const releaseMs = options?.releaseMs ?? interludeReleaseMsRef.current;
     const resetSchedule = options?.resetSchedule ?? true;
     const resetIndex = options?.resetIndex ?? false;
     const clearSource = options?.clearSource ?? true;
@@ -1202,6 +1335,7 @@ function FinalEffectWindow() {
     interludeOperationRef.current += 1;
     interludeStartingRef.current = false;
     interludePortAudioRef.current = false;
+    interludeReleaseMsRef.current = 0;
     clearInterludeStopTimer();
     interludeActiveRef.current = false;
     interludePausedRef.current = false;
@@ -1227,6 +1361,7 @@ function FinalEffectWindow() {
         interludeAudioUrlRef.current = null;
         setInterludeAudioUrl(null);
       }
+      releaseCurrentWebViewInterludeCache();
       interludeStopTimerRef.current = null;
     };
     if (releaseMs <= 0) {
@@ -1409,7 +1544,7 @@ function FinalEffectWindow() {
 
   function handleInterludeEnded() {
     clearInterludePlayback({
-      releaseMs: snapshotRef.current?.interlude?.ducking_release_ms ?? 0,
+      releaseMs: interludeReleaseMsRef.current,
       resetSchedule: true,
     });
   }
@@ -1421,24 +1556,107 @@ function FinalEffectWindow() {
     clearInterludePlayback({ resetSchedule: true });
   }
 
+  function resolveInterludeAudioCycle(
+    interlude: InterludeSnapshot,
+    currentClockMs: number,
+  ): AudioCycleSample {
+    const selectionMode = interlude.audio_selection_mode === 'fixed' ? 'fixed' : 'random';
+    const fixedPresetId = normalizeInterludeAudioPresetIds([
+      interlude.audio_fixed_preset_id ?? 'p01',
+    ])[0];
+    const presetIds = normalizeInterludeAudioPresetIds(interlude.audio_preset_ids);
+    const configKey = JSON.stringify([
+      selectionMode,
+      fixedPresetId,
+      presetIds,
+      interlude.audio_mix_enabled ?? false,
+      interlude.audio_mix_pick_min ?? DEFAULT_AUDIO_MIX_PICK_MIN,
+      interlude.audio_mix_pick_max ?? DEFAULT_AUDIO_MIX_PICK_MAX,
+      interlude.audio_variation_mode ?? 'each_playback',
+      interlude.audio_variation_period_min_ms ?? 8_000,
+      interlude.audio_variation_period_max_ms ?? 15_000,
+    ]);
+    if (configKey !== interludeAudioVariationConfigKeyRef.current) {
+      interludeAudioVariationConfigKeyRef.current = configKey;
+      interludeAudioCycleRef.current = null;
+      nextInterludeAudioVariationAtMsRef.current = null;
+    }
+
+    if (selectionMode === 'fixed') {
+      const sample = sampleAudioCycle([fixedPresetId], {
+        mixEnabled: false,
+        pickMin: 1,
+        pickMax: 1,
+      });
+      interludeAudioCycleRef.current = sample;
+      lastInterludeAudioPresetIdsRef.current = [...sample.presetIds];
+      nextInterludeAudioVariationAtMsRef.current = null;
+      return sample;
+    }
+
+    const periodic = interlude.audio_variation_mode === 'periodic';
+    const periodExpired = nextInterludeAudioVariationAtMsRef.current !== null
+      && currentClockMs >= nextInterludeAudioVariationAtMsRef.current;
+    if (!periodic || interludeAudioCycleRef.current === null || periodExpired) {
+      const sample = sampleAudioCycle(presetIds, {
+        mixEnabled: interlude.audio_mix_enabled ?? false,
+        pickMin: interlude.audio_mix_pick_min ?? DEFAULT_AUDIO_MIX_PICK_MIN,
+        pickMax: interlude.audio_mix_pick_max ?? DEFAULT_AUDIO_MIX_PICK_MAX,
+        previousPresetIds: lastInterludeAudioPresetIdsRef.current,
+      });
+      interludeAudioCycleRef.current = sample;
+      lastInterludeAudioPresetIdsRef.current = [...sample.presetIds];
+      const period = normalizeAudioPeriodRange(
+        interlude.audio_variation_period_min_ms ?? 8_000,
+        interlude.audio_variation_period_max_ms ?? 15_000,
+      );
+      nextInterludeAudioVariationAtMsRef.current = periodic
+        ? currentClockMs + samplePeriodMsInRange(period)
+        : null;
+    }
+    return interludeAudioCycleRef.current;
+  }
+
   async function startInterludePlayback(interlude: InterludeSnapshot) {
     if (interludeActiveRef.current || interludeStartingRef.current) return;
     const count = interlude.audio_files.length;
     const nextIndex = chooseInterludeIndex(count, lastInterludeIndexRef.current);
     if (nextIndex === null) return;
     const selectedPath = interlude.audio_files[nextIndex];
-    const selectedUrl = toAssetUrl(selectedPath);
-    if (!selectedUrl) return;
     const operation = interludeOperationRef.current + 1;
     interludeOperationRef.current = operation;
     interludeStartingRef.current = true;
     clearInterludeStopTimer();
     lastInterludeIndexRef.current = nextIndex;
     nextInterludeAtMsRef.current = null;
+    const audioCycle = resolveInterludeAudioCycle(interlude, performance.now());
+    const audioPeriod = normalizeAudioPeriodRange(
+      interlude.audio_variation_period_min_ms ?? 8_000,
+      interlude.audio_variation_period_max_ms ?? 15_000,
+    );
+    const audioPeriodMs = samplePeriodMsInRange(audioPeriod);
+    const audio = {
+      ...audioCycle.values,
+      random_change_period_ms: audioPeriodMs,
+      current_formant_hz: null,
+    };
+    const audioVariants = interlude.audio_selection_mode !== 'fixed'
+      && interlude.audio_mix_enabled
+      && audioCycle.variants.length > 1
+      ? buildAudioVariantsFromCycle(audio, audioCycle)
+      : [];
     const usePortAudio = portAudioHardwareRef.current;
+    let playbackPath = selectedPath;
+    let processedPath: string | null = null;
     if (usePortAudio) {
       try {
-        await invoke<void>('start_portaudio_interlude', { request: { path: selectedPath } });
+        await invoke<void>('start_portaudio_interlude', {
+          request: {
+            path: selectedPath,
+            audio,
+            audio_variants: audioVariants,
+          },
+        });
       } catch (cause) {
         if (operation === interludeOperationRef.current) {
           interludeStartingRef.current = false;
@@ -1448,17 +1666,48 @@ function FinalEffectWindow() {
         }
         return;
       }
+    } else {
+      try {
+        const prepared = await invoke<PrepareWebViewInterludeResult>('prepare_webview_interlude', {
+          request: {
+            path: selectedPath,
+            audio,
+            audio_variants: audioVariants,
+          },
+        });
+        if (prepared.state === 'processed') {
+          playbackPath = prepared.path;
+          processedPath = prepared.path;
+        } else if (prepared.state === 'original_fallback') {
+          playbackPath = prepared.path;
+          if (prepared.reason) setPlaybackError(`${prepared.reason}；已回退插话原声。`);
+        }
+      } catch (cause) {
+        if (operation === interludeOperationRef.current) {
+          setPlaybackError(`${getDisplayErrorMessage(cause, 'WebView 插话本地处理失败')}；已回退插话原声。`);
+        }
+      }
+    }
+    const selectedUrl = toAssetUrl(playbackPath);
+    if (!selectedUrl) {
+      if (processedPath) releaseWebViewInterludeCache(processedPath);
+      interludeStartingRef.current = false;
+      return;
     }
     if (operation !== interludeOperationRef.current) {
       if (usePortAudio) void invoke<void>('stop_portaudio_interlude').catch(() => undefined);
+      if (processedPath) releaseWebViewInterludeCache(processedPath);
       return;
     }
+    releaseCurrentWebViewInterludeCache();
+    webviewInterludeCachePathRef.current = processedPath;
     interludeStartingRef.current = false;
     interludePortAudioRef.current = usePortAudio;
     interludeActiveRef.current = true;
     interludePausedRef.current = false;
     interludeGainLevelRef.current = toGainValue(interlude.volume_db);
     duckGainLevelRef.current = toGainValue(interlude.ducking_depth_db);
+    interludeReleaseMsRef.current = interlude.ducking_release_ms;
     interludeAudioUrlRef.current = selectedUrl;
     setInterludeAudioUrl(selectedUrl);
     syncUserAudioSettings();
@@ -1523,6 +1772,7 @@ function FinalEffectWindow() {
     const video = videoRef.current;
     if (!video) return;
     if (message.action === 'seek') {
+      if (!shouldApplyPlaybackSeek(message, snapshotRef.current?.playback_generation)) return;
       clockEpochRef.current += 1;
       clockSequenceRef.current = 0;
       suppressClockDiscontinuityRef.current = true;
@@ -1538,11 +1788,6 @@ function FinalEffectWindow() {
       userVolumeRef.current = clampVolume(message.volume);
       setUserVolume(userVolumeRef.current);
       syncUserAudioSettings();
-      publishMediaState();
-      return;
-    }
-    if (message.action === 'set-playback-rate') {
-      video.playbackRate = message.playback_rate;
       publishMediaState();
       return;
     }
@@ -1644,6 +1889,7 @@ function FinalEffectWindow() {
         accepted: true,
         committed: result.committed,
         reason: result.reason,
+        error_code: result.reason_code,
         snapshot: result.snapshot,
       });
     } catch (cause) {
@@ -1726,8 +1972,6 @@ function FinalEffectWindow() {
       ) {
         return;
       }
-      setRuntimeParameters(event.data.payload);
-      setRuntimeVideoProcessingEnabled(event.data.video_processing_enabled);
       runtimeAudioEnabledRef.current = event.data.audio_processing_enabled;
       runtimeAudioParamsRef.current = event.data.payload;
       void audioContextRef.current?.resume().catch(() => undefined);
@@ -1738,12 +1982,7 @@ function FinalEffectWindow() {
     const handlePageHide = () => {
       const operationId = fixedSpeechOperationRef.current?.operationId;
       if (operationId) cancelFixedSpeech(operationId);
-      interludeOperationRef.current += 1;
-      if (interludePortAudioRef.current || interludeStartingRef.current) {
-        void invoke<void>('stop_portaudio_interlude').catch(() => undefined);
-      }
-      interludePortAudioRef.current = false;
-      interludeStartingRef.current = false;
+      shutdownInterludePlayback();
       setPortAudioHardwareActive(false);
       try {
         channel.postMessage({
@@ -1758,6 +1997,7 @@ function FinalEffectWindow() {
     return () => {
       const operationId = fixedSpeechOperationRef.current?.operationId;
       if (operationId) cancelFixedSpeech(operationId);
+      shutdownInterludePlayback();
       window.removeEventListener('pagehide', handlePageHide);
       channel.removeEventListener('message', handleMessage);
       channel.close();
@@ -1792,10 +2032,16 @@ function FinalEffectWindow() {
           peak_dbfs: null,
           low_band_rms_dbfs: null,
           cutoff_hz: null,
+          mfcc: [],
+          mfcc_available: false,
+          noise_floor_dbfs: null,
+          snr_db: null,
+          formants_hz: [null, null, null],
+          current_formant_hz: null,
           waveform: waveformSamples,
           spectrum: spectrumSamples,
           sent_at_ms: Date.now(),
-          error: playbackError,
+          error: playbackError ?? finalEffectResizeError,
         } satisfies DiagnosticMessage);
         return;
       }
@@ -1812,8 +2058,14 @@ function FinalEffectWindow() {
         peak_dbfs: null,
         low_band_rms_dbfs: null,
         cutoff_hz: null,
+        mfcc: [],
+        mfcc_available: false,
+        noise_floor_dbfs: null,
+        snr_db: null,
+        formants_hz: [null, null, null],
+        current_formant_hz: null,
         sent_at_ms: Date.now(),
-        error: playbackError ?? 'PortAudio 混音快照暂无数据，Web Audio 回退不可用',
+        error: playbackError ?? finalEffectResizeError ?? 'PortAudio 混音快照暂无数据，Web Audio 回退不可用',
       } satisfies DiagnosticMessage);
     };
     const publishDiagnostic = () => {
@@ -1836,8 +2088,14 @@ function FinalEffectWindow() {
               peak_dbfs: diagnostic.peak_dbfs,
               low_band_rms_dbfs: diagnostic.low_band_rms_dbfs,
               cutoff_hz: diagnostic.cutoff_hz,
+              mfcc: diagnostic.mfcc,
+              mfcc_available: diagnostic.mfcc_available,
+              noise_floor_dbfs: diagnostic.noise_floor_dbfs,
+              snr_db: diagnostic.snr_db,
+              formants_hz: diagnostic.formants_hz,
+              current_formant_hz: diagnostic.current_formant_hz,
               sent_at_ms: diagnostic.captured_at_ms,
-              error: playbackError,
+              error: playbackError ?? finalEffectResizeError,
             } satisfies DiagnosticMessage);
             return;
           }
@@ -1856,7 +2114,7 @@ function FinalEffectWindow() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [playbackError]);
+  }, [finalEffectResizeError, playbackError]);
 
   function resumeAudioDiagnostics() {
     void audioContextRef.current?.resume().catch(() => undefined);
@@ -2333,13 +2591,7 @@ function FinalEffectWindow() {
   useEffect(() => {
     // 普通声音已改为独立流式出口，视频缓存可以安全地只承担画面处理；
     // PortAudio 会从源视频取音频，WebView 回退则使用缓存中的源 AAC。
-    const useProcessedVideo =
-      snapshot?.current_video_source === 'processed'
-      && Boolean(snapshot.current_video_reference);
-    const path = useProcessedVideo
-      ? snapshot.current_video_reference
-      : (snapshot?.source_media?.source_path ?? null);
-    const nextUrl = toAssetUrl(path);
+    const nextUrl = playbackVideoUrl(snapshot);
     setSourceUrl((prev) => (prev === nextUrl ? prev : nextUrl));
   }, [
     snapshot?.audio_processing_enabled,
@@ -2377,54 +2629,100 @@ function FinalEffectWindow() {
   useEffect(() => {
     const source = snapshot?.source_media;
     const resizeKey = buildFinalEffectWindowResizeKey({
+      playbackGeneration: snapshot?.playback_generation,
       width: source?.width,
       height: source?.height,
+      sourcePath: source?.source_path,
     });
     if (!resizeKey || resizeKey === finalEffectResizeKeyRef.current) return;
 
     let cancelled = false;
     let retryTimer: number | null = null;
-    let attempts = 0;
-    const resizeWindow = () => {
-      attempts += 1;
-      void invoke('resize_final_effect_window', {
-        request: { width: source?.width, height: source?.height },
-      })
-        .then(() => {
-          if (cancelled) return;
+    let releaseRetryWait: (() => void) | null = null;
+    const isCurrentResize = () => {
+      const currentSnapshot = snapshotRef.current;
+      const currentSource = currentSnapshot?.source_media;
+      return buildFinalEffectWindowResizeKey({
+        playbackGeneration: currentSnapshot?.playback_generation,
+        width: currentSource?.width,
+        height: currentSource?.height,
+        sourcePath: currentSource?.source_path,
+      }) === resizeKey;
+    };
+    const waitBeforeRetry = () => new Promise<void>((resolve) => {
+      releaseRetryWait = resolve;
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        releaseRetryWait = null;
+        resolve();
+      }, 200);
+    });
+    const resizeWindow = async () => {
+      for (let attempts = 1; attempts <= 3; attempts += 1) {
+        if (cancelled || !isCurrentResize()) return;
+        try {
+          await invoke('resize_final_effect_window', {
+            request: { width: source?.width, height: source?.height },
+          });
+          if (cancelled || !isCurrentResize()) return;
           finalEffectResizeKeyRef.current = resizeKey;
           setFinalEffectResizeError(null);
-        })
-        .catch((cause) => {
-          if (cancelled) return;
-          if (attempts < 3) {
-            retryTimer = window.setTimeout(resizeWindow, 200);
+          return;
+        } catch (cause) {
+          if (cancelled || !isCurrentResize()) return;
+          if (attempts === 3) {
+            setFinalEffectResizeError(cause instanceof Error ? cause.message : '最终效果窗口尺寸调整失败');
             return;
           }
-          setFinalEffectResizeError(cause instanceof Error ? cause.message : '最终效果窗口尺寸调整失败');
-        });
+          await waitBeforeRetry();
+        }
+      }
     };
-    resizeWindow();
+    const queuedResize = finalEffectResizeQueueRef.current.then(resizeWindow, resizeWindow);
+    finalEffectResizeQueueRef.current = queuedResize;
     return () => {
       cancelled = true;
-      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      releaseRetryWait?.();
     };
   }, [
+    snapshot?.playback_generation,
     snapshot?.source_media?.height,
+    snapshot?.source_media?.source_path,
     snapshot?.source_media?.width,
   ]);
 
   useEffect(() => {
+    loadedPlaybackGenerationRef.current = null;
     const video = videoRef.current;
-    if (!video || !sourceUrl) return;
-    const resumeAt = playbackPositionSecRef.current;
+    const expectedPlaybackGeneration = snapshot?.playback_generation;
+    const expectedIdentity = finalEffectMediaIdentity;
+    if (
+      !video
+      || !sourceUrl
+      || expectedPlaybackGeneration === undefined
+      || !expectedIdentity
+    ) return;
+    const resumeAt = resolvePlaybackResumePosition(
+      playbackPositionRef.current,
+      expectedPlaybackGeneration,
+    );
     let cancelled = false;
     const restore = () => {
-      if (cancelled) return;
+      if (cancelled || !isCurrentFinalEffectVideo(video, expectedIdentity)) return;
+      video.removeEventListener('loadedmetadata', restore);
+      loadedPlaybackGenerationRef.current = expectedPlaybackGeneration;
+      setPlaybackError(null);
       if (resumeAt > 0.05 && Number.isFinite(video.duration) && video.duration > 0) {
         const safeEnd = Math.max(0, video.duration - 0.2);
         video.currentTime = Math.min(resumeAt, safeEnd);
-        playbackPositionSecRef.current = video.currentTime;
+        playbackPositionRef.current = {
+          playbackGeneration: expectedPlaybackGeneration,
+          positionSec: video.currentTime,
+        };
       }
       void audioContextRef.current?.resume().catch(() => undefined);
       userMutedRef.current = false;
@@ -2432,17 +2730,19 @@ function FinalEffectWindow() {
       if (snapshotRef.current?.playback_state === 'playing') {
         suppressMediaEventRef.current = true;
         void video.play().catch(() => {
+          if (!isCurrentFinalEffectVideo(video, expectedIdentity)) return;
           suppressMediaEventRef.current = false;
           setPlaybackError('处理结果已切换，但自动播放被拦截，请点击视频恢复声音。');
         });
       }
     };
+    video.addEventListener('loadedmetadata', restore);
     if (video.readyState >= 1) restore();
-    else video.addEventListener('loadedmetadata', restore, { once: true });
     return () => {
       cancelled = true;
+      video.removeEventListener('loadedmetadata', restore);
     };
-  }, [sourceUrl]);
+  }, [finalEffectMediaIdentity, snapshot?.playback_generation, sourceUrl]);
 
   function restoreDryAudioOutput() {
     processedAudioPlayingRef.current = false;
@@ -2475,6 +2775,10 @@ function FinalEffectWindow() {
     if (processedAudioUrlRef.current === processedAudioUrl) return;
     let cancelled = false;
     let cutDone = false;
+    let onSeeked: (() => void) | null = null;
+    let onPlaying: (() => void) | null = null;
+    let audibleFallbackTimer: number | null = null;
+    let crossfadeTimer: number | null = null;
     // 空闲槽预载；干声/旧槽一直播到新槽真正 playing，再切（根因：play() resolve ≠ 已出声）
     const nextSlot: 0 | 1 = processedAudioPlayingRef.current
       ? (processedActiveSlotRef.current === 0 ? 1 : 0)
@@ -2497,7 +2801,8 @@ function FinalEffectWindow() {
       setProcessedAudioReady(true);
       syncUserAudioSettings();
       if (active !== standby) {
-        window.setTimeout(() => {
+        crossfadeTimer = window.setTimeout(() => {
+          crossfadeTimer = null;
           if (
             !cancelled
             && processedAudioPlayingRef.current
@@ -2510,16 +2815,33 @@ function FinalEffectWindow() {
     };
     const waitAudibleThenCut = () => {
       if (cancelled) return;
-      const onPlaying = () => {
-        standby.removeEventListener('playing', onPlaying);
-        standby.removeEventListener('timeupdate', onPlaying);
+      onPlaying = () => {
+        const listener = onPlaying;
+        if (listener) {
+          standby.removeEventListener('playing', listener);
+          standby.removeEventListener('timeupdate', listener);
+          onPlaying = null;
+        }
+        if (audibleFallbackTimer !== null) {
+          window.clearTimeout(audibleFallbackTimer);
+          audibleFallbackTimer = null;
+        }
         cutOver();
       };
       standby.addEventListener('playing', onPlaying);
       standby.addEventListener('timeupdate', onPlaying);
       // 保险：仍无事件则 400ms 后切，避免永远不切
-      window.setTimeout(() => {
-        if (!cancelled && !cutDone && !standby.paused) cutOver();
+      audibleFallbackTimer = window.setTimeout(() => {
+        audibleFallbackTimer = null;
+        if (!cancelled && !cutDone && !standby.paused) {
+          const listener = onPlaying;
+          if (listener) {
+            standby.removeEventListener('playing', listener);
+            standby.removeEventListener('timeupdate', listener);
+            onPlaying = null;
+          }
+          cutOver();
+        }
       }, 400);
     };
     const activate = () => {
@@ -2533,14 +2855,20 @@ function FinalEffectWindow() {
         void standby.play().then(waitAudibleThenCut).catch(failStandby);
       };
       if (Math.abs((standby.currentTime || 0) - target) > 0.05) {
-        const onSeeked = () => {
-          standby.removeEventListener('seeked', onSeeked);
+        onSeeked = () => {
+          const listener = onSeeked;
+          if (listener) {
+            standby.removeEventListener('seeked', listener);
+            onSeeked = null;
+          }
           startPlay();
         };
         standby.addEventListener('seeked', onSeeked);
         try {
           standby.currentTime = target;
         } catch {
+          standby.removeEventListener('seeked', onSeeked);
+          onSeeked = null;
           startPlay();
         }
       } else {
@@ -2554,6 +2882,15 @@ function FinalEffectWindow() {
     }
     return () => {
       cancelled = true;
+      standby.removeEventListener('loadedmetadata', activate);
+      standby.removeEventListener('error', failStandby);
+      if (onSeeked) standby.removeEventListener('seeked', onSeeked);
+      if (onPlaying) {
+        standby.removeEventListener('playing', onPlaying);
+        standby.removeEventListener('timeupdate', onPlaying);
+      }
+      if (audibleFallbackTimer !== null) window.clearTimeout(audibleFallbackTimer);
+      if (crossfadeTimer !== null) window.clearTimeout(crossfadeTimer);
     };
   }, [processedAudioUrl]);
 
@@ -2592,11 +2929,11 @@ function FinalEffectWindow() {
   useEffect(() => {
     const video = videoRef.current;
     const audio = audioRef.current;
-    const interlude = snapshot?.interlude ?? null;
     if (!video || !sourceUrl) return;
     if (snapshot?.playback_state === 'stopped') {
       video.pause();
-      playbackPositionSecRef.current = 0;
+      playbackPositionRef.current = null;
+      loadedPlaybackGenerationRef.current = null;
       video.currentTime = 0;
       audio?.pause();
       if (audio) audio.currentTime = 0;
@@ -2608,7 +2945,7 @@ function FinalEffectWindow() {
       restoreDryAudioOutput();
       const operationId = fixedSpeechOperationRef.current?.operationId;
       if (operationId) cancelFixedSpeech(operationId);
-      clearInterludePlayback({ releaseMs: interlude?.ducking_release_ms ?? 0, resetSchedule: true, resetIndex: true });
+      clearInterludePlayback({ resetSchedule: true, resetIndex: true });
       return;
     }
     if (snapshot?.playback_state === 'paused' || snapshot?.playback_state === 'ready') {
@@ -2639,7 +2976,7 @@ function FinalEffectWindow() {
       }
       resumeInterludePlayback();
     }
-  }, [audioDiagnosticsReady, audioUrl, snapshot?.interlude, snapshot?.playback_state, snapshot?.effective_audio_source, snapshot?.current_audio_source, sourceUrl, processedAudioReady]);
+  }, [audioDiagnosticsReady, audioUrl, snapshot?.playback_state, snapshot?.effective_audio_source, snapshot?.current_audio_source, sourceUrl, processedAudioReady]);
 
   useEffect(() => {
     if (!snapshot || !sourceUrl) return;
@@ -2795,16 +3132,17 @@ function FinalEffectWindow() {
         interludeScheduleKeyRef.current = scheduleKey;
         nextInterludeAtMsRef.current = null;
         lastInterludeIndexRef.current = null;
+        interludeAudioCycleRef.current = null;
+        interludeAudioVariationConfigKeyRef.current = null;
+        nextInterludeAudioVariationAtMsRef.current = null;
+        lastInterludeAudioPresetIdsRef.current = [];
         clearInterludePlayback({ resetSchedule: true, resetIndex: true });
       }
 
-      if (
-        !interlude ||
-        !interlude.enabled ||
-        interlude.audio_files.length === 0 ||
-        currentSnapshot.playback_state === 'stopped'
-      ) {
-        clearInterludePlayback({ resetSchedule: true });
+      if (currentSnapshot.playback_state === 'stopped') {
+        if (interludeActiveRef.current || interludeStartingRef.current) {
+          clearInterludePlayback({ resetSchedule: true });
+        }
         return;
       }
 
@@ -2820,6 +3158,18 @@ function FinalEffectWindow() {
 
       if (interludeActiveRef.current && interludePausedRef.current) {
         resumeInterludePlayback();
+      }
+
+      if (
+        !interlude
+        || !interlude.enabled
+        || interlude.status !== 'ready'
+        || interlude.audio_files.length === 0
+      ) {
+        if (!interludeActiveRef.current && !interludeStartingRef.current) {
+          nextInterludeAtMsRef.current = null;
+        }
+        return;
       }
 
       if (interludeActiveRef.current || interludeStartingRef.current) return;
@@ -2939,14 +3289,9 @@ function FinalEffectWindow() {
     }
   }, [currentSourceKey, snapshot?.loop_index, snapshot?.playback_generation, snapshot?.playback_state]);
 
-  function restartToNextLoop(video: HTMLVideoElement, restartToken: string) {
-    const previousVideoReference = snapshotRef.current?.current_video_reference;
-    lastRestartTokenRef.current = restartToken;
-    loopSequenceRef.current += 1;
-    playbackPositionSecRef.current = 0;
+  function restartCurrentPlayback(video: HTMLVideoElement, autoplayError: string) {
     // 自然结束会先触发 pause；必须先占住事件，避免误暂停 PortAudio 和候选。
     suppressMediaEventRef.current = true;
-    // 声音-only：画面只 seek；真轨与画面同帧回 0
     suppressClockDiscontinuityRef.current = true;
     video.currentTime = 0;
     if (audioRef.current) audioRef.current.currentTime = 0;
@@ -2963,7 +3308,7 @@ function FinalEffectWindow() {
       }
     }).catch(() => {
       suppressMediaEventRef.current = false;
-      setPlaybackError('视频已回到开头，但自动播放失败，请点击视频播放。');
+      setPlaybackError(autoplayError);
     });
     const effectiveAudioSource = getEffectiveAudioSource(snapshotRef.current);
     if (effectiveAudioSource === 'realtime_variant' && audioRef.current) {
@@ -2971,21 +3316,53 @@ function FinalEffectWindow() {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
     }
+  }
 
-    const loopSyncPromise = invoke<PlaybackSnapshot>('complete_playback_loop', {
+  function restartToNextLoop(video: HTMLVideoElement, restartToken: string) {
+    const currentSnapshot = snapshotRef.current;
+    if (!currentSnapshot || currentSnapshot.source_media_index === null) return;
+    lastRestartTokenRef.current = restartToken;
+    playbackPositionRef.current = null;
+    const sourceCount = currentSnapshot.source_media_pool?.length
+      ?? (currentSnapshot.source_media ? 1 : 0);
+    const restartImmediately = shouldRestartCurrentSourceImmediately(sourceCount);
+    if (restartImmediately) {
+      loopSequenceRef.current += 1;
+      restartCurrentPlayback(video, '视频已回到开头，但自动播放失败，请点击视频播放。');
+    } else {
+      const operationId = fixedSpeechOperationRef.current?.operationId;
+      if (operationId) cancelFixedSpeech(operationId);
+      clearInterludePlayback({ resetSchedule: true, resetIndex: true });
+    }
+
+    const loopSyncPromise = invoke<PlaybackItemCompletionResult>('complete_playback_item', {
       request: {
-        playback_generation: snapshotRef.current?.playback_generation ?? 0,
-        target_loop_index: loopSequenceRef.current,
+        playback_generation: currentSnapshot.playback_generation,
+        loop_index: currentSnapshot.loop_index,
+        source_media_index: currentSnapshot.source_media_index,
       },
     })
-      .then((nextSnapshot) => {
-        if (nextSnapshot.current_video_reference === previousVideoReference) {
-          applyPlayerSnapshot(nextSnapshot);
-          if (portAudioHardwareRef.current) syncAudioOutputSourceLatest(false, true);
+      .then((result) => {
+        const nextSnapshot = result.snapshot;
+        if (result.source_changed && restartImmediately) {
+          const operationId = fixedSpeechOperationRef.current?.operationId;
+          if (operationId) cancelFixedSpeech(operationId);
+          clearInterludePlayback({ resetSchedule: true, resetIndex: true });
         }
+        loopSequenceRef.current = nextSnapshot.loop_index;
+        applyPlayerSnapshot(nextSnapshot);
+        if (!result.source_changed && !restartImmediately) {
+          restartCurrentPlayback(video, '视频已回到开头，但自动播放失败，请点击视频播放。');
+        }
+        if (portAudioHardwareRef.current) syncAudioOutputSourceLatest(false, true);
       })
       .catch((cause) => {
-        setPlaybackError(getDisplayErrorMessage(cause, '播放轮次同步失败，已保持本地循环。'));
+        lastRestartTokenRef.current = null;
+        loopSequenceRef.current = currentSnapshot.loop_index;
+        if (!restartImmediately) {
+          restartCurrentPlayback(video, '当前视频重新播放失败，请点击视频恢复播放。');
+        }
+        setPlaybackError(getDisplayErrorMessage(cause, '播放项切换失败，已重播当前视频。'));
       });
     const completion = loopSyncPromise.then(() => undefined);
     loopSyncPromiseRef.current = completion;
@@ -2997,9 +3374,21 @@ function FinalEffectWindow() {
   function restartAtBoundary(event: SyntheticEvent<HTMLVideoElement>) {
     const video = event.currentTarget;
     const currentSnapshot = snapshotRef.current;
-    if (!currentSnapshot || currentSnapshot.playback_state !== 'playing' || !currentSourceKey) return;
+    if (
+      !currentSnapshot
+      || currentSnapshot.playback_state !== 'playing'
+      || !currentSourceKey
+      || !isCurrentFinalEffectVideo(video, finalEffectMediaIdentity)
+    ) return;
     const currentTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
-    if (currentTime > 0) playbackPositionSecRef.current = currentTime;
+    if (currentTime > 0) {
+      playbackPositionRef.current = capturePlaybackPosition(playbackPositionRef.current, {
+        playbackGeneration: currentSnapshot.playback_generation,
+        loadedPlaybackGeneration: loadedPlaybackGenerationRef.current,
+        positionSec: currentTime,
+        transitionInFlight: loopSyncPromiseRef.current !== null,
+      });
+    }
     // ponytail: 不在 timeupdate 里 seek 真轨，频繁 seek 会卡顿；只在循环边界对齐
     const duration = Number.isFinite(video.duration) ? video.duration : 0;
     const restartToken = `${currentSourceKey}:${currentSnapshot.playback_generation}:${loopSequenceRef.current}`;
@@ -3018,36 +3407,10 @@ function FinalEffectWindow() {
     restartToNextLoop(video, restartToken);
   }
 
-  const runtimeVideoStyle = runtimeVideoProcessingEnabled && runtimeParameters
-    ? {
-        filter: `brightness(${Math.max(0, 1 + runtimeParameters.video_brightness_percent / 100)}) contrast(${runtimeParameters.video_contrast_percent / 100}) saturate(${runtimeParameters.video_saturation_percent / 100}) hue-rotate(${runtimeParameters.video_hue_rotation_degrees}deg) blur(${runtimeParameters.video_blur_radius_px}px)`,
-        transform: `translate(${runtimeParameters.video_space_x_offset_px}px, ${runtimeParameters.video_space_y_offset_px}px) scale(${runtimeParameters.video_pixel_scale_percent / 100})`,
-        transformOrigin: 'center',
-      }
-    : {};
-
-  const finalEffectNotice = playbackError
-    ? { type: 'error' as const, message: playbackError }
-    : !sourceUrl
-      ? { type: 'info' as const, message: '尚未导入视频，请先回到主页导入一个受支持的视频文件。' }
-      : snapshot?.playback_state === 'disabled'
-        ? { type: 'warning' as const, message: '当前播放已禁用，请返回主页检查源素材或后台状态。' }
-        : null;
-
   return (
-    <Layout style={{ width: '100%', height: '100vh', minHeight: 0, overflow: 'hidden', background: '#000' }}>
-      <Layout.Content style={{ width: '100%', height: '100%', minHeight: 0, padding: 0, overflow: 'hidden' }}>
-        <div style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden', background: '#000' }}>
-          {finalEffectNotice ? (
-            <div style={{ position: 'absolute', top: 8, left: 8, right: 8, zIndex: 1 }}>
-              <Alert type={finalEffectNotice.type} showIcon message={finalEffectNotice.message} />
-            </div>
-          ) : null}
-          {finalEffectResizeError ? (
-            <div style={{ position: 'absolute', top: finalEffectNotice ? 66 : 8, left: 8, right: 8, zIndex: 1 }}>
-              <Alert type="warning" showIcon message={finalEffectResizeError} />
-            </div>
-          ) : null}
+    <Layout style={{ position: 'fixed', inset: 0, width: '100vw', height: '100vh', minWidth: 0, minHeight: 0, overflow: 'hidden', background: '#000' }}>
+      <Layout.Content style={{ position: 'relative', width: '100%', height: '100%', minWidth: 0, minHeight: 0, padding: 0, overflow: 'hidden' }}>
+        <div style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', overflow: 'hidden', background: '#000' }}>
           {sourceUrl ? (
             <>
               <video
@@ -3065,7 +3428,8 @@ function FinalEffectWindow() {
                     : userMuted
                 }
                 onClick={resumeAudioDiagnostics}
-                onPlay={() => {
+                onPlay={(event) => {
+                  if (!isCurrentFinalEffectVideo(event.currentTarget, finalEffectMediaIdentity)) return;
                   resumeAudioDiagnostics();
                   if (suppressMediaEventRef.current) {
                     suppressMediaEventRef.current = false;
@@ -3080,9 +3444,12 @@ function FinalEffectWindow() {
                   }
                 }}
                 onPause={(event) => {
+                  if (!isCurrentFinalEffectVideo(event.currentTarget, finalEffectMediaIdentity)) return;
                   if (shouldIgnoreLoopBoundaryPause({
                     suppressMediaEvent: suppressMediaEventRef.current,
                     ended: event.currentTarget.ended,
+                    currentTime: event.currentTarget.currentTime,
+                    duration: event.currentTarget.duration,
                   })) {
                     suppressMediaEventRef.current = false;
                     return;
@@ -3094,6 +3461,8 @@ function FinalEffectWindow() {
                 onTimeUpdate={restartAtBoundary}
                 onEnded={restartAtBoundary}
                 style={{
+                  position: 'absolute',
+                  inset: 0,
                   width: '100%',
                   height: '100%',
                   maxWidth: 'none',
@@ -3101,9 +3470,12 @@ function FinalEffectWindow() {
                   objectFit: 'contain',
                   display: 'block',
                   background: '#000',
-                  ...runtimeVideoStyle,
                 }}
-                onError={() => setPlaybackError('独立播放器加载视频失败，请回到主页重新导入。')}
+                onError={(event) => {
+                  if (isCurrentFinalEffectVideo(event.currentTarget, finalEffectMediaIdentity, true)) {
+                    setPlaybackError('独立播放器加载视频失败，请回到主页重新导入。');
+                  }
+                }}
               />
               <audio
                 ref={audioRef}
@@ -3141,11 +3513,7 @@ function FinalEffectWindow() {
                 hidden
               />
             </>
-          ) : (
-            <div style={{ display: 'grid', placeItems: 'center', width: '100%', height: '100%', padding: 24, boxSizing: 'border-box' }}>
-              <Alert type="info" showIcon message="请从主窗口导入视频后开始播放。" />
-            </div>
-          )}
+          ) : null}
         </div>
       </Layout.Content>
     </Layout>
@@ -3153,9 +3521,9 @@ function FinalEffectWindow() {
 }
 
 function DesktopApp() {
+  const { message: messageApi } = AntApp.useApp();
   const location = useLocation();
   const initialRoute = location.pathname === '/settings' ? 'settings' : 'home';
-  const [probe, setProbe] = useState<MediaProbeResult | null>(null);
   const [snapshot, setSnapshot] = useState<PlaybackSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [snapshotLoading, setSnapshotLoading] = useState(true);
@@ -3179,6 +3547,7 @@ function DesktopApp() {
   const [interludeDraft, setInterludeDraft] = useState<InterludeConfigDraft>(() => buildInterludeDraft());
   const [interludeDirty, setInterludeDirty] = useState(false);
   const [interludeSaving, setInterludeSaving] = useState(false);
+  const [interludeSaveError, setInterludeSaveError] = useState<string | null>(null);
   const [mediaEngineCapabilities, setMediaEngineCapabilities] = useState<MediaEngineCapabilities | null>(null);
   const [audioOutputBackend, setAudioOutputBackend] = useState<AudioOutputBackendStatus | null>(null);
   const audioOutputBackendRef = useRef<AudioOutputBackendStatus | null>(null);
@@ -3256,7 +3625,8 @@ function DesktopApp() {
       setAudioOutputBusy(false);
     }
   }
-  const [researchParams, setResearchParams] = useState<ResearchParams | null>(null);
+  const [mediaEffectParams, setMediaEffectParams] = useState<MediaEffectParams | null>(null);
+  const [ambientSoundPath, setAmbientSoundPath] = useState<string | null>(null);
   const [cacheCleanup, setCacheCleanup] = useState<CacheCleanupResult | null>(null);
   const [cacheCleanupError, setCacheCleanupError] = useState<string | null>(null);
   const [mediaProcessingBusy, setMediaProcessingBusy] = useState<MediaProcessingScope | null>(null);
@@ -3286,22 +3656,18 @@ function DesktopApp() {
   const nextAudioCyclePlanRef = useRef<AudioCycleCandidatePlan<PendingAudioCyclePayload> | null>(null);
   const audioCyclePlansByIdRef = useRef(new Map<number, AudioCycleCandidatePlan<PendingAudioCyclePayload>>());
   const audioCycleSnapshotRefreshInFlightRef = useRef(false);
-  const pendingAudioApplyRef = useRef<{
-    params: ResearchParams;
+  const pendingMediaApplyRef = useRef<{
+    params: MediaEffectParams;
     cycle: AudioCycleSample | null;
-  } | null>(null);
-  const pendingAudioOutputPresetRef = useRef<{
-    presetIds: string[];
-    audioStreamRevision: number;
-    parametersVersion: string;
+    scope: MediaProcessingScope;
   } | null>(null);
   const mediaApplyInFlightRef = useRef(false);
-  const researchParamsRef = useRef<ResearchParams | null>(null);
-  const researchParamsMutationVersionRef = useRef(0);
+  const mediaEffectParamsRef = useRef<MediaEffectParams | null>(null);
+  const mediaEffectParamsMutationVersionRef = useRef(0);
   const audioProcessingEnabledRef = useRef(false);
   const videoProcessingEnabledRef = useRef(false);
   const snapshotRefHome = useRef<PlaybackSnapshot | null>(null);
-  const schedulePeriodRenderRef = useRef<(params: ResearchParams) => void>(() => undefined);
+  const schedulePeriodRenderRef = useRef<(params: MediaEffectParams) => void>(() => undefined);
   const lowFrequencyLineCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const refreshRuntimeResourceCapabilities = useCallback((
@@ -3465,7 +3831,7 @@ function DesktopApp() {
   const [, setRuntimeLastChangeMs] = useState<number | null>(null);
   const [audioVariationCycle, setAudioVariationCycle] = useState(0);
   const [, setAudioLastChangeMs] = useState<number | null>(null);
-  // 每个预设=完整 20 参数值；默认勾选全部；mix 默认关（单轨）；会话可持久化
+  // 每个预设显式包含 35 个可写字段；默认勾选 p01–p20；mix 默认关（单轨）；会话可持久化
   const [audioValuePresetIds, setAudioValuePresetIds] = useState<string[]>(() => {
     const saved = loadAudioMixSession();
     return saved?.selectedPresetIds?.length
@@ -3481,12 +3847,10 @@ function DesktopApp() {
     normalizeAudioMixPickMax(loadAudioMixSession()?.pickMax ?? DEFAULT_AUDIO_MIX_PICK_MAX),
   );
   const [audioActivePresetIds, setAudioActivePresetIds] = useState<string[]>([]);
-  const [actualAudioPresetIds, setActualAudioPresetIds] = useState<string[]>([]);
   const [audioPresetDrawerOpen, setAudioPresetDrawerOpen] = useState(false);
   const [audioSettingsDrawerOpen, setAudioSettingsDrawerOpen] = useState(false);
   const [interludeDrawerOpen, setInterludeDrawerOpen] = useState(false);
   const [fixedSpeechDrawerOpen, setFixedSpeechDrawerOpen] = useState(false);
-  const [sourceManageDrawerOpen, setSourceManageDrawerOpen] = useState(false);
 
   useEffect(() => {
     setAudioSettingsDrawerOpen(initialRoute === 'settings');
@@ -3522,8 +3886,8 @@ function DesktopApp() {
   }, [audioValuePresetIds, audioMixEnabled, audioMixPickMin, audioMixPickMax]);
 
   useEffect(() => {
-    researchParamsRef.current = researchParams;
-  }, [researchParams]);
+    mediaEffectParamsRef.current = mediaEffectParams;
+  }, [mediaEffectParams]);
   useEffect(() => {
     audioProcessingEnabledRef.current = audioProcessingEnabled;
   }, [audioProcessingEnabled]);
@@ -3538,14 +3902,14 @@ function DesktopApp() {
     sample: AudioCycleSample,
     options: {
       scheduleRender?: boolean;
-      applyAudioToResearchParams?: boolean;
-      baseParams?: ResearchParams;
+      applyAudioToMediaEffectParams?: boolean;
+      baseParams?: MediaEffectParams;
       randomChangePeriodMs?: number;
     } = {},
   ) {
     const {
       scheduleRender = true,
-      applyAudioToResearchParams = true,
+      applyAudioToMediaEffectParams = true,
       baseParams,
       randomChangePeriodMs,
     } = options;
@@ -3564,14 +3928,19 @@ function DesktopApp() {
         seed: sample.seed,
         presetIds: sample.presetIds,
         weights: sample.weights,
-        values: { ...sample.values },
+        // 历史快照结构只存数值；字符串、布尔和 null 可由稳定预设 ID 复原。
+        values: Object.fromEntries(
+          Object.entries(sample.values).filter(
+            (entry): entry is [string, number] => typeof entry[1] === 'number',
+          ),
+        ),
       });
       lastAudioCycleSnapshotSignatureRef.current = snapshotSignature;
     }
-    if (!applyAudioToResearchParams) return sample;
-    const refSource = baseParams ?? researchParamsRef.current;
+    if (!applyAudioToMediaEffectParams) return sample;
+    const refSource = baseParams ?? mediaEffectParamsRef.current;
     if (refSource) {
-      researchParamsRef.current = {
+      mediaEffectParamsRef.current = {
         ...refSource,
         audio: {
           ...refSource.audio,
@@ -3582,7 +3951,7 @@ function DesktopApp() {
         },
       };
     }
-    setResearchParams((current) => {
+    setMediaEffectParams((current) => {
       const source = baseParams ?? current;
       if (!source) return source;
       const next = {
@@ -3606,8 +3975,8 @@ function DesktopApp() {
 
   function sampleAndCommitAudioCycle(options: {
     scheduleRender?: boolean;
-    applyAudioToResearchParams?: boolean;
-    baseParams?: ResearchParams;
+    applyAudioToMediaEffectParams?: boolean;
+    baseParams?: MediaEffectParams;
     randomChangePeriodMs?: number;
   } = {}) {
     return commitAudioCycleSample(
@@ -3635,7 +4004,7 @@ function DesktopApp() {
     previousPresetIds: readonly string[] | undefined,
     planId = nextMediaCyclePlanId('audio'),
   ): MediaCycleSeed<PlannedAudioCyclePayload> | null {
-    const base = researchParamsRef.current;
+    const base = mediaEffectParamsRef.current;
     if (!base) return null;
     const sample = sampleAudioCycle(audioValuePresetIdsRef.current, {
       mixEnabled: audioMixEnabledRef.current,
@@ -3662,11 +4031,11 @@ function DesktopApp() {
     periodMs: number,
     planId = nextMediaCyclePlanId('video'),
   ): MediaCycleSeed<PlannedVideoCyclePayload> {
-    const sample = sampleVideoCycle();
+    const sample = sampleAutomaticVideoParameters();
     return {
       planId,
       periodMediaMs: periodMs,
-      payload: { seed: sample.seed, sample: sample.values, periodMs },
+      payload: { seed: sample.seed, video: sample.video, advanced: sample.advanced, periodMs },
     };
   }
 
@@ -3810,15 +4179,19 @@ function DesktopApp() {
     setRuntimeLastChangeMs(current.lastChangeMs);
     setVideoPeriodMs(plan.periodMediaMs);
     nextVideoPeriodMsRef.current = plan.periodMediaMs;
-    if (researchParamsRef.current) {
-      researchParamsRef.current = {
-        ...researchParamsRef.current,
-        video: { ...researchParamsRef.current.video, ...plan.payload.sample },
+    if (mediaEffectParamsRef.current) {
+      const next = {
+        ...mediaEffectParamsRef.current,
+        video: { ...mediaEffectParamsRef.current.video, ...plan.payload.video },
+        advanced: { ...mediaEffectParamsRef.current.advanced, ...plan.payload.advanced },
       };
+      mediaEffectParamsRef.current = next;
+      schedulePeriodRenderRef.current(next);
     }
-    setResearchParams((params) => params ? {
+    setMediaEffectParams((params) => params ? {
       ...params,
-      video: { ...params.video, ...plan.payload.sample },
+      video: { ...params.video, ...plan.payload.video },
+      advanced: { ...params.advanced, ...plan.payload.advanced },
     } : params);
   }
 
@@ -3904,15 +4277,13 @@ function DesktopApp() {
     nextAudioCyclePlanRef.current = null;
     if (plan) postAudioCycleCommand(plan, 'cancel');
   }
-  const [runtimePreview, setRuntimePreview] = useState<RuntimePreviewParameters | null>(null);
-  const [metricFlashTokens, setMetricFlashTokens] = useState<Record<string, number>>({});
   const [runtimeChannelError, setRuntimeChannelError] = useState<string | null>(null);
   const [diagnosticMessage, setDiagnosticMessage] = useState<DiagnosticMessage | null>(null);
   const [diagnosticNow, setDiagnosticNow] = useState(() => Date.now());
   const [mediaState, setMediaState] = useState<PlaybackMediaStateMessage | null>(null);
   const [pictureInPictureActive, setPictureInPictureActive] = useState(false);
   const pictureInPictureSourceUrl = toAssetUrl(
-    snapshot?.current_video_reference ?? snapshot?.source_media?.source_path ?? probe?.source.source_path,
+    snapshot?.current_video_reference ?? snapshot?.source_media?.source_path,
   );
   const runtimeResourceBusy = runtimeResourceStatus !== null && isRuntimeResourceBusy(runtimeResourceStatus);
 
@@ -3967,7 +4338,6 @@ function DesktopApp() {
           if (event.data.action === 'cancel') audioCyclePlansByIdRef.current.delete(event.data.candidate_id);
           return;
         }
-        const clock = mediaStateRef.current;
         if (event.data.action === 'prepare') {
           if (event.data.accepted) {
             nextAudioCyclePlanRef.current = updateAudioCycleCandidateStatus(plan, 'prepared');
@@ -3986,23 +4356,29 @@ function DesktopApp() {
           nextAudioCyclePlanRef.current = null;
           audioCyclePlansByIdRef.current.delete(event.data.candidate_id);
           const futurePlan = audioFuturePlansRef.current?.[0];
-          const canRebuild = event.data.error_code === 'audio_candidate_stale'
-            && futurePlan?.planId === plan.sample.planId
-            && clock
-            && clock.absolute_position_ms < plan.targetAbsolutePositionMs
-            && !audioCycleSnapshotRefreshInFlightRef.current;
-          if (!canRebuild) {
-            if (event.data.reason) setError(event.data.reason);
-            if (futurePlan?.planId === plan.sample.planId) {
-              if (
-                cycleLinkEnabledRef.current
-                && futurePlan.planId === videoFuturePlansRef.current?.[0].planId
-              ) {
-                advanceLinkedQueues();
-              } else {
-                advanceIndependentAudioQueue();
-              }
+          const advanceRejectedAudioPlan = () => {
+            const latestPlan = audioFuturePlansRef.current?.[0];
+            if (latestPlan?.planId !== plan.sample.planId) return;
+            if (
+              cycleLinkEnabledRef.current
+              && latestPlan.planId === videoFuturePlansRef.current?.[0].planId
+            ) {
+              advanceLinkedQueues();
+            } else {
+              advanceIndependentAudioQueue();
             }
+          };
+          const canRefreshCandidate = isTransientAudioCandidateCode(event.data.error_code)
+            && futurePlan?.planId === plan.sample.planId
+            && !audioCycleSnapshotRefreshInFlightRef.current;
+          if (!canRefreshCandidate) {
+            if (
+              event.data.reason
+              && !isTransientAudioCandidateCode(event.data.error_code)
+            ) {
+              setError(event.data.reason);
+            }
+            advanceRejectedAudioPlan();
             return;
           }
           audioCycleSnapshotRefreshInFlightRef.current = true;
@@ -4011,28 +4387,30 @@ function DesktopApp() {
               snapshotRefHome.current = latestSnapshot;
               setSnapshot(latestSnapshot);
               const latestPlan = audioFuturePlansRef.current?.[0];
+              const latestClock = resolveAudioSyncClock(latestSnapshot, null, null);
               if (
                 !nextAudioCyclePlanRef.current
                 && latestPlan?.planId === plan.sample.planId
-                && latestSnapshot.playback_generation === clock.playback_generation
-                && clock.absolute_position_ms < latestPlan.targetAbsolutePositionMs
+                && latestClock?.playback_generation === plan.sample.playbackGeneration
               ) {
-                bindNextAudioCandidate(latestPlan);
+                const targetDeltaMs = latestPlan.targetAbsolutePositionMs - latestClock.absolute_position_ms;
+                if (targetDeltaMs <= 0) {
+                  advanceRejectedAudioPlan();
+                  return;
+                }
+                if (targetDeltaMs <= PERIOD_HARD_MAX_MS) {
+                  bindNextAudioCandidate(latestPlan);
+                  return;
+                }
+                clearFutureMediaCyclePlans(false);
+                mediaStateRef.current = null;
+                return;
               }
+              advanceRejectedAudioPlan();
             })
             .catch((cause) => {
               setError(getDisplayErrorMessage(cause, '刷新最新声音快照失败'));
-              const latestPlan = audioFuturePlansRef.current?.[0];
-              if (latestPlan?.planId === plan.sample.planId) {
-                if (
-                  cycleLinkEnabledRef.current
-                  && latestPlan.planId === videoFuturePlansRef.current?.[0].planId
-                ) {
-                  advanceLinkedQueues();
-                } else {
-                  advanceIndependentAudioQueue();
-                }
-              }
+              advanceRejectedAudioPlan();
             })
             .finally(() => {
               audioCycleSnapshotRefreshInFlightRef.current = false;
@@ -4059,7 +4437,13 @@ function DesktopApp() {
         if (!event.data.committed) {
           if (isActivePlan) nextAudioCyclePlanRef.current = null;
           audioCyclePlansByIdRef.current.delete(event.data.candidate_id);
-          if (event.data.reason) setError(event.data.reason);
+          if (
+            event.data.reason
+            && !isTransientAudioCandidateCode(event.data.error_code)
+            && !isExpectedAudioCycleSkipCode(event.data.error_code)
+          ) {
+            setError(event.data.reason);
+          }
           if (!isActivePlan) return;
           if (
             cycleLinkEnabledRef.current
@@ -4079,8 +4463,6 @@ function DesktopApp() {
         }
         snapshotRefHome.current = committedSnapshot;
         setSnapshot(committedSnapshot);
-        pendingAudioOutputPresetRef.current = null;
-        setActualAudioPresetIds(plan.sample.sample.presetIds);
         const futureAudioPlan = audioFuturePlansRef.current?.[0];
         const committedPlan: MediaCyclePlan<PlannedAudioCyclePayload> =
           futureAudioPlan?.planId === plan.sample.planId
@@ -4381,40 +4763,20 @@ function DesktopApp() {
   }, [snapshot?.audio_processing_enabled, snapshot?.video_processing_enabled]);
 
   useEffect(() => {
-    const pending = pendingAudioOutputPresetRef.current;
-    if (!pending || !snapshot) return;
-    if (snapshot.audio_processing_status === 'failed') {
-      pendingAudioOutputPresetRef.current = null;
-      return;
-    }
-    if (
-      !snapshot.audio_processing_runtime
-      || (
-        snapshot.audio_stream_revision === pending.audioStreamRevision
-        && snapshot.audio_processing_parameters_version === pending.parametersVersion
-      )
-    ) return;
-    pendingAudioOutputPresetRef.current = null;
-    setActualAudioPresetIds(pending.presetIds);
-  }, [
-    snapshot?.audio_processing_parameters_version,
-    snapshot?.audio_processing_runtime,
-    snapshot?.audio_processing_status,
-    snapshot?.audio_stream_revision,
-  ]);
-
-  useEffect(() => {
-    if (audioProcessingEnabled) return;
-    pendingAudioOutputPresetRef.current = null;
-    setActualAudioPresetIds([]);
-  }, [audioProcessingEnabled]);
-
-  useEffect(() => {
     if (!interludeDirty) {
       setInterludeDraft(buildInterludeDraft(snapshot?.interlude));
     }
   }, [
     interludeDirty,
+    snapshot?.interlude?.audio_fixed_preset_id,
+    snapshot?.interlude?.audio_mix_enabled,
+    snapshot?.interlude?.audio_mix_pick_max,
+    snapshot?.interlude?.audio_mix_pick_min,
+    snapshot?.interlude?.audio_preset_ids?.join('\0'),
+    snapshot?.interlude?.audio_selection_mode,
+    snapshot?.interlude?.audio_variation_mode,
+    snapshot?.interlude?.audio_variation_period_max_ms,
+    snapshot?.interlude?.audio_variation_period_min_ms,
     snapshot?.interlude?.directory,
     snapshot?.interlude?.ducking_attack_ms,
     snapshot?.interlude?.ducking_depth_db,
@@ -4427,7 +4789,7 @@ function DesktopApp() {
 
   useEffect(() => {
     let cancelled = false;
-    const initialMutationVersion = researchParamsMutationVersionRef.current;
+    const initialMutationVersion = mediaEffectParamsMutationVersionRef.current;
     const cancelIdleWork = scheduleAfterInitialPaint(() => {
       if (cancelled) return;
       const capabilityToken = runtimeResourceActionTokenRef.current;
@@ -4448,9 +4810,9 @@ function DesktopApp() {
         .catch(() => {
           if (!cancelled) setAudioOutputDevices([]);
         });
-      void invoke<ResearchParams>('get_default_local_research_params')
+      void invoke<MediaEffectParams>('get_default_media_effect_params')
         .then((params) => {
-          if (!cancelled && researchParamsMutationVersionRef.current === initialMutationVersion) {
+          if (!cancelled && mediaEffectParamsMutationVersionRef.current === initialMutationVersion) {
             // 声音处理参数默认从预设抽样；采样率/码率等结构字段保留默认。
             sampleAndCommitAudioCycle({
               scheduleRender: false,
@@ -4460,7 +4822,7 @@ function DesktopApp() {
           }
         })
         .catch(() => {
-          if (!cancelled) setResearchParams(null);
+          if (!cancelled) setMediaEffectParams(null);
         });
     });
     return () => {
@@ -4476,70 +4838,70 @@ function DesktopApp() {
   }, [fixedSpeechPresets, selectedFixedSpeechPresetId]);
 
   const runtimeBaseParameters = useMemo<RuntimeBaseParameters | null>(() => {
-    if (!researchParams) return null;
+    if (!mediaEffectParams) return null;
     return {
       audio_gain_db:
-        researchParams.audio.input_gain_db +
-        researchParams.audio.output_gain_db +
-        researchParams.audio.loudness_adjustment_db,
-      audio_low_eq_db: researchParams.audio.low_eq_db,
-      audio_mid_eq_db: researchParams.audio.mid_eq_db,
-      audio_high_eq_db: researchParams.audio.high_eq_db,
-      audio_input_gain_db: researchParams.audio.input_gain_db,
-      audio_output_gain_db: researchParams.audio.output_gain_db,
-      audio_loudness_adjustment_db: researchParams.audio.loudness_adjustment_db,
-      audio_pitch_shift_semitones: researchParams.audio.pitch_shift_semitones,
-      audio_playback_speed: researchParams.audio.playback_speed,
-      audio_fade_in_ms: researchParams.audio.fade_in_ms,
-      audio_fade_out_ms: researchParams.audio.fade_out_ms,
-      audio_reverb_wet_percent: researchParams.audio.reverb_wet_percent,
-      audio_noise_reduction_percent: researchParams.audio.noise_reduction_percent,
-      audio_phase_perturbation_percent: researchParams.audio.phase_perturbation_percent,
-      audio_vibrato_frequency_hz: researchParams.audio.vibrato_frequency_hz,
-      audio_vibrato_depth_percent: researchParams.audio.vibrato_depth_percent,
-      audio_environment_noise_percent: researchParams.audio.environment_noise_percent,
-      audio_environment_noise_dbfs: researchParams.audio.environment_noise_dbfs,
-      audio_filter_q: researchParams.audio.filter_q,
-      audio_sample_rate_hz: researchParams.audio.sample_rate_hz ?? 0,
-      audio_output_bitrate_kbps: researchParams.audio.output_bitrate_kbps,
-      video_brightness_percent: researchParams.video.brightness_percent,
-      video_contrast_percent: researchParams.video.contrast_percent,
-      video_saturation_percent: researchParams.video.saturation_percent,
-      video_hue_rotation_degrees: researchParams.video.hue_rotation_degrees,
-      video_blur_radius_px: researchParams.video.blur_radius_px,
-      video_pixel_scale_percent: researchParams.video.pixel_scale_percent,
-      video_space_x_offset_px: researchParams.video.space_x_offset_px,
-      video_space_y_offset_px: researchParams.video.space_y_offset_px,
+        mediaEffectParams.audio.input_gain_db +
+        mediaEffectParams.audio.output_gain_db +
+        mediaEffectParams.audio.loudness_adjustment_db,
+      audio_low_eq_db: mediaEffectParams.audio.low_eq_db,
+      audio_mid_eq_db: mediaEffectParams.audio.mid_eq_db,
+      audio_high_eq_db: mediaEffectParams.audio.high_eq_db,
+      audio_input_gain_db: mediaEffectParams.audio.input_gain_db,
+      audio_output_gain_db: mediaEffectParams.audio.output_gain_db,
+      audio_loudness_adjustment_db: mediaEffectParams.audio.loudness_adjustment_db,
+      audio_pitch_shift_semitones: mediaEffectParams.audio.pitch_shift_semitones,
+      audio_playback_speed: mediaEffectParams.audio.playback_speed,
+      audio_fade_in_ms: mediaEffectParams.audio.fade_in_ms,
+      audio_fade_out_ms: mediaEffectParams.audio.fade_out_ms,
+      audio_reverb_wet_percent: mediaEffectParams.audio.reverb_wet_percent,
+      audio_noise_reduction_percent: mediaEffectParams.audio.noise_reduction_percent,
+      audio_phase_perturbation_percent: mediaEffectParams.audio.phase_perturbation_percent,
+      audio_vibrato_frequency_hz: mediaEffectParams.audio.vibrato_frequency_hz,
+      audio_vibrato_depth_percent: mediaEffectParams.audio.vibrato_depth_percent,
+      audio_environment_noise_percent: mediaEffectParams.audio.environment_noise_percent,
+      audio_environment_noise_dbfs: mediaEffectParams.audio.environment_noise_dbfs,
+      audio_filter_q: mediaEffectParams.audio.filter_q,
+      audio_sample_rate_hz: mediaEffectParams.audio.sample_rate_hz ?? 0,
+      audio_output_bitrate_kbps: mediaEffectParams.audio.output_bitrate_kbps,
+      video_brightness_percent: mediaEffectParams.video.brightness_percent,
+      video_contrast_percent: mediaEffectParams.video.contrast_percent,
+      video_saturation_percent: mediaEffectParams.video.saturation_percent,
+      video_hue_rotation_degrees: mediaEffectParams.video.hue_rotation_degrees,
+      video_blur_radius_px: mediaEffectParams.video.blur_radius_px,
+      video_pixel_scale_percent: mediaEffectParams.video.pixel_scale_percent,
+      video_space_x_offset_px: mediaEffectParams.video.space_x_offset_px,
+      video_space_y_offset_px: mediaEffectParams.video.space_y_offset_px,
     };
   }, [
-    researchParams?.audio.input_gain_db,
-    researchParams?.audio.loudness_adjustment_db,
-    researchParams?.audio.pitch_shift_semitones,
-    researchParams?.audio.playback_speed,
-    researchParams?.audio.fade_in_ms,
-    researchParams?.audio.fade_out_ms,
-    researchParams?.audio.reverb_wet_percent,
-    researchParams?.audio.noise_reduction_percent,
-    researchParams?.audio.phase_perturbation_percent,
-    researchParams?.audio.vibrato_frequency_hz,
-    researchParams?.audio.vibrato_depth_percent,
-    researchParams?.audio.environment_noise_percent,
-    researchParams?.audio.environment_noise_dbfs,
-    researchParams?.audio.filter_q,
-    researchParams?.audio.sample_rate_hz,
-    researchParams?.audio.output_bitrate_kbps,
-    researchParams?.audio.low_eq_db,
-    researchParams?.audio.mid_eq_db,
-    researchParams?.audio.high_eq_db,
-    researchParams?.audio.output_gain_db,
-    researchParams?.video.brightness_percent,
-    researchParams?.video.contrast_percent,
-    researchParams?.video.saturation_percent,
-    researchParams?.video.hue_rotation_degrees,
-    researchParams?.video.blur_radius_px,
-    researchParams?.video.pixel_scale_percent,
-    researchParams?.video.space_x_offset_px,
-    researchParams?.video.space_y_offset_px,
+    mediaEffectParams?.audio.input_gain_db,
+    mediaEffectParams?.audio.loudness_adjustment_db,
+    mediaEffectParams?.audio.pitch_shift_semitones,
+    mediaEffectParams?.audio.playback_speed,
+    mediaEffectParams?.audio.fade_in_ms,
+    mediaEffectParams?.audio.fade_out_ms,
+    mediaEffectParams?.audio.reverb_wet_percent,
+    mediaEffectParams?.audio.noise_reduction_percent,
+    mediaEffectParams?.audio.phase_perturbation_percent,
+    mediaEffectParams?.audio.vibrato_frequency_hz,
+    mediaEffectParams?.audio.vibrato_depth_percent,
+    mediaEffectParams?.audio.environment_noise_percent,
+    mediaEffectParams?.audio.environment_noise_dbfs,
+    mediaEffectParams?.audio.filter_q,
+    mediaEffectParams?.audio.sample_rate_hz,
+    mediaEffectParams?.audio.output_bitrate_kbps,
+    mediaEffectParams?.audio.low_eq_db,
+    mediaEffectParams?.audio.mid_eq_db,
+    mediaEffectParams?.audio.high_eq_db,
+    mediaEffectParams?.audio.output_gain_db,
+    mediaEffectParams?.video.brightness_percent,
+    mediaEffectParams?.video.contrast_percent,
+    mediaEffectParams?.video.saturation_percent,
+    mediaEffectParams?.video.hue_rotation_degrees,
+    mediaEffectParams?.video.blur_radius_px,
+    mediaEffectParams?.video.pixel_scale_percent,
+    mediaEffectParams?.video.space_x_offset_px,
+    mediaEffectParams?.video.space_y_offset_px,
   ]);
   const [audioPeriodRange, setAudioPeriodRange] = useState<PeriodRangeMs>(() => loadAudioPeriodRange());
   const [videoPeriodRange, setVideoPeriodRange] = useState<PeriodRangeMs>(() => loadVideoPeriodRange());
@@ -4550,11 +4912,11 @@ function DesktopApp() {
   const nextAudioPeriodMsRef = useRef(samplePeriodMsInRange(audioPeriodRange));
   const nextVideoPeriodMsRef = useRef(samplePeriodMsInRange(videoPeriodRange));
   const [, setAudioPeriodMs] = useState(() => nextAudioPeriodMsRef.current);
-  const [videoPeriodMs, setVideoPeriodMs] = useState(() => nextVideoPeriodMsRef.current);
+  const [, setVideoPeriodMs] = useState(() => nextVideoPeriodMsRef.current);
   const playbackActive = snapshot?.playback_state?.toLowerCase() === 'playing';
   // 暂停/停止时冻结音视频周期变化，避免画面停了参数还在跳。
   const runtimeActive = playbackActive && videoProcessingEnabled;
-  const audioPeriodActive = playbackActive && audioProcessingEnabled && Boolean(researchParams);
+  const audioPeriodActive = playbackActive && audioProcessingEnabled && Boolean(mediaEffectParams);
   const portAudioCycleEnabled = shouldKeepPortAudioCycleScheduling(audioOutputBackend);
 
   useEffect(() => {
@@ -4675,7 +5037,6 @@ function DesktopApp() {
 
   useEffect(() => {
     if (!runtimeActive || !runtimeBaseParameters) {
-      setRuntimePreview(null);
       if (!runtimeActive) {
         runtimeSchedulerRef.current = { cycle: 0, lastChangeMs: null };
         setRuntimeCycle(0);
@@ -4686,31 +5047,33 @@ function DesktopApp() {
     const scheduler = runtimeSchedulerRef.current;
     if (scheduler.cycle === 0 || scheduler.lastChangeMs === null) {
       const initialNowMs = Date.now();
-      const initialVideo = sampleSubtleVideoParams();
+      const initialVideo = sampleAutomaticVideoParameters();
       runtimeSchedulerRef.current = { cycle: 1, lastChangeMs: initialNowMs };
       setRuntimeCycle(1);
       setRuntimeLastChangeMs(initialNowMs);
-      if (researchParamsRef.current) {
-        researchParamsRef.current = {
-          ...researchParamsRef.current,
-          video: { ...researchParamsRef.current.video, ...initialVideo },
+      if (mediaEffectParamsRef.current) {
+        const next = {
+          ...mediaEffectParamsRef.current,
+          video: { ...mediaEffectParamsRef.current.video, ...initialVideo.video },
+          advanced: { ...mediaEffectParamsRef.current.advanced, ...initialVideo.advanced },
         };
+        mediaEffectParamsRef.current = next;
+        schedulePeriodRenderRef.current(next);
       }
-      setResearchParams((current) => {
+      setMediaEffectParams((current) => {
         if (!current) return current;
         return {
           ...current,
-          video: { ...current.video, ...initialVideo },
+          video: { ...current.video, ...initialVideo.video },
+          advanced: { ...current.advanced, ...initialVideo.advanced },
         };
       });
     }
-    setRuntimePreview(buildRuntimePreviewParameters(runtimeBaseParameters, runtimeSchedulerRef.current.cycle));
   }, [runtimeActive, runtimeBaseParameters, snapshot?.playback_state]);
 
   useEffect(() => {
     if (!audioPeriodActive) {
       audioSchedulerRef.current = { cycle: 0, lastChangeMs: null };
-      pendingAudioApplyRef.current = null;
       clearFutureMediaCyclePlans();
       setAudioVariationCycle(0);
       setAudioLastChangeMs(null);
@@ -4725,7 +5088,7 @@ function DesktopApp() {
       audioSchedulerRef.current = { cycle: 1, lastChangeMs: nowMs };
       setAudioVariationCycle(1);
       setAudioLastChangeMs(nowMs);
-      applyAudioCycleSample();
+      sampleAndCommitAudioCycle({ randomChangePeriodMs: firstPeriod });
     }
   }, [audioPeriodActive]);
 
@@ -4753,10 +5116,6 @@ function DesktopApp() {
         if (!portAudioCycleEnabled && clock.absolute_position_ms >= audioPlan.targetAbsolutePositionMs) {
           applyPlannedAudioCycle(audioPlan, false);
           applyPlannedVideoCycle(videoPlan);
-          queueMicrotask(() => {
-            const params = researchParamsRef.current;
-            if (params) schedulePeriodRenderRef.current(params);
-          });
           advanceLinkedQueues();
           return;
         }
@@ -4838,21 +5197,7 @@ function DesktopApp() {
     const liveAudio = playbackActive && audioProcessingEnabled;
     const liveVideo = runtimeActive;
     const audioPayload = runtimeBaseParameters && (liveAudio || liveVideo)
-      ? {
-          ...runtimeBaseParameters,
-          ...(liveVideo && runtimePreview
-            ? {
-                video_brightness_percent: runtimePreview.video_brightness_percent,
-                video_contrast_percent: runtimePreview.video_contrast_percent,
-                video_saturation_percent: runtimePreview.video_saturation_percent,
-                video_hue_rotation_degrees: runtimePreview.video_hue_rotation_degrees,
-                video_blur_radius_px: runtimePreview.video_blur_radius_px,
-                video_pixel_scale_percent: runtimePreview.video_pixel_scale_percent,
-                video_space_x_offset_px: runtimePreview.video_space_x_offset_px,
-                video_space_y_offset_px: runtimePreview.video_space_y_offset_px,
-              }
-            : {}),
-        }
+      ? runtimeBaseParameters
       : null;
     runtimeMessageRef.current = {
       version: 1,
@@ -4868,7 +5213,6 @@ function DesktopApp() {
     playbackActive,
     runtimeActive,
     runtimeBaseParameters,
-    runtimePreview,
     snapshot?.playback_generation,
     snapshot?.playback_state,
     videoProcessingEnabled,
@@ -4882,32 +5226,32 @@ function DesktopApp() {
     return () => window.clearInterval(timer);
   }, []);
 
-  function updateResearchParam(section: 'audio' | 'video' | 'research', field: string, value: number | null) {
-    if (value === null || !researchParams) return;
-    researchParamsMutationVersionRef.current += 1;
+  function updateMediaEffectParam(section: 'audio' | 'video' | 'advanced', field: PropertyKey, value: unknown) {
+    if (!mediaEffectParams) return;
+    mediaEffectParamsMutationVersionRef.current += 1;
     if (section === 'audio' || section === 'video') clearFutureMediaCyclePlans();
     const next = {
-      ...researchParams,
-      [section]: { ...researchParams[section], [field]: value },
+      ...mediaEffectParams,
+      [section]: { ...mediaEffectParams[section], [field]: value },
     };
-    researchParamsRef.current = next;
-    setResearchParams(next);
+    mediaEffectParamsRef.current = next;
+    setMediaEffectParams(next);
   }
 
-  async function resetResearchParams() {
-    const mutationVersion = ++researchParamsMutationVersionRef.current;
+  async function resetMediaEffectParams() {
+    const mutationVersion = ++mediaEffectParamsMutationVersionRef.current;
     clearFutureMediaCyclePlans();
     try {
-      const defaults = await invoke<ResearchParams>('get_default_local_research_params');
-      if (mutationVersion !== researchParamsMutationVersionRef.current) return;
+      const defaults = await invoke<MediaEffectParams>('get_default_media_effect_params');
+      if (mutationVersion !== mediaEffectParamsMutationVersionRef.current) return;
       sampleAndCommitAudioCycle({ scheduleRender: false, baseParams: defaults });
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '恢复视频参数默认值失败');
+      setError(cause instanceof Error ? cause.message : '恢复媒体效果参数默认值失败');
     }
   }
 
   function rerollSubtleAudioParams() {
-    if (!researchParams) return;
+    if (!mediaEffectParams) return;
     clearFutureMediaCyclePlans();
     const nowMs = Date.now();
     audioSchedulerRef.current = {
@@ -4919,7 +5263,12 @@ function DesktopApp() {
     applyAudioCycleSample(true);
   }
 
-  const currentSource = snapshot?.source_media ?? probe?.source ?? null;
+  const sourceMediaPool = snapshot?.source_media_pool?.length
+    ? snapshot.source_media_pool
+    : snapshot?.source_media
+      ? [snapshot.source_media]
+      : [];
+  const currentSource = snapshot?.source_media ?? null;
   const normalizedPlaybackState = snapshot?.playback_state?.toLowerCase() ?? '';
   const playbackDisplayState: PlaybackDisplayState =
     snapshotFetchError
@@ -5099,12 +5448,12 @@ function DesktopApp() {
   }
 
   async function openFinalEffectWindowFromHome(
-    sourceOverride?: MediaProbeResult['source'] | null,
+    sourceOverride?: PlaybackPoolSource | null,
   ): Promise<boolean> {
     setPlayerWindowBusy(true);
     setError(null);
     try {
-      const source = sourceOverride ?? snapshot?.source_media ?? probe?.source ?? null;
+      const source = sourceOverride ?? snapshot?.source_media ?? null;
       const request =
         typeof source?.width === 'number'
         && typeof source?.height === 'number'
@@ -5204,46 +5553,63 @@ function DesktopApp() {
     realtime_audio_variant_enabled: boolean;
   }) {
     clearFutureMediaCyclePlans();
-    researchParamsMutationVersionRef.current += 1;
+    mediaEffectParamsMutationVersionRef.current += 1;
+    pendingMediaApplyRef.current = null;
+    audioProcessingEnabledRef.current = next.audio_processing_enabled;
+    videoProcessingEnabledRef.current = next.video_processing_enabled;
     setVideoProcessingEnabled(next.video_processing_enabled);
     setAudioProcessingEnabled(next.audio_processing_enabled);
-    // 打开声音/视频：立刻抽样；不自动 FFmpeg。
-    if (researchParams && (next.audio_processing_enabled || next.video_processing_enabled)) {
+    let sampledParams: MediaEffectParams | null = null;
+    // 打开声音/视频时立刻形成首轮快照；播放中会进入同一条本地处理队列。
+    if (mediaEffectParams && (next.audio_processing_enabled || next.video_processing_enabled)) {
       const nowMs = Date.now();
+      const initialAudioPeriodMs = next.audio_processing_enabled
+        ? samplePeriodMsInRange(audioPeriodRangeRef.current)
+        : null;
       const audioSample = next.audio_processing_enabled
         ? sampleAndCommitAudioCycle({
             scheduleRender: false,
-            applyAudioToResearchParams: false,
+            applyAudioToMediaEffectParams: false,
+            randomChangePeriodMs: initialAudioPeriodMs ?? undefined,
           })
         : null;
-      setResearchParams((current) => {
-        const base = current ?? researchParams;
-        return {
-          ...base,
-          audio: audioSample
-            ? { ...base.audio, ...audioSample.values }
-            : base.audio,
-          video: next.video_processing_enabled
-            ? { ...base.video, ...sampleSubtleVideoParams() }
-            : base.video,
-          research: base.research,
-        };
-      });
+      const videoSample = next.video_processing_enabled
+        ? sampleAutomaticVideoParameters()
+        : null;
+      const base = mediaEffectParamsRef.current ?? mediaEffectParams;
+      sampledParams = {
+        ...base,
+        audio: audioSample ? {
+          ...base.audio,
+          ...audioSample.values,
+          random_change_period_ms: initialAudioPeriodMs ?? base.audio.random_change_period_ms,
+        } : base.audio,
+        video: videoSample ? { ...base.video, ...videoSample.video } : base.video,
+        advanced: videoSample ? { ...base.advanced, ...videoSample.advanced } : base.advanced,
+      };
+      mediaEffectParamsRef.current = sampledParams;
+      setMediaEffectParams(sampledParams);
       if (next.audio_processing_enabled) {
-        audioSchedulerRef.current = { cycle: 1, lastChangeMs: nowMs };
-        setAudioVariationCycle(1);
-        setAudioLastChangeMs(nowMs);
-        pendingAudioApplyRef.current = null;
+        if (initialAudioPeriodMs !== null) {
+          nextAudioPeriodMsRef.current = initialAudioPeriodMs;
+          setAudioPeriodMs(initialAudioPeriodMs);
+        }
+        audioSchedulerRef.current = playbackActive
+          ? { cycle: 1, lastChangeMs: nowMs }
+          : { cycle: 0, lastChangeMs: null };
+        setAudioVariationCycle(playbackActive ? 1 : 0);
+        setAudioLastChangeMs(playbackActive ? nowMs : null);
       }
       if (next.video_processing_enabled) {
-        runtimeSchedulerRef.current = { cycle: 1, lastChangeMs: nowMs };
-        setRuntimeCycle(1);
-        setRuntimeLastChangeMs(nowMs);
+        runtimeSchedulerRef.current = playbackActive
+          ? { cycle: 1, lastChangeMs: nowMs }
+          : { cycle: 0, lastChangeMs: null };
+        setRuntimeCycle(playbackActive ? 1 : 0);
+        setRuntimeLastChangeMs(playbackActive ? nowMs : null);
       }
     }
     if (!next.audio_processing_enabled) {
       audioSchedulerRef.current = { cycle: 0, lastChangeMs: null };
-      pendingAudioApplyRef.current = null;
       setAudioVariationCycle(0);
       setAudioLastChangeMs(null);
     }
@@ -5256,85 +5622,73 @@ function DesktopApp() {
       const nextSnapshot = await invoke<PlaybackSnapshot>('set_processing_switches', {
         request: next,
       });
+      snapshotRefHome.current = nextSnapshot;
       setSnapshot(nextSnapshot);
+      if (playbackActive && nextSnapshot.source_media && sampledParams) {
+        schedulePeriodRenderRef.current(sampledParams);
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '更新处理开关失败');
     }
   }
 
-  function schedulePeriodMediaRender(params: ResearchParams) {
-    if (!audioProcessingEnabledRef.current) return;
+  function schedulePeriodMediaRender(params: MediaEffectParams) {
+    if (!audioProcessingEnabledRef.current && !videoProcessingEnabledRef.current) return;
     if (!snapshotRefHome.current?.source_media) return;
-    const scope: MediaProcessingScope = videoProcessingEnabledRef.current ? 'both' : 'audio';
+    const scope: MediaProcessingScope = audioProcessingEnabledRef.current
+      ? (videoProcessingEnabledRef.current ? 'both' : 'audio')
+      : 'video';
     void applyMediaProcessing(scope, params);
   }
   schedulePeriodRenderRef.current = schedulePeriodMediaRender;
 
   async function applyMediaProcessing(
     scope: MediaProcessingScope,
-    paramsOverride?: ResearchParams,
+    paramsOverride?: MediaEffectParams,
+    showSaveSuccess = false,
   ) {
-    const rawParams = paramsOverride ?? researchParams;
+    const rawParams = paramsOverride ?? mediaEffectParams;
     const params = rawParams
       ? {
           ...rawParams,
-          // 未映射声音字段保留原值；下面在 UI 边界显式报错，Rust 仍会再次校验。
+          // 保留完整正式参数；Rust 媒体边界会再次校验并拒绝尚无真实执行条件的字段。
           audio: { ...rawParams.audio },
-          video: { ...rawParams.video, ...sanitizeMappedVideoSample(rawParams.video as never) },
-          // research 实验参数当前 Worker 未映射；必须与 Rust Default 一致，否则范围校验/未映射检查会拒渲染
-          research: {
-            ...rawParams.research,
-            band_weights: Object.fromEntries(
-              Object.keys(rawParams.research.band_weights ?? {}).map((key) => [key, 1]),
-            ),
-            target_frequency_hz: null,
-            core_frequency_hz: null,
-            wave_intensity: 0,
-            wave_level: 0,
-            wave_grain_count: 20,
-            dynamic_eq_threshold: 10,
-            channel_offset_percent: 0,
-            space_dimension: 2,
-            frequency_space_x_offset_px: 0,
-            frequency_space_y_offset_px: 0,
-            frame_perturbation_probability_percent: 0,
-            random_graphic_opacity_percent: 0,
-            random_graphic_size_px: 4,
-            abstract_face_count: 0,
-            abstract_face_size_percent: 2,
-            abstract_face_opacity_percent: 0,
-            overlay_offset_px: 0,
-            slice_length_ms: 5_000,
-            slice_min_length_ms: 10_000,
-            slice_trigger_interval_ms: 15_000,
-          },
+          video: { ...rawParams.video },
+          advanced: { ...rawParams.advanced },
         }
       : null;
     const scopeEnabled = scope === 'video'
-      ? videoProcessingEnabled && !audioProcessingEnabled
+      ? videoProcessingEnabledRef.current && !audioProcessingEnabledRef.current
       : scope === 'audio'
-        ? audioProcessingEnabled && !videoProcessingEnabled
-        : videoProcessingEnabled && audioProcessingEnabled;
-    if (!params || !snapshot?.source_media || !scopeEnabled) return;
-    const unsupportedAudioFields = getUnsupportedAudioPresetFields(params.audio);
-    if (unsupportedAudioFields.length > 0) {
-      setError(
-        `声音参数暂未支持：${unsupportedAudioFields
-          .map((field) => UNMAPPED_AUDIO_PRESET_FIELD_LABELS[field])
-          .join('、')}。请恢复为默认值后再应用。`,
-      );
+        ? audioProcessingEnabledRef.current && !videoProcessingEnabledRef.current
+        : videoProcessingEnabledRef.current && audioProcessingEnabledRef.current;
+    const currentSnapshot = snapshotRefHome.current ?? snapshot;
+    if (!params || !currentSnapshot?.source_media || !scopeEnabled) return;
+    let validation: MediaParameterValidationResult;
+    try {
+      validation = await invoke<MediaParameterValidationResult>('validate_media_effect_params', {
+        request: params,
+      });
+    } catch (cause) {
+      setError(getDisplayErrorMessage(cause, '媒体效果参数校验失败'));
+      return;
+    }
+    if (!validation.valid) {
+      setError(validation.errors[0]?.message ?? '媒体效果参数校验失败');
       return;
     }
     // 已有 FFmpeg 在跑 / IPC 在途：只排队最新参数，绝不中断当前任务。
     if (
       mediaApplyInFlightRef.current
-      || snapshot.audio_processing_status === 'processing'
-      || snapshot.video_processing_status === 'processing'
+      || currentSnapshot.audio_processing_status === 'processing'
+      || currentSnapshot.video_processing_status === 'processing'
     ) {
-      pendingAudioApplyRef.current = {
+      pendingMediaApplyRef.current = {
         params,
         cycle: audioCycleSampleRef.current,
+        scope,
       };
+      if (showSaveSuccess) void messageApi.success('保存成功');
       return;
     }
     mediaApplyInFlightRef.current = true;
@@ -5344,39 +5698,32 @@ function DesktopApp() {
       await ensureRuntimeResources('media', async () => {
         setMediaProcessingBusy(scope);
         try {
-          // 不在这里 stop worker：start 直接带上最新 params。
+          // 不抢停当前处理任务：启动请求直接携带最新参数。
           const cycle = audioCycleSampleRef.current;
           const audio_variants =
-            audioMixEnabledRef.current && cycle && cycle.variants.length > 1
+            scope !== 'video'
+            && audioProcessingEnabledRef.current
+            && audioMixEnabledRef.current
+            && cycle
+            && cycle.variants.length > 1
               ? buildAudioVariantsFromCycle(params.audio, cycle)
               : undefined;
-          const currentSnapshot = snapshotRefHome.current ?? snapshot;
-          const pendingOutputPreset = scope !== 'video' && cycle
-            ? {
-                presetIds: [...cycle.presetIds],
-                audioStreamRevision: currentSnapshot.audio_stream_revision,
-                parametersVersion: currentSnapshot.audio_processing_parameters_version,
-              }
-            : null;
-          if (pendingOutputPreset) pendingAudioOutputPresetRef.current = pendingOutputPreset;
-          let nextSnapshot: PlaybackSnapshot;
-          try {
-            nextSnapshot = await invoke<PlaybackSnapshot>('start_media_processing', {
-              request: { params, audio_variants },
-            });
-          } catch (cause) {
-            if (pendingAudioOutputPresetRef.current === pendingOutputPreset) {
-              pendingAudioOutputPresetRef.current = null;
-            }
-            throw cause;
-          }
+          const nextSnapshot = await invoke<PlaybackSnapshot>('start_media_processing', {
+            request: {
+              params,
+              audio_variants,
+              ambient_sound_path: scope === 'video' ? null : ambientSoundPath,
+            },
+          });
           setSnapshot(nextSnapshot);
           if (
             nextSnapshot.fallback_reason &&
             (nextSnapshot.audio_processing_status === 'failed' || nextSnapshot.video_processing_status === 'failed')
           ) {
             setError(nextSnapshot.fallback_reason);
+            return;
           }
+          if (showSaveSuccess) void messageApi.success('保存成功');
         } finally {
           setMediaProcessingBusy(null);
         }
@@ -5389,17 +5736,16 @@ function DesktopApp() {
     }
   }
 
-  async function flushPendingAudioApply() {
-    const pending = pendingAudioApplyRef.current;
-    if (!pending || !snapshot?.source_media || !audioProcessingEnabled) return;
+  async function flushPendingMediaApply() {
+    const pending = pendingMediaApplyRef.current;
+    if (!pending || !snapshot?.source_media) return;
     if (mediaApplyInFlightRef.current || mediaProcessingBusy !== null) return;
     if (snapshot.audio_processing_status === 'processing' || snapshot.video_processing_status === 'processing') return;
-    pendingAudioApplyRef.current = null;
-    if (pending.cycle) {
-      commitAudioCycleSample(pending.cycle, { applyAudioToResearchParams: false });
+    pendingMediaApplyRef.current = null;
+    if (pending.scope !== 'video' && pending.cycle) {
+      commitAudioCycleSample(pending.cycle, { applyAudioToMediaEffectParams: false });
     }
-    const scope: MediaProcessingScope = videoProcessingEnabled ? 'both' : 'audio';
-    await applyMediaProcessing(scope, pending.params);
+    await applyMediaProcessing(pending.scope, pending.params);
   }
 
   // FFmpeg 结束后稍等再续跑排队任务，避免 Tag 一直停在 processing、听感被连续重渲打断。
@@ -5409,7 +5755,7 @@ function DesktopApp() {
       || snapshot?.video_processing_status === 'processing';
     if (mediaWasProcessingRef.current && !processing) {
       const timer = window.setTimeout(() => {
-        void flushPendingAudioApply();
+        void flushPendingMediaApply();
       }, 2_500);
       mediaWasProcessingRef.current = false;
       return () => window.clearTimeout(timer);
@@ -5440,20 +5786,22 @@ function DesktopApp() {
     setImportVideoBusy(true);
     try {
       const selection = await open({
-        multiple: false,
+        multiple: true,
         filters: [{ name: '视频文件', extensions: [...SUPPORTED_VIDEO_EXTENSIONS] }],
       });
-      if (typeof selection !== 'string') return;
-      const selected = selection;
+      const paths = Array.isArray(selection)
+        ? selection
+        : typeof selection === 'string'
+          ? [selection]
+          : [];
+      if (paths.length === 0) return;
       setFixedSpeechFormError(null);
       setError(null);
       await ensureRuntimeResources('media', async () => {
         importVideoInFlightRef.current = true;
         setImportVideoBusy(true);
         try {
-          const result = await invoke<MediaProbeResult>('probe_local_video', { request: { path: selected } });
-          setProbe(result);
-          const nextSnapshot = await invoke<PlaybackSnapshot>('get_snapshot');
+          const nextSnapshot = await invoke<PlaybackSnapshot>('probe_local_videos', { request: { paths } });
           setSnapshot(nextSnapshot);
           setSnapshotLoading(false);
           setSnapshotFetchError(null);
@@ -5474,7 +5822,23 @@ function DesktopApp() {
 
   function updateInterludeDraft(patch: Partial<InterludeConfigDraft>) {
     setInterludeDirty(true);
+    setInterludeSaveError(null);
     setInterludeDraft((current) => ({ ...current, ...patch }));
+  }
+
+  async function chooseAmbientSoundFile() {
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: '环境声音频', extensions: ['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac'] }],
+      });
+      if (typeof selected === 'string') {
+        setAmbientSoundPath(selected);
+        setError(null);
+      }
+    } catch (cause) {
+      setError(getDisplayErrorMessage(cause, '选择环境声素材失败'));
+    }
   }
 
   async function chooseInterludeDirectory() {
@@ -5485,12 +5849,35 @@ function DesktopApp() {
 
   async function saveInterludeConfig() {
     setInterludeSaving(true);
+    setInterludeSaveError(null);
     setError(null);
     try {
+      const audioFixedPresetId = normalizeInterludeAudioPresetIds([
+        interludeDraft.audioFixedPresetId,
+      ])[0];
+      const audioPresetIds = normalizeInterludeAudioPresetIds(interludeDraft.audioPresetIds);
+      const audioMixPickMax = normalizeAudioMixPickMax(interludeDraft.audioMixPickMax);
+      const audioMixPickMin = normalizeAudioMixPickMin(
+        interludeDraft.audioMixPickMin,
+        audioMixPickMax,
+      );
+      const audioVariationPeriod = normalizeAudioPeriodRange(
+        interludeDraft.audioVariationPeriodMinMs,
+        interludeDraft.audioVariationPeriodMaxMs,
+      );
       const nextSnapshot = await invoke<PlaybackSnapshot>('set_interlude_config', {
         request: {
           enabled: interludeDraft.enabled,
           directory: interludeDraft.directory,
+          audio_selection_mode: interludeDraft.audioSelectionMode,
+          audio_fixed_preset_id: audioFixedPresetId,
+          audio_preset_ids: audioPresetIds,
+          audio_mix_enabled: interludeDraft.audioMixEnabled,
+          audio_mix_pick_min: audioMixPickMin,
+          audio_mix_pick_max: audioMixPickMax,
+          audio_variation_mode: interludeDraft.audioVariationMode,
+          audio_variation_period_min_ms: audioVariationPeriod.minMs,
+          audio_variation_period_max_ms: audioVariationPeriod.maxMs,
           interval_min_ms: interludeDraft.intervalMinMs,
           interval_max_ms: interludeDraft.intervalMaxMs,
           volume_db: interludeDraft.volumeDb,
@@ -5502,16 +5889,30 @@ function DesktopApp() {
       setSnapshot(nextSnapshot);
       setInterludeDraft(buildInterludeDraft(nextSnapshot.interlude));
       setInterludeDirty(false);
+      void messageApi.success('保存成功');
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '保存插话配置失败');
+      const message = getDisplayErrorMessage(cause, '保存插话配置失败');
+      setInterludeSaveError(message);
+      setError(message);
     } finally {
       setInterludeSaving(false);
     }
   }
 
-  const runtimeRemainingMs = videoFuturePlansRef.current?.[0]
-    ? Math.max(0, videoFuturePlansRef.current[0].targetAbsolutePositionMs - (mediaState?.absolute_position_ms ?? 0))
+  const nextVideoPlan = videoFuturePlansRef.current?.[0];
+  const runtimeRemainingMs = nextVideoPlan
+    ? Math.max(0, nextVideoPlan.targetAbsolutePositionMs - (mediaState?.absolute_position_ms ?? 0))
     : null;
+  const runtimeProgressPercent = !nextVideoPlan || nextVideoPlan.periodMediaMs <= 0 || runtimeRemainingMs === null
+    ? 0
+    : Math.max(0, Math.min(100, Math.round(((nextVideoPlan.periodMediaMs - runtimeRemainingMs) / nextVideoPlan.periodMediaMs) * 100)));
+  const nextAudioPlan = audioFuturePlansRef.current?.[0];
+  const audioRemainingMs = nextAudioPlan
+    ? Math.max(0, nextAudioPlan.targetAbsolutePositionMs - (mediaState?.absolute_position_ms ?? 0))
+    : null;
+  const audioProgressPercent = !nextAudioPlan || nextAudioPlan.periodMediaMs <= 0 || audioRemainingMs === null
+    ? 0
+    : Math.max(0, Math.min(100, Math.round(((nextAudioPlan.periodMediaMs - audioRemainingMs) / nextAudioPlan.periodMediaMs) * 100)));
   const diagnosticAgeMs = diagnosticMessage === null ? null : Math.max(0, diagnosticNow - diagnosticMessage.sent_at_ms);
   const diagnosticFresh = diagnosticAgeMs !== null && diagnosticAgeMs < 1_500;
   const diagnosticHasLine = diagnosticMessage !== null && diagnosticMessage.line.length > 0;
@@ -5527,6 +5928,19 @@ function DesktopApp() {
         : diagnosticMessage.source === 'portaudio-mixed-pcm'
           ? '实时：来自 PortAudio 最终混音 PCM'
           : '兼容回退：PortAudio 快照不可用，来自 Web Audio analyser';
+  const displayedMediaEffectParams = mediaEffectParams
+    ? {
+        ...mediaEffectParams,
+        audio: {
+          ...mediaEffectParams.audio,
+          current_formant_hz: diagnosticFresh
+            && diagnosticMessage?.source === 'portaudio-mixed-pcm'
+            && diagnosticMessage.current_formant_hz !== null
+            ? diagnosticMessage.current_formant_hz
+            : null,
+        },
+      }
+    : null;
   const interludePlaybackNotice = interludeDraft.enabled
     ? playbackDisplayState !== 'playing'
       ? '当前视频已暂停或未开始，插话不会播放，请点击“继续”后再试听。'
@@ -5558,6 +5972,7 @@ function DesktopApp() {
     : actualAudioOutputLabel === 'PortAudio'
       ? `${actualAudioStreamVariantCount} 条支路`
       : `未进入正式输出（配置 ${actualAudioStreamVariantCount} 条）`;
+  const audioSettingsApplyScope: MediaProcessingScope = videoProcessingEnabled ? 'both' : 'audio';
   const portAudioFallback = audioProcessingEnabled
     && Boolean(audioOutputBackend?.preferred_portaudio)
     && actualAudioOutputLabel === 'WebView';
@@ -5567,105 +5982,38 @@ function DesktopApp() {
       .filter((preset): preset is (typeof AUDIO_VALUE_PRESETS)[number] => Boolean(preset)),
     [audioActivePresetIds],
   );
+  const actualAudioBranches = useMemo(
+    () => resolveAudioStreamBranches(
+      snapshot?.audio_stream_params,
+      snapshot?.audio_stream_variants,
+      Boolean(
+        audioProcessingEnabled
+        && snapshot?.audio_processing_runtime
+        && snapshot.audio_processing_status !== 'failed'
+      ),
+    ),
+    [
+      audioProcessingEnabled,
+      snapshot?.audio_processing_runtime,
+      snapshot?.audio_processing_status,
+      snapshot?.audio_stream_params,
+      snapshot?.audio_stream_variants,
+    ],
+  );
+  const audioDisplayParams = actualAudioBranches[0] ?? mediaEffectParams?.audio ?? null;
   const audioCapabilityRows = useMemo(
     () => buildAudioCapabilityRows(
-      researchParams?.audio ?? null,
+      audioDisplayParams,
       audioProcessingEnabled,
-      audioProcessingStatus === 'ready' || audioProcessingStatus === 'runtime',
+      actualAudioBranches.length > 0,
     ),
-    [audioProcessingEnabled, audioProcessingStatus, researchParams?.audio],
+    [actualAudioBranches.length, audioDisplayParams, audioProcessingEnabled],
   );
 
-  const videoMetricDefinitions = useMemo(() => [
-    { field: 'brightness_percent', runtimeField: 'video_brightness_percent', label: '亮度', min: -100, max: 100, step: 0.1, baseline: 0, unit: '%', tone: 'blue' },
-    { field: 'contrast_percent', runtimeField: 'video_contrast_percent', label: '对比度', min: 0, max: 200, step: 0.1, baseline: 100, unit: '%', tone: 'blue' },
-    { field: 'saturation_percent', runtimeField: 'video_saturation_percent', label: '饱和度', min: 0, max: 200, step: 0.1, baseline: 100, unit: '%', tone: 'blue' },
-    { field: 'hue_rotation_degrees', runtimeField: 'video_hue_rotation_degrees', label: '色相旋转', min: -180, max: 180, step: 0.1, baseline: 0, unit: '°', tone: 'blue' },
-    { field: 'blur_radius_px', runtimeField: 'video_blur_radius_px', label: '模糊', min: 0, max: 8, step: 0.01, baseline: 0, unit: 'px', tone: 'blue' },
-    { field: 'sharpen_percent', label: '锐化', min: 0, max: 100, step: 0.1, baseline: 0, unit: '%', tone: 'green' },
-    { field: 'noise_percent', label: '噪点', min: 0, max: 8, step: 0.01, baseline: 0, unit: '%', tone: 'green' },
-    { field: 'detail_enhancement_percent', label: '细节增强', min: 0, max: 50, step: 0.1, baseline: 0, unit: '%', tone: 'green' },
-    { field: 'pixel_scale_percent', runtimeField: 'video_pixel_scale_percent', label: '缩放', min: 95, max: 105, step: 0.01, baseline: 100, unit: '%', tone: 'yellow' },
-    { field: 'dynamic_crop_percent', label: '动态裁剪', min: 0, max: 4, step: 0.01, baseline: 0, unit: '%', tone: 'yellow' },
-    { field: 'space_x_offset_px', runtimeField: 'video_space_x_offset_px', label: '水平偏移', min: -4, max: 4, step: 0.01, baseline: 0, unit: 'px', tone: 'pink' },
-    { field: 'space_y_offset_px', runtimeField: 'video_space_y_offset_px', label: '垂直偏移', min: -4, max: 4, step: 0.01, baseline: 0, unit: 'px', tone: 'pink' },
-  ] as const, []);
-  const videoMetricValues = useMemo(() => Object.fromEntries(
-    videoMetricDefinitions.map((metric) => {
-      const runtimeField = 'runtimeField' in metric ? metric.runtimeField : null;
-      const liveValue = runtimeField && runtimePreview ? runtimePreview[runtimeField] : null;
-      return [
-        metric.field,
-        runtimeActive && typeof liveValue === 'number'
-          ? liveValue
-          : researchParams?.video[metric.field] ?? metric.baseline,
-      ];
-    }),
-  ) as Record<string, number>, [researchParams?.video, runtimeActive, runtimePreview, videoMetricDefinitions]);
-  const videoMetricSnapshot: MetricValueSnapshot = videoMetricValues;
-  const previousVideoMetricSnapshotRef = useRef<MetricValueSnapshot | null>(null);
-  useEffect(() => {
-    if (!runtimeActive) {
-      previousVideoMetricSnapshotRef.current = null;
-      return;
-    }
-    const changed = getChangedMetricKeys(previousVideoMetricSnapshotRef.current, videoMetricSnapshot);
-    previousVideoMetricSnapshotRef.current = videoMetricSnapshot;
-    if (changed.length > 0) {
-      setMetricFlashTokens((current) => advanceMetricFlashTokens(
-        current,
-        changed.map((key) => `video:${key}`),
-      ));
-    }
-  }, [runtimeActive, videoMetricSnapshot]);
-
-  const audioMetricSnapshot = useMemo(() => Object.fromEntries(
-    audioCapabilityRows
-      .filter((row) => row.key !== 'spectral_perturbation_percent')
-      .map((row) => [row.key, row.value]),
-  ) as MetricValueSnapshot, [audioCapabilityRows]);
-  const audioMetricSnapshotIdentity = audioProcessingEnabled && snapshot?.audio_processing_runtime
-    ? `${snapshot.playback_generation}:${snapshot.audio_stream_revision}:${snapshot.audio_processing_parameters_version}`
-    : null;
-  const previousAudioMetricSnapshotRef = useRef<MetricValueSnapshot | null>(null);
-  const previousAudioMetricIdentityRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (audioMetricSnapshotIdentity === null) {
-      previousAudioMetricSnapshotRef.current = null;
-      previousAudioMetricIdentityRef.current = null;
-      return;
-    }
-    if (previousAudioMetricIdentityRef.current === audioMetricSnapshotIdentity) return;
-    previousAudioMetricIdentityRef.current = audioMetricSnapshotIdentity;
-    const changed = getChangedMetricKeys(previousAudioMetricSnapshotRef.current, audioMetricSnapshot);
-    previousAudioMetricSnapshotRef.current = audioMetricSnapshot;
-    if (changed.length > 0) {
-      setMetricFlashTokens((current) => advanceMetricFlashTokens(
-        current,
-        changed.map((key) => `audio:${key}`),
-      ));
-    }
-  }, [audioMetricSnapshot, audioMetricSnapshotIdentity]);
-
-  const previousActualAudioPresetIdsRef = useRef<readonly string[] | null>(null);
-  useEffect(() => {
-    if (!audioProcessingEnabled) {
-      previousActualAudioPresetIdsRef.current = null;
-      return;
-    }
-    const newlyActive = getNewlyActivePresetIds(
-      previousActualAudioPresetIdsRef.current,
-      actualAudioPresetIds,
-    );
-    previousActualAudioPresetIdsRef.current = actualAudioPresetIds;
-    if (newlyActive.length > 0) {
-      setMetricFlashTokens((current) => advanceMetricFlashTokens(
-        current,
-        newlyActive.map((id) => `preset:${id}`),
-      ));
-    }
-  }, [actualAudioPresetIds, audioProcessingEnabled]);
   const playbackProgressPercent = mediaDuration > 0 ? (mediaCurrentTime / mediaDuration) * 100 : 0;
+  const playbackPoolPosition = snapshot?.source_media_index === null || snapshot?.source_media_index === undefined
+    ? '等待导入'
+    : `第 ${snapshot.source_media_index + 1}/${sourceMediaPool.length} 项`;
   const sourceSpecification = currentSource
     ? `${currentSource.width ?? '-'}×${currentSource.height ?? '-'} · ${currentSource.frame_rate_fps?.toFixed(0) ?? '-'}fps`
     : '未导入';
@@ -5681,8 +6029,8 @@ function DesktopApp() {
     {
       key: 'loop',
       label: '循环次数',
-      value: String(snapshot?.loop_index ?? 0),
-      meta: getPlaybackDisplayLabel(playbackDisplayState),
+      value: String(snapshot?.playback_pool_cycle ?? 0),
+      meta: `${playbackPoolPosition} · ${getPlaybackDisplayLabel(playbackDisplayState)}`,
       tone: 'green',
     },
     {
@@ -5716,6 +6064,16 @@ function DesktopApp() {
       onAction: () => void openFinalEffectWindowFromHome(),
     },
   ];
+  const audioParameterControls = mediaEffectParams ? (
+    <AudioParameterControls
+      value={mediaEffectParams.audio}
+      disabled={!audioProcessingEnabled}
+      ambientSoundPath={ambientSoundPath}
+      onChange={(field, value) => updateMediaEffectParam('audio', field, value)}
+      onChooseAmbientSound={chooseAmbientSoundFile}
+      onClearAmbientSound={() => setAmbientSoundPath(null)}
+    />
+  ) : null;
 
   return (
     <>
@@ -5731,50 +6089,14 @@ function DesktopApp() {
       />
       <DesktopShell>
         <DesktopColumn area="source" ariaLabel="视频素材与播放控制">
-          <DesktopPanel
-            title="播放池"
-            extra={
-              <Space size={6}>
-                <Select
-                  aria-label="播放池"
-                  size="small"
-                  value="default"
-                  options={[{ value: 'default', label: '默认播放池' }]}
-                  style={{ width: 116 }}
-                />
-                <Button
-                  aria-label="管理播放池"
-                  icon={<UnorderedListOutlined />}
-                  size="small"
-                  disabled={!currentSource}
-                  onClick={() => setSourceManageDrawerOpen(true)}
-                >
-                  管理
-                </Button>
-                <Button
-                  aria-label="导入视频"
-                  icon={<UploadOutlined />}
-                  size="small"
-                  loading={importVideoBusy}
-                  disabled={importVideoBusy || runtimeResourceBusy}
-                  onClick={() => void importVideo()}
-                />
-              </Space>
-            }
-            className="desktop-panel-fill desktop-source-pool"
-          >
-            {currentSource ? (
-              <div className="desktop-source-item">
-                <strong><PictureOutlined /> {currentSource.file_name}</strong>
-                <small>
-                  {formatMediaTime((currentSource.duration_ms ?? 0) / 1000)} · {sourceSpecification} · {(currentSource.file_size_bytes / 1024 / 1024).toFixed(1)} MB
-                </small>
-              </div>
-            ) : (
-              <Alert type="info" showIcon message="尚未导入视频" description="导入一个本地视频后在同一窗口循环播放。" />
-            )}
-            {error ? <Alert type="error" showIcon message={error} style={{ marginTop: 10 }} /> : null}
-          </DesktopPanel>
+          <PlaybackPoolPanel
+            sources={sourceMediaPool}
+            currentIndex={snapshot?.source_media_index ?? null}
+            importBusy={importVideoBusy}
+            importDisabled={importVideoBusy || runtimeResourceBusy}
+            error={error}
+            onImport={() => void importVideo()}
+          />
 
           <DesktopPanel title="播放控制">
             <div className="desktop-control-row">
@@ -5822,12 +6144,14 @@ function DesktopApp() {
               disabled={!mediaState || mediaDuration <= 0}
               tooltip={{ formatter: (value) => formatMediaTime(value ?? 0) }}
               onChange={(value) => {
+                if (!mediaState) return;
                 clearFutureMediaCyclePlans();
                 postPlaybackMediaControl({
                   version: 1,
                   type: 'playback-media-control',
                   action: 'seek',
                   current_time: value,
+                  playback_generation: mediaState.playback_generation,
                 });
               }}
             />
@@ -5859,24 +6183,6 @@ function DesktopApp() {
                 disabled={!mediaState || !pictureInPictureSupported}
                 onClick={() => void togglePictureInPicture()}
               />
-            </div>
-            <div className="desktop-rate-grid" aria-label="播放倍速">
-              {[0.5, 1, 1.5, 2].map((rate) => (
-                <Button
-                  key={rate}
-                  size="small"
-                  type={Math.abs((mediaState?.playback_rate ?? 1) - rate) < 0.001 ? 'primary' : 'default'}
-                  disabled={!mediaState}
-                  onClick={() => postPlaybackMediaControl({
-                    version: 1,
-                    type: 'playback-media-control',
-                    action: 'set-playback-rate',
-                    playback_rate: rate,
-                  })}
-                >
-                  {rate.toFixed(1)}x
-                </Button>
-              ))}
             </div>
           </DesktopPanel>
 
@@ -5954,13 +6260,13 @@ function DesktopApp() {
             className="desktop-panel-fill"
             extra={
               <Space size={6} wrap>
-                <Tag>{videoMetricDefinitions.length} 项基础参数</Tag>
-                <Button icon={<ReloadOutlined />} size="small" onClick={() => void resetResearchParams()}>重置</Button>
+                <Tag>全部正式参数</Tag>
+                <Button icon={<ReloadOutlined />} size="small" onClick={() => void resetMediaEffectParams()}>重置</Button>
                 <Button
                   size="small"
                   onClick={() => void applyMediaProcessing('video')}
                   loading={mediaProcessingBusy === 'video'}
-                  disabled={!snapshot?.source_media || !researchParams || !videoProcessingEnabled || audioProcessingEnabled || mediaProcessingBusy !== null || runtimeResourceBusy}
+                  disabled={!snapshot?.source_media || !mediaEffectParams || !videoProcessingEnabled || audioProcessingEnabled || mediaProcessingBusy !== null || runtimeResourceBusy}
                 >
                   应用视频
                 </Button>
@@ -5969,7 +6275,7 @@ function DesktopApp() {
                   size="small"
                   onClick={() => void applyMediaProcessing('both')}
                   loading={mediaProcessingBusy === 'both'}
-                  disabled={!snapshot?.source_media || !researchParams || !videoProcessingEnabled || !audioProcessingEnabled || mediaProcessingBusy !== null || runtimeResourceBusy}
+                  disabled={!snapshot?.source_media || !mediaEffectParams || !videoProcessingEnabled || !audioProcessingEnabled || mediaProcessingBusy !== null || runtimeResourceBusy}
                 >
                   音视频同时应用
                 </Button>
@@ -5987,59 +6293,16 @@ function DesktopApp() {
           >
             {snapshot?.fallback_reason && videoProcessingStatus === 'failed' ? <Alert type="error" showIcon message={snapshot.fallback_reason} style={{ marginBottom: 10 }} /> : null}
             {!mediaEngineCapabilities?.available ? <Alert type="warning" showIcon message={mediaEngineCapabilities?.reason ?? '本地媒体引擎不可用'} style={{ marginBottom: 10 }} /> : null}
-            <div className="desktop-parameter-grid">
-              {videoMetricDefinitions.map((metric) => {
-                const value = videoMetricValues[metric.field] ?? metric.baseline;
-                return (
-                  <ParameterMetricCard
-                    key={metric.field}
-                    label={metric.label}
-                    value={value}
-                    baseline={metric.baseline}
-                    min={metric.min}
-                    max={metric.max}
-                    step={metric.step}
-                    unit={metric.unit}
-                    digits={metric.step < 0.1 ? 3 : 2}
-                    tone={metric.tone}
-                    flashToken={metricFlashTokens[`video:${metric.field}`]}
-                    disabled={!researchParams || !videoProcessingEnabled}
-                    onChange={(next) => updateResearchParam('video', metric.field, next)}
-                  />
-                );
-              })}
-              <div className="desktop-metric-section-title">普通声音 · 参数状态</div>
-              {audioCapabilityRows
-                .filter((row) => row.key !== 'spectral_perturbation_percent')
-                .map((row, index) => (
-                  <ReadOnlyMetricCard
-                    key={row.key}
-                    label={row.label}
-                    value={row.value === null ? '自动' : formatAudioPreviewValue(row.value, row.unit, 2)}
-                    meta={getProcessingStatusLabel(row.status)}
-                    tone={(['blue', 'green', 'pink', 'yellow'] as const)[index % 4]}
-                    percent={row.status === 'ready' || row.status === 'runtime' ? 100 : row.status === 'configured' ? 62 : row.status === 'unsupported' ? 14 : 0}
-                    flashToken={metricFlashTokens[`audio:${row.key}`]}
-                  />
-                ))}
-              <div className="desktop-metric-section-title">声音预设池 · 当前选择</div>
-              {AUDIO_VALUE_PRESETS
-                .filter((preset) => preset.id !== 'p21')
-                .map((preset, index) => {
-                  const selected = audioValuePresetIds.includes(preset.id);
-                  return (
-                    <ReadOnlyMetricCard
-                      key={preset.id}
-                      label={preset.label}
-                      value={selected ? '已选择' : '待选'}
-                      meta="普通声音预设"
-                      tone={(['yellow', 'pink', 'blue', 'green'] as const)[index % 4]}
-                      percent={selected ? 100 : 8}
-                      flashToken={metricFlashTokens[`preset:${preset.id}`]}
-                    />
-                  );
-                })}
-            </div>
+            {displayedMediaEffectParams ? (
+              <MediaParameterPanels
+                value={displayedMediaEffectParams}
+                loading={false}
+                error={null}
+                audioControls={audioParameterControls}
+              />
+            ) : (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="正在读取正式媒体参数" />
+            )}
             <div className="desktop-inline-between" style={{ marginTop: 12 }}>
               <Typography.Text className="desktop-muted">
                 视频周期 {(videoPeriodRange.minMs / 1000).toFixed(0)}–{(videoPeriodRange.maxMs / 1000).toFixed(0)}s · 第 {runtimeCycle} 次变化
@@ -6047,9 +6310,21 @@ function DesktopApp() {
               <Tag color={videoProcessingEnabled ? 'processing' : 'default'}>{getProcessingStatusLabel(videoProcessingStatus)}</Tag>
             </div>
             <Progress
-              percent={runtimeRemainingMs === null || videoPeriodMs <= 0 ? 0 : Math.min(100, Math.round(((videoPeriodMs - runtimeRemainingMs) / videoPeriodMs) * 100))}
+              percent={runtimeProgressPercent}
               showInfo={false}
-              status={runtimeActive ? 'active' : 'normal'}
+              status={runtimeActive && nextVideoPlan ? 'active' : 'normal'}
+              size="small"
+            />
+            <div className="desktop-inline-between" style={{ marginTop: 12 }}>
+              <Typography.Text className="desktop-muted">
+                声音周期 {(audioPeriodRange.minMs / 1000).toFixed(0)}–{(audioPeriodRange.maxMs / 1000).toFixed(0)}s · 第 {audioVariationCycle} 次变化
+              </Typography.Text>
+              <Tag color={getProcessingStatusColor(audioProcessingStatus)}>{getProcessingStatusLabel(audioProcessingStatus)}</Tag>
+            </div>
+            <Progress
+              percent={audioProgressPercent}
+              showInfo={false}
+              status={audioPeriodActive && nextAudioPlan ? 'active' : 'normal'}
               size="small"
             />
           </DesktopPanel>
@@ -6086,6 +6361,18 @@ function DesktopApp() {
             <div className="desktop-status-line"><span>实际出口</span><Tag color={actualAudioOutputLabel === 'PortAudio' ? 'success' : 'processing'}>{actualAudioOutputLabel}</Tag></div>
             <div className="desktop-status-line"><span>处理状态</span><Tag color={getProcessingStatusColor(audioProcessingStatus)}>{getProcessingStatusLabel(audioProcessingStatus)}</Tag></div>
             <div className="desktop-status-line"><span>声音周期</span><span>{(audioPeriodRange.minMs / 1000).toFixed(0)}–{(audioPeriodRange.maxMs / 1000).toFixed(0)}s</span></div>
+            <div className="desktop-status-line">
+              <span>多轨与预设</span>
+              <Typography.Text className="desktop-muted" style={{ minWidth: 0, textAlign: 'right' }}>{actualAudioMixLabel}</Typography.Text>
+            </div>
+            <div className="desktop-status-line">
+              <span>当前预设</span>
+              {activeAudioPresets.length > 0 ? (
+                <Space aria-label="当前声音预设" size={[4, 4]} wrap style={{ minWidth: 0, flex: '1 1 auto', justifyContent: 'flex-end' }}>
+                  {activeAudioPresets.map((preset) => <Tag key={preset.id}>{preset.label}</Tag>)}
+                </Space>
+              ) : <Tag>等待首轮</Tag>}
+            </div>
             <canvas ref={lowFrequencyLineCanvasRef} width={320} height={64} aria-label="声音波形" className="desktop-diagnostic-canvas" />
             <Typography.Text className="desktop-muted">{diagnosticStatus}</Typography.Text>
             <div className="desktop-diagnostic-grid" aria-label="音频只读诊断">
@@ -6096,6 +6383,10 @@ function DesktopApp() {
                 ['峰值', diagnosticMessage?.peak_dbfs === null || diagnosticMessage?.peak_dbfs === undefined ? '等待' : `${diagnosticMessage.peak_dbfs.toFixed(2)} dBFS`],
                 ['低频 RMS', diagnosticMessage?.low_band_rms_dbfs === null || diagnosticMessage?.low_band_rms_dbfs === undefined ? '等待' : `${diagnosticMessage.low_band_rms_dbfs.toFixed(2)} dBFS`],
                 ['低频截止', diagnosticMessage?.cutoff_hz === null || diagnosticMessage?.cutoff_hz === undefined ? '等待' : `${diagnosticMessage.cutoff_hz.toFixed(0)} Hz`],
+                ['噪声底', diagnosticMessage?.noise_floor_dbfs === null || diagnosticMessage?.noise_floor_dbfs === undefined ? '等待' : `${diagnosticMessage.noise_floor_dbfs.toFixed(2)} dBFS`],
+                ['SNR', diagnosticMessage?.snr_db === null || diagnosticMessage?.snr_db === undefined ? '等待' : `${diagnosticMessage.snr_db.toFixed(2)} dB`],
+                ['F1/F2/F3', diagnosticMessage?.formants_hz.some((value) => value !== null) ? diagnosticMessage.formants_hz.map((value) => value === null ? '—' : value.toFixed(0)).join(' / ') + ' Hz' : '等待'],
+                ['MFCC', diagnosticMessage?.mfcc_available ? `${diagnosticMessage.mfcc.length} 维` : '等待'],
               ].map(([label, value]) => (
                 <Card className="desktop-diagnostic-item" key={label} size="small" styles={{ body: { padding: '6px 8px' } }}>
                   <Typography.Text className="desktop-diagnostic-label">{label}</Typography.Text>
@@ -6130,22 +6421,9 @@ function DesktopApp() {
         </DesktopColumn>
       </DesktopShell>
 
-      <Drawer title="当前源素材" width={520} open={sourceManageDrawerOpen} onClose={() => setSourceManageDrawerOpen(false)}>
-        {currentSource ? (
-          <Descriptions column={1} bordered size="small">
-            <Descriptions.Item label="文件">{currentSource.file_name}</Descriptions.Item>
-            <Descriptions.Item label="路径">{currentSource.source_path}</Descriptions.Item>
-            <Descriptions.Item label="时长">{formatMediaTime((currentSource.duration_ms ?? 0) / 1000)}</Descriptions.Item>
-            <Descriptions.Item label="分辨率">{currentSource.width ?? '-'} × {currentSource.height ?? '-'}</Descriptions.Item>
-            <Descriptions.Item label="帧率">{currentSource.frame_rate_fps?.toFixed(3) ?? '-'} fps</Descriptions.Item>
-            <Descriptions.Item label="音频">{currentSource.audio_sample_rate_hz ?? '-'} Hz · {currentSource.audio_channel_count ?? '-'} 声道</Descriptions.Item>
-          </Descriptions>
-        ) : <Alert type="info" showIcon message="尚未导入视频" />}
-      </Drawer>
-
       <FeatureDrawer
         title="随机插话"
-        description="从本地音频目录随机插入声音，并在插话期间自动压低视频原声。"
+        description="递归扫描本地音频目录及其子目录，并在插话期间自动压低视频原声。"
         width={560}
         open={interludeDrawerOpen}
         onClose={() => setInterludeDrawerOpen(false)}
@@ -6154,6 +6432,14 @@ function DesktopApp() {
             <Tag color={interludeDraft.enabled ? 'success' : 'default'}>{interludeDraft.enabled ? '已启用' : '未启用'}</Tag>
             <Tag color={interludeDirty ? 'warning' : 'blue'}>{interludeDirty ? '有未保存更改' : '配置已同步'}</Tag>
             <Tag>{interludeDraft.directory ? '音频目录已选择' : '未选择音频目录'}</Tag>
+            <Tag>{interludeDraft.audioSelectionMode === 'fixed'
+              ? `固定 ${interludeDraft.audioFixedPresetId}`
+              : interludeDraft.audioMixEnabled
+                ? `随机合一 ${interludeDraft.audioMixPickMin}–${interludeDraft.audioMixPickMax} 轨`
+                : '随机单轨'}</Tag>
+            {interludeDraft.audioSelectionMode === 'random' ? (
+              <Tag>{interludeDraft.audioVariationMode === 'periodic' ? '周期换组' : '每次插话换组'}</Tag>
+            ) : null}
           </>
         )}
         footer={(
@@ -6162,6 +6448,7 @@ function DesktopApp() {
           </Button>
         )}
       >
+        {interludeSaveError ? <Alert type="error" showIcon message={interludeSaveError} /> : null}
         <FeatureDrawerSection
           title="启用状态"
           description="关闭后保留当前设置，但不会在播放过程中触发插话。"
@@ -6172,7 +6459,7 @@ function DesktopApp() {
           )}
         </FeatureDrawerSection>
 
-        <FeatureDrawerSection title="音频来源" description="选择一个仅包含本地插话音频的目录。">
+        <FeatureDrawerSection title="音频来源" description="选择插话音频根目录，系统会递归扫描其子目录。">
           <FeatureDrawerField label="插话音频目录" htmlFor="interlude-audio-directory">
             <Space.Compact style={{ width: '100%' }}>
               <Input id="interlude-audio-directory" readOnly value={interludeDraft.directory ?? ''} placeholder="请选择音频文件夹" />
@@ -6181,13 +6468,131 @@ function DesktopApp() {
           </FeatureDrawerField>
         </FeatureDrawerSection>
 
+        <FeatureDrawerSection title="独立声音轨" description="插话可固定一条预设，或从自己的 22 项预设池随机抽样；配置变化从下一段插话开始生效。">
+          <FeatureDrawerField label="音轨选择方式" htmlFor="interlude-audio-selection-mode">
+            <Select
+              id="interlude-audio-selection-mode"
+              aria-label="插话音轨选择方式"
+              value={interludeDraft.audioSelectionMode}
+              options={[
+                { value: 'fixed', label: '固定选择' },
+                { value: 'random', label: '从所选音轨随机' },
+              ]}
+              onChange={(audioSelectionMode: InterludeAudioSelectionMode) => updateInterludeDraft({ audioSelectionMode })}
+              style={{ width: '100%' }}
+            />
+          </FeatureDrawerField>
+
+          {interludeDraft.audioSelectionMode === 'fixed' ? (
+            <FeatureDrawerField label="固定声音预设" htmlFor="interlude-fixed-audio-preset">
+              <Select
+                id="interlude-fixed-audio-preset"
+                aria-label="插话固定声音预设"
+                value={interludeDraft.audioFixedPresetId}
+                options={AUDIO_VALUE_PRESETS.map((preset) => ({ value: preset.id, label: preset.label }))}
+                onChange={(audioFixedPresetId) => updateInterludeDraft({ audioFixedPresetId })}
+                style={{ width: '100%' }}
+              />
+            </FeatureDrawerField>
+          ) : (
+            <>
+              <div className="feature-drawer-toggle-row">
+                <div><strong>随机多轨合一</strong><Typography.Text>关闭时每段只抽一轨；开启后随机抽取 1–4 轨等权合一。</Typography.Text></div>
+                <Switch aria-label="随机多轨合一" checked={interludeDraft.audioMixEnabled} onChange={(audioMixEnabled) => updateInterludeDraft({ audioMixEnabled })} />
+              </div>
+              {interludeDraft.audioMixEnabled ? (
+                <div className="feature-drawer-field-grid feature-drawer-field-grid-compact">
+                  <FeatureDrawerField label="最少随机轨数">
+                    <InputNumber
+                      aria-label="插话最少随机轨数"
+                      min={1}
+                      max={AUDIO_MIX_PICK_HARD_MAX}
+                      value={interludeDraft.audioMixPickMin}
+                      onChange={(value) => typeof value === 'number' && updateInterludeDraft({
+                        audioMixPickMin: normalizeAudioMixPickMin(value, interludeDraft.audioMixPickMax),
+                      })}
+                      style={{ width: '100%' }}
+                    />
+                  </FeatureDrawerField>
+                  <FeatureDrawerField label="最多随机轨数">
+                    <InputNumber
+                      aria-label="插话最多随机轨数"
+                      min={1}
+                      max={AUDIO_MIX_PICK_HARD_MAX}
+                      value={interludeDraft.audioMixPickMax}
+                      onChange={(value) => {
+                        if (typeof value !== 'number') return;
+                        const audioMixPickMax = normalizeAudioMixPickMax(value);
+                        updateInterludeDraft({
+                          audioMixPickMax,
+                          audioMixPickMin: normalizeAudioMixPickMin(interludeDraft.audioMixPickMin, audioMixPickMax),
+                        });
+                      }}
+                      style={{ width: '100%' }}
+                    />
+                  </FeatureDrawerField>
+                </div>
+              ) : null}
+              <FeatureDrawerField label="插话声音预设" hint="22 项均可进入插话随机池，至少保留一项；p21、p22 为明显强效果。">
+                <Space direction="vertical" size="small" style={{ width: '100%' }}>
+                  <Button
+                    size="small"
+                    aria-label="全选插话声音预设"
+                    onClick={() => updateInterludeDraft({ audioPresetIds: AUDIO_VALUE_PRESETS.map((preset) => preset.id) })}
+                  >全选</Button>
+                  <Checkbox.Group
+                    aria-label="插话声音预设"
+                    value={interludeDraft.audioPresetIds}
+                    onChange={(values) => updateInterludeDraft({ audioPresetIds: normalizeInterludeAudioPresetIds(values.map(String)) })}
+                    style={{ width: '100%' }}
+                  >
+                    <div className="feature-drawer-checkbox-grid">
+                      {AUDIO_VALUE_PRESETS.map((preset) => <Checkbox key={preset.id} value={preset.id}>{preset.label}</Checkbox>)}
+                    </div>
+                  </Checkbox.Group>
+                </Space>
+              </FeatureDrawerField>
+
+              <FeatureDrawerField label="抽样方式" htmlFor="interlude-audio-variation-mode">
+                <Select
+                  id="interlude-audio-variation-mode"
+                  aria-label="插话声音抽样方式"
+                  value={interludeDraft.audioVariationMode}
+                  options={[
+                    { value: 'each_playback', label: '每次插话重新随机' },
+                    { value: 'periodic', label: '按周期更新' },
+                  ]}
+                  onChange={(audioVariationMode: InterludeAudioVariationMode) => updateInterludeDraft({ audioVariationMode })}
+                  style={{ width: '100%' }}
+                />
+              </FeatureDrawerField>
+              {interludeDraft.audioVariationMode === 'periodic' ? (
+                <div className="feature-drawer-field-grid feature-drawer-field-grid-compact">
+                  <FeatureDrawerField label="变化周期最小值">
+                    <CompactNumberField ariaLabel="插话变化周期最小值" unit="ms" min={PERIOD_HARD_MIN_MS} max={PERIOD_HARD_MAX_MS} value={interludeDraft.audioVariationPeriodMinMs} onChange={(value) => typeof value === 'number' && updateInterludeDraft({ audioVariationPeriodMinMs: value })} />
+                  </FeatureDrawerField>
+                  <FeatureDrawerField label="变化周期最大值">
+                    <CompactNumberField ariaLabel="插话变化周期最大值" unit="ms" min={PERIOD_HARD_MIN_MS} max={PERIOD_HARD_MAX_MS} value={interludeDraft.audioVariationPeriodMaxMs} onChange={(value) => typeof value === 'number' && updateInterludeDraft({ audioVariationPeriodMaxMs: value })} />
+                  </FeatureDrawerField>
+                </div>
+              ) : null}
+            </>
+          )}
+          <Alert
+            type="info"
+            showIcon
+            message={actualAudioOutputLabel === 'PortAudio' ? '当前由 PortAudio 应用插话声音预设。' : '当前由 WebView 本地处理插话声音预设。'}
+            description="PortAudio 与 WebView 均应用固定或随机预设与多轨合一；WebView 本地处理失败时明确回退插话原声。周期到期只影响下一段，不会重启当前插话。"
+          />
+        </FeatureDrawerSection>
+
         <FeatureDrawerSection title="触发与混音" description="间隔决定插话频率；音量与包络决定原声压低和恢复速度。">
           <div className="feature-drawer-parameter-groups">
             <div className="feature-drawer-parameter-group">
               <strong>触发间隔</strong>
               <div className="feature-drawer-field-grid">
-                <CompactNumberField ariaLabel="插话最小间隔" label="最小间隔" unit="ms" min={INTERLUDE_LIMITS.intervalMinMs.min} max={INTERLUDE_LIMITS.intervalMinMs.max} value={interludeDraft.intervalMinMs} onChange={(value) => typeof value === 'number' && updateInterludeDraft({ intervalMinMs: value })} />
-                <CompactNumberField ariaLabel="插话最大间隔" label="最大间隔" unit="ms" min={INTERLUDE_LIMITS.intervalMinMs.min} max={INTERLUDE_LIMITS.intervalMinMs.max} value={interludeDraft.intervalMaxMs} onChange={(value) => typeof value === 'number' && updateInterludeDraft({ intervalMaxMs: value })} />
+                <CompactNumberField ariaLabel="插话最小间隔（秒）" label="最小间隔" unit="秒" step={0.5} min={interludeIntervalMsToSeconds(INTERLUDE_LIMITS.intervalMinMs.min)} max={interludeIntervalMsToSeconds(INTERLUDE_LIMITS.intervalMinMs.max)} value={interludeIntervalMsToSeconds(interludeDraft.intervalMinMs)} onChange={(value) => typeof value === 'number' && updateInterludeDraft({ intervalMinMs: interludeIntervalSecondsToMs(value) })} />
+                <CompactNumberField ariaLabel="插话最大间隔（秒）" label="最大间隔" unit="秒" step={0.5} min={interludeIntervalMsToSeconds(INTERLUDE_LIMITS.intervalMinMs.min)} max={interludeIntervalMsToSeconds(INTERLUDE_LIMITS.intervalMinMs.max)} value={interludeIntervalMsToSeconds(interludeDraft.intervalMaxMs)} onChange={(value) => typeof value === 'number' && updateInterludeDraft({ intervalMaxMs: interludeIntervalSecondsToMs(value) })} />
               </div>
             </div>
             <div className="feature-drawer-parameter-group">
@@ -6279,14 +6684,21 @@ function DesktopApp() {
         )}
         footer={(
           <div className="feature-drawer-footer-split">
-            <Button onClick={rerollSubtleAudioParams} disabled={!researchParams}>重新生成本周期参数</Button>
-            <Button type="primary" onClick={() => void applyMediaProcessing('audio')} loading={mediaProcessingBusy === 'audio'} disabled={!snapshot?.source_media || !researchParams || !audioProcessingEnabled || videoProcessingEnabled || mediaProcessingBusy !== null}>应用声音参数</Button>
+            <Button onClick={rerollSubtleAudioParams} disabled={!mediaEffectParams}>重新生成本周期参数</Button>
+            <Button
+              type="primary"
+              onClick={() => void applyMediaProcessing(audioSettingsApplyScope, undefined, true)}
+              loading={mediaProcessingBusy === audioSettingsApplyScope}
+              disabled={!snapshot?.source_media || !mediaEffectParams || !audioProcessingEnabled || mediaProcessingBusy !== null || runtimeResourceBusy}
+            >
+              {audioSettingsApplyScope === 'both' ? '音视频同时应用' : '应用声音参数'}
+            </Button>
           </div>
         )}
       >
         <FeatureDrawerSection
           title="处理与输出"
-          description="普通声音与视频处理独立开关；应用参数前需先开启声音处理。"
+          description="普通声音与视频处理开关彼此独立；两者同时开启时会音视频一起应用。"
           extra={<Switch aria-label="高级声音处理" checked={audioProcessingEnabled} onChange={(checked) => void updateProcessingSwitches({ video_processing_enabled: videoProcessingEnabled, audio_processing_enabled: checked, realtime_audio_variant_enabled: false })} />}
         >
           <div className="feature-drawer-status-grid">
@@ -6361,16 +6773,16 @@ function DesktopApp() {
               </FeatureDrawerField>
             </div>
           ) : null}
-          <FeatureDrawerField label="声音参数值预设" hint="至少保留一套可用预设；第 21 套原值方案不参与当前随机池。">
+          <FeatureDrawerField label="声音参数值预设" hint="1–20 为默认低感知随机池；21、22 为可手动选择的明显效果。">
             <Checkbox.Group aria-label="声音参数值预设" value={audioValuePresetIds} disabled={!audioProcessingEnabled} onChange={(values) => setAudioValuePresetIds(values.map(String))} style={{ width: '100%' }}>
-              <div className="feature-drawer-checkbox-grid">{AUDIO_VALUE_PRESETS.filter((preset) => preset.id !== 'p21').map((preset) => <Checkbox key={preset.id} value={preset.id}>{preset.label}</Checkbox>)}</div>
+              <div className="feature-drawer-checkbox-grid">{AUDIO_VALUE_PRESETS.map((preset) => <Checkbox key={preset.id} value={preset.id}>{preset.label}</Checkbox>)}</div>
             </Checkbox.Group>
           </FeatureDrawerField>
         </FeatureDrawerSection>
 
         <FeatureDrawerSection title="音频参数状态" description="展示当前配置值及每个字段在实际处理链路中的生效状态。">
           <Descriptions column={{ xs: 1, sm: 1, md: 2, lg: 2, xl: 2, xxl: 2 }} size="small" bordered>
-            {audioCapabilityRows.filter((row) => row.key !== 'spectral_perturbation_percent').map((row) => <Descriptions.Item key={row.key} label={row.label}>{row.value === null ? '自动/未设置' : formatAudioPreviewValue(row.value, row.unit)} <Tag color={getProcessingStatusColor(row.status)}>{getProcessingStatusLabel(row.status)}</Tag></Descriptions.Item>)}
+            {audioCapabilityRows.map((row) => <Descriptions.Item key={row.key} label={row.label}>{row.value === null ? '自动/未设置' : formatAudioPreviewValue(row.value, row.unit)} <Tag color={getProcessingStatusColor(row.status)}>{getProcessingStatusLabel(row.status)}</Tag></Descriptions.Item>)}
           </Descriptions>
         </FeatureDrawerSection>
 
@@ -6389,7 +6801,7 @@ function DesktopApp() {
         <Space direction="vertical" size="middle" style={{ width: '100%' }}>
           {activeAudioPresets.map((preset) => (
             <Card key={preset.id} size="small" title={preset.label} extra={<Tag>{preset.id}</Tag>}>
-              <Descriptions column={1} size="small" bordered>{AUDIO_PRESET_FIELD_DEFINITIONS.map((field) => <Descriptions.Item key={field.key} label={field.label}>{formatAudioPreviewValue(preset.values[field.key], field.unit, field.digits)}</Descriptions.Item>)}</Descriptions>
+              <Descriptions column={1} size="small" bordered>{AUDIO_PRESET_FIELD_DEFINITIONS.map((field) => <Descriptions.Item key={field.key} label={field.label}>{formatAudioPresetFieldValue(field.key, preset.values[field.key], field.unit, field.digits)}</Descriptions.Item>)}</Descriptions>
             </Card>
           ))}
         </Space>

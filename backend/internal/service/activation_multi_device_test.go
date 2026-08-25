@@ -21,6 +21,7 @@ func TestActivationCodeSupportsMultipleDevices(t *testing.T) {
 	}
 
 	code, err := svc.CreateActivationCode(ctx, "multi-device-code", controlplane.CreateActivationCodeInput{
+		UserID:      "usr_local_admin",
 		ExpiresAt:  now.Add(time.Hour),
 		MaxDevices: 2,
 	})
@@ -30,7 +31,6 @@ func TestActivationCodeSupportsMultipleDevices(t *testing.T) {
 
 	for index, deviceID := range []string{"dev_multi01", "dev_multi02"} {
 		device, activateErr := svc.ActivateDevice(ctx, "multi-device-activation-"+deviceID, "usr_local_admin", controlplane.ActivateDeviceInput{
-			ActivationCode: *code.PlainCode,
 			Device: controlplane.DeviceRegistration{
 				DeviceID:   deviceID,
 				DeviceName: "Multi Device",
@@ -72,7 +72,6 @@ func TestActivationCodeSupportsMultipleDevices(t *testing.T) {
 	}
 
 	_, err = svc.ActivateDevice(ctx, "multi-device-activation-dev_multi03", "usr_local_admin", controlplane.ActivateDeviceInput{
-		ActivationCode: *code.PlainCode,
 		Device: controlplane.DeviceRegistration{
 			DeviceID:   "dev_multi03",
 			DeviceName: "Multi Device",
@@ -80,8 +79,8 @@ func TestActivationCodeSupportsMultipleDevices(t *testing.T) {
 			AppVersion: "1.0.0",
 		},
 	})
-	if !controlplane.IsErrorCode(err, "ACTIVATION_CODE_USED") {
-		t.Fatalf("third activation error = %v, want ACTIVATION_CODE_USED", err)
+	if !controlplane.IsErrorCode(err, "DEVICE_LIMIT_EXCEEDED") {
+		t.Fatalf("third activation error = %v, want DEVICE_LIMIT_EXCEEDED", err)
 	}
 }
 
@@ -90,6 +89,7 @@ func TestActivationCodeMaxDevicesRange(t *testing.T) {
 	svc := NewControlPlane(store.NewMemoryStore(func() time.Time { return now }))
 	for _, maxDevices := range []int{-1, 101} {
 		_, err := svc.CreateActivationCode(context.Background(), fmt.Sprintf("range-code-%d", maxDevices), controlplane.CreateActivationCodeInput{
+			UserID:      "usr_local_admin",
 			ExpiresAt:  now.Add(time.Hour),
 			MaxDevices: maxDevices,
 		})
