@@ -33,7 +33,7 @@ func TestAuditFailureFailsClosedWithoutLeakingBusinessResponse(t *testing.T) {
 	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
 	repository := &auditFailingRepository{MemoryStore: store.NewMemoryStore(func() time.Time { return now })}
 	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{
-		Username: "admin", Password: "password",
+		Username: "admin", Password: testAdminPassword,
 	}, repository, store.NewMemorySecretStore(), nil, true)
 	token := loginForTest(t, handler)
 	repository.failAudit = true

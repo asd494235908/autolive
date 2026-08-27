@@ -98,13 +98,13 @@ func TestLoginRejectsInvalidCredentials(t *testing.T) {
 
 func TestConfiguredAdminPasswordIsPersistedAcrossRouterRecreation(t *testing.T) {
 	repository := store.NewMemoryStore(time.Now)
-	first := NewRouterWithRepository("v1.0.0", nil, AuthConfig{Username: "admin", Password: "first-password"}, repository)
-	if response := doLoginRequest(t, first, "admin", "first-password"); response.Code != http.StatusOK {
+	first := NewRouterWithRepository("v1.0.0", nil, AuthConfig{Username: "admin", Password: "first-password-1"}, repository)
+	if response := doLoginRequest(t, first, "admin", "first-password-1"); response.Code != http.StatusOK {
 		t.Fatalf("first login status = %d; body=%s", response.Code, response.Body.String())
 	}
 
 	second := NewRouterWithRepository("v1.0.0", nil, AuthConfig{Username: "admin", Password: "second-password"}, repository)
-	if response := doLoginRequest(t, second, "admin", "first-password"); response.Code != http.StatusOK {
+	if response := doLoginRequest(t, second, "admin", "first-password-1"); response.Code != http.StatusOK {
 		t.Fatalf("persisted password login status = %d; body=%s", response.Code, response.Body.String())
 	}
 	if response := doLoginRequest(t, second, "admin", "second-password"); response.Code != http.StatusUnauthorized {
@@ -112,7 +112,7 @@ func TestConfiguredAdminPasswordIsPersistedAcrossRouterRecreation(t *testing.T) 
 	}
 
 	persisted := NewRouterWithRepository("v1.0.0", nil, AuthConfig{UsePersistedAdmin: true}, repository)
-	if response := doLoginRequest(t, persisted, "admin", "first-password"); response.Code != http.StatusOK {
+	if response := doLoginRequest(t, persisted, "admin", "first-password-1"); response.Code != http.StatusOK {
 		t.Fatalf("persisted-admin-only login status = %d; body=%s", response.Code, response.Body.String())
 	}
 }
@@ -120,9 +120,9 @@ func TestConfiguredAdminPasswordIsPersistedAcrossRouterRecreation(t *testing.T) 
 func TestLocalAdminPasswordChangeRevokesSessionsAndSupportsIdempotentRetry(t *testing.T) {
 	handler := NewRouterWithAuth("v1.0.0", nil, AuthConfig{
 		Username: "admin",
-		Password: "first-password",
+		Password: "first-password-1",
 	})
-	oldToken := loginWithCredentialsForTest(t, handler, `{"username":"admin","password":"first-password","product":"autolive"}`)
+	oldToken := loginWithCredentialsForTest(t, handler, `{"username":"admin","password":"first-password-1","product":"autolive"}`)
 	changeRequest := httptest.NewRequest(http.MethodPost, "/api/v1/admin/auth/change-password", strings.NewReader(`{"password":"rotated-password"}`))
 	changeRequest.Header.Set("Authorization", "Bearer "+oldToken)
 	changeRequest.Header.Set("Idempotency-Key", "rotate-local-admin")
@@ -139,7 +139,7 @@ func TestLocalAdminPasswordChangeRevokesSessionsAndSupportsIdempotentRetry(t *te
 	if oldSessionRecorder.Code != http.StatusUnauthorized {
 		t.Fatalf("old local admin session status = %d, want %d", oldSessionRecorder.Code, http.StatusUnauthorized)
 	}
-	if response := doLoginRequest(t, handler, "admin", "first-password"); response.Code != http.StatusUnauthorized {
+	if response := doLoginRequest(t, handler, "admin", "first-password-1"); response.Code != http.StatusUnauthorized {
 		t.Fatalf("old local admin password status = %d, want %d", response.Code, http.StatusUnauthorized)
 	}
 	newToken := loginWithCredentialsForTest(t, handler, `{"username":"admin","password":"rotated-password","product":"autolive"}`)
@@ -194,7 +194,7 @@ func TestCreatedUserCanLoginWithTheSameControlPlaneCredentials(t *testing.T) {
 		t.Fatalf("create user status = %d, want %d; body=%s", createRecorder.Code, http.StatusCreated, createRecorder.Body.String())
 	}
 
-	clientToken := loginWithCredentialsForTest(t, handler, `{"username":"client-a","password":"client-password","product":"autolive"}`)
+	clientToken := loginWithCredentialsAtPathForTest(t, handler, "/api/v1/client/auth/login", `{"username":"client-a","password":"client-password","product":"autolive"}`)
 	if clientToken == "" || clientToken == adminToken {
 		t.Fatalf("expected a distinct client access token")
 	}
@@ -214,7 +214,7 @@ func TestResetUserPasswordRevokesExistingSessions(t *testing.T) {
 	if createRecorder.Code != http.StatusCreated {
 		t.Fatalf("create user status = %d, want %d; body=%s", createRecorder.Code, http.StatusCreated, createRecorder.Body.String())
 	}
-	clientToken := loginWithCredentialsForTest(t, handler, `{"username":"client-b","password":"client-password","product":"autolive"}`)
+	clientToken := loginWithCredentialsAtPathForTest(t, handler, "/api/v1/client/auth/login", `{"username":"client-b","password":"client-password","product":"autolive"}`)
 
 	resetRequest := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users/usr_00000001/reset-password", strings.NewReader(`{"password":"changed-password"}`))
 	resetRequest.Header.Set("Authorization", "Bearer "+adminToken)
@@ -232,7 +232,7 @@ func TestResetUserPasswordRevokesExistingSessions(t *testing.T) {
 	if oldSessionRecorder.Code != http.StatusUnauthorized {
 		t.Fatalf("old session status = %d, want %d", oldSessionRecorder.Code, http.StatusUnauthorized)
 	}
-	if loginWithCredentialsForTest(t, handler, `{"username":"client-b","password":"changed-password","product":"autolive"}`) == "" {
+	if loginWithCredentialsAtPathForTest(t, handler, "/api/v1/client/auth/login", `{"username":"client-b","password":"changed-password","product":"autolive"}`) == "" {
 		t.Fatal("new password did not create a session")
 	}
 }
@@ -378,8 +378,8 @@ func TestLoginRejectsMissingOrDisabledProductMembership(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"correct-password","product":"douyin_desktop"}`))
 			loginHandler(auth).ServeHTTP(recorder, request)
-			if recorder.Code != http.StatusForbidden {
-				t.Fatalf("login status = %d, want %d; body=%s", recorder.Code, http.StatusForbidden, recorder.Body.String())
+			if recorder.Code != http.StatusUnauthorized {
+				t.Fatalf("login status = %d, want %d; body=%s", recorder.Code, http.StatusUnauthorized, recorder.Body.String())
 			}
 		})
 	}
@@ -441,7 +441,7 @@ func TestRequireBearerRestoresPersistedSessionProduct(t *testing.T) {
 	second := newAuthenticator(service.NewControlPlane(repository), AuthConfig{UsePersistedAdmin: true}, sessionStore)
 	var actor controlplane.Actor
 	record := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/client/profile", nil)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/users", nil)
 	request.Header.Set("Authorization", "Bearer "+login.Tokens.AccessToken)
 	second.requireBearer(func(w http.ResponseWriter, _ *http.Request, got controlplane.Actor) {
 		actor = got
@@ -462,7 +462,8 @@ func TestProductMismatchIsRejectedBeforeActivationOrHeartbeatBinding(t *testing.
 		Username: "admin",
 		Password: "correct-password",
 	}, repository, store.NewMemorySecretStore(), sessionStore, true)
-	login := loginTokensForTest(t, handler, `{"username":"admin","password":"correct-password","product":"douyin_desktop"}`)
+	admin := loginTokensForTest(t, handler, `{"username":"admin","password":"correct-password","product":"douyin_desktop"}`)
+	clientToken, _ := createDesktopUserForProductForTest(t, handler, admin.AccessToken, "product-mismatch-client", controlplane.ProductDouyinDesktop)
 
 	activation := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", map[string]any{
 		"device": map[string]any{
@@ -472,7 +473,7 @@ func TestProductMismatchIsRejectedBeforeActivationOrHeartbeatBinding(t *testing.
 			"platform":    "windows",
 			"app_version": "1.0.0",
 		},
-	}, login.AccessToken, "activate-product-mismatch")
+	}, clientToken, "activate-product-mismatch")
 	if activation.Code != http.StatusForbidden {
 		t.Fatalf("activation mismatch status = %d, want %d; body=%s", activation.Code, http.StatusForbidden, activation.Body.String())
 	}
@@ -482,14 +483,14 @@ func TestProductMismatchIsRejectedBeforeActivationOrHeartbeatBinding(t *testing.
 		"device_id": "dev_product01",
 		"sent_at":   time.Now().UTC().Format(time.RFC3339),
 		"status":    map[string]any{"disk_free_bytes": 1024},
-	}, login.AccessToken, "heartbeat-product-mismatch")
+	}, clientToken, "heartbeat-product-mismatch")
 	if heartbeat.Code != http.StatusForbidden {
 		t.Fatalf("heartbeat mismatch status = %d, want %d; body=%s", heartbeat.Code, http.StatusForbidden, heartbeat.Body.String())
 	}
 
 	sessionStore.mu.Lock()
 	defer sessionStore.mu.Unlock()
-	if session := sessionStore.byAccess[hashToken(login.AccessToken)]; session.DeviceID != "" {
+	if session := sessionStore.byAccess[hashToken(clientToken)]; session.DeviceID != "" {
 		t.Fatalf("mismatched product requests bound device %q", session.DeviceID)
 	}
 }
@@ -500,22 +501,22 @@ func TestLegacyAutoliveHeartbeatWithoutProductUsesAuthenticatedProduct(t *testin
 		Username: "admin",
 		Password: "correct-password",
 	}, repository, store.NewMemorySecretStore(), newTestSessionStore(), true)
+	admin := loginTokensForTest(t, handler, `{"username":"admin","password":"correct-password","product":"autolive"}`)
+	clientToken, userID := createDesktopUserForTest(t, handler, admin.AccessToken, "legacy-heartbeat-client")
 	if err := repository.Run(context.Background(), func(state *store.State) error {
 		state.Devices["dev_legacy01"] = controlplane.DeviceSummary{
-			ID: "dev_legacy01", UserID: "usr_local_admin", Product: controlplane.ProductAutoLive,
+			ID: "dev_legacy01", UserID: userID, Product: controlplane.ProductAutoLive,
 			Status: controlplane.DeviceStatusActive,
 		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	login := loginTokensForTest(t, handler, `{"username":"admin","password":"correct-password","product":"autolive"}`)
-
 	heartbeat := doJSON(t, handler, http.MethodPost, "/api/v1/client/heartbeat", map[string]any{
 		"device_id": "dev_legacy01",
 		"sent_at":   time.Now().UTC().Format(time.RFC3339),
 		"status":    map[string]any{"disk_free_bytes": 1024},
-	}, login.AccessToken, "heartbeat-legacy-missing-product")
+	}, clientToken, "heartbeat-legacy-missing-product")
 	if heartbeat.Code != http.StatusOK {
 		t.Fatalf("legacy heartbeat status = %d, want %d; body=%s", heartbeat.Code, http.StatusOK, heartbeat.Body.String())
 	}
@@ -527,22 +528,22 @@ func TestHeartbeatWithoutProductRejectsNonLegacyProduct(t *testing.T) {
 		Username: "admin",
 		Password: "correct-password",
 	}, repository, store.NewMemorySecretStore(), newTestSessionStore(), true)
+	admin := loginTokensForTest(t, handler, `{"username":"admin","password":"correct-password","product":"douyin_desktop"}`)
+	clientToken, userID := createDesktopUserForProductForTest(t, handler, admin.AccessToken, "douyin-heartbeat-client", controlplane.ProductDouyinDesktop)
 	if err := repository.Run(context.Background(), func(state *store.State) error {
 		state.Devices["dev_douyin01"] = controlplane.DeviceSummary{
-			ID: "dev_douyin01", UserID: "usr_local_admin", Product: controlplane.ProductDouyinDesktop,
+			ID: "dev_douyin01", UserID: userID, Product: controlplane.ProductDouyinDesktop,
 			Status: controlplane.DeviceStatusActive,
 		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	login := loginTokensForTest(t, handler, `{"username":"admin","password":"correct-password","product":"douyin_desktop"}`)
-
 	heartbeat := doJSON(t, handler, http.MethodPost, "/api/v1/client/heartbeat", map[string]any{
 		"device_id": "dev_douyin01",
 		"sent_at":   time.Now().UTC().Format(time.RFC3339),
 		"status":    map[string]any{"disk_free_bytes": 1024},
-	}, login.AccessToken, "heartbeat-douyin-missing-product")
+	}, clientToken, "heartbeat-douyin-missing-product")
 	if heartbeat.Code != http.StatusBadRequest {
 		t.Fatalf("douyin heartbeat status = %d, want %d; body=%s", heartbeat.Code, http.StatusBadRequest, heartbeat.Body.String())
 	}
@@ -552,8 +553,8 @@ func TestRevokeDeviceSessionsForProductDoesNotRevokeOtherProduct(t *testing.T) {
 	sessions := newTestSessionStore()
 	now := time.Now().UTC()
 	for _, session := range []store.AuthSession{
-		{ID: "session-auto", UserID: "user-1", Product: controlplane.ProductAutoLive, DeviceID: "device-shared", AccessTokenHash: "access-auto", RefreshTokenHash: "refresh-auto", AccessExpiresAt: now.Add(time.Hour), RefreshExpiresAt: now.Add(2 * time.Hour)},
-		{ID: "session-douyin", UserID: "user-1", Product: controlplane.ProductDouyinDesktop, DeviceID: "device-shared", AccessTokenHash: "access-douyin", RefreshTokenHash: "refresh-douyin", AccessExpiresAt: now.Add(time.Hour), RefreshExpiresAt: now.Add(2 * time.Hour)},
+		{ID: "session-auto", UserID: "user-1", Product: controlplane.ProductAutoLive, Audience: store.SessionAudienceDesktop, DeviceID: "device-shared", AccessTokenHash: "access-auto", RefreshTokenHash: "refresh-auto", RefreshFamilyID: "family-auto", AccessExpiresAt: now.Add(time.Hour), RefreshExpiresAt: now.Add(2 * time.Hour)},
+		{ID: "session-douyin", UserID: "user-1", Product: controlplane.ProductDouyinDesktop, Audience: store.SessionAudienceDesktop, DeviceID: "device-shared", AccessTokenHash: "access-douyin", RefreshTokenHash: "refresh-douyin", RefreshFamilyID: "family-douyin", AccessExpiresAt: now.Add(time.Hour), RefreshExpiresAt: now.Add(2 * time.Hour)},
 	} {
 		if err := sessions.Create(context.Background(), session); err != nil {
 			t.Fatalf("Create() error = %v", err)
@@ -575,12 +576,13 @@ func TestRevokeDeviceSessionsForProductDoesNotRevokeOtherProduct(t *testing.T) {
 
 func TestClientProfileReturnsActorAndDeviceProduct(t *testing.T) {
 	handler := newTestRouter(t)
-	token := loginForTest(t, handler)
+	adminToken := loginForTest(t, handler)
+	clientToken, userID := createDesktopUserForTest(t, handler, adminToken, "profile-product-client")
 	create := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
-		"user_id":     "usr_local_admin",
+		"user_id":     userID,
 		"expires_at":  testActivationExpiresAt(),
 		"max_devices": 1,
-	}, token, "profile-product-code")
+	}, adminToken, "profile-product-code")
 	if create.Code != http.StatusCreated {
 		t.Fatalf("create activation code status = %d, want %d; body=%s", create.Code, http.StatusCreated, create.Body.String())
 	}
@@ -592,12 +594,12 @@ func TestClientProfileReturnsActorAndDeviceProduct(t *testing.T) {
 			"platform":    "macOS",
 			"app_version": "1.0.0",
 		},
-	}, token, "profile-product-activate")
+	}, clientToken, "profile-product-activate")
 	if activate.Code != http.StatusOK {
 		t.Fatalf("activate status = %d, want %d; body=%s", activate.Code, http.StatusOK, activate.Body.String())
 	}
 
-	profile := doJSON(t, handler, http.MethodGet, "/api/v1/client/profile", nil, token, "")
+	profile := doJSON(t, handler, http.MethodGet, "/api/v1/client/profile", nil, clientToken, "")
 	if profile.Code != http.StatusOK {
 		t.Fatalf("profile status = %d, want %d; body=%s", profile.Code, http.StatusOK, profile.Body.String())
 	}
@@ -613,28 +615,29 @@ func TestClientProfileRejectsBoundDeviceFromAnotherProductWithoutMutation(t *tes
 	sessions := newTestSessionStore()
 	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{
 		Username: "admin",
-		Password: "password",
+		Password: testAdminPassword,
 	}, repository, store.NewMemorySecretStore(), sessions, true)
-	token := loginForTest(t, handler)
+	adminToken := loginForTest(t, handler)
+	clientToken, userID := createDesktopUserForTest(t, handler, adminToken, "profile-mismatch-client")
 	deviceID := "dev_profile_mismatch"
 	if err := repository.Run(context.Background(), func(state *store.State) error {
 		state.Devices[deviceID] = controlplane.DeviceSummary{
-			ID: deviceID, UserID: "usr_local_admin", Product: controlplane.ProductDouyinDesktop,
+			ID: deviceID, UserID: userID, Product: controlplane.ProductDouyinDesktop,
 			Status: controlplane.DeviceStatusActive,
 		}
 		return nil
 	}); err != nil {
 		t.Fatalf("seed mismatched device: %v", err)
 	}
-	if err := sessions.UpdateDeviceID(context.Background(), hashToken(token), deviceID); err != nil {
+	if err := sessions.UpdateDeviceID(context.Background(), hashToken(clientToken), deviceID); err != nil {
 		t.Fatalf("bind session device: %v", err)
 	}
 
-	profile := doJSON(t, handler, http.MethodGet, "/api/v1/client/profile", nil, token, "")
+	profile := doJSON(t, handler, http.MethodGet, "/api/v1/client/profile", nil, clientToken, "")
 	if profile.Code != http.StatusForbidden {
 		t.Fatalf("profile mismatch status = %d, want %d; body=%s", profile.Code, http.StatusForbidden, profile.Body.String())
 	}
-	session, found, err := sessions.GetByAccessTokenHash(context.Background(), hashToken(token))
+	session, found, err := sessions.GetByAccessTokenHash(context.Background(), hashToken(clientToken))
 	if err != nil || !found || session.DeviceID != deviceID {
 		t.Fatalf("profile mismatch changed session binding: session=%+v found=%t err=%v", session, found, err)
 	}
@@ -655,8 +658,7 @@ func TestLogoutRevokesAccessAndRefreshTokens(t *testing.T) {
 	})
 	initial := loginTokensForTest(t, handler, `{"username":"admin","password":"correct-password","product":"autolive"}`)
 
-	logoutRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
-	logoutRequest.Header.Set("Authorization", "Bearer "+initial.AccessToken)
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", strings.NewReader(`{"refresh_token":"`+initial.RefreshToken+`"}`))
 	logoutRecorder := httptest.NewRecorder()
 	handler.ServeHTTP(logoutRecorder, logoutRequest)
 	if logoutRecorder.Code != http.StatusOK {
@@ -690,8 +692,7 @@ func TestLogoutReportsPersistentRevocationFailure(t *testing.T) {
 	}, store.NewMemoryStore(time.Now), store.NewMemorySecretStore(), sessionStore)
 	initial := loginTokensForTest(t, handler, `{"username":"admin","password":"correct-password","product":"autolive"}`)
 
-	logoutRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
-	logoutRequest.Header.Set("Authorization", "Bearer "+initial.AccessToken)
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", strings.NewReader(`{"refresh_token":"`+initial.RefreshToken+`"}`))
 	logoutRecorder := httptest.NewRecorder()
 	handler.ServeHTTP(logoutRecorder, logoutRequest)
 	if logoutRecorder.Code != http.StatusServiceUnavailable {
@@ -735,7 +736,7 @@ func TestBindDeviceReportsPersistentUpdateFailure(t *testing.T) {
 	}
 }
 
-func TestLogoutCannotRevokeAnotherSessionRefreshToken(t *testing.T) {
+func TestLogoutRevokesOnlyThePresentedRefreshTokenFamily(t *testing.T) {
 	handler := NewRouterWithAuth("v1.0.0", nil, AuthConfig{
 		Username: "admin",
 		Password: "correct-password",
@@ -746,7 +747,6 @@ func TestLogoutCannotRevokeAnotherSessionRefreshToken(t *testing.T) {
 	logoutRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", strings.NewReader(
 		`{"refresh_token":"`+second.RefreshToken+`"}`,
 	))
-	logoutRequest.Header.Set("Authorization", "Bearer "+first.AccessToken)
 	logoutRecorder := httptest.NewRecorder()
 	handler.ServeHTTP(logoutRecorder, logoutRequest)
 	if logoutRecorder.Code != http.StatusOK {
@@ -758,8 +758,14 @@ func TestLogoutCannotRevokeAnotherSessionRefreshToken(t *testing.T) {
 	))
 	refreshRecorder := httptest.NewRecorder()
 	handler.ServeHTTP(refreshRecorder, refreshRequest)
-	if refreshRecorder.Code != http.StatusOK {
-		t.Fatalf("another session refresh status = %d, want %d; body=%s", refreshRecorder.Code, http.StatusOK, refreshRecorder.Body.String())
+	if refreshRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("presented session refresh status = %d, want %d; body=%s", refreshRecorder.Code, http.StatusUnauthorized, refreshRecorder.Body.String())
+	}
+	firstRefresh := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", strings.NewReader(`{"refresh_token":"`+first.RefreshToken+`"}`))
+	firstRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(firstRecorder, firstRefresh)
+	if firstRecorder.Code != http.StatusOK {
+		t.Fatalf("unrelated session refresh status = %d, want %d; body=%s", firstRecorder.Code, http.StatusOK, firstRecorder.Body.String())
 	}
 }
 
@@ -842,11 +848,11 @@ func TestSnapshotProductRepositoryIsNotInjectedIntoAuthenticator(t *testing.T) {
 	repository := &snapshotProductRepositoryStub{MemoryStore: store.NewMemoryStore(time.Now)}
 	handler := NewRouterWithRepositoryAndSecretStore("test", nil, AuthConfig{
 		Username: "admin",
-		Password: "password",
+		Password: testAdminPassword,
 	}, repository, store.NewMemorySecretStore())
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(
-		`{"username":"admin","password":"password","product":"autolive"}`,
+		`{"username":"admin","password":"correct-password","product":"autolive"}`,
 	))
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
@@ -891,8 +897,11 @@ func (s *testSessionStore) GetByRefreshTokenHash(_ context.Context, hash string)
 		return store.AuthSession{}, false, nil
 	}
 	session, ok := s.byAccess[accessHash]
-	if !ok || s.revoked[session.ID] {
+	if !ok {
 		return store.AuthSession{}, false, nil
+	}
+	if s.revoked[session.ID] && session.RevokedAt.IsZero() {
+		session.RevokedAt = time.Now().UTC()
 	}
 	return session, true, nil
 }
@@ -905,10 +914,29 @@ func (s *testSessionStore) Rotate(_ context.Context, refreshHash string, next st
 		return store.AuthSession{}, false, nil
 	}
 	old, ok := s.byAccess[accessHash]
-	if !ok || s.revoked[old.ID] {
+	if !ok {
 		return store.AuthSession{}, false, nil
 	}
+	if s.revoked[old.ID] {
+		if !old.ConsumedAt.IsZero() {
+			for accessHash, session := range s.byAccess {
+				if session.RefreshFamilyID == old.RefreshFamilyID {
+					s.revoked[session.ID] = true
+					delete(s.byRefresh, session.RefreshTokenHash)
+					_ = accessHash
+				}
+			}
+			return old, false, store.ErrRefreshTokenReplayed
+		}
+		return old, false, nil
+	}
 	s.revoked[old.ID] = true
+	now := time.Now().UTC()
+	old.RevokedAt = now
+	old.ConsumedAt = now
+	old.RevokedReason = "rotated"
+	old.RotatedToSessionID = next.ID
+	s.byAccess[accessHash] = old
 	s.byAccess[next.AccessTokenHash] = next
 	s.byRefresh[next.RefreshTokenHash] = next.AccessTokenHash
 	return old, true, nil
@@ -922,6 +950,25 @@ func (s *testSessionStore) RevokeByAccessTokenHash(_ context.Context, hash strin
 	}
 	if session, ok := s.byAccess[hash]; ok {
 		s.revoked[session.ID] = true
+	}
+	return nil
+}
+
+func (s *testSessionStore) RevokeByRefreshTokenHash(_ context.Context, hash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revokeErr != nil {
+		return s.revokeErr
+	}
+	accessHash, ok := s.byRefresh[hash]
+	if !ok {
+		return nil
+	}
+	familyID := s.byAccess[accessHash].RefreshFamilyID
+	for _, session := range s.byAccess {
+		if session.RefreshFamilyID == familyID {
+			s.revoked[session.ID] = true
+		}
 	}
 	return nil
 }
@@ -1021,7 +1068,12 @@ func loginTokensForTest(t *testing.T, handler http.Handler, body string) testSes
 
 func loginWithCredentialsForTest(t *testing.T, handler http.Handler, body string) string {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(body))
+	return loginWithCredentialsAtPathForTest(t, handler, "/api/v1/auth/login", body)
+}
+
+func loginWithCredentialsAtPathForTest(t *testing.T, handler http.Handler, path, body string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)

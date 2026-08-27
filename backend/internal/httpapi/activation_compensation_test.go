@@ -17,12 +17,13 @@ func TestActivateBindsBeforeBusinessMutationWhenSessionStoreFails(t *testing.T) 
 	repository := store.NewMemoryStore(func() time.Time { return testNow })
 	sessions := newTestSessionStore()
 	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStore(
-		"test", nil, AuthConfig{Username: "admin", Password: "password"}, repository, store.NewMemorySecretStore(), sessions,
+		"test", nil, AuthConfig{Username: "admin", Password: testAdminPassword}, repository, store.NewMemorySecretStore(), sessions,
 	)
-	token := loginForTest(t, handler)
+	adminToken := loginForTest(t, handler)
+	clientToken, userID := createDesktopUserForTest(t, handler, adminToken, "activation-bind-user")
 	adminCode := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
-		"user_id": "usr_local_admin", "expires_at": testActivationExpiresAt(), "max_devices": 1,
-	}, token, "activation-prepare-1")
+		"user_id": userID, "expires_at": testActivationExpiresAt(), "max_devices": 1,
+	}, adminToken, "activation-prepare-1")
 	if adminCode.Code != http.StatusCreated {
 		t.Fatalf("create activation code status = %d; body=%s", adminCode.Code, adminCode.Body.String())
 	}
@@ -37,7 +38,7 @@ func TestActivateBindsBeforeBusinessMutationWhenSessionStoreFails(t *testing.T) 
 	sessions.mu.Unlock()
 	response := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", controlplane.ActivateDeviceInput{
 		Device: controlplane.DeviceRegistration{Product: controlplane.ProductAutoLive, DeviceID: "dev_bindfail1", DeviceName: "Test", Platform: "windows", AppVersion: "1.0.0"},
-	}, token, "activation-bind-failure")
+	}, clientToken, "activation-bind-failure")
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("activation with unavailable session store status = %d; body=%s", response.Code, response.Body.String())
 	}
@@ -61,12 +62,13 @@ func TestActivateCompensatesNewSessionBindingWhenBusinessFails(t *testing.T) {
 	repository := store.NewMemoryStore(func() time.Time { return testNow })
 	sessions := newTestSessionStore()
 	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStore(
-		"test", nil, AuthConfig{Username: "admin", Password: "password"}, repository, store.NewMemorySecretStore(), sessions,
+		"test", nil, AuthConfig{Username: "admin", Password: testAdminPassword}, repository, store.NewMemorySecretStore(), sessions,
 	)
-	token := loginForTest(t, handler)
+	adminToken := loginForTest(t, handler)
+	clientToken, _ := createDesktopUserForTest(t, handler, adminToken, "activation-comp-user")
 	response := doJSON(t, handler, http.MethodPost, "/api/v1/client/activate", controlplane.ActivateDeviceInput{
 		Device: controlplane.DeviceRegistration{Product: controlplane.ProductAutoLive, DeviceID: "dev_compens1", DeviceName: "Test", Platform: "windows", AppVersion: "1.0.0"},
-	}, token, "activation-compensation")
+	}, clientToken, "activation-compensation")
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("activation business failure status = %d; body=%s", response.Code, response.Body.String())
 	}
@@ -74,8 +76,10 @@ func TestActivateCompensatesNewSessionBindingWhenBusinessFails(t *testing.T) {
 	var sessionDeviceID string
 	sessions.mu.Lock()
 	for _, session := range sessions.byAccess {
-		sessionDeviceID = session.DeviceID
-		break
+		if session.Audience == store.SessionAudienceDesktop {
+			sessionDeviceID = session.DeviceID
+			break
+		}
 	}
 	sessions.mu.Unlock()
 	if sessionDeviceID != "" {
@@ -95,19 +99,20 @@ func TestHeartbeatCompensatesNewSessionBindingWhenBusinessFails(t *testing.T) {
 	repository := store.NewMemoryStore(func() time.Time { return testNow })
 	sessions := newTestSessionStore()
 	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStore(
-		"test", nil, AuthConfig{Username: "admin", Password: "password"}, repository, store.NewMemorySecretStore(), sessions,
+		"test", nil, AuthConfig{Username: "admin", Password: testAdminPassword}, repository, store.NewMemorySecretStore(), sessions,
 	)
-	token := loginForTest(t, handler)
+	adminToken := loginForTest(t, handler)
+	clientToken, _ := createDesktopUserForTest(t, handler, adminToken, "heartbeat-comp-user")
 	response := doJSON(t, handler, http.MethodPost, "/api/v1/client/heartbeat", controlplane.HeartbeatInput{
 		Product: controlplane.ProductAutoLive, DeviceID: "dev_hb_fail1", SentAt: testNow,
-	}, token, "heartbeat-compensation")
+	}, clientToken, "heartbeat-compensation")
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("heartbeat business failure status = %d; body=%s", response.Code, response.Body.String())
 	}
 	sessions.mu.Lock()
 	defer sessions.mu.Unlock()
 	for _, session := range sessions.byAccess {
-		if session.DeviceID != "" {
+		if session.Audience == store.SessionAudienceDesktop && session.DeviceID != "" {
 			t.Fatalf("compensated heartbeat session device id = %q, want empty", session.DeviceID)
 		}
 	}

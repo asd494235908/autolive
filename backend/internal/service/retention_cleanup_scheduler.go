@@ -16,13 +16,14 @@ import (
 // available before the bounded cleanup worker removes it.
 type RetentionCleanupPolicy struct {
 	AuthSessionTTL       time.Duration
+	AuthThrottleTTL      time.Duration
 	IdempotencyRecordTTL time.Duration
 	ModelTestResultTTL   time.Duration
 	AuditLogTTL          time.Duration
 }
 
 func (p RetentionCleanupPolicy) validate() error {
-	if p.AuthSessionTTL <= 0 || p.IdempotencyRecordTTL <= 0 || p.ModelTestResultTTL <= 0 || p.AuditLogTTL <= 0 {
+	if p.AuthSessionTTL <= 0 || p.AuthThrottleTTL <= 0 || p.IdempotencyRecordTTL <= 0 || p.ModelTestResultTTL <= 0 || p.AuditLogTTL <= 0 {
 		return fmt.Errorf("retention TTLs must be positive")
 	}
 	return nil
@@ -58,6 +59,7 @@ const stagedSecretCleanupGrace = time.Hour
 // contains record IDs, request IDs, URLs, error text or secrets.
 type RetentionCleanupSummary struct {
 	AuthSessions           int64
+	AuthThrottleBuckets    int64
 	OrphanedDeviceBindings int64
 	StagedSecrets          int64
 	IdempotencyRecords     int64
@@ -294,6 +296,9 @@ func (s *RetentionCleanupScheduler) RunOnce(parent context.Context) (summary Ret
 		cleanup(RetentionCleanupDatasetStagedSecrets, stagedSecretCleanupGrace, s.stagedSecretCleaner, &summary.StagedSecrets)
 	}
 	if s.controlPlaneCleaner != nil {
+		if throttleCleaner, ok := s.controlPlaneCleaner.(store.LoginThrottleRetentionCleaner); ok {
+			cleanup(RetentionCleanupDatasetAuthThrottleBuckets, s.policy.AuthThrottleTTL, throttleCleaner.CleanupLoginThrottleBuckets, &summary.AuthThrottleBuckets)
+		}
 		cleanup(RetentionCleanupDatasetIdempotencyRecords, s.policy.IdempotencyRecordTTL, s.controlPlaneCleaner.CleanupIdempotencyRecords, &summary.IdempotencyRecords)
 		cleanup(RetentionCleanupDatasetModelTestResults, s.policy.ModelTestResultTTL, s.controlPlaneCleaner.CleanupModelPoolTestResults, &summary.ModelTestResults)
 		cleanup(RetentionCleanupDatasetAuditLogs, s.policy.AuditLogTTL, s.controlPlaneCleaner.CleanupAuditLogs, &summary.AuditLogs)

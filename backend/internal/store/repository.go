@@ -161,13 +161,13 @@ type AuditOutboxRepository interface {
 }
 
 type DeviceActivationRecord struct {
-	Scope              string
-	IdempotencyKey     string
-	Fingerprint        string
-	AccessTokenHash    string
-	UserID             string
-	Product            controlplane.ProductCode
-	Device             controlplane.DeviceRegistration
+	Scope           string
+	IdempotencyKey  string
+	Fingerprint     string
+	AccessTokenHash string
+	UserID          string
+	Product         controlplane.ProductCode
+	Device          controlplane.DeviceRegistration
 	// Audit is optional for compatibility callers. Normalized HTTP activation
 	// supplies the prevalidated success event so it is committed with the
 	// activation, device and session binding transaction.
@@ -368,7 +368,7 @@ type ProductUserPageReader interface {
 }
 
 // UserRepository owns normalized user writes without exposing the legacy
-// control-plane snapshot to callers. PasswordHash is already bcrypt-derived
+// control-plane snapshot to callers. PasswordHash is already derived by the
 // at the service boundary and must never be logged or returned.
 type UserRepository interface {
 	CreateUser(ctx context.Context, scope, idempotencyKey, fingerprint string, record UserCreateRecord) (controlplane.UserSummary, error)
@@ -377,11 +377,18 @@ type UserRepository interface {
 	DisableUser(ctx context.Context, scope, idempotencyKey, fingerprint, userID string) (controlplane.UserSummary, error)
 }
 
-// UserCredentialReader reads one normalized user row and its bcrypt hash for
+// UserCredentialReader reads one normalized user row and its password hash for
 // the authentication boundary. The hash is transient process data only; it
 // must never be serialized, logged, or returned by an HTTP handler.
 type UserCredentialReader interface {
 	GetUserCredential(ctx context.Context, username string) (controlplane.UserSummary, []byte, error)
+}
+
+// UserCredentialHashUpdater atomically upgrades a legacy password hash after
+// successful authentication. Implementations must use oldHash as a compare-and-
+// swap guard so concurrent password resets cannot be overwritten.
+type UserCredentialHashUpdater interface {
+	UpdateUserCredentialHash(ctx context.Context, userID string, oldHash, newHash []byte) (bool, error)
 }
 
 // UserReader provides a bounded normalized user lookup for authenticated

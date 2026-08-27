@@ -8,8 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"autoLive/backend/internal/controlplane"
 	"autoLive/backend/internal/store"
 )
+
+const testAdminPassword = "correct-password"
 
 func newTestRouter(t *testing.T) http.Handler {
 	t.Helper()
@@ -18,7 +21,7 @@ func newTestRouter(t *testing.T) http.Handler {
 	repository := store.NewMemoryStore(func() time.Time { return testNow })
 	return NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{
 		Username: "admin",
-		Password: "password",
+		Password: testAdminPassword,
 	}, repository, store.NewMemorySecretStore(), nil, true)
 }
 
@@ -28,7 +31,28 @@ func testActivationExpiresAt() string {
 
 func loginForTest(t *testing.T, handler http.Handler) string {
 	t.Helper()
-	return loginWithCredentialsForTest(t, handler, `{"username":"admin","password":"password","product":"autolive"}`)
+	return loginWithCredentialsForTest(t, handler, `{"username":"admin","password":"correct-password","product":"autolive"}`)
+}
+
+func createDesktopUserForTest(t *testing.T, handler http.Handler, adminToken, username string) (string, string) {
+	return createDesktopUserForProductForTest(t, handler, adminToken, username, controlplane.ProductAutoLive)
+}
+
+func createDesktopUserForProductForTest(t *testing.T, handler http.Handler, adminToken, username string, product controlplane.ProductCode) (string, string) {
+	t.Helper()
+	password := "desktop-test-password"
+	created := doJSON(t, handler, http.MethodPost, "/api/v1/admin/users", map[string]any{
+		"username": username,
+		"password": password,
+		"role":     "user",
+	}, adminToken, "create-"+username)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create desktop test user status = %d; body=%s", created.Code, created.Body.String())
+	}
+	var payload userEnvelope
+	decodeJSON(t, created.Body.Bytes(), &payload)
+	token := loginWithCredentialsAtPathForTest(t, handler, "/api/v1/client/auth/login", `{"username":"`+username+`","password":"`+password+`","product":"`+string(product)+`"}`)
+	return token, payload.User.ID
 }
 
 func doJSON(t *testing.T, handler http.Handler, method, path string, body any, token, idempotencyKey string) *httptest.ResponseRecorder {

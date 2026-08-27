@@ -536,6 +536,9 @@ func TestOpenAPIErrorResponseExamplesAndRuntimeStatusMatrix(t *testing.T) {
 		handler := newTestRouter(t)
 		if token == "login" {
 			token = loginForTest(t, handler)
+		} else if token == "client-login" {
+			adminToken := loginForTest(t, handler)
+			token, _ = createDesktopUserForTest(t, handler, adminToken, "contract-client-user")
 		}
 		return doJSON(t, handler, method, path, body, token, idempotencyKey)
 	}
@@ -567,7 +570,7 @@ func TestOpenAPIErrorResponseExamplesAndRuntimeStatusMatrix(t *testing.T) {
 			status: http.StatusForbidden,
 			code:   "DEVICE_BINDING_REQUIRED",
 			run: func(t *testing.T) *httptest.ResponseRecorder {
-				return runRoute(t, http.MethodPost, "/api/v1/client/model-leases", map[string]any{"provider": "openai-compatible", "model": "contract-model"}, "login", "contract-forbidden")
+				return runRoute(t, http.MethodPost, "/api/v1/client/model-leases", map[string]any{"provider": "openai-compatible", "model": "contract-model"}, "client-login", "contract-forbidden")
 			},
 		},
 		{

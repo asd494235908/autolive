@@ -227,9 +227,56 @@ func TestMigration23ForeignKeyContractCoversAllProductReferences(t *testing.T) {
 	}
 }
 
-func TestLatestVersionIsAccountActivationMigration25(t *testing.T) {
-	if LatestVersion != 25 {
-		t.Fatalf("LatestVersion = %d, want 25", LatestVersion)
+func TestLatestVersionIncludesLoginSecurityMigrations(t *testing.T) {
+	if LatestVersion != 27 {
+		t.Fatalf("LatestVersion = %d, want 27", LatestVersion)
+	}
+}
+
+func TestMigration26AddsAudienceAndRefreshTokenFamilyReplayState(t *testing.T) {
+	payload, err := fs.ReadFile(FS, "0026_登录会话受众与刷新令牌族.up.sql")
+	if err != nil {
+		t.Fatalf("read migration 0026: %v", err)
+	}
+	sql := string(payload)
+	for _, fragment := range []string{
+		"ADD COLUMN IF NOT EXISTS audience TEXT",
+		"ADD COLUMN IF NOT EXISTS token_family_id TEXT",
+		"ADD COLUMN IF NOT EXISTS generation INTEGER",
+		"ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ",
+		"ADD COLUMN IF NOT EXISTS revoked_reason TEXT",
+		"ADD COLUMN IF NOT EXISTS rotated_to_session_id TEXT",
+		"ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ",
+		"audience IN ('admin', 'desktop', 'legacy')",
+		"CREATE UNIQUE INDEX IF NOT EXISTS uq_auth_sessions_token_family_generation",
+		"SET audience = COALESCE(audience, 'legacy')",
+		"revoked_reason = COALESCE(revoked_reason, 'legacy_migration')",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0026 is missing session-security fragment %q", fragment)
+		}
+	}
+}
+
+func TestMigration27AddsHashedPersistentLoginThrottleBuckets(t *testing.T) {
+	payload, err := fs.ReadFile(FS, "0027_登录失败持久限流桶.up.sql")
+	if err != nil {
+		t.Fatalf("read migration 0027: %v", err)
+	}
+	sql := string(payload)
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS auth_login_throttles",
+		"bucket_type TEXT NOT NULL",
+		"bucket_hash CHAR(64) NOT NULL",
+		"PRIMARY KEY (bucket_type, bucket_hash)",
+		"blocked_until TIMESTAMPTZ NOT NULL",
+		"last_failed_at TIMESTAMPTZ NOT NULL",
+		"updated_at TIMESTAMPTZ NOT NULL",
+		"idx_auth_login_throttles_cleanup",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0027 is missing login throttle fragment %q", fragment)
+		}
 	}
 }
 

@@ -2,30 +2,58 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"autoLive/backend/internal/controlplane"
 	"autoLive/backend/internal/store"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestEnsureConfiguredAdminPersistsCredentialAndDoesNotOverwriteIt(t *testing.T) {
 	ctx := context.Background()
 	svc := NewControlPlane(store.NewMemoryStore(time.Now))
-	if err := svc.EnsureConfiguredAdmin(ctx, "admin", "first-password"); err != nil {
+	if err := svc.EnsureConfiguredAdmin(ctx, "admin", "first-password-1"); err != nil {
 		t.Fatalf("EnsureConfiguredAdmin() first error = %v", err)
 	}
-	if _, _, err := svc.AuthenticateUser(ctx, "admin", "first-password"); err != nil {
+	if _, _, err := svc.AuthenticateUser(ctx, "admin", "first-password-1"); err != nil {
 		t.Fatalf("AuthenticateUser() first password error = %v", err)
 	}
 	if err := svc.EnsureConfiguredAdmin(ctx, "admin", "second-password"); err != nil {
 		t.Fatalf("EnsureConfiguredAdmin() restart error = %v", err)
 	}
-	if _, _, err := svc.AuthenticateUser(ctx, "admin", "first-password"); err != nil {
+	if _, _, err := svc.AuthenticateUser(ctx, "admin", "first-password-1"); err != nil {
 		t.Fatalf("persisted password error = %v", err)
 	}
 	if _, _, err := svc.AuthenticateUser(ctx, "admin", "second-password"); !controlplane.IsErrorCode(err, controlplane.ErrUnauthenticated.Code) {
 		t.Fatalf("replacement password error = %v, want unauthenticated", err)
+	}
+}
+
+func TestAuthenticateUserUpgradesLegacyBcryptHashBestEffort(t *testing.T) {
+	repository := store.NewMemoryStore(time.Now)
+	legacy, err := bcrypt.GenerateFromPassword([]byte("legacy-password"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Users["usr_legacy"] = controlplane.UserSummary{ID: "usr_legacy", Username: "legacy", Role: controlplane.RoleUser, Status: controlplane.UserStatusActive}
+		state.UserCredentialHashes["usr_legacy"] = legacy
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := NewControlPlane(repository).AuthenticateUser(context.Background(), "legacy", "legacy-password"); err != nil {
+		t.Fatalf("AuthenticateUser() error = %v", err)
+	}
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		if !strings.HasPrefix(string(state.UserCredentialHashes["usr_legacy"]), "$argon2id$") {
+			t.Fatalf("upgraded hash = %q", state.UserCredentialHashes["usr_legacy"])
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -45,7 +73,7 @@ func TestEnsureConfiguredAdminRejectsInvalidBootstrap(t *testing.T) {
 func TestChangeLocalAdminPasswordRotatesPersistedCredentialIdempotently(t *testing.T) {
 	ctx := context.Background()
 	svc := NewControlPlane(store.NewMemoryStore(time.Now))
-	if err := svc.EnsureConfiguredAdmin(ctx, "admin", "first-password"); err != nil {
+	if err := svc.EnsureConfiguredAdmin(ctx, "admin", "first-password-1"); err != nil {
 		t.Fatalf("EnsureConfiguredAdmin() error = %v", err)
 	}
 
@@ -57,7 +85,7 @@ func TestChangeLocalAdminPasswordRotatesPersistedCredentialIdempotently(t *testi
 	if user.ID != "usr_local_admin" {
 		t.Fatalf("rotated user = %+v", user)
 	}
-	if _, _, err := svc.AuthenticateUser(ctx, "admin", "first-password"); !controlplane.IsErrorCode(err, controlplane.ErrUnauthenticated.Code) {
+	if _, _, err := svc.AuthenticateUser(ctx, "admin", "first-password-1"); !controlplane.IsErrorCode(err, controlplane.ErrUnauthenticated.Code) {
 		t.Fatalf("old password error = %v, want unauthenticated", err)
 	}
 	if _, _, err := svc.AuthenticateUser(ctx, "admin", "rotated-password"); err != nil {
@@ -77,18 +105,27 @@ func TestChangeLocalAdminPasswordRotatesPersistedCredentialIdempotently(t *testi
 
 func TestUpdateAndResetUserCredentials(t *testing.T) {
 	now := time.Date(2026, 8, 20, 11, 0, 0, 0, time.UTC)
-	svc := NewControlPlane(store.NewMemoryStore(func() time.Time { return now }))
+	repository := store.NewMemoryStore(func() time.Time { return now })
+	svc := NewControlPlane(repository)
 	ctx := context.Background()
 	if err := svc.EnsureLocalAdmin(ctx, "admin"); err != nil {
 		t.Fatalf("EnsureLocalAdmin() error = %v", err)
 	}
 	user, err := svc.CreateUser(ctx, "create-user", controlplane.CreateUserInput{
 		Username: "operator",
-		Password: "old-password",
+		Password: "old-password-001",
 		Role:     controlplane.RoleUser,
 	})
 	if err != nil {
 		t.Fatalf("CreateUser() error = %v", err)
+	}
+	if err := repository.Run(ctx, func(state *store.State) error {
+		if !strings.HasPrefix(string(state.UserCredentialHashes[user.ID]), "$argon2id$") {
+			t.Fatalf("created password hash = %q, want Argon2id PHC", state.UserCredentialHashes[user.ID])
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 
 	updatedName := "operator-renamed"
@@ -99,21 +136,21 @@ func TestUpdateAndResetUserCredentials(t *testing.T) {
 	if updated.Username != updatedName {
 		t.Fatalf("updated user = %+v", updated)
 	}
-	if _, _, err := svc.AuthenticateUser(ctx, updatedName, "old-password"); err != nil {
+	if _, _, err := svc.AuthenticateUser(ctx, updatedName, "old-password-001"); err != nil {
 		t.Fatalf("AuthenticateUser() after rename error = %v", err)
 	}
 
-	reset, err := svc.ResetUserPassword(ctx, "reset-user", user.ID, controlplane.ResetUserPasswordInput{Password: "new-password"})
+	reset, err := svc.ResetUserPassword(ctx, "reset-user", user.ID, controlplane.ResetUserPasswordInput{Password: "new-password-001"})
 	if err != nil {
 		t.Fatalf("ResetUserPassword() error = %v", err)
 	}
 	if reset.ID != user.ID {
 		t.Fatalf("reset user = %+v", reset)
 	}
-	if _, _, err := svc.AuthenticateUser(ctx, updatedName, "old-password"); !controlplane.IsErrorCode(err, controlplane.ErrUnauthenticated.Code) {
+	if _, _, err := svc.AuthenticateUser(ctx, updatedName, "old-password-001"); !controlplane.IsErrorCode(err, controlplane.ErrUnauthenticated.Code) {
 		t.Fatalf("old password error = %v, want UNAUTHENTICATED", err)
 	}
-	if _, _, err := svc.AuthenticateUser(ctx, updatedName, "new-password"); err != nil {
+	if _, _, err := svc.AuthenticateUser(ctx, updatedName, "new-password-001"); err != nil {
 		t.Fatalf("new password error = %v", err)
 	}
 }
@@ -159,7 +196,7 @@ func TestDisableUserPreservesLastActiveAdmin(t *testing.T) {
 	}
 	user, err := svc.CreateUser(ctx, "create-admin", controlplane.CreateUserInput{
 		Username: "second-admin",
-		Password: "admin-password",
+		Password: "admin-password-001",
 		Role:     controlplane.RoleAdmin,
 	})
 	if err != nil {

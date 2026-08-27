@@ -151,18 +151,10 @@ func TestAdminRBACAdminMeReturnsSessionScopedAuthorization(t *testing.T) {
 	}
 
 	plain := doJSON(t, env.handler, http.MethodGet, "/api/v1/admin/me", nil, env.tokens["plain"], "")
-	if plain.Code != http.StatusOK {
-		t.Fatalf("plain /admin/me status = %d, want %d; body=%s", plain.Code, http.StatusOK, plain.Body.String())
+	if plain.Code != http.StatusForbidden {
+		t.Fatalf("plain /admin/me status = %d, want %d; body=%s", plain.Code, http.StatusForbidden, plain.Body.String())
 	}
-	var plainPayload struct {
-		GlobalSuperAdmin bool     `json:"global_super_admin"`
-		RoleCodes        []string `json:"role_codes"`
-		Permissions      []string `json:"permissions"`
-	}
-	decodeJSON(t, plain.Body.Bytes(), &plainPayload)
-	if plainPayload.GlobalSuperAdmin || len(plainPayload.RoleCodes) != 0 || len(plainPayload.Permissions) != 0 {
-		t.Fatalf("plain /admin/me payload = %+v, want empty authorization", plainPayload)
-	}
+	assertErrorCode(t, plain.Body.Bytes(), "AUTH_SESSION_AUDIENCE_MISMATCH")
 
 	failing := newAdminRBACHTTPTestEnv(t, "usr_broken")
 	failClosed := doJSON(t, failing.handler, http.MethodGet, "/api/v1/admin/me", nil, failing.tokens["broken"], "")
@@ -394,7 +386,7 @@ func TestAdminRBACLocalAdminCompatibilityRoutesRemainBuiltinOnly(t *testing.T) {
 		t.Fatalf("local admin change password status = %d, want %d; body=%s", changePassword.Code, http.StatusOK, changePassword.Body.String())
 	}
 
-	oldLogin := doLoginRequest(t, env.handler, "admin", "password")
+	oldLogin := doLoginRequest(t, env.handler, "admin", "local-admin-password")
 	if oldLogin.Code != http.StatusUnauthorized {
 		t.Fatalf("old local admin password login status = %d, want %d; body=%s", oldLogin.Code, http.StatusUnauthorized, oldLogin.Body.String())
 	}
@@ -519,14 +511,14 @@ func newAdminRBACHTTPTestEnv(t *testing.T, failUserID string) adminRBACHTTPTestE
 	}
 
 	if err := baseRepository.Run(context.Background(), func(state *store.State) error {
-		seedAdminRBACHTTPUser(t, state, now, "usr_reader", "reader", "reader-password", controlplane.RoleUser)
-		seedAdminRBACHTTPUser(t, state, now, "usr_roles", "roles-admin", "roles-password", controlplane.RoleUser)
-		seedAdminRBACHTTPUser(t, state, now, "usr_security", "security-admin", "security-password", controlplane.RoleUser)
-		seedAdminRBACHTTPUser(t, state, now, "usr_users_manager", "users-manager", "users-manager-password", controlplane.RoleUser)
+		seedAdminRBACHTTPUser(t, state, now, "usr_reader", "reader", "reader-password", controlplane.RoleAdmin)
+		seedAdminRBACHTTPUser(t, state, now, "usr_roles", "roles-admin", "roles-password", controlplane.RoleAdmin)
+		seedAdminRBACHTTPUser(t, state, now, "usr_security", "security-admin", "security-password", controlplane.RoleAdmin)
+		seedAdminRBACHTTPUser(t, state, now, "usr_users_manager", "users-manager", "users-manager-password", controlplane.RoleAdmin)
 		seedAdminRBACHTTPUser(t, state, now, "usr_plain", "plain-user", "plain-password", controlplane.RoleUser)
 		seedAdminRBACHTTPUser(t, state, now, "usr_target", "target-user", "target-password", controlplane.RoleUser)
-		seedAdminRBACHTTPUser(t, state, now, "usr_global", "global-admin", "global-password", controlplane.RoleUser)
-		seedAdminRBACHTTPUser(t, state, now, "usr_broken", "broken-admin", "broken-password", controlplane.RoleUser)
+		seedAdminRBACHTTPUser(t, state, now, "usr_global", "global-admin", "global-password", controlplane.RoleAdmin)
+		seedAdminRBACHTTPUser(t, state, now, "usr_broken", "broken-admin", "broken-password", controlplane.RoleAdmin)
 
 		for _, userID := range []string{"usr_reader", "usr_roles", "usr_security", "usr_users_manager", "usr_plain", "usr_target", "usr_global", "usr_broken"} {
 			state.UserProducts[userID+":autolive"] = controlplane.UserProductMembership{UserID: userID, Product: controlplane.ProductAutoLive, Status: "active"}
@@ -589,7 +581,7 @@ func newAdminRBACHTTPTestEnv(t *testing.T, failUserID string) adminRBACHTTPTestE
 
 	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{
 		Username: "admin",
-		Password: "password",
+		Password: "local-admin-password",
 	}, repository, store.NewMemorySecretStore(), nil, true)
 
 	return adminRBACHTTPTestEnv{
@@ -599,10 +591,10 @@ func newAdminRBACHTTPTestEnv(t *testing.T, failUserID string) adminRBACHTTPTestE
 			"roles":         loginWithCredentialsAtIPForTest(t, handler, `{"username":"roles-admin","password":"roles-password","product":"autolive"}`, "198.51.100.12:1234"),
 			"security":      loginWithCredentialsAtIPForTest(t, handler, `{"username":"security-admin","password":"security-password","product":"autolive"}`, "198.51.100.13:1234"),
 			"users_manager": loginWithCredentialsAtIPForTest(t, handler, `{"username":"users-manager","password":"users-manager-password","product":"autolive"}`, "198.51.100.17:1234"),
-			"plain":         loginWithCredentialsAtIPForTest(t, handler, `{"username":"plain-user","password":"plain-password","product":"autolive"}`, "198.51.100.14:1234"),
+			"plain":         loginWithCredentialsAtPathAndIPForTest(t, handler, "/api/v1/client/auth/login", `{"username":"plain-user","password":"plain-password","product":"autolive"}`, "198.51.100.14:1234"),
 			"global":        loginWithCredentialsAtIPForTest(t, handler, `{"username":"global-admin","password":"global-password","product":"autolive"}`, "198.51.100.15:1234"),
 			"broken":        loginWithCredentialsAtIPForTest(t, handler, `{"username":"broken-admin","password":"broken-password","product":"autolive"}`, "198.51.100.16:1234"),
-			"local":         loginWithCredentialsAtIPForTest(t, handler, `{"username":"admin","password":"password","product":"autolive"}`, "198.51.100.18:1234"),
+			"local":         loginWithCredentialsAtIPForTest(t, handler, `{"username":"admin","password":"local-admin-password","product":"autolive"}`, "198.51.100.18:1234"),
 		},
 	}
 }
@@ -667,9 +659,13 @@ func assertErrorCode(t *testing.T, body []byte, want string) {
 }
 
 func loginWithCredentialsAtIPForTest(t *testing.T, handler http.Handler, body, remoteAddr string) string {
+	return loginWithCredentialsAtPathAndIPForTest(t, handler, "/api/v1/auth/login", body, remoteAddr)
+}
+
+func loginWithCredentialsAtPathAndIPForTest(t *testing.T, handler http.Handler, path, body, remoteAddr string) string {
 	t.Helper()
 
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(body))
+	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.RemoteAddr = remoteAddr
 	response := httptest.NewRecorder()

@@ -124,7 +124,7 @@ func (b *auditResponseBuffer) flush(destination http.ResponseWriter) {
 }
 
 func shouldAuditUnauthenticatedRequest(r *http.Request) bool {
-	return r.Method == http.MethodPost && r.URL.Path == "/api/v1/auth/login"
+	return r.Method == http.MethodPost && (r.URL.Path == "/api/v1/auth/login" || r.URL.Path == "/api/v1/client/auth/login")
 }
 
 func successAuditForDevice(r *http.Request, actor controlplane.Actor, deviceID string) controlplane.AuditLogInput {

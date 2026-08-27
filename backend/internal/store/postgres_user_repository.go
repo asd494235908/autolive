@@ -16,9 +16,11 @@ import (
 
 var _ UserRepository = (*PostgresRepository)(nil)
 var _ UserCredentialReader = (*PostgresRepository)(nil)
+var _ UserCredentialHashUpdater = (*PostgresRepository)(nil)
 var _ UserReader = (*PostgresRepository)(nil)
 
 var ErrNormalizedUserCredentialReaderRequired = errors.New("normalized user credential reader is required")
+var ErrNormalizedUserCredentialHashUpdaterRequired = errors.New("normalized user credential hash updater is required")
 var ErrNormalizedUserReaderRequired = errors.New("normalized user reader is required")
 var ErrNormalizedUserRepositoryRequired = errors.New("normalized user repository is required")
 
@@ -82,6 +84,30 @@ func (s *PostgresRepository) GetUserCredential(ctx context.Context, username str
 	}
 	user.CreatedAt = createdAt.UTC().Format(time.RFC3339)
 	return user, append([]byte(nil), passwordHash...), nil
+}
+
+func (s *PostgresRepository) UpdateUserCredentialHash(ctx context.Context, userID string, oldHash, newHash []byte) (bool, error) {
+	if s.modelReadSource != ModelReadSourceNormalized {
+		return false, ErrNormalizedUserCredentialHashUpdaterRequired
+	}
+	if ctx == nil || strings.TrimSpace(userID) == "" || len(oldHash) == 0 || len(newHash) == 0 {
+		return false, controlplane.ErrInvalidRequest
+	}
+	operationCtx, cancel := s.operationContext(ctx)
+	defer cancel()
+	result, err := s.db.ExecContext(operationCtx, `
+		UPDATE users
+		SET password_hash = $3
+		WHERE id = $1 AND password_hash = $2
+	`, strings.TrimSpace(userID), oldHash, newHash)
+	if err != nil {
+		return false, postgresOperationError(operationCtx, fmt.Errorf("upgrade normalized user password hash: %w", err))
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read normalized password hash upgrade result: %w", err)
+	}
+	return updated == 1, nil
 }
 
 // CreateUser persists the normalized users and idempotency records in one

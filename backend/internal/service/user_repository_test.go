@@ -87,7 +87,7 @@ func TestNormalizedAdminCredentialOperationsUseRepositoryBoundary(t *testing.T) 
 		adminChange: controlplane.UserSummary{ID: "usr_local_admin", Username: "admin", Role: controlplane.RoleAdmin, Status: controlplane.UserStatusActive},
 	}
 	svc := NewControlPlaneWithRepository(repository)
-	if err := svc.EnsureConfiguredAdmin(context.Background(), "admin", "first-password"); err != nil {
+	if err := svc.EnsureConfiguredAdmin(context.Background(), "admin", "first-password-1"); err != nil {
 		t.Fatalf("EnsureConfiguredAdmin() error = %v", err)
 	}
 	if err := svc.CheckReady(context.Background()); err != nil {
@@ -112,7 +112,8 @@ func TestAuthenticateUserUsesNormalizedCredentialReader(t *testing.T) {
 		credentialUser: controlplane.UserSummary{ID: "usr_normalized", Username: "normalized", Role: controlplane.RoleUser, Status: controlplane.UserStatusActive, CreatedAt: "2026-08-21T12:00:00Z"},
 		credentialHash: hash,
 	}
-	svc := NewControlPlaneWithRepository(repository)
+	var upgradeErr error
+	svc := NewControlPlaneWithRepositoryAndSecretStoreAndOptions(repository, nil, nil, ControlPlaneOptions{PasswordUpgradeError: func(err error) { upgradeErr = err }})
 	actor, user, err := svc.AuthenticateUser(context.Background(), "normalized", "correct-password")
 	if err != nil {
 		t.Fatalf("AuthenticateUser() error = %v", err)
@@ -120,12 +121,15 @@ func TestAuthenticateUserUsesNormalizedCredentialReader(t *testing.T) {
 	if actor.UserID != user.ID || actor.Role != user.Role || user.ID != "usr_normalized" {
 		t.Fatalf("normalized authentication = actor:%+v user:%+v", actor, user)
 	}
+	if upgradeErr != store.ErrNormalizedUserCredentialHashUpdaterRequired {
+		t.Fatalf("password upgrade observer error = %v", upgradeErr)
+	}
 	if _, _, err := svc.AuthenticateUser(context.Background(), "normalized", "wrong-password"); !controlplane.IsErrorCode(err, controlplane.ErrUnauthenticated.Code) {
 		t.Fatalf("wrong password error = %v, want unauthenticated", err)
 	}
 	repository.credentialUser.Status = controlplane.UserStatusDisabled
-	if _, _, err := svc.AuthenticateUser(context.Background(), "normalized", "correct-password"); !controlplane.IsErrorCode(err, controlplane.ErrUserDisabled.Code) {
-		t.Fatalf("disabled user error = %v, want user disabled", err)
+	if _, _, err := svc.AuthenticateUser(context.Background(), "normalized", "correct-password"); !controlplane.IsErrorCode(err, controlplane.ErrUnauthenticated.Code) {
+		t.Fatalf("disabled user error = %v, want generic unauthenticated", err)
 	}
 	user, err = svc.GetUser(context.Background(), "usr_normalized")
 	if err != nil || user.ID != "usr_normalized" {

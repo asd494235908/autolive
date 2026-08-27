@@ -66,10 +66,18 @@ func main() {
 
 	healthTelemetry := httpapi.NewModelPoolHealthProbeMetrics()
 	retentionTelemetry := httpapi.NewRetentionCleanupMetrics()
+	loginThrottleKey, err := parseOptionalHMACKey(cfg.AuthThrottleHMACKey)
+	if err != nil {
+		logger.Error("login throttle key configuration failed", "error", err)
+		closeStorage()
+		os.Exit(1)
+	}
 	handler, authRetentionCleaner := httpapi.NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTelemetryAndRetentionCleaner(cfg.ServiceVersion, logger, httpapi.AuthConfig{
-		Username:          cfg.AdminUsername,
-		Password:          cfg.AdminPassword,
-		UsePersistedAdmin: cfg.StorageMode == config.StorageModePostgres && cfg.AdminUsername == "" && cfg.AdminPassword == "",
+		Username:            cfg.AdminUsername,
+		Password:            cfg.AdminPassword,
+		UsePersistedAdmin:   cfg.StorageMode == config.StorageModePostgres && cfg.AdminUsername == "" && cfg.AdminPassword == "",
+		AuthThrottleHMACKey: loginThrottleKey,
+		TrustedProxyCIDRs:   cfg.TrustedProxyCIDRs,
 	}, storage.repository, storage.secretStore, storage.sessionStore, cfg.AllowInsecureHTTP, healthTelemetry, retentionTelemetry)
 	healthControlPlane := service.NewControlPlaneWithRepositoryAndSecretStoreAndOptions(storage.repository, nil, storage.secretStore, service.ControlPlaneOptions{AllowInsecureHTTP: cfg.AllowInsecureHTTP})
 	healthScheduler, err := service.NewModelPoolHealthProbeScheduler(healthControlPlane, service.ModelPoolHealthProbeSchedulerOptions{
@@ -98,6 +106,7 @@ func main() {
 			AuditOutboxDispatcher: healthControlPlane.DispatchAuditOutbox,
 			Policy: service.RetentionCleanupPolicy{
 				AuthSessionTTL:       cfg.AuthSessionRetentionTTL,
+				AuthThrottleTTL:      cfg.AuthThrottleRetentionTTL,
 				IdempotencyRecordTTL: cfg.IdempotencyRetentionTTL,
 				ModelTestResultTTL:   cfg.ModelTestRetentionTTL,
 				AuditLogTTL:          cfg.AuditLogRetentionTTL,
@@ -262,9 +271,35 @@ func openStorage(cfg config.Config) (storageRuntime, error) {
 }
 
 func parseSecretEncryptionKey(raw string) ([]byte, error) {
+	return parseRequired32ByteKey(raw, "APP_SECRET_ENCRYPTION_KEY", " for PostgreSQL mode")
+}
+
+func parseOptionalHMACKey(raw string) ([]byte, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	raw = strings.TrimSpace(raw)
+	var key []byte
+	var err error
+	if len(raw)%2 == 0 {
+		key, err = hex.DecodeString(raw)
+	}
+	if err != nil || len(key) == 0 {
+		key, err = base64.RawStdEncoding.DecodeString(raw)
+		if err != nil {
+			key, err = base64.StdEncoding.DecodeString(raw)
+		}
+	}
+	if err != nil || len(key) < 32 || len(key) > 128 {
+		return nil, errors.New("APP_AUTH_THROTTLE_HMAC_KEY must be 32 to 128 bytes encoded as hex or base64")
+	}
+	return key, nil
+}
+
+func parseRequired32ByteKey(raw, name, requiredContext string) ([]byte, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return nil, errors.New("APP_SECRET_ENCRYPTION_KEY must be set for PostgreSQL mode")
+		return nil, fmt.Errorf("%s must be set%s", name, requiredContext)
 	}
 	if len(raw) == 64 {
 		key, err := hex.DecodeString(raw)
@@ -277,7 +312,7 @@ func parseSecretEncryptionKey(raw string) ([]byte, error) {
 		key, err = base64.StdEncoding.DecodeString(raw)
 	}
 	if err != nil || len(key) != 32 {
-		return nil, errors.New("APP_SECRET_ENCRYPTION_KEY must be 32 bytes encoded as 64 hex characters or base64")
+		return nil, fmt.Errorf("%s must be 32 bytes encoded as 64 hex characters or base64", name)
 	}
 	return key, nil
 }

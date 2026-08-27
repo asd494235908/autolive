@@ -59,7 +59,7 @@ func TestAccountActivationCannotUseAnotherUsersAuthorization(t *testing.T) {
 	if err := svc.EnsureLocalAdmin(ctx, "admin"); err != nil {
 		t.Fatalf("EnsureLocalAdmin() error = %v", err)
 	}
-	user, err := svc.CreateUser(ctx, "account-user", controlplane.CreateUserInput{Username: "account_user", Password: "password-123", Role: controlplane.RoleUser})
+	user, err := svc.CreateUser(ctx, "account-user", controlplane.CreateUserInput{Username: "account_user", Password: "password-123-001", Role: controlplane.RoleUser})
 	if err != nil {
 		t.Fatalf("CreateUser() error = %v", err)
 	}
@@ -170,7 +170,7 @@ func TestAccountActivationReturnsStableExistingDeviceErrors(t *testing.T) {
 	if _, err := svc.ActivateDevice(ctx, "stable-errors-disabled-relogin", "usr_local_admin", controlplane.ActivateDeviceInput{Device: device}); !controlplane.IsErrorCode(err, "DEVICE_DISABLED") {
 		t.Fatalf("disabled device error = %v, want DEVICE_DISABLED", err)
 	}
-	other, err := svc.CreateUser(ctx, "stable-errors-user", controlplane.CreateUserInput{Username: "stable_error_user", Password: "password-123", Role: controlplane.RoleUser})
+	other, err := svc.CreateUser(ctx, "stable-errors-user", controlplane.CreateUserInput{Username: "stable_error_user", Password: "password-123-001", Role: controlplane.RoleUser})
 	if err != nil {
 		t.Fatalf("CreateUser() error = %v", err)
 	}

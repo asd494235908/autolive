@@ -9,9 +9,10 @@ import (
 func TestUnbindDeviceUsesUnboundResponseWithoutUserID(t *testing.T) {
 	handler := newTestRouter(t)
 	token := loginForTest(t, handler)
+	clientToken, userID := createDesktopUserForTest(t, handler, token, "unbind-contract-user")
 
 	create := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
-		"user_id":     "usr_local_admin",
+		"user_id":     userID,
 		"expires_at":  testActivationExpiresAt(),
 		"max_devices": 1,
 	}, token, "unbind-contract-code")
@@ -26,7 +27,7 @@ func TestUnbindDeviceUsesUnboundResponseWithoutUserID(t *testing.T) {
 			"platform":    "windows",
 			"app_version": "1.0.0",
 		},
-	}, token, "unbind-contract-activate")
+	}, clientToken, "unbind-contract-activate")
 	if activate.Code != http.StatusOK {
 		t.Fatalf("activate status = %d, want %d; body=%s", activate.Code, http.StatusOK, activate.Body.String())
 	}
@@ -54,8 +55,9 @@ func TestUnbindDeviceUsesUnboundResponseWithoutUserID(t *testing.T) {
 func TestDeviceActivationAuditUsesDeviceTargetWithoutPlainCode(t *testing.T) {
 	handler := newTestRouter(t)
 	token := loginForTest(t, handler)
+	clientToken, userID := createDesktopUserForTest(t, handler, token, "audit-activation-user")
 	create := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
-		"user_id":     "usr_local_admin",
+		"user_id":     userID,
 		"expires_at":  testActivationExpiresAt(),
 		"max_devices": 1,
 	}, token, "audit-activation-code")
@@ -70,7 +72,7 @@ func TestDeviceActivationAuditUsesDeviceTargetWithoutPlainCode(t *testing.T) {
 			"platform":    "windows",
 			"app_version": "1.0.0",
 		},
-	}, token, "audit-activation-request")
+	}, clientToken, "audit-activation-request")
 	if activate.Code != http.StatusOK {
 		t.Fatalf("activate status = %d, want %d; body=%s", activate.Code, http.StatusOK, activate.Body.String())
 	}
@@ -99,8 +101,9 @@ func TestDeviceActivationAuditUsesDeviceTargetWithoutPlainCode(t *testing.T) {
 func TestRevokeFullAccountAuthorizationAllowsUsedStatus(t *testing.T) {
 	handler := newTestRouter(t)
 	token := loginForTest(t, handler)
+	clientToken, userID := createDesktopUserForTest(t, handler, token, "revoke-full-user")
 	create := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
-		"user_id":     "usr_local_admin",
+		"user_id":     userID,
 		"expires_at":  testActivationExpiresAt(),
 		"max_devices": 1,
 	}, token, "revoke-full-code")
@@ -117,7 +120,7 @@ func TestRevokeFullAccountAuthorizationAllowsUsedStatus(t *testing.T) {
 			"platform":    "windows",
 			"app_version": "1.0.0",
 		},
-	}, token, "revoke-full-activate")
+	}, clientToken, "revoke-full-activate")
 	if activate.Code != http.StatusOK {
 		t.Fatalf("activate status = %d, want %d; body=%s", activate.Code, http.StatusOK, activate.Body.String())
 	}

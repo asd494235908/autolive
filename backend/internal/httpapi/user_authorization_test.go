@@ -22,7 +22,7 @@ func TestAdminUserAuthorizationSummaryEndpoint(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed authorization summary state: %v", err)
 	}
-	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{Username: "admin", Password: "password"}, repository, store.NewMemorySecretStore(), nil, true)
+	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{Username: "admin", Password: testAdminPassword}, repository, store.NewMemorySecretStore(), nil, true)
 	token := loginForTest(t, handler)
 	rec := doJSON(t, handler, http.MethodGet, "/api/v1/admin/users/usr_summary/authorization-summary", nil, token, "")
 	if rec.Code != http.StatusOK {
@@ -46,7 +46,7 @@ func TestAdminUserAuthorizationPolicyEndpoint(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed policy state: %v", err)
 	}
-	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{Username: "admin", Password: "password"}, repository, store.NewMemorySecretStore(), nil, true)
+	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{Username: "admin", Password: testAdminPassword}, repository, store.NewMemorySecretStore(), nil, true)
 	token := loginForTest(t, handler)
 	rec := doJSON(t, handler, http.MethodPatch, "/api/v1/admin/users/usr_policy/authorization", map[string]any{
 		"allowed_models": []string{"openai/rewrite"}, "daily_token_limit": 500,

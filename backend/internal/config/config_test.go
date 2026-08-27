@@ -12,6 +12,8 @@ func TestLoadFromEnvUsesDefaults(t *testing.T) {
 	t.Setenv("APP_DATABASE_URL", "")
 	t.Setenv("APP_MIGRATION_METRICS_FILE", "")
 	t.Setenv("APP_SECRET_ENCRYPTION_KEY", "")
+	t.Setenv("APP_AUTH_THROTTLE_HMAC_KEY", "")
+	t.Setenv("APP_TRUSTED_PROXY_CIDRS", "")
 	t.Setenv("APP_MODEL_READ_SOURCE", "")
 	t.Setenv("APP_SHUTDOWN_TIMEOUT", "")
 	t.Setenv("APP_REQUEST_TIMEOUT", "")
@@ -26,6 +28,7 @@ func TestLoadFromEnvUsesDefaults(t *testing.T) {
 	t.Setenv("APP_RETENTION_CLEANUP_TIMEOUT", "")
 	t.Setenv("APP_RETENTION_CLEANUP_BATCH", "")
 	t.Setenv("APP_AUTH_SESSION_RETENTION_TTL", "")
+	t.Setenv("APP_AUTH_THROTTLE_RETENTION_TTL", "")
 	t.Setenv("APP_IDEMPOTENCY_RETENTION_TTL", "")
 	t.Setenv("APP_MODEL_TEST_RETENTION_TTL", "")
 	t.Setenv("APP_AUDIT_LOG_RETENTION_TTL", "")
@@ -64,7 +67,7 @@ func TestLoadFromEnvUsesDefaults(t *testing.T) {
 	if cfg.ModelHealthProbeInterval != defaultModelHealthProbeInterval || cfg.ModelHealthProbeTimeout != defaultModelHealthProbeTimeout || cfg.ModelHealthProbeMaxConcurrent != defaultModelHealthProbeMaxConcurrent || cfg.ModelHealthProbeMaxAccounts != defaultModelHealthProbeMaxAccounts {
 		t.Fatalf("health probe defaults = interval %v timeout %v concurrency %d accounts %d", cfg.ModelHealthProbeInterval, cfg.ModelHealthProbeTimeout, cfg.ModelHealthProbeMaxConcurrent, cfg.ModelHealthProbeMaxAccounts)
 	}
-	if cfg.RetentionCleanupInterval != defaultRetentionCleanupInterval || cfg.RetentionCleanupTimeout != defaultRetentionCleanupTimeout || cfg.RetentionCleanupBatch != defaultRetentionCleanupBatch || cfg.AuthSessionRetentionTTL != defaultAuthSessionRetentionTTL || cfg.IdempotencyRetentionTTL != defaultIdempotencyRetentionTTL || cfg.ModelTestRetentionTTL != defaultModelTestRetentionTTL || cfg.AuditLogRetentionTTL != defaultAuditLogRetentionTTL {
+	if cfg.RetentionCleanupInterval != defaultRetentionCleanupInterval || cfg.RetentionCleanupTimeout != defaultRetentionCleanupTimeout || cfg.RetentionCleanupBatch != defaultRetentionCleanupBatch || cfg.AuthSessionRetentionTTL != defaultAuthSessionRetentionTTL || cfg.AuthThrottleRetentionTTL != defaultAuthThrottleRetentionTTL || cfg.IdempotencyRetentionTTL != defaultIdempotencyRetentionTTL || cfg.ModelTestRetentionTTL != defaultModelTestRetentionTTL || cfg.AuditLogRetentionTTL != defaultAuditLogRetentionTTL {
 		t.Fatalf("retention defaults = %+v", cfg)
 	}
 	if cfg.DeploymentEnvironment != DeploymentEnvironmentDevelopment {
@@ -87,6 +90,7 @@ func TestLoadFromEnvParsesSemanticValues(t *testing.T) {
 	t.Setenv("APP_RETENTION_CLEANUP_TIMEOUT", "11s")
 	t.Setenv("APP_RETENTION_CLEANUP_BATCH", "17")
 	t.Setenv("APP_AUTH_SESSION_RETENTION_TTL", "10h")
+	t.Setenv("APP_AUTH_THROTTLE_RETENTION_TTL", "9h")
 	t.Setenv("APP_IDEMPOTENCY_RETENTION_TTL", "11h")
 	t.Setenv("APP_MODEL_TEST_RETENTION_TTL", "12h")
 	t.Setenv("APP_AUDIT_LOG_RETENTION_TTL", "13h")
@@ -110,7 +114,7 @@ func TestLoadFromEnvParsesSemanticValues(t *testing.T) {
 	if cfg.ModelHealthProbeInterval != 2*time.Minute || cfg.ModelHealthProbeTimeout != 7*time.Second || cfg.ModelHealthProbeMaxConcurrent != 3 || cfg.ModelHealthProbeMaxAccounts != 9 {
 		t.Fatalf("health probe config = interval %v timeout %v concurrency %d accounts %d", cfg.ModelHealthProbeInterval, cfg.ModelHealthProbeTimeout, cfg.ModelHealthProbeMaxConcurrent, cfg.ModelHealthProbeMaxAccounts)
 	}
-	if cfg.RetentionCleanupInterval != 2*time.Hour || cfg.RetentionCleanupTimeout != 11*time.Second || cfg.RetentionCleanupBatch != 17 || cfg.AuthSessionRetentionTTL != 10*time.Hour || cfg.IdempotencyRetentionTTL != 11*time.Hour || cfg.ModelTestRetentionTTL != 12*time.Hour || cfg.AuditLogRetentionTTL != 13*time.Hour {
+	if cfg.RetentionCleanupInterval != 2*time.Hour || cfg.RetentionCleanupTimeout != 11*time.Second || cfg.RetentionCleanupBatch != 17 || cfg.AuthSessionRetentionTTL != 10*time.Hour || cfg.AuthThrottleRetentionTTL != 9*time.Hour || cfg.IdempotencyRetentionTTL != 11*time.Hour || cfg.ModelTestRetentionTTL != 12*time.Hour || cfg.AuditLogRetentionTTL != 13*time.Hour {
 		t.Fatalf("retention config = %+v", cfg)
 	}
 }
@@ -288,6 +292,7 @@ func TestLoadFromEnvRequiresHTTPSPublicURLInProduction(t *testing.T) {
 	t.Setenv("APP_DATABASE_URL", "postgres://example")
 	t.Setenv("APP_DEPLOYMENT_ENV", DeploymentEnvironmentProduction)
 	t.Setenv("APP_PUBLIC_BASE_URL", "")
+	t.Setenv("APP_AUTH_THROTTLE_HMAC_KEY", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
 	if _, err := LoadFromEnv(); err == nil {
 		t.Fatal("LoadFromEnv() error = nil, want missing production public URL error")
 	}
@@ -304,6 +309,18 @@ func TestLoadFromEnvRequiresHTTPSPublicURLInProduction(t *testing.T) {
 	}
 	if cfg.PublicBaseURL != "https://admin.example.com" {
 		t.Fatalf("PublicBaseURL = %q", cfg.PublicBaseURL)
+	}
+}
+
+func TestLoadFromEnvValidatesTrustedProxyCIDRs(t *testing.T) {
+	t.Setenv("APP_TRUSTED_PROXY_CIDRS", "10.0.0.0/8, 2001:db8::/32")
+	cfg, err := LoadFromEnv()
+	if err != nil || len(cfg.TrustedProxyCIDRs) != 2 {
+		t.Fatalf("trusted proxy config = %+v, error %v", cfg.TrustedProxyCIDRs, err)
+	}
+	t.Setenv("APP_TRUSTED_PROXY_CIDRS", "not-a-cidr")
+	if _, err := LoadFromEnv(); err == nil {
+		t.Fatal("invalid trusted proxy CIDR accepted")
 	}
 }
 

@@ -10,8 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-
+	"autoLive/backend/internal/authn"
 	"autoLive/backend/internal/controlplane"
 	"autoLive/backend/internal/store"
 )
@@ -21,18 +20,21 @@ var (
 )
 
 type ControlPlane struct {
-	repository        store.Repository
-	secretStore       store.SecretStore
-	httpClient        *http.Client
-	modelPoolResolver modelPoolIPResolver
-	allowInsecureHTTP bool
+	repository           store.Repository
+	secretStore          store.SecretStore
+	httpClient           *http.Client
+	modelPoolResolver    modelPoolIPResolver
+	allowInsecureHTTP    bool
+	passwords            *authn.PasswordManager
+	passwordUpgradeError func(error)
 }
 
 // ControlPlaneOptions controls outbound behavior that must be explicit at the
 // application boundary. Insecure HTTP is disabled by default and is intended
 // only for controlled development or test environments.
 type ControlPlaneOptions struct {
-	AllowInsecureHTTP bool
+	AllowInsecureHTTP    bool
+	PasswordUpgradeError func(error)
 }
 
 const deviceOnlineThreshold = 2 * time.Minute
@@ -85,7 +87,7 @@ func newControlPlaneWithRepositoryAndSecretStoreOptions(repository store.Reposit
 	if resolver == nil {
 		resolver = defaultModelPoolIPResolver
 	}
-	return &ControlPlane{repository: repository, secretStore: secretStore, httpClient: client, modelPoolResolver: resolver, allowInsecureHTTP: options.AllowInsecureHTTP}
+	return &ControlPlane{repository: repository, secretStore: secretStore, httpClient: client, modelPoolResolver: resolver, allowInsecureHTTP: options.AllowInsecureHTTP, passwords: authn.NewPasswordManager(), passwordUpgradeError: options.PasswordUpgradeError}
 }
 
 func (s *ControlPlane) EnsureLocalAdmin(ctx context.Context, username string) error {
@@ -119,17 +121,17 @@ func (s *ControlPlane) EnsureLocalAdmin(ctx context.Context, username string) er
 }
 
 // EnsureConfiguredAdmin creates the bootstrap administrator with a persisted
-// bcrypt credential. Existing credentials are never overwritten by a process
+// password credential. Existing credentials are never overwritten by a process
 // restart; password changes must go through an explicit control-plane command.
 func (s *ControlPlane) EnsureConfiguredAdmin(ctx context.Context, username, password string) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
 	username = strings.TrimSpace(username)
-	if username == "" || len(username) > 64 || len(password) < 8 || len(password) > 256 {
+	if username == "" || len(username) > 64 || !authn.ValidNewPassword(password) {
 		return errors.New("configured administrator credentials are invalid")
 	}
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	passwordHash, err := s.passwords.Hash(ctx, password)
 	if err != nil {
 		return fmt.Errorf("hash configured administrator password: %w", err)
 	}
@@ -179,10 +181,10 @@ func (s *ControlPlane) ChangeLocalAdminPassword(ctx context.Context, idempotency
 	if err := checkContext(ctx); err != nil {
 		return controlplane.UserSummary{}, err
 	}
-	if !validIdempotencyKey(idempotencyKey) || len(input.Password) < 12 || len(input.Password) > 256 {
+	if !validIdempotencyKey(idempotencyKey) || !authn.ValidNewPassword(input.Password) {
 		return controlplane.UserSummary{}, controlplane.ErrInvalidRequest
 	}
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
+	passwordHash, err := s.passwords.Hash(ctx, input.Password)
 	if err != nil {
 		return controlplane.UserSummary{}, fmt.Errorf("hash local administrator password: %w", err)
 	}
@@ -823,7 +825,7 @@ func (s *ControlPlane) CreateUser(ctx context.Context, idempotencyKey string, in
 	if err := validateCreateUserInput(input); err != nil {
 		return controlplane.UserSummary{}, err
 	}
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
+	passwordHash, err := s.passwords.Hash(ctx, input.Password)
 	if err != nil {
 		return controlplane.UserSummary{}, fmt.Errorf("hash user password: %w", err)
 	}
@@ -880,7 +882,7 @@ func (s *ControlPlane) AuthenticateUser(ctx context.Context, username, password 
 		return controlplane.Actor{}, controlplane.UserSummary{}, err
 	}
 	username = strings.TrimSpace(username)
-	if username == "" || password == "" {
+	if username == "" || password == "" || len(password) > authn.MaxPasswordBytes {
 		return controlplane.Actor{}, controlplane.UserSummary{}, controlplane.ErrUnauthenticated
 	}
 	if source, ok := s.repository.(store.NormalizedReadSource); ok && source.UsesNormalizedReadSource() {
@@ -890,13 +892,35 @@ func (s *ControlPlane) AuthenticateUser(ctx context.Context, username, password 
 		}
 		user, passwordHash, err := reader.GetUserCredential(ctx, username)
 		if err != nil {
+			if controlplane.IsErrorCode(err, controlplane.ErrUnauthenticated.Code) {
+				if dummyErr := s.passwords.DummyVerify(ctx, password); dummyErr != nil {
+					return controlplane.Actor{}, controlplane.UserSummary{}, dummyErr
+				}
+				return controlplane.Actor{}, controlplane.UserSummary{}, controlplane.ErrUnauthenticated
+			}
 			return controlplane.Actor{}, controlplane.UserSummary{}, err
 		}
-		if user.Status != controlplane.UserStatusActive {
-			return controlplane.Actor{}, controlplane.UserSummary{}, controlplane.ErrUserDisabled
+		valid, needsUpgrade, verifyErr := s.passwords.Verify(ctx, passwordHash, password)
+		if verifyErr != nil {
+			if dummyErr := s.passwords.DummyVerify(ctx, password); dummyErr != nil {
+				return controlplane.Actor{}, controlplane.UserSummary{}, dummyErr
+			}
 		}
-		if bcrypt.CompareHashAndPassword(passwordHash, []byte(password)) != nil {
+		if verifyErr != nil || !valid || user.Status != controlplane.UserStatusActive {
 			return controlplane.Actor{}, controlplane.UserSummary{}, controlplane.ErrUnauthenticated
+		}
+		if needsUpgrade {
+			if updater, ok := s.repository.(store.UserCredentialHashUpdater); ok {
+				if upgradedHash, hashErr := s.passwords.Hash(ctx, password); hashErr == nil {
+					if _, updateErr := updater.UpdateUserCredentialHash(ctx, user.ID, passwordHash, upgradedHash); updateErr != nil {
+						s.reportPasswordUpgradeError(updateErr)
+					}
+				} else {
+					s.reportPasswordUpgradeError(hashErr)
+				}
+			} else {
+				s.reportPasswordUpgradeError(store.ErrNormalizedUserCredentialHashUpdaterRequired)
+			}
 		}
 		return controlplane.Actor{UserID: user.ID, Role: user.Role}, user, nil
 	}
@@ -909,18 +933,28 @@ func (s *ControlPlane) AuthenticateUser(ctx context.Context, username, password 
 			if user.Username != username {
 				continue
 			}
-			if user.Status != controlplane.UserStatusActive {
-				return struct {
-					Actor controlplane.Actor
-					User  controlplane.UserSummary
-				}{}, controlplane.ErrUserDisabled
-			}
 			hash := state.UserCredentialHashes[user.ID]
-			if bcrypt.CompareHashAndPassword(hash, []byte(password)) != nil {
+			valid, needsUpgrade, verifyErr := s.passwords.Verify(ctx, hash, password)
+			if verifyErr != nil {
+				if dummyErr := s.passwords.DummyVerify(ctx, password); dummyErr != nil {
+					return struct {
+						Actor controlplane.Actor
+						User  controlplane.UserSummary
+					}{}, dummyErr
+				}
+			}
+			if verifyErr != nil || !valid || user.Status != controlplane.UserStatusActive {
 				return struct {
 					Actor controlplane.Actor
 					User  controlplane.UserSummary
 				}{}, controlplane.ErrUnauthenticated
+			}
+			if needsUpgrade {
+				if upgradedHash, hashErr := s.passwords.Hash(ctx, password); hashErr == nil {
+					state.UserCredentialHashes[user.ID] = upgradedHash
+				} else {
+					s.reportPasswordUpgradeError(hashErr)
+				}
 			}
 			return struct {
 				Actor controlplane.Actor
@@ -929,6 +963,12 @@ func (s *ControlPlane) AuthenticateUser(ctx context.Context, username, password 
 				Actor: controlplane.Actor{UserID: user.ID, Role: user.Role},
 				User:  user,
 			}, nil
+		}
+		if dummyErr := s.passwords.DummyVerify(ctx, password); dummyErr != nil {
+			return struct {
+				Actor controlplane.Actor
+				User  controlplane.UserSummary
+			}{}, dummyErr
 		}
 		return struct {
 			Actor controlplane.Actor
@@ -939,6 +979,12 @@ func (s *ControlPlane) AuthenticateUser(ctx context.Context, username, password 
 		return controlplane.Actor{}, controlplane.UserSummary{}, err
 	}
 	return result.Actor, result.User, nil
+}
+
+func (s *ControlPlane) reportPasswordUpgradeError(err error) {
+	if err != nil && s.passwordUpgradeError != nil {
+		s.passwordUpgradeError(err)
+	}
 }
 
 func (s *ControlPlane) DisableUser(ctx context.Context, idempotencyKey, userID string) (controlplane.UserSummary, error) {
@@ -1070,14 +1116,14 @@ func (s *ControlPlane) ResetUserPassword(ctx context.Context, idempotencyKey, us
 	if !validIdempotencyKey(idempotencyKey) {
 		return controlplane.UserSummary{}, controlplane.ErrIdempotencyKeyRequired
 	}
-	if len(input.Password) < 8 || len(input.Password) > 256 {
+	if !authn.ValidNewPassword(input.Password) {
 		return controlplane.UserSummary{}, controlplane.ErrInvalidRequest
 	}
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
 		return controlplane.UserSummary{}, controlplane.ErrUserNotFound
 	}
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
+	passwordHash, err := s.passwords.Hash(ctx, input.Password)
 	if err != nil {
 		return controlplane.UserSummary{}, fmt.Errorf("hash user password: %w", err)
 	}
@@ -4463,7 +4509,7 @@ func formatActivationExpiryString(expiresAt string) *string {
 
 func validateCreateUserInput(input controlplane.CreateUserInput) error {
 	username := strings.TrimSpace(input.Username)
-	if len(username) < 3 || len(username) > 64 || len(input.Password) < 8 || len(input.Password) > 256 {
+	if len(username) < 3 || len(username) > 64 || !authn.ValidNewPassword(input.Password) {
 		return controlplane.ErrInvalidRequest
 	}
 	if input.Role != controlplane.RoleAdmin && input.Role != controlplane.RoleUser {

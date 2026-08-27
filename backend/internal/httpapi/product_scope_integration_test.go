@@ -255,9 +255,9 @@ func newProductScopeIntegrationRouter(t *testing.T) (http.Handler, string, strin
 	}); err != nil {
 		t.Fatalf("bind product admin users.read role: %v", err)
 	}
-	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{Username: "admin", Password: "password"}, repository, store.NewMemorySecretStore(), nil, true)
+	handler := NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptions("test", nil, AuthConfig{Username: "admin", Password: testAdminPassword}, repository, store.NewMemorySecretStore(), nil, true)
 	return handler,
-		loginWithCredentialsForTest(t, handler, `{"username":"admin","password":"password","product":"autolive"}`),
+		loginWithCredentialsForTest(t, handler, `{"username":"admin","password":"correct-password","product":"autolive"}`),
 		loginWithCredentialsForTest(t, handler, `{"username":"ordinary-admin","password":"ordinary-password","product":"autolive"}`)
 }
 

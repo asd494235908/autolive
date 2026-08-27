@@ -86,7 +86,7 @@ func boundedRetentionRunStatus(status service.RetentionCleanupRunStatus) string 
 
 func boundedRetentionDataset(dataset service.RetentionCleanupDataset) string {
 	switch dataset {
-	case service.RetentionCleanupDatasetAuthSessions, service.RetentionCleanupDatasetOrphanedDeviceBindings, service.RetentionCleanupDatasetStagedSecrets, service.RetentionCleanupDatasetIdempotencyRecords, service.RetentionCleanupDatasetModelTestResults, service.RetentionCleanupDatasetAuditLogs, service.RetentionCleanupDatasetUnknown:
+	case service.RetentionCleanupDatasetAuthSessions, service.RetentionCleanupDatasetAuthThrottleBuckets, service.RetentionCleanupDatasetOrphanedDeviceBindings, service.RetentionCleanupDatasetStagedSecrets, service.RetentionCleanupDatasetIdempotencyRecords, service.RetentionCleanupDatasetModelTestResults, service.RetentionCleanupDatasetAuditLogs, service.RetentionCleanupDatasetUnknown:
 		return string(dataset)
 	default:
 		return string(service.RetentionCleanupDatasetUnknown)

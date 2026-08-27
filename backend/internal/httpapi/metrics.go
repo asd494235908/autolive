@@ -350,7 +350,7 @@ func metricRoute(r *http.Request) string {
 	switch {
 	case path == "/api/v1/health", path == "/api/v1/livez", path == "/api/v1/readyz":
 		return path
-	case path == "/api/v1/auth/login", path == "/api/v1/auth/refresh", path == "/api/v1/auth/logout":
+	case path == "/api/v1/auth/login", path == "/api/v1/client/auth/login", path == "/api/v1/auth/refresh", path == "/api/v1/auth/logout":
 		return path
 	case strings.HasPrefix(path, "/api/v1/admin/users/"):
 		return "/api/v1/admin/users/:id"

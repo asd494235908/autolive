@@ -112,9 +112,10 @@ func TestPostgresMigration23CompatibilityAndOrphanRecovery(t *testing.T) {
 		}
 		if _, err := schemaDB.ExecContext(context.Background(), `
 			INSERT INTO auth_sessions (
-				id, user_id, device_id, access_token_hash, refresh_token_hash,
+				id, user_id, audience, device_id, access_token_hash, refresh_token_hash,
+				token_family_id, generation,
 				access_expires_at, refresh_expires_at, created_at, device_bound_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			) VALUES ($1, $2, 'desktop', $3, $4, $5, $1, 0, $6, $7, $8, $9)
 		`, sessionID, userID, deviceID, "access-"+sessionID, "refresh-"+sessionID, now.Add(time.Hour), now.Add(24*time.Hour), now, now); err != nil {
 			t.Fatalf("insert legacy-shaped auth session after 0023: %v", err)
 		}
@@ -260,14 +261,20 @@ func applyMigrationsToVersion(t *testing.T, database *sql.DB, migrationTable str
 	if err != nil {
 		t.Fatalf("open embedded migrations: %v", err)
 	}
-	driver, err := postgres.WithInstance(database, &postgres.Config{
+	connection, err := database.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open postgres migration connection: %v", err)
+	}
+	driver, err := postgres.WithConnection(context.Background(), connection, &postgres.Config{
 		MigrationsTable: migrationTable,
 	})
 	if err != nil {
+		_ = connection.Close()
 		t.Fatalf("create postgres migration driver: %v", err)
 	}
 	migrator, err := migrate.NewWithInstance("iofs", source, "postgres", driver)
 	if err != nil {
+		_ = driver.Close()
 		t.Fatalf("create migration runner: %v", err)
 	}
 	defer func() {

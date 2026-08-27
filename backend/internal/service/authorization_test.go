@@ -19,7 +19,7 @@ func TestUpdateUserAuthorizationNormalizesAndIsIdempotent(t *testing.T) {
 	if err := svc.EnsureLocalAdmin(ctx, "admin"); err != nil {
 		t.Fatalf("EnsureLocalAdmin() error = %v", err)
 	}
-	user, err := svc.CreateUser(ctx, "create-policy-user", controlplane.CreateUserInput{Username: "policy-user", Password: "password-123", Role: controlplane.RoleUser})
+	user, err := svc.CreateUser(ctx, "create-policy-user", controlplane.CreateUserInput{Username: "policy-user", Password: "password-123-001", Role: controlplane.RoleUser})
 	if err != nil {
 		t.Fatalf("CreateUser() error = %v", err)
 	}

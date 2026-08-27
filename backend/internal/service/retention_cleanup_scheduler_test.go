@@ -19,6 +19,7 @@ func TestRetentionCleanupSchedulerRunsAllDatasetsWithBoundedCutoffs(t *testing.T
 		BatchSize:        23,
 		Policy: RetentionCleanupPolicy{
 			AuthSessionTTL:       24 * time.Hour,
+			AuthThrottleTTL:      36 * time.Hour,
 			IdempotencyRecordTTL: 48 * time.Hour,
 			ModelTestResultTTL:   72 * time.Hour,
 			AuditLogTTL:          96 * time.Hour,
@@ -33,19 +34,20 @@ func TestRetentionCleanupSchedulerRunsAllDatasetsWithBoundedCutoffs(t *testing.T
 	if err != nil {
 		t.Fatalf("RunOnce() error = %v", err)
 	}
-	if summary != (RetentionCleanupSummary{AuthSessions: 1, IdempotencyRecords: 2, ModelTestResults: 3, AuditLogs: 4}) {
+	if summary != (RetentionCleanupSummary{AuthSessions: 1, AuthThrottleBuckets: 5, IdempotencyRecords: 2, ModelTestResults: 3, AuditLogs: 4}) {
 		t.Fatalf("summary = %+v", summary)
 	}
 	cleaner.mu.Lock()
 	defer cleaner.mu.Unlock()
-	if len(cleaner.requests) != 4 {
-		t.Fatalf("cleanup requests = %+v, want 4", cleaner.requests)
+	if len(cleaner.requests) != 5 {
+		t.Fatalf("cleanup requests = %+v, want 5", cleaner.requests)
 	}
 	want := map[string]time.Time{
-		"auth_sessions":       now.Add(-24 * time.Hour),
-		"idempotency_records": now.Add(-48 * time.Hour),
-		"model_test_results":  now.Add(-72 * time.Hour),
-		"audit_logs":          now.Add(-96 * time.Hour),
+		"auth_sessions":         now.Add(-24 * time.Hour),
+		"auth_throttle_buckets": now.Add(-36 * time.Hour),
+		"idempotency_records":   now.Add(-48 * time.Hour),
+		"model_test_results":    now.Add(-72 * time.Hour),
+		"audit_logs":            now.Add(-96 * time.Hour),
 	}
 	for _, request := range cleaner.requests {
 		if request.request.BatchSize != 23 {
@@ -60,7 +62,7 @@ func TestRetentionCleanupSchedulerRunsAllDatasetsWithBoundedCutoffs(t *testing.T
 	if telemetry.runStatus != RetentionCleanupRunCompleted || telemetry.runDuration < 0 {
 		t.Fatalf("run telemetry = %+v", telemetry)
 	}
-	for _, dataset := range []RetentionCleanupDataset{RetentionCleanupDatasetAuthSessions, RetentionCleanupDatasetIdempotencyRecords, RetentionCleanupDatasetModelTestResults, RetentionCleanupDatasetAuditLogs} {
+	for _, dataset := range []RetentionCleanupDataset{RetentionCleanupDatasetAuthSessions, RetentionCleanupDatasetAuthThrottleBuckets, RetentionCleanupDatasetIdempotencyRecords, RetentionCleanupDatasetModelTestResults, RetentionCleanupDatasetAuditLogs} {
 		if telemetry.datasetStatus[dataset] != RetentionCleanupDatasetCompleted {
 			t.Fatalf("dataset %q telemetry = %+v", dataset, telemetry.datasetStatus)
 		}
@@ -73,6 +75,7 @@ func TestRetentionCleanupSchedulerSkipsSnapshotBoundaryButContinues(t *testing.T
 		BatchSize: 1,
 		Policy: RetentionCleanupPolicy{
 			AuthSessionTTL:       time.Hour,
+			AuthThrottleTTL:      time.Hour,
 			IdempotencyRecordTTL: time.Hour,
 			ModelTestResultTTL:   time.Hour,
 			AuditLogTTL:          time.Hour,
@@ -92,6 +95,7 @@ func TestRetentionCleanupSchedulerPreservesCancellation(t *testing.T) {
 		BatchSize: 1,
 		Policy: RetentionCleanupPolicy{
 			AuthSessionTTL:       time.Hour,
+			AuthThrottleTTL:      time.Hour,
 			IdempotencyRecordTTL: time.Hour,
 			ModelTestResultTTL:   time.Hour,
 			AuditLogTTL:          time.Hour,
@@ -111,7 +115,7 @@ func TestRetentionCleanupSchedulerRecordsTimeout(t *testing.T) {
 	scheduler, err := NewRetentionCleanupScheduler(cleaner, nil, RetentionCleanupSchedulerOptions{
 		BatchSize: 1,
 		Policy: RetentionCleanupPolicy{
-			AuthSessionTTL: time.Hour, IdempotencyRecordTTL: time.Hour,
+			AuthSessionTTL: time.Hour, AuthThrottleTTL: time.Hour, IdempotencyRecordTTL: time.Hour,
 			ModelTestResultTTL: time.Hour, AuditLogTTL: time.Hour,
 		},
 		Telemetry: telemetry,
@@ -138,7 +142,7 @@ func TestRetentionCleanupSchedulerReconcilesOrphanedDeviceBindings(t *testing.T)
 	scheduler, err := NewRetentionCleanupScheduler(nil, cleaner, RetentionCleanupSchedulerOptions{
 		BatchSize: 7,
 		Policy: RetentionCleanupPolicy{
-			AuthSessionTTL: time.Hour, IdempotencyRecordTTL: time.Hour,
+			AuthSessionTTL: time.Hour, AuthThrottleTTL: time.Hour, IdempotencyRecordTTL: time.Hour,
 			ModelTestResultTTL: time.Hour, AuditLogTTL: time.Hour,
 		},
 		Now: func() time.Time { return now },
@@ -168,7 +172,7 @@ func TestRetentionCleanupSchedulerCleansStagedSecrets(t *testing.T) {
 			return 2, nil
 		},
 		Policy: RetentionCleanupPolicy{
-			AuthSessionTTL: time.Hour, IdempotencyRecordTTL: time.Hour,
+			AuthSessionTTL: time.Hour, AuthThrottleTTL: time.Hour, IdempotencyRecordTTL: time.Hour,
 			ModelTestResultTTL: time.Hour, AuditLogTTL: time.Hour,
 		},
 		Now: func() time.Time { return now },
@@ -191,7 +195,7 @@ func TestRetentionCleanupSchedulerLifecycle(t *testing.T) {
 		Interval:         10 * time.Millisecond,
 		OperationTimeout: time.Second,
 		BatchSize:        1,
-		Policy:           RetentionCleanupPolicy{AuthSessionTTL: time.Hour, IdempotencyRecordTTL: time.Hour, ModelTestResultTTL: time.Hour, AuditLogTTL: time.Hour},
+		Policy:           RetentionCleanupPolicy{AuthSessionTTL: time.Hour, AuthThrottleTTL: time.Hour, IdempotencyRecordTTL: time.Hour, ModelTestResultTTL: time.Hour, AuditLogTTL: time.Hour},
 	})
 	if err != nil {
 		t.Fatalf("NewRetentionCleanupScheduler() error = %v", err)
@@ -210,7 +214,7 @@ func TestRetentionCleanupSchedulerLifecycle(t *testing.T) {
 }
 
 func TestRetentionCleanupSchedulerRejectsInvalidOptions(t *testing.T) {
-	policy := RetentionCleanupPolicy{AuthSessionTTL: time.Hour, IdempotencyRecordTTL: time.Hour, ModelTestResultTTL: time.Hour, AuditLogTTL: time.Hour}
+	policy := RetentionCleanupPolicy{AuthSessionTTL: time.Hour, AuthThrottleTTL: time.Hour, IdempotencyRecordTTL: time.Hour, ModelTestResultTTL: time.Hour, AuditLogTTL: time.Hour}
 	if _, err := NewRetentionCleanupScheduler(nil, nil, RetentionCleanupSchedulerOptions{Policy: policy}); err == nil {
 		t.Fatal("nil cleaners accepted")
 	}
@@ -261,6 +265,14 @@ func (r *recordingRetentionTelemetry) ObserveDataset(dataset RetentionCleanupDat
 func (r *recordingRetentionCleaner) CleanupAuthSessions(_ context.Context, request store.RetentionCleanupRequest) (int64, error) {
 	r.record("auth_sessions", request)
 	return 1, nil
+}
+
+func (r *recordingRetentionCleaner) CleanupLoginThrottleBuckets(_ context.Context, request store.RetentionCleanupRequest) (int64, error) {
+	r.record("auth_throttle_buckets", request)
+	if r.controlPlaneError != nil {
+		return 0, r.controlPlaneError
+	}
+	return 5, r.controlPlaneError
 }
 
 func (r *recordingRetentionCleaner) CleanupIdempotencyRecords(_ context.Context, request store.RetentionCleanupRequest) (int64, error) {

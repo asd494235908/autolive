@@ -95,7 +95,7 @@ func TestLoginAuditCapturesSuccessAndFailureWithoutCredentials(t *testing.T) {
 	}
 	succeeded := doJSON(t, handler, http.MethodPost, "/api/v1/auth/login", map[string]any{
 		"username": "admin",
-		"password": "password",
+		"password": testAdminPassword,
 		"product":  "autolive",
 	}, "", "")
 	if succeeded.Code != http.StatusOK {

@@ -53,7 +53,7 @@ func TestRetentionCleanupSchedulerDispatchesAuditOutbox(t *testing.T) {
 			return 3, nil
 		},
 		Policy: RetentionCleanupPolicy{
-			AuthSessionTTL: time.Hour, IdempotencyRecordTTL: time.Hour,
+			AuthSessionTTL: time.Hour, AuthThrottleTTL: time.Hour, IdempotencyRecordTTL: time.Hour,
 			ModelTestResultTTL: time.Hour, AuditLogTTL: time.Hour,
 		},
 	})

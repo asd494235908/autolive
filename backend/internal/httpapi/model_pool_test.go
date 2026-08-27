@@ -181,6 +181,7 @@ func TestAdminModelPoolUpdateEndpoint(t *testing.T) {
 func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 	handler := newTestRouter(t)
 	token := loginForTest(t, handler)
+	clientToken, userID := createDesktopUserForTest(t, handler, token, "model-lease-user")
 
 	doJSON(t, handler, http.MethodPost, "/api/v1/admin/model-pool", map[string]any{
 		"provider":          "openai-compatible",
@@ -192,7 +193,7 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 	}, token, "idem-model-account-2")
 
 	codeRec := doJSON(t, handler, http.MethodPost, "/api/v1/admin/activation-codes", map[string]any{
-		"user_id":     "usr_local_admin",
+		"user_id":     userID,
 		"expires_at":  testActivationExpiresAt(),
 		"max_devices": 1,
 	}, token, "idem-model-lease-code")
@@ -208,7 +209,7 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 			"platform":    "macOS",
 			"app_version": "0.1.0",
 		},
-	}, token, "idem-model-lease-device")
+	}, clientToken, "idem-model-lease-device")
 	if activateRec.Code != http.StatusOK {
 		t.Fatalf("activate status = %d, want %d, body=%s", activateRec.Code, http.StatusOK, activateRec.Body.String())
 	}
@@ -218,7 +219,7 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 		"model":                "rewrite-model",
 		"purpose":              "realtime_script",
 		"max_duration_seconds": 300,
-	}, token, "idem-model-lease-create")
+	}, clientToken, "idem-model-lease-create")
 	if leaseRec.Code != http.StatusOK {
 		t.Fatalf("lease create status = %d, want %d, body=%s", leaseRec.Code, http.StatusOK, leaseRec.Body.String())
 	}
@@ -270,7 +271,7 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 		"latency_ms":     40,
 		"status":         "succeeded",
 		"usage_source":   "client_reported",
-	}, token, "idem-http-call-record")
+	}, clientToken, "idem-http-call-record")
 	if callRec.Code != http.StatusOK {
 		t.Fatalf("call record status = %d, want %d, body=%s", callRec.Code, http.StatusOK, callRec.Body.String())
 	}
@@ -288,7 +289,7 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 	if len(usagePayload["items"].([]any)) != 1 {
 		t.Fatalf("usage payload = %v", usagePayload)
 	}
-	filteredUsageRec := doJSON(t, handler, http.MethodGet, "/api/v1/admin/model-usage?page_size=10&provider=openai-compatible&model=rewrite-model&user_id=usr_local_admin&sort=created_at_asc", nil, token, "")
+	filteredUsageRec := doJSON(t, handler, http.MethodGet, "/api/v1/admin/model-usage?page_size=10&provider=openai-compatible&model=rewrite-model&user_id="+userID+"&sort=created_at_asc", nil, token, "")
 	if filteredUsageRec.Code != http.StatusOK {
 		t.Fatalf("filtered usage list status = %d, want %d, body=%s", filteredUsageRec.Code, http.StatusOK, filteredUsageRec.Body.String())
 	}
@@ -307,7 +308,7 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 		"model":                "rewrite-model",
 		"purpose":              "realtime_script",
 		"max_duration_seconds": 300,
-	}, token, "idem-model-lease-create")
+	}, clientToken, "idem-model-lease-create")
 	if leaseRecRepeat.Code != http.StatusOK {
 		t.Fatalf("lease repeat create status = %d, want %d, body=%s", leaseRecRepeat.Code, http.StatusOK, leaseRecRepeat.Body.String())
 	}
@@ -319,28 +320,28 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 
 	renewRec := doJSON(t, handler, http.MethodPost, "/api/v1/client/model-leases/"+leaseID+"/renew", map[string]any{
 		"extend_seconds": 120,
-	}, token, "idem-model-lease-renew")
+	}, clientToken, "idem-model-lease-renew")
 	if renewRec.Code != http.StatusOK {
 		t.Fatalf("lease renew status = %d, want %d, body=%s", renewRec.Code, http.StatusOK, renewRec.Body.String())
 	}
 
 	releaseRec := doJSON(t, handler, http.MethodPost, "/api/v1/client/model-leases/"+leaseID+"/release", map[string]any{
 		"reason": "done",
-	}, token, "idem-model-lease-release")
+	}, clientToken, "idem-model-lease-release")
 	if releaseRec.Code != http.StatusOK {
 		t.Fatalf("lease release status = %d, want %d, body=%s", releaseRec.Code, http.StatusOK, releaseRec.Body.String())
 	}
 
 	releaseAgainRec := doJSON(t, handler, http.MethodPost, "/api/v1/client/model-leases/"+leaseID+"/release", map[string]any{
 		"reason": "again",
-	}, token, "idem-model-lease-release-2")
+	}, clientToken, "idem-model-lease-release-2")
 	if releaseAgainRec.Code != http.StatusOK {
 		t.Fatalf("lease release repeat status = %d, want %d, body=%s", releaseAgainRec.Code, http.StatusOK, releaseAgainRec.Body.String())
 	}
 
 	renewAfterRelease := doJSON(t, handler, http.MethodPost, "/api/v1/client/model-leases/"+leaseID+"/renew", map[string]any{
 		"extend_seconds": 60,
-	}, token, "idem-model-lease-renew-after-release")
+	}, clientToken, "idem-model-lease-renew-after-release")
 	if renewAfterRelease.Code != http.StatusConflict {
 		t.Fatalf("renew after release status = %d, want %d, body=%s", renewAfterRelease.Code, http.StatusConflict, renewAfterRelease.Body.String())
 	}
@@ -349,7 +350,7 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 		"provider": "openai-compatible",
 		"model":    "rewrite-model",
 		"purpose":  "realtime_script",
-	}, token, "idem-model-lease-create-second")
+	}, clientToken, "idem-model-lease-create-second")
 	if secondLeaseRec.Code != http.StatusOK {
 		t.Fatalf("second lease create status = %d, want %d, body=%s", secondLeaseRec.Code, http.StatusOK, secondLeaseRec.Body.String())
 	}
@@ -357,15 +358,15 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 	decodeJSON(t, secondLeaseRec.Body.Bytes(), &secondLeasePayload)
 	secondLeaseID := secondLeasePayload["lease"].(map[string]any)["id"].(string)
 
-	renewWithoutBody := doJSON(t, handler, http.MethodPost, "/api/v1/client/model-leases/"+secondLeaseID+"/renew", nil, token, "idem-model-lease-renew-empty")
+	renewWithoutBody := doJSON(t, handler, http.MethodPost, "/api/v1/client/model-leases/"+secondLeaseID+"/renew", nil, clientToken, "idem-model-lease-renew-empty")
 	if renewWithoutBody.Code != http.StatusOK {
 		t.Fatalf("renew without body status = %d, want %d, body=%s", renewWithoutBody.Code, http.StatusOK, renewWithoutBody.Body.String())
 	}
-	renewWithNullBody := doJSON(t, handler, http.MethodPost, "/api/v1/client/model-leases/"+secondLeaseID+"/renew", json.RawMessage("null"), token, "idem-model-lease-renew-null")
+	renewWithNullBody := doJSON(t, handler, http.MethodPost, "/api/v1/client/model-leases/"+secondLeaseID+"/renew", json.RawMessage("null"), clientToken, "idem-model-lease-renew-null")
 	if renewWithNullBody.Code != http.StatusBadRequest {
 		t.Fatalf("renew with null body status = %d, want %d, body=%s", renewWithNullBody.Code, http.StatusBadRequest, renewWithNullBody.Body.String())
 	}
-	releaseWithoutBody := doJSON(t, handler, http.MethodPost, "/api/v1/client/model-leases/"+secondLeaseID+"/release", nil, token, "idem-model-lease-release-empty")
+	releaseWithoutBody := doJSON(t, handler, http.MethodPost, "/api/v1/client/model-leases/"+secondLeaseID+"/release", nil, clientToken, "idem-model-lease-release-empty")
 	if releaseWithoutBody.Code != http.StatusOK {
 		t.Fatalf("release without body status = %d, want %d, body=%s", releaseWithoutBody.Code, http.StatusOK, releaseWithoutBody.Body.String())
 	}
@@ -375,7 +376,7 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 		"model":                "rewrite-model-v2",
 		"purpose":              "realtime_script",
 		"max_duration_seconds": 300,
-	}, token, "idem-model-lease-create")
+	}, clientToken, "idem-model-lease-create")
 	if conflictCreate.Code != http.StatusConflict {
 		t.Fatalf("lease idempotency conflict status = %d, want %d, body=%s", conflictCreate.Code, http.StatusConflict, conflictCreate.Body.String())
 	}
@@ -389,7 +390,7 @@ func TestClientModelLeaseEndpointsLifecycleAndConflict(t *testing.T) {
 		"provider": "openai-compatible",
 		"model":    "rewrite-model",
 		"purpose":  "realtime_script",
-	}, token, "idem-model-lease-create-third")
+	}, clientToken, "idem-model-lease-create-third")
 	if thirdLeaseRec.Code != http.StatusOK {
 		t.Fatalf("third lease create status = %d, want %d, body=%s", thirdLeaseRec.Code, http.StatusOK, thirdLeaseRec.Body.String())
 	}

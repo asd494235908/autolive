@@ -45,6 +45,19 @@ func TestParseSecretEncryptionKeyAcceptsHexAndBase64(t *testing.T) {
 	}
 }
 
+func TestParseOptionalHMACKeyRequiresAtLeast32Bytes(t *testing.T) {
+	key, err := parseOptionalHMACKey("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+	if err != nil || len(key) != 32 {
+		t.Fatalf("parse HMAC key = (%d, %v)", len(key), err)
+	}
+	if _, err := parseOptionalHMACKey("00112233"); err == nil {
+		t.Fatal("short HMAC key accepted")
+	}
+	if key, err := parseOptionalHMACKey(""); err != nil || key != nil {
+		t.Fatalf("optional empty HMAC key = (%v, %v)", key, err)
+	}
+}
+
 func TestValidateAppliedMigrationRejectsDirtyOrMismatchedVersion(t *testing.T) {
 	if err := validateAppliedMigration(migrations.LatestVersion, false); err != nil {
 		t.Fatalf("validateAppliedMigration(current) error = %v", err)

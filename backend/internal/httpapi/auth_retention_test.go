@@ -67,6 +67,7 @@ func TestMemoryAuthenticatorRetentionCleanupCanRunInOwnedScheduler(t *testing.T)
 		BatchSize: 1,
 		Policy: service.RetentionCleanupPolicy{
 			AuthSessionTTL:       time.Hour,
+			AuthThrottleTTL:      time.Hour,
 			IdempotencyRecordTTL: time.Hour,
 			ModelTestResultTTL:   time.Hour,
 			AuditLogTTL:          time.Hour,

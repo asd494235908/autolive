@@ -259,12 +259,14 @@ func TestPostgresNormalizedActivationRedeemIsSingleWinnerAcrossRepositories(t *t
 		t.Fatalf("seed activation race code: %v", err)
 	}
 	for index := range accessTokens {
+		sessionID := fmt.Sprintf("activation_race_session_%d_%d", suffix, index)
 		if _, err := database.ExecContext(ctx, `
 			INSERT INTO auth_sessions (
 				id, user_id, access_token_hash, refresh_token_hash,
-				access_expires_at, refresh_expires_at, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7)
-		`, fmt.Sprintf("activation_race_session_%d_%d", suffix, index), userID, accessTokens[index], fmt.Sprintf("activation_race_refresh_%d_%d", suffix, index), now.Add(time.Hour), now.Add(24*time.Hour), now); err != nil {
+				access_expires_at, refresh_expires_at, created_at,
+				audience, token_family_id, generation
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0)
+		`, sessionID, userID, accessTokens[index], fmt.Sprintf("activation_race_refresh_%d_%d", suffix, index), now.Add(time.Hour), now.Add(24*time.Hour), now, SessionAudienceDesktop, sessionID); err != nil {
 			t.Fatalf("seed activation race session %d: %v", index, err)
 		}
 	}
@@ -642,12 +644,14 @@ func seedPostgresActivationFixture(t *testing.T, database *sql.DB, ctx context.C
 	for index := range fixture.AccessTokenHashes {
 		fixture.DeviceIDs[index] = fmt.Sprintf("activation_edge_device_%s_%d", suffix, index)
 		fixture.AccessTokenHashes[index] = fmt.Sprintf("activation_edge_access_%s_%d", suffix, index)
+		sessionID := fmt.Sprintf("activation_edge_session_%s_%d", suffix, index)
 		if _, err := database.ExecContext(ctx, `
 			INSERT INTO auth_sessions (
 				id, user_id, access_token_hash, refresh_token_hash,
-				access_expires_at, refresh_expires_at, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7)
-		`, fmt.Sprintf("activation_edge_session_%s_%d", suffix, index), fixture.UserID, fixture.AccessTokenHashes[index], fmt.Sprintf("activation_edge_refresh_%s_%d", suffix, index), now.Add(time.Hour), now.Add(24*time.Hour), now); err != nil {
+				access_expires_at, refresh_expires_at, created_at,
+				audience, token_family_id, generation
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0)
+		`, sessionID, fixture.UserID, fixture.AccessTokenHashes[index], fmt.Sprintf("activation_edge_refresh_%s_%d", suffix, index), now.Add(time.Hour), now.Add(24*time.Hour), now, SessionAudienceDesktop, sessionID); err != nil {
 			t.Fatalf("seed activation edge session %d: %v", index, err)
 		}
 	}
@@ -948,31 +952,39 @@ func TestSQLSessionStoreRestartsAndConsumesRefreshTokenOnce(t *testing.T) {
 		ID:               fmt.Sprintf("session_first_%d", suffix),
 		UserID:           userID,
 		Product:          controlplane.ProductAutoLive,
+		Audience:         SessionAudienceDesktop,
 		AccessTokenHash:  fmt.Sprintf("access_first_%d", suffix),
 		RefreshTokenHash: fmt.Sprintf("refresh_first_%d", suffix),
+		RefreshFamilyID:  fmt.Sprintf("family_%d", suffix),
 		AccessExpiresAt:  now.Add(time.Hour),
 		RefreshExpiresAt: now.Add(24 * time.Hour),
 		CreatedAt:        now,
 	}
 	second := AuthSession{
-		ID:               fmt.Sprintf("session_second_%d", suffix),
-		UserID:           userID,
-		Product:          controlplane.ProductAutoLive,
-		AccessTokenHash:  fmt.Sprintf("access_second_%d", suffix),
-		RefreshTokenHash: fmt.Sprintf("refresh_second_%d", suffix),
-		AccessExpiresAt:  now.Add(2 * time.Hour),
-		RefreshExpiresAt: first.RefreshExpiresAt,
-		CreatedAt:        now.Add(time.Minute),
+		ID:                fmt.Sprintf("session_second_%d", suffix),
+		UserID:            userID,
+		Product:           controlplane.ProductAutoLive,
+		Audience:          first.Audience,
+		AccessTokenHash:   fmt.Sprintf("access_second_%d", suffix),
+		RefreshTokenHash:  fmt.Sprintf("refresh_second_%d", suffix),
+		RefreshFamilyID:   first.RefreshFamilyID,
+		RefreshGeneration: 1,
+		AccessExpiresAt:   now.Add(2 * time.Hour),
+		RefreshExpiresAt:  first.RefreshExpiresAt,
+		CreatedAt:         now.Add(time.Minute),
 	}
 	replayCandidate := AuthSession{
-		ID:               fmt.Sprintf("session_replay_%d", suffix),
-		UserID:           userID,
-		Product:          controlplane.ProductAutoLive,
-		AccessTokenHash:  fmt.Sprintf("access_replay_%d", suffix),
-		RefreshTokenHash: fmt.Sprintf("refresh_replay_%d", suffix),
-		AccessExpiresAt:  now.Add(3 * time.Hour),
-		RefreshExpiresAt: first.RefreshExpiresAt,
-		CreatedAt:        now.Add(2 * time.Minute),
+		ID:                fmt.Sprintf("session_replay_%d", suffix),
+		UserID:            userID,
+		Product:           controlplane.ProductAutoLive,
+		Audience:          first.Audience,
+		AccessTokenHash:   fmt.Sprintf("access_replay_%d", suffix),
+		RefreshTokenHash:  fmt.Sprintf("refresh_replay_%d", suffix),
+		RefreshFamilyID:   first.RefreshFamilyID,
+		RefreshGeneration: 1,
+		AccessExpiresAt:   now.Add(3 * time.Hour),
+		RefreshExpiresAt:  first.RefreshExpiresAt,
+		CreatedAt:         now.Add(2 * time.Minute),
 	}
 	if _, err := database.ExecContext(ctx, `
 		INSERT INTO users (id, username, password_hash, role, status, created_at)
@@ -1007,19 +1019,19 @@ func TestSQLSessionStoreRestartsAndConsumesRefreshTokenOnce(t *testing.T) {
 	if err != nil || !found || rotated.ID != first.ID {
 		t.Fatalf("first refresh rotation = (%+v, %t, %v)", rotated, found, err)
 	}
-	if _, found, err := restartedStore.Rotate(ctx, first.RefreshTokenHash, replayCandidate); err != nil || found {
-		t.Fatalf("replayed refresh rotation = (found %t, error %v), want single consumption", found, err)
+	if _, found, err := restartedStore.Rotate(ctx, first.RefreshTokenHash, replayCandidate); !errors.Is(err, ErrRefreshTokenReplayed) || found {
+		t.Fatalf("replayed refresh rotation = (found %t, error %v), want replay detection", found, err)
 	}
 
 	afterRestart, err := NewSQLSessionStore(database, func() time.Time { return now })
 	if err != nil {
 		t.Fatalf("post-rotation session store constructor: %v", err)
 	}
-	if restored, found, err := afterRestart.GetByRefreshTokenHash(ctx, second.RefreshTokenHash); err != nil || !found || restored.ID != second.ID {
-		t.Fatalf("rotated session after restart = (%+v, %t, %v)", restored, found, err)
+	if restored, found, err := afterRestart.GetByRefreshTokenHash(ctx, second.RefreshTokenHash); err != nil || !found || restored.ID != second.ID || restored.RevokedAt.IsZero() {
+		t.Fatalf("replayed family session after restart = (%+v, %t, %v)", restored, found, err)
 	}
-	if _, found, err := afterRestart.GetByRefreshTokenHash(ctx, first.RefreshTokenHash); err != nil || found {
-		t.Fatalf("revoked refresh after restart = (found %t, error %v)", found, err)
+	if restored, found, err := afterRestart.GetByRefreshTokenHash(ctx, first.RefreshTokenHash); err != nil || !found || restored.ConsumedAt.IsZero() {
+		t.Fatalf("consumed refresh after restart = (%+v, %t, %v)", restored, found, err)
 	}
 	if _, found, err := afterRestart.GetByRefreshTokenHash(ctx, replayCandidate.RefreshTokenHash); err != nil || found {
 		t.Fatalf("replay candidate persisted = (found %t, error %v)", found, err)
@@ -1035,8 +1047,10 @@ func TestSQLSessionStoreReconcilesPreDeviceActivationBinding(t *testing.T) {
 		ID:               fmt.Sprintf("binding_session_%d", suffix),
 		UserID:           userID,
 		Product:          controlplane.ProductAutoLive,
+		Audience:         SessionAudienceDesktop,
 		AccessTokenHash:  fmt.Sprintf("binding_access_%d", suffix),
 		RefreshTokenHash: fmt.Sprintf("binding_refresh_%d", suffix),
+		RefreshFamilyID:  fmt.Sprintf("binding_family_%d", suffix),
 		AccessExpiresAt:  now.Add(time.Hour),
 		RefreshExpiresAt: now.Add(24 * time.Hour),
 		CreatedAt:        now,
@@ -1083,8 +1097,9 @@ func TestPostgresRepositorySessionBindingRollsBackWithDomainFailure(t *testing.T
 	userID := fmt.Sprintf("tx_binding_user_%d", suffix)
 	session := AuthSession{
 		ID: fmt.Sprintf("tx_binding_session_%d", suffix), UserID: userID,
-		Product:         controlplane.ProductAutoLive,
+		Product: controlplane.ProductAutoLive, Audience: SessionAudienceDesktop,
 		AccessTokenHash: fmt.Sprintf("tx_binding_access_%d", suffix), RefreshTokenHash: fmt.Sprintf("tx_binding_refresh_%d", suffix),
+		RefreshFamilyID: fmt.Sprintf("tx_binding_family_%d", suffix),
 		AccessExpiresAt: now.Add(time.Hour), RefreshExpiresAt: now.Add(24 * time.Hour), CreatedAt: now,
 	}
 	if _, err := database.ExecContext(ctx, `
@@ -1542,9 +1557,10 @@ func TestPostgresProductCompatibilityDefaultsLegacyWritesToAutolive(t *testing.T
 	if _, err := database.ExecContext(ctx, `
 		INSERT INTO auth_sessions (
 			id, user_id, device_id, access_token_hash, refresh_token_hash,
-			access_expires_at, refresh_expires_at, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, sessionID, userID, deviceID, accessTokenHash, refreshTokenHash, now.Add(time.Hour), now.Add(24*time.Hour), now); err != nil {
+			access_expires_at, refresh_expires_at, created_at,
+			audience, token_family_id, generation
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0)
+	`, sessionID, userID, deviceID, accessTokenHash, refreshTokenHash, now.Add(time.Hour), now.Add(24*time.Hour), now, SessionAudienceLegacy, sessionID); err != nil {
 		t.Fatalf("seed legacy-shaped auth session: %v", err)
 	}
 
@@ -1600,6 +1616,13 @@ func openPostgresIntegrationDatabase(t *testing.T) (*sql.DB, context.Context) {
 	}
 	if err := migrationscheck.ValidateApplied(ctx, database); err != nil {
 		t.Fatalf("migration check error = %v", err)
+	}
+	var backfillStatus string
+	if err := database.QueryRowContext(ctx, `SELECT status FROM normalized_backfill_state WHERE id = TRUE`).Scan(&backfillStatus); err != nil {
+		t.Fatalf("normalized backfill preflight error = %v", err)
+	}
+	if backfillStatus != "completed" {
+		t.Fatalf("normalized backfill status = %q; TEST_POSTGRES_URL must target a dedicated test database, then run cmd/backfill-normalized with APP_NORMALIZED_BACKFILL_CONFIRM=YES before store integration tests", backfillStatus)
 	}
 	return database, ctx
 }

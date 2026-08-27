@@ -2,11 +2,14 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"autoLive/backend/internal/authn"
 )
 
 const (
@@ -28,6 +31,7 @@ const (
 	defaultRetentionCleanupTimeout       = 30 * time.Second
 	defaultRetentionCleanupBatch         = 1000
 	defaultAuthSessionRetentionTTL       = 30 * 24 * time.Hour
+	defaultAuthThrottleRetentionTTL      = 24 * time.Hour
 	defaultIdempotencyRetentionTTL       = 30 * 24 * time.Hour
 	defaultModelTestRetentionTTL         = 30 * 24 * time.Hour
 	defaultAuditLogRetentionTTL          = 365 * 24 * time.Hour
@@ -55,6 +59,8 @@ type Config struct {
 	DatabaseURL                   string
 	MigrationMetricsFile          string
 	SecretEncryptionKey           string
+	AuthThrottleHMACKey           string
+	TrustedProxyCIDRs             []string
 	AdminUsername                 string
 	AdminPassword                 string
 	DeploymentEnvironment         string
@@ -73,6 +79,7 @@ type Config struct {
 	RetentionCleanupTimeout       time.Duration
 	RetentionCleanupBatch         int
 	AuthSessionRetentionTTL       time.Duration
+	AuthThrottleRetentionTTL      time.Duration
 	IdempotencyRetentionTTL       time.Duration
 	ModelTestRetentionTTL         time.Duration
 	AuditLogRetentionTTL          time.Duration
@@ -87,6 +94,8 @@ func LoadFromEnv() (Config, error) {
 		DatabaseURL:                   strings.TrimSpace(os.Getenv("APP_DATABASE_URL")),
 		MigrationMetricsFile:          strings.TrimSpace(os.Getenv("APP_MIGRATION_METRICS_FILE")),
 		SecretEncryptionKey:           strings.TrimSpace(os.Getenv("APP_SECRET_ENCRYPTION_KEY")),
+		AuthThrottleHMACKey:           strings.TrimSpace(os.Getenv("APP_AUTH_THROTTLE_HMAC_KEY")),
+		TrustedProxyCIDRs:             splitCommaSeparated(os.Getenv("APP_TRUSTED_PROXY_CIDRS")),
 		AdminUsername:                 strings.TrimSpace(os.Getenv("APP_ADMIN_USERNAME")),
 		AdminPassword:                 os.Getenv("APP_ADMIN_PASSWORD"),
 		DeploymentEnvironment:         valueOrDefault("APP_DEPLOYMENT_ENV", defaultDeploymentEnv),
@@ -104,6 +113,7 @@ func LoadFromEnv() (Config, error) {
 		RetentionCleanupTimeout:       defaultRetentionCleanupTimeout,
 		RetentionCleanupBatch:         defaultRetentionCleanupBatch,
 		AuthSessionRetentionTTL:       defaultAuthSessionRetentionTTL,
+		AuthThrottleRetentionTTL:      defaultAuthThrottleRetentionTTL,
 		IdempotencyRetentionTTL:       defaultIdempotencyRetentionTTL,
 		ModelTestRetentionTTL:         defaultModelTestRetentionTTL,
 		AuditLogRetentionTTL:          defaultAuditLogRetentionTTL,
@@ -144,6 +154,14 @@ func LoadFromEnv() (Config, error) {
 	}
 	if err := validatePublishConfig(cfg.DeploymentEnvironment, cfg.PublicBaseURL, cfg.AllowInsecureHTTP); err != nil {
 		return Config{}, err
+	}
+	if cfg.DeploymentEnvironment == DeploymentEnvironmentProduction && cfg.AuthThrottleHMACKey == "" {
+		return Config{}, fmt.Errorf("APP_AUTH_THROTTLE_HMAC_KEY must be set in production")
+	}
+	for _, raw := range cfg.TrustedProxyCIDRs {
+		if _, err := netip.ParsePrefix(raw); err != nil {
+			return Config{}, fmt.Errorf("APP_TRUSTED_PROXY_CIDRS contains invalid CIDR %q", raw)
+		}
 	}
 
 	if raw := strings.TrimSpace(os.Getenv("APP_SHUTDOWN_TIMEOUT")); raw != "" {
@@ -250,6 +268,7 @@ func LoadFromEnv() (Config, error) {
 		value *time.Duration
 	}{
 		{name: "APP_AUTH_SESSION_RETENTION_TTL", value: &cfg.AuthSessionRetentionTTL},
+		{name: "APP_AUTH_THROTTLE_RETENTION_TTL", value: &cfg.AuthThrottleRetentionTTL},
 		{name: "APP_IDEMPOTENCY_RETENTION_TTL", value: &cfg.IdempotencyRetentionTTL},
 		{name: "APP_MODEL_TEST_RETENTION_TTL", value: &cfg.ModelTestRetentionTTL},
 		{name: "APP_AUDIT_LOG_RETENTION_TTL", value: &cfg.AuditLogRetentionTTL},
@@ -285,13 +304,23 @@ func validateProductionAdminCredentials(username, password string) error {
 	if len(username) < 3 || len(username) > 64 {
 		return fmt.Errorf("APP_ADMIN_USERNAME must contain 3 to 64 characters")
 	}
-	if len(password) < 12 || len(password) > 256 {
-		return fmt.Errorf("APP_ADMIN_PASSWORD must contain 12 to 256 characters for PostgreSQL mode")
+	if !authn.ValidNewPassword(password) {
+		return fmt.Errorf("APP_ADMIN_PASSWORD must contain 15 to 128 Unicode characters and at most 256 bytes for PostgreSQL mode")
 	}
 	if strings.Contains(password, "REPLACE_WITH_") {
 		return fmt.Errorf("APP_ADMIN_PASSWORD must be replaced before PostgreSQL startup")
 	}
 	return nil
+}
+
+func splitCommaSeparated(raw string) []string {
+	var result []string
+	for _, value := range strings.Split(raw, ",") {
+		if value = strings.TrimSpace(value); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 // validatePublishConfig makes the external transport contract explicit. The Go

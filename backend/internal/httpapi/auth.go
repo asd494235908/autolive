@@ -43,7 +43,7 @@ type refreshTokenResponse struct {
 }
 
 type logoutRequest struct {
-	RefreshToken string `json:"refresh_token,omitempty"`
+	RefreshToken string `json:"refresh_token"`
 }
 
 type logoutResponse struct {
@@ -55,6 +55,7 @@ type sessionTokens struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	ExpiresAt    string `json:"expires_at"`
+	Audience     string `json:"audience"`
 }
 
 type userSummary struct {
@@ -66,13 +67,16 @@ type userSummary struct {
 }
 
 type sessionRecord struct {
-	AccessTokenHash  string
-	RefreshTokenHash string
-	ExpiresAt        time.Time
-	RefreshExpiresAt time.Time
-	Product          controlplane.ProductCode
-	Actor            controlplane.Actor
-	DeviceID         string
+	AccessTokenHash   string
+	RefreshTokenHash  string
+	ExpiresAt         time.Time
+	RefreshExpiresAt  time.Time
+	Product           controlplane.ProductCode
+	Audience          store.SessionAudience
+	RefreshFamilyID   string
+	RefreshGeneration int
+	Actor             controlplane.Actor
+	DeviceID          string
 }
 
 type authContextKey string
@@ -83,14 +87,23 @@ const deviceContextKey authContextKey = "device"
 const adminAuthorizationContextKey authContextKey = "admin_authorization"
 
 type authenticator struct {
-	mu           sync.Mutex
-	controlPlane *service.ControlPlane
-	initErr      error
-	sessions     map[string]sessionRecord
-	refreshIndex map[string]string
-	store        store.SessionStore
-	productRepo  store.ProductRepository
+	mu              sync.Mutex
+	controlPlane    *service.ControlPlane
+	initErr         error
+	sessions        map[string]sessionRecord
+	refreshIndex    map[string]string
+	consumedRefresh map[string]consumedRefreshRecord
+	store           store.SessionStore
+	productRepo     store.ProductRepository
 }
+
+type consumedRefreshRecord struct {
+	FamilyID         string
+	RefreshExpiresAt time.Time
+}
+
+const accessTokenTTL = 15 * time.Minute
+const refreshTokenTTL = 30 * 24 * time.Hour
 
 func newAuthenticator(controlPlane *service.ControlPlane, config AuthConfig, sessionStores ...store.SessionStore) *authenticator {
 	return newAuthenticatorWithProductRepository(controlPlane, config, nil, sessionStores...)
@@ -107,22 +120,28 @@ func newAuthenticatorWithProductRepository(controlPlane *service.ControlPlane, c
 	}
 	config.Password = ""
 	return &authenticator{
-		controlPlane: controlPlane,
-		initErr:      initializationErr,
-		sessions:     map[string]sessionRecord{},
-		refreshIndex: map[string]string{},
-		store:        sessionStore,
-		productRepo:  productRepo,
+		controlPlane:    controlPlane,
+		initErr:         initializationErr,
+		sessions:        map[string]sessionRecord{},
+		refreshIndex:    map[string]string{},
+		consumedRefresh: map[string]consumedRefreshRecord{},
+		store:           sessionStore,
+		productRepo:     productRepo,
 	}
 }
 
 func registerAuthRoutes(mux *http.ServeMux, auth *authenticator) {
-	mux.Handle("POST /api/v1/auth/login", loginHandler(auth))
+	mux.Handle("POST /api/v1/auth/login", loginHandlerForAudience(auth, store.SessionAudienceAdmin))
+	mux.Handle("POST /api/v1/client/auth/login", loginHandlerForAudience(auth, store.SessionAudienceDesktop))
 	mux.Handle("POST /api/v1/auth/refresh", refreshHandler(auth))
-	mux.Handle("POST /api/v1/auth/logout", auth.requireBearer(logoutHandler(auth)))
+	mux.Handle("POST /api/v1/auth/logout", logoutHandler(auth))
 }
 
 func loginHandler(auth *authenticator) http.Handler {
+	return loginHandlerForAudience(auth, store.SessionAudienceAdmin)
+}
+
+func loginHandlerForAudience(auth *authenticator, audience store.SessionAudience) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if auth.initErr != nil {
 			writeError(w, r, http.StatusServiceUnavailable, "AUTH_INITIALIZATION_UNAVAILABLE", "管理员认证初始化暂不可用")
@@ -145,18 +164,22 @@ func loginHandler(auth *authenticator) http.Handler {
 			writeAppError(w, r, err)
 			return
 		}
+		if !audienceMatchesRole(audience, user.Role) {
+			writeAppError(w, r, controlplane.ErrUnauthenticated)
+			return
+		}
 		if auth.productRepo != nil {
 			membership, err := auth.productRepo.GetUserProductMembership(r.Context(), user.ID, product)
 			if err != nil {
 				if errors.Is(err, controlplane.ErrForbidden) {
-					writeAppError(w, r, controlplane.ErrForbidden)
+					writeAppError(w, r, controlplane.ErrUnauthenticated)
 				} else {
 					writeError(w, r, http.StatusServiceUnavailable, "PRODUCT_MEMBERSHIP_UNAVAILABLE", "产品授权暂时无法读取")
 				}
 				return
 			}
 			if membership.Status != "active" {
-				writeAppError(w, r, controlplane.ErrForbidden)
+				writeAppError(w, r, controlplane.ErrUnauthenticated)
 				return
 			}
 		}
@@ -178,13 +201,17 @@ func loginHandler(auth *authenticator) http.Handler {
 		}
 
 		now := time.Now().UTC()
+		familyID := "family_" + hashToken(refreshToken)
 		session := sessionRecord{
-			AccessTokenHash:  hashToken(accessToken),
-			RefreshTokenHash: hashToken(refreshToken),
-			ExpiresAt:        now.Add(time.Hour),
-			RefreshExpiresAt: now.Add(30 * 24 * time.Hour),
-			Product:          product,
-			Actor:            actor,
+			AccessTokenHash:   hashToken(accessToken),
+			RefreshTokenHash:  hashToken(refreshToken),
+			ExpiresAt:         now.Add(accessTokenTTL),
+			RefreshExpiresAt:  now.Add(refreshTokenTTL),
+			Product:           product,
+			Audience:          audience,
+			RefreshFamilyID:   familyID,
+			RefreshGeneration: 0,
+			Actor:             actor,
 		}
 		if auth.store != nil {
 			if err := auth.store.Create(r.Context(), persistedSession("session_"+session.AccessTokenHash, actor.UserID, session)); err != nil {
@@ -206,6 +233,7 @@ func loginHandler(auth *authenticator) http.Handler {
 				AccessToken:  accessToken,
 				RefreshToken: refreshToken,
 				ExpiresAt:    session.ExpiresAt.Format(time.RFC3339),
+				Audience:     string(session.Audience),
 			},
 			User: userSummary{
 				ID:        user.ID,
@@ -247,61 +275,69 @@ func refreshHandler(auth *authenticator) http.Handler {
 				writeError(w, r, http.StatusServiceUnavailable, "AUTH_SESSION_STORE_UNAVAILABLE", "刷新会话暂时无法读取")
 				return
 			}
-			if !found || now.After(persisted.RefreshExpiresAt) {
-				writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "刷新凭证已失效或不存在")
+			if !found {
+				writeRefreshTokenInvalid(w, r)
 				return
 			}
 			oldSession = sessionFromPersisted(persisted)
-			oldAccessTokenHash = oldSession.AccessTokenHash
 		} else {
 			auth.mu.Lock()
 			var ok, sessionExists bool
 			oldAccessTokenHash, ok = auth.refreshIndex[refreshHash]
 			oldSession, sessionExists = auth.sessions[oldAccessTokenHash]
+			if !ok {
+				if consumed, replayed := auth.consumedRefresh[refreshHash]; replayed {
+					auth.revokeFamilyMemory(consumed.FamilyID)
+				}
+			}
 			auth.mu.Unlock()
 			if !ok || !sessionExists || now.After(oldSession.RefreshExpiresAt) {
-				writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "刷新凭证已失效或不存在")
+				writeRefreshTokenInvalid(w, r)
 				return
 			}
 		}
 
 		user, err := auth.controlPlane.GetUser(r.Context(), oldSession.Actor.UserID)
-		if err != nil || user.Status != controlplane.UserStatusActive {
-			writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "用户会话已失效")
+		if err != nil || user.Status != controlplane.UserStatusActive || !audienceMatchesRole(oldSession.Audience, user.Role) {
+			writeRefreshTokenInvalid(w, r)
 			return
 		}
 
 		newSession := sessionRecord{
-			AccessTokenHash:  hashToken(newAccessToken),
-			RefreshTokenHash: hashToken(newRefreshToken),
-			ExpiresAt:        now.Add(time.Hour),
-			RefreshExpiresAt: oldSession.RefreshExpiresAt,
-			Product:          oldSession.Product,
-			Actor:            controlplane.Actor{UserID: user.ID, Role: user.Role, Product: oldSession.Product},
-			DeviceID:         oldSession.DeviceID,
+			AccessTokenHash:   hashToken(newAccessToken),
+			RefreshTokenHash:  hashToken(newRefreshToken),
+			ExpiresAt:         minTime(now.Add(accessTokenTTL), oldSession.RefreshExpiresAt),
+			RefreshExpiresAt:  oldSession.RefreshExpiresAt,
+			Product:           oldSession.Product,
+			Audience:          oldSession.Audience,
+			RefreshFamilyID:   oldSession.RefreshFamilyID,
+			RefreshGeneration: oldSession.RefreshGeneration + 1,
+			Actor:             controlplane.Actor{UserID: user.ID, Role: user.Role, Product: oldSession.Product},
+			DeviceID:          oldSession.DeviceID,
 		}
 		if !newSession.Product.Valid() {
-			writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "会话产品无效")
+			writeRefreshTokenInvalid(w, r)
 			return
 		}
 		if auth.store != nil {
-			rotated, found, err := auth.store.Rotate(r.Context(), refreshHash, persistedSession("session_"+newSession.AccessTokenHash, user.ID, newSession))
+			_, found, err := auth.store.Rotate(r.Context(), refreshHash, persistedSession("session_"+newSession.AccessTokenHash, user.ID, newSession))
 			if err != nil {
+				if errors.Is(err, store.ErrRefreshTokenReplayed) {
+					writeRefreshTokenInvalid(w, r)
+					return
+				}
 				writeError(w, r, http.StatusServiceUnavailable, "AUTH_SESSION_STORE_UNAVAILABLE", "刷新会话暂时无法保存")
 				return
 			}
 			if !found {
-				writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "刷新凭证已失效或不存在")
+				writeRefreshTokenInvalid(w, r)
 				return
 			}
-			oldAccessTokenHash = rotated.AccessTokenHash
 		} else {
-			auth.mu.Lock()
-			delete(auth.sessions, oldAccessTokenHash)
-			delete(auth.refreshIndex, oldSession.RefreshTokenHash)
-			auth.sessions[newSession.AccessTokenHash] = newSession
-			auth.refreshIndex[newSession.RefreshTokenHash] = newSession.AccessTokenHash
-			auth.mu.Unlock()
+			if !auth.rotateMemorySession(refreshHash, oldAccessTokenHash, newSession) {
+				writeRefreshTokenInvalid(w, r)
+				return
+			}
 		}
 
 		writeJSON(w, http.StatusOK, refreshTokenResponse{
@@ -310,20 +346,20 @@ func refreshHandler(auth *authenticator) http.Handler {
 				AccessToken:  newAccessToken,
 				RefreshToken: newRefreshToken,
 				ExpiresAt:    newSession.ExpiresAt.Format(time.RFC3339),
+				Audience:     string(newSession.Audience),
 			},
 		})
 	})
 }
 
-func logoutHandler(auth *authenticator) func(http.ResponseWriter, *http.Request, controlplane.Actor) {
-	return func(w http.ResponseWriter, r *http.Request, _ controlplane.Actor) {
+func logoutHandler(auth *authenticator) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request logoutRequest
-		if err := decodeOptionalJSONBody(r, &request); err != nil {
+		if err := decodeJSONBody(r, &request); err != nil || strings.TrimSpace(request.RefreshToken) == "" {
 			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "退出请求格式无效")
 			return
 		}
-		token, _ := r.Context().Value(sessionTokenContextKey).(string)
-		if err := auth.revokeAccessToken(r.Context(), token); err != nil {
+		if err := auth.revokeRefreshToken(r.Context(), request.RefreshToken); err != nil {
 			writeError(w, r, http.StatusServiceUnavailable, "AUTH_SESSION_STORE_UNAVAILABLE", "登录会话暂时无法注销")
 			return
 		}
@@ -331,7 +367,7 @@ func logoutHandler(auth *authenticator) func(http.ResponseWriter, *http.Request,
 			RequestID: RequestIDFromContext(r.Context()),
 			Success:   true,
 		})
-	}
+	})
 }
 
 func (a *authenticator) requireBearer(next func(http.ResponseWriter, *http.Request, controlplane.Actor)) http.Handler {
@@ -369,6 +405,11 @@ func (a *authenticator) requireBearer(next func(http.ResponseWriter, *http.Reque
 			writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "会话产品无效")
 			return
 		}
+		expectedAudience := audienceForPath(r.URL.Path)
+		if expectedAudience != "" && session.Audience != expectedAudience {
+			writeError(w, r, http.StatusForbidden, "AUTH_SESSION_AUDIENCE_MISMATCH", "登录会话不适用于当前入口")
+			return
+		}
 
 		user, err := a.controlPlane.GetUser(r.Context(), session.Actor.UserID)
 		if err != nil {
@@ -377,6 +418,10 @@ func (a *authenticator) requireBearer(next func(http.ResponseWriter, *http.Reque
 		}
 		if user.Status != controlplane.UserStatusActive {
 			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "当前用户已不可用")
+			return
+		}
+		if !audienceMatchesRole(session.Audience, user.Role) {
+			writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "会话身份已失效")
 			return
 		}
 
@@ -455,6 +500,81 @@ func loginProduct(raw string) (controlplane.ProductCode, error) {
 func hashToken(token string) string {
 	digest := sha256.Sum256([]byte(token))
 	return base64.RawURLEncoding.EncodeToString(digest[:])
+}
+
+func audienceForPath(path string) store.SessionAudience {
+	switch {
+	case strings.HasPrefix(path, "/api/v1/admin/"):
+		return store.SessionAudienceAdmin
+	case strings.HasPrefix(path, "/api/v1/client/"):
+		return store.SessionAudienceDesktop
+	default:
+		return ""
+	}
+}
+
+func audienceMatchesRole(audience store.SessionAudience, role string) bool {
+	return (audience == store.SessionAudienceAdmin && role == controlplane.RoleAdmin) ||
+		(audience == store.SessionAudienceDesktop && role == controlplane.RoleUser)
+}
+
+func writeRefreshTokenInvalid(w http.ResponseWriter, r *http.Request) {
+	writeError(w, r, http.StatusUnauthorized, "REFRESH_TOKEN_INVALID", "刷新凭证已失效或不存在")
+}
+
+func minTime(left, right time.Time) time.Time {
+	if left.Before(right) {
+		return left
+	}
+	return right
+}
+
+func (a *authenticator) revokeFamilyMemory(familyID string) {
+	for accessHash, session := range a.sessions {
+		if session.RefreshFamilyID == familyID {
+			delete(a.sessions, accessHash)
+			delete(a.refreshIndex, session.RefreshTokenHash)
+		}
+	}
+}
+
+func (a *authenticator) rotateMemorySession(refreshHash, expectedAccessHash string, next sessionRecord) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	currentAccessHash, ok := a.refreshIndex[refreshHash]
+	current, exists := a.sessions[currentAccessHash]
+	if !ok || !exists || currentAccessHash != expectedAccessHash {
+		if consumed, replayed := a.consumedRefresh[refreshHash]; replayed {
+			a.revokeFamilyMemory(consumed.FamilyID)
+		}
+		return false
+	}
+	delete(a.sessions, currentAccessHash)
+	delete(a.refreshIndex, current.RefreshTokenHash)
+	a.consumedRefresh[current.RefreshTokenHash] = consumedRefreshRecord{FamilyID: current.RefreshFamilyID, RefreshExpiresAt: current.RefreshExpiresAt}
+	a.sessions[next.AccessTokenHash] = next
+	a.refreshIndex[next.RefreshTokenHash] = next.AccessTokenHash
+	return true
+}
+
+func (a *authenticator) revokeRefreshToken(ctx context.Context, refreshToken string) error {
+	refreshHash := hashToken(refreshToken)
+	if a.store != nil {
+		if err := a.store.RevokeByRefreshTokenHash(ctx, refreshHash); err != nil {
+			return fmt.Errorf("revoke refresh token family: %w", err)
+		}
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if accessHash, ok := a.refreshIndex[refreshHash]; ok {
+		a.revokeFamilyMemory(a.sessions[accessHash].RefreshFamilyID)
+		return nil
+	}
+	if consumed, ok := a.consumedRefresh[refreshHash]; ok {
+		a.revokeFamilyMemory(consumed.FamilyID)
+	}
+	return nil
 }
 
 func (a *authenticator) revokeAccessToken(ctx context.Context, accessToken string) error {
@@ -650,26 +770,32 @@ func (a *authenticator) deviceID(r *http.Request) string {
 
 func persistedSession(id, userID string, session sessionRecord) store.AuthSession {
 	return store.AuthSession{
-		ID:               id,
-		UserID:           userID,
-		Product:          session.Product,
-		DeviceID:         session.DeviceID,
-		AccessTokenHash:  session.AccessTokenHash,
-		RefreshTokenHash: session.RefreshTokenHash,
-		AccessExpiresAt:  session.ExpiresAt,
-		RefreshExpiresAt: session.RefreshExpiresAt,
-		CreatedAt:        time.Now().UTC(),
+		ID:                id,
+		UserID:            userID,
+		Product:           session.Product,
+		Audience:          session.Audience,
+		DeviceID:          session.DeviceID,
+		AccessTokenHash:   session.AccessTokenHash,
+		RefreshTokenHash:  session.RefreshTokenHash,
+		RefreshFamilyID:   session.RefreshFamilyID,
+		RefreshGeneration: session.RefreshGeneration,
+		AccessExpiresAt:   session.ExpiresAt,
+		RefreshExpiresAt:  session.RefreshExpiresAt,
+		CreatedAt:         time.Now().UTC(),
 	}
 }
 
 func sessionFromPersisted(session store.AuthSession) sessionRecord {
 	return sessionRecord{
-		AccessTokenHash:  session.AccessTokenHash,
-		RefreshTokenHash: session.RefreshTokenHash,
-		ExpiresAt:        session.AccessExpiresAt,
-		RefreshExpiresAt: session.RefreshExpiresAt,
-		Product:          session.Product,
-		Actor:            controlplane.Actor{UserID: session.UserID, Product: session.Product},
-		DeviceID:         session.DeviceID,
+		AccessTokenHash:   session.AccessTokenHash,
+		RefreshTokenHash:  session.RefreshTokenHash,
+		ExpiresAt:         session.AccessExpiresAt,
+		RefreshExpiresAt:  session.RefreshExpiresAt,
+		Product:           session.Product,
+		Audience:          session.Audience,
+		RefreshFamilyID:   session.RefreshFamilyID,
+		RefreshGeneration: session.RefreshGeneration,
+		Actor:             controlplane.Actor{UserID: session.UserID, Product: session.Product},
+		DeviceID:          session.DeviceID,
 	}
 }

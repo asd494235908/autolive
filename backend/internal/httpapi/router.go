@@ -19,9 +19,11 @@ type contextKey string
 const requestIDKey contextKey = "request_id"
 
 type AuthConfig struct {
-	Username          string
-	Password          string
-	UsePersistedAdmin bool
+	Username            string
+	Password            string
+	UsePersistedAdmin   bool
+	AuthThrottleHMACKey []byte
+	TrustedProxyCIDRs   []string
 }
 
 func NewRouter(serviceVersion string, logger *slog.Logger) http.Handler {
@@ -64,7 +66,12 @@ func NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTele
 		logger = slog.Default()
 	}
 
-	controlPlane := service.NewControlPlaneWithRepositoryAndSecretStoreAndOptions(repository, nil, secretStore, service.ControlPlaneOptions{AllowInsecureHTTP: allowInsecureHTTP})
+	controlPlane := service.NewControlPlaneWithRepositoryAndSecretStoreAndOptions(repository, nil, secretStore, service.ControlPlaneOptions{
+		AllowInsecureHTTP: allowInsecureHTTP,
+		PasswordUpgradeError: func(err error) {
+			logger.Warn("password credential upgrade failed", "error", err)
+		},
+	})
 	var productRepository store.ProductRepository
 	if candidate, ok := repository.(store.ProductRepository); ok {
 		// Product membership is a normalized-only capability. Snapshot-backed
@@ -94,7 +101,29 @@ func NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTele
 		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "请求的资源不存在")
 	}))
 
-	return requestIDMiddleware(loggingMiddleware(logger, auditMiddlewareWithOptions(controlPlane, logger, metrics, metrics.middleware(rateLimitMiddlewareWithMetrics(newRequestRateLimiter(time.Now), metrics, mux))))), authenticator
+	clientAddresses, err := newClientAddressResolver(authConfig.TrustedProxyCIDRs)
+	if err != nil {
+		// Server configuration validates CIDRs before constructing the router. A
+		// direct library caller with invalid input must fail closed and ignore all
+		// forwarded headers instead of trusting an ambiguous proxy chain.
+		logger.Error("trusted proxy configuration rejected", "error", err)
+		clientAddresses = clientAddressResolver{}
+	}
+	var protected http.Handler = mux
+	if throttleStore, ok := repository.(store.LoginThrottleStore); ok {
+		protected = loginThrottleMiddleware(loginThrottleOptions{
+			store:   throttleStore,
+			hmacKey: authConfig.AuthThrottleHMACKey,
+			clients: clientAddresses,
+			now:     time.Now,
+			onError: func(err error) {
+				logger.Error("persistent login throttle operation failed", "error", err)
+			},
+		}, protected)
+	}
+	protected = rateLimitMiddlewareWithMetricsAndClients(newRequestRateLimiter(time.Now), metrics, clientAddresses, protected)
+
+	return requestIDMiddleware(loggingMiddleware(logger, auditMiddlewareWithOptions(controlPlane, logger, metrics, metrics.middleware(protected)))), authenticator
 }
 
 func RequestIDFromContext(ctx context.Context) string {

@@ -62,7 +62,14 @@ func (a *authenticator) CleanupAuthSessions(ctx context.Context, request store.R
 		delete(a.sessions, session.AccessTokenHash)
 		delete(a.refreshIndex, session.RefreshTokenHash)
 	}
-	return int64(len(candidates)), nil
+	deleted := len(candidates)
+	for refreshHash, consumed := range a.consumedRefresh {
+		if consumed.RefreshExpiresAt.Before(request.Cutoff) {
+			delete(a.consumedRefresh, refreshHash)
+			deleted++
+		}
+	}
+	return int64(deleted), nil
 }
 
 func (a *authenticator) CleanupOrphanedDeviceBindings(ctx context.Context, request store.RetentionCleanupRequest) (int64, error) {

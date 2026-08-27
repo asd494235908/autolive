@@ -19,6 +19,7 @@ type RetentionCleanupDataset string
 
 const (
 	RetentionCleanupDatasetAuthSessions           RetentionCleanupDataset = "auth_sessions"
+	RetentionCleanupDatasetAuthThrottleBuckets    RetentionCleanupDataset = "auth_throttle_buckets"
 	RetentionCleanupDatasetOrphanedDeviceBindings RetentionCleanupDataset = "orphaned_device_bindings"
 	RetentionCleanupDatasetStagedSecrets          RetentionCleanupDataset = "staged_secrets"
 	RetentionCleanupDatasetIdempotencyRecords     RetentionCleanupDataset = "idempotency_records"

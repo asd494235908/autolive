@@ -68,7 +68,7 @@ func TestHealthHandlerRejectsWrongMethod(t *testing.T) {
 }
 
 func TestReadinessHandlerReturnsOKWhenDependenciesAreReady(t *testing.T) {
-	handler := NewRouterWithAuth("v1.0.0", nil, AuthConfig{Username: "admin", Password: "password"})
+	handler := NewRouterWithAuth("v1.0.0", nil, AuthConfig{Username: "admin", Password: testAdminPassword})
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/readyz", nil)
 	rec := httptest.NewRecorder()
 
@@ -88,7 +88,7 @@ func TestReadinessHandlerReturnsOKWhenDependenciesAreReady(t *testing.T) {
 
 func TestReadinessHandlerReportsRepositoryFailure(t *testing.T) {
 	repository := failingHealthRepository{err: errors.New("database unavailable")}
-	handler := NewRouterWithRepositoryAndSecretStore("v1.0.0", nil, AuthConfig{Username: "admin", Password: "password"}, repository, store.NewMemorySecretStore())
+	handler := NewRouterWithRepositoryAndSecretStore("v1.0.0", nil, AuthConfig{Username: "admin", Password: testAdminPassword}, repository, store.NewMemorySecretStore())
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/readyz", nil)
 	rec := httptest.NewRecorder()
 
@@ -108,7 +108,7 @@ func TestReadinessHandlerReportsRepositoryFailure(t *testing.T) {
 
 func TestReadinessHandlerReportsSecretStoreFailure(t *testing.T) {
 	secretStore := failingHealthSecretStore{err: errors.New("secret store unavailable")}
-	handler := NewRouterWithRepositoryAndSecretStore("v1.0.0", nil, AuthConfig{Username: "admin", Password: "password"}, store.NewMemoryStore(time.Now), secretStore)
+	handler := NewRouterWithRepositoryAndSecretStore("v1.0.0", nil, AuthConfig{Username: "admin", Password: testAdminPassword}, store.NewMemoryStore(time.Now), secretStore)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/readyz", nil)
 	rec := httptest.NewRecorder()
 
