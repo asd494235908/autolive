@@ -4,6 +4,7 @@ import {
   isSelectableAudioValuePresetId,
 } from './audio-value-presets';
 import type { SubtleAudioSample } from './audio-value-presets';
+import type { MediaEffectParams } from './media-parameter-panels/media-parameter-types';
 
 export {
   AUDIO_PRESET_FIELDS,
@@ -45,19 +46,65 @@ export type RuntimeBaseParameters = {
   video_pixel_scale_percent: number;
   video_space_x_offset_px: number;
   video_space_y_offset_px: number;
+  video_rotation_degrees: number;
+  video_horizontal_flip_enabled: boolean;
+  video_vertical_flip_enabled: boolean;
 };
 
 export type RuntimePreviewParameters = RuntimeBaseParameters;
+
+export function toRuntimePreviewParameters(
+  params: Pick<MediaEffectParams, 'audio' | 'video'>,
+): RuntimePreviewParameters {
+  return {
+    audio_gain_db:
+      params.audio.input_gain_db
+      + params.audio.output_gain_db
+      + params.audio.loudness_adjustment_db,
+    audio_low_eq_db: params.audio.low_eq_db,
+    audio_mid_eq_db: params.audio.mid_eq_db,
+    audio_high_eq_db: params.audio.high_eq_db,
+    audio_input_gain_db: params.audio.input_gain_db,
+    audio_output_gain_db: params.audio.output_gain_db,
+    audio_loudness_adjustment_db: params.audio.loudness_adjustment_db,
+    audio_pitch_shift_semitones: params.audio.pitch_shift_semitones,
+    audio_playback_speed: params.audio.playback_speed,
+    audio_fade_in_ms: params.audio.fade_in_ms,
+    audio_fade_out_ms: params.audio.fade_out_ms,
+    audio_reverb_wet_percent: params.audio.reverb_wet_percent,
+    audio_noise_reduction_percent: params.audio.noise_reduction_percent,
+    audio_phase_perturbation_percent: params.audio.phase_perturbation_percent,
+    audio_vibrato_frequency_hz: params.audio.vibrato_frequency_hz,
+    audio_vibrato_depth_percent: params.audio.vibrato_depth_percent,
+    audio_environment_noise_percent: params.audio.environment_noise_percent,
+    audio_environment_noise_dbfs: params.audio.environment_noise_dbfs,
+    audio_filter_q: params.audio.filter_q,
+    audio_sample_rate_hz: params.audio.sample_rate_hz ?? 0,
+    audio_output_bitrate_kbps: params.audio.output_bitrate_kbps,
+    video_brightness_percent: params.video.brightness_percent,
+    video_contrast_percent: params.video.contrast_percent,
+    video_saturation_percent: params.video.saturation_percent,
+    video_hue_rotation_degrees: params.video.hue_rotation_degrees,
+    video_blur_radius_px: params.video.blur_radius_px,
+    video_pixel_scale_percent: params.video.pixel_scale_percent,
+    video_space_x_offset_px: params.video.space_x_offset_px,
+    video_space_y_offset_px: params.video.space_y_offset_px,
+    video_rotation_degrees: params.video.rotation_degrees,
+    video_horizontal_flip_enabled: params.video.horizontal_flip_enabled,
+    video_vertical_flip_enabled: params.video.vertical_flip_enabled,
+  };
+}
 
 /** 周期输入硬上限（秒换算 ms）；用户填 min–max，每周期在闭区间内随机。 */
 export const PERIOD_HARD_MIN_MS = 1_000;
 export const PERIOD_HARD_MAX_MS = 60_000;
 
-// ponytail: 默认别太短，短周期会频繁换轨/跳 Tag；听感验收用 8–15s
-export const DEFAULT_AUDIO_PERIOD_MIN_MS = 8_000;
-export const DEFAULT_AUDIO_PERIOD_MAX_MS = 15_000;
-export const DEFAULT_VIDEO_PERIOD_MIN_MS = 8_000;
-export const DEFAULT_VIDEO_PERIOD_MAX_MS = 15_000;
+// 普通声音新配置与恢复默认使用 3–5s；已有本地保存值继续按原值读取。
+export const DEFAULT_AUDIO_PERIOD_MIN_MS = 3_000;
+export const DEFAULT_AUDIO_PERIOD_MAX_MS = 5_000;
+// ponytail: 默认加长到 20–30s，给 83 项 period 处理留墙钟；用户仍可改回更短
+export const DEFAULT_VIDEO_PERIOD_MIN_MS = 20_000;
+export const DEFAULT_VIDEO_PERIOD_MAX_MS = 30_000;
 
 /** @deprecated 兼容旧常量名 */
 export const DEFAULT_AUDIO_VARIATION_PERIOD_MS = DEFAULT_AUDIO_PERIOD_MIN_MS;

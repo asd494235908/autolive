@@ -123,6 +123,18 @@ test('状态、频段和关键真实链路声明保持稳定', async () => {
   assert.ok(all.every(({ field }) => !/research|ocr/i.test(field)));
 });
 
+test('参数分组标题使用正式定义数量并标明只读快照', async () => {
+  const definitions = await importTypeScriptModule('./parameter-definitions.ts');
+  const componentSource = await readFile(new URL('./MediaParameterPanels.tsx', import.meta.url), 'utf8');
+
+  assert.equal(definitions.MEDIA_PARAMETER_DEFINITIONS.video.length, 32);
+  assert.equal(definitions.MEDIA_PARAMETER_DEFINITIONS.advanced.length, 42);
+  assert.equal(definitions.MEDIA_PARAMETER_DEFINITIONS.audio.length, 37);
+  assert.match(componentSource, /const visibleParameterCount = MEDIA_PARAMETER_DEFINITIONS\[section\]\.reduce/);
+  assert.match(componentSource, /definition\.kind === 'band-weights' \? VISUAL_BAND_FREQUENCIES_HZ\.length : 1/);
+  assert.match(componentSource, /\{visibleParameterCount\} 项 · 只读快照/);
+});
+
 test('分段进度按完整参数范围归一化并夹紧边界', async () => {
   const progress = await importTypeScriptModule('./media-parameter-progress.ts');
 
@@ -171,7 +183,8 @@ test('参数状态面板保持只读，声音编辑通过独立插槽组合', as
   assert.match(componentSource, /<Spin/);
   assert.match(componentSource, /aria-labelledby/);
   assert.doesNotMatch(componentSource, /aria-describedby/);
-  assert.match(componentSource, /<Progress\b[\s\S]*?aria-label=/);
+  assert.match(componentSource, /<Typography\.Text aria-labelledby=\{labelId\}[\s\S]*?\{valueText\}/);
+  assert.doesNotMatch(componentSource, /<Progress\b/);
   assert.doesNotMatch(componentSource, /role="progressbar"/);
   assert.doesNotMatch(cssSource, /\.ant-/);
 });
@@ -281,75 +294,43 @@ test('声音控件插槽位于声音列且窄容器单列无横向滚动', async
   assert.doesNotMatch(cssSource, /\.ant-/);
 });
 
-test('数值参数使用 Ant Design 分段进度，视频与声音参数保持双主栏', async () => {
+test('数值参数只显示名称与当前值，视频与声音参数支持按卡片分区', async () => {
   const componentSource = await readFile(new URL('./MediaParameterPanels.tsx', import.meta.url), 'utf8');
   const cssSource = await readFile(new URL('./media-parameter-panels.css', import.meta.url), 'utf8');
 
-  assert.match(componentSource, /import\s*\{[\s\S]*?\bProgress\b[\s\S]*?\}\s*from 'antd'/);
-  assert.match(componentSource, /<Progress\b[\s\S]*?\bpercent=/);
-  assert.match(componentSource, /<Progress\b[\s\S]*?\bsteps=/);
+  assert.doesNotMatch(componentSource, /\bProgress\b/);
+  assert.match(componentSource, /const valueText = numericValue === null/);
+  assert.match(componentSource, /className="media-parameter-card__result"/);
   for (const label of ['普通视频', '普通声音', '高级视觉']) {
     assert.match(componentSource, new RegExp(`['"]${label}['"]`));
   }
-  assert.match(componentSource, /className="media-parameter-panels__columns"/);
+  assert.match(componentSource, /className=\{`media-parameter-panels__columns/);
+  assert.match(componentSource, /media-parameter-panels__columns--split/);
   assert.match(componentSource, /className="media-parameter-panels__lane media-parameter-panels__lane--video"/);
   assert.match(componentSource, /className="media-parameter-panels__lane media-parameter-panels__lane--audio"/);
+  assert.match(componentSource, /sections\.some\(\(section\) => section === 'video' \|\| section === 'advanced'\)/);
+  assert.match(componentSource, /sections\.includes\('audio'\)/);
   assert.match(
     componentSource,
-    /media-parameter-panels__lane--video"[\s\S]*?section="video"[\s\S]*?section="advanced"[\s\S]*?media-parameter-panels__lane--audio"[\s\S]*?section="audio"/,
+    /media-parameter-panels__lane--video"[\s\S]*?sections\.filter[\s\S]*?section=\{section\}[\s\S]*?media-parameter-panels__lane--audio"[\s\S]*?section="audio"/,
   );
   assert.match(
     cssSource,
-    /\.media-parameter-panels__columns\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/s,
+    /\.media-parameter-panels__columns\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s,
+  );
+  assert.match(
+    cssSource,
+    /\.media-parameter-panels__columns--split\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/s,
   );
 });
 
-test('分段进度使用公开紧凑尺寸数组，并使用参考图提取的五色色板', async () => {
+test('参数卡不显示装饰进度条，并使用参考图提取的五色色板', async () => {
   const componentSource = await readFile(new URL('./MediaParameterPanels.tsx', import.meta.url), 'utf8');
   const cssSource = await readFile(new URL('./media-parameter-panels.css', import.meta.url), 'utf8');
   const feedback = await importTypeScriptModule('./parameter-panel-feedback.ts');
-  const sourceFile = ts.createSourceFile(
-    'MediaParameterPanels.tsx',
-    componentSource,
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TSX,
-  );
-  const progressElements = [];
-  const visit = (node) => {
-    if (ts.isJsxSelfClosingElement(node) && node.tagName.getText(sourceFile) === 'Progress') {
-      progressElements.push(node);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-
-  assert.ok(progressElements.length >= 2, '普通数值和频段权重都必须使用 Progress');
-  for (const element of progressElements) {
-    const sizeAttribute = element.attributes.properties.find(
-      (property) => ts.isJsxAttribute(property) && property.name.getText(sourceFile) === 'size',
-    );
-    assert.ok(sizeAttribute && sizeAttribute.initializer && ts.isJsxExpression(sizeAttribute.initializer));
-    const sizeExpression = sizeAttribute.initializer.expression;
-    assert.ok(sizeExpression && ts.isArrayLiteralExpression(sizeExpression), 'Progress size 必须使用公开数组 API');
-    assert.equal(sizeExpression.elements.length, 2);
-    assert.ok(sizeExpression.elements.every(ts.isNumericLiteral));
-    const [unitWidth, height] = sizeExpression.elements.map((element) => Number(element.text));
-    assert.ok(unitWidth >= 4 && unitWidth <= 8, '单个分段必须在可读前提下收窄');
-    assert.ok(height >= 4 && height <= 8, '分段高度必须兼顾紧凑与可读性');
-
-    const stepsAttribute = element.attributes.properties.find(
-      (property) => ts.isJsxAttribute(property) && property.name.getText(sourceFile) === 'steps',
-    );
-    assert.ok(stepsAttribute && stepsAttribute.initializer && ts.isJsxExpression(stepsAttribute.initializer));
-    const stepsExpression = stepsAttribute.initializer.expression;
-    assert.ok(stepsExpression && ts.isNumericLiteral(stepsExpression), 'Progress steps 必须是可审计的固定段数');
-    const stepCount = Number(stepsExpression.text);
-    assert.ok(
-      stepCount * unitWidth + (stepCount - 1) * 2 <= 96,
-      '分段总宽度必须适配 960px 最小窗口下的卡片正文',
-    );
-  }
+  assert.doesNotMatch(componentSource, /<Progress\b/);
+  assert.match(componentSource, /function NumericValue/);
+  assert.match(componentSource, /function BandWeightCards/);
 
   assert.deepEqual(feedback.REFERENCE_IMAGE_ACCENT_COLORS, {
     cyan: '#38B8F8',
@@ -388,19 +369,15 @@ test('参数卡按栏内可用宽度自动决定列数并自然换行', async ()
   );
   assert.match(
     cssSource,
-    /\.media-parameter-section__grid\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(min\(200px,\s*100%\),\s*1fr\)\)[^}]*align-items:\s*start[^}]*gap:\s*4px/s,
+    /\.media-parameter-section__grid\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(min\(126px,\s*100%\),\s*1fr\)\)[^}]*align-items:\s*start[^}]*gap:\s*2px/s,
   );
   assert.match(cssSource, /\.media-parameter-card\s*\{[^}]*width:\s*100%/s);
   assert.doesNotMatch(cssSource, /\.media-parameter-card\s*\{[^}]*height:\s*100%/s);
-  assert.match(cssSource, /\.media-parameter-card__value-area\s*\{[^}]*margin-top:\s*3px/s);
-  assert.match(cssSource, /\.media-parameter-card__numeric-value\s*\{[^}]*gap:\s*2px/s);
-  assert.match(
-    cssSource,
-    /\.media-parameter-card__bands\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/s,
-  );
+  assert.match(cssSource, /\.media-parameter-card__header\s*\{[^}]*justify-content:\s*space-between/s);
+  assert.match(cssSource, /\.media-parameter-card__value\s*\{[^}]*font-size:\s*11px/s);
 });
 
-test('参数卡隐藏底部说明并使用不裁剪内容的固定高度', async () => {
+test('参数卡隐藏底部说明并使用紧凑固定高度，频段权重拆成独立行', async () => {
   const componentSource = await readFile(new URL('./MediaParameterPanels.tsx', import.meta.url), 'utf8');
   const cssSource = await readFile(new URL('./media-parameter-panels.css', import.meta.url), 'utf8');
 
@@ -413,14 +390,12 @@ test('参数卡隐藏底部说明并使用不裁剪内容的固定高度', async
     assert.doesNotMatch(componentSource, removedDescriptionPath);
   }
   assert.doesNotMatch(cssSource, /media-parameter-card__description/);
-  assert.doesNotMatch(cssSource, /overflow:\s*hidden/);
-  assert.match(cssSource, /\.media-parameter-card\s*\{[^}]*height:\s*80px/s);
-  assert.match(componentSource, /definition\.kind\s*===\s*'band-weights'[\s\S]*?media-parameter-card--band-weights/);
-  assert.match(
-    cssSource,
-    /\.media-parameter-card--band-weights\s*\{[^}]*grid-column:\s*1\s*\/\s*-1[^}]*height:\s*196px/s,
-  );
-  assert.match(cssSource, /\.media-parameter-card__band-label\s*\{[^}]*flex-wrap:\s*wrap/s);
+  const compactHeight = cssSource.match(/\.media-parameter-card\s*\{[^}]*height:\s*(\d+)px/s);
+  assert.ok(compactHeight, '参数卡必须声明紧凑固定高度');
+  assert.ok(Number(compactHeight[1]) >= 24 && Number(compactHeight[1]) <= 28);
+  assert.match(componentSource, /function BandWeightCards[\s\S]*VISUAL_BAND_FREQUENCIES_HZ\.map/);
+  assert.match(componentSource, /\{frequencyHz\} Hz 权重/);
+  assert.match(componentSource, /className="media-parameter-card media-parameter-card--band"/);
 });
 
 test('每张参数卡挂载时独立配色且顺序相邻颜色不重复', async () => {
@@ -454,69 +429,39 @@ test('每张参数卡挂载时独立配色且顺序相邻颜色不重复', async
   assert.doesNotMatch(componentSource, /sectionAccents|sectionAccent|createRandomSectionAccents/);
 });
 
-test('每张参数卡都显示能力三态，面板顶部保留可见图例', async () => {
+test('已实现参数不显示接入标签，未接入参数就地显示真实状态', async () => {
   const componentSource = await readFile(new URL('./MediaParameterPanels.tsx', import.meta.url), 'utf8');
 
-  assert.match(componentSource, /aria-label="参数接入状态说明"/);
-  assert.match(componentSource, /Object\.keys\(MEDIA_PARAMETER_STATUS_LABELS\)/);
-  assert.match(componentSource, /MEDIA_PARAMETER_STATUS_LABELS\[status\]/);
-  assert.match(componentSource, /status=\{statusOverrides\?\.\[path\]\s*\?\?\s*definition\.status\}/);
+  assert.doesNotMatch(componentSource, /aria-label="参数接入状态说明"/);
+  assert.match(componentSource, /status === 'implemented' \? null/);
+  assert.match(componentSource, /正式需求·待实现/);
+  assert.match(componentSource, /待确认/);
+  assert.match(componentSource, /const status = statusOverrides\?\.\[path\] \?\? definition\.status/);
 });
 
-test('参数值签名忽略对象键顺序并只在实际值变化时改变', async () => {
-  const feedback = await importTypeScriptModule('./parameter-panel-feedback.ts');
-
-  assert.equal(
-    feedback.createMediaParameterValueSignature({ 65: 1, 92: 0.75 }),
-    feedback.createMediaParameterValueSignature({ 92: 0.75, 65: 1 }),
-  );
-  assert.notEqual(
-    feedback.createMediaParameterValueSignature({ 65: 1, 92: 0.75 }),
-    feedback.createMediaParameterValueSignature({ 65: 1, 92: 0.8 }),
-  );
-  assert.equal(
-    feedback.createMediaParameterValueSignature(null),
-    feedback.createMediaParameterValueSignature(null),
-  );
-  assert.notEqual(
-    feedback.createMediaParameterValueSignature(0),
-    feedback.createMediaParameterValueSignature(-0),
-  );
-});
-
-test('参数卡只在值变化时按自己的颜色执行可重复重启的缓慢淡出反馈', async () => {
+test('参数卡保留静态强调色，不创建闪烁状态或发光动画', async () => {
   const componentSource = await readFile(new URL('./MediaParameterPanels.tsx', import.meta.url), 'utf8');
   const cssSource = await readFile(new URL('./media-parameter-panels.css', import.meta.url), 'utf8');
+  const feedbackSource = await readFile(new URL('./parameter-panel-feedback.ts', import.meta.url), 'utf8');
 
-  assert.match(componentSource, /createMediaParameterValueSignature\(rawValue\)/);
-  assert.match(componentSource, /useState\(0\)/);
-  assert.match(componentSource, /previousValueSignature\.current\s*===\s*valueSignature/);
-  assert.match(componentSource, /setFlashGeneration\(\(current\)\s*=>\s*current\s*\+\s*1\)/);
-  assert.match(componentSource, /flashGeneration\s*===\s*0\s*\?\s*baseCardClassName/);
-  assert.match(componentSource, /media-parameter-card--flash-a/);
-  assert.match(componentSource, /media-parameter-card--flash-b/);
   assert.match(componentSource, /'--media-parameter-accent':\s*progressColor/);
-  assert.match(
-    cssSource,
-    /\.media-parameter-card::after\s*\{[^}]*border:[^}]*var\(--media-parameter-accent\)[^}]*box-shadow:[^}]*var\(--media-parameter-accent\)[^}]*opacity:\s*0[^}]*pointer-events:\s*none/s,
+  assert.doesNotMatch(componentSource, /flashGeneration|previousValueSignature|createMediaParameterValueSignature|media-parameter-card--flash/);
+  assert.doesNotMatch(feedbackSource, /createMediaParameterValueSignature/);
+  assert.doesNotMatch(cssSource, /media-parameter-card::after|media-parameter-card--flash|media-parameter-card-flash|box-shadow/);
+});
+
+test('单张参数卡只接收当前字段值，并使用 React memo 跳过无关重渲染', async () => {
+  const componentSource = await readFile(new URL('./MediaParameterPanels.tsx', import.meta.url), 'utf8');
+  const cardSource = componentSource.slice(
+    componentSource.indexOf('const MediaParameterCard'),
+    componentSource.indexOf('function groupDefinitions'),
   );
-  assert.match(
-    cssSource,
-    /\.media-parameter-card--flash-a::after[\s\S]*?\.media-parameter-card--flash-b::after\s*\{[^}]*animation-duration:\s*900ms[^}]*animation-timing-function:\s*ease-in-out/s,
-  );
-  for (const animationName of ['media-parameter-card-flash-a', 'media-parameter-card-flash-b']) {
-    const animationStart = cssSource.indexOf(`@keyframes ${animationName}`);
-    const animationEnd = cssSource.indexOf('\n}', animationStart);
-    const animation = cssSource.slice(animationStart, animationEnd);
-    assert.ok(animationStart >= 0 && animationEnd > animationStart);
-    assert.match(animation, /10%\s*\{[^}]*opacity:\s*1/s);
-    assert.match(animation, /100%\s*\{[^}]*opacity:\s*0/s);
-    assert.doesNotMatch(animation, /box-shadow|border/);
-  }
-  assert.match(
-    cssSource,
-    /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*?\.media-parameter-card--flash-a::after[\s\S]*?animation:\s*none/s,
-  );
+
+  assert.match(componentSource, /const MediaParameterCard\s*=\s*memo\(/);
+  assert.match(cardSource, /rawValue:\s*unknown/);
+  assert.match(componentSource, /rawValue=\{params\[definition\.section\]\[definition\.field\]\}/);
+  assert.doesNotMatch(cardSource, /params:\s*MediaEffectParams/);
+  assert.match(componentSource, /export const MediaParameterPanels\s*=\s*memo\(/);
 });
 
 test('全部正式参数已接入，同时主参数面板保持只读职责', async () => {

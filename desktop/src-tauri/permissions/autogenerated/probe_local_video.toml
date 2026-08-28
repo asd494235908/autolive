@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-probe-local-video"
+description = "Enables the probe_local_video command without any pre-configured scope."
+commands.allow = ["probe_local_video"]
+
+[[permission]]
+identifier = "deny-probe-local-video"
+description = "Denies the probe_local_video command without any pre-configured scope."
+commands.deny = ["probe_local_video"]

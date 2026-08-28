@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-discard-audio-media-candidate"
+description = "Enables the discard_audio_media_candidate command without any pre-configured scope."
+commands.allow = ["discard_audio_media_candidate"]
+
+[[permission]]
+identifier = "deny-discard-audio-media-candidate"
+description = "Denies the discard_audio_media_candidate command without any pre-configured scope."
+commands.deny = ["discard_audio_media_candidate"]

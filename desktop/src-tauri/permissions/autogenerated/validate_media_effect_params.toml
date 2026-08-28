@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-validate-media-effect-params"
+description = "Enables the validate_media_effect_params command without any pre-configured scope."
+commands.allow = ["validate_media_effect_params"]
+
+[[permission]]
+identifier = "deny-validate-media-effect-params"
+description = "Denies the validate_media_effect_params command without any pre-configured scope."
+commands.deny = ["validate_media_effect_params"]

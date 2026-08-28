@@ -139,6 +139,7 @@ export type EditableAudioParameterField =
 export interface AudioParameterControlsProps {
   value: AudioEffectParams;
   disabled: boolean;
+  showHeading?: boolean;
   ambientSoundPath: string | null;
   onChange: <Field extends EditableAudioParameterField>(
     field: Field,
@@ -154,4 +155,5 @@ export interface MediaParameterPanelsProps {
   error?: string | null;
   statusOverrides?: Partial<Record<MediaParameterPath, MediaParameterStatus>>;
   audioControls?: ReactNode;
+  sections?: readonly MediaParameterSection[];
 }

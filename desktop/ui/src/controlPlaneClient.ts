@@ -4,7 +4,8 @@ import type { components as OpenAPIComponents } from './api/openapi.generated';
 type ViteEnvironment = { DEV?: boolean; VITE_CONTROL_PLANE_BASE_URL?: string; VITE_CONTROL_PLANE_ENV?: string };
 const viteEnvironment = (import.meta as ImportMeta & { env?: ViteEnvironment }).env;
 const configuredControlPlaneBaseUrl = viteEnvironment?.VITE_CONTROL_PLANE_BASE_URL?.trim();
-const developmentControlPlaneBaseUrl = 'http://101.96.208.132:9090';
+const developmentControlPlaneBaseUrl = 'http://127.0.0.1:18090';
+const testControlPlaneBaseUrl = 'http://101.96.208.132:9090';
 const testControlPlaneBuild = viteEnvironment?.VITE_CONTROL_PLANE_ENV === 'test';
 
 function resolveControlPlaneBaseUrl() {
@@ -21,13 +22,15 @@ function resolveControlPlaneBaseUrl() {
   if (parsed.username || parsed.password || parsed.search || parsed.hash) {
     throw new Error('VITE_CONTROL_PLANE_BASE_URL must not contain credentials, query, or hash');
   }
-  if (!viteEnvironment?.DEV && !testControlPlaneBuild && parsed.protocol !== 'https:') {
-    throw new Error('VITE_CONTROL_PLANE_BASE_URL must use HTTPS for production desktop builds');
+  const loopbackHttp = parsed.protocol === 'http:'
+    && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]');
+  const normalizedBaseUrl = parsed.toString().replace(/\/+$/, '');
+  const fixedTestHttp = parsed.protocol === 'http:'
+    && testControlPlaneBuild && normalizedBaseUrl === testControlPlaneBaseUrl;
+  if (parsed.protocol !== 'https:' && !(viteEnvironment?.DEV && loopbackHttp) && !fixedTestHttp) {
+    throw new Error('VITE_CONTROL_PLANE_BASE_URL must use HTTPS; development HTTP is limited to loopback and test HTTP to the fixed test origin');
   }
-  if ((viteEnvironment?.DEV || testControlPlaneBuild) && parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('VITE_CONTROL_PLANE_BASE_URL must use HTTP or HTTPS for development/test desktop builds');
-  }
-  return parsed.toString().replace(/\/+$/, '');
+  return normalizedBaseUrl;
 }
 
 export const CONTROL_PLANE_BASE_URL = resolveControlPlaneBaseUrl();
@@ -36,11 +39,6 @@ export type ApiErrorDetailDto = OpenAPISchemas['ErrorDetail'];
 export type ErrorResponseDto = OpenAPISchemas['ErrorResponse'];
 export type UserSummaryDto = OpenAPISchemas['UserSummary'];
 export type DeviceSummaryDto = OpenAPISchemas['DeviceSummary'];
-export type LoginRequestDto = OpenAPISchemas['LoginRequest'];
-export type LoginResponseDto = OpenAPISchemas['LoginResponse'];
-export type RefreshTokenResponseDto = OpenAPISchemas['RefreshTokenResponse'];
-export type LogoutRequestDto = OpenAPISchemas['LogoutRequest'];
-export type LogoutResponseDto = OpenAPISchemas['LogoutResponse'];
 export type DeviceRegistrationDto = OpenAPISchemas['DeviceRegistration'];
 export type ActivateDeviceRequestDto = Pick<OpenAPISchemas['ActivateDeviceRequest'], 'device'>;
 export type ActivateDeviceResponseDto = OpenAPISchemas['ActivateDeviceResponse'];
@@ -144,16 +142,13 @@ async function requestJson<T>(path: string, init: { method: 'GET' | 'POST'; body
     if (response.status === 503 && allowAuditRetry && init.method !== 'GET' && init.idempotencyKey && isRecord(payload) && payload.code === 'AUDIT_UNAVAILABLE') {
       return requestJson<T>(path, init, allowAuthRefresh, false);
     }
-    if (response.status === 401 && allowAuthRefresh && init.accessToken && !path.startsWith('/api/v1/auth/')) { const refreshed = await refreshExpiredSession(); if (refreshed && refreshed !== init.accessToken) return requestJson<T>(path, { ...init, accessToken: refreshed }, false) }
+    if (response.status === 401 && allowAuthRefresh && init.accessToken) { const refreshed = await refreshExpiredSession(); if (refreshed && refreshed !== init.accessToken) return requestJson<T>(path, { ...init, accessToken: refreshed }, false) }
     if (isRecord(payload) && typeof payload.code === 'string' && typeof payload.message === 'string') { const errorPayload = payload as unknown as ErrorResponseDto; throw new ControlPlaneError({ code: errorPayload.code, message: errorPayload.message, requestId: errorPayload.request_id ?? requestId, details: errorPayload.details, status: response.status }) }
     throw new ControlPlaneError({ code: 'HTTP_ERROR', message: `${response.status} ${response.statusText}`.trim(), status: response.status, requestId })
   }
   return payload as T;
 }
 export function buildIdempotencyKey(): string { return createRequestId() }
-export function loginControlPlane(request: LoginRequestDto) { return requestJson<LoginResponseDto>('/api/v1/auth/login', { method: 'POST', body: request }) }
-export function refreshControlPlane(refreshToken: string) { return requestJson<RefreshTokenResponseDto>('/api/v1/auth/refresh', { method: 'POST', body: { refresh_token: refreshToken } }, false) }
-export function logoutControlPlane(accessToken: string, refreshToken?: string) { return requestJson<LogoutResponseDto>('/api/v1/auth/logout', { method: 'POST', body: refreshToken ? { refresh_token: refreshToken } : undefined, accessToken }, false) }
 export function activateDeviceControlPlane(accessToken: string, request: ActivateDeviceRequestDto) { return requestJson<ActivateDeviceResponseDto>('/api/v1/client/activate', { method: 'POST', body: request, accessToken, idempotencyKey: buildIdempotencyKey() }) }
 export function getClientProfileControlPlane(accessToken: string) { return requestJson<ClientProfileResponseDto>('/api/v1/client/profile', { method: 'GET', accessToken }) }
 export function sendHeartbeatControlPlane(accessToken: string, request: HeartbeatRequestDto, idempotencyKey = buildIdempotencyKey()) { return requestJson<HeartbeatResponseDto>('/api/v1/client/heartbeat', { method: 'POST', body: request, accessToken, idempotencyKey }) }

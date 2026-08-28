@@ -29,11 +29,18 @@ type rateLimitPolicy struct {
 }
 
 var protectedRateLimitPolicies = []rateLimitPolicy{
-	{name: "auth-login", limit: rate.Every(2 * time.Second), burst: 5, retry: 2 * time.Second},
+	{name: "auth-login", limit: rate.Every(time.Second), burst: 60, retry: time.Second},
 	{name: "auth-refresh", limit: rate.Every(time.Second), burst: 10, retry: time.Second},
 	{name: "model-test", limit: rate.Every(2 * time.Second), burst: 5, retry: 2 * time.Second},
 	{name: "model-rotate", limit: rate.Every(2 * time.Second), burst: 5, retry: 2 * time.Second},
 	{name: "admin-password-change", limit: rate.Every(30 * time.Second), burst: 2, retry: 30 * time.Second},
+}
+
+var authLoginAccountRateLimitPolicy = rateLimitPolicy{
+	name:  "auth-login",
+	limit: rate.Every(2 * time.Second),
+	burst: 20,
+	retry: 2 * time.Second,
 }
 
 type requestRateLimiter struct {
@@ -128,8 +135,16 @@ func rateLimitMiddlewareWithMetricsAndClients(limiter *requestRateLimiter, metri
 			next.ServeHTTP(w, r)
 			return
 		}
-		key := policy.name + ":" + clients.clientAddress(r)
-		if !limiter.allow(key, policy) {
+		addressKey := policy.name + ":address:" + clients.clientAddress(r)
+		allowed := limiter.allow(addressKey, policy)
+		if allowed && policy.name == "auth-login" {
+			if username, ok := loginUsername(r); ok {
+				accountDigest := sha256.Sum256([]byte(username))
+				accountKey := policy.name + ":account:" + hex.EncodeToString(accountDigest[:])
+				allowed = limiter.allow(accountKey, authLoginAccountRateLimitPolicy)
+			}
+		}
+		if !allowed {
 			if metrics != nil {
 				metrics.recordRateLimited(policy.name)
 			}

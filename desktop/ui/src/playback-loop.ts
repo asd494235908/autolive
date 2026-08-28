@@ -5,11 +5,42 @@ type 播放重启判断输入 = {
   lastRestartGeneration?: number | null;
   syncInFlight?: boolean;
   ended: boolean;
+  endedRequiresDurationBoundary?: boolean;
   currentTime?: number;
   duration?: number;
 };
 
 const 接近结束阈值秒 = 0.05;
+
+export function resolveMseSourceTimeSeconds(
+  streamTimeSeconds: number,
+  sourceStreamOriginMs: number,
+): number {
+  if (!Number.isFinite(streamTimeSeconds) || streamTimeSeconds < 0) return 0;
+  if (!Number.isSafeInteger(sourceStreamOriginMs) || sourceStreamOriginMs < 0) return streamTimeSeconds;
+  return Math.max(0, streamTimeSeconds - sourceStreamOriginMs / 1_000);
+}
+
+export function resolvePlaybackBoundaryDuration({
+  mediaDurationSeconds,
+  sourceDurationMs,
+  realtimeVideoStreamActive,
+}: {
+  mediaDurationSeconds: number;
+  sourceDurationMs?: number | null;
+  realtimeVideoStreamActive: boolean;
+}): number {
+  if (
+    realtimeVideoStreamActive
+    && Number.isSafeInteger(sourceDurationMs)
+    && (sourceDurationMs as number) > 0
+  ) {
+    return (sourceDurationMs as number) / 1_000;
+  }
+  return Number.isFinite(mediaDurationSeconds) && mediaDurationSeconds > 0
+    ? mediaDurationSeconds
+    : 0;
+}
 
 export function shouldIgnoreLoopBoundaryPause({
   suppressMediaEvent,
@@ -55,15 +86,17 @@ function 令牌有效(令牌: string | number | null): 令牌 is string | number
 
 function 已到播放边界({
   ended,
+  endedRequiresDurationBoundary,
   currentTime,
   duration,
-}: Pick<播放重启判断输入, 'ended' | 'currentTime' | 'duration'>): boolean {
-  return ended || (
+}: Pick<播放重启判断输入, 'ended' | 'endedRequiresDurationBoundary' | 'currentTime' | 'duration'>): boolean {
+  const reachedDurationBoundary = (
     Number.isFinite(currentTime) &&
     Number.isFinite(duration) &&
     (duration as number) > 0 &&
     (currentTime as number) >= (duration as number) - 接近结束阈值秒
   );
+  return reachedDurationBoundary || (ended && !endedRequiresDurationBoundary);
 }
 
 export function shouldRestartPlayback({
@@ -73,6 +106,7 @@ export function shouldRestartPlayback({
   lastRestartGeneration,
   syncInFlight,
   ended,
+  endedRequiresDurationBoundary,
   currentTime,
   duration,
 }: 播放重启判断输入): boolean {
@@ -97,5 +131,10 @@ export function shouldRestartPlayback({
     return false;
   }
 
-  return 已到播放边界({ ended, currentTime, duration });
+  return 已到播放边界({
+    ended,
+    endedRequiresDurationBoundary,
+    currentTime,
+    duration,
+  });
 }

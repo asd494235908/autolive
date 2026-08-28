@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-switch-portaudio-interlude-preset"
+description = "Enables the switch_portaudio_interlude_preset command without any pre-configured scope."
+commands.allow = ["switch_portaudio_interlude_preset"]
+
+[[permission]]
+identifier = "deny-switch-portaudio-interlude-preset"
+description = "Denies the switch_portaudio_interlude_preset command without any pre-configured scope."
+commands.deny = ["switch_portaudio_interlude_preset"]

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "artifact": {
+    "build_repository": "https://github.com/shinchiro/mpv-winbuild-cmake",
+    "release": "20260814",
+    "asset": "mpv-x86_64-20260814-git-7b8915bc1d.7z",
+    "download_url": "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260814/mpv-x86_64-20260814-git-7b8915bc1d.7z",
+    "archive_sha256": "1bf3b029da2c98e605e00e85f21ee3142f22a1dcc4ceb5c827b5c51e36e390f9"
+  },
+  "components": {
+    "mpv": {
+      "version": "v0.41.0-923-g7b8915bc1",
+      "built_at": "Aug 14 2026 00:27:31",
+      "source_repository": "https://github.com/mpv-player/mpv",
+      "source_ref": "7b8915bc1d",
+      "license_expression": "GPL-2.0-or-later",
+      "copyright_file": "Copyright.txt",
+      "license_file": "GPL-2.0.txt",
+      "source_file": "SOURCE.md"
+    },
+    "libplacebo": {
+      "version": "v7.371.0",
+      "build_revision": "v7.360.0-111-g22ee762-dirty",
+      "source_repository": "https://github.com/haasn/libplacebo",
+      "source_ref": "22ee762",
+      "license_expression": "LGPL-2.1-or-later",
+      "license_file": "LGPL-2.1.txt",
+      "source_file": "SOURCE.md"
+    },
+    "d3dcompiler_43": {
+      "license_expression": "LicenseRef-Microsoft-DirectX-Redistributable-EULA",
+      "license_file": "D3DCOMPILER_43-EULA.txt"
+    }
+  },
+  "files": {
+    "mpv.exe": {
+      "sha256": "09dc5c350a70b536cc91015e7a856f77c933fa9d7f4c41563666e51c998a0243"
+    },
+    "d3dcompiler_43.dll": {
+      "sha256": "4b074a3976399dc735484f5d43d04b519b7bdee8ac719d9ab8ed6bd4e6be0345"
+    }
+  }
+}

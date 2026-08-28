@@ -26,6 +26,7 @@ test('accepts a valid media state and rejects malformed values', async () => {
     paused: false,
     playback_generation: 3,
     source_revision: 3,
+    clock_session: 'window-a',
     clock_epoch: 1,
     clock_sequence: 7,
     loop_index: 2,
@@ -33,6 +34,7 @@ test('accepts a valid media state and rejects malformed values', async () => {
     duration_ms: 10_000,
     absolute_position_ms: 22_000,
     playback_rate: 1,
+    clock_health: 'healthy',
   }), true);
   assert.equal(isPlaybackMediaStateMessage({
     version: 2,
@@ -44,6 +46,7 @@ test('accepts a valid media state and rejects malformed values', async () => {
     paused: false,
     playback_generation: 3,
     source_revision: 3,
+    clock_session: 'window-a',
     clock_epoch: 1,
     clock_sequence: 7,
     loop_index: 2,
@@ -51,6 +54,7 @@ test('accepts a valid media state and rejects malformed values', async () => {
     duration_ms: 10_000,
     absolute_position_ms: 22_000,
     playback_rate: 1,
+    clock_health: 'healthy',
   }), false);
   assert.equal(isPlaybackMediaStateMessage({
     version: 2,
@@ -62,6 +66,7 @@ test('accepts a valid media state and rejects malformed values', async () => {
     paused: false,
     playback_generation: 3,
     source_revision: 3,
+    clock_session: 'window-a',
     clock_epoch: 1,
     clock_sequence: 7,
     loop_index: 2,
@@ -69,6 +74,7 @@ test('accepts a valid media state and rejects malformed values', async () => {
     duration_ms: 10_000,
     absolute_position_ms: 22_000,
     playback_rate: Number.NaN,
+    clock_health: 'healthy',
   }), false);
   assert.equal(isPlaybackMediaStateMessage({
     version: 2,
@@ -80,6 +86,7 @@ test('accepts a valid media state and rejects malformed values', async () => {
     paused: false,
     playback_generation: 3,
     source_revision: 3,
+    clock_session: 'window-a',
     clock_epoch: 1,
     clock_sequence: 7,
     loop_index: 2,
@@ -87,6 +94,27 @@ test('accepts a valid media state and rejects malformed values', async () => {
     duration_ms: 10_000,
     absolute_position_ms: 12_000,
     playback_rate: 1,
+    clock_health: 'healthy',
+  }), false);
+  assert.equal(isPlaybackMediaStateMessage({
+    version: 2,
+    type: 'playback-media-state',
+    current_time: 2,
+    duration: 10,
+    volume: 0.8,
+    muted: false,
+    paused: false,
+    playback_generation: 3,
+    source_revision: 3,
+    clock_session: 'window-a',
+    clock_epoch: 1,
+    clock_sequence: 7,
+    loop_index: 2,
+    position_ms: 2_000,
+    duration_ms: 10_000,
+    absolute_position_ms: 22_000,
+    playback_rate: 1,
+    clock_health: 'unknown',
   }), false);
 });
 
@@ -222,6 +250,91 @@ test('the home page exposes media controls but no manual playback-rate control',
   assert.match(source, /shouldApplyPlaybackSeek\(message, snapshotRef\.current\?\.playback_generation\)/);
 });
 
+test('媒体音量发布真实用户值并与插话音量分离', async () => {
+  const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+  const controls = source.slice(
+    source.indexOf('title="播放控制"'),
+    source.indexOf('</DesktopColumn>', source.indexOf('title="播放控制"')),
+  );
+
+  assert.match(controls, /aria-label="媒体音量"/);
+  assert.match(controls, />媒体音量</);
+  assert.match(source, /volume: clampVolume\(userVolumeRef\.current\)/);
+  assert.match(source, /invoke<void>\('set_portaudio_media_volume'/);
+  assert.match(source, /mainMediaVolumeGainRef\.current\.gain\.value = hardwareOut \|\| muted \? 0 : clampVolume\(volume\)/);
+  assert.match(source, /speakerMuteGainRef\.current\.gain\.value = hardwareOut \? 0 : 1/);
+  assert.match(source, /mainProgramGain\.connect\(mainMediaVolumeGain\)[\s\S]*mainMediaVolumeGain\.connect\(analyser\)[\s\S]*createMediaElementSource\(interlude\)\.connect\(analyser\)/);
+  assert.match(source, /interludeAudio\.volume = clampVolume\(interludeGainLevelRef\.current\)/);
+  assert.doesNotMatch(source, /interludeAudio\.volume = clampVolume\(volume \* interludeGainLevelRef\.current\)/);
+});
+
+test('播放进度拖动保留本地值，松手后只提交一次 seek', async () => {
+  const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+  const controls = source.slice(
+    source.indexOf('title="播放控制"'),
+    source.indexOf('</DesktopColumn>', source.indexOf('title="播放控制"')),
+  );
+  const dragHandler = controls.slice(
+    controls.indexOf('onChange={(value)'),
+    controls.indexOf('onChangeComplete={(value)'),
+  );
+  const commitHandler = controls.slice(
+    controls.indexOf('onChangeComplete={(value)'),
+    controls.indexOf('/>', controls.indexOf('onChangeComplete={(value)')),
+  );
+
+  assert.match(controls, /value=\{mediaDisplayedTime\}/);
+  assert.match(dragHandler, /setMediaSeekDraft\([\s\S]*committed: false/);
+  assert.doesNotMatch(dragHandler, /action: 'seek'/);
+  assert.match(commitHandler, /action: 'seek'/);
+});
+
+test('最终效果窗重开后接受新发布会话，并继续拒绝同会话倒序时钟', async () => {
+  const { shouldAcceptPlaybackMediaState } = await loadTypeScriptModule('playback-control-message.ts', [
+    'shouldAcceptPlaybackMediaState',
+  ]);
+  const state = (overrides = {}) => ({
+    version: 2,
+    type: 'playback-media-state',
+    current_time: 2,
+    duration: 10,
+    volume: 0.8,
+    muted: false,
+    paused: false,
+    playback_generation: 3,
+    source_revision: 1,
+    clock_session: 'window-a',
+    clock_epoch: 100,
+    clock_sequence: 20,
+    loop_index: 0,
+    position_ms: 2_000,
+    duration_ms: 10_000,
+    absolute_position_ms: 2_000,
+    playback_rate: 1,
+    clock_health: 'healthy',
+    ...overrides,
+  });
+  const previous = state();
+
+  assert.equal(shouldAcceptPlaybackMediaState(previous, state({
+    clock_session: 'window-b',
+    clock_epoch: 1,
+    clock_sequence: 1,
+  })), true);
+  assert.equal(shouldAcceptPlaybackMediaState(previous, state({
+    clock_epoch: 99,
+    clock_sequence: 999,
+  })), false);
+  assert.equal(shouldAcceptPlaybackMediaState(previous, state({
+    clock_sequence: 21,
+  })), true);
+
+  const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+  assert.match(source, /const clockSessionRef = useRef\(crypto\.randomUUID\(\)\)/);
+  assert.match(source, /clock_session: clockSessionRef\.current/);
+  assert.match(source, /shouldAcceptPlaybackMediaState\(previous, event\.data\)/);
+});
+
 test('does not carry an old video position into the next playback generation', async () => {
   const { capturePlaybackPosition, resolvePlaybackResumePosition } = await loadTypeScriptModule(
     'playback-control-message.ts',
@@ -248,14 +361,29 @@ test('does not carry an old video position into the next playback generation', a
   assert.equal(resolvePlaybackResumePosition(current, 9), 0);
 });
 
-test('stale audio candidates are recovered or advanced without a global error', async () => {
+test('busy audio media candidates retry without a global error and expired plans rebuild locally', async () => {
   const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
   assert.match(
     source,
-    /function isTransientAudioCandidateCode[\s\S]*audio_candidate_stale[\s\S]*audio_mixer_candidate_superseded/,
+    /function isMediaWorkerBusyError[\s\S]*media_worker_already_running/,
   );
   assert.match(
     source,
-    /event\.data\.reason\s*&&\s*!isTransientAudioCandidateCode\(event\.data\.error_code\)/,
+    /if \(isMediaWorkerBusyError\(cause\)\) return;[\s\S]*audioFuturePlansRef\.current = null/,
   );
+  assert.match(source, /候选声音已超过有效媒体时间窗口[\s\S]*advanceIndependentAudioQueue/);
+});
+
+test('runtime IPC messages validate finite values, safe integers, bounded arrays, enums, and combinations', async () => {
+  const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+
+  assert.match(source, /function isPlaybackSnapshot\(value: unknown\): value is PlaybackSnapshot/);
+  assert.match(source, /sourceMediaPool\.length > 100/);
+  assert.match(source, /audioStreamVariants\.length <= AUDIO_MIX_PICK_HARD_MAX/);
+  assert.match(source, /\['ready', 'playing', 'paused', 'stopped'\]\.includes/);
+  assert.match(source, /Number\.isFinite/);
+  assert.match(source, /Number\.isSafeInteger/);
+  assert.match(source, /nullableBoundedString\(record\.pending_audio_artifact_reference\)/);
+  assert.match(source, /isNullableSafeNonNegativeInteger\(record\.pending_audio_media_target_absolute_position_ms\)/);
+  assert.doesNotMatch(source, /event\.data\.snapshot as PlaybackSnapshot/);
 });

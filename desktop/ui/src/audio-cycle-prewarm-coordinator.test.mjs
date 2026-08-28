@@ -59,6 +59,16 @@ test('候选提交会扣除环缓待播和硬件延迟对应的媒体时间', ()
   assert.equal(coordinator.getAudioCycleCoordinatorAction(prepared, 4_625, 1.5, 250), 'commit');
 });
 
+test('提交中的候选超过目标宽限期仍等待真实提交结果', () => {
+  const plan = coordinator.createAudioCycleCandidatePlan(5, { seed: 3 }, 0, 5_000);
+  const committing = coordinator.updateAudioCycleCandidateStatus(plan, 'committing');
+
+  assert.equal(
+    coordinator.getAudioCycleCoordinatorAction(committing, 5_501, 1, 250),
+    null,
+  );
+});
+
 test('候选错误没有恢复旧 candidate 或旧 revision 的入口', () => {
   assert.equal('recoverAudioCycleCandidate' in coordinator, false);
 });

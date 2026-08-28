@@ -12,6 +12,105 @@ const MIN_SPATIAL_CYCLES: f64 = 1.0;
 const MAX_SPATIAL_CYCLES: f64 = 32.0;
 const MIN_EFFECTIVE_OVERLAY_ALPHA: f64 = 2.0 / 255.0;
 
+const VISUAL_BAND_APPLIED_FIELDS: [(u32, &str); 12] = [
+    (65, "advanced.band_weights.65"),
+    (92, "advanced.band_weights.92"),
+    (131, "advanced.band_weights.131"),
+    (188, "advanced.band_weights.188"),
+    (267, "advanced.band_weights.267"),
+    (381, "advanced.band_weights.381"),
+    (544, "advanced.band_weights.544"),
+    (777, "advanced.band_weights.777"),
+    (1_110, "advanced.band_weights.1110"),
+    (1_585, "advanced.band_weights.1585"),
+    (2_263, "advanced.band_weights.2263"),
+    (20_000, "advanced.band_weights.20000"),
+];
+
+const ATOMIC_VIDEO_FIELDS: [&str; 30] = [
+    "video.brightness_percent",
+    "video.saturation_percent",
+    "video.blur_radius_px",
+    "video.contrast_percent",
+    "video.hue_rotation_degrees",
+    "video.sharpen_percent",
+    "video.noise_percent",
+    "video.detail_enhancement_percent",
+    "video.crop_edge_smoothing",
+    "video.frame_rate_jitter_percent",
+    "video.frame_rate_perturbation_frequency_hz",
+    "video.frame_rate_perturbation_amplitude_fps",
+    "video.pixel_scale_percent",
+    "video.pixel_jitter_px",
+    "video.dynamic_crop_percent",
+    "video.frame_inner_perturbation_percent",
+    "video.frame_inter_perturbation_percent",
+    "video.space_x_offset_px",
+    "video.space_y_offset_px",
+    "video.color_space_conversion_strength_percent",
+    "video.color_space_conversion_enabled",
+    "video.rotation_degrees",
+    "video.vignette_percent",
+    "video.highlights_percent",
+    "video.shadows_percent",
+    "video.red_channel_lock_enabled",
+    "video.edge_softness_percent",
+    "video.image_repair_enabled",
+    "video.image_repair_strength_percent",
+    "video.frame_rate_lock_enabled",
+];
+
+const ATOMIC_ADVANCED_FIELDS: [&str; 42] = [
+    "advanced.band_weights",
+    "advanced.target_frequency_hz",
+    "advanced.core_frequency_hz",
+    "advanced.wave_intensity",
+    "advanced.wave_level",
+    "advanced.wave_grain_count",
+    "advanced.dynamic_eq_threshold",
+    "advanced.channel_offset_percent",
+    "advanced.space_dimension",
+    "advanced.frequency_space_x_offset_px",
+    "advanced.frequency_space_y_offset_px",
+    "advanced.frame_perturbation_probability_percent",
+    "advanced.random_graphic_opacity_percent",
+    "advanced.random_graphic_size_px",
+    "advanced.abstract_face_count",
+    "advanced.abstract_face_size_percent",
+    "advanced.abstract_face_opacity_percent",
+    "advanced.overlay_offset_px",
+    "advanced.slice_length_ms",
+    "advanced.slice_min_length_ms",
+    "advanced.slice_trigger_interval_ms",
+    "advanced.random_graphic_enabled",
+    "advanced.random_graphic_count",
+    "advanced.picture_in_picture_enabled",
+    "advanced.picture_in_picture_scale_percent",
+    "advanced.picture_in_picture_opacity_percent",
+    "advanced.picture_in_picture_rotation_degrees",
+    "advanced.picture_in_picture_pixel_jitter_px",
+    "advanced.picture_in_picture_timeline_locked",
+    "advanced.local_blur_enabled",
+    "advanced.local_blur_region_percent",
+    "advanced.local_blur_radius_px",
+    "advanced.local_blur_interval_ms",
+    "advanced.edge_fill_enabled",
+    "advanced.edge_feather_percent",
+    "advanced.transform_smoothing_enabled",
+    "advanced.transform_smoothing_duration_ms",
+    "advanced.highlight_perturbation_enabled",
+    "advanced.highlight_perturbation_interval_ms",
+    "advanced.asynchronous_rotation_enabled",
+    "advanced.asynchronous_rotation_min_degrees",
+    "advanced.asynchronous_rotation_max_degrees",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicMediaVideoEffectError {
+    pub field: String,
+    pub reason: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaVideoEffectPlan {
     pub filters: Vec<String>,
@@ -53,6 +152,8 @@ pub fn build_media_video_effect_plan(
     };
 
     append_crop_with_smoothing(&mut plan, video);
+    append_subpixel_pixel_jitter(&mut plan, video);
+    append_pixel_scale_canvas_restore(&mut plan, video);
     append_inter_frame_perturbation(&mut plan, video);
     append_channel_offset(&mut plan, advanced);
     append_spatial_modulation(&mut plan, video, advanced);
@@ -69,6 +170,277 @@ pub fn build_media_video_effect_plan(
     Ok(plan)
 }
 
+/// 构建“30 个普通字段 + 42 个高级模型字段（12 个频段逐项展开）”的原子计划。
+///
+/// 这里只完成参数、从属关系和滤镜映射准入；成功不等同于输出已产生帧差或已经呈现。
+pub fn build_atomic_media_video_effect_plan(
+    video: &VideoEffectParams,
+    advanced: &AdvancedEffectParams,
+) -> Result<MediaVideoEffectPlan, Vec<AtomicMediaVideoEffectError>> {
+    let mut errors = Vec::new();
+    if let Err(validation_errors) = video.validate() {
+        errors.extend(
+            validation_errors
+                .into_iter()
+                .map(|error| AtomicMediaVideoEffectError {
+                    field: error.field,
+                    reason: "invalid_parameter",
+                }),
+        );
+    }
+    if let Err(validation_errors) = advanced.validate() {
+        errors.extend(
+            validation_errors
+                .into_iter()
+                .map(|error| AtomicMediaVideoEffectError {
+                    field: error.field,
+                    reason: "invalid_parameter",
+                }),
+        );
+    }
+    if video.horizontal_flip_enabled {
+        push_atomic_error(
+            &mut errors,
+            "video.horizontal_flip_enabled",
+            "excluded_flip_must_be_disabled",
+        );
+    }
+    if video.vertical_flip_enabled {
+        push_atomic_error(
+            &mut errors,
+            "video.vertical_flip_enabled",
+            "excluded_flip_must_be_disabled",
+        );
+    }
+    if video.noise_percent < 1.0 || video.noise_percent.fract().abs() > f64::EPSILON {
+        push_atomic_error(
+            &mut errors,
+            "video.noise_percent",
+            "noise_requires_nonzero_integer_strength",
+        );
+    }
+    if format!("{:.6}", video.pixel_jitter_px) == "0.000000" {
+        push_atomic_error(
+            &mut errors,
+            "video.pixel_jitter_px",
+            "subpixel_value_quantizes_to_zero",
+        );
+    }
+    if format!("{:.6}", video.pixel_scale_percent / 100.0) == "1.000000" {
+        push_atomic_error(
+            &mut errors,
+            "video.pixel_scale_percent",
+            "scale_quantizes_to_neutral",
+        );
+    }
+    if (video.frame_inner_perturbation_percent * 1_000.0).round() < 1.0 {
+        push_atomic_error(
+            &mut errors,
+            "video.frame_inner_perturbation_percent",
+            "pixel_density_quantizes_to_zero",
+        );
+    }
+    if (advanced.wave_level * 100_000.0).round() < 1.0 {
+        push_atomic_error(
+            &mut errors,
+            "advanced.wave_level",
+            "eight_bit_density_quantizes_to_zero",
+        );
+    }
+    if advanced.wave_intensity * 12.0 < 1.0 {
+        push_atomic_error(
+            &mut errors,
+            "advanced.wave_intensity",
+            "carrier_amplitude_below_one_code_value",
+        );
+    }
+    if advanced.dynamic_eq_threshold <= f64::EPSILON {
+        push_atomic_error(
+            &mut errors,
+            "advanced.dynamic_eq_threshold",
+            "dependent_threshold_must_be_nonzero",
+        );
+    }
+    if (advanced.channel_offset_percent.abs() * 255.0 / 100.0 * 100_000.0).round() < 1.0 {
+        push_atomic_error(
+            &mut errors,
+            "advanced.channel_offset_percent",
+            "channel_code_value_density_quantizes_to_zero",
+        );
+    }
+    if format!("{:.6}", advanced.frequency_space_x_offset_px) == "0.000000" {
+        push_atomic_error(
+            &mut errors,
+            "advanced.frequency_space_x_offset_px",
+            "spatial_offset_quantizes_to_zero",
+        );
+    }
+    if advanced.space_dimension >= 2
+        && format!("{:.6}", advanced.frequency_space_y_offset_px) == "0.000000"
+    {
+        push_atomic_error(
+            &mut errors,
+            "advanced.frequency_space_y_offset_px",
+            "spatial_offset_quantizes_to_zero",
+        );
+    }
+    if (advanced.frame_perturbation_probability_percent * 1_000.0).round() < 1.0 {
+        push_atomic_error(
+            &mut errors,
+            "advanced.frame_perturbation_probability_percent",
+            "frame_probability_quantizes_to_zero",
+        );
+    }
+    let minimum_opacity_percent = MIN_EFFECTIVE_OVERLAY_ALPHA * 100.0;
+    for (field, opacity_percent) in [
+        (
+            "advanced.random_graphic_opacity_percent",
+            advanced.random_graphic_opacity_percent,
+        ),
+        (
+            "advanced.abstract_face_opacity_percent",
+            advanced.abstract_face_opacity_percent,
+        ),
+        (
+            "advanced.picture_in_picture_opacity_percent",
+            advanced.picture_in_picture_opacity_percent,
+        ),
+    ] {
+        if opacity_percent < minimum_opacity_percent {
+            push_atomic_error(&mut errors, field, "opacity_below_two_code_value_minimum");
+        }
+    }
+    if format!("{:.6}", advanced.overlay_offset_px) == "0.000000" {
+        push_atomic_error(
+            &mut errors,
+            "advanced.overlay_offset_px",
+            "overlay_offset_quantizes_to_zero",
+        );
+    }
+    if format!("{:.6}", advanced.picture_in_picture_pixel_jitter_px) == "0.000000" {
+        push_atomic_error(
+            &mut errors,
+            "advanced.picture_in_picture_pixel_jitter_px",
+            "subpixel_value_quantizes_to_zero",
+        );
+    }
+    if advanced.asynchronous_rotation_min_degrees.abs() <= f64::EPSILON
+        || advanced.asynchronous_rotation_max_degrees.abs() <= f64::EPSILON
+        || (advanced.asynchronous_rotation_max_degrees - advanced.asynchronous_rotation_min_degrees)
+            .abs()
+            <= f64::EPSILON
+    {
+        push_atomic_error(
+            &mut errors,
+            "advanced.asynchronous_rotation_min_degrees",
+            "rotation_range_must_be_nonzero",
+        );
+    }
+    for (frequency_hz, field) in VISUAL_BAND_APPLIED_FIELDS {
+        let quantizes_to_neutral = match advanced.band_weights.get(&frequency_hz) {
+            Some(weight) => format!("{weight:.6}") == "1.000000",
+            None => true,
+        };
+        if quantizes_to_neutral {
+            push_atomic_error(&mut errors, field, "band_weight_quantizes_to_neutral");
+        }
+    }
+
+    let plan = match build_media_video_effect_plan(video, advanced) {
+        Ok(plan) => plan,
+        Err(error) => match error {},
+    };
+    for field in ATOMIC_VIDEO_FIELDS
+        .iter()
+        .chain(ATOMIC_ADVANCED_FIELDS.iter())
+        .copied()
+    {
+        if !plan.applied_fields.contains(&field) {
+            push_atomic_error(&mut errors, field, "missing_or_inactive_mapping");
+        }
+    }
+    for (_, field) in VISUAL_BAND_APPLIED_FIELDS {
+        if !plan.applied_fields.contains(&field) {
+            push_atomic_error(&mut errors, field, "missing_band_mapping");
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(plan)
+    } else {
+        Err(errors)
+    }
+}
+
+/// 校验原子计划的输出证据。`applied_fields` 只能证明构图，不能替代帧差验证；
+/// MSE 呈现确认属于播放控制器提交边界，不在本模块伪造。
+pub fn validate_atomic_media_video_effect_output(
+    plan: &MediaVideoEffectPlan,
+    verified_frame_difference_fields: &[&str],
+) -> Result<(), Vec<AtomicMediaVideoEffectError>> {
+    let mut errors = Vec::new();
+    for field in ATOMIC_VIDEO_FIELDS
+        .iter()
+        .chain(
+            ATOMIC_ADVANCED_FIELDS
+                .iter()
+                .filter(|field| **field != "advanced.band_weights"),
+        )
+        .copied()
+    {
+        if !plan.applied_fields.contains(&field)
+            || !verified_frame_difference_fields.contains(&field)
+        {
+            push_atomic_error(&mut errors, field, "field_frame_difference_not_verified");
+        }
+    }
+    for (_, field) in VISUAL_BAND_APPLIED_FIELDS {
+        if !plan.applied_fields.contains(&field)
+            || !verified_frame_difference_fields.contains(&field)
+        {
+            push_atomic_error(&mut errors, field, "field_frame_difference_not_verified");
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// 将 72 个模型字段证据投影为 83 个 UI 行证据：内部 aggregate Map 证据不发布，
+/// 保留 12 个逐频段证据。调用前必须先通过 `build_atomic_media_video_effect_plan`。
+pub fn atomic_media_video_ui_applied_fields(plan: &MediaVideoEffectPlan) -> Vec<&'static str> {
+    ATOMIC_VIDEO_FIELDS
+        .iter()
+        .copied()
+        .chain(
+            ATOMIC_ADVANCED_FIELDS
+                .iter()
+                .copied()
+                .filter(|field| *field != "advanced.band_weights"),
+        )
+        .chain(VISUAL_BAND_APPLIED_FIELDS.iter().map(|(_, field)| *field))
+        .filter(|field| plan.applied_fields.contains(field))
+        .collect()
+}
+
+fn push_atomic_error(
+    errors: &mut Vec<AtomicMediaVideoEffectError>,
+    field: &str,
+    reason: &'static str,
+) {
+    if !errors
+        .iter()
+        .any(|error| error.field == field && error.reason == reason)
+    {
+        errors.push(AtomicMediaVideoEffectError {
+            field: field.to_owned(),
+            reason,
+        });
+    }
+}
+
 /// 为需要分支/合成的效果构建视频子图。基础串行滤镜由调用方传入，避免在两个模块
 /// 重复维护亮度、裁剪等既有映射。
 pub fn build_media_video_complex_effect_plan(
@@ -83,11 +455,13 @@ pub fn build_media_video_complex_effect_plan(
         && advanced.picture_in_picture_opacity_percent > f64::EPSILON;
     let edge_fill_feather = advanced.edge_fill_enabled && advanced.edge_feather_percent > 0.0;
     let edge_softness = video.edge_softness_percent > 0.0;
+    let spatial_modulation = spatial_modulation_delta(video, advanced);
     if !color_conversion
         && !local_blur
         && !picture_in_picture
         && !edge_fill_feather
         && !edge_softness
+        && spatial_modulation.is_none()
     {
         return None;
     }
@@ -102,6 +476,15 @@ pub fn build_media_video_complex_effect_plan(
     )];
     let mut current = "vstage0".to_owned();
     let mut stage = 1_u8;
+
+    if let Some(delta) = spatial_modulation {
+        let next = format!("vstage{stage}");
+        parts.push(format!(
+            "[{current}]split=2[vspatialbase][vspatialsrc];[vspatialsrc]scale=w='max(2,trunc(iw/4/2)*2)':h='max(2,trunc(ih/4/2)*2)':flags=fast_bilinear,format=yuv420p,geq=lum='clip(128+{delta}\\,0\\,255)':cb='128':cr='128'[vspatialsmall];[vspatialsmall][vspatialbase]scale2ref=w=ref_w:h=ref_h:flags=bilinear[vspatial][vspatialbasefull];[vspatialbasefull][vspatial]blend=all_mode=addition128[{next}]"
+        ));
+        current = next;
+        stage += 1;
+    }
 
     if color_conversion {
         let next = format!("vstage{stage}");
@@ -176,6 +559,9 @@ pub fn build_media_video_complex_effect_plan(
         pip_filters.push(format!(
             "scale=trunc(iw*{scale:.6}/2)*2:trunc(ih*{scale:.6}/2)*2"
         ));
+        if jitter > 0.0 && jitter < 0.5 {
+            pip_filters.push(subpixel_jitter_filter(jitter));
+        }
         if advanced.picture_in_picture_rotation_degrees.abs() > f64::EPSILON {
             let radians = advanced.picture_in_picture_rotation_degrees.to_radians();
             let angle = if advanced.transform_smoothing_enabled {
@@ -243,17 +629,50 @@ fn append_inter_frame_perturbation(plan: &mut MediaVideoEffectPlan, video: &Vide
     }
 }
 
+fn append_subpixel_pixel_jitter(plan: &mut MediaVideoEffectPlan, video: &VideoEffectParams) {
+    if video.pixel_jitter_px <= 0.0 || video.pixel_jitter_px >= 0.5 {
+        return;
+    }
+    plan.filters
+        .push(subpixel_jitter_filter(video.pixel_jitter_px));
+}
+
+fn subpixel_jitter_filter(jitter_px: f64) -> String {
+    let chroma_jitter = jitter_px / 2.0;
+    format!(
+        "geq=lum='lum(X+sin(N*0.73)*{jitter_px:.6}\\,Y+cos(N*0.91)*{jitter_px:.6})':cb='cb(X+sin(N*0.73)*{chroma_jitter:.6}\\,Y+cos(N*0.91)*{chroma_jitter:.6})':cr='cr(X+sin(N*0.73)*{chroma_jitter:.6}\\,Y+cos(N*0.91)*{chroma_jitter:.6})':interpolation=bilinear"
+    )
+}
+
+fn append_pixel_scale_canvas_restore(plan: &mut MediaVideoEffectPlan, video: &VideoEffectParams) {
+    if (video.pixel_scale_percent - 100.0).abs() <= f64::EPSILON {
+        return;
+    }
+    let scale = video.pixel_scale_percent / 100.0;
+    // `media_engine` 先执行参数缩放；这里恢复原画布量级并强制偶数，避免 period
+    // 因轻微缩放改变最终编码分辨率或产生 yuv420p 奇数尺寸。
+    plan.filters.push(format!(
+        "scale=round(iw/{scale:.6}/2)*2:round(ih/{scale:.6}/2)*2"
+    ));
+}
+
 fn append_channel_offset(plan: &mut MediaVideoEffectPlan, advanced: &AdvancedEffectParams) {
     if advanced.channel_offset_percent == 0.0 {
         return;
     }
-    let (red_delta, blue_delta) = if advanced.channel_offset_percent.is_sign_positive() {
-        (1, -1)
+    let magnitude = advanced.channel_offset_percent.abs() * 255.0 / 100.0;
+    let whole_code_values = magnitude.floor() as u8;
+    let fractional_threshold = ((magnitude.fract() * 100_000.0).round() as u32).min(99_999);
+    let dither = format!(
+        "{whole_code_values}+if(lt(mod(val*9973\\,100000)\\,{fractional_threshold})\\,1\\,0)"
+    );
+    let (red_sign, blue_sign) = if advanced.channel_offset_percent.is_sign_positive() {
+        ("+", "-")
     } else {
-        (-1, 1)
+        ("-", "+")
     };
     plan.filters.push(format!(
-        "lutrgb=r='clip(val{red_delta:+}\\,0\\,255)':g='val':b='clip(val{blue_delta:+}\\,0\\,255)'"
+        "lutrgb=r='clip(val{red_sign}({dither})\\,0\\,255)':g='val':b='clip(val{blue_sign}({dither})\\,0\\,255)'"
     ));
     plan.applied_fields.push("advanced.channel_offset_percent");
 }
@@ -263,6 +682,61 @@ fn append_spatial_modulation(
     video: &VideoEffectParams,
     advanced: &AdvancedEffectParams,
 ) {
+    if spatial_modulation_delta(video, advanced).is_none() {
+        return;
+    }
+
+    let band_weights_active = advanced
+        .band_weights
+        .iter()
+        .any(|(_, weight)| (weight - 1.0).abs() > f64::EPSILON);
+    let frame_inner_active = video.frame_inner_perturbation_percent > 0.0;
+
+    if band_weights_active {
+        plan.applied_fields.push("advanced.band_weights");
+        for (frequency_hz, field) in VISUAL_BAND_APPLIED_FIELDS {
+            if advanced
+                .band_weights
+                .get(&frequency_hz)
+                .is_some_and(|weight| (weight - 1.0).abs() > f64::EPSILON)
+            {
+                plan.applied_fields.push(field);
+            }
+        }
+    }
+    if advanced.target_frequency_hz.is_some() {
+        plan.applied_fields.push("advanced.target_frequency_hz");
+    }
+    if advanced.core_frequency_hz.is_some() {
+        plan.applied_fields.push("advanced.core_frequency_hz");
+    }
+    if advanced.target_frequency_hz.is_some() || band_weights_active {
+        plan.applied_fields.push("advanced.dynamic_eq_threshold");
+    }
+    if advanced.wave_intensity > 0.0 {
+        plan.applied_fields.push("advanced.wave_intensity");
+        plan.applied_fields.push("advanced.wave_grain_count");
+        plan.applied_fields.push("advanced.space_dimension");
+        plan.applied_fields
+            .push("advanced.frequency_space_x_offset_px");
+        if advanced.space_dimension >= 2 {
+            plan.applied_fields
+                .push("advanced.frequency_space_y_offset_px");
+        }
+    }
+    if advanced.wave_level > 0.0 {
+        plan.applied_fields.push("advanced.wave_level");
+    }
+    if frame_inner_active {
+        plan.applied_fields
+            .push("video.frame_inner_perturbation_percent");
+    }
+}
+
+fn spatial_modulation_delta(
+    video: &VideoEffectParams,
+    advanced: &AdvancedEffectParams,
+) -> Option<String> {
     let band_deltas = advanced
         .band_weights
         .iter()
@@ -305,10 +779,16 @@ fn append_spatial_modulation(
         && advanced.wave_level <= 0.0
         && frame_inner_delta.is_none()
     {
-        return;
+        return None;
     }
 
-    let mut delta = format!("{:.6}", advanced.wave_level * 4.0);
+    let level_threshold = (advanced.wave_level * 100_000.0).round() as u64;
+    let level_phase = level_threshold * 7_919 % 100_000;
+    let mut delta = if level_threshold > 0 {
+        format!("if(lt(mod(X*61+Y*131+N*197+{level_phase}\\,100000)\\,{level_threshold})\\,1\\,0)")
+    } else {
+        "0".to_owned()
+    };
     if let Some(frame_inner_delta) = &frame_inner_delta {
         delta.push_str(&format!("+({frame_inner_delta})"));
     }
@@ -361,46 +841,16 @@ fn append_spatial_modulation(
         } else {
             0.0
         };
-        let wave_amplitude = advanced.wave_intensity * 12.0;
+        let wave_amplitude = if wave_active {
+            (advanced.wave_intensity * 12.0).max(1.0)
+        } else {
+            0.0
+        };
         let amplitude = band_amplitude + wave_amplitude;
         delta.push_str(&format!("+{amplitude:.8}*{carrier}"));
     }
 
-    plan.filters.push(yuv_geq(
-        &format!("clip(lum(X\\,Y)+{delta}\\,0\\,255)"),
-        None,
-    ));
-
-    if !band_deltas.is_empty() {
-        plan.applied_fields.push("advanced.band_weights");
-    }
-    if advanced.target_frequency_hz.is_some() {
-        plan.applied_fields.push("advanced.target_frequency_hz");
-    }
-    if advanced.core_frequency_hz.is_some() {
-        plan.applied_fields.push("advanced.core_frequency_hz");
-    }
-    if target_cycles.is_some() || !band_deltas.is_empty() {
-        plan.applied_fields.push("advanced.dynamic_eq_threshold");
-    }
-    if advanced.wave_intensity > 0.0 {
-        plan.applied_fields.push("advanced.wave_intensity");
-        plan.applied_fields.push("advanced.wave_grain_count");
-        plan.applied_fields.push("advanced.space_dimension");
-        plan.applied_fields
-            .push("advanced.frequency_space_x_offset_px");
-        if advanced.space_dimension >= 2 {
-            plan.applied_fields
-                .push("advanced.frequency_space_y_offset_px");
-        }
-    }
-    if advanced.wave_level > 0.0 {
-        plan.applied_fields.push("advanced.wave_level");
-    }
-    if frame_inner_delta.is_some() {
-        plan.applied_fields
-            .push("video.frame_inner_perturbation_percent");
-    }
+    Some(delta)
 }
 
 fn frame_inner_perturbation_delta(video: &VideoEffectParams) -> Option<String> {
@@ -537,6 +987,7 @@ fn append_asynchronous_rotation(plan: &mut MediaVideoEffectPlan, advanced: &Adva
         .push("advanced.asynchronous_rotation_min_degrees");
     plan.applied_fields
         .push("advanced.asynchronous_rotation_max_degrees");
+    record_applied(plan, "advanced.slice_trigger_interval_ms");
 }
 
 fn append_complex_effect_applied_fields(
@@ -764,14 +1215,6 @@ fn slice_enable_at(advanced: &AdvancedEffectParams, start_seconds: f64) -> Strin
     }
 }
 
-fn yuv_geq(expression: &str, enable: Option<&str>) -> String {
-    let mut filter = format!("geq=lum='{expression}':cb='cb(X\\,Y)':cr='cr(X\\,Y)'");
-    if let Some(enable) = enable {
-        filter.push_str(&format!(":enable='{enable}'"));
-    }
-    filter
-}
-
 fn append_frame_rate_perturbation(plan: &mut MediaVideoEffectPlan, video: &VideoEffectParams) {
     let relative_jitter = video.frame_rate_jitter_percent / 100.0;
     let amplitude_fps = video.frame_rate_perturbation_amplitude_fps;
@@ -816,10 +1259,15 @@ fn append_frame_rate_lock(plan: &mut MediaVideoEffectPlan, video: &VideoEffectPa
 
 #[cfg(test)]
 mod tests {
-    use super::{build_media_video_complex_effect_plan, build_media_video_effect_plan};
+    use super::{
+        atomic_media_video_ui_applied_fields, build_atomic_media_video_effect_plan,
+        build_media_video_complex_effect_plan, build_media_video_effect_plan,
+        validate_atomic_media_video_effect_output,
+    };
     use crate::media_effect_params::{
         AdvancedEffectParams, VideoEffectParams, VISUAL_BAND_FREQUENCIES_HZ,
     };
+    use std::collections::BTreeSet;
     use std::process::{Command, Stdio};
 
     #[test]
@@ -844,9 +1292,16 @@ mod tests {
 
         let plan = build_media_video_effect_plan(&video, &AdvancedEffectParams::default())
             .expect("fractional frame perturbation maps");
+        let complex = build_media_video_complex_effect_plan(
+            &plan.filter_chain(),
+            &video,
+            &AdvancedEffectParams::default(),
+        )
+        .expect("frame perturbation needs a low-resolution branch");
 
-        assert!(plan.filter_chain().contains("geq=lum="));
-        assert!(plan.filter_chain().contains("N*199+58380\\,100000)\\,20)"));
+        assert!(!plan.filter_chain().contains("geq=lum="));
+        assert!(complex.graph.contains("geq=lum="));
+        assert!(complex.graph.contains("N*199+58380\\,100000)\\,20)"));
         assert!(!plan.filter_chain().contains("noise=alls=1"));
     }
 
@@ -864,14 +1319,11 @@ mod tests {
 
         let plan = build_media_video_effect_plan(&video, &advanced)
             .expect("frame and spatial perturbations map");
+        let complex =
+            build_media_video_complex_effect_plan(&plan.filter_chain(), &video, &advanced)
+                .expect("frame and spatial perturbations need a low-resolution branch");
 
-        assert_eq!(
-            plan.filters
-                .iter()
-                .filter(|filter| filter.starts_with("geq=lum="))
-                .count(),
-            1
-        );
+        assert_eq!(complex.graph.matches("geq=lum=").count(), 1);
         assert!(plan
             .applied_fields
             .contains(&"video.frame_inner_perturbation_percent"));
@@ -992,9 +1444,13 @@ mod tests {
 
         assert!(plan.requires_variable_frame_rate);
         assert!(plan.replaces_base_dynamic_crop);
-        for filter in ["scale=", "noise=", "tblend=", "geq=", "setpts="] {
+        for filter in ["scale=", "noise=", "tblend=", "setpts="] {
             assert!(plan.filter_chain().contains(filter), "{filter}");
         }
+        let complex =
+            build_media_video_complex_effect_plan(&plan.filter_chain(), &video, &advanced)
+                .expect("spatial effects need a low-resolution branch");
+        assert!(complex.graph.contains("geq="));
         for field in [
             "video.crop_edge_smoothing",
             "video.frame_rate_jitter_percent",
@@ -1008,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_offset_uses_one_code_value_lut_instead_of_spatial_shift() {
+    fn channel_offset_preserves_fractional_magnitude_with_ordered_code_value_dither() {
         let advanced = AdvancedEffectParams {
             channel_offset_percent: 0.02,
             ..AdvancedEffectParams::default()
@@ -1016,15 +1472,108 @@ mod tests {
 
         let plan = build_media_video_effect_plan(&VideoEffectParams::default(), &advanced)
             .expect("channel offset maps");
-        assert_eq!(
-            plan.filters,
-            ["lutrgb=r='clip(val+1\\,0\\,255)':g='val':b='clip(val-1\\,0\\,255)'"]
-        );
+        assert_eq!(plan.filters.len(), 1);
+        assert!(plan
+            .filter_chain()
+            .contains("0+if(lt(mod(val*9973\\,100000)\\,5100)\\,1\\,0)"));
         assert!(!plan.filter_chain().contains("rgbashift="));
         assert!(!plan.filter_chain().contains("geq="));
         assert!(plan
             .applied_fields
             .contains(&"advanced.channel_offset_percent"));
+    }
+
+    #[test]
+    fn subpixel_jitter_uses_bilinear_sampling_instead_of_integer_crop_rounding() {
+        let video = VideoEffectParams {
+            pixel_jitter_px: 0.125,
+            ..VideoEffectParams::default()
+        };
+
+        let plan = build_media_video_effect_plan(&video, &AdvancedEffectParams::default())
+            .expect("subpixel jitter maps");
+
+        assert!(plan.filter_chain().contains("interpolation=bilinear"));
+        assert!(plan.filter_chain().contains("sin(N*0.73)*0.125000"));
+        assert!(plan.applied_fields.contains(&"video.pixel_jitter_px"));
+    }
+
+    #[test]
+    fn pixel_scale_restores_a_stable_even_output_canvas() {
+        let video = VideoEffectParams {
+            pixel_scale_percent: 100.1,
+            ..VideoEffectParams::default()
+        };
+
+        let plan = build_media_video_effect_plan(&video, &AdvancedEffectParams::default())
+            .expect("pixel scale maps");
+
+        assert!(plan
+            .filter_chain()
+            .contains("scale=round(iw/1.001000/2)*2:round(ih/1.001000/2)*2"));
+    }
+
+    #[test]
+    fn picture_in_picture_subpixel_jitter_is_sampled_before_overlay() {
+        let advanced = AdvancedEffectParams {
+            picture_in_picture_enabled: true,
+            picture_in_picture_pixel_jitter_px: 0.125,
+            ..AdvancedEffectParams::default()
+        };
+        let video = VideoEffectParams::default();
+        let serial = build_media_video_effect_plan(&video, &advanced).expect("pip maps");
+        let graph =
+            build_media_video_complex_effect_plan(&serial.filter_chain(), &video, &advanced)
+                .expect("pip graph")
+                .graph;
+
+        assert!(graph.contains("interpolation=bilinear"));
+        assert!(graph.contains("sin(N*0.73)*0.125000"));
+    }
+
+    #[test]
+    fn low_wave_values_reach_at_least_one_eight_bit_code_value() {
+        let advanced = AdvancedEffectParams {
+            wave_intensity: 0.002,
+            wave_level: 0.002,
+            ..AdvancedEffectParams::default()
+        };
+        let video = VideoEffectParams::default();
+        let serial = build_media_video_effect_plan(&video, &advanced).expect("wave maps");
+        let graph =
+            build_media_video_complex_effect_plan(&serial.filter_chain(), &video, &advanced)
+                .expect("wave graph")
+                .graph;
+
+        assert!(graph.contains("+1.00000000*sin("), "{graph}");
+        assert!(graph.contains("if(lt(mod(X*61+Y*131"), "{graph}");
+    }
+
+    #[test]
+    fn every_band_and_rotation_interval_have_individual_applied_evidence() {
+        assert_eq!(
+            super::VISUAL_BAND_APPLIED_FIELDS.map(|(frequency_hz, _)| frequency_hz),
+            VISUAL_BAND_FREQUENCIES_HZ,
+            "applied evidence frequencies must match the model's only band contract"
+        );
+        let mut advanced = AdvancedEffectParams {
+            asynchronous_rotation_enabled: true,
+            ..AdvancedEffectParams::default()
+        };
+        for weight in advanced.band_weights.values_mut() {
+            *weight = 1.001;
+        }
+
+        let plan = build_media_video_effect_plan(&VideoEffectParams::default(), &advanced)
+            .expect("bands and rotation map");
+
+        for frequency_hz in VISUAL_BAND_FREQUENCIES_HZ {
+            let field = format!("advanced.band_weights.{frequency_hz}");
+            assert!(plan.applied_fields.iter().any(|applied| *applied == field));
+        }
+        assert!(plan
+            .applied_fields
+            .contains(&"advanced.slice_trigger_interval_ms"));
     }
 
     #[test]
@@ -1052,7 +1601,6 @@ mod tests {
         advanced.band_weights.insert(65, 1.1);
 
         let plan = build_media_video_effect_plan(&video, &advanced).expect("all fields mapped");
-        assert!(plan.filter_chain().contains("geq="));
         assert!(plan.filter_chain().contains("fps=fps=source_fps"));
         assert!(!plan.requires_variable_frame_rate);
         for field in [
@@ -1075,6 +1623,7 @@ mod tests {
         let complex =
             build_media_video_complex_effect_plan(&plan.filter_chain(), &video, &advanced)
                 .expect("edge and unlocked picture-in-picture require a graph");
+        assert!(complex.graph.contains("geq="));
         for fragment in [
             "fillborders=",
             "blend=all_opacity=0.500000",
@@ -1113,13 +1662,16 @@ mod tests {
 
         let plan = build_media_video_effect_plan(&VideoEffectParams::default(), &advanced)
             .expect("spatial fields map");
+        let complex = build_media_video_complex_effect_plan(
+            &plan.filter_chain(),
+            &VideoEffectParams::default(),
+            &advanced,
+        )
+        .expect("spatial fields need a low-resolution branch");
         assert_eq!(
-            plan.filters
-                .iter()
-                .filter(|filter| filter.starts_with("geq=lum="))
-                .count(),
+            complex.graph.matches("geq=lum=").count(),
             1,
-            "band and wave modulation must not traverse every pixel twice"
+            "band and wave modulation must share one low-resolution luma pass"
         );
         for field in [
             "advanced.band_weights",
@@ -1135,6 +1687,39 @@ mod tests {
         ] {
             assert!(plan.applied_fields.contains(&field), "{field}");
         }
+    }
+
+    #[test]
+    fn spatial_modulation_runs_on_quarter_resolution_delta_branch() {
+        let advanced = AdvancedEffectParams {
+            wave_intensity: 0.002,
+            wave_grain_count: 9,
+            space_dimension: 2,
+            ..AdvancedEffectParams::default()
+        };
+        let video = VideoEffectParams::default();
+        let serial =
+            build_media_video_effect_plan(&video, &advanced).expect("spatial modulation maps");
+        let complex =
+            build_media_video_complex_effect_plan(&serial.filter_chain(), &video, &advanced)
+                .expect("spatial modulation needs a low-resolution branch");
+
+        assert!(
+            complex
+                .graph
+                .contains("scale=w='max(2,trunc(iw/4/2)*2)':h='max(2,trunc(ih/4/2)*2)'"),
+            "{}",
+            complex.graph
+        );
+        assert!(
+            complex
+                .graph
+                .contains("[vspatialsmall][vspatialbase]scale2ref="),
+            "{}",
+            complex.graph
+        );
+        assert_eq!(complex.graph.matches("geq=lum=").count(), 1);
+        assert!(!serial.filter_chain().contains("geq=lum="));
     }
 
     #[test]
@@ -1184,7 +1769,7 @@ mod tests {
             contrast_percent: 99.8,
             hue_rotation_degrees: 0.1,
             sharpen_percent: 0.2,
-            noise_percent: 0.05,
+            noise_percent: 1.0,
             detail_enhancement_percent: 0.2,
             crop_edge_smoothing: 0.8,
             frame_rate_jitter_percent: 0.02,
@@ -1214,7 +1799,7 @@ mod tests {
         let mut advanced = AdvancedEffectParams {
             target_frequency_hz: Some(500.0),
             core_frequency_hz: Some(250.0),
-            wave_intensity: 0.002,
+            wave_intensity: 0.084,
             wave_level: 0.002,
             wave_grain_count: 9,
             dynamic_eq_threshold: 0.05,
@@ -1223,11 +1808,11 @@ mod tests {
             frequency_space_x_offset_px: 0.1,
             frequency_space_y_offset_px: -0.1,
             frame_perturbation_probability_percent: 0.05,
-            random_graphic_opacity_percent: 0.1,
+            random_graphic_opacity_percent: 0.8,
             random_graphic_size_px: 1.5,
             abstract_face_count: 1,
             abstract_face_size_percent: 1.2,
-            abstract_face_opacity_percent: 0.05,
+            abstract_face_opacity_percent: 0.8,
             overlay_offset_px: 0.1,
             slice_length_ms: 500,
             slice_min_length_ms: 1_000,
@@ -1236,7 +1821,7 @@ mod tests {
             random_graphic_count: 1,
             picture_in_picture_enabled: true,
             picture_in_picture_scale_percent: 10.0,
-            picture_in_picture_opacity_percent: 0.5,
+            picture_in_picture_opacity_percent: 0.8,
             picture_in_picture_rotation_degrees: 0.05,
             picture_in_picture_pixel_jitter_px: 0.05,
             picture_in_picture_timeline_locked: false,
@@ -1262,6 +1847,21 @@ mod tests {
         video.validate().expect("video snapshot is valid");
         advanced.validate().expect("advanced snapshot is valid");
         let plan = build_media_video_effect_plan(&video, &advanced).expect("snapshot maps");
+        let atomic_plan = build_atomic_media_video_effect_plan(&video, &advanced)
+            .expect("all 83 UI rows pass atomic plan admission");
+        assert_eq!(plan, atomic_plan);
+        assert_eq!(atomic_plan.applied_fields.len(), 84);
+        let ui_applied_fields = atomic_media_video_ui_applied_fields(&atomic_plan);
+        assert_eq!(ui_applied_fields.len(), 83);
+        assert_eq!(
+            ui_applied_fields
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            83
+        );
+        assert!(!ui_applied_fields.contains(&"advanced.band_weights"));
 
         for field in [
             "video.brightness_percent",
@@ -1343,11 +1943,31 @@ mod tests {
             .applied_fields
             .contains(&"video.horizontal_flip_enabled"));
         assert!(!plan.applied_fields.contains(&"video.vertical_flip_enabled"));
+        let missing_output = validate_atomic_media_video_effect_output(&plan, &[])
+            .expect_err("applied fields do not replace output frame-difference evidence");
+        assert!(missing_output
+            .iter()
+            .any(|error| error.reason == "field_frame_difference_not_verified"));
+        let mut verified_fields = super::ATOMIC_VIDEO_FIELDS.to_vec();
+        verified_fields.extend(
+            super::ATOMIC_ADVANCED_FIELDS
+                .iter()
+                .copied()
+                .filter(|field| *field != "advanced.band_weights"),
+        );
+        verified_fields.extend(
+            super::VISUAL_BAND_APPLIED_FIELDS
+                .iter()
+                .map(|(_, field)| *field),
+        );
+        assert_eq!(verified_fields.len(), 83);
+        validate_atomic_media_video_effect_output(&plan, &verified_fields)
+            .expect("aggregate and per-band frame differences admit output");
 
         let complex =
             build_media_video_complex_effect_plan(&plan.filter_chain(), &video, &advanced)
                 .expect("automatic snapshot needs a complex graph");
-        assert!(complex.graph.contains("colorchannelmixer=aa=0.007843"));
+        assert!(complex.graph.contains("colorchannelmixer=aa=0.008000"));
 
         if let Some(ffmpeg) = std::env::var_os("AUTOLIVE_TEST_FFMPEG") {
             let baseline = render_test_frames_with_duration(&ffmpeg, None, 3, 25);
@@ -1364,6 +1984,47 @@ mod tests {
     }
 
     #[test]
+    fn atomic_plan_rejects_neutral_defaults_and_enabled_flips_with_field_diagnostics() {
+        let video = VideoEffectParams {
+            horizontal_flip_enabled: true,
+            ..VideoEffectParams::default()
+        };
+        let errors = build_atomic_media_video_effect_plan(&video, &AdvancedEffectParams::default())
+            .expect_err("partial/default plan must not enter the 83-item path");
+
+        for (field, reason) in [
+            (
+                "video.horizontal_flip_enabled",
+                "excluded_flip_must_be_disabled",
+            ),
+            (
+                "video.noise_percent",
+                "noise_requires_nonzero_integer_strength",
+            ),
+            (
+                "advanced.wave_intensity",
+                "carrier_amplitude_below_one_code_value",
+            ),
+            (
+                "advanced.random_graphic_opacity_percent",
+                "opacity_below_two_code_value_minimum",
+            ),
+            ("advanced.band_weights.65", "missing_band_mapping"),
+            (
+                "advanced.picture_in_picture_enabled",
+                "missing_or_inactive_mapping",
+            ),
+        ] {
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.field == field && error.reason == reason),
+                "{field}: {reason}"
+            );
+        }
+    }
+
+    #[test]
     fn every_fixed_visual_band_maps_to_a_distinct_logarithmic_spatial_carrier() {
         let mut chains = Vec::new();
         for frequency_hz in VISUAL_BAND_FREQUENCIES_HZ {
@@ -1372,7 +2033,13 @@ mod tests {
             let plan = build_media_video_effect_plan(&VideoEffectParams::default(), &advanced)
                 .expect("fixed visual band mapped");
             assert!(plan.applied_fields.contains(&"advanced.band_weights"));
-            chains.push(plan.filter_chain());
+            let complex = build_media_video_complex_effect_plan(
+                &plan.filter_chain(),
+                &VideoEffectParams::default(),
+                &advanced,
+            )
+            .expect("fixed visual band needs a low-resolution branch");
+            chains.push(complex.graph);
         }
         chains.dedup();
         assert_eq!(chains.len(), VISUAL_BAND_FREQUENCIES_HZ.len());

@@ -16,7 +16,7 @@ export function DesktopTopbar() {
       <div className="desktop-brand" data-tauri-drag-region>
         <img className="desktop-brand-icon" src="/app-icon.png" alt="" data-tauri-drag-region />
         <span className="desktop-brand-name" data-tauri-drag-region>GpAutoLive</span>
-        <span className="desktop-brand-subtitle" data-tauri-drag-region>本地单视频循环引擎</span>
+        <span className="desktop-brand-subtitle" data-tauri-drag-region>本地有序播放池引擎</span>
       </div>
       <DesktopWindowControls />
     </header>
@@ -51,10 +51,17 @@ export function DesktopWindowControls() {
   );
 }
 
+export function DesktopWindowFrame({ children }: { children: ReactNode }) {
+  return (
+    <div className="desktop-window-frame">
+      <DesktopTopbar />
+      <div className="desktop-window-client">{children}</div>
+    </div>
+  );
+}
+
 const DESKTOP_ROUTE_ITEMS = [
   { path: '/', label: '主页' },
-  { path: '/settings', label: '设置' },
-  { path: '/status', label: '状态' },
 ] as const;
 
 function DesktopRouteNavigation() {
@@ -87,7 +94,6 @@ function DesktopRouteNavigation() {
 export function DesktopShell({ children }: { children: ReactNode }) {
   return (
     <div className="desktop-page">
-      <DesktopTopbar />
       <DesktopRouteNavigation />
       <main className="desktop-page-content">
         <div className="desktop-workspace">{children}</div>
@@ -101,7 +107,7 @@ export function DesktopColumn({
   ariaLabel,
   children,
 }: {
-  area: 'source' | 'video' | 'audio-output';
+  area: 'source' | 'media' | 'output';
   ariaLabel: string;
   children: ReactNode;
 }) {

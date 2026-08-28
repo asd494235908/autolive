@@ -47,7 +47,10 @@ test('固定话术从 starting 起暂停插话，朗读结束后保留并恢复�
   assert.match(start, /pauseInterludePlayback\(\)/);
 
   const scheduleStart = source.indexOf('const currentClockMs = performance.now();');
-  const scheduleEnd = source.indexOf('  }, [sourceUrl]);', scheduleStart);
+  const scheduleEnd = source.indexOf(
+    '  }, [snapshot?.playback_state, sourceUrl]);',
+    scheduleStart,
+  );
   const schedule = source.slice(source.lastIndexOf('useEffect(() => {', scheduleStart), scheduleEnd);
   const pauseBranch = schedule.slice(schedule.indexOf('if (shouldPauseInterlude({'));
   assert.match(pauseBranch, /pauseInterludePlayback\(\)/);

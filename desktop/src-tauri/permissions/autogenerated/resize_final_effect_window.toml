@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resize-final-effect-window"
+description = "Enables the resize_final_effect_window command without any pre-configured scope."
+commands.allow = ["resize_final_effect_window"]
+
+[[permission]]
+identifier = "deny-resize-final-effect-window"
+description = "Denies the resize_final_effect_window command without any pre-configured scope."
+commands.deny = ["resize_final_effect_window"]

@@ -47,6 +47,8 @@ test('启动 Loading 显示可访问的进行状态和指定提示', async () =>
   assert.equal(view.props['aria-live'], 'polite');
   assert.equal(view.props.style.background, '#0b0b0f');
   assert.equal(view.props.style.color, '#f7f7f8');
+  assert.equal(view.props.style.position, 'absolute');
+  assert.equal(view.props.style.minHeight, '100%');
   assert.match(readText(view), /正在加载主界面/);
   const message = findElement(view, (element) => element.type === 'span' && readText(element) === '正在加载主界面…');
   assert.equal(message?.props.style.color, '#9a9aa3');

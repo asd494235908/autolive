@@ -17,6 +17,27 @@ const MAX_FFPROBE_OUTPUT_BYTES: u64 = 256 * 1024;
 pub const SUPPORTED_SOURCE_VIDEO_EXTENSIONS: [&str; 11] = [
     "mp4", "mov", "mkv", "avi", "webm", "m4v", "ts", "m2ts", "flv", "wmv", "3gp",
 ];
+pub const SUPPORTED_SOURCE_AUDIO_EXTENSIONS: [&str; 6] =
+    ["mp3", "wav", "m4a", "aac", "ogg", "flac"];
+pub const SUPPORTED_SOURCE_MEDIA_EXTENSIONS: [&str; 17] = [
+    "mp4", "mov", "mkv", "avi", "webm", "m4v", "ts", "m2ts", "flv", "wmv", "3gp", "mp3", "wav",
+    "m4a", "aac", "ogg", "flac",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKind {
+    Video,
+    Audio,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaCompatibilityMode {
+    Direct,
+    Remuxed,
+    Transcoded,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaProbeRequestDto {
@@ -39,14 +60,21 @@ pub struct SourceMediaProbeDto {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceMediaDto {
     pub source_path: String,
+    pub playback_reference: String,
+    pub media_kind: MediaKind,
+    pub compatibility_mode: MediaCompatibilityMode,
     pub file_name: String,
     pub file_size_bytes: u64,
     pub duration_ms: Option<u64>,
+    pub audio_start_ms: Option<u64>,
+    pub audio_end_ms: Option<u64>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub frame_rate_fps: Option<f64>,
     pub audio_sample_rate_hz: Option<u32>,
     pub audio_channel_count: Option<u16>,
+    pub video_codec_name: Option<String>,
+    pub audio_codec_name: Option<String>,
     pub mp4_sha256: Option<String>,
     pub mp4_hash_status: String,
 }
@@ -67,15 +95,22 @@ pub fn probe_user_selected_mp4(
     Ok(MediaProbeResultDto {
         canonical_path: resolved.display().to_string(),
         source: SourceMediaDto {
+            playback_reference: metadata.source_path.clone(),
             source_path: metadata.source_path,
+            media_kind: MediaKind::Video,
+            compatibility_mode: MediaCompatibilityMode::Direct,
             file_name: metadata.file_name,
             file_size_bytes: metadata.file_size_bytes,
             duration_ms: metadata.duration_ms,
+            audio_start_ms: None,
+            audio_end_ms: None,
             width: metadata.width,
             height: metadata.height,
             frame_rate_fps: metadata.frame_rate_fps,
             audio_sample_rate_hz: metadata.audio_sample_rate_hz,
             audio_channel_count: metadata.audio_channel_count,
+            video_codec_name: None,
+            audio_codec_name: None,
             mp4_sha256: None,
             mp4_hash_status: "disabled".to_owned(),
         },
@@ -92,18 +127,60 @@ struct FfprobeMediaOutput {
 #[derive(Debug, Deserialize)]
 struct FfprobeMediaStream {
     codec_type: Option<String>,
+    codec_name: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
     sample_rate: Option<String>,
     channels: Option<u16>,
+    start_time: Option<String>,
+    duration: Option<String>,
+    #[serde(default)]
+    disposition: FfprobeStreamDisposition,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FfprobeStreamDisposition {
+    #[serde(default)]
+    attached_pic: u8,
 }
 
 #[derive(Debug, Deserialize)]
 struct FfprobeMediaFormat {
     format_name: Option<String>,
+    start_time: Option<String>,
     duration: Option<String>,
+}
+
+struct FfprobeStreamClassification<'a> {
+    media_kind: MediaKind,
+    video: Option<&'a FfprobeMediaStream>,
+    audio: Option<&'a FfprobeMediaStream>,
+}
+
+fn classify_ffprobe_streams(
+    output: &FfprobeMediaOutput,
+) -> Option<FfprobeStreamClassification<'_>> {
+    let video = output.streams.iter().find(|stream| {
+        stream.codec_type.as_deref() == Some("video") && stream.disposition.attached_pic == 0
+    });
+    let audio = output
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("audio"));
+    let media_kind = if video.is_some() {
+        MediaKind::Video
+    } else if audio.is_some() {
+        MediaKind::Audio
+    } else {
+        return None;
+    };
+    Some(FfprobeStreamClassification {
+        media_kind,
+        video,
+        audio,
+    })
 }
 
 pub fn probe_user_selected_video_with_ffprobe(
@@ -133,7 +210,7 @@ fn probe_user_selected_video_with_ffprobe_impl(
 ) -> Result<MediaProbeResultDto, MediaLibraryError> {
     let resolved = resolve_user_selected_file(
         &request.path,
-        &SUPPORTED_SOURCE_VIDEO_EXTENSIONS,
+        &SUPPORTED_SOURCE_MEDIA_EXTENSIONS,
         cancellation,
     )?;
     let metadata =
@@ -167,7 +244,7 @@ fn probe_user_selected_video_with_ffprobe_impl(
             "-v",
             "error",
             "-show_entries",
-            "format=format_name,duration:stream=codec_type,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels",
+            "format=format_name,start_time,duration:stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels,start_time,duration:stream_disposition=attached_pic",
             "-of",
             "json",
         ])
@@ -204,7 +281,7 @@ fn probe_user_selected_video_with_ffprobe_impl(
             let _ = stderr_reader.join();
             return Err(unreadable_ffprobe_error(
                 &resolved,
-                format!("读取视频信息超时（{timeout_ms}ms），请检查视频文件是否完整"),
+                format!("读取媒体信息超时（{timeout_ms}ms），请检查媒体文件是否完整"),
             ));
         }
         match child.try_wait() {
@@ -227,17 +304,14 @@ fn probe_user_selected_video_with_ffprobe_impl(
     let output = serde_json::from_slice::<FfprobeMediaOutput>(&stdout).map_err(|error| {
         unreadable_ffprobe_error(&resolved, format!("FFprobe 返回的 JSON 无法解析：{error}"))
     })?;
-    let video = output
-        .streams
-        .iter()
-        .find(|stream| stream.codec_type.as_deref() == Some("video"))
-        .ok_or_else(|| unreadable_ffprobe_error(&resolved, "文件中没有视频轨道".to_owned()))?;
-    let audio = output
-        .streams
-        .iter()
-        .find(|stream| stream.codec_type.as_deref() == Some("audio"));
+    let streams = classify_ffprobe_streams(&output).ok_or_else(|| {
+        unreadable_ffprobe_error(&resolved, "文件中没有可播放的音视频轨道".to_owned())
+    })?;
+    let video = streams.video;
+    let audio = streams.audio;
     let format = output
         .format
+        .as_ref()
         .ok_or_else(|| unreadable_ffprobe_error(&resolved, "FFprobe 未返回容器信息".to_owned()))?;
     if format
         .format_name
@@ -253,14 +327,18 @@ fn probe_user_selected_video_with_ffprobe_impl(
     }
     let duration_ms = format
         .duration
+        .as_deref()
         .and_then(|duration| duration.parse::<f64>().ok())
         .filter(|duration| duration.is_finite() && *duration > 0.0)
         .map(|duration| (duration * 1_000.0).round() as u64);
-    let frame_rate_fps = video
-        .avg_frame_rate
-        .as_deref()
-        .and_then(parse_ffprobe_ratio)
-        .or_else(|| video.r_frame_rate.as_deref().and_then(parse_ffprobe_ratio));
+    let audio_window_ms = normalized_audio_window_ms(&output, audio);
+    let frame_rate_fps = video.and_then(|stream| {
+        stream
+            .avg_frame_rate
+            .as_deref()
+            .and_then(parse_ffprobe_ratio)
+            .or_else(|| stream.r_frame_rate.as_deref().and_then(parse_ffprobe_ratio))
+    });
     let audio_sample_rate_hz = audio
         .and_then(|stream| stream.sample_rate.as_deref())
         .and_then(|sample_rate| sample_rate.parse::<u32>().ok())
@@ -270,16 +348,27 @@ fn probe_user_selected_video_with_ffprobe_impl(
         canonical_path: resolved.display().to_string(),
         source: SourceMediaDto {
             source_path: resolved.display().to_string(),
+            playback_reference: resolved.display().to_string(),
+            media_kind: streams.media_kind,
+            compatibility_mode: MediaCompatibilityMode::Direct,
             file_name,
             file_size_bytes: metadata.len(),
             duration_ms,
-            width: video.width.filter(|width| *width > 0),
-            height: video.height.filter(|height| *height > 0),
+            audio_start_ms: audio_window_ms.map(|(start_ms, _)| start_ms),
+            audio_end_ms: audio_window_ms.map(|(_, end_ms)| end_ms),
+            width: video
+                .and_then(|stream| stream.width)
+                .filter(|width| *width > 0),
+            height: video
+                .and_then(|stream| stream.height)
+                .filter(|height| *height > 0),
             frame_rate_fps,
             audio_sample_rate_hz,
             audio_channel_count: audio
                 .and_then(|stream| stream.channels)
                 .filter(|count| *count > 0),
+            video_codec_name: video.and_then(|stream| stream.codec_name.clone()),
+            audio_codec_name: audio.and_then(|stream| stream.codec_name.clone()),
             mp4_sha256: None,
             mp4_hash_status: "disabled".to_owned(),
         },
@@ -331,6 +420,41 @@ fn parse_ffprobe_ratio(value: &str) -> Option<f64> {
     let denominator = denominator.parse::<f64>().ok()?;
     let ratio = numerator / denominator;
     (denominator != 0.0 && ratio.is_finite() && ratio > 0.0).then_some(ratio)
+}
+
+fn normalized_audio_window_ms(
+    output: &FfprobeMediaOutput,
+    audio: Option<&FfprobeMediaStream>,
+) -> Option<(u64, u64)> {
+    let format = output.format.as_ref()?;
+    let container_start = parse_ffprobe_seconds(format.start_time.as_deref()?, false)?;
+    let container_duration = parse_ffprobe_seconds(format.duration.as_deref()?, true)?;
+    let audio = audio?;
+    let audio_start = parse_ffprobe_seconds(audio.start_time.as_deref()?, false)?;
+    let audio_duration = parse_ffprobe_seconds(audio.duration.as_deref()?, true)?;
+
+    let start = (audio_start - container_start).clamp(0.0, container_duration);
+    let end = (audio_start - container_start + audio_duration).clamp(0.0, container_duration);
+    let start_ms = floor_seconds_to_ms(start)?;
+    let end_ms = ceil_seconds_to_ms(end)?;
+    (end_ms > start_ms).then_some((start_ms, end_ms))
+}
+
+fn parse_ffprobe_seconds(value: &str, positive: bool) -> Option<f64> {
+    let seconds = value.parse::<f64>().ok()?;
+    (seconds.is_finite() && (!positive || seconds > 0.0)).then_some(seconds)
+}
+
+fn floor_seconds_to_ms(seconds: f64) -> Option<u64> {
+    let milliseconds = (seconds * 1_000.0).floor();
+    (milliseconds.is_finite() && milliseconds >= 0.0 && milliseconds <= u64::MAX as f64)
+        .then_some(milliseconds as u64)
+}
+
+fn ceil_seconds_to_ms(seconds: f64) -> Option<u64> {
+    let milliseconds = (seconds * 1_000.0).ceil();
+    (milliseconds.is_finite() && milliseconds >= 0.0 && milliseconds <= u64::MAX as f64)
+        .then_some(milliseconds as u64)
 }
 
 fn unreadable_ffprobe_error(path: &Path, message: String) -> MediaLibraryError {
@@ -489,7 +613,7 @@ fn resolve_user_selected_file(
             supported_extensions: if supported_extensions == ["mp4"] {
                 "mp4"
             } else {
-                "mp4、mov、mkv、avi、webm、m4v、ts、m2ts、flv、wmv、3gp"
+                "mp4、mov、mkv、avi、webm、m4v、ts、m2ts、flv、wmv、3gp、mp3、wav、m4a、aac、ogg、flac"
             },
         });
     }
@@ -502,8 +626,10 @@ mod tests {
     #[cfg(unix)]
     use super::probe_user_selected_video_with_ffprobe;
     use super::{
-        probe_user_selected_mp4, resolve_user_selected_file, MediaProbeRequestDto,
-        MediaProbeResultDto, SourceMediaDto, SUPPORTED_SOURCE_VIDEO_EXTENSIONS,
+        classify_ffprobe_streams, normalized_audio_window_ms, probe_user_selected_mp4,
+        resolve_user_selected_file, FfprobeMediaOutput, MediaKind, MediaProbeRequestDto,
+        MediaProbeResultDto, SourceMediaDto, SUPPORTED_SOURCE_AUDIO_EXTENSIONS,
+        SUPPORTED_SOURCE_MEDIA_EXTENSIONS, SUPPORTED_SOURCE_VIDEO_EXTENSIONS,
     };
     use crate::cancellation::CancellationToken;
     use crate::errors::MediaLibraryError;
@@ -683,18 +809,36 @@ printf '%s' '{"streams":[{"codec_type":"video","width":720,"height":1280,"avg_fr
             canonical_path: String::from("/tmp/example.mp4"),
             source: SourceMediaDto {
                 source_path: String::from("/tmp/example.mp4"),
+                playback_reference: String::from("/tmp/example.mp4"),
+                media_kind: MediaKind::Video,
+                compatibility_mode: super::MediaCompatibilityMode::Direct,
                 file_name: String::from("example.mp4"),
                 file_size_bytes: 1024,
                 duration_ms: Some(1000),
+                audio_start_ms: Some(0),
+                audio_end_ms: Some(1000),
                 width: Some(1280),
                 height: Some(720),
                 frame_rate_fps: Some(30.0),
                 audio_sample_rate_hz: Some(48_000),
                 audio_channel_count: Some(2),
+                video_codec_name: Some("h264".to_owned()),
+                audio_codec_name: Some("aac".to_owned()),
                 mp4_sha256: None,
                 mp4_hash_status: "pending".to_owned(),
             },
         };
+    }
+
+    #[test]
+    fn source_media_deserialization_keeps_missing_audio_window_backward_compatible() {
+        let source: SourceMediaDto = serde_json::from_str(
+            r#"{"source_path":"/tmp/example.mp4","playback_reference":"/tmp/example.mp4","media_kind":"video","compatibility_mode":"direct","file_name":"example.mp4","file_size_bytes":1024,"duration_ms":1000,"width":1280,"height":720,"frame_rate_fps":30.0,"audio_sample_rate_hz":48000,"audio_channel_count":2,"video_codec_name":"h264","audio_codec_name":"aac","mp4_sha256":null,"mp4_hash_status":"disabled"}"#,
+        )
+        .expect("older source media payload should remain readable");
+
+        assert_eq!(source.audio_start_ms, None);
+        assert_eq!(source.audio_end_ms, None);
     }
 
     #[test]
@@ -756,6 +900,117 @@ printf '%s' '{"streams":[{"codec_type":"video","width":720,"height":1280,"avg_fr
     }
 
     #[test]
+    fn source_audio_extensions_are_part_of_the_unified_media_allowlist() {
+        assert_eq!(
+            SUPPORTED_SOURCE_AUDIO_EXTENSIONS,
+            ["mp3", "wav", "m4a", "aac", "ogg", "flac"]
+        );
+        for extension in SUPPORTED_SOURCE_AUDIO_EXTENSIONS {
+            assert!(SUPPORTED_SOURCE_MEDIA_EXTENSIONS.contains(&extension));
+        }
+    }
+
+    #[test]
+    fn ffprobe_stream_classification_ignores_attached_cover_art() {
+        let output: FfprobeMediaOutput = serde_json::from_str(
+            r#"{"streams":[{"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}},{"codec_type":"audio","codec_name":"mp3","sample_rate":"44100","channels":2}],"format":{"format_name":"mp3","duration":"2.0"}}"#,
+        )
+        .expect("fixture should deserialize");
+
+        let classification =
+            classify_ffprobe_streams(&output).expect("audio plus cover art should be accepted");
+
+        assert_eq!(classification.media_kind, MediaKind::Audio);
+        assert!(classification.video.is_none());
+        assert_eq!(
+            classification
+                .audio
+                .and_then(|stream| stream.codec_name.as_deref()),
+            Some("mp3")
+        );
+    }
+
+    #[test]
+    fn ffprobe_stream_classification_rejects_files_without_playable_streams() {
+        let output: FfprobeMediaOutput = serde_json::from_str(
+            r#"{"streams":[{"codec_type":"subtitle","codec_name":"subrip"}],"format":{"format_name":"matroska","duration":"2.0"}}"#,
+        )
+        .expect("fixture should deserialize");
+
+        assert!(classify_ffprobe_streams(&output).is_none());
+    }
+
+    #[test]
+    fn ffprobe_audio_window_is_normalized_to_the_container_timeline() {
+        let output: FfprobeMediaOutput = serde_json::from_str(
+            r#"{"streams":[{"codec_type":"video"},{"codec_type":"audio","start_time":"10.5004","duration":"5.2492"}],"format":{"format_name":"mpegts","start_time":"10.000","duration":"20.000"}}"#,
+        )
+        .expect("fixture should deserialize");
+        let audio = classify_ffprobe_streams(&output)
+            .expect("fixture should contain playable streams")
+            .audio;
+
+        assert_eq!(
+            normalized_audio_window_ms(&output, audio),
+            Some((500, 5_750))
+        );
+    }
+
+    #[test]
+    fn ffprobe_audio_window_supports_negative_timestamps_and_clips_to_container() {
+        let output: FfprobeMediaOutput = serde_json::from_str(
+            r#"{"streams":[{"codec_type":"audio","start_time":"-2.500","duration":"10.000"}],"format":{"format_name":"mpegts","start_time":"-2.000","duration":"10.000"}}"#,
+        )
+        .expect("fixture should deserialize");
+        let audio = classify_ffprobe_streams(&output)
+            .expect("fixture should contain an audio stream")
+            .audio;
+
+        assert_eq!(normalized_audio_window_ms(&output, audio), Some((0, 9_500)));
+    }
+
+    #[test]
+    fn ffprobe_audio_window_clips_the_end_and_rejects_non_overlapping_ranges() {
+        let clipped: FfprobeMediaOutput = serde_json::from_str(
+            r#"{"streams":[{"codec_type":"audio","start_time":"9.000","duration":"5.000"}],"format":{"format_name":"mpegts","start_time":"0.000","duration":"10.000"}}"#,
+        )
+        .expect("fixture should deserialize");
+        let clipped_audio = classify_ffprobe_streams(&clipped)
+            .expect("fixture should contain an audio stream")
+            .audio;
+        assert_eq!(
+            normalized_audio_window_ms(&clipped, clipped_audio),
+            Some((9_000, 10_000))
+        );
+
+        let outside: FfprobeMediaOutput = serde_json::from_str(
+            r#"{"streams":[{"codec_type":"audio","start_time":"11.000","duration":"1.000"}],"format":{"format_name":"mpegts","start_time":"0.000","duration":"10.000"}}"#,
+        )
+        .expect("fixture should deserialize");
+        let outside_audio = classify_ffprobe_streams(&outside)
+            .expect("fixture should contain an audio stream")
+            .audio;
+        assert_eq!(normalized_audio_window_ms(&outside, outside_audio), None);
+    }
+
+    #[test]
+    fn ffprobe_audio_window_is_unknown_when_any_required_timestamp_is_missing() {
+        for json in [
+            r#"{"streams":[{"codec_type":"audio","start_time":"0.000","duration":"1.000"}],"format":{"format_name":"wav","duration":"1.000"}}"#,
+            r#"{"streams":[{"codec_type":"audio","duration":"1.000"}],"format":{"format_name":"wav","start_time":"0.000","duration":"1.000"}}"#,
+            r#"{"streams":[{"codec_type":"audio","start_time":"0.000"}],"format":{"format_name":"wav","start_time":"0.000","duration":"1.000"}}"#,
+            r#"{"streams":[{"codec_type":"audio","start_time":"0.000","duration":"1.000"}],"format":{"format_name":"wav","start_time":"0.000"}}"#,
+        ] {
+            let output: FfprobeMediaOutput =
+                serde_json::from_str(json).expect("fixture should deserialize");
+            let audio = classify_ffprobe_streams(&output)
+                .expect("fixture should contain an audio stream")
+                .audio;
+            assert_eq!(normalized_audio_window_ms(&output, audio), None);
+        }
+    }
+
+    #[test]
     fn probe_reads_mp4_metadata_and_file_size() {
         let directory = TestDir::new("probe-mp4");
         let file_path = directory.path().join("sample.mp4");
@@ -774,6 +1029,8 @@ printf '%s' '{"streams":[{"codec_type":"video","width":720,"height":1280,"avg_fr
         assert_eq!(result.source.file_name, "sample.mp4");
         assert_eq!(result.source.file_size_bytes, expected_size);
         assert_eq!(result.source.duration_ms, Some(1000));
+        assert_eq!(result.source.audio_start_ms, None);
+        assert_eq!(result.source.audio_end_ms, None);
         assert_eq!(result.source.width, Some(1280));
         assert_eq!(result.source.height, Some(720));
         assert_eq!(result.source.frame_rate_fps, Some(1.0));

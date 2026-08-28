@@ -61,7 +61,7 @@ impl AuxiliaryMixPlan {
     /// 调用方以 `[dry][auxiliary]` 顺序连接两条真实音频支路。
     pub fn ffmpeg_filter(&self) -> String {
         format!(
-            "amix=inputs=2:weights={:.6} {:.6}:duration=first:dropout_transition=0:normalize=0",
+            "amix=inputs=2:weights={:.6} {:.6}:duration=shortest:dropout_transition=0:normalize=0",
             self.dry_weight, self.auxiliary_weight
         )
     }
@@ -512,12 +512,12 @@ mod tests {
         let ambient = plan.ambient_sound_mix.as_ref().expect("ambient mix");
 
         assert_eq!(dry_wet.source, AuxiliaryMixSource::ProcessedWet);
-        assert_eq!(dry_wet.ffmpeg_filter(), "amix=inputs=2:weights=0.750000 0.250000:duration=first:dropout_transition=0:normalize=0");
+        assert_eq!(dry_wet.ffmpeg_filter(), "amix=inputs=2:weights=0.750000 0.250000:duration=shortest:dropout_transition=0:normalize=0");
         assert_eq!(ambient.source, AuxiliaryMixSource::AmbientSound);
-        assert_eq!(ambient.ffmpeg_filter(), "amix=inputs=2:weights=0.600000 0.400000:duration=first:dropout_transition=0:normalize=0");
+        assert_eq!(ambient.ffmpeg_filter(), "amix=inputs=2:weights=0.600000 0.400000:duration=shortest:dropout_transition=0:normalize=0");
         assert_eq!(
             ambient.ffmpeg_complex_graph_fragment("main", "ambient", "mixed"),
-            "[main][ambient]amix=inputs=2:weights=0.600000 0.400000:duration=first:dropout_transition=0:normalize=0[mixed]"
+            "[main][ambient]amix=inputs=2:weights=0.600000 0.400000:duration=shortest:dropout_transition=0:normalize=0[mixed]"
         );
         assert_eq!(plan.required_ffmpeg_filters(), vec!["amix"]);
     }

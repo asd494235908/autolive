@@ -24,26 +24,41 @@ test('主窗口保持参考图的三栏尺寸、顺序和独立滚动', async ()
     readSource('./desktop-layout.css'),
   ]);
 
-  assert.match(css, /\.desktop-topbar\s*\{[^}]*height:\s*36px/s);
+  assert.match(css, /\.desktop-topbar\s*\{[^}]*height:\s*var\(--desktop-titlebar-height\)/s);
+  assert.match(css, /--desktop-titlebar-height:\s*36px/);
+  assert.match(css, /\.desktop-window-frame\s*\{[^}]*grid-template-rows:\s*var\(--desktop-titlebar-height\) minmax\(0,\s*1fr\)/s);
+  assert.match(css, /\.desktop-window-client\s*\{[^}]*overflow:\s*hidden/s);
+  assert.match(css, /\.desktop-page\s*\{[^}]*width:\s*100%/s);
+  assert.doesNotMatch(css, /\.desktop-page\s*\{[^}]*width:\s*100vw/s);
   assert.match(css, /\.desktop-page-content\s*\{[^}]*padding:\s*12px[^}]*overflow:\s*hidden/s);
   assert.match(css, /grid-template-columns:\s*320px minmax\(0,\s*1fr\) 272px/);
-  assert.match(css, /grid-template-areas:\s*"source video audio-output"/);
+  assert.match(css, /grid-template-areas:\s*"source media output"/);
   assert.match(css, /gap:\s*12px/);
+  assert.match(css, /\.desktop-panel\s*\{[^}]*border-radius:\s*10px/s);
+  assert.match(css, /\.desktop-source-pool\s*\{[^}]*min-height:\s*328px[^}]*flex:\s*0\s+0\s+328px/s);
+  assert.match(css, /\.desktop-source-current\s*>\s*\.desktop-source-list\s*\{[^}]*max-height:\s*214px/s);
   assert.match(css, /\.desktop-column\s*\{[^}]*overflow:\s*hidden auto/s);
-  assert.match(css, /@media\s*\(max-width:\s*1280px\)/);
+  assert.match(css, /@media\s*\(max-width:\s*1199px\)[\s\S]*?\.desktop-page-content\s*\{[^}]*overflow:\s*auto/s);
+  assert.doesNotMatch(css, /@media\s*\(max-width:\s*1199px\)[\s\S]*?\.desktop-page\s*\{[^}]*overflow:\s*auto/s);
   assert.match(css, /@media\s*\(max-width:\s*1199px\)[\s\S]*?\.desktop-workspace\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/);
   assert.match(css, /@media\s*\(max-width:\s*900px\)/);
+  assert.match(css, /@media\s*\(max-width:\s*720px\)[\s\S]*?\.desktop-media-domain-grid,\s*\.desktop-column-media\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s);
+  assert.match(css, /@media\s*\(max-width:\s*720px\)[\s\S]*?\.desktop-auth-session-controls\s*\{[^}]*right:\s*8px/s);
+  assert.match(css, /\.desktop-auth-session-expiry\s*\{[^}]*text-overflow:\s*ellipsis/s);
+  assert.match(css, /@media\s*\(max-width:\s*480px\)[\s\S]*?\.desktop-page-content\s*\{[^}]*padding:\s*8px/s);
+  assert.match(css, /@media\s*\(prefers-reduced-motion:\s*reduce\)/);
 
   const source = app.indexOf('area="source"');
-  const video = app.indexOf('area="video"');
-  const audioOutput = app.indexOf('area="audio-output"');
-  assert.ok(source >= 0 && source < video && video < audioOutput, 'DOM 顺序必须为素材→视频→声音输出');
+  const media = app.indexOf('area="media"');
+  const output = app.indexOf('area="output"');
+  assert.ok(source >= 0 && source < media && media < output, 'DOM 顺序必须为播放区→音视频双卡→输出状态');
+  assert.match(css, /\.desktop-column-media\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/s);
 });
 
-test('最终效果窗口卡片按真实内容高度展示，不再固定为 96px', async () => {
+test('最终效果窗口卡片按设计稿紧凑高度展示', async () => {
   const css = await readSource('./desktop-layout.css');
 
-  assert.match(css, /\.desktop-output-panel\s*\{[^}]*min-height:\s*120px/s);
+  assert.match(css, /\.desktop-output-panel\s*\{[^}]*min-height:\s*106px/s);
   assert.doesNotMatch(css, /\.desktop-output-panel\s*\{[^}]*flex:\s*0\s+0\s+96px/s);
 });
 
@@ -62,37 +77,50 @@ test('普通声音面板按内容自然增高并由右列负责滚动', async ()
   );
 });
 
-test('状态条和正式参数面板使用 Ant Design 公开组件', async () => {
-  const [app, css, panel, strip, parameterPanels] = await Promise.all([
+test('主页周期卡和正式参数面板使用 Ant Design 公开组件', async () => {
+  const [app, css, panel, cycleCard, parameterPanels] = await Promise.all([
     readSource('./App.tsx'),
     readSource('./desktop-layout.css'),
     readSource('./desktop/desktop-panel.tsx'),
-    readSource('./desktop/status-strip.tsx'),
+    readSource('./desktop/media-cycle-card.tsx'),
     readSource('./media-parameter-panels/MediaParameterPanels.tsx'),
   ]);
 
-  assert.match(css, /grid-template-columns:\s*repeat\(6,\s*minmax\(0,\s*1fr\)\)/);
-  assert.equal((app.match(/key:\s*'(?:playback|loop|video|audio|source|output)'/g) ?? []).length, 6);
   assert.match(panel, /import \{ Card \} from 'antd'/);
-  assert.match(strip, /import \{ Badge, Button, Card, Progress \} from 'antd'/);
+  assert.match(cycleCard, /import \{[^}]*\bProgress\b[^}]*\} from 'antd'/);
+  assert.match(cycleCard, /<Progress aria-label=\{`\$\{title\}下一计划进度`\}/);
+  assert.match(cycleCard, /desktop-cycle-meta[\s\S]*?<CompactNumberField ariaLabel=\{`\$\{title\}最小秒`\}/);
+  assert.match(cycleCard, /ariaLabel=\{`\$\{title\}(?:最小|最大)秒`\}[^>]*size="small"/);
+  assert.doesNotMatch(cycleCard, /desktop-cycle-inputs/);
+  assert.match(panel, /titleIcon\?: ReactNode/);
+  assert.match(panel, /subtitle\?: ReactNode/);
   assert.match(parameterPanels, /from 'antd'/);
+  assert.doesNotMatch(parameterPanels, /\bProgress\b/);
   assert.match(app, /<MediaParameterPanels/);
-  assert.match(app, /全部正式参数/);
+  assert.match(app, /const AUDIO_PARAMETER_SECTIONS = \['audio'\] as const/);
+  assert.match(app, /const VIDEO_PARAMETER_SECTIONS = \['video', 'advanced'\] as const/);
+  assert.match(app, /sections=\{AUDIO_PARAMETER_SECTIONS\}/);
+  assert.match(app, /sections=\{VIDEO_PARAMETER_SECTIONS\}/);
   assert.doesNotMatch(app, /addonBefore|addonAfter/);
   assert.doesNotMatch(css, /\.ant-/);
 });
 
-test('声音核心与特征控件移动到主页声音参数列且高级抽屉不再重复', async () => {
+test('主页声音参数保持只读，高级抽屉承载可编辑声音控件', async () => {
   const app = await readSource('./App.tsx');
+  const home = app.slice(
+    app.indexOf('<DesktopShell>'),
+    app.indexOf('title="随机插话"'),
+  );
   const advancedDrawer = app.slice(
     app.indexOf('title="高级声音设置"'),
     app.indexOf('title={`当前声音预设'),
   );
 
-  assert.match(app, /<MediaParameterPanels[\s\S]*audioControls=\{audioParameterControls\}/);
   assert.match(app, /const audioParameterControls = mediaEffectParams \? \(/);
   assert.match(app, /<AudioParameterControls/);
   assert.match(app, /onChange=\{\(field, value\) => updateMediaEffectParam\('audio', field, value\)\}/);
+  assert.doesNotMatch(home, /audioControls=\{audioParameterControls\}/);
+  assert.match(advancedDrawer, /\{audioParameterControls\}/);
   assert.doesNotMatch(advancedDrawer, /title="音高、变速与共振峰"/);
   assert.doesNotMatch(advancedDrawer, /title="特征、信噪比与空间混合"/);
 });
@@ -130,7 +158,7 @@ test('声音预设详情完整展示 35 个效果字段并格式化非数值类�
   assert.doesNotMatch(app, /AUDIO_VALUE_PRESETS\.filter\(\(preset\) => preset\.id !== 'p2[12]'\)/);
 });
 
-test('App 使用完整视频自动快照并让每个视频周期进入真实本地处理队列', async () => {
+test('App 使用完整视频自动快照，并在实时流确认热更新后提交已生效字段', async () => {
   const app = await readSource('./App.tsx');
   const plannedVideo = app.slice(
     app.indexOf('type PlannedVideoCyclePayload'),
@@ -145,17 +173,36 @@ test('App 使用完整视频自动快照并让每个视频周期进入真实本�
     app.indexOf('function applyPlannedAudioCycle('),
   );
 
-  assert.match(app, /import \{ sampleAutomaticVideoParameters \} from '\.\/video-parameter-randomizer'/);
   assert.match(plannedVideo, /video: MediaEffectParams\['video'\]/);
   assert.match(plannedVideo, /advanced: MediaEffectParams\['advanced'\]/);
   assert.match(buildSeed, /sampleAutomaticVideoParameters\(\)/);
-  assert.match(applyCycle, /video: \{ \.\.\.mediaEffectParamsRef\.current\.video, \.\.\.plan\.payload\.video \}/);
-  assert.match(applyCycle, /advanced: \{ \.\.\.mediaEffectParamsRef\.current\.advanced, \.\.\.plan\.payload\.advanced \}/);
-  assert.match(applyCycle, /schedulePeriodRenderRef\.current\(next\)/);
+  assert.match(applyCycle, /video: plan\.payload\.video/);
+  assert.match(applyCycle, /advanced: plan\.payload\.advanced/);
+  assert.match(applyCycle, /setMediaEffectParams\(nextParams\)/);
+  assert.doesNotMatch(applyCycle, /schedulePeriodRenderRef\.current|start_media_processing/);
+  assert.doesNotMatch(applyCycle, /update_video_effect_stream|video_stream/);
   assert.doesNotMatch(app, /sampleSubtleVideoParams|sampleVideoCycle|sanitizeMappedVideoSample/);
 });
 
-test('播放池组件展示真实顺序、数量和当前项，三个入口复用同一导入流程', async () => {
+test('视频真实渲染只有 mpv 提交 active 才提升参数，失败保持 Original', async () => {
+  const app = await readSource('./App.tsx');
+  const promotionStart = app.indexOf('function commitPreparedRealtimeVideoCandidate(');
+  const promotionEnd = app.indexOf('function commitCompletedAudioRender(', promotionStart);
+  const promotion = app.slice(promotionStart, promotionEnd);
+  const applyStart = app.indexOf('async function applyVideoProcessing(');
+  const applyEnd = app.indexOf('function commitPreparedRealtimeVideoCandidate(', applyStart);
+  const applyMedia = app.slice(applyStart, applyEnd);
+
+  assert.ok(promotionStart >= 0 && promotionEnd > promotionStart);
+  assert.match(applyMedia, /activeVideoRenderRef\.current\s*=/);
+  assert.match(applyMedia, /prepare_realtime_video_plan/);
+  assert.match(promotion, /status\?\.backend !== 'realtime_gpu' \|\| status\.activation !== 'active'/);
+  assert.match(promotion, /applyPlannedVideoCycle\(candidate\.videoCyclePlan\)/);
+  assert.match(promotion, /advanceIndependentVideoQueue\(clock\.absolute_position_ms\)/);
+  assert.doesNotMatch(applyMedia, /prepare_media_video_stream_period|video_stream|activate_ffmpeg_video_backend/);
+});
+
+test('播放池组件展示真实顺序、数量和当前项，并区分整批导入与追加媒体', async () => {
   const [app, pool, css] = await Promise.all([
     readSource('./App.tsx'),
     readSource('./desktop/playback-pool-panel.tsx'),
@@ -166,13 +213,14 @@ test('播放池组件展示真实顺序、数量和当前项，三个入口复�
   assert.match(app, /sources=\{sourceMediaPool\}/);
   assert.match(app, /currentIndex=\{snapshot\?\.source_media_index \?\? null\}/);
   assert.match(pool, /<List/);
-  assert.match(pool, /共 \{sources\.length\} 项/);
+  assert.match(pool, /本地有序循环 · \{sources\.length\}\/100 项/);
   assert.match(pool, /第 \{index \+ 1\} 项/);
-  assert.match(pool, /当前播放/);
-  assert.match(pool, /<UploadOutlined\s*\/>\s*导入视频/);
+  assert.match(pool, /当前项/);
+  assert.match(pool, /导入媒体/);
+  assert.match(pool, /追加媒体/);
   assert.match(pool, /<Empty/);
-  assert.match(pool, /选择视频文件/);
-  assert.match(pool, /重新选择视频/);
+  assert.match(pool, /尚未导入本地媒体/);
+  assert.match(pool, /整批替换/);
   assert.ok((pool.match(/onImport/g) ?? []).length >= 3);
   assert.doesNotMatch(pool, /默认播放池|<Select/);
   assert.match(css, /\.desktop-source-empty\s*\{/);
@@ -250,11 +298,12 @@ test('主窗口只暴露本期视频参数，并保留插话与固定话术抽�
   assert.doesNotMatch(desktop, /实时话术幻化/);
 });
 
-test('三个功能抽屉复用响应式高密度结构并保留清晰操作区', async () => {
-  const [app, css, drawer] = await Promise.all([
+test('三个功能抽屉复用响应式高密度结构，PortAudio 设置固定在主页', async () => {
+  const [app, css, drawer, portAudio] = await Promise.all([
     readSource('./App.tsx'),
     readSource('./desktop-layout.css'),
     readSource('./desktop/feature-drawer.tsx'),
+    readSource('./desktop/portaudio-device-panel.tsx'),
   ]);
 
   assert.match(drawer, /import \{ Card, Drawer, Typography \} from 'antd'/);
@@ -265,16 +314,19 @@ test('三个功能抽屉复用响应式高密度结构并保留清晰操作区',
   assert.equal((app.match(/<FeatureDrawer\b/g) ?? []).length, 3);
   assert.match(app, /title="高级声音设置"[\s\S]*width=\{760\}/);
   assert.match(app, /title="随机插话"[\s\S]*width=\{560\}/);
-  assert.match(app, /递归扫描本地音频目录及其子目录/);
+  assert.match(app, /递归扫描本地媒体目录及其子目录/);
   assert.match(app, /title="固定话术"[\s\S]*width=\{560\}/);
-  for (const label of ['插话音频目录', '插话声音预设', '预制标题', '朗读正文', 'Host API', '输出设备', '内存缓冲', '声音参数值预设']) {
+  for (const label of ['插话媒体目录', '插话声音预设', '预制标题', '朗读正文', '声音参数值预设']) {
     assert.match(app, new RegExp(`label="${label}"`), `抽屉字段缺少可见标签：${label}`);
+  }
+  for (const label of ['Host API', '输出设备', '内存缓冲']) {
+    assert.match(portAudio, new RegExp(`>${label}</label>`), `主页 PortAudio 设置缺少可见标签：${label}`);
   }
   assert.match(app, /删除这条预制文本？/);
   assert.match(app, /ariaLabel="原声压低过渡" label="原声压低过渡"/);
   assert.match(app, /ariaLabel="原声恢复过渡" label="原声恢复过渡"/);
   assert.match(app, /重新生成本周期参数/);
-  assert.match(app, /应用声音参数/);
+  assert.doesNotMatch(app, /应用声音参数/);
   assert.match(css, /feature-drawer-checkbox-grid[^}]*repeat\(4,/);
   assert.match(css, /@media\s*\(max-width:\s*900px\)[\s\S]*feature-drawer-checkbox-grid[^}]*repeat\(2,/);
   assert.match(css, /@media\s*\(max-width:\s*600px\)[\s\S]*feature-drawer-field-grid[\s\S]*grid-template-columns:\s*minmax\(0,\s*1fr\)/);
@@ -282,16 +334,23 @@ test('三个功能抽屉复用响应式高密度结构并保留清晰操作区',
 });
 
 test('页面固定状态层低于抽屉且抽屉保留滚动和键盘焦点行为', async () => {
-  const [css, drawer] = await Promise.all([
+  const [app, css, drawer, shell] = await Promise.all([
+    readSource('./App.tsx'),
     readSource('./desktop-layout.css'),
     readSource('./desktop/feature-drawer.tsx'),
+    readSource('./desktop/desktop-shell.tsx'),
   ]);
 
   const fixedLayerZIndexes = [
-    ...css.matchAll(/\.desktop-auth-session-(?:warning|expiry|controls)\s*\{[^}]*z-index:\s*(\d+)/gs),
+    ...css.matchAll(/\.desktop-auth-session-(?:warning|controls)\s*\{[^}]*z-index:\s*(\d+)/gs),
   ].map((match) => Number(match[1]));
-  assert.deepEqual(fixedLayerZIndexes, [20, 20, 21]);
+  assert.deepEqual(fixedLayerZIndexes, [20, 21]);
   assert.ok(fixedLayerZIndexes.every((zIndex) => zIndex < 1000), '页面 fixed 状态层必须低于 Ant Design 弹层');
+  assert.match(css, /\.desktop-topbar\s*\{[^}]*z-index:\s*3000/s);
+  assert.match(shell, /export function DesktopWindowFrame/);
+  assert.match(drawer, /export const DESKTOP_DRAWER_ROOT_STYLE/);
+  assert.match(drawer, /rootStyle=\{DESKTOP_DRAWER_ROOT_STYLE\}/);
+  assert.equal((app.match(/rootStyle=\{DESKTOP_DRAWER_ROOT_STYLE\}/g) ?? []).length, 2);
   assert.match(drawer, /\sautoFocus\s/);
   assert.match(drawer, /\skeyboard\s/);
   assert.match(drawer, /header:\s*\{[^}]*flex:\s*'0 0 auto'/s);

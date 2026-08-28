@@ -26,7 +26,8 @@ const session = {
   tokens: {
     access_token: 'access-old',
     refresh_token: 'refresh-old',
-    expires_at: '2026-08-13T00:00:00Z'
+    expires_at: '2026-08-13T00:00:00Z',
+    audience: 'admin'
   },
   user: { id: 'usr_1' }
 };
@@ -36,7 +37,8 @@ test('refresh token rotation updates only the stored session tokens', () => {
   sessionModule.updateSessionTokens({
     access_token: 'access-new',
     refresh_token: 'refresh-new',
-    expires_at: '2026-08-13T01:00:00Z'
+    expires_at: '2026-08-13T01:00:00Z',
+    audience: 'admin'
   });
 
   assert.deepEqual(sessionModule.readSession(), {
@@ -44,7 +46,18 @@ test('refresh token rotation updates only the stored session tokens', () => {
     tokens: {
       access_token: 'access-new',
       refresh_token: 'refresh-new',
-      expires_at: '2026-08-13T01:00:00Z'
+      expires_at: '2026-08-13T01:00:00Z',
+      audience: 'admin'
     }
   });
+});
+
+test('desktop audience cannot be restored as an admin session', () => {
+  sessionModule.saveSession({
+    ...session,
+    tokens: { ...session.tokens, audience: 'desktop' }
+  });
+
+  assert.equal(sessionModule.readSession(), null);
+  assert.equal(values.size, 0);
 });

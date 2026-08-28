@@ -602,7 +602,7 @@ func TestOpenAPIErrorResponseExamplesAndRuntimeStatusMatrix(t *testing.T) {
 			run: func(t *testing.T) *httptest.ResponseRecorder {
 				handler := newTestRouter(t)
 				var last *httptest.ResponseRecorder
-				for attempt := 0; attempt < 6; attempt++ {
+				for attempt := 0; attempt <= authLoginAccountRateLimitPolicy.burst; attempt++ {
 					req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"wrong-password"}`))
 					req.RemoteAddr = "198.51.100.42:9000"
 					req.Header.Set("Content-Type", "application/json")

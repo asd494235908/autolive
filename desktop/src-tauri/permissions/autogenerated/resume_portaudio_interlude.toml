@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resume-portaudio-interlude"
+description = "Enables the resume_portaudio_interlude command without any pre-configured scope."
+commands.allow = ["resume_portaudio_interlude"]
+
+[[permission]]
+identifier = "deny-resume-portaudio-interlude"
+description = "Denies the resume_portaudio_interlude command without any pre-configured scope."
+commands.deny = ["resume_portaudio_interlude"]

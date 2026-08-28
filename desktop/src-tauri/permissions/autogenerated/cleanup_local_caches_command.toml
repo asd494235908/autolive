@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cleanup-local-caches-command"
+description = "Enables the cleanup_local_caches_command command without any pre-configured scope."
+commands.allow = ["cleanup_local_caches_command"]
+
+[[permission]]
+identifier = "deny-cleanup-local-caches-command"
+description = "Denies the cleanup_local_caches_command command without any pre-configured scope."
+commands.deny = ["cleanup_local_caches_command"]

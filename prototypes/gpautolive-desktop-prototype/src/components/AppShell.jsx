@@ -5,13 +5,7 @@ import {
 } from "@ant-design/icons";
 import { Badge, Button, Tooltip } from "antd";
 
-const NAV_ITEMS = [
-  { key: "home", label: "主页" },
-  { key: "settings", label: "设置" },
-  { key: "status", label: "状态" },
-];
-
-export function AppShell({ activeView, onViewChange, onWindowAction, children }) {
+export function AppShell({ onWindowAction, children }) {
   return (
     <div className="app-shell">
       <header className="app-titlebar">
@@ -40,17 +34,7 @@ export function AppShell({ activeView, onViewChange, onWindowAction, children })
 
       <nav className="app-nav" aria-label="桌面端页面导航">
         <span className="nav-label">工作区</span>
-        {NAV_ITEMS.map((item) => (
-          <Button
-            key={item.key}
-            size="small"
-            type={activeView === item.key ? "primary" : "text"}
-            aria-current={activeView === item.key ? "page" : undefined}
-            onClick={() => onViewChange(item.key)}
-          >
-            {item.label}
-          </Button>
-        ))}
+        <Button size="small" type="primary" aria-current="page">主页</Button>
         <div className="nav-spacer" />
         <span className="license-copy">授权剩余 364 天 · 设备 1/3</span>
       </nav>

@@ -2,12 +2,11 @@ import { LockOutlined } from '@ant-design/icons';
 import { Alert, Button, Card, Checkbox, Form, Input, Space, Typography, type InputRef } from 'antd';
 import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import {
-  clearLegacyRememberedActivationCode,
+  clearLegacyRememberedAuthCredentials,
   clearRememberedLogin,
   loadRememberedLogin,
 } from '../authFormMemory';
 import { getControlPlaneErrorMessage, type ControlPlaneSessionSnapshot } from '../controlPlaneSession';
-import { DesktopTopbar } from './desktop-shell';
 
 export type AccessFormValues = {
   username: string;
@@ -51,23 +50,20 @@ export function ControlPlaneAccessPanel({
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
-      await clearLegacyRememberedActivationCode(deviceId);
       try {
+        await clearLegacyRememberedAuthCredentials(deviceId);
         const remembered = await loadRememberedLogin(deviceId);
         if (cancelled) return;
         form.setFieldsValue({
           username: remembered.username,
-          password: remembered.password,
+          password: '',
           rememberLogin: remembered.remember,
         });
-        if (remembered.credentialMissing) {
-          onCredentialNotice({ type: 'warning', message: '已读取账号偏好，但系统钥匙串中没有已保存的密码。' });
-        }
       } catch (error) {
         if (cancelled) return;
         onCredentialNotice({
           type: 'warning',
-          message: getControlPlaneErrorMessage(error, '读取已保存的账号和密码失败，请手动输入。'),
+          message: getControlPlaneErrorMessage(error, '读取已保存的账号失败，请手动输入。'),
         });
       } finally {
         if (!cancelled) setMemoryLoading(false);
@@ -86,11 +82,11 @@ export function ControlPlaneAccessPanel({
       await clearRememberedLogin(deviceId);
       form.setFieldValue('rememberLogin', false);
       if (clearForm) form.setFieldsValue({ username: '', password: '' });
-      onCredentialNotice({ type: 'success', message: '已清除当前设备保存的账号和密码。' });
+      onCredentialNotice({ type: 'success', message: '已清除当前设备记住的账号。' });
     } catch (error) {
       onCredentialNotice({
         type: 'warning',
-        message: getControlPlaneErrorMessage(error, '清除已保存的账号和密码失败。'),
+        message: getControlPlaneErrorMessage(error, '清除已记住账号失败。'),
       });
     } finally {
       setMemoryMutating(false);
@@ -109,7 +105,6 @@ export function ControlPlaneAccessPanel({
 
   return (
     <div className="desktop-auth-page">
-      <DesktopTopbar />
       <main className="desktop-auth-gate">
         <Card className="desktop-auth-card desktop-access-card" bordered={false}>
           <div className="desktop-login-header">
@@ -153,6 +148,12 @@ export function ControlPlaneAccessPanel({
                 <Form.Item label="密码" name="password" rules={[
                   { required: true, message: '请输入密码' },
                   { min: 8, max: 256, message: '密码长度需要在 8 到 256 个字符之间' },
+                  {
+                    validator: async (_, value: unknown) => {
+                      if (typeof value !== 'string' || new TextEncoder().encode(value).byteLength <= 256) return;
+                      throw new Error('密码 UTF-8 编码后不能超过 256 字节');
+                    },
+                  },
                 ]}>
                   <Input.Password ref={passwordInputRef} disabled={controlsDisabled} autoComplete="current-password" placeholder="请输入密码" maxLength={256} />
                 </Form.Item>
@@ -164,15 +165,15 @@ export function ControlPlaneAccessPanel({
                         if (!event.target.checked) void clearLoginMemory(false);
                       }}
                     >
-                      记住账号和密码
+                      记住账号
                     </Checkbox>
                   </Form.Item>
                   <Button type="link" size="small" disabled={controlsDisabled} onClick={() => void clearLoginMemory(true)}>
-                    清除账号密码
+                    清除已记住账号
                   </Button>
                 </div>
                 <Typography.Paragraph className="desktop-auth-memory-help" type="secondary">
-                  账号保存在当前设备偏好中，密码仅保存在系统钥匙串；自动填充不会自动登录。
+                  只在当前设备偏好中记住账号；密码不保存。保持登录使用系统钥匙串中的会话凭据。
                 </Typography.Paragraph>
                 <Typography.Text className="desktop-auth-device-id" type="secondary" copyable>
                   当前设备：{deviceId}

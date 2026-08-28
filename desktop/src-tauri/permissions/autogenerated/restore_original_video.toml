@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-restore-original-video"
+description = "Enables the restore_original_video command without any pre-configured scope."
+commands.allow = ["restore_original_video"]
+
+[[permission]]
+identifier = "deny-restore-original-video"
+description = "Denies the restore_original_video command without any pre-configured scope."
+commands.deny = ["restore_original_video"]

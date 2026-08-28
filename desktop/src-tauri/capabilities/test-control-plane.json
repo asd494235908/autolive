@@ -2,8 +2,7 @@
   "identifier": "test-control-plane",
   "description": "Test-only control-plane capability; never use this capability for production builds.",
   "windows": [
-    "main",
-    "final-effect"
+    "main"
   ],
   "permissions": [
     "core:default",
@@ -12,13 +11,14 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
     "core:window:allow-start-dragging",
+    "main-commands",
     "dialog:default",
     {
       "identifier": "http:default",
       "allow": [
         { "url": "http://127.0.0.1:18090/**" },
-        { "url": "https://admin.example.com/**" },
-        { "url": "http://101.96.208.132:9090/**" }
+        { "url": "http://101.96.208.132:9090/**" },
+        { "url": "https://admin.example.com/**" }
       ]
     }
   ]

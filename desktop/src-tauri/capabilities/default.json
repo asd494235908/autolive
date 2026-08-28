@@ -1,9 +1,8 @@
 {
   "identifier": "default",
-  "description": "Main and final-effect window capability for local playback, MP4 probing and SHA-256 hashing.",
+  "description": "Main window capability for local playback, dialogs and allowlisted control-plane HTTP.",
   "windows": [
-    "main",
-    "final-effect"
+    "main"
   ],
   "permissions": [
     "core:default",
@@ -12,11 +11,11 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
     "core:window:allow-start-dragging",
+    "main-commands",
     "dialog:default",
     {
       "identifier": "http:default",
       "allow": [
-        { "url": "http://127.0.0.1:18090/**" },
         { "url": "https://admin.example.com/**" }
       ]
     }

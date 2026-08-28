@@ -1,6 +1,7 @@
 //! PortAudio 输出后端：主总线 f32 → 环缓 → 硬件回调。
 //! 与 WebView 互斥；探测/启动失败时调用方回退 WebView。
 
+use std::borrow::Cow;
 #[cfg(autolive_has_portaudio)]
 use std::ffi::CStr;
 #[cfg(all(windows, autolive_has_portaudio))]
@@ -371,6 +372,14 @@ fn pa_error_text(code: i32) -> String {
 }
 
 #[cfg(autolive_has_portaudio)]
+fn checked_device_count(count: ffi::PaDeviceIndex) -> Result<ffi::PaDeviceIndex, String> {
+    if count < 0 {
+        return Err(format!("Pa_GetDeviceCount 失败：{}", pa_error_text(count)));
+    }
+    Ok(count)
+}
+
+#[cfg(autolive_has_portaudio)]
 fn host_api_kind_from_type(type_id: i32) -> HostApiKind {
     match type_id {
         ffi::PA_WASAPI => HostApiKind::Wasapi,
@@ -510,7 +519,13 @@ pub fn list_output_devices() -> Result<Vec<OutputDeviceInfo>, String> {
         ensure_portaudio_dll_search_path();
         let _guard = portaudio_lock().lock().unwrap_or_else(|e| e.into_inner());
         pa_acquire()?;
-        let count = unsafe { ffi::Pa_GetDeviceCount() };
+        let count = match checked_device_count(unsafe { ffi::Pa_GetDeviceCount() }) {
+            Ok(count) => count,
+            Err(error) => {
+                pa_release();
+                return Err(error);
+            }
+        };
         let mut devices = Vec::new();
         if count > 0 {
             for index in 0..count {
@@ -618,7 +633,31 @@ fn pop_audio_samples(consumer: &mut HeapCons<f32>, output: &mut [f32]) -> usize 
     filled
 }
 
-fn prepare_mixer_samples(samples: &[f32], output_channels: usize) -> Result<Vec<f32>, String> {
+fn take_callback_after_confirmed_close<T>(
+    callback_data: &mut Option<T>,
+    close_succeeded: bool,
+) -> Option<T> {
+    close_succeeded.then(|| callback_data.take()).flatten()
+}
+
+fn should_attempt_stream_close(has_stream: bool, close_quarantined: bool) -> bool {
+    has_stream && !close_quarantined
+}
+
+fn stereo_samples_for_output_samples(
+    output_samples: usize,
+    output_channels: usize,
+) -> Option<usize> {
+    if output_channels == 0 || !output_samples.is_multiple_of(output_channels) {
+        return None;
+    }
+    output_samples.checked_div(output_channels)?.checked_mul(2)
+}
+
+fn prepare_mixer_samples(
+    samples: &[f32],
+    output_channels: usize,
+) -> Result<Cow<'_, [f32]>, String> {
     if samples.iter().any(|sample| !sample.is_finite()) {
         return Err("PortAudio 输入包含 NaN 或 Infinity".to_owned());
     }
@@ -627,16 +666,18 @@ fn prepare_mixer_samples(samples: &[f32], output_channels: usize) -> Result<Vec<
             if !samples.len().is_multiple_of(2) {
                 return Err("单声道 PortAudio 需要完整的立体声帧".to_owned());
             }
-            Ok(samples
-                .chunks_exact(2)
-                .map(|frame| (frame[0] + frame[1]) * 0.5)
-                .collect())
+            Ok(Cow::Owned(
+                samples
+                    .chunks_exact(2)
+                    .map(|frame| (frame[0] + frame[1]) * 0.5)
+                    .collect(),
+            ))
         }
         2 => {
             if !samples.len().is_multiple_of(2) {
                 return Err("立体声 PortAudio 输入未按完整帧对齐".to_owned());
             }
-            Ok(samples.to_vec())
+            Ok(Cow::Borrowed(samples))
         }
         _ => Err(format!("不支持的 PortAudio 输出声道数：{output_channels}")),
     }
@@ -749,6 +790,8 @@ pub struct PortAudioOutput {
     #[cfg(autolive_has_portaudio)]
     user_data: Option<Box<CallbackUserData>>,
     #[cfg(autolive_has_portaudio)]
+    close_quarantined: bool,
+    #[cfg(autolive_has_portaudio)]
     initialized: bool,
     sample_rate_hz: u32,
     ring_capacity_kib: u32,
@@ -803,6 +846,8 @@ impl PortAudioOutput {
             stream: std::ptr::null_mut(),
             #[cfg(autolive_has_portaudio)]
             user_data: None,
+            #[cfg(autolive_has_portaudio)]
+            close_quarantined: false,
             #[cfg(autolive_has_portaudio)]
             initialized: false,
             sample_rate_hz,
@@ -869,11 +914,19 @@ impl PortAudioOutput {
     /// 查询本身不获取 callback 使用的任何锁。
     pub fn stream_health(&self) -> PortAudioStreamHealth {
         #[cfg(autolive_has_portaudio)]
-        let hardware_state = query_portaudio_stream_state(self.stream);
+        let hardware_state = if self.close_quarantined {
+            PortAudioHardwareState::Unknown
+        } else {
+            query_portaudio_stream_state(self.stream)
+        };
         #[cfg(not(autolive_has_portaudio))]
         let hardware_state = PortAudioHardwareState::Unsupported;
         #[cfg(autolive_has_portaudio)]
-        let (output_latency_us, actual_sample_rate_hz) = query_portaudio_stream_info(self.stream);
+        let (output_latency_us, actual_sample_rate_hz) = if self.close_quarantined {
+            (None, None)
+        } else {
+            query_portaudio_stream_info(self.stream)
+        };
         #[cfg(not(autolive_has_portaudio))]
         let (output_latency_us, actual_sample_rate_hz) = (None, None);
 
@@ -924,6 +977,9 @@ impl PortAudioOutput {
         {
             if self.running.load(Ordering::SeqCst) {
                 return Ok(());
+            }
+            if !self.stream.is_null() || self.user_data.is_some() || self.close_quarantined {
+                return Err("此前 PortAudio 流关闭失败，不能重复创建硬件流".to_owned());
             }
             ensure_portaudio_dll_search_path();
             let _guard = portaudio_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -990,11 +1046,23 @@ impl PortAudioOutput {
             }
             let start_err = unsafe { ffi::Pa_StartStream(stream) };
             if start_err != ffi::PA_NO_ERROR {
-                let _ = unsafe { ffi::Pa_CloseStream(stream) };
+                let close_err = unsafe { ffi::Pa_CloseStream(stream) };
+                // SAFETY: user_ptr 仍只由本函数持有；关闭失败时转交给 self，
+                // 保证可能仍被 native stream 引用的 callback 数据继续存活。
                 let callback_data = unsafe { Box::from_raw(user_ptr) };
-                self.consumer = Some(callback_data.consumer);
-                self.shutdown_pa_unlocked();
-                return Err(format!("Pa_StartStream 失败：{}", pa_error_text(start_err)));
+                if close_err == ffi::PA_NO_ERROR {
+                    self.consumer = Some(callback_data.consumer);
+                    self.shutdown_pa_unlocked();
+                    return Err(format!("Pa_StartStream 失败：{}", pa_error_text(start_err)));
+                }
+                self.stream = stream;
+                self.user_data = Some(callback_data);
+                self.close_quarantined = true;
+                return Err(format!(
+                    "Pa_StartStream 失败：{}；Pa_CloseStream 同时失败：{}",
+                    pa_error_text(start_err),
+                    pa_error_text(close_err)
+                ));
             }
             self.stream = stream;
             // SAFETY: 所有权转回 Box，随 self 生命周期。
@@ -1012,15 +1080,40 @@ impl PortAudioOutput {
         #[cfg(autolive_has_portaudio)]
         {
             let _guard = portaudio_lock().lock().unwrap_or_else(|e| e.into_inner());
-            if !self.stream.is_null() {
-                let _ = unsafe { ffi::Pa_StopStream(self.stream) };
-                let _ = unsafe { ffi::Pa_CloseStream(self.stream) };
-                self.stream = std::ptr::null_mut();
-            }
-            if let Some(callback_data) = self.user_data.take() {
+            let close_succeeded = if self.stream.is_null() {
+                true
+            } else if should_attempt_stream_close(!self.stream.is_null(), self.close_quarantined) {
+                let stop_err = unsafe { ffi::Pa_StopStream(self.stream) };
+                if stop_err != ffi::PA_NO_ERROR {
+                    eprintln!(
+                        "autolive PortAudio: Pa_StopStream 失败，继续尝试关闭：{}",
+                        pa_error_text(stop_err)
+                    );
+                }
+                let close_err = unsafe { ffi::Pa_CloseStream(self.stream) };
+                if close_err == ffi::PA_NO_ERROR {
+                    self.stream = std::ptr::null_mut();
+                    self.close_quarantined = false;
+                    true
+                } else {
+                    self.close_quarantined = true;
+                    eprintln!(
+                        "autolive PortAudio: Pa_CloseStream 失败，隔离流与 callback 所有权：{}",
+                        pa_error_text(close_err)
+                    );
+                    false
+                }
+            } else {
+                false
+            };
+            if let Some(callback_data) =
+                take_callback_after_confirmed_close(&mut self.user_data, close_succeeded)
+            {
                 self.consumer = Some(callback_data.consumer);
             }
-            self.shutdown_pa_unlocked();
+            if close_succeeded {
+                self.shutdown_pa_unlocked();
+            }
         }
         self.shared.clear_requested.store(false, Ordering::Release);
         self.clear_ring();
@@ -1061,7 +1154,7 @@ impl PortAudioOutput {
             return Ok(());
         }
         let normalized = prepare_mixer_samples(samples, usize::from(self.channels()))?;
-        let written = self.push_interleaved_available(&normalized);
+        let written = self.push_interleaved_available(normalized.as_ref());
         if written < normalized.len() {
             self.shared
                 .producer_drop_count
@@ -1082,12 +1175,9 @@ impl PortAudioOutput {
         }
         let output_channels = usize::from(self.channels());
         let normalized = prepare_mixer_samples(samples, output_channels)?;
-        let written = self.push_interleaved_available(&normalized);
-        Ok(if output_channels == 1 {
-            written.saturating_mul(2)
-        } else {
-            written
-        })
+        let written = self.push_interleaved_available(normalized.as_ref());
+        stereo_samples_for_output_samples(written, output_channels)
+            .ok_or_else(|| "PortAudio 写入结果未按完整硬件帧对齐".to_owned())
     }
 
     /// 候选提交前原子写入环缓；只允许启动事务使用，正常写入仍要求流已运行。
@@ -1106,12 +1196,18 @@ impl PortAudioOutput {
         }
         // `push_slice` 可能受环缓分段影响而部分写入；`push_iter` 会跨越两段
         // vacant slice，并在一次 advance_write_index 中提交，满足候选原子提交。
-        let written = self.push_interleaved_available_to_capacity(&normalized);
-        Ok(if output_channels == 1 {
-            written.saturating_mul(2)
-        } else {
-            written
-        })
+        let written = self.push_interleaved_available_to_capacity(normalized.as_ref());
+        stereo_samples_for_output_samples(written, output_channels)
+            .ok_or_else(|| "PortAudio 预填结果未按完整硬件帧对齐".to_owned())
+    }
+
+    /// 当前目标播放水位还能接收的内部双声道交错采样数。
+    pub fn writable_stereo_samples_within_watermark(&self) -> usize {
+        let output_channels = usize::from(self.channels());
+        let output_samples =
+            self.writable_output_samples_up_to(self.target_playback_watermark_samples());
+        let frames = output_samples / output_channels;
+        frames.saturating_mul(2)
     }
 
     pub fn set_prestart_writes_enabled(&mut self, enabled: bool) {
@@ -1130,12 +1226,20 @@ impl PortAudioOutput {
         // `push_slice` 只覆盖当前连续 vacant slice；写指针跨过环尾时，即使总空闲
         // 空间足够也可能返回 0，导致混音线程把“有回调进度”误判为背压失败。
         // `push_iter` 会跨越环缓两段，仍保持单生产者无锁写入。
-        let remaining = max_occupied_samples.saturating_sub(self.producer.occupied_len());
+        let remaining = self.writable_output_samples_up_to(max_occupied_samples);
         if remaining == 0 {
             return 0;
         }
         self.producer
             .push_iter(samples.iter().copied().take(remaining))
+    }
+
+    fn writable_output_samples_up_to(&self, max_occupied_samples: usize) -> usize {
+        let channels = usize::from(self.channels());
+        let remaining = max_occupied_samples
+            .saturating_sub(self.producer.occupied_len())
+            .min(self.producer.vacant_len());
+        remaining.saturating_sub(remaining % channels)
     }
 
     pub fn clear_ring(&mut self) {
@@ -1207,6 +1311,15 @@ impl PortAudioOutput {
 impl Drop for PortAudioOutput {
     fn drop(&mut self) {
         self.stop();
+        #[cfg(autolive_has_portaudio)]
+        if !self.stream.is_null() {
+            // Native close 已失败，不能释放仍可能被 callback 引用的数据。这里选择
+            // 在进程余生保留极小资源，避免驱动线程发生 UAF；PA 会话同样不 Terminate。
+            if let Some(callback_data) = self.user_data.take() {
+                let _ = Box::into_raw(callback_data);
+            }
+            eprintln!("autolive PortAudio: 流关闭失败，保留 native stream 直到进程退出");
+        }
     }
 }
 
@@ -1234,16 +1347,77 @@ mod tests {
 
     #[test]
     fn mixer_downmixes_stereo_for_mono_device() {
-        assert_eq!(
-            prepare_mixer_samples(&[1.0, 3.0, 2.0, 4.0], 1).unwrap(),
-            [2.0, 3.0]
-        );
+        let normalized = prepare_mixer_samples(&[1.0, 3.0, 2.0, 4.0], 1).unwrap();
+        assert_eq!(normalized.as_ref(), &[2.0, 3.0]);
+        assert!(matches!(&normalized, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn mixer_borrows_already_stereo_pcm_without_copying() {
+        let samples = [1.0, 2.0, 3.0, 4.0];
+        let normalized = prepare_mixer_samples(&samples, 2).unwrap();
+
+        assert!(matches!(&normalized, Cow::Borrowed(_)));
+        assert_eq!(normalized.as_ptr(), samples.as_ptr());
     }
 
     #[test]
     fn mixer_rejects_incomplete_frame_and_non_finite_input() {
         assert!(prepare_mixer_samples(&[1.0], 1).is_err());
         assert!(prepare_mixer_samples(&[f32::NAN, 0.0], 2).is_err());
+    }
+
+    #[test]
+    fn callback_ownership_is_released_only_after_confirmed_stream_close() {
+        let mut callback = Some("callback");
+
+        assert_eq!(
+            take_callback_after_confirmed_close(&mut callback, false),
+            None
+        );
+        assert_eq!(callback, Some("callback"));
+        assert_eq!(
+            take_callback_after_confirmed_close(&mut callback, false),
+            None
+        );
+        assert_eq!(
+            take_callback_after_confirmed_close(&mut callback, true),
+            Some("callback")
+        );
+        assert_eq!(
+            take_callback_after_confirmed_close(&mut callback, true),
+            None
+        );
+    }
+
+    #[test]
+    fn quarantined_stream_close_is_not_retried_or_double_closed() {
+        assert!(should_attempt_stream_close(true, false));
+        assert!(!should_attempt_stream_close(true, true));
+        assert!(!should_attempt_stream_close(false, false));
+    }
+
+    #[cfg(autolive_has_portaudio)]
+    #[test]
+    fn quarantined_stream_health_never_queries_the_native_handle() {
+        let mut output = PortAudioOutput::new(DEFAULT_SAMPLE_RATE_HZ, 128, 2);
+        output.close_quarantined = true;
+
+        let health = output.stream_health();
+
+        assert_eq!(health.hardware_state, PortAudioHardwareState::Unknown);
+        assert_eq!(health.output_latency_us, None);
+        assert_eq!(health.actual_sample_rate_hz, None);
+        output.close_quarantined = false;
+    }
+
+    #[test]
+    fn hardware_samples_convert_to_stereo_samples_by_complete_frames() {
+        assert_eq!(stereo_samples_for_output_samples(256, 1), Some(512));
+        assert_eq!(stereo_samples_for_output_samples(512, 2), Some(512));
+        assert_eq!(stereo_samples_for_output_samples(3, 2), None);
+        assert_eq!(stereo_samples_for_output_samples(1, 0), None);
+        assert_eq!(stereo_samples_for_output_samples(usize::MAX, 1), None);
     }
 
     #[test]
@@ -1499,6 +1673,15 @@ mod tests {
     fn probe_does_not_panic() {
         let status = probe_portaudio();
         assert!(status.selected_backend == "portaudio" || status.selected_backend == "webview");
+    }
+
+    #[cfg(autolive_has_portaudio)]
+    #[test]
+    fn negative_device_count_is_reported_as_portaudio_error() {
+        let error = checked_device_count(-10_000).expect_err("negative count must fail");
+
+        assert_eq!(error, "Pa_GetDeviceCount 失败：PortAudio not initialized");
+        assert_eq!(checked_device_count(0).unwrap(), 0);
     }
 
     #[cfg(autolive_has_portaudio)]

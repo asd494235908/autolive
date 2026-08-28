@@ -1,3 +1,5 @@
+import type { PlaybackClockStatus } from './playback-clock-health';
+
 export type PlaybackMediaStateMessage = {
   version: 2;
   type: 'playback-media-state';
@@ -8,6 +10,7 @@ export type PlaybackMediaStateMessage = {
   paused: boolean;
   playback_generation: number;
   source_revision: number;
+  clock_session: string;
   clock_epoch: number;
   clock_sequence: number;
   loop_index: number;
@@ -15,6 +18,7 @@ export type PlaybackMediaStateMessage = {
   duration_ms: number;
   absolute_position_ms: number;
   playback_rate: number;
+  clock_health: PlaybackClockStatus;
 };
 
 export type PlaybackMediaControlMessage =
@@ -53,6 +57,13 @@ function isSafeNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
+function isPlaybackClockStatus(value: unknown): value is PlaybackClockStatus {
+  return value === 'healthy'
+    || value === 'buffering'
+    || value === 'recovering'
+    || value === 'stalled';
+}
+
 function hasConsistentAbsoluteClock(
   loopIndex: number,
   positionMs: number,
@@ -77,6 +88,9 @@ export function isPlaybackMediaStateMessage(value: unknown): value is PlaybackMe
     typeof record.paused === 'boolean' &&
     isSafeNonNegativeInteger(record.playback_generation) &&
     isSafeNonNegativeInteger(record.source_revision) &&
+    typeof record.clock_session === 'string' &&
+    record.clock_session.length > 0 &&
+    record.clock_session.length <= 128 &&
     isSafeNonNegativeInteger(record.clock_epoch) &&
     isSafeNonNegativeInteger(record.clock_sequence) &&
     isSafeNonNegativeInteger(record.loop_index) &&
@@ -91,8 +105,28 @@ export function isPlaybackMediaStateMessage(value: unknown): value is PlaybackMe
     ) &&
     typeof record.playback_rate === 'number' &&
     Number.isFinite(record.playback_rate) &&
-    record.playback_rate > 0
+    record.playback_rate > 0 &&
+    isPlaybackClockStatus(record.clock_health)
   );
+}
+
+export function shouldAcceptPlaybackMediaState(
+  previous: PlaybackMediaStateMessage | null,
+  next: PlaybackMediaStateMessage,
+): boolean {
+  if (
+    !previous
+    || previous.playback_generation !== next.playback_generation
+    || previous.clock_session !== next.clock_session
+    || previous.source_revision !== next.source_revision
+  ) {
+    return true;
+  }
+  return next.clock_epoch > previous.clock_epoch
+    || (
+      next.clock_epoch === previous.clock_epoch
+      && next.clock_sequence > previous.clock_sequence
+    );
 }
 
 export function isPlaybackMediaControlMessage(value: unknown): value is PlaybackMediaControlMessage {

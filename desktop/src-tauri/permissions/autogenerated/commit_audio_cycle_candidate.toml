@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-commit-audio-cycle-candidate"
+description = "Enables the commit_audio_cycle_candidate command without any pre-configured scope."
+commands.allow = ["commit_audio_cycle_candidate"]
+
+[[permission]]
+identifier = "deny-commit-audio-cycle-candidate"
+description = "Denies the commit_audio_cycle_candidate command without any pre-configured scope."
+commands.deny = ["commit_audio_cycle_candidate"]

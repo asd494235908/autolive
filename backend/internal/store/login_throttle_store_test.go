@@ -10,14 +10,23 @@ import (
 )
 
 func TestLoginFailureBackoffIsBounded(t *testing.T) {
-	if got := LoginFailureBackoff(0); got != 0 {
-		t.Fatalf("LoginFailureBackoff(0) = %v", got)
+	if got := LoginFailureBackoff(LoginThrottleBucketAccount, 0); got != 0 {
+		t.Fatalf("account LoginFailureBackoff(0) = %v", got)
 	}
-	if got := LoginFailureBackoff(5); got != 30*time.Second {
-		t.Fatalf("LoginFailureBackoff(5) = %v, want 30s", got)
+	if got := LoginFailureBackoff(LoginThrottleBucketAccount, 5); got != 30*time.Second {
+		t.Fatalf("account LoginFailureBackoff(5) = %v, want 30s", got)
 	}
-	if got := LoginFailureBackoff(100); got != 15*time.Minute {
-		t.Fatalf("LoginFailureBackoff(100) = %v, want 15m", got)
+	if got := LoginFailureBackoff(LoginThrottleBucketAccount, 100); got != 15*time.Minute {
+		t.Fatalf("account LoginFailureBackoff(100) = %v, want 15m", got)
+	}
+	if got := LoginFailureBackoff(LoginThrottleBucketAddress, 49); got != 0 {
+		t.Fatalf("address LoginFailureBackoff(49) = %v, want no backoff", got)
+	}
+	if got := LoginFailureBackoff(LoginThrottleBucketAddress, 50); got != 30*time.Second {
+		t.Fatalf("address LoginFailureBackoff(50) = %v, want 30s", got)
+	}
+	if got := LoginFailureBackoff(LoginThrottleBucketAddress, 100); got != 15*time.Minute {
+		t.Fatalf("address LoginFailureBackoff(100) = %v, want 15m", got)
 	}
 }
 

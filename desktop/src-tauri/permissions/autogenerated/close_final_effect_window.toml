@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-close-final-effect-window"
+description = "Enables the close_final_effect_window command without any pre-configured scope."
+commands.allow = ["close_final_effect_window"]
+
+[[permission]]
+identifier = "deny-close-final-effect-window"
+description = "Denies the close_final_effect_window command without any pre-configured scope."
+commands.deny = ["close_final_effect_window"]

@@ -52,3 +52,10 @@ test('超出钥匙串命名上限的旧标识会被替换', async () => {
   assert.notEqual(deviceId, `desktop-${'x'.repeat(64)}`);
   assert.ok(deviceId.length <= 64);
 });
+
+test('WebView 设备标识只作为 Rust 首次稳定存储的迁移候选', async () => {
+  const source = await readFile(new URL('./deviceIdentity.ts', import.meta.url), 'utf8');
+
+  assert.match(source, /迁移候选/);
+  assert.doesNotMatch(source, /事实源/);
+});

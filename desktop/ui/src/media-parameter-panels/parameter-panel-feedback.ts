@@ -47,20 +47,3 @@ export function createRandomParameterAccents(
 
   return assignments;
 }
-
-export function createMediaParameterValueSignature(value: unknown): string {
-  if (value === null) return 'null';
-  if (typeof value === 'number') {
-    if (Number.isNaN(value)) return 'number:NaN';
-    return `number:${Object.is(value, -0) ? '-0' : value}`;
-  }
-  if (typeof value !== 'object') return `${typeof value}:${String(value)}`;
-  if (Array.isArray(value)) {
-    return `array:[${value.map(createMediaParameterValueSignature).join(',')}]`;
-  }
-
-  const entries = Object.entries(value as Record<string, unknown>)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, entryValue]) => `${key}:${createMediaParameterValueSignature(entryValue)}`);
-  return `object:{${entries.join(',')}}`;
-}

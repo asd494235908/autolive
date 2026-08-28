@@ -1,3 +1,4 @@
+use crate::media_library::SUPPORTED_SOURCE_MEDIA_EXTENSIONS;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -13,12 +14,11 @@ const MAX_DUCKING_ATTACK_MS: u64 = 1_000;
 const MIN_DUCKING_RELEASE_MS: u64 = 0;
 const MAX_DUCKING_RELEASE_MS: u64 = 3_000;
 const MIN_AUDIO_VARIATION_PERIOD_MS: u64 = 1_000;
-const MAX_AUDIO_VARIATION_PERIOD_MS: u64 = 60_000;
+const MAX_AUDIO_VARIATION_PERIOD_MS: u64 = 600_000;
 const MAX_AUDIO_PRESET_IDS: usize = 22;
 const MIN_AUDIO_MIX_PICK: u8 = 1;
 const MAX_AUDIO_MIX_PICK: u8 = 4;
-const ALLOWED_EXTENSIONS: [&str; 6] = ["mp3", "wav", "m4a", "aac", "ogg", "flac"];
-pub const MAX_INTERLUDE_AUDIO_FILES: usize = 256;
+pub const MAX_INTERLUDE_AUDIO_FILES: usize = 1_000;
 const MAX_INTERLUDE_PATH_UTF8_BYTES: usize = 4_096;
 const MAX_INTERLUDE_CATALOG_PATH_BYTES: usize = 512 * 1024;
 
@@ -85,7 +85,7 @@ impl Default for InterludeConfig {
             interval_min_ms: 8_000,
             interval_max_ms: 13_000,
             volume_db: 0.0,
-            ducking_depth_db: -12.0,
+            ducking_depth_db: -60.0,
             ducking_attack_ms: 50,
             ducking_release_ms: 250,
         }
@@ -307,11 +307,11 @@ impl fmt::Display for InterludeError {
                 write!(formatter, "插话目录读取失败：{message}")
             }
             Self::NoUsableAudioFiles => formatter
-                .write_str("插话目录内至少需要一个可播放音频文件（mp3、wav、m4a、aac、ogg、flac）"),
+                .write_str("插话目录内至少需要一个受支持的音频或视频文件（视频仅使用音轨）"),
             Self::TooManyAudioFiles { count, max_files } => {
                 write!(
                     formatter,
-                    "插话目录内有 {count} 个可播放音频文件，最多允许 {max_files} 个"
+                    "插话目录内有 {count} 个受支持的媒体文件，最多允许 {max_files} 个"
                 )
             }
             Self::PathTooLong { bytes, max_bytes } => {
@@ -525,7 +525,7 @@ fn has_allowed_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
         .map(|value| value.to_ascii_lowercase())
-        .is_some_and(|value| ALLOWED_EXTENSIONS.iter().any(|allowed| *allowed == value))
+        .is_some_and(|value| SUPPORTED_SOURCE_MEDIA_EXTENSIONS.contains(&value.as_str()))
 }
 
 #[cfg(test)]
@@ -566,6 +566,7 @@ mod tests {
 
         assert_eq!(config.audio_preset_ids, expected_default_audio_preset_ids());
         assert_eq!(config.audio_fixed_preset_id, "p01");
+        assert_eq!(config.ducking_depth_db, -60.0);
         assert!(!config
             .audio_preset_ids
             .iter()
@@ -611,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_accepts_256_audio_files_and_rejects_the_257th() {
+    fn catalog_accepts_1000_audio_files_and_rejects_the_1001st() {
         let temp = TempDir::new();
         for index in 0..MAX_INTERLUDE_AUDIO_FILES {
             std::fs::write(temp.0.join(format!("audio-{index:03}.wav")), b"wav")
@@ -620,15 +621,15 @@ mod tests {
         let directory = temp.0.display().to_string();
         assert_eq!(
             scan_catalog(&directory)
-                .expect("256 audio files should be accepted")
+                .expect("1000 audio files should be accepted")
                 .audio_files
                 .len(),
             MAX_INTERLUDE_AUDIO_FILES
         );
 
-        std::fs::write(temp.0.join("audio-256.wav"), b"wav").expect("257th audio file");
+        std::fs::write(temp.0.join("audio-1000.wav"), b"wav").expect("1001st audio file");
         assert_eq!(
-            scan_catalog(&directory).expect_err("257 audio files should be rejected"),
+            scan_catalog(&directory).expect_err("1001 audio files should be rejected"),
             InterludeError::TooManyAudioFiles {
                 count: MAX_INTERLUDE_AUDIO_FILES + 1,
                 max_files: MAX_INTERLUDE_AUDIO_FILES,

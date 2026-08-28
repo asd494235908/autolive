@@ -7,6 +7,7 @@ export type CompactNumberFieldProps = {
   min: number;
   max: number;
   step?: number;
+  size?: 'small' | 'middle' | 'large';
   value: number | null;
   onChange: (value: number | null) => void;
   onBlur?: () => void;
@@ -19,6 +20,7 @@ export function CompactNumberField({
   min,
   max,
   step,
+  size,
   value,
   onChange,
   onBlur,
@@ -31,6 +33,7 @@ export function CompactNumberField({
         min={min}
         max={max}
         step={step}
+        size={size}
         value={value}
         style={{ width: '100%' }}
         onChange={onChange}

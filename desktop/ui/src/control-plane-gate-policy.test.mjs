@@ -12,7 +12,7 @@ async function loadPolicy() {
 }
 
 const NOW = Date.parse('2026-08-21T10:00:00.000Z');
-const activeUser = { id: 'user-current', status: 'active' };
+const activeUser = { id: 'user-current', role: 'user', status: 'active' };
 const activeDevice = {
   id: 'desktop-current',
   user_id: 'user-current',
@@ -24,6 +24,7 @@ test('只有当前设备、启用用户和未过期激活状态同时成立才�
   const { isConfirmedDesktopAccess } = await loadPolicy();
 
   assert.equal(isConfirmedDesktopAccess(activeUser, activeDevice, 'desktop-current', NOW), true);
+  assert.equal(isConfirmedDesktopAccess({ ...activeUser, role: 'admin' }, activeDevice, 'desktop-current', NOW), false);
   assert.equal(isConfirmedDesktopAccess(activeUser, activeDevice, '', NOW), false);
   assert.equal(isConfirmedDesktopAccess({ status: 'disabled' }, activeDevice, 'desktop-current', NOW), false);
   assert.equal(isConfirmedDesktopAccess(activeUser, { ...activeDevice, user_id: 'user-other' }, 'desktop-current', NOW), false);
@@ -62,6 +63,11 @@ test('同账号同设备的待授权或过期绑定可自动重绑，禁用和�
   ), false);
   assert.equal(shouldAutomaticallyRegisterDevice(
     { user: { ...activeUser, status: 'disabled' }, device: { ...activeDevice, status: 'pending_activation' } },
+    'desktop-current',
+    NOW,
+  ), false);
+  assert.equal(shouldAutomaticallyRegisterDevice(
+    { user: { ...activeUser, role: 'admin' }, device: { ...activeDevice, status: 'pending_activation' } },
     'desktop-current',
     NOW,
   ), false);

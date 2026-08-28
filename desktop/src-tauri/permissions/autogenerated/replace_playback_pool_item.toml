@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-replace-playback-pool-item"
+description = "Enables the replace_playback_pool_item command without any pre-configured scope."
+commands.allow = ["replace_playback_pool_item"]
+
+[[permission]]
+identifier = "deny-replace-playback-pool-item"
+description = "Denies the replace_playback_pool_item command without any pre-configured scope."
+commands.deny = ["replace_playback_pool_item"]

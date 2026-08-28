@@ -1,0 +1,48 @@
+//!PARAM al_image_repair_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_image_repair_strength_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 100.0
+0.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive Phase 3A edge-aware image repair candidate
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN 1
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+    float repair_mix = clamp(al_image_repair_enabled, 0.0, 1.0)
+        * clamp(al_image_repair_strength_percent / 100.0, 0.0, 1.0) * 0.35;
+    if (repair_mix <= 0.0) {
+        return source_color;
+    }
+
+    vec2 pixel_size = HOOKED_pt;
+    vec3 left = HOOKED_tex(clamp(HOOKED_pos - vec2(pixel_size.x, 0.0), vec2(0.0), vec2(1.0))).rgb;
+    vec3 right = HOOKED_tex(clamp(HOOKED_pos + vec2(pixel_size.x, 0.0), vec2(0.0), vec2(1.0))).rgb;
+    vec3 up = HOOKED_tex(clamp(HOOKED_pos - vec2(0.0, pixel_size.y), vec2(0.0), vec2(1.0))).rgb;
+    vec3 down = HOOKED_tex(clamp(HOOKED_pos + vec2(0.0, pixel_size.y), vec2(0.0), vec2(1.0))).rgb;
+
+    float left_weight = 1.0 / (1.0 + 64.0 * dot(left - source_color.rgb, left - source_color.rgb));
+    float right_weight = 1.0 / (1.0 + 64.0 * dot(right - source_color.rgb, right - source_color.rgb));
+    float up_weight = 1.0 / (1.0 + 64.0 * dot(up - source_color.rgb, up - source_color.rgb));
+    float down_weight = 1.0 / (1.0 + 64.0 * dot(down - source_color.rgb, down - source_color.rgb));
+    float weight_sum = 1.0 + left_weight + right_weight + up_weight + down_weight;
+    vec3 repaired_color = (
+        source_color.rgb
+        + left * left_weight
+        + right * right_weight
+        + up * up_weight
+        + down * down_weight
+    ) / weight_sum;
+
+    return vec4(mix(source_color.rgb, repaired_color, repair_mix), source_color.a);
+}

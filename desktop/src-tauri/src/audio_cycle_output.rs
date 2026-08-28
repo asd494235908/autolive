@@ -22,12 +22,11 @@ const AUDIBLE_REFERENCE_PEAK: f32 = 0.001;
 pub const AUDIO_CANDIDATE_DIGITAL_SILENCE_ERROR: &str = "候选音轨首段为数字静音，保持当前音轨";
 type CrossfadePair = (Vec<f32>, Vec<f32>);
 const OUTPUT_CHUNK_FRAMES: usize = 512;
-const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(1_000);
 const STARTUP_TIMEOUT: Duration = Duration::from_millis(5_000);
 const CROSSFADE_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 const RING_CLEAR_TIMEOUT: Duration = Duration::from_millis(500);
-const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 pub const AUDIO_CYCLE_CROSSFADE_MS: usize = AUDIO_CROSSFADE_MS;
 
 type ControlResponse = mpsc::Sender<Result<(), String>>;
@@ -79,6 +78,10 @@ pub struct AudioInterludeMixConfig {
 
 #[derive(Debug)]
 enum OutputCommand {
+    SetMediaGain {
+        gain: f32,
+        response: ControlResponse,
+    },
     SetCurrent {
         track: AudioMixerTrack,
         timeline: AudioTrackTimeline,
@@ -96,6 +99,14 @@ enum OutputCommand {
     StartInterlude {
         track: AudioMixerTrack,
         config: AudioInterludeMixConfig,
+        response: ControlResponse,
+    },
+    CrossfadeInterludeTo {
+        track: AudioMixerTrack,
+        response: ControlResponse,
+    },
+    SetInterludeGain {
+        gain: f32,
         response: ControlResponse,
     },
     PauseInterlude(ControlResponse),
@@ -131,12 +142,22 @@ enum InterludeEnvelope {
 #[derive(Debug)]
 struct InterludeMixState {
     track: AudioMixerTrack,
+    pending_crossfade: Option<PendingInterludeCrossfade>,
     volume_gain: f32,
     duck_gain: f32,
     attack_frames: usize,
     release_frames: usize,
     envelope: InterludeEnvelope,
     paused: bool,
+}
+
+#[derive(Debug)]
+struct PendingInterludeCrossfade {
+    next: AudioMixerTrack,
+    response: ControlResponse,
+    completed_frames: usize,
+    total_frames: usize,
+    deadline: Instant,
 }
 
 impl InterludeMixState {
@@ -152,6 +173,7 @@ impl InterludeMixState {
         };
         Self {
             track,
+            pending_crossfade: None,
             volume_gain: sanitize_gain(config.volume_gain, 4.0),
             duck_gain: sanitize_gain(config.duck_gain, 1.0),
             attack_frames,
@@ -162,6 +184,7 @@ impl InterludeMixState {
     }
 
     fn pause(&mut self) {
+        self.cancel_pending_crossfade("PortAudio 插话已暂停");
         self.paused = true;
     }
 
@@ -178,11 +201,112 @@ impl InterludeMixState {
     }
 
     fn begin_release(&mut self) {
+        self.cancel_pending_crossfade("PortAudio 插话已停止");
         self.paused = false;
         self.envelope = InterludeEnvelope::Release {
             frame: 0,
             total_frames: self.release_frames,
         };
+    }
+
+    fn set_volume_gain(&mut self, gain: f32) {
+        self.volume_gain = sanitize_gain(gain, 4.0);
+    }
+
+    fn start_crossfade(
+        &mut self,
+        next: AudioMixerTrack,
+        sample_rate_hz: u32,
+        response: ControlResponse,
+    ) {
+        let error = if self.paused {
+            Some("PortAudio 插话已暂停，不能切换声音预设".to_owned())
+        } else if self.pending_crossfade.is_some() {
+            Some("PortAudio 插话声音预设正在切换".to_owned())
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            let _ = response.send(Err(error));
+            return;
+        }
+        let total_samples = stereo_samples_for_ms(sample_rate_hz, AUDIO_CYCLE_CROSSFADE_MS);
+        let minimum_candidate_samples =
+            stereo_samples_for_ms(sample_rate_hz, AUDIO_CANDIDATE_COMMIT_TAIL_MS);
+        if let Err(error) = validate_candidate_signal(&self.track, &next, minimum_candidate_samples)
+        {
+            let _ = response.send(Err(error));
+            return;
+        }
+        if self.track.available_samples() < total_samples {
+            let _ = response.send(Err("当前插话 PCM 不足以执行平滑预设切换".to_owned()));
+            return;
+        }
+        self.pending_crossfade = Some(PendingInterludeCrossfade {
+            next,
+            response,
+            completed_frames: 0,
+            total_frames: total_samples / OUTPUT_CHANNELS,
+            deadline: Instant::now() + CROSSFADE_WAIT_TIMEOUT,
+        });
+    }
+
+    fn cancel_pending_crossfade(&mut self, reason: &str) {
+        if let Some(pending) = self.pending_crossfade.take() {
+            let _ = pending.response.send(Err(reason.to_owned()));
+        }
+    }
+
+    fn take_interlude_samples(&mut self, sample_count: usize) -> Result<Vec<f32>, String> {
+        let sample_count = sample_count - sample_count % OUTPUT_CHANNELS;
+        let Some(mut pending) = self.pending_crossfade.take() else {
+            return self.track.take_up_to(sample_count);
+        };
+        let remaining_frames = pending
+            .total_frames
+            .saturating_sub(pending.completed_frames);
+        let fade_samples = sample_count.min(remaining_frames.saturating_mul(OUTPUT_CHANNELS));
+        if fade_samples == 0 {
+            self.track = pending.next;
+            let _ = pending.response.send(Ok(()));
+            return self.track.take_up_to(sample_count);
+        }
+        if self.track.available_samples() < fade_samples
+            || pending.next.available_samples() < fade_samples
+        {
+            if Instant::now() >= pending.deadline {
+                let _ = pending
+                    .response
+                    .send(Err("插话候选未在 500ms 内提供完整交叉淡化 PCM".to_owned()));
+            } else {
+                self.pending_crossfade = Some(pending);
+            }
+            return self.track.take_up_to(sample_count);
+        }
+        let old = self
+            .track
+            .take_exact(fade_samples)?
+            .ok_or_else(|| "当前插话 PCM 在交叉淡化期间意外不足".to_owned())?;
+        let next = pending
+            .next
+            .take_exact(fade_samples)?
+            .ok_or_else(|| "候选插话 PCM 在交叉淡化期间意外不足".to_owned())?;
+        let mut mixed =
+            linear_crossfade_window(&old, &next, pending.completed_frames, pending.total_frames);
+        pending.completed_frames = pending
+            .completed_frames
+            .saturating_add(fade_samples / OUTPUT_CHANNELS);
+        if pending.completed_frames >= pending.total_frames {
+            self.track = pending.next;
+            let _ = pending.response.send(Ok(()));
+            mixed.extend(
+                self.track
+                    .take_up_to(sample_count.saturating_sub(fade_samples))?,
+            );
+        } else {
+            self.pending_crossfade = Some(pending);
+        }
+        Ok(mixed)
     }
 
     fn envelope_gain(&mut self) -> (f32, bool) {
@@ -389,6 +513,10 @@ impl Drop for AudioCycleOutputTask {
 }
 
 impl AudioCycleOutputControl {
+    pub fn set_media_gain(&self, gain: f32) -> Result<(), String> {
+        self.request(|response| OutputCommand::SetMediaGain { gain, response })
+    }
+
     pub fn set_current(
         &self,
         track: AudioMixerTrack,
@@ -427,6 +555,14 @@ impl AudioCycleOutputControl {
             config,
             response,
         })
+    }
+
+    pub fn crossfade_interlude_to(&self, track: AudioMixerTrack) -> Result<(), String> {
+        self.request(|response| OutputCommand::CrossfadeInterludeTo { track, response })
+    }
+
+    pub fn set_interlude_gain(&self, gain: f32) -> Result<(), String> {
+        self.request(|response| OutputCommand::SetInterludeGain { gain, response })
     }
 
     pub fn pause_interlude(&self) -> Result<(), String> {
@@ -501,12 +637,18 @@ fn output_loop(
 ) {
     let sample_rate_hz = output.sample_rate_hz();
     let output_chunk_samples = OUTPUT_CHUNK_FRAMES * OUTPUT_CHANNELS;
-    let initial_prime_samples = output.target_playback_watermark_samples();
-    let initial_prime_ms = stereo_samples_duration_ms(
-        initial_prime_samples,
-        sample_rate_hz,
-        usize::from(output.channels().max(1)),
-    );
+    let output_channels = usize::from(output.channels().max(1));
+    let initial_prime_output_samples = output.target_playback_watermark_samples();
+    let Some(initial_prime_samples) =
+        stereo_samples_for_output_samples(initial_prime_output_samples, output_channels)
+    else {
+        set_failure(&failure, "PortAudio 初始水位未按完整硬件帧对齐".to_owned());
+        output.stop();
+        update_status(&status, &output, None);
+        return;
+    };
+    let initial_prime_ms =
+        stereo_samples_duration_ms(initial_prime_samples, sample_rate_hz, OUTPUT_CHANNELS);
     let crossfade_samples = stereo_samples_for_ms(sample_rate_hz, AUDIO_CYCLE_CROSSFADE_MS);
     let minimum_candidate_samples =
         stereo_samples_for_ms(sample_rate_hz, AUDIO_CANDIDATE_COMMIT_TAIL_MS);
@@ -518,11 +660,17 @@ fn output_loop(
     let mut timeline = OutputTimeline::default();
     let mut diagnostic_analyzer = LowFrequencyDiagnosticAnalyzer::new(sample_rate_hz);
     let mut paused = output.is_callback_paused();
+    let mut media_gain = 1.0_f32;
     let mut last_status_refresh = Instant::now();
+    let output_retry_interval = output_block_interval(sample_rate_hz, output.frames_per_buffer());
 
     loop {
         while let Ok(command) = commands.try_recv() {
             match command {
+                OutputCommand::SetMediaGain { gain, response } => {
+                    media_gain = sanitize_gain(gain, 1.0);
+                    let _ = response.send(Ok(()));
+                }
                 OutputCommand::SetCurrent {
                     track,
                     timeline: next_timeline,
@@ -548,6 +696,7 @@ fn output_loop(
                     current = None;
                     match track.take_exact(initial_prime_samples) {
                         Ok(Some(mut samples)) => {
+                            apply_media_gain(&mut samples, media_gain);
                             if let Some(interlude) = interlude_state.as_mut() {
                                 match apply_interlude_mix(&mut samples, interlude) {
                                     Ok(true) => {}
@@ -658,13 +807,34 @@ fn output_loop(
                     } else if paused {
                         let _ =
                             response.send(Err("PortAudio 输出已暂停，不能启动插话混音".to_owned()));
-                    } else if track.available_samples() < output_chunk_samples {
+                    } else if track.available_samples() < output_chunk_samples
+                        && !(track.is_finished() && track.available_samples() >= OUTPUT_CHANNELS)
+                    {
                         let _ = response.send(Err("插话 PCM 尚未达到安全启动水位".to_owned()));
                     } else {
+                        if let Some(current_interlude) = interlude_state.as_mut() {
+                            current_interlude
+                                .cancel_pending_crossfade("PortAudio 插话被新插话替换");
+                        }
                         interlude_state =
                             Some(InterludeMixState::new(track, config, sample_rate_hz));
                         let _ = response.send(Ok(()));
                     }
+                }
+                OutputCommand::CrossfadeInterludeTo { track, response } => {
+                    let Some(interlude) = interlude_state.as_mut() else {
+                        let _ = response.send(Err(
+                            "当前没有活动的 PortAudio 插话，不能切换声音预设".to_owned(),
+                        ));
+                        continue;
+                    };
+                    interlude.start_crossfade(track, sample_rate_hz, response);
+                }
+                OutputCommand::SetInterludeGain { gain, response } => {
+                    if let Some(interlude) = interlude_state.as_mut() {
+                        interlude.set_volume_gain(gain);
+                    }
+                    let _ = response.send(Ok(()));
                 }
                 OutputCommand::PauseInterlude(response) => {
                     if let Some(interlude) = interlude_state.as_mut() {
@@ -710,6 +880,9 @@ fn output_loop(
                     pending_output.clear();
                     current = None;
                     tone_state = None;
+                    if let Some(interlude) = interlude_state.as_mut() {
+                        interlude.cancel_pending_crossfade("音频输出已清空");
+                    }
                     interlude_state = None;
                     timeline = OutputTimeline::default();
                     diagnostic_analyzer.reset();
@@ -720,6 +893,9 @@ fn output_loop(
                 }
                 OutputCommand::Stop(response) => {
                     fail_pending_switch(&mut pending_crossfade, "音频输出已停止");
+                    if let Some(interlude) = interlude_state.as_mut() {
+                        interlude.cancel_pending_crossfade("音频输出已停止");
+                    }
                     output.set_callback_paused(true);
                     output.clear_ring();
                     output.stop();
@@ -741,7 +917,7 @@ fn output_loop(
         // 初次 SetCurrent 需要在 callback 暂停时填入完整有效水位；
         // 仅在没有待写数据时暂停继续消费当前轨。
         if tone_state.is_none() && paused && pending_output.is_empty() {
-            thread::sleep(OUTPUT_RETRY_INTERVAL);
+            thread::sleep(output_retry_interval);
             continue;
         }
 
@@ -749,7 +925,7 @@ fn output_loop(
             if let Some(tone) = tone_state.take() {
                 if output.ring_len_samples() > 0 {
                     tone_state = Some(tone);
-                    thread::sleep(OUTPUT_RETRY_INTERVAL);
+                    thread::sleep(output_retry_interval);
                     continue;
                 }
                 if let Some(track) = current.as_ref() {
@@ -773,10 +949,15 @@ fn output_loop(
                     let _ = switch.response.send(Err(error));
                     continue;
                 }
-                let vacant_samples = output
+                let vacant_output_samples = output
                     .ring_capacity_samples()
                     .saturating_sub(output.ring_len_samples());
-                if vacant_samples < crossfade_samples {
+                let vacant_stereo_samples = stereo_samples_for_output_samples(
+                    vacant_output_samples,
+                    usize::from(output.channels().max(1)),
+                )
+                .unwrap_or(0);
+                if vacant_stereo_samples < crossfade_samples {
                     if Instant::now() < switch.deadline {
                         pending_crossfade = Some(switch);
                     } else {
@@ -786,7 +967,7 @@ fn output_loop(
                             AUDIO_CYCLE_CROSSFADE_MS,
                         )));
                     }
-                    thread::sleep(OUTPUT_RETRY_INTERVAL);
+                    thread::sleep(output_retry_interval);
                     continue;
                 }
                 let fade_in_from_silence = output.ring_len_samples() == 0;
@@ -798,6 +979,7 @@ fn output_loop(
                 ) {
                     Ok(Some((old_samples, next_samples))) => {
                         let mut mixed = linear_crossfade(&old_samples, &next_samples);
+                        apply_media_gain(&mut mixed, media_gain);
                         if let Some(interlude) = interlude_state.as_mut() {
                             match apply_interlude_mix(&mut mixed, interlude) {
                                 Ok(true) => {}
@@ -851,9 +1033,11 @@ fn output_loop(
                             update_status(&status, &output, Some(&mut timeline));
                             return;
                         }
-                        if let Err(error) =
-                            mix_pending_output_once(&mut pending_output, &mut interlude_state)
-                        {
+                        if let Err(error) = mix_pending_output_once(
+                            &mut pending_output,
+                            media_gain,
+                            &mut interlude_state,
+                        ) {
                             let _ = switch.response.send(Err(error.clone()));
                             set_failure(&failure, error);
                             output.stop();
@@ -885,7 +1069,7 @@ fn output_loop(
                     return;
                 }
                 if let Err(error) =
-                    mix_pending_output_once(&mut pending_output, &mut interlude_state)
+                    mix_pending_output_once(&mut pending_output, media_gain, &mut interlude_state)
                 {
                     set_failure(&failure, error);
                     output.stop();
@@ -896,23 +1080,33 @@ fn output_loop(
         }
 
         if pending_output.is_empty() {
-            thread::sleep(OUTPUT_RETRY_INTERVAL);
+            thread::sleep(output_retry_interval);
             continue;
         }
 
-        let write_chunk: Vec<f32> = pending_output
-            .iter()
-            .take(output_chunk_samples)
-            .copied()
-            .collect();
-        match output.write_stereo_interleaved_available(&write_chunk) {
-            Ok(0) => thread::sleep(OUTPUT_RETRY_INTERVAL),
-            Ok(written) => {
-                let observed = written.min(write_chunk.len());
-                diagnostic_analyzer.observe_stereo_pcm(&write_chunk[..observed]);
+        let writable_samples = output
+            .writable_stereo_samples_within_watermark()
+            .min(output_chunk_samples);
+        let write_result = if writable_samples < OUTPUT_CHANNELS {
+            None
+        } else {
+            let write_chunk = pending_stereo_chunk(&mut pending_output, writable_samples);
+            Some(
+                output
+                    .write_stereo_interleaved_available(write_chunk)
+                    .map(|written| {
+                        let observed = written.min(write_chunk.len());
+                        diagnostic_analyzer.observe_stereo_pcm(&write_chunk[..observed]);
+                        observed
+                    }),
+            )
+        };
+        match write_result {
+            None | Some(Ok(0)) => thread::sleep(output_retry_interval),
+            Some(Ok(observed)) => {
                 pending_output.drain(..observed.min(pending_output.len()));
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 fail_pending_switch(&mut pending_crossfade, &error);
                 set_failure(&failure, error);
                 output.stop();
@@ -925,8 +1119,10 @@ fn output_loop(
 
 fn mix_pending_output_once(
     pending_output: &mut VecDeque<f32>,
+    media_gain: f32,
     interlude_state: &mut Option<InterludeMixState>,
 ) -> Result<(), String> {
+    apply_media_gain(pending_output.make_contiguous(), media_gain);
     let Some(interlude) = interlude_state.as_mut() else {
         return Ok(());
     };
@@ -946,6 +1142,23 @@ fn refill_pending_output_from_current(
         pending_output.extend(current.take_up_to(output_chunk_samples)?);
     }
     Ok(())
+}
+
+fn pending_stereo_chunk(pending: &mut VecDeque<f32>, max_samples: usize) -> &[f32] {
+    let max_samples = max_samples - max_samples % OUTPUT_CHANNELS;
+    let front_len = {
+        let (front, _) = pending.as_slices();
+        front.len().min(max_samples) / OUTPUT_CHANNELS * OUTPUT_CHANNELS
+    };
+    if front_len >= OUTPUT_CHANNELS {
+        let (front, _) = pending.as_slices();
+        return &front[..front_len];
+    }
+
+    // 环尾可能只剩半个立体声帧；仅此时整理一次，正常热路径直接借用前片。
+    let contiguous = pending.make_contiguous();
+    let chunk_len = contiguous.len().min(max_samples) / OUTPUT_CHANNELS * OUTPUT_CHANNELS;
+    &contiguous[..chunk_len]
 }
 
 fn validate_candidate_signal(
@@ -1008,10 +1221,17 @@ fn apply_interlude_mix(
     if state.paused {
         return Ok(true);
     }
-    let interlude_samples = state.track.take_up_to(main_samples.len())?;
+    let interlude_samples = state.take_interlude_samples(main_samples.len())?;
+    let finite_track_finished = state.pending_crossfade.is_none() && state.track.is_finished();
     let frame_count = main_samples.len() / OUTPUT_CHANNELS;
     let mut active = true;
     for frame in 0..frame_count {
+        if finite_track_finished
+            && frame.saturating_mul(OUTPUT_CHANNELS) >= interlude_samples.len()
+            && !matches!(&state.envelope, InterludeEnvelope::Release { .. })
+        {
+            state.begin_release();
+        }
         let (envelope_gain, still_active) = state.envelope_gain();
         active = still_active;
         let main_gain = 1.0 - (1.0 - state.duck_gain) * envelope_gain;
@@ -1030,7 +1250,22 @@ fn apply_interlude_mix(
             break;
         }
     }
+    if active
+        && finite_track_finished
+        && state.track.is_exhausted()
+        && !matches!(&state.envelope, InterludeEnvelope::Release { .. })
+    {
+        state.begin_release();
+        active = state.release_frames > 0;
+    }
     Ok(active)
+}
+
+fn apply_media_gain(samples: &mut [f32], gain: f32) {
+    let gain = sanitize_gain(gain, 1.0);
+    for sample in samples {
+        *sample = (finite_sample(*sample) * gain).clamp(-1.0, 1.0);
+    }
 }
 
 fn finite_sample(sample: f32) -> f32 {
@@ -1059,15 +1294,24 @@ fn frames_for_ms(sample_rate_hz: u32, duration_ms: u64) -> usize {
 }
 
 fn linear_crossfade(old: &[f32], next: &[f32]) -> Vec<f32> {
+    linear_crossfade_window(old, next, 0, old.len() / OUTPUT_CHANNELS)
+}
+
+fn linear_crossfade_window(
+    old: &[f32],
+    next: &[f32],
+    start_frame: usize,
+    total_frames: usize,
+) -> Vec<f32> {
     debug_assert_eq!(old.len(), next.len());
     debug_assert_eq!(old.len() % OUTPUT_CHANNELS, 0);
     let frame_count = old.len() / OUTPUT_CHANNELS;
     let mut mixed = Vec::with_capacity(old.len());
     for frame in 0..frame_count {
-        let progress = if frame_count <= 1 {
+        let progress = if total_frames <= 1 {
             1.0
         } else {
-            frame as f32 / (frame_count - 1) as f32
+            start_frame.saturating_add(frame) as f32 / (total_frames - 1) as f32
         };
         let old_gain = 1.0 - progress;
         for channel in 0..OUTPUT_CHANNELS {
@@ -1119,11 +1363,12 @@ fn clear_ring_synchronously(
 ) -> Result<(), String> {
     output.clear_ring();
     let started = Instant::now();
+    let retry_interval = output_block_interval(output.sample_rate_hz(), output.frames_per_buffer());
     while output.ring_len_samples() > 0 {
         if started.elapsed() >= RING_CLEAR_TIMEOUT {
             return Err("PortAudio 环缓未在 500ms 内确认清空".to_owned());
         }
-        thread::sleep(OUTPUT_RETRY_INTERVAL);
+        thread::sleep(retry_interval);
     }
     Ok(())
 }
@@ -1223,17 +1468,42 @@ fn set_failure(failure: &Arc<Mutex<Option<String>>>, message: String) {
 }
 
 fn stereo_samples_for_ms(sample_rate_hz: u32, duration_ms: usize) -> usize {
+    let duration_ms = u64::try_from(duration_ms).unwrap_or(u64::MAX);
     usize::try_from(
         u64::from(sample_rate_hz)
-            .saturating_mul(duration_ms as u64)
+            .saturating_mul(duration_ms)
             .saturating_div(1_000)
             .saturating_mul(OUTPUT_CHANNELS as u64),
     )
     .unwrap_or(usize::MAX)
 }
 
+fn stereo_samples_for_output_samples(
+    output_samples: usize,
+    output_channels: usize,
+) -> Option<usize> {
+    if output_channels == 0 || !output_samples.is_multiple_of(output_channels) {
+        return None;
+    }
+    output_samples
+        .checked_div(output_channels)?
+        .checked_mul(OUTPUT_CHANNELS)
+}
+
+fn output_block_interval(sample_rate_hz: u32, frames_per_buffer: u32) -> Duration {
+    let sample_rate_hz = u64::from(sample_rate_hz.max(1));
+    let micros = u64::from(frames_per_buffer.max(1))
+        .saturating_mul(1_000_000)
+        .saturating_add(sample_rate_hz.saturating_sub(1))
+        .saturating_div(sample_rate_hz)
+        .max(1);
+    Duration::from_micros(micros)
+}
+
 fn stereo_samples_duration_ms(samples: usize, sample_rate_hz: u32, channels: usize) -> u64 {
-    (samples as u64 / channels.max(1) as u64)
+    let samples = u64::try_from(samples).unwrap_or(u64::MAX);
+    let channels = u64::try_from(channels.max(1)).unwrap_or(u64::MAX);
+    (samples / channels)
         .saturating_mul(1_000)
         .saturating_div(u64::from(sample_rate_hz.max(1)))
 }
@@ -1241,10 +1511,12 @@ fn stereo_samples_duration_ms(samples: usize, sample_rate_hz: u32, channels: usi
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_interlude_mix, build_test_tone, estimate_media_position_ms, linear_crossfade,
-        mix_pending_output_once, refill_pending_output_from_current, stereo_samples_for_ms,
-        take_crossfade_pair_or_fade_in, validate_candidate_signal, validate_resume_request,
-        AudioInterludeMixConfig, AudioMixerTrack, AudioTestTone, InterludeMixState, TimelineAnchor,
+        apply_interlude_mix, apply_media_gain, build_test_tone, estimate_media_position_ms,
+        linear_crossfade, mix_pending_output_once, output_block_interval, pending_stereo_chunk,
+        refill_pending_output_from_current, stereo_samples_for_ms,
+        stereo_samples_for_output_samples, take_crossfade_pair_or_fade_in,
+        validate_candidate_signal, validate_resume_request, AudioInterludeMixConfig,
+        AudioMixerTrack, AudioTestTone, InterludeMixState, TimelineAnchor,
         AUDIO_CYCLE_CROSSFADE_MS,
     };
     use std::collections::VecDeque;
@@ -1266,6 +1538,32 @@ mod tests {
             stereo_samples_for_ms(48_000, AUDIO_CYCLE_CROSSFADE_MS),
             2_880
         );
+    }
+
+    #[test]
+    fn hardware_watermark_is_converted_to_internal_stereo_samples() {
+        assert_eq!(stereo_samples_for_output_samples(8_820, 1), Some(17_640));
+        assert_eq!(stereo_samples_for_output_samples(17_640, 2), Some(17_640));
+        assert_eq!(stereo_samples_for_output_samples(3, 2), None);
+        assert_eq!(stereo_samples_for_output_samples(1, 0), None);
+    }
+
+    #[test]
+    fn pending_output_borrows_complete_stereo_frames_across_ring_wrap() {
+        let mut pending = VecDeque::from([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(pending_stereo_chunk(&mut pending, 5), &[1.0, 2.0, 3.0, 4.0]);
+
+        let mut wrapped = VecDeque::with_capacity(5);
+        wrapped.extend([0.0, 1.0, 2.0, 3.0, 4.0]);
+        wrapped.drain(..4);
+        wrapped.extend([5.0, 6.0, 7.0]);
+        assert_eq!(pending_stereo_chunk(&mut wrapped, 4), &[4.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn output_backpressure_waits_at_least_one_hardware_block() {
+        assert_eq!(output_block_interval(48_000, 256).as_micros(), 5_334);
+        assert_eq!(output_block_interval(44_100, 2_048).as_micros(), 46_440);
     }
 
     #[test]
@@ -1396,6 +1694,128 @@ mod tests {
     }
 
     #[test]
+    fn media_mute_does_not_mute_the_interlude_track() {
+        let track = AudioMixerTrack::from_samples(VecDeque::from([0.5, 0.5]));
+        let mut state = Some(InterludeMixState::new(
+            track,
+            AudioInterludeMixConfig {
+                volume_gain: 1.0,
+                duck_gain: 0.0,
+                attack_ms: 0,
+                release_ms: 0,
+            },
+            48_000,
+        ));
+        let mut pending = VecDeque::from([0.75, 0.75]);
+
+        mix_pending_output_once(&mut pending, 0.0, &mut state).unwrap();
+
+        assert_eq!(pending, VecDeque::from([0.5, 0.5]));
+    }
+
+    #[test]
+    fn media_gain_is_finite_and_bounded() {
+        let mut samples = [0.5, -0.5, f32::NAN, 2.0];
+        apply_media_gain(&mut samples, 0.5);
+        assert_eq!(samples, [0.25, -0.25, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn active_interlude_volume_updates_without_restarting_its_envelope() {
+        let track = AudioMixerTrack::from_samples(VecDeque::from([0.5, 0.5]));
+        let mut state = InterludeMixState::new(
+            track,
+            AudioInterludeMixConfig {
+                volume_gain: 1.0,
+                duck_gain: 1.0,
+                attack_ms: 0,
+                release_ms: 0,
+            },
+            48_000,
+        );
+        state.set_volume_gain(0.25);
+        let mut main = vec![0.0, 0.0];
+
+        assert!(apply_interlude_mix(&mut main, &mut state).unwrap());
+        assert_eq!(main, vec![0.125, 0.125]);
+        assert!(matches!(state.envelope, super::InterludeEnvelope::Sustain));
+    }
+
+    #[test]
+    fn interlude_candidate_crossfades_and_promotes_only_after_completion() {
+        let current = AudioMixerTrack::from_samples(VecDeque::from([1.0; 300]));
+        let next = AudioMixerTrack::from_samples(VecDeque::from([0.25; 300]));
+        let mut state = InterludeMixState::new(
+            current,
+            AudioInterludeMixConfig {
+                volume_gain: 1.0,
+                duck_gain: 1.0,
+                attack_ms: 0,
+                release_ms: 0,
+            },
+            1_000,
+        );
+        let (response, receiver) = std::sync::mpsc::channel();
+        state.start_crossfade(next, 1_000, response);
+        let mut main = vec![0.0; 60];
+
+        assert!(apply_interlude_mix(&mut main, &mut state).unwrap());
+        assert_eq!(receiver.try_recv().unwrap(), Ok(()));
+        assert_eq!(main[0], 1.0);
+        assert_eq!(main[1], 1.0);
+        assert_eq!(main[58], 0.25);
+        assert_eq!(main[59], 0.25);
+        assert!(state.pending_crossfade.is_none());
+    }
+
+    #[test]
+    fn rejected_interlude_candidate_keeps_the_current_track_untouched() {
+        let current = AudioMixerTrack::from_samples(VecDeque::from([0.5; 300]));
+        let next = AudioMixerTrack::from_samples(VecDeque::from([0.0; 300]));
+        let mut state = InterludeMixState::new(
+            current.clone(),
+            AudioInterludeMixConfig {
+                volume_gain: 1.0,
+                duck_gain: 1.0,
+                attack_ms: 0,
+                release_ms: 0,
+            },
+            1_000,
+        );
+        let (response, receiver) = std::sync::mpsc::channel();
+
+        state.start_crossfade(next, 1_000, response);
+
+        assert!(receiver.try_recv().unwrap().is_err());
+        assert_eq!(current.available_samples(), 300);
+        assert!(state.pending_crossfade.is_none());
+    }
+
+    #[test]
+    fn pausing_interlude_cancels_pending_crossfade_and_keeps_current() {
+        let current = AudioMixerTrack::from_samples(VecDeque::from([0.5; 300]));
+        let next = AudioMixerTrack::from_samples(VecDeque::from([0.25; 300]));
+        let mut state = InterludeMixState::new(
+            current.clone(),
+            AudioInterludeMixConfig {
+                volume_gain: 1.0,
+                duck_gain: 1.0,
+                attack_ms: 0,
+                release_ms: 0,
+            },
+            1_000,
+        );
+        let (response, receiver) = std::sync::mpsc::channel();
+        state.start_crossfade(next, 1_000, response);
+
+        state.pause();
+
+        assert!(receiver.try_recv().unwrap().is_err());
+        assert_eq!(current.available_samples(), 300);
+        assert!(state.pending_crossfade.is_none());
+    }
+
+    #[test]
     fn interlude_pcm_is_consumed_once_when_portaudio_accepts_a_partial_chunk() {
         let track = AudioMixerTrack::from_samples(VecDeque::from([0.2; 8]));
         let mut state = Some(InterludeMixState::new(
@@ -1410,13 +1830,34 @@ mod tests {
         ));
         let mut pending_output = VecDeque::from([0.4; 8]);
 
-        mix_pending_output_once(&mut pending_output, &mut state).unwrap();
+        mix_pending_output_once(&mut pending_output, 1.0, &mut state).unwrap();
         assert_eq!(track.available_samples(), 0);
         assert_eq!(
             pending_output.drain(..2).collect::<Vec<_>>(),
             vec![0.3, 0.3]
         );
         assert_eq!(pending_output, VecDeque::from([0.3; 6]));
+    }
+
+    #[test]
+    fn finite_interlude_stops_at_eof_instead_of_repeating_short_pcm() {
+        let track = AudioMixerTrack::from_finite_samples(VecDeque::from([0.2; 4]));
+        let mut state = InterludeMixState::new(
+            track.clone(),
+            AudioInterludeMixConfig {
+                volume_gain: 0.5,
+                duck_gain: 0.5,
+                attack_ms: 0,
+                release_ms: 0,
+            },
+            48_000,
+        );
+        let mut main = vec![0.4; 8];
+
+        assert!(!apply_interlude_mix(&mut main, &mut state).unwrap());
+        assert_eq!(&main[..4], &[0.3; 4]);
+        assert_eq!(&main[4..], &[0.4; 4]);
+        assert!(track.is_exhausted());
     }
 
     #[test]

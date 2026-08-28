@@ -12,11 +12,24 @@ async function loadTypeScriptModule(fileName, exports) {
   return Object.fromEntries(exports.map((name) => [name, module[name]]));
 }
 
-const { shouldIgnoreLoopBoundaryPause, shouldRestartPlayback, shouldRestartCurrentSourceImmediately } = await loadTypeScriptModule('playback-loop.ts', [
+const {
+  resolvePlaybackBoundaryDuration,
+  shouldIgnoreLoopBoundaryPause,
+  shouldRestartPlayback,
+  shouldRestartCurrentSourceImmediately,
+} = await loadTypeScriptModule('playback-loop.ts', [
+  'resolvePlaybackBoundaryDuration',
   'shouldIgnoreLoopBoundaryPause',
   'shouldRestartPlayback',
   'shouldRestartCurrentSourceImmediately',
 ]);
+
+test('视频播放使用媒体元素的有限时长作为播放池边界', () => {
+  assert.equal(resolvePlaybackBoundaryDuration({
+    mediaDurationSeconds: 42.5,
+    sourceDurationMs: 60_000,
+  }), 42.5);
+});
 
 test('只有单项池可以在后端完成响应前即时重播当前源', () => {
   assert.equal(shouldRestartCurrentSourceImmediately(0), false);
@@ -61,13 +74,17 @@ test('自然结束产生的 pause 不得暂停后端音频出口', () => {
   );
 });
 
-test('循环 seek 前先占住 pause 事件，并在最终效果窗使用边界判断', async () => {
+test('循环 seek 前先占住 pause 事件，且最终效果窗不回写内部 pause', async () => {
   const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
   const restartStart = source.indexOf('function restartCurrentPlayback');
   const restartEnd = source.indexOf('function restartToNextLoop', restartStart);
   const restartSource = source.slice(restartStart, restartEnd);
+  const finalEffectStart = source.indexOf('function FinalEffectWindow()');
+  const videoStart = source.indexOf('<video', finalEffectStart);
+  const finalEffectVideo = source.slice(videoStart, source.indexOf('<audio', videoStart));
 
   assert.ok(restartStart >= 0 && restartEnd > restartStart);
+  assert.ok(finalEffectStart >= 0 && videoStart > finalEffectStart);
   assert.ok(
     restartSource.indexOf('suppressMediaEventRef.current = true')
       < restartSource.indexOf('video.currentTime = 0'),
@@ -76,10 +93,7 @@ test('循环 seek 前先占住 pause 事件，并在最终效果窗使用边界�
     restartSource,
     /video\.play\(\)\.then\(\(\) => \{\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*suppressMediaEventRef\.current = false;/,
   );
-  assert.match(
-    source,
-    /shouldIgnoreLoopBoundaryPause\(\{\s*suppressMediaEvent: suppressMediaEventRef\.current,\s*ended: event\.currentTarget\.ended,\s*currentTime: event\.currentTarget\.currentTime,\s*duration: event\.currentTarget\.duration,/,
-  );
+  assert.doesNotMatch(finalEffectVideo, /onPause=\{[\s\S]*pause_playback/);
 });
 
 test('播放项完成后应用权威快照，换源不预先重播旧源', async () => {
@@ -87,7 +101,7 @@ test('播放项完成后应用权威快照，换源不预先重播旧源', async
   const restartStart = source.indexOf('function restartToNextLoop');
   const restartEnd = source.indexOf('function restartAtBoundary', restartStart);
   const restartSource = source.slice(restartStart, restartEnd);
-  const completeLoop = restartSource.indexOf("invoke<PlaybackItemCompletionResult>('complete_playback_item'");
+  const completeLoop = restartSource.indexOf("invoke<unknown>('complete_playback_item'");
   const applySnapshot = restartSource.indexOf('applyPlayerSnapshot(nextSnapshot)', completeLoop);
   const reanchorPortAudio = restartSource.indexOf(
     'syncAudioOutputSourceLatest(false, true)',
@@ -96,6 +110,7 @@ test('播放项完成后应用权威快照，换源不预先重播旧源', async
 
   assert.ok(restartStart >= 0 && restartEnd > restartStart);
   assert.ok(completeLoop >= 0);
+  assert.match(restartSource, /isPlaybackItemCompletionResult\(result\)/);
   assert.match(restartSource, /playback_generation:\s*currentSnapshot\.playback_generation/);
   assert.match(restartSource, /loop_index:\s*currentSnapshot\.loop_index/);
   assert.match(restartSource, /source_media_index:\s*currentSnapshot\.source_media_index/);
@@ -109,6 +124,19 @@ test('播放项完成后应用权威快照，换源不预先重播旧源', async
     reanchorPortAudio > applySnapshot,
     '循环提交后必须用边界优先级同步新轮次的 PortAudio 源，不能被普通 N+1 候选挡住',
   );
+});
+
+test('播放结束推进使用源身份且不依赖旧视频流状态', async () => {
+  const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+  const guardStart = source.indexOf('function isCurrentFinalEffectVideo');
+  const guardEnd = source.indexOf('useEffect(() => {', guardStart);
+  const guardSource = source.slice(guardStart, guardEnd);
+
+  assert.ok(guardStart >= 0 && guardEnd > guardStart);
+  assert.match(guardSource, /sourceIdentityElement\?\.getAttribute\('src'\) === currentSourceIdentity/);
+  assert.match(guardSource, /playbackVideoUrl\(currentSnapshot\)/);
+  assert.doesNotMatch(guardSource, /VideoMse|videoMse|video_stream/);
+  assert.doesNotMatch(guardSource, /video\.currentSrc/);
 });
 
 test('同一个结束事件 token 只允许重启一次', () => {
@@ -138,6 +166,15 @@ test('同一个结束事件 token 只允许重启一次', () => {
   );
 });
 
+test('最终效果窗口只保留 mpv 实时视频入口', async () => {
+  const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+
+  assert.match(source, /prepare_realtime_video_plan/);
+  assert.match(source, /commit_realtime_video_plan/);
+  assert.match(source, /stop_realtime_video_renderer/);
+  assert.doesNotMatch(source, /prepare_media_video_stream|read_media_video_stream|ack_media_video_stream|commit_media_video_stream|VideoMse|video_stream/);
+});
+
 test('循环提交未完成时拒绝 ended 和 timeupdate 重复推进本地轮次', () => {
   assert.equal(
     shouldRestartPlayback({
@@ -154,7 +191,7 @@ test('循环提交失败时保留 Tauri 返回的真实原因', async () => {
   const source = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
   assert.match(
     source,
-    /setPlaybackError\(getDisplayErrorMessage\(cause, '播放项切换失败，已重播当前视频。'\)\)/,
+    /setPlaybackError\(getDisplayErrorMessage\(cause, '播放项切换失败，已重播当前媒体。'\)\)/,
   );
 });
 

@@ -21,3 +21,24 @@ test('浏览器播放倍速被限制在 HTMLMediaElement 的安全范围', () =>
   assert.equal(syncModule.resolveSynchronizedVideoPlaybackRate(true, 0.1), 0.25);
   assert.equal(syncModule.resolveSynchronizedVideoPlaybackRate(true, 10), 4);
 });
+
+test('源音轨小漂移使用轻量变速，严重漂移或跨循环才硬对齐', () => {
+  assert.deepEqual(syncModule.resolveSourceAudioSync(1, 10, false, false), {
+    hardRealign: false,
+    playbackRate: 1,
+  });
+  assert.deepEqual(syncModule.resolveSourceAudioSync(1, 40, false, false), {
+    hardRealign: false,
+    playbackRate: 0.98,
+  });
+  assert.deepEqual(syncModule.resolveSourceAudioSync(1, -40, false, false), {
+    hardRealign: false,
+    playbackRate: 1.02,
+  });
+  assert.deepEqual(syncModule.resolveSourceAudioSync(1, 120, false, false), {
+    hardRealign: true,
+    playbackRate: 1,
+  });
+  assert.equal(syncModule.resolveSourceAudioSync(1, 0, true, false).hardRealign, true);
+  assert.equal(syncModule.resolveSourceAudioSync(1, 0, false, true).hardRealign, true);
+});

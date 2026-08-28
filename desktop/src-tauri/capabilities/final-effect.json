@@ -1,0 +1,13 @@
+{
+  "identifier": "final-effect",
+  "description": "Final-effect playback window capability without authentication, dialogs or outbound HTTP.",
+  "windows": [
+    "final-effect"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-close",
+    "final-effect-commands"
+  ]
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-logout-control-plane-session"
+description = "Enables the logout_control_plane_session command without any pre-configured scope."
+commands.allow = ["logout_control_plane_session"]
+
+[[permission]]
+identifier = "deny-logout-control-plane-session"
+description = "Denies the logout_control_plane_session command without any pre-configured scope."
+commands.deny = ["logout_control_plane_session"]

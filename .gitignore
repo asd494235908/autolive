@@ -39,6 +39,8 @@ desktop/third_party/ffmpeg/*/ffmpeg
 desktop/third_party/ffmpeg/*/ffprobe
 desktop/third_party/ffmpeg/*/ffmpeg.exe
 desktop/third_party/ffmpeg/*/ffprobe.exe
+desktop/third_party/mpv/*/mpv.exe
+desktop/third_party/mpv/*/d3dcompiler_43.dll
 desktop/src-tauri/runtime-resources.json
 desktop/src-tauri/embedded-runtime-resources/
 !desktop/src-tauri/embedded-runtime-resources/.gitkeep

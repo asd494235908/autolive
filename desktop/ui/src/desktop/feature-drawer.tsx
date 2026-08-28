@@ -1,5 +1,9 @@
 import { Card, Drawer, Typography } from 'antd';
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
+
+export const DESKTOP_DRAWER_ROOT_STYLE: CSSProperties = {
+  top: 'var(--desktop-titlebar-height)',
+};
 
 export function FeatureDrawer({
   title,
@@ -23,6 +27,7 @@ export function FeatureDrawer({
   return (
     <Drawer
       rootClassName="feature-drawer"
+      rootStyle={DESKTOP_DRAWER_ROOT_STYLE}
       title={(
         <div className="feature-drawer-title">
           <strong>{title}</strong>

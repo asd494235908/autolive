@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-audio-cycle-diagnostic"
+description = "Enables the get_audio_cycle_diagnostic command without any pre-configured scope."
+commands.allow = ["get_audio_cycle_diagnostic"]
+
+[[permission]]
+identifier = "deny-get-audio-cycle-diagnostic"
+description = "Denies the get_audio_cycle_diagnostic command without any pre-configured scope."
+commands.deny = ["get_audio_cycle_diagnostic"]

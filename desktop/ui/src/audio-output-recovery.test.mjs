@@ -120,7 +120,7 @@ test('hardware restart is left to the main window instead of racing source sync'
   );
 });
 
-test('active PortAudio hardware keeps candidate scheduling while PCM recovery is pending', () => {
+test('PortAudio recovery helper remains isolated while ordinary cycles use media candidates', () => {
   assert.equal(
     shouldKeepPortAudioCycleScheduling({
       ...stalledStatus,
@@ -145,8 +145,9 @@ test('active PortAudio hardware keeps candidate scheduling while PCM recovery is
   );
   assert.match(
     appSource,
-    /const portAudioCycleEnabled = shouldKeepPortAudioCycleScheduling\(audioOutputBackend\)/,
+    /prepare_audio_media_candidate/,
   );
+  assert.doesNotMatch(appSource, /getAudioCycleCoordinatorAction\(/);
 });
 
 test('processed video cache changes do not change the PortAudio input source', () => {
@@ -245,4 +246,29 @@ test('sync status separates active output, retryable recovery, and hard fallback
     }),
     'fallback',
   );
+});
+
+test('播放期间 Web Audio 图保持运行，PortAudio 只静音末端输出，卸载时关闭', () => {
+  const finalEffectWindow = appSource.slice(
+    appSource.indexOf('function FinalEffectWindow()'),
+    appSource.indexOf('function DesktopApp()'),
+  );
+  const contextSync = finalEffectWindow.slice(
+    finalEffectWindow.indexOf('function syncWebAudioContextState()'),
+    finalEffectWindow.indexOf('function setPortAudioHardwareActive('),
+  );
+  const userAudioSync = finalEffectWindow.slice(
+    finalEffectWindow.indexOf('function syncUserAudioSettings()'),
+    finalEffectWindow.indexOf('function syncWebAudioContextState()'),
+  );
+
+  assert.match(finalEffectWindow, /audioContextTransitionRef/);
+  assert.doesNotMatch(contextSync, /portAudioHardwareRef\.current/);
+  assert.match(contextSync, /snapshotRef\.current\?\.playback_state === 'playing'/);
+  assert.match(contextSync, /context\.resume\(\)/);
+  assert.match(contextSync, /context\.suspend\(\)/);
+  assert.match(userAudioSync, /mainMediaVolumeGainRef\.current\.gain\.value = hardwareOut \|\| muted \? 0 : clampVolume\(volume\)/);
+  assert.match(userAudioSync, /speakerMuteGainRef\.current\.gain\.value = hardwareOut \? 0 : 1/);
+  assert.match(finalEffectWindow, /function setPortAudioHardwareActive[\s\S]*syncWebAudioContextState\(\)/);
+  assert.match(finalEffectWindow, /context\?\.close\(\)/);
 });

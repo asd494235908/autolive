@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-retry-pending-control-plane-logout"
+description = "Enables the retry_pending_control_plane_logout command without any pre-configured scope."
+commands.allow = ["retry_pending_control_plane_logout"]
+
+[[permission]]
+identifier = "deny-retry-pending-control-plane-logout"
+description = "Denies the retry_pending_control_plane_logout command without any pre-configured scope."
+commands.deny = ["retry_pending_control_plane_logout"]

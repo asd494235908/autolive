@@ -13,7 +13,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use autolive_signalsmith_stretch::{QualityPitchConfig, QualityPitchProcessor};
+use autolive_signalsmith_stretch::{QualityPitchConfig, QualityPitchProcessor, StretchError};
 
 use crate::audio_pcm_effects::{AudioPcmEffectConfig, AudioPcmEffectProcessor};
 use crate::background_process::background_command;
@@ -24,10 +24,12 @@ type DecoderProcessSlot = Arc<Mutex<Option<Child>>>;
 const OUTPUT_CHANNELS: usize = 2;
 const DECODE_BUFFER_BYTES: usize = 16 * 1024;
 const MIX_QUEUE_CAPACITY: usize = 8;
-const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 const TRUE_PEAK_DBTP: f32 = -1.5;
 const PCM_FRAME_BYTES: usize = std::mem::size_of::<f32>() * OUTPUT_CHANNELS;
 const MAX_DECODER_STDERR_BYTES: usize = 16 * 1024;
+const FIRST_EMPTY_DECODER_RETRY: Duration = Duration::from_millis(50);
+const PCM_STALL_RECOVERY_INTERVAL: Duration = Duration::from_millis(1_500);
+const CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 // atempo=s 会把 s 秒输入压成 1 秒输出；按 s×1.1 读取可在任意合法倍速保留 10% PCM 余量。
 const REALTIME_READ_RATE_HEADROOM_RATIO: f64 = 1.1;
 // 候选需要在有限预算内领先正在播放的画面时钟，但不能无界突发读取。
@@ -60,6 +62,8 @@ struct AudioMixerLoopContext {
     sample_rate_hz: u32,
     prebuffer_started_at: Instant,
     candidate_prebuffer_policy: CandidatePrebufferPolicy,
+    eof_behavior: DecoderEofBehavior,
+    finished: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,9 +73,16 @@ enum DecoderPacing {
     ShortCycle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecoderEofBehavior {
+    Restart,
+    Finish,
+}
+
 #[derive(Debug, Clone)]
 pub struct AudioMixerTrack {
     samples: Arc<Mutex<VecDeque<f32>>>,
+    finished: Arc<AtomicBool>,
 }
 
 impl AudioMixerTrack {
@@ -79,6 +90,15 @@ impl AudioMixerTrack {
     pub(crate) fn from_samples(samples: VecDeque<f32>) -> Self {
         Self {
             samples: Arc::new(Mutex::new(samples)),
+            finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_finite_samples(samples: VecDeque<f32>) -> Self {
+        Self {
+            samples: Arc::new(Mutex::new(samples)),
+            finished: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -87,6 +107,14 @@ impl AudioMixerTrack {
             .lock()
             .map(|samples| samples.len())
             .unwrap_or(0)
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.is_finished() && self.available_samples() == 0
     }
 
     pub(crate) fn peak_in_first(&self, sample_count: usize) -> Result<Option<f32>, String> {
@@ -158,6 +186,7 @@ pub struct AudioMixerTask {
     config: AudioMixerConfig,
     ready: Arc<AtomicBool>,
     prebuffer: Arc<Mutex<VecDeque<f32>>>,
+    finished: Arc<AtomicBool>,
     start_position_ms: u64,
 }
 
@@ -259,6 +288,7 @@ impl AudioMixerTask {
             pcm_effects,
             ambient_source_path,
             decoder_pacing,
+            DecoderEofBehavior::Restart,
             playback_rate,
             CandidatePrebufferPolicy::CatchUp { minimum_ready_ms },
             minimum_ready_ms,
@@ -295,6 +325,43 @@ impl AudioMixerTask {
             pcm_effects,
             ambient_source_path,
             DecoderPacing::RealTime,
+            DecoderEofBehavior::Restart,
+            playback_rate,
+            CandidatePrebufferPolicy::FixedWindow { buffer_ms },
+            minimum_commit_tail_ms,
+            prebuffer_started_at,
+        )
+    }
+
+    /// 为只播放一次的音轨准备候选；成功到达 EOF 后不从文件开头重新解码。
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_finite_scheduled_candidate_with_filter_and_variant_count(
+        ffmpeg_path: PathBuf,
+        source_path: PathBuf,
+        sample_rate_hz: u32,
+        seek_position_ms: u64,
+        timeline_start_position_ms: u64,
+        filter_graph: Option<String>,
+        quality_pitch: Option<QualityPitchConfig>,
+        pcm_effects: Option<AudioPcmEffectConfig>,
+        ambient_source_path: Option<PathBuf>,
+        playback_rate: f64,
+        buffer_ms: usize,
+        minimum_commit_tail_ms: usize,
+        prebuffer_started_at: Instant,
+    ) -> Result<Self, String> {
+        Self::start_internal(
+            ffmpeg_path,
+            source_path,
+            sample_rate_hz,
+            seek_position_ms,
+            timeline_start_position_ms,
+            filter_graph,
+            quality_pitch,
+            pcm_effects,
+            ambient_source_path,
+            DecoderPacing::RealTime,
+            DecoderEofBehavior::Finish,
             playback_rate,
             CandidatePrebufferPolicy::FixedWindow { buffer_ms },
             minimum_commit_tail_ms,
@@ -315,6 +382,7 @@ impl AudioMixerTask {
         pcm_effects: Option<AudioPcmEffectConfig>,
         ambient_source_path: Option<PathBuf>,
         decoder_pacing: DecoderPacing,
+        eof_behavior: DecoderEofBehavior,
         playback_rate: f64,
         candidate_prebuffer_policy: CandidatePrebufferPolicy,
         minimum_commit_tail_ms: usize,
@@ -333,12 +401,10 @@ impl AudioMixerTask {
         let decoder_process = Arc::new(Mutex::new(None));
         let ready = Arc::new(AtomicBool::new(false));
         let prebuffer = Arc::new(Mutex::new(VecDeque::new()));
+        let finished = Arc::new(AtomicBool::new(false));
         let prebuffer_limit_ms = candidate_prebuffer_limit_ms(candidate_prebuffer_policy);
-        let prebuffer_limit_samples = sample_rate_hz
-            .saturating_mul(prebuffer_limit_ms as u32)
-            .saturating_div(1_000)
-            .saturating_mul(OUTPUT_CHANNELS as u32)
-            .max(PCM_FRAME_BYTES as u32) as usize;
+        let prebuffer_limit_samples =
+            stereo_samples_for_ms(sample_rate_hz, prebuffer_limit_ms).max(OUTPUT_CHANNELS);
         let config = AudioMixerConfig {
             sample_rate_hz,
             prebuffer_ms: minimum_commit_tail_ms,
@@ -365,6 +431,7 @@ impl AudioMixerTask {
                     ambient_source_path.as_deref(),
                     decoder_process_slot,
                     decoder_pacing,
+                    eof_behavior,
                     playback_rate,
                 );
             })
@@ -374,6 +441,7 @@ impl AudioMixerTask {
         let mixer_failure = Arc::clone(&failure);
         let mixer_ready = Arc::clone(&ready);
         let mixer_prebuffer = Arc::clone(&prebuffer);
+        let mixer_finished = Arc::clone(&finished);
         let mixer_handle = match thread::Builder::new()
             .name("autolive-audio-mixer".to_owned())
             .spawn(move || {
@@ -387,6 +455,8 @@ impl AudioMixerTask {
                     sample_rate_hz,
                     prebuffer_started_at,
                     candidate_prebuffer_policy,
+                    eof_behavior,
+                    finished: mixer_finished,
                 });
             }) {
             Ok(handle) => handle,
@@ -407,6 +477,7 @@ impl AudioMixerTask {
             config,
             ready,
             prebuffer,
+            finished,
             start_position_ms: timeline_start_position_ms,
         })
     }
@@ -491,6 +562,7 @@ impl AudioMixerTask {
     pub fn output_track(&self) -> AudioMixerTrack {
         AudioMixerTrack {
             samples: Arc::clone(&self.prebuffer),
+            finished: Arc::clone(&self.finished),
         }
     }
 
@@ -552,21 +624,12 @@ fn decode_audio_loop(
     ambient_source_path: Option<&Path>,
     decoder_process: DecoderProcessSlot,
     decoder_pacing: DecoderPacing,
+    eof_behavior: DecoderEofBehavior,
     playback_rate: f64,
 ) {
-    let mut quality_pitch = match quality_pitch
-        .map(|config| QualityPitchProcessor::new(config, sample_rate_hz, OUTPUT_CHANNELS))
-        .transpose()
-    {
-        Ok(processor) => processor,
-        Err(error) => {
-            set_failure(
-                failure,
-                AudioMixerFailure::Runtime(format!("初始化高质量变调处理器失败：{error}")),
-            );
-            return;
-        }
-    };
+    let mut quality_pitch = quality_pitch.and_then(|config| {
+        QualityPitchProcessor::new(config, sample_rate_hz, OUTPUT_CHANNELS).ok()
+    });
     let mut pcm_effects = match pcm_effects
         .map(|config| AudioPcmEffectProcessor::new(config, sample_rate_hz, OUTPUT_CHANNELS))
         .transpose()
@@ -581,6 +644,7 @@ fn decode_audio_loop(
         }
     };
     let mut first_loop = true;
+    let mut consecutive_empty_loops = 0_usize;
     while !cancellation.is_cancelled() {
         let start_seconds = if first_loop {
             format!("{:.3}", start_position_ms as f64 / 1000.0)
@@ -681,7 +745,7 @@ fn decode_audio_loop(
 
         let mut bytes = vec![0_u8; DECODE_BUFFER_BYTES];
         let mut pending = Vec::with_capacity(PCM_FRAME_BYTES);
-        let mut decoded_samples = 0_usize;
+        let mut emitted_samples = 0_usize;
         loop {
             if cancellation.is_cancelled() {
                 terminate_decoder_process(&decoder_process);
@@ -710,22 +774,16 @@ fn decode_audio_loop(
             if samples.is_empty() {
                 continue;
             }
-            decoded_samples += samples.len();
-            let samples = match quality_pitch.as_mut() {
-                Some(processor) => match processor.process_interleaved(&samples) {
-                    Ok(processed) => processed,
-                    Err(error) => {
-                        set_failure(
-                            failure,
-                            AudioMixerFailure::Runtime(format!("高质量变调处理失败：{error}")),
-                        );
-                        terminate_decoder_process(&decoder_process);
-                        let _ = join_stderr_reader(stderr_reader);
-                        return;
-                    }
-                },
-                None => samples,
+            let (samples, disable_quality_pitch) = match quality_pitch.as_mut() {
+                Some(processor) => {
+                    let processed = processor.process_interleaved(&samples);
+                    quality_pitch_output_or_bypass(samples, processed)
+                }
+                None => (samples, false),
             };
+            if disable_quality_pitch {
+                quality_pitch = None;
+            }
             // Signalsmith 会在前导延迟尚未填满时合法返回空块；空块不是 PCM，
             // 不能送入要求非空输入的 MFCC/SNR 特征处理器。
             if samples.is_empty() {
@@ -749,11 +807,13 @@ fn decode_audio_loop(
             if samples.is_empty() {
                 continue;
             }
-            if !send_samples_with_cancellation(cancellation, &sender, samples) {
+            let sample_count = samples.len();
+            if !send_samples_with_backpressure(&sender, samples) {
                 terminate_decoder_process(&decoder_process);
                 let _ = join_stderr_reader(stderr_reader);
                 return;
             }
+            emitted_samples = emitted_samples.saturating_add(sample_count);
         }
         // 先从共享槽位取出 Child，再等待；不能持有槽位锁调用 wait，
         // 否则 stop_inner 无法取得同一把锁来终止子进程。
@@ -790,13 +850,71 @@ fn decode_audio_loop(
             );
             return;
         }
-        if decoded_samples == 0 {
-            // 从接近 EOF 的媒体时钟启动时，FFmpeg 可以正常退出但尚未输出样本。
-            // 下一轮从源开头重试；候选仍未 ready，因此 WebView/旧轨继续出声。
+        if eof_behavior == DecoderEofBehavior::Finish {
+            let tail = match quality_pitch.as_mut() {
+                Some(processor) => match processor.flush() {
+                    Ok(samples) => samples,
+                    Err(error) => {
+                        set_failure(
+                            failure,
+                            AudioMixerFailure::Runtime(format!("排空质量变调尾部失败：{error}")),
+                        );
+                        return;
+                    }
+                },
+                None => Vec::new(),
+            };
+            if !tail.is_empty() {
+                let tail = match pcm_effects.as_mut() {
+                    Some(processor) => match processor.process_interleaved(&tail) {
+                        Ok(processed) => processed,
+                        Err(error) => {
+                            set_failure(
+                                failure,
+                                AudioMixerFailure::Runtime(format!(
+                                    "处理质量变调尾部的 PCM 特征效果失败：{error}"
+                                )),
+                            );
+                            return;
+                        }
+                    },
+                    None => tail,
+                };
+                let sample_count = tail.len();
+                if sample_count > 0 {
+                    if !send_samples_with_backpressure(&sender, tail) {
+                        return;
+                    }
+                    emitted_samples = emitted_samples.saturating_add(sample_count);
+                }
+            }
+        }
+        if emitted_samples == 0 {
+            if eof_behavior == DecoderEofBehavior::Finish {
+                set_failure(
+                    failure,
+                    AudioMixerFailure::Ffmpeg(
+                        "音频源从指定位置开始没有可播放的音频数据".to_owned(),
+                    ),
+                );
+                return;
+            }
+            // 从接近 EOF 启动或 DSP 尚在合法预热时，FFmpeg 可以成功退出但没有
+            // 可播放 PCM。首次快速回源；连续空轮按真实停产门槛退避，避免重启风暴。
+            consecutive_empty_loops = consecutive_empty_loops.saturating_add(1);
             first_loop = false;
-            thread::sleep(Duration::from_millis(50));
+            if !wait_with_cancellation(
+                cancellation,
+                empty_decoder_restart_delay(consecutive_empty_loops),
+            ) {
+                return;
+            }
             continue;
         }
+        if eof_behavior == DecoderEofBehavior::Finish {
+            return;
+        }
+        consecutive_empty_loops = 0;
         first_loop = false;
     }
 }
@@ -849,33 +967,60 @@ fn wait_for_child_exit(child: &mut Child) -> Option<ExitStatus> {
     child.wait().ok()
 }
 
-fn send_samples_with_cancellation(
-    cancellation: &CancellationToken,
-    sender: &mpsc::SyncSender<Vec<f32>>,
-    samples: Vec<f32>,
-) -> bool {
-    let mut samples = Some(samples);
-    loop {
+fn send_samples_with_backpressure(sender: &mpsc::SyncSender<Vec<f32>>, samples: Vec<f32>) -> bool {
+    sender.send(samples).is_ok()
+}
+
+fn quality_pitch_output_or_bypass(
+    original: Vec<f32>,
+    processed: Result<Vec<f32>, StretchError>,
+) -> (Vec<f32>, bool) {
+    match processed {
+        Ok(samples) if samples.iter().all(|sample| sample.is_finite()) => (samples, false),
+        Ok(_) | Err(_) => (original, true),
+    }
+}
+
+fn empty_decoder_restart_delay(consecutive_empty_loops: usize) -> Duration {
+    if consecutive_empty_loops <= 1 {
+        FIRST_EMPTY_DECODER_RETRY
+    } else {
+        PCM_STALL_RECOVERY_INTERVAL
+    }
+}
+
+fn wait_with_cancellation(cancellation: &CancellationToken, duration: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < duration {
         if cancellation.is_cancelled() {
             return false;
         }
-        let samples_to_send = match samples.take() {
-            Some(samples) => samples,
-            None => return false,
-        };
-        match sender.try_send(samples_to_send) {
-            Ok(()) => return true,
-            Err(mpsc::TrySendError::Full(samples_to_retry)) => {
-                samples = Some(samples_to_retry);
-                thread::sleep(OUTPUT_RETRY_INTERVAL);
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => return false,
-        }
+        thread::sleep(
+            duration
+                .saturating_sub(started.elapsed())
+                .min(CANCELLATION_CHECK_INTERVAL),
+        );
     }
+    !cancellation.is_cancelled()
+}
+
+fn pcm_decode_block_interval(sample_rate_hz: u32) -> Duration {
+    let frames_per_block = DECODE_BUFFER_BYTES / PCM_FRAME_BYTES;
+    let sample_rate_hz = u64::from(sample_rate_hz.max(1));
+    let micros = u64::try_from(frames_per_block)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1_000_000)
+        .saturating_add(sample_rate_hz.saturating_sub(1))
+        .saturating_div(sample_rate_hz)
+        .max(1);
+    Duration::from_micros(micros)
 }
 
 // 音轨处理线程只填充自己的有界 PCM 队列；PortAudio 由 audio_cycle_output 单线程写入。
 fn mix_audio_loop(context: AudioMixerLoopContext) {
+    let retry_interval = pcm_decode_block_interval(context.sample_rate_hz);
+    let mut pending_samples = VecDeque::new();
+    let mut received_pcm = false;
     while !context.cancellation.is_cancelled() {
         // 缓冲达到上限后暂停消费，让有界 channel 反压 FFmpeg；不能读取后丢弃，
         // 否则当前轨或候选轨恢复消费时会出现时间跳跃。
@@ -885,27 +1030,51 @@ fn mix_audio_loop(context: AudioMixerLoopContext) {
             .ok()
             .is_some_and(|buffered| buffered.len() >= context.prebuffer_limit_samples)
         {
-            thread::sleep(OUTPUT_RETRY_INTERVAL);
+            thread::sleep(retry_interval);
             continue;
         }
-        let mut samples = match context.receiver.recv_timeout(Duration::from_millis(50)) {
-            Ok(samples) => samples,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if !context.cancellation.is_cancelled() {
-                    set_failure(
-                        &context.failure,
-                        AudioMixerFailure::Runtime("音频解码输入已断开".to_owned()),
-                    );
+        if pending_samples.is_empty() {
+            let mut samples = match context.receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(samples) => {
+                    received_pcm |= !samples.is_empty();
+                    samples
                 }
-                return;
-            }
-        };
-        process_audio_bus(&mut samples);
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if context.eof_behavior == DecoderEofBehavior::Finish {
+                        if received_pcm {
+                            context.ready.store(true, Ordering::Release);
+                            context.finished.store(true, Ordering::Release);
+                        } else if !context.cancellation.is_cancelled() {
+                            set_failure(
+                                &context.failure,
+                                AudioMixerFailure::Runtime(
+                                    "有限音轨结束时没有可播放的 PCM".to_owned(),
+                                ),
+                            );
+                        }
+                        return;
+                    }
+                    if !context.cancellation.is_cancelled() {
+                        set_failure(
+                            &context.failure,
+                            AudioMixerFailure::Runtime("音频解码输入已断开".to_owned()),
+                        );
+                    }
+                    return;
+                }
+            };
+            process_audio_bus(&mut samples);
+            pending_samples = VecDeque::from(samples);
+        }
         if let Ok(mut buffered) = context.prebuffer.lock() {
-            let buffered_samples =
-                append_prebuffer(&mut buffered, &samples, context.prebuffer_limit_samples);
-            let elapsed_ms = elapsed_ms(context.prebuffer_started_at) as usize;
+            let buffered_samples = append_prebuffer(
+                &mut buffered,
+                &mut pending_samples,
+                context.prebuffer_limit_samples,
+            );
+            let elapsed_ms =
+                usize::try_from(elapsed_ms(context.prebuffer_started_at)).unwrap_or(usize::MAX);
             let required_samples = candidate_readiness_samples(
                 context.sample_rate_hz,
                 elapsed_ms,
@@ -925,11 +1094,15 @@ fn mix_audio_loop(context: AudioMixerLoopContext) {
     }
 }
 
-fn append_prebuffer(buffered: &mut VecDeque<f32>, samples: &[f32], limit_samples: usize) -> usize {
-    if buffered.len() < limit_samples {
-        // 整块保留，最多只会比上限多一个解码块；拆块丢尾会破坏 PCM 连续性。
-        buffered.extend(samples.iter().copied());
-    }
+fn append_prebuffer(
+    buffered: &mut VecDeque<f32>,
+    samples: &mut VecDeque<f32>,
+    limit_samples: usize,
+) -> usize {
+    let writable = limit_samples
+        .saturating_sub(buffered.len())
+        .min(samples.len());
+    buffered.extend(samples.drain(..writable));
     buffered.len()
 }
 
@@ -939,12 +1112,14 @@ fn candidate_required_prebuffer_samples(
     minimum_ready_ms: usize,
     max_samples: usize,
 ) -> usize {
-    let required_ms = elapsed_ms.saturating_add(minimum_ready_ms);
+    let required_ms =
+        u64::try_from(elapsed_ms.saturating_add(minimum_ready_ms)).unwrap_or(u64::MAX);
     let required_samples = u64::from(sample_rate_hz)
-        .saturating_mul(required_ms as u64)
+        .saturating_mul(required_ms)
         .saturating_div(1_000)
         .saturating_mul(OUTPUT_CHANNELS as u64);
-    required_samples.min(max_samples as u64) as usize
+    let max_samples = u64::try_from(max_samples).unwrap_or(u64::MAX);
+    usize::try_from(required_samples.min(max_samples)).unwrap_or(usize::MAX)
 }
 
 fn candidate_prebuffer_limit_ms(policy: CandidatePrebufferPolicy) -> usize {
@@ -982,9 +1157,10 @@ fn candidate_readiness_samples(
 }
 
 fn stereo_samples_for_ms(sample_rate_hz: u32, duration_ms: usize) -> usize {
+    let duration_ms = u64::try_from(duration_ms).unwrap_or(u64::MAX);
     usize::try_from(
         u64::from(sample_rate_hz)
-            .saturating_mul(duration_ms as u64)
+            .saturating_mul(duration_ms)
             .saturating_div(1_000)
             .saturating_mul(OUTPUT_CHANNELS as u64),
     )
@@ -1017,20 +1193,28 @@ fn prebuffer_skip_samples(
     minimum_remaining_ms: usize,
 ) -> Result<usize, String> {
     let elapsed_ms = position_ms.saturating_sub(start_position_ms);
-    let skip_samples = (u64::from(sample_rate_hz)
-        .saturating_mul(elapsed_ms)
-        .saturating_div(1_000)
-        .saturating_mul(u64::from(OUTPUT_CHANNELS as u32))) as usize;
-    let minimum_remaining_samples = (u64::from(sample_rate_hz)
-        .saturating_mul(minimum_remaining_ms as u64)
-        .saturating_div(1_000)
-        .saturating_mul(OUTPUT_CHANNELS as u64)) as usize;
+    let skip_samples = usize::try_from(
+        u64::from(sample_rate_hz)
+            .saturating_mul(elapsed_ms)
+            .saturating_div(1_000)
+            .saturating_mul(u64::from(OUTPUT_CHANNELS as u32)),
+    )
+    .unwrap_or(usize::MAX);
+    let minimum_remaining_ms = u64::try_from(minimum_remaining_ms).unwrap_or(u64::MAX);
+    let minimum_remaining_samples = usize::try_from(
+        u64::from(sample_rate_hz)
+            .saturating_mul(minimum_remaining_ms)
+            .saturating_div(1_000)
+            .saturating_mul(OUTPUT_CHANNELS as u64),
+    )
+    .unwrap_or(usize::MAX);
     if skip_samples.saturating_add(minimum_remaining_samples) > buffered_samples {
-        let buffered_ms = (buffered_samples as u64)
+        let buffered_ms = u64::try_from(buffered_samples)
+            .unwrap_or(u64::MAX)
             .saturating_mul(1_000)
             .saturating_div(u64::from(sample_rate_hz.max(1)))
             .saturating_div(OUTPUT_CHANNELS as u64);
-        let required_ms = elapsed_ms.saturating_add(minimum_remaining_ms as u64);
+        let required_ms = elapsed_ms.saturating_add(minimum_remaining_ms);
         let missing_ms = required_ms.saturating_sub(buffered_ms);
         return Err(format!(
             "候选音轨尚未追上画面：起始位置 {start_position_ms}ms，目标位置 {position_ms}ms；需要缓冲 {required_ms}ms（含安全水位 {minimum_remaining_ms}ms），实际缓冲 {buffered_ms}ms，缺少 {missing_ms}ms"
@@ -1185,25 +1369,36 @@ fn set_failure(failure: &Arc<Mutex<Option<AudioMixerFailure>>>, reason: AudioMix
 mod tests {
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use autolive_signalsmith_stretch::QualityPitchConfig;
+    use autolive_signalsmith_stretch::{QualityPitchConfig, StretchError};
 
     use super::{
         append_prebuffer, candidate_ffmpeg_read_rate, candidate_prebuffer_limit_ms,
         candidate_readiness_samples, candidate_required_prebuffer_samples, decoder_input_seek_args,
-        prebuffer_skip_samples, process_audio_bus, realtime_ffmpeg_read_rate,
-        sanitize_error_detail, send_samples_with_cancellation, short_cycle_ffmpeg_read_rate,
+        empty_decoder_restart_delay, pcm_decode_block_interval, prebuffer_skip_samples,
+        process_audio_bus, quality_pitch_output_or_bypass, realtime_ffmpeg_read_rate,
+        sanitize_error_detail, send_samples_with_backpressure, short_cycle_ffmpeg_read_rate,
         stereo_samples_for_ms, take_complete_stereo_samples, trim_prebuffer_to_position,
         AudioMixerTask, AudioMixerTrack, CandidatePrebufferPolicy, AUDIO_CANDIDATE_COMMIT_TAIL_MS,
         SHORT_CYCLE_INITIAL_BURST_SECONDS, SWITCH_CATCH_UP_MAX_MS,
     };
     use crate::audio_pcm_effects::AudioPcmEffectConfig;
-    use crate::cancellation::CancellationToken;
     use crate::media_audio_effects::{MfccOperation, MfccRuntimePlan};
 
     fn generated_user_audio_fixture(ffmpeg: &Path, name: &str) -> (PathBuf, PathBuf) {
+        generated_user_audio_fixture_from_lavfi(
+            ffmpeg,
+            name,
+            "sine=frequency=440:sample_rate=44100:duration=1",
+        )
+    }
+
+    fn generated_user_audio_fixture_from_lavfi(
+        ffmpeg: &Path,
+        name: &str,
+        source: &str,
+    ) -> (PathBuf, PathBuf) {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("test clock")
@@ -1223,7 +1418,7 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "sine=frequency=440:sample_rate=44100:duration=1",
+                source,
                 "-ac",
                 "2",
                 "-c:a",
@@ -1304,6 +1499,39 @@ mod tests {
     }
 
     #[test]
+    fn quality_pitch_error_disables_processor_and_preserves_original_finite_pcm() {
+        let original = vec![0.25, -0.25, 0.5, -0.5];
+        let (samples, disable_processor) = quality_pitch_output_or_bypass(
+            original.clone(),
+            Err(StretchError::NativeFailure("test failure")),
+        );
+
+        assert_eq!(samples, original);
+        assert!(samples.iter().all(|sample| sample.is_finite()));
+        assert!(disable_processor);
+    }
+
+    #[test]
+    fn non_finite_quality_pitch_output_falls_back_without_matching_error_text() {
+        let original = vec![0.1, -0.1];
+        let (samples, disable_processor) =
+            quality_pitch_output_or_bypass(original.clone(), Ok(vec![f32::NAN, 0.0]));
+
+        assert_eq!(samples, original);
+        assert!(disable_processor);
+    }
+
+    #[test]
+    fn finite_quality_pitch_output_keeps_normal_path_enabled() {
+        let processed = vec![0.2, -0.2];
+        let (samples, disable_processor) =
+            quality_pitch_output_or_bypass(vec![0.1, -0.1], Ok(processed.clone()));
+
+        assert_eq!(samples, processed);
+        assert!(!disable_processor);
+    }
+
+    #[test]
     fn clean_zero_pcm_seek_restarts_from_source_beginning_without_hard_failure() {
         let Some(ffmpeg) = std::env::var_os("AUTOLIVE_TEST_FFMPEG") else {
             return;
@@ -1331,6 +1559,131 @@ mod tests {
         task.stop_preserving_output();
         let _ = std::fs::remove_dir_all(fixture_root);
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn finite_candidate_accepts_a_short_eof_tail_without_restarting_the_source() {
+        let Some(ffmpeg) = std::env::var_os("AUTOLIVE_TEST_FFMPEG") else {
+            return;
+        };
+        let ffmpeg = PathBuf::from(ffmpeg);
+        let (fixture_root, audio_fixture) = generated_user_audio_fixture(&ffmpeg, "finite-eof");
+        let mut task =
+            AudioMixerTask::start_finite_scheduled_candidate_with_filter_and_variant_count(
+                ffmpeg,
+                audio_fixture,
+                44_100,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+                1.0,
+                1_500,
+                1_500,
+                Instant::now(),
+            )
+            .expect("finite candidate should start");
+
+        let result = wait_until_ready(&task, Duration::from_secs(3));
+        let track = task.output_track();
+        let available_samples = track.available_samples();
+        task.stop_preserving_output();
+        let _ = std::fs::remove_dir_all(fixture_root);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(track.is_finished());
+        assert!(available_samples > 0);
+        assert!(available_samples < stereo_samples_for_ms(44_100, 1_500));
+    }
+
+    #[test]
+    fn finite_candidate_flushes_quality_pitch_latency_for_a_ten_millisecond_file() {
+        let Some(ffmpeg) = std::env::var_os("AUTOLIVE_TEST_FFMPEG") else {
+            return;
+        };
+        let ffmpeg = PathBuf::from(ffmpeg);
+        let (fixture_root, audio_fixture) = generated_user_audio_fixture_from_lavfi(
+            &ffmpeg,
+            "finite-pitch-tail",
+            "sine=frequency=440:sample_rate=44100:duration=0.01",
+        );
+        let mut task =
+            AudioMixerTask::start_finite_scheduled_candidate_with_filter_and_variant_count(
+                ffmpeg,
+                audio_fixture,
+                44_100,
+                0,
+                0,
+                None,
+                Some(QualityPitchConfig {
+                    pitch_shift_semitones: -0.018,
+                    formant_shift_percent: 0.105,
+                }),
+                None,
+                None,
+                1.0,
+                130,
+                130,
+                Instant::now(),
+            )
+            .expect("finite quality-pitch candidate should start");
+
+        let result = wait_until_ready(&task, Duration::from_secs(3));
+        let track = task.output_track();
+        let available_samples = track.available_samples();
+        task.stop_preserving_output();
+        let _ = std::fs::remove_dir_all(fixture_root);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(track.is_finished());
+        assert!(available_samples > 0);
+        assert!(available_samples < stereo_samples_for_ms(44_100, 130));
+    }
+
+    #[test]
+    fn finite_candidate_marks_finished_after_live_consumer_drains_the_last_pcm() {
+        let Some(ffmpeg) = std::env::var_os("AUTOLIVE_TEST_FFMPEG") else {
+            return;
+        };
+        let ffmpeg = PathBuf::from(ffmpeg);
+        let (fixture_root, audio_fixture) = generated_user_audio_fixture(&ffmpeg, "finite-drain");
+        let mut task =
+            AudioMixerTask::start_finite_scheduled_candidate_with_filter_and_variant_count(
+                ffmpeg,
+                audio_fixture,
+                44_100,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+                1.0,
+                130,
+                130,
+                Instant::now(),
+            )
+            .expect("finite candidate should start");
+        wait_until_ready(&task, Duration::from_secs(3)).expect("finite candidate should be ready");
+        let track = task.output_track();
+        let started_at = Instant::now();
+        while !track.is_finished() && started_at.elapsed() < Duration::from_secs(3) {
+            track
+                .take_up_to(stereo_samples_for_ms(44_100, 50))
+                .expect("consume finite candidate");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let failure = task.failure();
+        task.stop_preserving_output();
+        let _ = std::fs::remove_dir_all(fixture_root);
+
+        assert!(track.is_finished(), "finite decoder did not publish EOF");
+        assert!(
+            failure.is_none(),
+            "finite decoder failed at EOF: {failure:?}"
+        );
     }
 
     #[test]
@@ -1406,42 +1759,63 @@ mod tests {
     }
 
     #[test]
-    fn decoder_send_exits_when_cancelled_while_channel_is_full() {
-        let cancellation = CancellationToken::new();
+    fn decoder_blocked_send_exits_when_receiver_is_dropped() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(0);
-        let cancellation_for_thread = cancellation.clone();
-        let thread = std::thread::spawn(move || {
-            send_samples_with_cancellation(&cancellation_for_thread, &sender, vec![0.0, 0.0])
-        });
+        let thread =
+            std::thread::spawn(move || send_samples_with_backpressure(&sender, vec![0.0, 0.0]));
 
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        cancellation.cancel();
-        assert!(!thread.join().unwrap());
         drop(receiver);
+        assert!(!thread.join().unwrap());
+    }
+
+    #[test]
+    fn decoder_and_empty_output_retries_use_audio_scale_intervals() {
+        assert_eq!(pcm_decode_block_interval(48_000).as_micros(), 42_667);
+        assert_eq!(empty_decoder_restart_delay(1), Duration::from_millis(50));
+        assert_eq!(empty_decoder_restart_delay(2), Duration::from_millis(1_500));
+        assert_eq!(
+            empty_decoder_restart_delay(usize::MAX),
+            Duration::from_millis(1_500)
+        );
     }
 
     #[test]
     fn output_track_is_consumed_only_through_explicit_take_operations() {
-        let samples = Arc::new(Mutex::new(VecDeque::from([1.0, 2.0, 3.0, 4.0])));
-        let track = AudioMixerTrack {
-            samples: Arc::clone(&samples),
-        };
+        let track = AudioMixerTrack::from_samples(VecDeque::from([1.0, 2.0, 3.0, 4.0]));
 
         assert_eq!(track.available_samples(), 4);
         assert_eq!(track.take_exact(6).unwrap(), None);
         assert_eq!(track.take_exact(2).unwrap(), Some(vec![1.0, 2.0]));
         assert_eq!(track.take_up_to(8).unwrap(), vec![3.0, 4.0]);
-        assert!(samples.lock().unwrap().is_empty());
+        assert_eq!(track.available_samples(), 0);
+    }
+
+    #[test]
+    fn finite_output_track_reports_exhaustion_only_after_its_tail_is_consumed() {
+        let track = AudioMixerTrack::from_finite_samples(VecDeque::from([1.0, 1.0]));
+
+        assert!(track.is_finished());
+        assert!(!track.is_exhausted());
+        assert_eq!(track.take_up_to(2).unwrap(), vec![1.0, 1.0]);
+        assert!(track.is_exhausted());
     }
 
     #[test]
     fn candidate_prebuffer_catches_up_slow_filter_start_and_stays_bounded() {
         let mut buffered = VecDeque::new();
-        assert_eq!(append_prebuffer(&mut buffered, &[1.0, 2.0], 4), 2);
-        assert_eq!(append_prebuffer(&mut buffered, &[3.0, 4.0, 5.0, 6.0], 4), 6);
-        assert_eq!(buffered.len(), 6);
-        assert_eq!(append_prebuffer(&mut buffered, &[7.0, 8.0, 9.0], 4), 6);
-        assert_eq!(buffered.len(), 6);
+        let mut pending = VecDeque::from([1.0, 2.0]);
+        assert_eq!(append_prebuffer(&mut buffered, &mut pending, 4), 2);
+        assert!(pending.is_empty());
+
+        pending.extend([3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(append_prebuffer(&mut buffered, &mut pending, 4), 4);
+        assert_eq!(buffered, VecDeque::from([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(pending, VecDeque::from([5.0, 6.0]));
+
+        buffered.drain(..2);
+        assert_eq!(append_prebuffer(&mut buffered, &mut pending, 4), 4);
+        assert_eq!(buffered, VecDeque::from([3.0, 4.0, 5.0, 6.0]));
+        assert!(pending.is_empty());
 
         // 1kHz 双声道、滤镜启动耗时 2 秒时，候选必须保留 2.13 秒 PCM，
         // 覆盖 30ms 交叉淡化和其后的 100ms 连续尾部。

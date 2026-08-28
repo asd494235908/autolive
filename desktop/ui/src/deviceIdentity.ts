@@ -26,6 +26,7 @@ function resolveDefaultStorage(): Storage | null {
 }
 
 export function getOrCreateDeviceId(storage?: Storage | null): string {
+  // 这里只提供首次迁移候选；认证链路最终使用 Rust 系统钥匙串返回的稳定设备标识。
   const targetStorage = storage === undefined ? resolveDefaultStorage() : storage;
   if (targetStorage) {
     try {

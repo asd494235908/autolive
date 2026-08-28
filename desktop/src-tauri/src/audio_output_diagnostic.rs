@@ -1,11 +1,12 @@
 //! 从最终混音 PCM 提取有界的低频诊断快照。
 
 use crate::audio_feature_analysis::{AudioFeatureAnalyzer, MAX_MFCC_DIMENSIONS};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const LOW_FREQUENCY_DIAGNOSTIC_POINTS: usize = 96;
 pub const LOW_FREQUENCY_DIAGNOSTIC_CUTOFF_HZ: f32 = 180.0;
 const DIAGNOSTIC_WINDOW_MS: u32 = 120;
+const FEATURE_ANALYSIS_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioLowFrequencyDiagnosticSnapshot {
@@ -70,6 +71,11 @@ pub struct LowFrequencyDiagnosticAnalyzer {
     published_frame_count: u64,
     last_pcm_at_ms: u64,
     feature_analyzer: AudioFeatureAnalyzer,
+    cached_features: crate::audio_feature_analysis::AudioFeatureSnapshot,
+    feature_dirty: bool,
+    last_feature_analysis_at: Option<Instant>,
+    #[cfg(test)]
+    feature_analysis_count: u64,
 }
 
 impl LowFrequencyDiagnosticAnalyzer {
@@ -83,6 +89,9 @@ impl LowFrequencyDiagnosticAnalyzer {
         let normalized_cutoff =
             (LOW_FREQUENCY_DIAGNOSTIC_CUTOFF_HZ / sample_rate_hz as f32).clamp(0.000_001, 0.49);
         let lowpass_alpha = 1.0 - (-std::f32::consts::TAU * normalized_cutoff).exp();
+        let mut feature_analyzer =
+            AudioFeatureAnalyzer::new_stereo_output(sample_rate_hz, MAX_MFCC_DIMENSIONS);
+        let cached_features = feature_analyzer.snapshot();
         Self {
             sample_rate_hz,
             frames_per_point,
@@ -101,10 +110,12 @@ impl LowFrequencyDiagnosticAnalyzer {
             sequence: 0,
             published_frame_count: 0,
             last_pcm_at_ms: 0,
-            feature_analyzer: AudioFeatureAnalyzer::new_stereo_output(
-                sample_rate_hz,
-                MAX_MFCC_DIMENSIONS,
-            ),
+            feature_analyzer,
+            cached_features,
+            feature_dirty: false,
+            last_feature_analysis_at: None,
+            #[cfg(test)]
+            feature_analysis_count: 0,
         }
     }
 
@@ -124,11 +135,13 @@ impl LowFrequencyDiagnosticAnalyzer {
         self.published_frame_count = 0;
         self.last_pcm_at_ms = 0;
         self.feature_analyzer.reset();
+        self.cached_features = self.feature_analyzer.snapshot();
+        self.feature_dirty = false;
+        self.last_feature_analysis_at = None;
     }
 
     /// 观察已经完成混音并准备写入输出环缓的交错 PCM。
     pub fn observe_stereo_pcm(&mut self, samples: &[f32]) {
-        self.feature_analyzer.observe_interleaved_pcm(samples);
         let mut captured_frames = 0_u64;
         for frame in samples.chunks_exact(2) {
             let left = finite_sample(frame[0]);
@@ -157,12 +170,33 @@ impl LowFrequencyDiagnosticAnalyzer {
             }
         }
         if captured_frames > 0 {
+            self.feature_analyzer.observe_interleaved_pcm(samples);
+            self.feature_dirty = true;
             self.last_pcm_at_ms = unix_now_ms();
         }
     }
 
     pub fn snapshot(&mut self) -> AudioLowFrequencyDiagnosticSnapshot {
-        let features = self.feature_analyzer.snapshot();
+        self.snapshot_at(Instant::now())
+    }
+
+    fn snapshot_at(&mut self, now: Instant) -> AudioLowFrequencyDiagnosticSnapshot {
+        let feature_analysis_due = self.feature_dirty
+            && self
+                .last_feature_analysis_at
+                .is_none_or(|last_analysis_at| {
+                    now.saturating_duration_since(last_analysis_at) >= FEATURE_ANALYSIS_INTERVAL
+                });
+        if feature_analysis_due {
+            self.cached_features = self.feature_analyzer.snapshot();
+            self.feature_dirty = false;
+            self.last_feature_analysis_at = Some(now);
+            #[cfg(test)]
+            {
+                self.feature_analysis_count = self.feature_analysis_count.saturating_add(1);
+            }
+        }
+        let features = &self.cached_features;
         let mut line = [0.0; LOW_FREQUENCY_DIAGNOSTIC_POINTS];
         let scale = self
             .line
@@ -208,7 +242,7 @@ impl LowFrequencyDiagnosticAnalyzer {
             peak_dbfs: amplitude_dbfs(peak),
             low_band_rms_dbfs: dbfs(low_sum_square, captured_frame_count),
             cutoff_hz: LOW_FREQUENCY_DIAGNOSTIC_CUTOFF_HZ,
-            mfcc: features.mfcc,
+            mfcc: features.mfcc.clone(),
             mfcc_available: features.mfcc_available,
             noise_floor_dbfs: features.noise_floor_dbfs,
             snr_db: features.snr_db,
@@ -252,6 +286,7 @@ fn unix_now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{LowFrequencyDiagnosticAnalyzer, LOW_FREQUENCY_DIAGNOSTIC_POINTS};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn silent_pcm_snapshot_is_finite_and_bounded() {
@@ -297,5 +332,25 @@ mod tests {
         assert!(snapshot.rms_dbfs.is_finite());
         assert!(snapshot.peak_dbfs.is_finite());
         assert!(snapshot.low_band_rms_dbfs.is_finite());
+    }
+
+    #[test]
+    fn heavy_features_require_new_pcm_and_a_250ms_interval() {
+        let mut analyzer = LowFrequencyDiagnosticAnalyzer::new(48_000);
+        let started = Instant::now();
+        analyzer.observe_stereo_pcm(&vec![0.1; 48_000 / 10 * 2]);
+
+        analyzer.snapshot_at(started);
+        assert_eq!(analyzer.feature_analysis_count, 1);
+
+        analyzer.observe_stereo_pcm(&vec![0.2; 48_000 / 10 * 2]);
+        analyzer.snapshot_at(started + Duration::from_millis(249));
+        assert_eq!(analyzer.feature_analysis_count, 1);
+
+        analyzer.snapshot_at(started + Duration::from_millis(250));
+        assert_eq!(analyzer.feature_analysis_count, 2);
+
+        analyzer.snapshot_at(started + Duration::from_secs(1));
+        assert_eq!(analyzer.feature_analysis_count, 2);
     }
 }

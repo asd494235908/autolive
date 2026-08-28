@@ -39,7 +39,37 @@ const {
   sampleSubtleVideoParams,
   sampleVideoCycle,
   sanitizeAudioPresetValues,
+  toRuntimePreviewParameters,
 } = runtimeModule;
+
+test('运行时消息使用已提交媒体参数而不是旧默认视频值', () => {
+  const params = {
+    audio: {
+      input_gain_db: 1,
+      output_gain_db: 2,
+      loudness_adjustment_db: 3,
+      low_eq_db: 4,
+      mid_eq_db: 5,
+      high_eq_db: 6,
+    },
+    video: {
+      brightness_percent: 2.5,
+      contrast_percent: 104,
+      saturation_percent: 96,
+      hue_rotation_degrees: -3,
+      blur_radius_px: 0.1,
+      pixel_scale_percent: 100.2,
+      space_x_offset_px: 0.5,
+      space_y_offset_px: -0.5,
+    },
+  };
+
+  const payload = toRuntimePreviewParameters(params);
+  assert.equal(payload.video_brightness_percent, 2.5);
+  assert.equal(payload.video_contrast_percent, 104);
+  assert.equal(payload.video_saturation_percent, 96);
+  assert.equal(payload.video_hue_rotation_degrees, -3);
+});
 
 test('视频周期 seed 可复现完整 N+1/N+2 参数快照', () => {
   assert.deepEqual(sampleVideoCycle(123), sampleVideoCycle(123));
@@ -51,7 +81,8 @@ test('音视频周期区间归一化并保证 min≤max', () => {
   assert.deepEqual(normalizeAudioPeriodRange(6_000, 3_000), { minMs: 3_000, maxMs: 6_000 });
   assert.deepEqual(normalizeAudioPeriodRange(500, 90_000), { minMs: 1_000, maxMs: 60_000 });
   assert.deepEqual(normalizeVideoPeriodRange(8_000, 15_000), { minMs: 8_000, maxMs: 15_000 });
-  assert.deepEqual(normalizeVideoPeriodRange(undefined, undefined), { minMs: 8_000, maxMs: 15_000 });
+  assert.deepEqual(normalizeAudioPeriodRange(undefined, undefined), { minMs: 3_000, maxMs: 5_000 });
+  assert.deepEqual(normalizeVideoPeriodRange(undefined, undefined), { minMs: 20_000, maxMs: 30_000 });
 });
 
 test('周期区间闭区间随机含端点', () => {

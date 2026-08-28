@@ -39,6 +39,7 @@ export function getAudioCycleCoordinatorAction<T>(
     ? queuedPlaybackMs
     : 0;
   const graceMediaMs = Math.round(AUDIO_CYCLE_COMMIT_GRACE_MS * safePlaybackRate);
+  if (plan.status === 'committing') return null;
   if (currentAbsolutePositionMs > plan.targetAbsolutePositionMs + graceMediaMs) return 'expire';
   const mediaLeadMs = plan.targetAbsolutePositionMs - currentAbsolutePositionMs;
   if (plan.status === 'planned') return 'prepare';

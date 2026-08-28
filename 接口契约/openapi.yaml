@@ -21,7 +21,11 @@ paths:
   /api/v1/auth/login:
     post:
       tags: [Auth]
-      summary: 用户登录
+      summary: 管理端登录
+      description: |
+        保留的管理端登录入口，成功后只签发 `audience=admin` 会话。
+        桌面客户端必须使用 `/api/v1/client/auth/login`，不得复用本入口获取管理会话。
+        账号不存在、密码错误、用户禁用或缺少目标产品成员关系对外统一返回 `401 UNAUTHENTICATED`。
       operationId: authLogin
       parameters:
         - $ref: '#/components/parameters/LegacyClientCompatibilityHeader'
@@ -33,7 +37,7 @@ paths:
               $ref: '#/components/schemas/LoginRequest'
       responses:
         '200':
-          description: 登录成功
+          description: 登录成功；`tokens.audience` 固定为 `admin`
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
@@ -45,8 +49,6 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '429':
           $ref: '#/components/responses/TooManyRequests'
         '405':
@@ -55,10 +57,53 @@ paths:
           $ref: '#/components/responses/RequestTimeout'
         '500':
           $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/v1/client/auth/login:
+    post:
+      tags: [Client, Auth]
+      summary: 桌面端登录
+      description: |
+        桌面端专用登录入口，成功后只签发 `audience=desktop` 会话。
+        管理员账号、不存在的账号、密码错误、用户禁用或缺少目标产品成员关系对外统一返回 `401 UNAUTHENTICATED`，不泄露账号是否存在或角色。
+      operationId: clientAuthLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: 登录成功；`tokens.audience` 固定为 `desktop`
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
   /api/v1/auth/refresh:
     post:
       tags: [Auth]
       summary: 刷新会话
+      description: |
+        单次轮换 Refresh Token，新会话必须继承原会话的用户、产品、设备和 `audience`，客户端不能借刷新切换权限面。
+        已轮换的 Refresh Token 被再次使用时，服务端撤销同一 token family 的全部会话，对外统一返回 `401 REFRESH_TOKEN_INVALID`。
       operationId: authRefresh
       requestBody:
         required: true
@@ -88,15 +133,19 @@ paths:
           $ref: '#/components/responses/RequestTimeout'
         '500':
           $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
   /api/v1/auth/logout:
     post:
       tags: [Auth]
       summary: 退出登录
+      description: |
+        以 Refresh Token 定位并撤销对应会话，不要求 Access Token 仍有效。
+        相同、已轮换、已撤销、已过期或未知 Refresh Token 的重复退出均返回同样的 `200` 成功响应，不泄露 Token 状态。
       operationId: authLogout
-      security:
-        - bearerAuth: []
+      security: []
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
@@ -111,8 +160,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LogoutResponse'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
         '405':
@@ -2066,6 +2115,7 @@ components:
       type: http
       scheme: bearer
       bearerFormat: Opaque
+      description: 不透明 Access Token；`/api/v1/admin/**` 受保护路由只接受 `audience=admin`，桌面专用 `/api/v1/client/**` 受保护路由只接受 `audience=desktop`，错配返回 `403 AUTH_SESSION_AUDIENCE_MISMATCH`
   headers:
     X-Request-Id:
       description: 客户端提供合法值时服务端校验后透传；缺失或非法时由服务端生成请求追踪 ID
@@ -2363,6 +2413,10 @@ components:
     ActorRole:
       type: string
       enum: [admin, user]
+    SessionAudience:
+      type: string
+      enum: [admin, desktop]
+      description: 会话的固定权限面；刷新不得改变该值
     ProductCode:
       type: string
       enum: [autolive, douyin_desktop]
@@ -2384,14 +2438,18 @@ components:
     SessionTokens:
       type: object
       additionalProperties: false
-      required: [access_token, refresh_token, expires_at]
+      required: [access_token, refresh_token, expires_at, audience]
       properties:
         access_token:
           type: string
+          description: 随机不透明 Access Token，有效期固定为 15 分钟
         refresh_token:
           type: string
+          description: 仅返回给直接调用认证 API 的受信边界；有效期固定为 30 天且每次刷新轮换。桌面 Rust 边界必须在返回 WebView 前移除该字段并存入系统 Keychain/Credential Manager
         expires_at:
           $ref: '#/components/schemas/Timestamp'
+        audience:
+          $ref: '#/components/schemas/SessionAudience'
     UserSummary:
       type: object
       additionalProperties: false
@@ -2693,6 +2751,8 @@ components:
           type: string
           minLength: 8
           maxLength: 256
+          description: 登录兼容既有 bcrypt 凭据；服务端不会因新密码策略拒绝仍有效的历史密码
+          writeOnly: true
         product:
           $ref: '#/components/schemas/ProductCode'
     LoginResponse:
@@ -2713,6 +2773,9 @@ components:
       properties:
         refresh_token:
           type: string
+          minLength: 1
+          maxLength: 4096
+          writeOnly: true
     RefreshTokenResponse:
       type: object
       additionalProperties: false
@@ -2725,10 +2788,14 @@ components:
     LogoutRequest:
       type: object
       additionalProperties: false
-      description: 可选 refresh_token 仅为兼容客户端请求体；服务端只撤销当前 Bearer Token 对应会话，不会撤销其他会话。
+      required: [refresh_token]
+      description: Refresh Token 用于定位当前会话；服务端只撤销该会话，重复或无效 Token 也返回幂等成功。
       properties:
         refresh_token:
           type: string
+          minLength: 1
+          maxLength: 4096
+          writeOnly: true
     LogoutResponse:
       type: object
       additionalProperties: false
@@ -3296,8 +3363,10 @@ components:
           maxLength: 64
         password:
           type: string
-          minLength: 8
-          maxLength: 256
+          minLength: 15
+          maxLength: 128
+          description: 新账号密码；按 Unicode 字符计 15～128 个字符，UTF-8 编码最多 256 字节
+          writeOnly: true
         role:
           $ref: '#/components/schemas/ActorRole'
     UpdateUserRequest:
@@ -3336,8 +3405,10 @@ components:
       properties:
         password:
           type: string
-          minLength: 8
-          maxLength: 256
+          minLength: 15
+          maxLength: 128
+          description: 新密码；按 Unicode 字符计 15～128 个字符，UTF-8 编码最多 256 字节
+          writeOnly: true
     ChangeLocalAdminPasswordRequest:
       type: object
       additionalProperties: false
@@ -3345,8 +3416,10 @@ components:
       properties:
         password:
           type: string
-          minLength: 12
-          maxLength: 256
+          minLength: 15
+          maxLength: 128
+          description: 新管理员密码；按 Unicode 字符计 15～128 个字符，UTF-8 编码最多 256 字节
+          writeOnly: true
     DeviceListResponse:
       type: object
       additionalProperties: false

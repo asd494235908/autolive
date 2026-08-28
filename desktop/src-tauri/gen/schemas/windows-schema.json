@@ -315,6 +315,882 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Minimal playback commands required by the final-effect window.\n#### This permission set includes:\n\n- `allow-cancel-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-complete-playback-item`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-get-audio-output-backend-status`\n- `allow-get-snapshot`\n- `allow-pause-playback`\n- `allow-pause-portaudio-interlude`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-prepare-webview-interlude`\n- `allow-release-media-processing-artifact`\n- `allow-release-audio-media-candidate`\n- `allow-release-webview-interlude-cache`\n- `allow-resize-final-effect-window`\n- `allow-restore-original-audio`\n- `allow-restore-original-video`\n- `allow-resume-playback`\n- `allow-resume-portaudio-interlude`\n- `allow-set-audio-output-backend`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-stop-portaudio-interlude`\n- `allow-sync-audio-output-source`\n- `allow-sync-realtime-video-renderer`\n- `allow-stop-realtime-video-renderer`\n- `allow-update-playback-position`",
+          "type": "string",
+          "const": "final-effect-commands",
+          "markdownDescription": "Minimal playback commands required by the final-effect window.\n#### This permission set includes:\n\n- `allow-cancel-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-complete-playback-item`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-get-audio-output-backend-status`\n- `allow-get-snapshot`\n- `allow-pause-playback`\n- `allow-pause-portaudio-interlude`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-prepare-webview-interlude`\n- `allow-release-media-processing-artifact`\n- `allow-release-audio-media-candidate`\n- `allow-release-webview-interlude-cache`\n- `allow-resize-final-effect-window`\n- `allow-restore-original-audio`\n- `allow-restore-original-video`\n- `allow-resume-playback`\n- `allow-resume-portaudio-interlude`\n- `allow-set-audio-output-backend`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-stop-portaudio-interlude`\n- `allow-sync-audio-output-source`\n- `allow-sync-realtime-video-renderer`\n- `allow-stop-realtime-video-renderer`\n- `allow-update-playback-position`"
+        },
+        {
+          "description": "Commands available to the authenticated main application window.\n#### This permission set includes:\n\n- `allow-probe-local-video`\n- `allow-probe-local-videos`\n- `allow-append-local-videos`\n- `allow-replace-playback-pool-item`\n- `allow-reorder-playback-pool-items`\n- `allow-remove-playback-pool-item`\n- `allow-clear-playback-pool`\n- `allow-probe-local-mp4`\n- `allow-get-device-runtime-info`\n- `allow-get-media-engine-capabilities`\n- `allow-get-media-video-backend-status`\n- `allow-get-audio-output-backend-status`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-list-audio-output-devices`\n- `allow-set-audio-output-backend`\n- `allow-sync-audio-output-source`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-cancel-audio-cycle-candidate`\n- `allow-play-portaudio-test-tone`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-prepare-webview-interlude`\n- `allow-release-webview-interlude-cache`\n- `allow-pause-portaudio-interlude`\n- `allow-resume-portaudio-interlude`\n- `allow-stop-portaudio-interlude`\n- `allow-get-runtime-resource-status`\n- `allow-install-runtime-resources`\n- `allow-cancel-runtime-resource-install`\n- `allow-import-runtime-resource-directory`\n- `allow-clear-runtime-resources`\n- `allow-cleanup-local-caches-command`\n- `allow-prepare-audio-media-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-release-audio-media-candidate`\n- `allow-get-default-media-effect-params`\n- `allow-start-playback`\n- `allow-pause-playback`\n- `allow-resume-playback`\n- `allow-update-playback-position`\n- `allow-stop-playback`\n- `allow-complete-playback-loop`\n- `allow-complete-playback-item`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-set-processing-switches`\n- `allow-set-audio-processing-profile`\n- `allow-set-interlude-config`\n- `allow-start-media-processing`\n- `allow-prepare-realtime-video-plan`\n- `allow-commit-realtime-video-plan`\n- `allow-sync-realtime-video-renderer`\n- `allow-stop-realtime-video-renderer`\n- `allow-release-media-processing-artifact`\n- `allow-restore-original-audio`\n- `allow-get-snapshot`\n- `allow-validate-media-effect-params`\n- `allow-get-or-create-control-plane-device-id`\n- `allow-login-control-plane-session`\n- `allow-restore-control-plane-session`\n- `allow-refresh-control-plane-session`\n- `allow-logout-control-plane-session`\n- `allow-retry-pending-control-plane-logout`\n- `allow-clear-legacy-auth-credentials`\n- `allow-open-final-effect-window`\n- `allow-close-final-effect-window`\n- `allow-resize-final-effect-window`",
+          "type": "string",
+          "const": "main-commands",
+          "markdownDescription": "Commands available to the authenticated main application window.\n#### This permission set includes:\n\n- `allow-probe-local-video`\n- `allow-probe-local-videos`\n- `allow-append-local-videos`\n- `allow-replace-playback-pool-item`\n- `allow-reorder-playback-pool-items`\n- `allow-remove-playback-pool-item`\n- `allow-clear-playback-pool`\n- `allow-probe-local-mp4`\n- `allow-get-device-runtime-info`\n- `allow-get-media-engine-capabilities`\n- `allow-get-media-video-backend-status`\n- `allow-get-audio-output-backend-status`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-list-audio-output-devices`\n- `allow-set-audio-output-backend`\n- `allow-sync-audio-output-source`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-cancel-audio-cycle-candidate`\n- `allow-play-portaudio-test-tone`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-prepare-webview-interlude`\n- `allow-release-webview-interlude-cache`\n- `allow-pause-portaudio-interlude`\n- `allow-resume-portaudio-interlude`\n- `allow-stop-portaudio-interlude`\n- `allow-get-runtime-resource-status`\n- `allow-install-runtime-resources`\n- `allow-cancel-runtime-resource-install`\n- `allow-import-runtime-resource-directory`\n- `allow-clear-runtime-resources`\n- `allow-cleanup-local-caches-command`\n- `allow-prepare-audio-media-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-release-audio-media-candidate`\n- `allow-get-default-media-effect-params`\n- `allow-start-playback`\n- `allow-pause-playback`\n- `allow-resume-playback`\n- `allow-update-playback-position`\n- `allow-stop-playback`\n- `allow-complete-playback-loop`\n- `allow-complete-playback-item`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-set-processing-switches`\n- `allow-set-audio-processing-profile`\n- `allow-set-interlude-config`\n- `allow-start-media-processing`\n- `allow-prepare-realtime-video-plan`\n- `allow-commit-realtime-video-plan`\n- `allow-sync-realtime-video-renderer`\n- `allow-stop-realtime-video-renderer`\n- `allow-release-media-processing-artifact`\n- `allow-restore-original-audio`\n- `allow-get-snapshot`\n- `allow-validate-media-effect-params`\n- `allow-get-or-create-control-plane-device-id`\n- `allow-login-control-plane-session`\n- `allow-restore-control-plane-session`\n- `allow-refresh-control-plane-session`\n- `allow-logout-control-plane-session`\n- `allow-retry-pending-control-plane-logout`\n- `allow-clear-legacy-auth-credentials`\n- `allow-open-final-effect-window`\n- `allow-close-final-effect-window`\n- `allow-resize-final-effect-window`"
+        },
+        {
+          "description": "Enables the append_local_videos command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-append-local-videos",
+          "markdownDescription": "Enables the append_local_videos command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cancel_audio_cycle_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-audio-cycle-candidate",
+          "markdownDescription": "Enables the cancel_audio_cycle_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cancel_runtime_resource_install command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-runtime-resource-install",
+          "markdownDescription": "Enables the cancel_runtime_resource_install command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cleanup_local_caches_command command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cleanup-local-caches-command",
+          "markdownDescription": "Enables the cleanup_local_caches_command command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the clear_legacy_auth_credentials command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-clear-legacy-auth-credentials",
+          "markdownDescription": "Enables the clear_legacy_auth_credentials command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the clear_playback_pool command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-clear-playback-pool",
+          "markdownDescription": "Enables the clear_playback_pool command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the clear_runtime_resources command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-clear-runtime-resources",
+          "markdownDescription": "Enables the clear_runtime_resources command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the close_final_effect_window command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-close-final-effect-window",
+          "markdownDescription": "Enables the close_final_effect_window command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the commit_audio_cycle_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-commit-audio-cycle-candidate",
+          "markdownDescription": "Enables the commit_audio_cycle_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the commit_audio_media_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-commit-audio-media-candidate",
+          "markdownDescription": "Enables the commit_audio_media_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the commit_media_processing_if_ready command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-commit-media-processing-if-ready",
+          "markdownDescription": "Enables the commit_media_processing_if_ready command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the commit_realtime_video_plan command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-commit-realtime-video-plan",
+          "markdownDescription": "Enables the commit_realtime_video_plan command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the complete_playback_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-complete-playback-item",
+          "markdownDescription": "Enables the complete_playback_item command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the complete_playback_loop command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-complete-playback-loop",
+          "markdownDescription": "Enables the complete_playback_loop command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the discard_audio_media_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-discard-audio-media-candidate",
+          "markdownDescription": "Enables the discard_audio_media_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the discard_media_processing_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-discard-media-processing-candidate",
+          "markdownDescription": "Enables the discard_media_processing_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_audio_cycle_diagnostic command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-audio-cycle-diagnostic",
+          "markdownDescription": "Enables the get_audio_cycle_diagnostic command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_audio_output_backend_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-audio-output-backend-status",
+          "markdownDescription": "Enables the get_audio_output_backend_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_default_media_effect_params command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-default-media-effect-params",
+          "markdownDescription": "Enables the get_default_media_effect_params command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_device_runtime_info command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-device-runtime-info",
+          "markdownDescription": "Enables the get_device_runtime_info command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_media_engine_capabilities command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-media-engine-capabilities",
+          "markdownDescription": "Enables the get_media_engine_capabilities command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_media_video_backend_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-media-video-backend-status",
+          "markdownDescription": "Enables the get_media_video_backend_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_or_create_control_plane_device_id command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-or-create-control-plane-device-id",
+          "markdownDescription": "Enables the get_or_create_control_plane_device_id command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_runtime_resource_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-runtime-resource-status",
+          "markdownDescription": "Enables the get_runtime_resource_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-snapshot",
+          "markdownDescription": "Enables the get_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the import_runtime_resource_directory command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-import-runtime-resource-directory",
+          "markdownDescription": "Enables the import_runtime_resource_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the install_runtime_resources command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-install-runtime-resources",
+          "markdownDescription": "Enables the install_runtime_resources command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_audio_output_devices command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-audio-output-devices",
+          "markdownDescription": "Enables the list_audio_output_devices command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the login_control_plane_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-login-control-plane-session",
+          "markdownDescription": "Enables the login_control_plane_session command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the logout_control_plane_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-logout-control-plane-session",
+          "markdownDescription": "Enables the logout_control_plane_session command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_final_effect_window command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-final-effect-window",
+          "markdownDescription": "Enables the open_final_effect_window command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pause_playback command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pause-playback",
+          "markdownDescription": "Enables the pause_playback command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pause_portaudio_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pause-portaudio-interlude",
+          "markdownDescription": "Enables the pause_portaudio_interlude command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the play_portaudio_test_tone command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-play-portaudio-test-tone",
+          "markdownDescription": "Enables the play_portaudio_test_tone command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the prepare_audio_cycle_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-prepare-audio-cycle-candidate",
+          "markdownDescription": "Enables the prepare_audio_cycle_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the prepare_audio_media_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-prepare-audio-media-candidate",
+          "markdownDescription": "Enables the prepare_audio_media_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the prepare_realtime_video_plan command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-prepare-realtime-video-plan",
+          "markdownDescription": "Enables the prepare_realtime_video_plan command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the prepare_webview_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-prepare-webview-interlude",
+          "markdownDescription": "Enables the prepare_webview_interlude command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the probe_local_mp4 command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-probe-local-mp4",
+          "markdownDescription": "Enables the probe_local_mp4 command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the probe_local_video command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-probe-local-video",
+          "markdownDescription": "Enables the probe_local_video command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the probe_local_videos command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-probe-local-videos",
+          "markdownDescription": "Enables the probe_local_videos command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the refresh_control_plane_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-refresh-control-plane-session",
+          "markdownDescription": "Enables the refresh_control_plane_session command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the release_audio_media_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-release-audio-media-candidate",
+          "markdownDescription": "Enables the release_audio_media_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the release_media_processing_artifact command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-release-media-processing-artifact",
+          "markdownDescription": "Enables the release_media_processing_artifact command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the release_webview_interlude_cache command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-release-webview-interlude-cache",
+          "markdownDescription": "Enables the release_webview_interlude_cache command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_playback_pool_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-playback-pool-item",
+          "markdownDescription": "Enables the remove_playback_pool_item command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reorder_playback_pool_items command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reorder-playback-pool-items",
+          "markdownDescription": "Enables the reorder_playback_pool_items command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the replace_playback_pool_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-replace-playback-pool-item",
+          "markdownDescription": "Enables the replace_playback_pool_item command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the resize_final_effect_window command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-resize-final-effect-window",
+          "markdownDescription": "Enables the resize_final_effect_window command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the restore_control_plane_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-restore-control-plane-session",
+          "markdownDescription": "Enables the restore_control_plane_session command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the restore_original_audio command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-restore-original-audio",
+          "markdownDescription": "Enables the restore_original_audio command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the restore_original_video command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-restore-original-video",
+          "markdownDescription": "Enables the restore_original_video command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the resume_playback command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-resume-playback",
+          "markdownDescription": "Enables the resume_playback command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the resume_portaudio_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-resume-portaudio-interlude",
+          "markdownDescription": "Enables the resume_portaudio_interlude command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the retry_pending_control_plane_logout command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-retry-pending-control-plane-logout",
+          "markdownDescription": "Enables the retry_pending_control_plane_logout command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_audio_output_backend command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-audio-output-backend",
+          "markdownDescription": "Enables the set_audio_output_backend command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_audio_processing_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-audio-processing-profile",
+          "markdownDescription": "Enables the set_audio_processing_profile command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_interlude_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-interlude-config",
+          "markdownDescription": "Enables the set_interlude_config command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_portaudio_interlude_volume command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-portaudio-interlude-volume",
+          "markdownDescription": "Enables the set_portaudio_interlude_volume command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_portaudio_media_volume command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-portaudio-media-volume",
+          "markdownDescription": "Enables the set_portaudio_media_volume command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_processing_switches command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-processing-switches",
+          "markdownDescription": "Enables the set_processing_switches command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_media_processing command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-media-processing",
+          "markdownDescription": "Enables the start_media_processing command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_playback command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-playback",
+          "markdownDescription": "Enables the start_playback command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_portaudio_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-portaudio-interlude",
+          "markdownDescription": "Enables the start_portaudio_interlude command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_playback command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-playback",
+          "markdownDescription": "Enables the stop_playback command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_portaudio_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-portaudio-interlude",
+          "markdownDescription": "Enables the stop_portaudio_interlude command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_realtime_video_renderer command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-realtime-video-renderer",
+          "markdownDescription": "Enables the stop_realtime_video_renderer command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the switch_portaudio_interlude_preset command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-switch-portaudio-interlude-preset",
+          "markdownDescription": "Enables the switch_portaudio_interlude_preset command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the sync_audio_output_source command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-sync-audio-output-source",
+          "markdownDescription": "Enables the sync_audio_output_source command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the sync_realtime_video_renderer command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-sync-realtime-video-renderer",
+          "markdownDescription": "Enables the sync_realtime_video_renderer command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_playback_position command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-playback-position",
+          "markdownDescription": "Enables the update_playback_position command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the validate_media_effect_params command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-validate-media-effect-params",
+          "markdownDescription": "Enables the validate_media_effect_params command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the append_local_videos command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-append-local-videos",
+          "markdownDescription": "Denies the append_local_videos command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel_audio_cycle_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-audio-cycle-candidate",
+          "markdownDescription": "Denies the cancel_audio_cycle_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel_runtime_resource_install command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-runtime-resource-install",
+          "markdownDescription": "Denies the cancel_runtime_resource_install command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cleanup_local_caches_command command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cleanup-local-caches-command",
+          "markdownDescription": "Denies the cleanup_local_caches_command command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the clear_legacy_auth_credentials command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-clear-legacy-auth-credentials",
+          "markdownDescription": "Denies the clear_legacy_auth_credentials command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the clear_playback_pool command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-clear-playback-pool",
+          "markdownDescription": "Denies the clear_playback_pool command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the clear_runtime_resources command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-clear-runtime-resources",
+          "markdownDescription": "Denies the clear_runtime_resources command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the close_final_effect_window command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-close-final-effect-window",
+          "markdownDescription": "Denies the close_final_effect_window command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the commit_audio_cycle_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-commit-audio-cycle-candidate",
+          "markdownDescription": "Denies the commit_audio_cycle_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the commit_audio_media_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-commit-audio-media-candidate",
+          "markdownDescription": "Denies the commit_audio_media_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the commit_media_processing_if_ready command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-commit-media-processing-if-ready",
+          "markdownDescription": "Denies the commit_media_processing_if_ready command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the commit_realtime_video_plan command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-commit-realtime-video-plan",
+          "markdownDescription": "Denies the commit_realtime_video_plan command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the complete_playback_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-complete-playback-item",
+          "markdownDescription": "Denies the complete_playback_item command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the complete_playback_loop command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-complete-playback-loop",
+          "markdownDescription": "Denies the complete_playback_loop command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the discard_audio_media_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-discard-audio-media-candidate",
+          "markdownDescription": "Denies the discard_audio_media_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the discard_media_processing_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-discard-media-processing-candidate",
+          "markdownDescription": "Denies the discard_media_processing_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_audio_cycle_diagnostic command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-audio-cycle-diagnostic",
+          "markdownDescription": "Denies the get_audio_cycle_diagnostic command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_audio_output_backend_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-audio-output-backend-status",
+          "markdownDescription": "Denies the get_audio_output_backend_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_default_media_effect_params command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-default-media-effect-params",
+          "markdownDescription": "Denies the get_default_media_effect_params command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_device_runtime_info command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-device-runtime-info",
+          "markdownDescription": "Denies the get_device_runtime_info command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_media_engine_capabilities command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-media-engine-capabilities",
+          "markdownDescription": "Denies the get_media_engine_capabilities command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_media_video_backend_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-media-video-backend-status",
+          "markdownDescription": "Denies the get_media_video_backend_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_or_create_control_plane_device_id command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-or-create-control-plane-device-id",
+          "markdownDescription": "Denies the get_or_create_control_plane_device_id command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_runtime_resource_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-runtime-resource-status",
+          "markdownDescription": "Denies the get_runtime_resource_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-snapshot",
+          "markdownDescription": "Denies the get_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the import_runtime_resource_directory command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-import-runtime-resource-directory",
+          "markdownDescription": "Denies the import_runtime_resource_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the install_runtime_resources command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-install-runtime-resources",
+          "markdownDescription": "Denies the install_runtime_resources command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_audio_output_devices command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-audio-output-devices",
+          "markdownDescription": "Denies the list_audio_output_devices command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the login_control_plane_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-login-control-plane-session",
+          "markdownDescription": "Denies the login_control_plane_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the logout_control_plane_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-logout-control-plane-session",
+          "markdownDescription": "Denies the logout_control_plane_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_final_effect_window command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-final-effect-window",
+          "markdownDescription": "Denies the open_final_effect_window command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pause_playback command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pause-playback",
+          "markdownDescription": "Denies the pause_playback command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pause_portaudio_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pause-portaudio-interlude",
+          "markdownDescription": "Denies the pause_portaudio_interlude command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the play_portaudio_test_tone command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-play-portaudio-test-tone",
+          "markdownDescription": "Denies the play_portaudio_test_tone command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the prepare_audio_cycle_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-prepare-audio-cycle-candidate",
+          "markdownDescription": "Denies the prepare_audio_cycle_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the prepare_audio_media_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-prepare-audio-media-candidate",
+          "markdownDescription": "Denies the prepare_audio_media_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the prepare_realtime_video_plan command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-prepare-realtime-video-plan",
+          "markdownDescription": "Denies the prepare_realtime_video_plan command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the prepare_webview_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-prepare-webview-interlude",
+          "markdownDescription": "Denies the prepare_webview_interlude command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the probe_local_mp4 command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-probe-local-mp4",
+          "markdownDescription": "Denies the probe_local_mp4 command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the probe_local_video command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-probe-local-video",
+          "markdownDescription": "Denies the probe_local_video command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the probe_local_videos command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-probe-local-videos",
+          "markdownDescription": "Denies the probe_local_videos command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the refresh_control_plane_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-refresh-control-plane-session",
+          "markdownDescription": "Denies the refresh_control_plane_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the release_audio_media_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-release-audio-media-candidate",
+          "markdownDescription": "Denies the release_audio_media_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the release_media_processing_artifact command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-release-media-processing-artifact",
+          "markdownDescription": "Denies the release_media_processing_artifact command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the release_webview_interlude_cache command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-release-webview-interlude-cache",
+          "markdownDescription": "Denies the release_webview_interlude_cache command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_playback_pool_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-playback-pool-item",
+          "markdownDescription": "Denies the remove_playback_pool_item command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reorder_playback_pool_items command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reorder-playback-pool-items",
+          "markdownDescription": "Denies the reorder_playback_pool_items command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the replace_playback_pool_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-replace-playback-pool-item",
+          "markdownDescription": "Denies the replace_playback_pool_item command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the resize_final_effect_window command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-resize-final-effect-window",
+          "markdownDescription": "Denies the resize_final_effect_window command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the restore_control_plane_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-restore-control-plane-session",
+          "markdownDescription": "Denies the restore_control_plane_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the restore_original_audio command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-restore-original-audio",
+          "markdownDescription": "Denies the restore_original_audio command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the restore_original_video command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-restore-original-video",
+          "markdownDescription": "Denies the restore_original_video command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the resume_playback command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-resume-playback",
+          "markdownDescription": "Denies the resume_playback command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the resume_portaudio_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-resume-portaudio-interlude",
+          "markdownDescription": "Denies the resume_portaudio_interlude command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the retry_pending_control_plane_logout command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-retry-pending-control-plane-logout",
+          "markdownDescription": "Denies the retry_pending_control_plane_logout command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_audio_output_backend command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-audio-output-backend",
+          "markdownDescription": "Denies the set_audio_output_backend command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_audio_processing_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-audio-processing-profile",
+          "markdownDescription": "Denies the set_audio_processing_profile command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_interlude_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-interlude-config",
+          "markdownDescription": "Denies the set_interlude_config command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_portaudio_interlude_volume command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-portaudio-interlude-volume",
+          "markdownDescription": "Denies the set_portaudio_interlude_volume command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_portaudio_media_volume command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-portaudio-media-volume",
+          "markdownDescription": "Denies the set_portaudio_media_volume command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_processing_switches command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-processing-switches",
+          "markdownDescription": "Denies the set_processing_switches command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_media_processing command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-media-processing",
+          "markdownDescription": "Denies the start_media_processing command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_playback command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-playback",
+          "markdownDescription": "Denies the start_playback command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_portaudio_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-portaudio-interlude",
+          "markdownDescription": "Denies the start_portaudio_interlude command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_playback command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-playback",
+          "markdownDescription": "Denies the stop_playback command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_portaudio_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-portaudio-interlude",
+          "markdownDescription": "Denies the stop_portaudio_interlude command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_realtime_video_renderer command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-realtime-video-renderer",
+          "markdownDescription": "Denies the stop_realtime_video_renderer command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the switch_portaudio_interlude_preset command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-switch-portaudio-interlude-preset",
+          "markdownDescription": "Denies the switch_portaudio_interlude_preset command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the sync_audio_output_source command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-sync-audio-output-source",
+          "markdownDescription": "Denies the sync_audio_output_source command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the sync_realtime_video_renderer command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-sync-realtime-video-renderer",
+          "markdownDescription": "Denies the sync_realtime_video_renderer command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_playback_position command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-playback-position",
+          "markdownDescription": "Denies the update_playback_position command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the validate_media_effect_params command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-validate-media-effect-params",
+          "markdownDescription": "Denies the validate_media_effect_params command without any pre-configured scope."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

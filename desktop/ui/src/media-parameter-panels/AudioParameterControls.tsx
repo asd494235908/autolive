@@ -7,6 +7,7 @@ import type { AudioParameterControlsProps } from './media-parameter-types';
 export function AudioParameterControls({
   value,
   disabled,
+  showHeading = true,
   ambientSoundPath,
   onChange,
   onChooseAmbientSound,
@@ -36,17 +37,18 @@ export function AudioParameterControls({
       layout="vertical"
     >
       <section
-        aria-labelledby={`${idBase}-feature-heading`}
+        aria-label={showHeading ? undefined : '声音来源与自动基线配置'}
+        aria-labelledby={showHeading ? `${idBase}-feature-heading` : undefined}
         className="audio-parameter-controls__section"
       >
-        <div className="audio-parameter-controls__section-heading">
+        {showHeading ? <div className="audio-parameter-controls__section-heading">
           <Typography.Title id={`${idBase}-feature-heading`} level={5}>
             声音来源与自动基线
           </Typography.Title>
           <Typography.Paragraph type="secondary">
             其余声音效果由周期随机化生成，并在下方参数卡中只读展示。
           </Typography.Paragraph>
-        </div>
+        </div> : null}
 
         <div className="audio-parameter-controls__field-grid">
           <Form.Item

@@ -11,9 +11,9 @@ const shellStyle: CSSProperties = {
   gap: 12,
   inset: 0,
   justifyContent: 'center',
-  minHeight: '100vh',
+  minHeight: '100%',
   padding: 24,
-  position: 'fixed',
+  position: 'absolute',
   textAlign: 'center',
 };
 

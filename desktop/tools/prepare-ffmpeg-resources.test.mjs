@@ -18,6 +18,62 @@ function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+const legalFixture = Object.freeze({
+  'Copyright.txt': 'mpv and libplacebo copyright notices',
+  'GPL-2.0.txt': 'GPL-2.0-or-later license text',
+  'LGPL-2.1.txt': 'LGPL-2.1-or-later license text',
+  'SOURCE.md': 'source retrieval instructions',
+  'D3DCOMPILER_43-EULA.txt': 'Microsoft redistributable license terms',
+});
+
+function fixedMpvManifest() {
+  return {
+    schema_version: 1,
+    artifact: {
+      build_repository: 'https://github.com/shinchiro/mpv-winbuild-cmake',
+      release: '20260814',
+      asset: 'mpv-x86_64-20260814-git-7b8915bc1d.7z',
+      download_url: 'https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260814/mpv-x86_64-20260814-git-7b8915bc1d.7z',
+      archive_sha256: '1bf3b029da2c98e605e00e85f21ee3142f22a1dcc4ceb5c827b5c51e36e390f9',
+    },
+    components: {
+      mpv: {
+        version: 'v0.41.0-923-g7b8915bc1',
+        built_at: 'Aug 14 2026 00:27:31',
+        source_repository: 'https://github.com/mpv-player/mpv',
+        source_ref: '7b8915bc1d',
+        license_expression: 'GPL-2.0-or-later',
+        copyright_file: 'Copyright.txt',
+        license_file: 'GPL-2.0.txt',
+        source_file: 'SOURCE.md',
+      },
+      libplacebo: {
+        version: 'v7.371.0',
+        build_revision: 'v7.360.0-111-g22ee762-dirty',
+        source_repository: 'https://github.com/haasn/libplacebo',
+        source_ref: '22ee762',
+        license_expression: 'LGPL-2.1-or-later',
+        license_file: 'LGPL-2.1.txt',
+        source_file: 'SOURCE.md',
+      },
+      d3dcompiler_43: {
+        license_expression: 'LicenseRef-Microsoft-DirectX-Redistributable-EULA',
+        license_file: 'D3DCOMPILER_43-EULA.txt',
+      },
+    },
+    files: {
+      'mpv.exe': { sha256: sha256('mpv-test') },
+      'd3dcompiler_43.dll': { sha256: sha256('d3dcompiler-test') },
+      ...Object.fromEntries(
+        Object.entries(legalFixture).map(([name, content]) => [
+          `legal/${name}`,
+          { sha256: sha256(content) },
+        ]),
+      ),
+    },
+  };
+}
+
 test('缺少当前目标的 FFmpeg 文件时失败且不创建输出', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-ffmpeg-'));
   const source = join(root, 'source');
@@ -62,6 +118,115 @@ test('按目标三元组复制当前包所需的标准资源名', () => {
   assert.equal(readFileSync(join(output, 'ffprobe'), 'utf8'), 'ffprobe-test');
 });
 
+test('Windows 构建要求许可证材料并复制固定 mpv GPU 运行资源和清单', () => {
+  const root = mkdtempSync(join(tmpdir(), 'autolive-media-runtime-'));
+  const target = 'x86_64-pc-windows-msvc';
+  const ffmpegRoot = join(root, 'ffmpeg');
+  const mpvRoot = join(root, 'mpv');
+  const output = join(root, 'output');
+  mkdirSync(join(ffmpegRoot, target), { recursive: true });
+  mkdirSync(join(mpvRoot, target), { recursive: true });
+  writeFileSync(join(ffmpegRoot, target, 'ffmpeg.exe'), 'ffmpeg-test');
+  writeFileSync(join(ffmpegRoot, target, 'ffprobe.exe'), 'ffprobe-test');
+
+  const missing = spawnSync(process.execPath, [script], {
+    env: {
+      ...process.env,
+      AUTOLIVE_FFMPEG_SOURCE_DIR: ffmpegRoot,
+      AUTOLIVE_MPV_SOURCE_DIR: mpvRoot,
+      AUTOLIVE_FFMPEG_OUTPUT_DIR: output,
+      AUTOLIVE_TARGET_TRIPLE: target,
+    },
+    encoding: 'utf8',
+  });
+  assert.notEqual(missing.status, 0);
+  assert.match(`${missing.stdout}${missing.stderr}`, /缺少当前目标的 mpv/);
+
+  writeFileSync(join(mpvRoot, target, 'mpv.exe'), 'mpv-test');
+  writeFileSync(join(mpvRoot, target, 'd3dcompiler_43.dll'), 'd3dcompiler-test');
+  const missingLegal = spawnSync(process.execPath, [script], {
+    env: {
+      ...process.env,
+      AUTOLIVE_FFMPEG_SOURCE_DIR: ffmpegRoot,
+      AUTOLIVE_MPV_SOURCE_DIR: mpvRoot,
+      AUTOLIVE_FFMPEG_OUTPUT_DIR: output,
+      AUTOLIVE_TARGET_TRIPLE: target,
+    },
+    encoding: 'utf8',
+  });
+  assert.notEqual(missingLegal.status, 0);
+  assert.match(`${missingLegal.stdout}${missingLegal.stderr}`, /mpv 许可证/);
+  assert.throws(() => statSync(output));
+
+  const legalRoot = join(mpvRoot, target, 'legal');
+  mkdirSync(legalRoot, { recursive: true });
+  for (const [name, content] of Object.entries(legalFixture)) {
+    writeFileSync(join(legalRoot, name), content);
+  }
+  const manifestPath = join(legalRoot, 'mpv-runtime-manifest.json');
+  const invalidManifest = fixedMpvManifest();
+  invalidManifest.components.libplacebo.license_expression = 'GPL-2.0-or-later';
+  writeFileSync(manifestPath, `${JSON.stringify(invalidManifest, null, 2)}\n`);
+  const invalid = spawnSync(process.execPath, [script], {
+    env: {
+      ...process.env,
+      AUTOLIVE_FFMPEG_SOURCE_DIR: ffmpegRoot,
+      AUTOLIVE_MPV_SOURCE_DIR: mpvRoot,
+      AUTOLIVE_FFMPEG_OUTPUT_DIR: output,
+      AUTOLIVE_TARGET_TRIPLE: target,
+    },
+    encoding: 'utf8',
+  });
+  assert.notEqual(invalid.status, 0);
+  assert.match(
+    `${invalid.stdout}${invalid.stderr}`,
+    /mpv 发布清单字段不匹配：components\.libplacebo\.license_expression/,
+  );
+  assert.throws(() => statSync(output));
+
+  writeFileSync(manifestPath, `${JSON.stringify(fixedMpvManifest(), null, 2)}\n`);
+  writeFileSync(join(legalRoot, 'SOURCE.md'), 'tampered source instructions');
+  const tampered = spawnSync(process.execPath, [script], {
+    env: {
+      ...process.env,
+      AUTOLIVE_FFMPEG_SOURCE_DIR: ffmpegRoot,
+      AUTOLIVE_MPV_SOURCE_DIR: mpvRoot,
+      AUTOLIVE_FFMPEG_OUTPUT_DIR: output,
+      AUTOLIVE_TARGET_TRIPLE: target,
+    },
+    encoding: 'utf8',
+  });
+  assert.notEqual(tampered.status, 0);
+  assert.match(`${tampered.stdout}${tampered.stderr}`, /mpv 发布清单文件哈希不匹配：legal[\\/]SOURCE\.md/);
+  assert.throws(() => statSync(output));
+
+  writeFileSync(join(legalRoot, 'SOURCE.md'), legalFixture['SOURCE.md']);
+  writeFileSync(manifestPath, `${JSON.stringify(fixedMpvManifest(), null, 2)}\n`);
+  const prepared = spawnSync(process.execPath, [script], {
+    env: {
+      ...process.env,
+      AUTOLIVE_FFMPEG_SOURCE_DIR: ffmpegRoot,
+      AUTOLIVE_MPV_SOURCE_DIR: mpvRoot,
+      AUTOLIVE_FFMPEG_OUTPUT_DIR: output,
+      AUTOLIVE_TARGET_TRIPLE: target,
+    },
+    encoding: 'utf8',
+  });
+  assert.equal(prepared.status, 0, `${prepared.stdout}${prepared.stderr}`);
+  assert.equal(readFileSync(join(output, 'mpv.exe'), 'utf8'), 'mpv-test');
+  assert.equal(readFileSync(join(output, 'd3dcompiler_43.dll'), 'utf8'), 'd3dcompiler-test');
+  const publishedLegalRoot = join(output, 'licenses', 'mpv');
+  assert.equal(readFileSync(join(publishedLegalRoot, 'SOURCE.md'), 'utf8'), 'source retrieval instructions');
+  assert.equal(
+    readFileSync(join(publishedLegalRoot, 'D3DCOMPILER_43-EULA.txt'), 'utf8'),
+    'Microsoft redistributable license terms',
+  );
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(publishedLegalRoot, 'mpv-runtime-manifest.json'), 'utf8')),
+    fixedMpvManifest(),
+  );
+});
+
 test('Tauri scripts use the package binary lookup that works on Windows', () => {
   const packageJsonPath = fileURLToPath(new URL('../ui/package.json', import.meta.url));
   const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
@@ -91,6 +256,7 @@ test('测试包固定使用测试控制面和测试 Tauri 配置', () => {
     delete process.env.VITE_CONTROL_PLANE_ENV;
     delete process.env.AUTOLIVE_TAURI_CONFIG;
     applyBuildProfile('test');
+    assert.equal(TEST_CONTROL_PLANE_BASE_URL, 'http://101.96.208.132:9090');
     assert.equal(process.env.VITE_CONTROL_PLANE_BASE_URL, TEST_CONTROL_PLANE_BASE_URL);
     assert.equal(process.env.VITE_CONTROL_PLANE_ENV, 'test');
     assert.equal(process.env.AUTOLIVE_TAURI_CONFIG, 'src-tauri/tauri.test.conf.json');

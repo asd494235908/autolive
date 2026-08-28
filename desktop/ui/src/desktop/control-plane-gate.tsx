@@ -1,6 +1,6 @@
 import { ReloadOutlined } from '@ant-design/icons';
-import { Alert, Button, Result, Space, Spin, Typography } from 'antd';
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Alert, Badge, Button, Result, Space, Spin, Typography } from 'antd';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 import {
   clearRememberedLogin,
@@ -12,6 +12,7 @@ import {
   getControlPlaneErrorMessage,
   type ControlPlaneSessionSnapshot,
 } from '../controlPlaneSession';
+import { getOrCreateControlPlaneDeviceId } from '../controlPlaneAuth';
 import { isConfirmedDesktopAccess } from '../controlPlaneGatePolicy';
 import {
   ControlPlaneAccessPanel,
@@ -38,7 +39,9 @@ function useCredentialNotice() {
 }
 
 export function ControlPlaneGate({ children }: { children: ReactNode }) {
-  const deviceId = useMemo(() => getOrCreateDeviceId(), []);
+  const [deviceId, setDeviceId] = useState<string | null>(null);
+  const [deviceIdentityError, setDeviceIdentityError] = useState<unknown | null>(null);
+  const [deviceIdentityAttempt, setDeviceIdentityAttempt] = useState(0);
   const [session] = useState(() => new ControlPlaneSession());
   const [snapshot, setSnapshot] = useState<ControlPlaneSessionSnapshot>(() => session.getSnapshot());
   const [credentialNotice, setCredentialNotice] = useCredentialNotice();
@@ -47,12 +50,32 @@ export function ControlPlaneGate({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const unsubscribe = session.subscribe(setSnapshot);
-    void session.restore(buildDeviceRegistration(deviceId));
     return () => {
       unsubscribe();
       session.dispose();
     };
-  }, [deviceId, session]);
+  }, [session]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const restore = async () => {
+      setDeviceIdentityError(null);
+      try {
+        const stableDeviceId = await getOrCreateControlPlaneDeviceId(getOrCreateDeviceId());
+        if (cancelled) return;
+        setDeviceId(stableDeviceId);
+        await session.restore(buildDeviceRegistration(stableDeviceId));
+      } catch (error) {
+        if (!cancelled) setDeviceIdentityError(error);
+      }
+    };
+    void restore();
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceIdentityAttempt, session]);
+
+  const resolvedDeviceId = deviceId ?? '';
 
   const handleAccess = async (values: AccessFormValues): Promise<AccessSubmitResult> => {
     if (accessSubmitInFlightRef.current) {
@@ -67,17 +90,17 @@ export function ControlPlaneGate({ children }: { children: ReactNode }) {
     const warningMessages: string[] = [];
 
     try {
-      const result = await session.login(username, values.password, buildDeviceRegistration(deviceId));
+      const result = await session.login(username, values.password, buildDeviceRegistration(resolvedDeviceId));
       if (result.accessToken) {
         try {
           if (values.rememberLogin) {
-            await saveRememberedLogin(deviceId, username, values.password);
-            successMessages.push('账号和密码已保存到当前设备的安全凭据库。');
+            await saveRememberedLogin(resolvedDeviceId, username);
+            successMessages.push('账号已记住，密码不会保存。');
           } else {
-            await clearRememberedLogin(deviceId);
+            await clearRememberedLogin(resolvedDeviceId);
           }
         } catch (error) {
-          warningMessages.push(getControlPlaneErrorMessage(error, '账号和密码保存失败，本次登录仍然有效。'));
+          warningMessages.push(getControlPlaneErrorMessage(error, '账号偏好保存失败，本次登录仍然有效。'));
         }
       }
 
@@ -97,21 +120,42 @@ export function ControlPlaneGate({ children }: { children: ReactNode }) {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    if (accessSubmitInFlightRef.current) return;
+    accessSubmitInFlightRef.current = true;
+    setAccessBusy(true);
     setCredentialNotice(null);
-    void session.logout();
+    try {
+      await session.logout();
+    } finally {
+      accessSubmitInFlightRef.current = false;
+      setAccessBusy(false);
+    }
   };
 
   const accessPanel = (
     <ControlPlaneAccessPanel
       snapshot={snapshot}
-      deviceId={deviceId}
+      deviceId={resolvedDeviceId}
       busy={accessBusy}
       credentialNotice={credentialNotice}
       onCredentialNotice={setCredentialNotice}
       onSubmit={handleAccess}
     />
   );
+
+  if (deviceIdentityError) {
+    return (
+      <main className="desktop-auth-gate">
+        <Result
+          status="error"
+          title="无法读取稳定设备标识"
+          subTitle={getControlPlaneErrorMessage(deviceIdentityError, '请检查系统凭据服务后重试。')}
+          extra={<Button type="primary" icon={<ReloadOutlined />} onClick={() => setDeviceIdentityAttempt((value) => value + 1)}>重新读取</Button>}
+        />
+      </main>
+    );
+  }
 
   if (snapshot.status === 'loading' && !accessBusy) {
     return (
@@ -141,13 +185,13 @@ export function ControlPlaneGate({ children }: { children: ReactNode }) {
           status="error"
           title="控制面暂时不可用"
           subTitle={getControlPlaneErrorMessage(snapshot.error, '无法完成桌面端启动校验，请检查服务端地址和网络连接。')}
-          extra={<Button type="primary" icon={<ReloadOutlined />} onClick={() => void session.restore(buildDeviceRegistration(deviceId))}>重新连接</Button>}
+          extra={<Button type="primary" icon={<ReloadOutlined />} onClick={() => void session.restore(buildDeviceRegistration(resolvedDeviceId))}>重新连接</Button>}
         />
       </main>
     );
   }
 
-  if (!isConfirmedDesktopAccess(snapshot.user, snapshot.device, deviceId)) {
+  if (!isConfirmedDesktopAccess(snapshot.user, snapshot.device, resolvedDeviceId)) {
     return (
       <Routes>
         <Route path="/login" element={accessPanel} />
@@ -166,9 +210,12 @@ export function ControlPlaneGate({ children }: { children: ReactNode }) {
         </Space>
       ) : null}
       <div className="desktop-auth-session-controls">
-        <Typography.Text type="secondary">{snapshot.user?.username ?? '已登录'}</Typography.Text>
+        <Badge className="desktop-auth-session-authorization" status="success" text="设备已授权" />
+        <Typography.Text className="desktop-auth-session-account" type="secondary">
+          {snapshot.user?.username ?? '已登录'}
+        </Typography.Text>
         <AuthorizationExpiryStatus expiresAt={snapshot.device?.activation_expires_at} />
-        <Button size="small" onClick={handleLogout}>退出登录</Button>
+        <Button size="small" loading={accessBusy} onClick={() => void handleLogout()}>退出登录</Button>
       </div>
       <Routes>
         <Route path="/login" element={<Navigate to="/" replace />} />

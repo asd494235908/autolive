@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-release-webview-interlude-cache"
+description = "Enables the release_webview_interlude_cache command without any pre-configured scope."
+commands.allow = ["release_webview_interlude_cache"]
+
+[[permission]]
+identifier = "deny-release-webview-interlude-cache"
+description = "Denies the release_webview_interlude_cache command without any pre-configured scope."
+commands.deny = ["release_webview_interlude_cache"]

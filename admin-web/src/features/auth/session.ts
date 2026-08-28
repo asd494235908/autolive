@@ -15,7 +15,12 @@ export function readSession(): AdminSession | null {
 
   try {
     const session = JSON.parse(raw) as AdminSession;
-    if (!session.tokens?.access_token || !session.user?.id) {
+    if (
+      !session.tokens?.access_token ||
+      session.tokens.audience !== 'admin' ||
+      !session.user?.id
+    ) {
+      sessionStorage.removeItem(SESSION_KEY);
       return null;
     }
     return session;

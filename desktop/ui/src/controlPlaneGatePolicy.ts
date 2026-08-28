@@ -1,5 +1,6 @@
 type GateUser = {
   id: string;
+  role: string;
   status: string;
 };
 
@@ -22,7 +23,7 @@ export function isConfirmedDesktopAccess(
   now = Date.now(),
 ): boolean {
   if (!expectedDeviceId) return false;
-  if (!user || user.status !== 'active') return false;
+  if (!user || user.role !== 'user' || user.status !== 'active') return false;
   if (
     !device
     || device.user_id !== user.id
@@ -40,7 +41,7 @@ export function shouldAutomaticallyRegisterDevice(
   now = Date.now(),
 ): boolean {
   if (!expectedDeviceId) return false;
-  if (profile.user.status !== 'active') return false;
+  if (profile.user.role !== 'user' || profile.user.status !== 'active') return false;
   if (profile.device.id !== expectedDeviceId || profile.device.user_id !== profile.user.id) return false;
   if (profile.device.status === 'pending_activation') return true;
   if (profile.device.status !== 'active') return false;

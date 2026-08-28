@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-append-local-videos"
+description = "Enables the append_local_videos command without any pre-configured scope."
+commands.allow = ["append_local_videos"]
+
+[[permission]]
+identifier = "deny-append-local-videos"
+description = "Denies the append_local_videos command without any pre-configured scope."
+commands.deny = ["append_local_videos"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-processing-switches"
+description = "Enables the set_processing_switches command without any pre-configured scope."
+commands.allow = ["set_processing_switches"]
+
+[[permission]]
+identifier = "deny-set-processing-switches"
+description = "Denies the set_processing_switches command without any pre-configured scope."
+commands.deny = ["set_processing_switches"]

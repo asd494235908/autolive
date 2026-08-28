@@ -12,6 +12,16 @@ pub enum PlaybackError {
         max: usize,
         actual: usize,
     },
+    SourceMediaPoolIndexOutOfBounds {
+        index: usize,
+        len: usize,
+    },
+    SourceMediaPathEmpty {
+        index: usize,
+    },
+    DuplicateSourceMediaPath {
+        path: String,
+    },
     InvalidMediaProcessingOutput,
     StaleMediaProcessing,
     InvalidTransition {
@@ -28,10 +38,19 @@ impl Display for PlaybackError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyWindowId => f.write_str("播放窗口标识不能为空"),
-            Self::SourceMediaRequired => f.write_str("请先导入一个源视频"),
-            Self::SourceMediaPoolEmpty => f.write_str("播放池至少需要一个源视频"),
+            Self::SourceMediaRequired => f.write_str("请先导入一个源媒体"),
+            Self::SourceMediaPoolEmpty => f.write_str("播放池至少需要一个源媒体"),
             Self::SourceMediaPoolTooLarge { max, actual } => {
-                write!(f, "播放池最多允许 {max} 个源视频，实际收到 {actual} 个")
+                write!(f, "播放池最多允许 {max} 个源媒体，实际收到 {actual} 个")
+            }
+            Self::SourceMediaPoolIndexOutOfBounds { index, len } => {
+                write!(f, "播放池索引越界: index={index}, len={len}")
+            }
+            Self::SourceMediaPathEmpty { index } => {
+                write!(f, "播放池第 {} 个源媒体路径不能为空", index + 1)
+            }
+            Self::DuplicateSourceMediaPath { path } => {
+                write!(f, "播放池不能包含重复源媒体: {path}")
             }
             Self::InvalidMediaProcessingOutput => f.write_str("媒体处理输出无效"),
             Self::StaleMediaProcessing => f.write_str("媒体处理结果已过期"),
@@ -100,7 +119,7 @@ impl Display for MediaLibraryError {
                 extension,
                 supported_extensions,
             } => {
-                write!(f, "当前仅支持 {supported_extensions} 视频文件: {path}")?;
+                write!(f, "当前仅支持 {supported_extensions} 媒体文件: {path}")?;
                 if let Some(extension) = extension {
                     write!(f, " (extension={extension})")?;
                 }
@@ -114,7 +133,7 @@ impl Display for MediaLibraryError {
             }
             Self::FileOpenFailed { path } => write!(f, "打开文件失败: {path}"),
             Self::UnreadableVideoContainer { path, message } => {
-                write!(f, "视频容器不可读: {path}; {message}")
+                write!(f, "媒体容器不可读: {path}; {message}")
             }
             Self::NumericOverflow { field } => {
                 write!(f, "数值超出当前实现可表达范围: {field}")

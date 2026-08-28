@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-interlude-config"
+description = "Enables the set_interlude_config command without any pre-configured scope."
+commands.allow = ["set_interlude_config"]
+
+[[permission]]
+identifier = "deny-set-interlude-config"
+description = "Denies the set_interlude_config command without any pre-configured scope."
+commands.deny = ["set_interlude_config"]

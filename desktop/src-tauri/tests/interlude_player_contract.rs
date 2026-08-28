@@ -2,11 +2,12 @@ use autolive_desktop_core::interlude_player::{
     prepare_interlude_snapshot, InterludeAudioSelectionMode, InterludeAudioVariationMode,
     InterludeConfig, InterludeError, MAX_INTERLUDE_AUDIO_FILES,
 };
-use autolive_desktop_core::media_library::SourceMediaDto;
+use autolive_desktop_core::media_effect_params::AudioEffectParams;
+use autolive_desktop_core::media_library::{MediaCompatibilityMode, MediaKind, SourceMediaDto};
 use autolive_desktop_core::speech_to_speech::{
     AudioTrackInput, AudioVariantCandidate, SpeechToSpeechContext,
 };
-use autolive_desktop_core::PlaybackCore;
+use autolive_desktop_core::{PendingMediaCandidateIdentity, PlaybackCore};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,14 +43,21 @@ impl Drop for TempDirGuard {
 fn source(path: &str, file_name: &str) -> SourceMediaDto {
     SourceMediaDto {
         source_path: path.to_owned(),
+        playback_reference: path.to_owned(),
+        media_kind: MediaKind::Video,
+        compatibility_mode: MediaCompatibilityMode::Direct,
         file_name: file_name.to_owned(),
         file_size_bytes: 1,
         duration_ms: Some(10_000),
+        audio_start_ms: Some(0),
+        audio_end_ms: Some(10_000),
         width: Some(1280),
         height: Some(720),
         frame_rate_fps: Some(30.0),
         audio_sample_rate_hz: Some(48_000),
         audio_channel_count: Some(2),
+        video_codec_name: Some("h264".to_owned()),
+        audio_codec_name: Some("aac".to_owned()),
         mp4_sha256: Some("a".repeat(64)),
         mp4_hash_status: "ready".to_owned(),
     }
@@ -122,6 +130,22 @@ fn enabled_interlude_rejects_empty_directory() {
 }
 
 #[test]
+fn interlude_catalog_errors_describe_audio_and_video_sources() {
+    assert_eq!(
+        InterludeError::NoUsableAudioFiles.to_string(),
+        "插话目录内至少需要一个受支持的音频或视频文件（视频仅使用音轨）"
+    );
+    assert_eq!(
+        InterludeError::TooManyAudioFiles {
+            count: 1_001,
+            max_files: 1_000,
+        }
+        .to_string(),
+        "插话目录内有 1001 个受支持的媒体文件，最多允许 1000 个"
+    );
+}
+
+#[test]
 fn interlude_scan_ignores_unsupported_extensions_and_returns_canonical_paths() {
     let temp = TempDirGuard::new("interlude-scan");
     let keep = temp.path().join("keep.mp3");
@@ -158,6 +182,34 @@ fn interlude_scan_ignores_unsupported_extensions_and_returns_canonical_paths() {
 }
 
 #[test]
+fn interlude_scan_accepts_supported_video_containers_as_audio_sources() {
+    let temp = TempDirGuard::new("interlude-video-audio-sources");
+    let extensions = [
+        "mp4", "mov", "mkv", "avi", "webm", "m4v", "ts", "m2ts", "flv", "wmv", "3gp",
+    ];
+    for extension in extensions {
+        std::fs::write(temp.path().join(format!("source.{extension}")), b"video")
+            .expect("supported video container");
+    }
+    std::fs::write(temp.path().join("uppercase.MP4"), b"video").expect("uppercase video container");
+
+    let (_, snapshot) = prepare_interlude_snapshot(InterludeConfig {
+        enabled: true,
+        directory: Some(temp.path().display().to_string()),
+        ..InterludeConfig::default()
+    })
+    .expect("supported video containers should enter the interlude audio catalog");
+
+    assert_eq!(snapshot.audio_count, 12);
+    assert!(snapshot.audio_files.iter().all(|path| {
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extensions.contains(&extension.to_ascii_lowercase().as_str()))
+    }));
+}
+
+#[test]
 fn interlude_scan_discovers_supported_audio_in_nested_directory() {
     let temp = TempDirGuard::new("interlude-recursive-scan");
     let nested_audio = temp
@@ -187,9 +239,9 @@ fn interlude_scan_discovers_supported_audio_in_nested_directory() {
 }
 
 #[test]
-fn interlude_scan_accepts_256_audio_files_and_rejects_the_257th() {
+fn interlude_scan_accepts_1000_audio_files_and_rejects_the_1001st() {
     let temp = TempDirGuard::new("interlude-file-limit");
-    for index in 0..MAX_INTERLUDE_AUDIO_FILES {
+    for index in 0..1_000 {
         std::fs::write(temp.path().join(format!("audio-{index:03}.wav")), b"wav")
             .expect("bounded audio file");
     }
@@ -200,18 +252,16 @@ fn interlude_scan_accepts_256_audio_files_and_rejects_the_257th() {
         ..InterludeConfig::default()
     };
     let (_, snapshot) =
-        prepare_interlude_snapshot(config.clone()).expect("256 audio files should be accepted");
-    assert_eq!(
-        snapshot.audio_count,
-        u32::try_from(MAX_INTERLUDE_AUDIO_FILES).expect("file limit fits u32")
-    );
+        prepare_interlude_snapshot(config.clone()).expect("1000 audio files should be accepted");
+    assert_eq!(MAX_INTERLUDE_AUDIO_FILES, 1_000);
+    assert_eq!(snapshot.audio_count, 1_000);
 
-    std::fs::write(temp.path().join("audio-256.wav"), b"wav").expect("257th audio file");
+    std::fs::write(temp.path().join("audio-1000.wav"), b"wav").expect("1001st audio file");
     assert_eq!(
-        prepare_interlude_snapshot(config).expect_err("257 audio files should be rejected"),
+        prepare_interlude_snapshot(config).expect_err("1001 audio files should be rejected"),
         InterludeError::TooManyAudioFiles {
-            count: MAX_INTERLUDE_AUDIO_FILES + 1,
-            max_files: MAX_INTERLUDE_AUDIO_FILES,
+            count: 1_001,
+            max_files: 1_000,
         }
     );
 }
@@ -383,6 +433,28 @@ fn interlude_snapshot_preserves_fixed_selection_and_the_random_pool() {
 }
 
 #[test]
+fn ten_minute_interlude_preset_period_is_independent_from_audio_effect_period() {
+    let config = InterludeConfig {
+        audio_variation_mode: InterludeAudioVariationMode::Periodic,
+        audio_variation_period_min_ms: 600_000,
+        audio_variation_period_max_ms: 600_000,
+        ..InterludeConfig::default()
+    };
+    assert!(config.validate().is_ok());
+
+    let audio = AudioEffectParams {
+        random_change_period_ms: 600_000,
+        ..AudioEffectParams::default()
+    };
+    let errors = audio
+        .validate()
+        .expect_err("声音效果内部周期仍应保持独立的 60 秒上限");
+    assert!(errors
+        .iter()
+        .any(|error| error.field == "audio.random_change_period_ms"));
+}
+
+#[test]
 fn interlude_selection_mode_uses_strict_wire_values() {
     assert_eq!(
         serde_json::to_string(&InterludeAudioSelectionMode::Fixed)
@@ -536,7 +608,7 @@ fn interlude_validation_rejects_invalid_mix_and_variation_ranges() {
         ),
         (
             InterludeConfig {
-                audio_variation_period_max_ms: 60_001,
+                audio_variation_period_max_ms: 600_001,
                 ..InterludeConfig::default()
             },
             InterludeError::AudioVariationPeriodMaxOutOfRange,
@@ -566,10 +638,25 @@ fn playback_snapshot_reports_effective_audio_source_priority_without_mutating_ba
 
     let generation = core.snapshot().playback_generation;
     core.set_processing_switches(true, false, true);
+    let source_revision = core.snapshot().audio_stream_revision;
+    core.mark_media_processing_running_with_candidate(PendingMediaCandidateIdentity {
+        plan_id: "plan-1".to_owned(),
+        sequence: 1,
+        playback_generation: generation,
+        source_revision,
+        target_absolute_position_ms: 8_000,
+        source_start_ms: 8_000,
+        output_duration_ms: 10_000,
+        valid_until_absolute_position_ms: 18_000,
+    })
+    .expect("media processing should start");
     core.mark_media_processing_ready(generation, "/tmp/processed.mp4".to_owned(), "f".repeat(64))
         .expect("processed media should be accepted");
-    // ready 已立即 commit，无需再 commit。
-    assert!(!core.commit_media_processing_if_ready());
+    // 候选需由播放器预加载确认后显式提交。
+    assert_eq!(
+        core.commit_media_processing_if_ready("plan-1", 1, generation, source_revision, 8_000),
+        autolive_desktop_core::MediaProcessingCommitOutcome::Committed
+    );
     assert_eq!(core.snapshot().effective_audio_source, "processed_original");
 
     core.stage_audio_variant_candidate(
@@ -597,6 +684,9 @@ fn portaudio_interlude_commands_are_registered_on_the_single_output_path() {
 
     for command in [
         "start_portaudio_interlude",
+        "switch_portaudio_interlude_preset",
+        "set_portaudio_media_volume",
+        "set_portaudio_interlude_volume",
         "pause_portaudio_interlude",
         "resume_portaudio_interlude",
         "stop_portaudio_interlude",
@@ -615,12 +705,10 @@ fn portaudio_interlude_commands_are_registered_on_the_single_output_path() {
         .map(|offset| start + offset)
         .expect("PortAudio interlude implementation should have a bounded source segment");
     let implementation = &commands[start..end];
-    assert!(commands.contains(
-        "ValidatedAudioStreamConfiguration::new(request.audio.clone(), request.audio_variants.clone())"
-    ));
+    assert!(commands.contains("fn validate_interlude_audio_params("));
     assert!(implementation.contains("validate_interlude_processing_request(&request)?;"));
     assert!(implementation.contains("request.audio_variants"));
-    assert!(implementation.contains("interlude_audio_variant_speed_mismatch"));
+    assert!(commands.contains("interlude_audio_variant_speed_mismatch"));
     assert!(implementation.contains("build_audio_stream_filter_graph_with_ambient("));
     assert!(implementation.contains("&request.audio"));
     assert!(implementation.contains("&request.audio_variants"));
@@ -632,6 +720,18 @@ fn portaudio_interlude_commands_are_registered_on_the_single_output_path() {
     assert_eq!(
         implementation
             .matches("AudioMixerTask::start_scheduled_candidate")
+            .count(),
+        2
+    );
+    assert_eq!(
+        implementation
+            .matches("output_control.start_interlude(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        implementation
+            .matches("output_control\n        .crossfade_interlude_to(")
             .count(),
         1
     );

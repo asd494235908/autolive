@@ -13,8 +13,34 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 用户登录 */
+        /**
+         * 管理端登录
+         * @description 保留的管理端登录入口，成功后只签发 `audience=admin` 会话。
+         *     桌面客户端必须使用 `/api/v1/client/auth/login`，不得复用本入口获取管理会话。
+         *     账号不存在、密码错误、用户禁用或缺少目标产品成员关系对外统一返回 `401 UNAUTHENTICATED`。
+         */
         post: operations["authLogin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/client/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 桌面端登录
+         * @description 桌面端专用登录入口，成功后只签发 `audience=desktop` 会话。
+         *     管理员账号、不存在的账号、密码错误、用户禁用或缺少目标产品成员关系对外统一返回 `401 UNAUTHENTICATED`，不泄露账号是否存在或角色。
+         */
+        post: operations["clientAuthLogin"];
         delete?: never;
         options?: never;
         head?: never;
@@ -30,7 +56,11 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 刷新会话 */
+        /**
+         * 刷新会话
+         * @description 单次轮换 Refresh Token，新会话必须继承原会话的用户、产品、设备和 `audience`，客户端不能借刷新切换权限面。
+         *     已轮换的 Refresh Token 被再次使用时，服务端撤销同一 token family 的全部会话，对外统一返回 `401 REFRESH_TOKEN_INVALID`。
+         */
         post: operations["authRefresh"];
         delete?: never;
         options?: never;
@@ -47,7 +77,11 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 退出登录 */
+        /**
+         * 退出登录
+         * @description 以 Refresh Token 定位并撤销对应会话，不要求 Access Token 仍有效。
+         *     相同、已轮换、已撤销、已过期或未知 Refresh Token 的重复退出均返回同样的 `200` 成功响应，不泄露 Token 状态。
+         */
         post: operations["authLogout"];
         delete?: never;
         options?: never;
@@ -791,6 +825,11 @@ export interface components {
         };
         /** @enum {string} */
         ActorRole: "admin" | "user";
+        /**
+         * @description 会话的固定权限面；刷新不得改变该值
+         * @enum {string}
+         */
+        SessionAudience: "admin" | "desktop";
         /** @enum {string} */
         ProductCode: "autolive" | "douyin_desktop";
         /** @enum {string} */
@@ -804,9 +843,12 @@ export interface components {
         /** @enum {string} */
         ModelLeaseStatus: "active" | "released" | "expired";
         SessionTokens: {
+            /** @description 随机不透明 Access Token，有效期固定为 15 分钟 */
             access_token: string;
+            /** @description 仅返回给直接调用认证 API 的受信边界；有效期固定为 30 天且每次刷新轮换。桌面 Rust 边界必须在返回 WebView 前移除该字段并存入系统 Keychain/Credential Manager */
             refresh_token: string;
             expires_at: components["schemas"]["Timestamp"];
+            audience: components["schemas"]["SessionAudience"];
         };
         UserSummary: {
             id: components["schemas"]["Id"];
@@ -921,6 +963,7 @@ export interface components {
         };
         LoginRequest: {
             username: string;
+            /** @description 登录兼容既有 bcrypt 凭据；服务端不会因新密码策略拒绝仍有效的历史密码 */
             password: string;
             product: components["schemas"]["ProductCode"];
         };
@@ -936,9 +979,9 @@ export interface components {
             request_id: string;
             tokens: components["schemas"]["SessionTokens"];
         };
-        /** @description 可选 refresh_token 仅为兼容客户端请求体；服务端只撤销当前 Bearer Token 对应会话，不会撤销其他会话。 */
+        /** @description Refresh Token 用于定位当前会话；服务端只撤销该会话，重复或无效 Token 也返回幂等成功。 */
         LogoutRequest: {
-            refresh_token?: string;
+            refresh_token: string;
         };
         LogoutResponse: {
             request_id: string;
@@ -1184,6 +1227,7 @@ export interface components {
         };
         CreateUserRequest: {
             username: string;
+            /** @description 新账号密码；按 Unicode 字符计 15～128 个字符，UTF-8 编码最多 256 字节 */
             password: string;
             role: components["schemas"]["ActorRole"];
         };
@@ -1198,9 +1242,11 @@ export interface components {
             daily_token_limit: number;
         };
         ResetUserPasswordRequest: {
+            /** @description 新密码；按 Unicode 字符计 15～128 个字符，UTF-8 编码最多 256 字节 */
             password: string;
         };
         ChangeLocalAdminPasswordRequest: {
+            /** @description 新管理员密码；按 Unicode 字符计 15～128 个字符，UTF-8 编码最多 256 字节 */
             password: string;
         };
         DeviceListResponse: {
@@ -1485,7 +1531,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description 登录成功 */
+            /** @description 登录成功；`tokens.audience` 固定为 `admin` */
             200: {
                 headers: {
                     "X-Request-Id": components["headers"]["X-Request-Id"];
@@ -1497,11 +1543,43 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             429: components["responses"]["TooManyRequests"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    clientAuthLogin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoginRequest"];
+            };
+        };
+        responses: {
+            /** @description 登录成功；`tokens.audience` 固定为 `desktop` */
+            200: {
+                headers: {
+                    "X-Request-Id": components["headers"]["X-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoginResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            405: components["responses"]["MethodNotAllowed"];
+            408: components["responses"]["RequestTimeout"];
+            429: components["responses"]["TooManyRequests"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     authRefresh: {
@@ -1533,6 +1611,7 @@ export interface operations {
             408: components["responses"]["RequestTimeout"];
             429: components["responses"]["TooManyRequests"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     authLogout: {
@@ -1542,7 +1621,7 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody?: {
+        requestBody: {
             content: {
                 "application/json": components["schemas"]["LogoutRequest"];
             };
@@ -1558,7 +1637,7 @@ export interface operations {
                     "application/json": components["schemas"]["LogoutResponse"];
                 };
             };
-            401: components["responses"]["Unauthorized"];
+            400: components["responses"]["BadRequest"];
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];

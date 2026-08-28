@@ -25,19 +25,35 @@ use autolive_desktop_core::interlude_player::{
     prepare_interlude_snapshot, InterludeAudioSelectionMode, InterludeAudioVariationMode,
     InterludeConfig, InterludeError, InterludeSnapshot,
 };
+use autolive_desktop_core::media_compatibility::{
+    cleanup_compatibility_files, prepare_media_compatibility, MediaCompatibilityRequest,
+};
 use autolive_desktop_core::media_effect_params::{
     AudioEffectParams, MediaEffectParams, ParameterValidationError,
 };
 use autolive_desktop_core::media_engine::{
     build_audio_stream_filter_graph_with_ambient, build_media_render_args,
     configured_media_engine_paths_with_resource_dir,
-    configured_media_engine_status_with_resource_dir, render_media, target_triple,
-    validate_audio_input_decodable, MediaEngineStatus, MediaRenderRequest, FFMPEG_PATH_ENV,
-    FFPROBE_PATH_ENV,
+    configured_media_engine_status_with_resource_dir, render_media_with_progress, target_triple,
+    validate_audio_input_decodable, MediaEngineStatus, MediaRenderRequest, MediaRenderTarget,
+    FFMPEG_PATH_ENV, FFPROBE_PATH_ENV,
 };
 use autolive_desktop_core::media_library::{
-    probe_user_selected_video_with_ffprobe, MediaProbeRequestDto, MediaProbeResultDto,
+    probe_user_selected_video_with_ffprobe, MediaKind, MediaProbeRequestDto, MediaProbeResultDto,
     SourceMediaDto,
+};
+use autolive_desktop_core::media_video_effects::build_atomic_media_video_effect_plan;
+use autolive_desktop_core::media_video_gpu_effects::{
+    build_gpu83_shader_snapshot, Gpu83ParameterCapability, GPU83_PARAMETER_MAPPINGS,
+};
+use autolive_desktop_core::realtime_video_backend::{
+    resolve_mpv_executable, resolve_mpv_shader, CompiledRealtimeParameters, MpvCommand,
+    MpvShaderOptions, ParameterSupportReport, ParameterSupportResult, RealtimeVideoParameter,
+    RealtimeVideoPlan, VideoBackend, VideoCommitGate, VideoPlanIdentity, VideoPlanSlot,
+};
+use autolive_desktop_core::realtime_video_runtime::{
+    CycleSlotState, CycleSlotStatus, MediaVideoBackendRuntimeStatus, PrepareRealtimeRenderer,
+    RealtimeVideoRuntime,
 };
 use autolive_desktop_core::runtime_resource_task::{
     RuntimeResourceTask, RuntimeResourceTaskShutdown,
@@ -62,8 +78,9 @@ use autolive_desktop_core::webview_interlude_cache::{
 };
 use autolive_desktop_core::window_sizing::{calculate_window_size, WindowSizingError};
 use autolive_desktop_core::{
-    PlaybackCore, PlaybackSnapshot, PlaybackState, ValidatedAudioStreamConfiguration,
-    MAX_SOURCE_MEDIA_POOL_ITEMS,
+    MediaProcessingCommitOutcome, PendingAudioMediaCandidateIdentity,
+    PendingMediaCandidateIdentity, PlaybackCore, PlaybackSnapshot, PlaybackState,
+    ValidatedAudioStreamConfiguration, MAX_SOURCE_MEDIA_POOL_ITEMS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -81,6 +98,7 @@ use std::os::unix::process::CommandExt;
 
 const MACOS_NATIVE_TITLEBAR_HEIGHT: f64 = 32.0;
 const MEDIA_IMPORT_PROBE_TIMEOUT_MS: u64 = 10_000;
+const MEDIA_IMPORT_COMPATIBILITY_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
 const MAX_SOURCE_MEDIA_PATH_BYTES: usize = 32 * 1024;
 const PORTAUDIO_CALLBACK_STALL_MS: u64 = 1_500;
 const PORTAUDIO_PCM_STALL_MS: u64 = 1_500;
@@ -89,9 +107,37 @@ const PORTAUDIO_SWITCH_READY_TIMEOUT_MS: u64 = 5_000;
 const PORTAUDIO_SWITCH_READY_POLL_MS: u64 = 10;
 const AUDIO_CYCLE_CANDIDATE_PRE_ROLL_MS: u64 = 250;
 const AUDIO_CYCLE_CANDIDATE_BUFFER_MS: usize = 750;
+const MAX_INTERLUDE_MEDIA_POSITION_MS: u64 = 24 * 60 * 60 * 1_000;
+const VIDEO_BACKEND_SOURCE_REVISION: u64 = 0;
+const MEDIA_CANDIDATE_TIMEOUT_SECONDS: u64 = 30 * 60;
+const MEDIA_WORKER_STOP_BUDGET: Duration = Duration::from_secs(3);
+struct PreparedMediaImports {
+    results: Vec<MediaProbeResultDto>,
+    created_compatibility_files: Vec<PathBuf>,
+}
+
+#[derive(Clone)]
+struct MediaImportLease {
+    generation: u64,
+    cancellation: CancellationToken,
+}
+
+impl PreparedMediaImports {
+    fn retain_created_files(&mut self) {
+        self.created_compatibility_files.clear();
+    }
+}
+
+impl Drop for PreparedMediaImports {
+    fn drop(&mut self) {
+        cleanup_compatibility_files(std::mem::take(&mut self.created_compatibility_files));
+    }
+}
 const AUDIO_CYCLE_TARGET_HORIZON_MS: u64 = 60_000;
 const AUDIO_SYNC_CLOCK_EXPIRED: &str = "绝对媒体时间已经过期";
 const AUDIO_OUTPUT_RESUME_REQUIRED_CODE: &str = "audio_output_resume_required";
+const AUDIO_CANDIDATE_OUTSIDE_SOURCE_AUDIO_WINDOW_CODE: &str =
+    "audio_candidate_outside_source_audio_window";
 
 fn scheduled_candidate_commit_tail_ms(playback_watermark_ms: u64) -> usize {
     usize::try_from(playback_watermark_ms)
@@ -274,7 +320,7 @@ fn source_duration_ms(snapshot: &PlaybackSnapshot) -> Result<u64, CommandErrorDt
         .ok_or_else(|| {
             CommandErrorDto::new(
                 "audio_candidate_source_duration_missing",
-                "源视频时长不可用，无法建立候选音轨绝对时间轴",
+                "源媒体时长不可用，无法建立候选音轨绝对时间轴",
             )
         })
 }
@@ -303,16 +349,24 @@ pub struct AppState {
     /// 最终效果窗口最近一次上报视频 currentTime 的单调近似墙钟时间。
     playback_position_observed_at: Arc<Mutex<Option<Instant>>>,
     speech_worker: Arc<Mutex<Option<BackgroundWorkerTask>>>,
-    media_worker: Arc<Mutex<Option<BackgroundWorkerTask>>>,
+    video_media_worker: Arc<Mutex<Option<BackgroundWorkerTask>>>,
+    audio_media_worker: Arc<Mutex<Option<BackgroundWorkerTask>>>,
+    /// 导入批次的最新取消令牌；新的导入、池编辑和退出会使旧批次停止并回滚。
+    media_import_cancellation: Arc<Mutex<Option<CancellationToken>>>,
+    media_import_generation: Arc<AtomicU64>,
     runtime_resource_task: Arc<RuntimeResourceTask>,
     /// 按值拥有 PortAudio 流和唯一环缓生产线程；None = WebView。
     audio_cycle_output: Arc<Mutex<Option<AudioCycleOutputTask>>>,
     /// FFmpeg 解码线程 → 音频混音线程；PortAudio 失败时整体停止并回退 WebView。
     audio_mixer: Arc<Mutex<Option<AudioMixerTask>>>,
     /// 随机插话只生产 PCM；实际叠加和 duck 仍由唯一 audio_cycle_output 完成。
-    interlude_mixer: Arc<Mutex<Option<AudioMixerTask>>>,
+    interlude_mixer: Arc<Mutex<Option<ActiveInterludeMixer>>>,
     /// 串行化插话的创建/停止，避免并发 IPC 短暂生成多个 FFmpeg 解码器。
     interlude_prepare_lock: Arc<Mutex<()>>,
+    /// 每次准备/切换/停止都会推进；阻塞解码只允许提交最新操作。
+    interlude_prepare_token: Arc<AtomicU64>,
+    /// 活动插话会话代际；同一文件内的预设切换必须匹配该代际。
+    interlude_session_generation: Arc<AtomicU64>,
     /// WebView 插话缓存生成与显式清理互斥；不阻塞 PortAudio 插话控制。
     webview_interlude_cache_lock: Arc<Mutex<()>>,
     /// 已交给 WebView 播放或待播放的缓存；显式 release 前清理命令必须保留。
@@ -339,6 +393,15 @@ pub struct AppState {
     audio_output_last_pcm_progress_ms: Arc<AtomicU64>,
     /// 经路径校验和 FFmpeg 短时解码探测的环境声；用户素材优先，否则使用打包底噪。
     ambient_sound: Arc<Mutex<Option<ResolvedAmbientSound>>>,
+    /// 单一实时画面进程所有者；任何窗口关闭、停止或应用退出都从这里回收 mpv。
+    realtime_video_runtime: Arc<Mutex<RealtimeVideoRuntime>>,
+}
+
+#[derive(Debug)]
+struct ActiveInterludeMixer {
+    generation: u64,
+    source_path: PathBuf,
+    task: AudioMixerTask,
 }
 
 #[derive(Debug)]
@@ -626,6 +689,22 @@ pub struct ProbeLocalVideosRequestDto {
     pub paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplacePlaybackPoolItemRequestDto {
+    pub source_path: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReorderPlaybackPoolItemsRequestDto {
+    pub source_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemovePlaybackPoolItemRequestDto {
+    pub source_path: String,
+}
+
 fn validate_source_media_pool_count(item_count: usize) -> Result<(), CommandErrorDto> {
     if (1..=MAX_SOURCE_MEDIA_POOL_ITEMS).contains(&item_count) {
         Ok(())
@@ -633,7 +712,7 @@ fn validate_source_media_pool_count(item_count: usize) -> Result<(), CommandErro
         Err(CommandErrorDto::new(
             "invalid_source_media_pool_count",
             format!(
-                "播放池必须包含 1..={MAX_SOURCE_MEDIA_POOL_ITEMS} 个视频，实际收到 {item_count} 个"
+                "播放池必须包含 1..={MAX_SOURCE_MEDIA_POOL_ITEMS} 个媒体，实际收到 {item_count} 个"
             ),
         ))
     }
@@ -644,20 +723,127 @@ fn validate_source_media_paths(paths: &[String]) -> Result<(), CommandErrorDto> 
         if path.trim().is_empty() {
             return Err(CommandErrorDto::new(
                 "empty_source_media_path",
-                format!("播放池第 {} 个视频路径不能为空", index + 1),
+                format!("播放池第 {} 个媒体路径不能为空", index + 1),
             ));
         }
         if path.len() > MAX_SOURCE_MEDIA_PATH_BYTES {
             return Err(CommandErrorDto::new(
                 "source_media_path_too_long",
                 format!(
-                    "播放池第 {} 个视频路径超过 {MAX_SOURCE_MEDIA_PATH_BYTES} 字节上限",
+                    "播放池第 {} 个媒体路径超过 {MAX_SOURCE_MEDIA_PATH_BYTES} 字节上限",
                     index + 1
                 ),
             ));
         }
     }
     Ok(())
+}
+
+fn validate_audio_candidate_source_window(
+    source_duration_ms: Option<u64>,
+    audio_start_ms: Option<u64>,
+    audio_end_ms: Option<u64>,
+    source_start_ms: u64,
+    output_duration_ms: u64,
+    loop_source: bool,
+) -> Result<(), CommandErrorDto> {
+    let (Some(source_duration_ms), Some(audio_start_ms), Some(audio_end_ms)) =
+        (source_duration_ms, audio_start_ms, audio_end_ms)
+    else {
+        return Ok(());
+    };
+    // 缺失或不一致的旧元数据继续交给既有请求/产物校验，避免把兼容输入误判为跳过。
+    if source_duration_ms == 0
+        || source_start_ms >= source_duration_ms
+        || output_duration_ms == 0
+        || audio_start_ms >= audio_end_ms
+        || audio_end_ms > source_duration_ms
+    {
+        return Ok(());
+    }
+
+    let overlaps = |candidate_start_ms: u128, candidate_end_ms: u128| {
+        candidate_start_ms < u128::from(audio_end_ms)
+            && u128::from(audio_start_ms) < candidate_end_ms
+    };
+    let source_duration_ms = u128::from(source_duration_ms);
+    let source_start_ms = u128::from(source_start_ms);
+    let output_duration_ms = u128::from(output_duration_ms);
+    let intersects = if !loop_source {
+        overlaps(
+            source_start_ms,
+            source_start_ms
+                .saturating_add(output_duration_ms)
+                .min(source_duration_ms),
+        )
+    } else if output_duration_ms >= source_duration_ms {
+        true
+    } else {
+        let candidate_end_ms = source_start_ms.saturating_add(output_duration_ms);
+        overlaps(source_start_ms, candidate_end_ms.min(source_duration_ms))
+            || (candidate_end_ms > source_duration_ms
+                && overlaps(0, candidate_end_ms - source_duration_ms))
+    };
+
+    if intersects {
+        Ok(())
+    } else {
+        Err(CommandErrorDto::new(
+            AUDIO_CANDIDATE_OUTSIDE_SOURCE_AUDIO_WINDOW_CODE,
+            "声音候选窗口未覆盖源媒体的有效音轨，跳过本轮",
+        ))
+    }
+}
+
+fn source_media_index_by_path(
+    source_media_pool: &[SourceMediaDto],
+    source_path: &str,
+) -> Result<usize, CommandErrorDto> {
+    validate_source_media_paths(&[source_path.to_owned()])?;
+    source_media_pool
+        .iter()
+        .position(|source| source.source_path == source_path)
+        .ok_or_else(|| {
+            CommandErrorDto::new(
+                "source_media_not_found",
+                "播放池中不存在指定源媒体，列表可能已经变化",
+            )
+        })
+}
+
+fn reorder_source_media_pool(
+    source_media_pool: &[SourceMediaDto],
+    source_paths: &[String],
+) -> Result<Vec<SourceMediaDto>, CommandErrorDto> {
+    if source_paths.len() != source_media_pool.len() {
+        return Err(CommandErrorDto::new(
+            "invalid_source_media_pool_order",
+            "重排必须提交当前播放池全部条目的稳定路径",
+        ));
+    }
+    validate_source_media_paths(source_paths)?;
+    let mut unique_paths = HashSet::with_capacity(source_paths.len());
+    let mut reordered = Vec::with_capacity(source_paths.len());
+    for source_path in source_paths {
+        insert_canonical_source_path(&mut unique_paths, source_path)?;
+        let index = source_media_index_by_path(source_media_pool, source_path)?;
+        reordered.push(source_media_pool[index].clone());
+    }
+    Ok(reordered)
+}
+
+fn apply_source_media_order(
+    playback: &mut PlaybackCore,
+    source_paths: &[String],
+) -> Result<(), CommandErrorDto> {
+    let snapshot = playback.snapshot();
+    let edited = reorder_source_media_pool(&snapshot.source_media_pool, source_paths)?;
+    if edited == snapshot.source_media_pool {
+        return Ok(());
+    }
+    playback
+        .set_source_pool(edited)
+        .map_err(command_error_from_playback)
 }
 
 fn resolve_user_ambient_sound(
@@ -701,6 +887,16 @@ fn resolve_user_ambient_sound(
     Ok(resolved)
 }
 
+fn audio_mix_requires_ambient_sound(
+    audio: &AudioEffectParams,
+    variants: &[AudioEffectParams],
+) -> bool {
+    audio.ambient_sound_mix_percent > f64::EPSILON
+        || variants
+            .iter()
+            .any(|variant| variant.ambient_sound_mix_percent > f64::EPSILON)
+}
+
 fn resolve_active_ambient_sound(
     app: &AppHandle,
     ffmpeg_path: &Path,
@@ -739,7 +935,7 @@ fn insert_canonical_source_path(
     } else {
         Err(CommandErrorDto::new(
             "duplicate_source_media_path",
-            format!("播放池包含重复视频：{canonical_path}"),
+            format!("播放池包含重复媒体：{canonical_path}"),
         ))
     }
 }
@@ -1146,12 +1342,17 @@ impl Default for AppState {
             playback_transition: Arc::new(Mutex::new(())),
             playback_position_observed_at: Arc::new(Mutex::new(None)),
             speech_worker: Arc::new(Mutex::new(None)),
-            media_worker: Arc::new(Mutex::new(None)),
+            video_media_worker: Arc::new(Mutex::new(None)),
+            audio_media_worker: Arc::new(Mutex::new(None)),
+            media_import_cancellation: Arc::new(Mutex::new(None)),
+            media_import_generation: Arc::new(AtomicU64::new(0)),
             runtime_resource_task: Arc::new(RuntimeResourceTask::default()),
             audio_cycle_output: Arc::new(Mutex::new(None)),
             audio_mixer: Arc::new(Mutex::new(None)),
             interlude_mixer: Arc::new(Mutex::new(None)),
             interlude_prepare_lock: Arc::new(Mutex::new(())),
+            interlude_prepare_token: Arc::new(AtomicU64::new(0)),
+            interlude_session_generation: Arc::new(AtomicU64::new(0)),
             webview_interlude_cache_lock: Arc::new(Mutex::new(())),
             protected_webview_interlude_paths: Arc::new(Mutex::new(HashSet::new())),
             audio_mixer_pending: Arc::new(Mutex::new(None)),
@@ -1167,11 +1368,51 @@ impl Default for AppState {
             audio_output_last_pcm_frame_count: Arc::new(AtomicU64::new(0)),
             audio_output_last_pcm_progress_ms: Arc::new(AtomicU64::new(0)),
             ambient_sound: Arc::new(Mutex::new(None)),
+            realtime_video_runtime: Arc::new(Mutex::new(RealtimeVideoRuntime::default())),
         }
     }
 }
 
 impl AppState {
+    fn stop_realtime_video_runtime(&self) -> Result<(), CommandErrorDto> {
+        self.realtime_video_runtime
+            .lock()
+            .map_err(|_| {
+                CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏")
+            })?
+            .stop();
+        Ok(())
+    }
+
+    fn begin_media_import(&self) -> Result<MediaImportLease, CommandErrorDto> {
+        self.ensure_running()?;
+        let mut active = self.media_import_cancellation.lock().map_err(|_| {
+            CommandErrorDto::new("media_import_lock_failed", "媒体导入取消状态锁已损坏")
+        })?;
+        let cancellation = CancellationToken::new();
+        if let Some(previous) = active.replace(cancellation.clone()) {
+            previous.cancel();
+        }
+        let generation = self
+            .media_import_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        Ok(MediaImportLease {
+            generation,
+            cancellation,
+        })
+    }
+
+    fn cancel_media_import(&self) -> Result<(), CommandErrorDto> {
+        let active = self.media_import_cancellation.lock().map_err(|_| {
+            CommandErrorDto::new("media_import_lock_failed", "媒体导入取消状态锁已损坏")
+        })?;
+        if let Some(cancellation) = active.as_ref() {
+            cancellation.cancel();
+        }
+        Ok(())
+    }
+
     fn ambient_sound_selection(&self) -> Result<Option<ResolvedAmbientSound>, CommandErrorDto> {
         self.ambient_sound
             .lock()
@@ -1341,6 +1582,13 @@ impl AppState {
         let started_at = Instant::now();
         let mut first_error = None;
 
+        match self.realtime_video_runtime.lock() {
+            Ok(mut runtime) => runtime.stop(),
+            Err(_) => {
+                first_error.get_or_insert("实时画面运行时锁已损坏".to_owned());
+            }
+        }
+
         match self.protected_webview_interlude_paths.lock() {
             Ok(mut paths) => paths.clear(),
             Err(_) => {
@@ -1350,7 +1598,9 @@ impl AppState {
 
         for result in [
             cancel_background_worker(&self.speech_worker, "话术 Worker 状态锁已损坏"),
-            cancel_background_worker(&self.media_worker, "媒体 Worker 状态锁已损坏"),
+            cancel_background_worker(&self.video_media_worker, "视频 Worker 状态锁已损坏"),
+            cancel_background_worker(&self.audio_media_worker, "声音 Worker 状态锁已损坏"),
+            self.cancel_media_import().map_err(|error| error.message),
             self.runtime_resource_task.begin_shutdown(),
         ] {
             if let Err(error) = result {
@@ -1359,6 +1609,16 @@ impl AppState {
         }
         if let Err(error) = self.stop_audio_for_shutdown() {
             first_error.get_or_insert(error.message);
+        }
+        if let Ok(playback) = self.playback.lock() {
+            cleanup_compatibility_files(
+                playback
+                    .snapshot()
+                    .source_media_pool
+                    .into_iter()
+                    .filter(|source| source.playback_reference != source.source_path)
+                    .map(|source| PathBuf::from(source.playback_reference)),
+            );
         }
 
         let mut joined_any = false;
@@ -1371,8 +1631,14 @@ impl AppState {
                 budget,
             ),
             join_background_worker_until(
-                &self.media_worker,
-                "媒体 Worker 状态锁已损坏",
+                &self.video_media_worker,
+                "视频 Worker 状态锁已损坏",
+                started_at,
+                budget,
+            ),
+            join_background_worker_until(
+                &self.audio_media_worker,
+                "声音 Worker 状态锁已损坏",
                 started_at,
                 budget,
             ),
@@ -1453,7 +1719,7 @@ impl AppState {
             .map(|mut output| output.take())
     }
 
-    fn take_interlude_mixer_task(&self) -> Result<Option<AudioMixerTask>, CommandErrorDto> {
+    fn take_interlude_mixer_task(&self) -> Result<Option<ActiveInterludeMixer>, CommandErrorDto> {
         self.interlude_mixer
             .lock()
             .map_err(|_| {
@@ -1465,19 +1731,26 @@ impl AppState {
             .map(|mut task| task.take())
     }
 
-    fn stop_interlude_mixer(&self) -> Result<(), CommandErrorDto> {
+    fn stop_interlude_mixer_current(&self) -> Result<(), CommandErrorDto> {
         let stop_result = self.audio_output_control().ok().map(|control| {
             control
                 .stop_interlude()
                 .map_err(|error| CommandErrorDto::new("interlude_output_stop_failed", error))
         });
-        if let Some(mut task) = self.take_interlude_mixer_task()? {
-            task.stop_preserving_output();
+        if let Some(mut active) = self.take_interlude_mixer_task()? {
+            active.task.stop_preserving_output();
         }
         if let Some(result) = stop_result {
             result?;
         }
         Ok(())
+    }
+
+    fn stop_interlude_mixer(&self) -> Result<(), CommandErrorDto> {
+        self.interlude_prepare_token.fetch_add(1, Ordering::AcqRel);
+        self.interlude_session_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.stop_interlude_mixer_current()
     }
 
     fn stop_audio_cycle_output(&self) -> Result<(), CommandErrorDto> {
@@ -1490,6 +1763,7 @@ impl AppState {
     }
 
     fn stop_audio_for_shutdown(&self) -> Result<(), CommandErrorDto> {
+        self.interlude_prepare_token.fetch_add(1, Ordering::AcqRel);
         let _interlude_guard = self.interlude_prepare_lock.lock().map_err(|_| {
             CommandErrorDto::new(
                 "interlude_prepare_lock_failed",
@@ -1527,6 +1801,7 @@ impl AppState {
 
     fn pause_audio_output(&self) -> Result<(), CommandErrorDto> {
         self.next_audio_mixer_pending_token();
+        self.interlude_prepare_token.fetch_add(1, Ordering::AcqRel);
         let pause_result = self.audio_output_control().and_then(|control| {
             control
                 .pause()
@@ -1545,13 +1820,16 @@ impl AppState {
     }
 
     fn stop_audio_for_playback(&self) -> Result<(), CommandErrorDto> {
+        self.interlude_prepare_token.fetch_add(1, Ordering::AcqRel);
+        self.interlude_session_generation
+            .fetch_add(1, Ordering::AcqRel);
         if let Ok(control) = self.audio_output_control() {
             control
                 .clear()
                 .map_err(|error| CommandErrorDto::new("audio_output_clear_failed", error))?;
         }
-        if let Some(mut task) = self.take_interlude_mixer_task()? {
-            task.stop_preserving_output();
+        if let Some(mut active) = self.take_interlude_mixer_task()? {
+            active.task.stop_preserving_output();
         }
         self.stop_audio_mixer()
     }
@@ -1830,13 +2108,10 @@ impl AppState {
                 .lock()
                 .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
             let snapshot = playback.snapshot();
+            let (audio, variants) = playback.audio_stream_configuration();
             snapshot.audio_processing_enabled
                 && snapshot.current_audio_source.as_deref() != Some("realtime_variant")
-                && playback
-                    .audio_stream_configuration()
-                    .0
-                    .ambient_sound_mix_percent
-                    > f64::EPSILON
+                && audio_mix_requires_ambient_sound(&audio, &variants)
         };
         let target_root = runtime_resource_target_root(app)
             .map_err(|error| CommandErrorDto::new("media_resource_dir_failed", error))?;
@@ -1886,7 +2161,7 @@ impl AppState {
             let stream_processed_audio =
                 snapshot.audio_processing_enabled && realtime_audio_path.is_none();
             let source_path = realtime_audio_path.or_else(|| {
-                if stream_processed_audio {
+                if stream_processed_audio || source.playback_reference != source.source_path {
                     Some(PathBuf::from(source.source_path.clone()))
                 } else {
                     snapshot
@@ -2095,11 +2370,11 @@ impl AppState {
         let source = snapshot
             .source_media
             .as_ref()
-            .ok_or_else(|| CommandErrorDto::new("source_media_required", "请先导入一个源视频"))?;
+            .ok_or_else(|| CommandErrorDto::new("source_media_required", "请先导入一个源媒体"))?;
         if source.audio_sample_rate_hz.is_none() {
             return Err(CommandErrorDto::new(
                 "audio_candidate_source_missing",
-                "源视频没有可供周期处理的音频流",
+                "源媒体没有可供周期处理的音频流",
             ));
         }
 
@@ -2130,7 +2405,7 @@ impl AppState {
             app,
             &ffmpeg_path,
             current_ambient_sound.as_ref(),
-            request.audio.ambient_sound_mix_percent > f64::EPSILON,
+            audio_mix_requires_ambient_sound(&request.audio, &request.audio_variants),
         )?;
         let ambient_sound_path = ambient_sound.map(|selection| selection.path);
         let filter_plan = build_audio_stream_filter_graph_with_ambient(
@@ -2366,42 +2641,122 @@ impl AppState {
         Ok(())
     }
 
-    fn stop_media_worker(&self) -> Result<(), CommandErrorDto> {
-        let task = self
-            .media_worker
-            .lock()
-            .map_err(|_| {
-                CommandErrorDto::new("media_worker_lock_failed", "媒体 Worker 状态锁已损坏")
-            })?
-            .take();
-        if let Some(task) = task {
+    fn stop_media_worker_slot(
+        &self,
+        worker: &Mutex<Option<BackgroundWorkerTask>>,
+        lock_code: &str,
+        lock_message: &str,
+        worker_label: &str,
+        budget: Duration,
+    ) -> Result<bool, CommandErrorDto> {
+        {
+            let worker = worker
+                .lock()
+                .map_err(|_| CommandErrorDto::new(lock_code, lock_message))?;
+            let Some(task) = worker.as_ref() else {
+                return Ok(false);
+            };
             task.cancellation.cancel();
-            let _join_result = task.handle.join();
-            // 取消后必须清掉 processing，否则 UI 会一直卡在「处理中」。
+        }
+        match join_background_worker_until(worker, lock_message, Instant::now(), budget) {
+            Ok(RuntimeResourceTaskShutdown::Joined | RuntimeResourceTaskShutdown::Idle) => Ok(true),
+            Ok(RuntimeResourceTaskShutdown::TimedOut) => Err(CommandErrorDto::new(
+                "media_worker_stop_timeout",
+                format!(
+                    "{worker_label}未在 {} 毫秒停止预算内退出",
+                    budget.as_millis()
+                ),
+            )),
+            Err(error) => Err(CommandErrorDto::new("media_worker_stop_failed", error)),
+        }
+    }
+
+    fn stop_video_media_worker(&self) -> Result<(), CommandErrorDto> {
+        if self.stop_media_worker_slot(
+            &self.video_media_worker,
+            "video_media_worker_lock_failed",
+            "视频 Worker 状态锁已损坏",
+            "视频 Worker",
+            MEDIA_WORKER_STOP_BUDGET,
+        )? {
             if let Ok(mut playback) = self.playback.lock() {
-                let snapshot = playback.snapshot();
-                if snapshot.audio_processing_status == "processing"
-                    || snapshot.video_processing_status == "processing"
-                {
-                    playback.mark_media_processing_failed("媒体处理已取消，等待应用最新参数");
+                if playback.snapshot().video_processing_status == "processing" {
+                    playback.mark_media_processing_failed("视频处理已取消，等待应用最新参数");
                 }
             }
         }
         Ok(())
     }
 
-    fn media_worker_is_running(&self) -> Result<bool, CommandErrorDto> {
-        let worker = self.media_worker.lock().map_err(|_| {
-            CommandErrorDto::new("media_worker_lock_failed", "媒体 Worker 状态锁已损坏")
-        })?;
+    fn stop_audio_media_worker(&self) -> Result<(), CommandErrorDto> {
+        if self.stop_media_worker_slot(
+            &self.audio_media_worker,
+            "audio_media_worker_lock_failed",
+            "声音 Worker 状态锁已损坏",
+            "声音 Worker",
+            MEDIA_WORKER_STOP_BUDGET,
+        )? {
+            if let Ok(mut playback) = self.playback.lock() {
+                if playback.snapshot().audio_processing_status == "processing" {
+                    playback
+                        .mark_audio_media_processing_failed("声音候选处理已取消，等待应用最新参数");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_media_workers(&self) -> Result<(), CommandErrorDto> {
+        let mut first_error = None;
+        for result in [
+            self.stop_video_media_worker(),
+            self.stop_audio_media_worker(),
+        ] {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn media_worker_slot_is_running(
+        &self,
+        worker: &Mutex<Option<BackgroundWorkerTask>>,
+        lock_code: &str,
+        lock_message: &str,
+    ) -> Result<bool, CommandErrorDto> {
+        let worker = worker
+            .lock()
+            .map_err(|_| CommandErrorDto::new(lock_code, lock_message))?;
         Ok(worker.is_some())
     }
 
-    fn reap_finished_media_worker(&self) -> Result<bool, CommandErrorDto> {
+    fn video_media_worker_is_running(&self) -> Result<bool, CommandErrorDto> {
+        self.media_worker_slot_is_running(
+            &self.video_media_worker,
+            "video_media_worker_lock_failed",
+            "视频 Worker 状态锁已损坏",
+        )
+    }
+
+    fn audio_media_worker_is_running(&self) -> Result<bool, CommandErrorDto> {
+        self.media_worker_slot_is_running(
+            &self.audio_media_worker,
+            "audio_media_worker_lock_failed",
+            "声音 Worker 状态锁已损坏",
+        )
+    }
+
+    fn reap_finished_media_worker_slot(
+        &self,
+        worker: &Mutex<Option<BackgroundWorkerTask>>,
+        lock_code: &str,
+        lock_message: &str,
+    ) -> Result<bool, CommandErrorDto> {
         let task = {
-            let mut worker = self.media_worker.lock().map_err(|_| {
-                CommandErrorDto::new("media_worker_lock_failed", "媒体 Worker 状态锁已损坏")
-            })?;
+            let mut worker = worker
+                .lock()
+                .map_err(|_| CommandErrorDto::new(lock_code, lock_message))?;
             let finished = worker.as_ref().is_some_and(|task| {
                 task.completed.load(Ordering::Acquire) || task.handle.is_finished()
             });
@@ -2416,6 +2771,22 @@ impl AppState {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn reap_finished_video_media_worker(&self) -> Result<bool, CommandErrorDto> {
+        self.reap_finished_media_worker_slot(
+            &self.video_media_worker,
+            "video_media_worker_lock_failed",
+            "视频 Worker 状态锁已损坏",
+        )
+    }
+
+    fn reap_finished_audio_media_worker(&self) -> Result<bool, CommandErrorDto> {
+        self.reap_finished_media_worker_slot(
+            &self.audio_media_worker,
+            "audio_media_worker_lock_failed",
+            "声音 Worker 状态锁已损坏",
+        )
     }
 
     fn install_speech_worker(
@@ -2436,11 +2807,15 @@ impl AppState {
         Ok(())
     }
 
-    fn install_media_worker(&self, task: BackgroundWorkerTask) -> Result<(), BackgroundWorkerTask> {
+    fn install_media_worker_slot(
+        &self,
+        worker: &Mutex<Option<BackgroundWorkerTask>>,
+        task: BackgroundWorkerTask,
+    ) -> Result<(), BackgroundWorkerTask> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(task);
         }
-        let mut worker = match self.media_worker.lock() {
+        let mut worker = match worker.lock() {
             Ok(worker) => worker,
             Err(_) => return Err(task),
         };
@@ -2449,6 +2824,20 @@ impl AppState {
         }
         worker.replace(task);
         Ok(())
+    }
+
+    fn install_video_media_worker(
+        &self,
+        task: BackgroundWorkerTask,
+    ) -> Result<(), BackgroundWorkerTask> {
+        self.install_media_worker_slot(&self.video_media_worker, task)
+    }
+
+    fn install_audio_media_worker(
+        &self,
+        task: BackgroundWorkerTask,
+    ) -> Result<(), BackgroundWorkerTask> {
+        self.install_media_worker_slot(&self.audio_media_worker, task)
     }
 
     fn ensure_main_window(&self, window: &Window) -> Result<(), CommandErrorDto> {
@@ -2521,7 +2910,11 @@ impl AppState {
     }
 
     fn snapshot(&self, playback: &PlaybackCore) -> PlaybackSnapshotDto {
-        PlaybackSnapshotDto::from(playback.snapshot())
+        self.snapshot_from_core(playback.snapshot())
+    }
+
+    fn snapshot_from_core(&self, snapshot: PlaybackSnapshot) -> PlaybackSnapshotDto {
+        PlaybackSnapshotDto::from(snapshot)
     }
 }
 
@@ -2539,11 +2932,49 @@ pub struct PlaybackSnapshotDto {
     pub current_video_source: Option<String>,
     pub current_video_reference: Option<String>,
     pub current_video_sha256: Option<String>,
+    pub current_media_plan_id: Option<String>,
+    pub current_media_sequence: Option<u64>,
+    pub current_media_playback_generation: Option<u64>,
+    pub current_media_source_revision: Option<u64>,
+    pub current_media_target_absolute_position_ms: Option<u64>,
+    pub current_media_source_start_ms: Option<u64>,
+    pub current_media_output_duration_ms: Option<u64>,
+    pub current_media_valid_until_absolute_position_ms: Option<u64>,
     pub pending_video_reference: Option<String>,
     pub pending_video_sha256: Option<String>,
+    pub pending_media_plan_id: Option<String>,
+    pub pending_media_sequence: Option<u64>,
+    pub pending_media_playback_generation: Option<u64>,
+    pub pending_media_source_revision: Option<u64>,
+    pub pending_media_target_absolute_position_ms: Option<u64>,
+    pub pending_media_source_start_ms: Option<u64>,
+    pub pending_media_output_duration_ms: Option<u64>,
+    pub pending_media_valid_until_absolute_position_ms: Option<u64>,
     pub video_processing_enabled: bool,
     pub video_processing_status: String,
+    pub video_processing_progress_percent: u8,
     pub audio_processing_enabled: bool,
+    pub audio_processing_progress_percent: u8,
+    pub current_audio_artifact_reference: Option<String>,
+    pub current_audio_artifact_sha256: Option<String>,
+    pub current_audio_media_plan_id: Option<String>,
+    pub current_audio_media_sequence: Option<u64>,
+    pub current_audio_media_playback_generation: Option<u64>,
+    pub current_audio_media_source_revision: Option<u64>,
+    pub current_audio_media_target_absolute_position_ms: Option<u64>,
+    pub current_audio_media_source_start_ms: Option<u64>,
+    pub current_audio_media_output_duration_ms: Option<u64>,
+    pub current_audio_media_valid_until_absolute_position_ms: Option<u64>,
+    pub pending_audio_artifact_reference: Option<String>,
+    pub pending_audio_artifact_sha256: Option<String>,
+    pub pending_audio_media_plan_id: Option<String>,
+    pub pending_audio_media_sequence: Option<u64>,
+    pub pending_audio_media_playback_generation: Option<u64>,
+    pub pending_audio_media_source_revision: Option<u64>,
+    pub pending_audio_media_target_absolute_position_ms: Option<u64>,
+    pub pending_audio_media_source_start_ms: Option<u64>,
+    pub pending_audio_media_output_duration_ms: Option<u64>,
+    pub pending_audio_media_valid_until_absolute_position_ms: Option<u64>,
     pub realtime_audio_variant_enabled: bool,
     pub current_audio_source: Option<String>,
     pub current_audio_reference: Option<String>,
@@ -2586,11 +3017,57 @@ impl From<PlaybackSnapshot> for PlaybackSnapshotDto {
             current_video_source: value.current_video_source,
             current_video_reference: value.current_video_reference,
             current_video_sha256: value.current_video_sha256,
+            current_media_plan_id: value.current_media_plan_id,
+            current_media_sequence: value.current_media_sequence,
+            current_media_playback_generation: value.current_media_playback_generation,
+            current_media_source_revision: value.current_media_source_revision,
+            current_media_target_absolute_position_ms: value
+                .current_media_target_absolute_position_ms,
+            current_media_source_start_ms: value.current_media_source_start_ms,
+            current_media_output_duration_ms: value.current_media_output_duration_ms,
+            current_media_valid_until_absolute_position_ms: value
+                .current_media_valid_until_absolute_position_ms,
             pending_video_reference: value.pending_video_reference,
             pending_video_sha256: value.pending_video_sha256,
+            pending_media_plan_id: value.pending_media_plan_id,
+            pending_media_sequence: value.pending_media_sequence,
+            pending_media_playback_generation: value.pending_media_playback_generation,
+            pending_media_source_revision: value.pending_media_source_revision,
+            pending_media_target_absolute_position_ms: value
+                .pending_media_target_absolute_position_ms,
+            pending_media_source_start_ms: value.pending_media_source_start_ms,
+            pending_media_output_duration_ms: value.pending_media_output_duration_ms,
+            pending_media_valid_until_absolute_position_ms: value
+                .pending_media_valid_until_absolute_position_ms,
             video_processing_enabled: value.video_processing_enabled,
             video_processing_status: value.video_processing_status,
+            video_processing_progress_percent: value.video_processing_progress_percent,
             audio_processing_enabled: value.audio_processing_enabled,
+            audio_processing_progress_percent: value.audio_processing_progress_percent,
+            current_audio_artifact_reference: value.current_audio_artifact_reference,
+            current_audio_artifact_sha256: value.current_audio_artifact_sha256,
+            current_audio_media_plan_id: value.current_audio_media_plan_id,
+            current_audio_media_sequence: value.current_audio_media_sequence,
+            current_audio_media_playback_generation: value.current_audio_media_playback_generation,
+            current_audio_media_source_revision: value.current_audio_media_source_revision,
+            current_audio_media_target_absolute_position_ms: value
+                .current_audio_media_target_absolute_position_ms,
+            current_audio_media_source_start_ms: value.current_audio_media_source_start_ms,
+            current_audio_media_output_duration_ms: value.current_audio_media_output_duration_ms,
+            current_audio_media_valid_until_absolute_position_ms: value
+                .current_audio_media_valid_until_absolute_position_ms,
+            pending_audio_artifact_reference: value.pending_audio_artifact_reference,
+            pending_audio_artifact_sha256: value.pending_audio_artifact_sha256,
+            pending_audio_media_plan_id: value.pending_audio_media_plan_id,
+            pending_audio_media_sequence: value.pending_audio_media_sequence,
+            pending_audio_media_playback_generation: value.pending_audio_media_playback_generation,
+            pending_audio_media_source_revision: value.pending_audio_media_source_revision,
+            pending_audio_media_target_absolute_position_ms: value
+                .pending_audio_media_target_absolute_position_ms,
+            pending_audio_media_source_start_ms: value.pending_audio_media_source_start_ms,
+            pending_audio_media_output_duration_ms: value.pending_audio_media_output_duration_ms,
+            pending_audio_media_valid_until_absolute_position_ms: value
+                .pending_audio_media_valid_until_absolute_position_ms,
             realtime_audio_variant_enabled: value.realtime_audio_variant_enabled,
             current_audio_source: value.current_audio_source,
             current_audio_reference: value.current_audio_reference,
@@ -2661,6 +3138,37 @@ pub struct StartPortAudioInterludeRequestDto {
     pub timeout_seconds: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetPortAudioMediaVolumeRequestDto {
+    pub volume: f64,
+    pub muted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetPortAudioInterludeVolumeRequestDto {
+    pub volume_db: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StartPortAudioInterludeResultDto {
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SwitchPortAudioInterludePresetRequestDto {
+    pub generation: u64,
+    pub media_position_ms: u64,
+    pub audio: AudioEffectParams,
+    #[serde(default)]
+    pub audio_variants: Vec<AudioEffectParams>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SwitchPortAudioInterludePresetResultDto {
+    pub generation: u64,
+    pub media_position_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrepareWebViewInterludeResultDto {
     pub state: String,
@@ -2713,7 +3221,115 @@ pub struct StartMediaProcessingRequestDto {
     /// 仅在环境声混合比例非零时使用；必须来自用户选择的本地音频文件。
     #[serde(default)]
     pub ambient_sound_path: Option<String>,
-    pub timeout_seconds: Option<u64>,
+    /// 本次只更新 video、audio，或同时更新；旧客户端省略时按 both。
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// 自动视频周期要求 83 个 UI 参数项（排除两个翻转）作为一个整体通过准入。
+    /// 手动恢复默认和历史客户端省略时保持兼容，不借此伪装成正式全量周期。
+    #[serde(default)]
+    pub require_atomic_video_admission: bool,
+    pub plan_id: String,
+    pub sequence: u64,
+    pub playback_generation: u64,
+    pub source_revision: u64,
+    pub source_start_ms: u64,
+    pub output_duration_ms: u64,
+    pub loop_source: bool,
+    pub target_absolute_position_ms: u64,
+    pub valid_until_absolute_position_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrepareRealtimeVideoPlanRequestDto {
+    pub params: MediaEffectParams,
+    pub sequence: u64,
+    pub playback_generation: u64,
+    pub source_revision: u64,
+    pub target_absolute_position_ms: u64,
+    pub period_ms: u64,
+    pub seed: u64,
+    #[serde(default)]
+    pub next_sequence: Option<u64>,
+    #[serde(default)]
+    pub next_target_absolute_position_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitRealtimeVideoPlanRequestDto {
+    pub sequence: u64,
+    pub playback_generation: u64,
+    pub source_revision: u64,
+    pub media_pts_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncRealtimeVideoRendererRequestDto {
+    pub playback_generation: u64,
+    pub position_ms: u64,
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitMediaProcessingRequestDto {
+    pub plan_id: String,
+    pub sequence: u64,
+    pub playback_generation: u64,
+    pub source_revision: u64,
+    pub observed_absolute_position_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscardMediaProcessingCandidateRequestDto {
+    pub plan_id: String,
+    pub sequence: u64,
+    pub playback_generation: u64,
+    pub source_revision: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReleaseMediaProcessingArtifactRequestDto {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrepareAudioMediaCandidateRequestDto {
+    pub params: AudioEffectParams,
+    #[serde(default)]
+    pub audio_variants: Vec<AudioEffectParams>,
+    #[serde(default)]
+    pub ambient_sound_path: Option<String>,
+    pub plan_id: String,
+    pub sequence: u64,
+    pub playback_generation: u64,
+    pub source_revision: u64,
+    pub source_start_ms: u64,
+    pub output_duration_ms: u64,
+    pub loop_source: bool,
+    pub target_absolute_position_ms: u64,
+    pub valid_until_absolute_position_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioMediaCandidateIdentityRequestDto {
+    pub plan_id: String,
+    pub sequence: u64,
+    pub playback_generation: u64,
+    pub source_revision: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscardAudioMediaCandidateRequestDto {
+    pub plan_id: String,
+    pub sequence: u64,
+    pub playback_generation: u64,
+    pub source_revision: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReleaseAudioMediaCandidateRequestDto {
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2779,8 +3395,10 @@ fn remove_media_processing_cache_files_at(
             remaining_bytes = remaining_bytes.saturating_add(size);
             continue;
         };
-        let is_partial = name.starts_with("processed-") && name.contains(".partial");
-        let is_completed = name.starts_with("processed-") && name.ends_with(".mp4") && !is_partial;
+        let managed = name.starts_with("processed-") || name.starts_with("ts-compat-");
+        let is_partial = managed && name.contains(".partial");
+        let is_completed =
+            managed && (name.ends_with(".mp4") || name.ends_with(".m4a")) && !is_partial;
         let stale_partial = is_partial && modified <= partial_expiry;
         if protected.contains(&path) || (!is_completed && !stale_partial) {
             remaining_bytes = remaining_bytes.saturating_add(size);
@@ -2809,9 +3427,76 @@ fn remove_media_processing_cache_files(
     remove_media_processing_cache_files_at(directory, protected_paths, SystemTime::now())
 }
 
+fn validate_managed_media_processing_artifact_path(
+    cache_dir: &Path,
+    path: &Path,
+) -> Result<(), CommandErrorDto> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let parent = path.parent().and_then(|value| value.canonicalize().ok());
+    let cache_root = cache_dir.canonicalize().ok();
+    if parent.is_none()
+        || cache_root.is_none()
+        || parent.as_ref() != cache_root.as_ref()
+        || !(file_name.starts_with("processed-g") || file_name.starts_with("processed-audio-g"))
+        || !matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("mp4" | "m4a")
+        )
+    {
+        return Err(CommandErrorDto::new(
+            "media_artifact_path_invalid",
+            "只允许释放媒体处理缓存目录中的成品文件",
+        ));
+    }
+    Ok(())
+}
+
+fn remove_managed_media_processing_artifact(
+    cache_dir: &Path,
+    path: &Path,
+) -> Result<bool, CommandErrorDto> {
+    validate_managed_media_processing_artifact_path(cache_dir, path)?;
+    const RETRY_DELAYS_MS: [u64; 4] = [25, 50, 100, 200];
+    let mut retry_delays = RETRY_DELAYS_MS.into_iter();
+    loop {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Other
+                ) =>
+            {
+                let Some(delay_ms) = retry_delays.next() else {
+                    return Err(CommandErrorDto::new(
+                        "media_artifact_release_failed",
+                        error.to_string(),
+                    ));
+                };
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            Err(error) => {
+                return Err(CommandErrorDto::new(
+                    "media_artifact_release_failed",
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod cache_tests {
-    use super::remove_media_processing_cache_files_at;
+    use super::{
+        remove_managed_media_processing_artifact, remove_media_processing_cache_files_at,
+        validate_managed_media_processing_artifact_path,
+    };
     use std::fs;
     use std::time::{Duration, SystemTime};
 
@@ -2828,11 +3513,13 @@ mod cache_tests {
         fs::create_dir_all(&directory).expect("cache directory should be created");
         let protected = directory.join("processed-current.mp4");
         let completed = directory.join("processed-old.mp4");
+        let completed_audio = directory.join("processed-audio-old.m4a");
         let stale_partial = directory.join("processed-old.partial.mp4");
         let fresh_partial = directory.join("processed-fresh.partial.mp4");
         let unrelated = directory.join("other.mp4");
         fs::write(&protected, b"keep").expect("write");
         fs::write(&completed, b"done").expect("write");
+        fs::write(&completed_audio, b"audio").expect("write");
         fs::write(&stale_partial, b"stale").expect("write");
         fs::write(&unrelated, b"other").expect("write");
 
@@ -2847,8 +3534,9 @@ mod cache_tests {
         assert!(!completed.exists());
         assert!(!stale_partial.exists());
         assert!(unrelated.exists());
-        assert_eq!(result.removed_files, 2);
-        assert_eq!(result.removed_bytes, 9);
+        assert!(!completed_audio.exists());
+        assert_eq!(result.removed_files, 3);
+        assert_eq!(result.removed_bytes, 14);
         assert_eq!(result.remaining_bytes, 9);
 
         fs::write(&fresh_partial, b"fresh").expect("write");
@@ -2863,24 +3551,55 @@ mod cache_tests {
         assert_eq!(fresh_result.remaining_bytes, 14);
         let _ignored = fs::remove_dir_all(directory);
     }
+
+    #[test]
+    fn managed_media_artifact_deletion_validates_scope_and_treats_missing_as_idempotent() {
+        let directory = std::env::temp_dir().join(format!(
+            "autolive-media-artifact-delete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be valid")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("cache directory should be created");
+        let missing = directory.join("processed-g7-s2.mp4");
+        let missing_audio = directory.join("processed-audio-g7-s2.m4a");
+        assert!(validate_managed_media_processing_artifact_path(&directory, &missing).is_ok());
+        assert!(
+            validate_managed_media_processing_artifact_path(&directory, &missing_audio).is_ok()
+        );
+        assert!(
+            !remove_managed_media_processing_artifact(&directory, &missing)
+                .expect("missing artifact deletion should be idempotent")
+        );
+        assert!(validate_managed_media_processing_artifact_path(
+            &directory,
+            &directory.join("unmanaged.mp4")
+        )
+        .is_err());
+        let _ignored = fs::remove_dir_all(directory);
+    }
 }
 
 fn cleanup_media_processing_cache(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<CacheCleanupResultDto, CommandErrorDto> {
-    let _ = state.reap_finished_media_worker()?;
-    if state.media_worker_is_running()? {
+    let _ = state.reap_finished_video_media_worker()?;
+    let _ = state.reap_finished_audio_media_worker()?;
+    if state.video_media_worker_is_running()? || state.audio_media_worker_is_running()? {
         return Err(CommandErrorDto::new(
             "media_cache_cleanup_busy",
             "媒体处理仍在进行，请完成后再删除已生成缓存",
         ));
     }
-    let cache_dir = app
+    let app_cache_dir = app
         .path()
         .app_cache_dir()
-        .map_err(|error| CommandErrorDto::new("cache_dir_failed", error.to_string()))?
-        .join("media-processing");
+        .map_err(|error| CommandErrorDto::new("cache_dir_failed", error.to_string()))?;
+    let cache_dir = app_cache_dir.join("media-processing");
+    let compatibility_cache_dir = app_cache_dir.join("media-compatibility");
     let protected_paths = {
         let playback = state
             .playback
@@ -2903,19 +3622,37 @@ fn cleanup_media_processing_cache(
                 "声音处理正在播放，请先暂停或停止播放后再删除缓存",
             ));
         }
-        [
+        let mut protected = [
             snapshot.current_video_reference,
             snapshot.pending_video_reference,
+            snapshot.current_audio_artifact_reference,
+            snapshot.pending_audio_artifact_reference,
             snapshot.current_audio_reference,
             snapshot.pending_audio_reference,
         ]
         .into_iter()
         .flatten()
         .map(PathBuf::from)
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+        protected.extend(
+            snapshot
+                .source_media_pool
+                .into_iter()
+                .map(|source| PathBuf::from(source.playback_reference)),
+        );
+        protected
     };
     let media = remove_media_processing_cache_files(&cache_dir, &protected_paths)
         .map_err(|error| CommandErrorDto::new("media_cache_cleanup_failed", error.to_string()))?;
+    let compatibility =
+        remove_media_processing_cache_files(&compatibility_cache_dir, &protected_paths).map_err(
+            |error| {
+                CommandErrorDto::new(
+                    "media_compatibility_cache_cleanup_failed",
+                    error.to_string(),
+                )
+            },
+        )?;
     let _webview_cache_guard = state
         .webview_interlude_cache_lock
         .try_lock()
@@ -2941,12 +3678,65 @@ fn cleanup_media_processing_cache(
         CommandErrorDto::new("webview_interlude_cache_cleanup_failed", error.to_string())
     })?;
     Ok(CacheCleanupResultDto {
-        removed_files: media.removed_files.saturating_add(webview.removed_files),
-        removed_bytes: media.removed_bytes.saturating_add(webview.removed_bytes),
+        removed_files: media
+            .removed_files
+            .saturating_add(compatibility.removed_files)
+            .saturating_add(webview.removed_files),
+        removed_bytes: media
+            .removed_bytes
+            .saturating_add(compatibility.removed_bytes)
+            .saturating_add(webview.removed_bytes),
         remaining_bytes: media
             .remaining_bytes
+            .saturating_add(compatibility.remaining_bytes)
             .saturating_add(webview.remaining_bytes),
     })
+}
+
+pub fn purge_media_processing_cache(app: &AppHandle) -> Result<(), String> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("media-processing");
+    let mut retry_delays = [25_u64, 50, 100, 200].into_iter();
+    loop {
+        match std::fs::remove_dir_all(&cache_dir) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Other
+                ) =>
+            {
+                let Some(delay_ms) = retry_delays.next() else {
+                    return Err(error.to_string());
+                };
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+pub fn cleanup_stale_generated_caches(app: &AppHandle) -> Result<(), String> {
+    let app_cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    match std::fs::remove_dir_all(app_cache_dir.join("media-video-stream")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    remove_media_processing_cache_files(&app_cache_dir.join("media-compatibility"), &[])
+        .map_err(|error| error.to_string())?;
+    cleanup_webview_interlude_cache(&app_cache_dir.join("webview-interlude"), &[])
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 impl AppState {
@@ -2984,7 +3774,7 @@ pub async fn probe_local_video(
     })
     .await
     .map_err(|error| {
-        CommandErrorDto::new("media_probe_failed", format!("视频导入任务失败：{error}"))
+        CommandErrorDto::new("media_probe_failed", format!("媒体导入任务失败：{error}"))
     })?
 }
 
@@ -3005,9 +3795,120 @@ pub async fn probe_local_videos(
     .map_err(|error| {
         CommandErrorDto::new(
             "media_probe_failed",
-            format!("视频批量导入任务失败：{error}"),
+            format!("媒体批量导入任务失败：{error}"),
         )
     })?
+}
+
+#[tauri::command]
+pub async fn append_local_videos(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: ProbeLocalVideosRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let import = state.begin_media_import()?;
+        let mut prepared = probe_local_video_paths(&app, request.paths, &import.cancellation)?;
+        let sources: Vec<_> = prepared
+            .results
+            .iter()
+            .map(|result| result.source.clone())
+            .collect();
+        let result = commit_playback_pool_edit(&window, &state, Some(&import), move |playback| {
+            playback
+                .append_source_pool(sources.clone())
+                .map_err(command_error_from_playback)
+        });
+        if result.is_ok() {
+            prepared.retain_created_files();
+        }
+        result
+    })
+    .await
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "media_probe_failed",
+            format!("媒体追加导入任务失败：{error}"),
+        )
+    })?
+}
+
+#[tauri::command]
+pub async fn replace_playback_pool_item(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: ReplacePlaybackPoolItemRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let import = state.begin_media_import()?;
+        let mut prepared = probe_local_video_paths(&app, vec![request.path], &import.cancellation)?;
+        let replacement = prepared
+            .results
+            .pop()
+            .ok_or_else(|| CommandErrorDto::new("media_probe_failed", "替换媒体未返回探测结果"))?;
+        let result = commit_playback_pool_edit(&window, &state, Some(&import), move |playback| {
+            let snapshot = playback.snapshot();
+            let index =
+                source_media_index_by_path(&snapshot.source_media_pool, &request.source_path)?;
+            playback
+                .replace_source_at(index, replacement.source.clone())
+                .map_err(command_error_from_playback)
+        });
+        match result {
+            Ok(snapshot) => {
+                prepared.retain_created_files();
+                Ok(snapshot)
+            }
+            Err(error) => Err(error),
+        }
+    })
+    .await
+    .map_err(|error| {
+        CommandErrorDto::new("media_probe_failed", format!("媒体替换任务失败：{error}"))
+    })?
+}
+
+#[tauri::command]
+pub fn reorder_playback_pool_items(
+    window: Window,
+    state: State<'_, AppState>,
+    request: ReorderPlaybackPoolItemsRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    commit_playback_pool_edit(&window, state.inner(), None, move |playback| {
+        apply_source_media_order(playback, &request.source_paths)
+    })
+}
+
+#[tauri::command]
+pub fn remove_playback_pool_item(
+    window: Window,
+    state: State<'_, AppState>,
+    request: RemovePlaybackPoolItemRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    commit_playback_pool_edit(&window, state.inner(), None, move |playback| {
+        let snapshot = playback.snapshot();
+        let index = source_media_index_by_path(&snapshot.source_media_pool, &request.source_path)?;
+        playback
+            .remove_source(index)
+            .map_err(command_error_from_playback)
+    })
+}
+
+#[tauri::command]
+pub fn clear_playback_pool(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    commit_playback_pool_edit(&window, state.inner(), None, |playback| {
+        playback.clear_source_pool();
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -3030,7 +3931,90 @@ fn probe_local_video_blocking(
     results
         .into_iter()
         .next()
-        .ok_or_else(|| CommandErrorDto::new("media_probe_failed", "单视频导入未返回探测结果"))
+        .ok_or_else(|| CommandErrorDto::new("media_probe_failed", "单媒体导入未返回探测结果"))
+}
+
+fn probe_local_video_paths(
+    app: &AppHandle,
+    paths: Vec<String>,
+    cancellation: &CancellationToken,
+) -> Result<PreparedMediaImports, CommandErrorDto> {
+    validate_source_media_pool_count(paths.len())?;
+    validate_source_media_paths(&paths)?;
+    let target_root = runtime_resource_target_root(app).map_err(|error| {
+        CommandErrorDto::new(
+            "media_probe_failed",
+            format!("读取已验证媒体运行资源目录失败：{error}"),
+        )
+    })?;
+    let (ffmpeg_path, ffprobe_path) = configured_media_engine_paths_with_resource_dir(&target_root)
+        .map_err(|error| CommandErrorDto::new("media_probe_failed", error.to_string()))?;
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?
+        .join("media-compatibility");
+    let mut canonical_paths = HashSet::with_capacity(paths.len());
+    let mut results = Vec::with_capacity(paths.len());
+    let mut created_compatibility_files = Vec::new();
+    let prepared = (|| {
+        for path in paths {
+            let mut result = probe_user_selected_video_with_ffprobe(
+                &MediaProbeRequestDto { path },
+                &ffprobe_path,
+                MEDIA_IMPORT_PROBE_TIMEOUT_MS,
+                cancellation,
+            )
+            .map_err(command_error_from_media_library)?;
+            insert_canonical_source_path(&mut canonical_paths, &result.canonical_path)?;
+            let compatibility = prepare_media_compatibility(
+                &MediaCompatibilityRequest {
+                    ffmpeg_path: ffmpeg_path.clone(),
+                    ffprobe_path: ffprobe_path.clone(),
+                    cache_dir: cache_dir.clone(),
+                    source: result.source.clone(),
+                    timeout_seconds: MEDIA_IMPORT_COMPATIBILITY_TIMEOUT_SECONDS,
+                },
+                cancellation,
+            )
+            .map_err(|error| {
+                CommandErrorDto::new("media_compatibility_failed", error.to_string())
+            })?;
+            result.source.playback_reference = compatibility.playback_reference;
+            result.source.compatibility_mode = compatibility.mode;
+            if let Some(path) = compatibility.created_file {
+                created_compatibility_files.push(path);
+            }
+            results.push(result);
+        }
+        if cancellation.is_cancelled() {
+            return Err(command_error_from_media_library(
+                MediaLibraryError::Cancelled,
+            ));
+        }
+        for result in &results {
+            allow_local_playback_asset_file(
+                app,
+                Path::new(&result.source.source_path),
+                "source_media_asset_scope_failed",
+                "源媒体",
+            )?;
+            allow_local_playback_asset_file(
+                app,
+                Path::new(&result.source.playback_reference),
+                "playback_media_asset_scope_failed",
+                "媒体播放引用",
+            )?;
+        }
+        Ok(PreparedMediaImports {
+            results,
+            created_compatibility_files: created_compatibility_files.clone(),
+        })
+    })();
+    if prepared.is_err() {
+        cleanup_compatibility_files(created_compatibility_files);
+    }
+    prepared
 }
 
 fn probe_local_video_pool_blocking(
@@ -3040,53 +4024,100 @@ fn probe_local_video_pool_blocking(
     paths: Vec<String>,
 ) -> Result<(Vec<MediaProbeResultDto>, PlaybackSnapshotDto), CommandErrorDto> {
     state.ensure_main_window(&window)?;
-    validate_source_media_pool_count(paths.len())?;
-    validate_source_media_paths(&paths)?;
-    let target_root = runtime_resource_target_root(&app).map_err(|error| {
-        CommandErrorDto::new(
-            "media_probe_failed",
-            format!("读取已验证媒体运行资源目录失败：{error}"),
-        )
-    })?;
-    let (_, ffprobe_path) = configured_media_engine_paths_with_resource_dir(&target_root)
-        .map_err(|error| CommandErrorDto::new("media_probe_failed", error.to_string()))?;
-    let cancellation = CancellationToken::new();
-    let mut canonical_paths = HashSet::with_capacity(paths.len());
-    let mut results = Vec::with_capacity(paths.len());
-    for path in paths {
-        let result = probe_user_selected_video_with_ffprobe(
-            &MediaProbeRequestDto { path },
-            &ffprobe_path,
-            MEDIA_IMPORT_PROBE_TIMEOUT_MS,
-            &cancellation,
-        )
-        .map_err(command_error_from_media_library)?;
-        insert_canonical_source_path(&mut canonical_paths, &result.canonical_path)?;
-        results.push(result);
-    }
-    for result in &results {
-        allow_local_playback_asset_file(
-            &app,
-            Path::new(&result.canonical_path),
-            "source_media_asset_scope_failed",
-            "源视频",
-        )?;
-    }
+    let import = state.begin_media_import()?;
+    let mut prepared = probe_local_video_paths(&app, paths, &import.cancellation)?;
+    let results = prepared.results.clone();
 
     let _transition_guard = state.playback_transition.lock().map_err(|_| {
         CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
     })?;
+    let _import_guard = lock_current_media_import(&state, &import)?;
+    state.stop_media_workers()?;
     state.stop_audio_for_playback()?;
     state.stop_speech_worker()?;
-    state.stop_media_worker()?;
+    state.stop_realtime_video_runtime()?;
+    let before = state.with_playback(&window, |playback| Ok(playback.snapshot()))?;
     let sources = results.iter().map(|result| result.source.clone()).collect();
     let snapshot = state.with_playback(&window, |playback| {
         playback
             .set_source_pool(sources)
             .map_err(command_error_from_playback)?;
         Ok(state.snapshot(playback))
-    })?;
+    });
+    let snapshot = snapshot?;
+    prepared.retain_created_files();
+    cleanup_replaced_compatibility_files(&before, &snapshot);
     Ok((results, snapshot))
+}
+
+fn lock_current_media_import<'a>(
+    state: &'a AppState,
+    media_import: &MediaImportLease,
+) -> Result<std::sync::MutexGuard<'a, Option<CancellationToken>>, CommandErrorDto> {
+    let guard = state.media_import_cancellation.lock().map_err(|_| {
+        CommandErrorDto::new("media_import_lock_failed", "媒体导入取消状态锁已损坏")
+    })?;
+    if media_import.cancellation.is_cancelled()
+        || state.media_import_generation.load(Ordering::Acquire) != media_import.generation
+        || guard.is_none()
+    {
+        return Err(command_error_from_media_library(
+            MediaLibraryError::Cancelled,
+        ));
+    }
+    Ok(guard)
+}
+
+fn commit_playback_pool_edit(
+    window: &Window,
+    state: &AppState,
+    media_import: Option<&MediaImportLease>,
+    edit: impl Fn(&mut PlaybackCore) -> Result<(), CommandErrorDto>,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.ensure_main_window(window)?;
+    if media_import.is_none() {
+        state.cancel_media_import()?;
+    }
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
+    let _import_guard = media_import
+        .map(|media_import| lock_current_media_import(state, media_import))
+        .transpose()?;
+    let mut validated = state.with_playback(window, |playback| Ok(playback.clone()))?;
+    let current = validated.snapshot();
+    edit(&mut validated)?;
+    if validated.snapshot() == current {
+        return Ok(state.snapshot_from_core(current));
+    }
+
+    state.stop_media_workers()?;
+    state.stop_audio_for_playback()?;
+    state.stop_speech_worker()?;
+    state.stop_realtime_video_runtime()?;
+    let snapshot = state.with_playback(window, |playback| {
+        edit(playback)?;
+        Ok(state.snapshot(playback))
+    })?;
+    cleanup_replaced_compatibility_files(&current, &snapshot);
+    Ok(snapshot)
+}
+
+fn cleanup_replaced_compatibility_files(before: &PlaybackSnapshot, after: &PlaybackSnapshotDto) {
+    let retained: HashSet<&str> = after
+        .source_media_pool
+        .iter()
+        .map(|source| source.playback_reference.as_str())
+        .collect();
+    let removed = before
+        .source_media_pool
+        .iter()
+        .filter(|source| {
+            source.playback_reference != source.source_path
+                && !retained.contains(source.playback_reference.as_str())
+        })
+        .map(|source| PathBuf::from(&source.playback_reference));
+    cleanup_compatibility_files(removed);
 }
 
 #[tauri::command]
@@ -3163,6 +4194,397 @@ pub fn get_media_engine_capabilities(
     Ok(configured_media_engine_status_with_resource_dir(
         &target_root,
     ))
+}
+
+fn collect_realtime_video_parameters(
+    params: &MediaEffectParams,
+) -> Result<Vec<RealtimeVideoParameter>, CommandErrorDto> {
+    fn walk(
+        path: &str,
+        current: &serde_json::Value,
+        defaults: &serde_json::Value,
+        output: &mut Vec<RealtimeVideoParameter>,
+    ) {
+        if let serde_json::Value::Object(fields) = current {
+            for (name, value) in fields {
+                let next_path = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{path}.{name}")
+                };
+                walk(
+                    &next_path,
+                    value,
+                    defaults.get(name).unwrap_or(&serde_json::Value::Null),
+                    output,
+                );
+            }
+            return;
+        }
+        let active = current != defaults;
+        let value = current
+            .as_f64()
+            .or_else(|| {
+                current
+                    .as_bool()
+                    .map(|enabled| if enabled { 1.0 } else { 0.0 })
+            })
+            .unwrap_or(0.0);
+        output.push(if active {
+            RealtimeVideoParameter::active(path, value)
+        } else {
+            RealtimeVideoParameter::inactive(path, value)
+        });
+    }
+
+    let current = serde_json::json!({
+        "video": &params.video,
+        "advanced": &params.advanced,
+    });
+    let defaults = MediaEffectParams::default();
+    let defaults = serde_json::json!({
+        "video": &defaults.video,
+        "advanced": &defaults.advanced,
+    });
+    let mut output = Vec::new();
+    walk("", &current, &defaults, &mut output);
+    if output.is_empty() {
+        return Err(CommandErrorDto::new(
+            "realtime_video_params_empty",
+            "实时画面参数快照为空",
+        ));
+    }
+    Ok(output)
+}
+
+fn compile_gpu83_realtime_parameters(
+    params: &MediaEffectParams,
+) -> Result<CompiledRealtimeParameters, CommandErrorDto> {
+    let active_fields = collect_realtime_video_parameters(params)?
+        .into_iter()
+        .filter(|parameter| parameter.active)
+        .map(|parameter| parameter.field)
+        .collect::<HashSet<_>>();
+    let snapshot =
+        build_gpu83_shader_snapshot(&params.video, &params.advanced).map_err(|error| {
+            CommandErrorDto::new(
+                "gpu83_snapshot_invalid",
+                format!("GPU83 参数快照无效（{}:{}）", error.field, error.code),
+            )
+        })?;
+    let update = snapshot.mpv_property_update();
+    let options = MpvShaderOptions::parse(update.value)
+        .map_err(|error| CommandErrorDto::new("gpu83_snapshot_invalid", error.to_string()))?;
+    let parameters = snapshot
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let mapping = GPU83_PARAMETER_MAPPINGS
+                .iter()
+                .find(|mapping| mapping.field_path == entry.field_path);
+            let supported = entry.capability == Gpu83ParameterCapability::ShaderParameter;
+            ParameterSupportResult {
+                field: entry.field_path.to_owned(),
+                active: active_fields.contains(entry.field_path),
+                supported,
+                mapping: supported.then(|| {
+                    format!(
+                        "mpv_shader_option:{}",
+                        mapping
+                            .map(|mapping| mapping.shader_option)
+                            .unwrap_or("unknown")
+                    )
+                }),
+                reason: match entry.capability {
+                    Gpu83ParameterCapability::ShaderParameter => None,
+                    Gpu83ParameterCapability::Unavailable(reason) => Some(reason.to_owned()),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let fully_supported = parameters
+        .iter()
+        .all(|parameter| !parameter.active || parameter.supported);
+    Ok(CompiledRealtimeParameters {
+        commands: vec![MpvCommand::SetShaderOptions { options }],
+        support: ParameterSupportReport {
+            backend: VideoBackend::RealtimeGpu,
+            fully_supported,
+            parameters,
+        },
+    })
+}
+
+fn record_realtime_video_fallback(
+    state: &AppState,
+    reason: String,
+) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
+    let mut runtime = state.realtime_video_runtime.lock().map_err(|_| {
+        CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏")
+    })?;
+    runtime.record_source_backend(reason);
+    Ok(runtime.status())
+}
+
+#[cfg(windows)]
+fn final_effect_host_window_id(window: &tauri::WebviewWindow) -> Result<u64, CommandErrorDto> {
+    let hwnd = window.hwnd().map_err(|error| {
+        CommandErrorDto::new(
+            "final_effect_window_handle_failed",
+            format!("读取最终效果窗口句柄失败：{error}"),
+        )
+    })?;
+    let value = hwnd.0 as usize as u64;
+    if value == 0 {
+        return Err(CommandErrorDto::new(
+            "final_effect_window_handle_failed",
+            "最终效果窗口句柄无效",
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(not(windows))]
+fn final_effect_host_window_id(_window: &tauri::WebviewWindow) -> Result<u64, CommandErrorDto> {
+    Err(CommandErrorDto::new(
+        "realtime_video_platform_unsupported",
+        "mpv 实时画面主链当前只支持 Windows",
+    ))
+}
+
+#[tauri::command]
+pub fn get_media_video_backend_status(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    state
+        .realtime_video_runtime
+        .lock()
+        .map_err(|_| CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏"))
+        .map(|runtime| runtime.status())
+}
+
+#[tauri::command]
+pub fn prepare_realtime_video_plan(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: PrepareRealtimeVideoPlanRequestDto,
+) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
+    state.ensure_running()?;
+    request.params.validate().map_err(|errors| {
+        CommandErrorDto::new(
+            "media_processing_params_invalid",
+            errors
+                .iter()
+                .map(|error| format!("{}: {}", error.field, error.message))
+                .collect::<Vec<_>>()
+                .join("；"),
+        )
+    })?;
+    if request.sequence == 0 || request.period_ms == 0 {
+        return Err(CommandErrorDto::new(
+            "realtime_video_plan_invalid",
+            "实时画面 sequence 和 period_ms 必须大于 0",
+        ));
+    }
+    let snapshot = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot();
+    if request.playback_generation != snapshot.playback_generation
+        || request.source_revision != VIDEO_BACKEND_SOURCE_REVISION
+    {
+        return Err(CommandErrorDto::new(
+            "stale_realtime_video_plan",
+            "实时画面计划绑定的播放代次已过期",
+        ));
+    }
+    let source = snapshot
+        .source_media
+        .as_ref()
+        .ok_or_else(|| CommandErrorDto::new("source_media_required", "请先导入一个源媒体"))?;
+    if source.media_kind != MediaKind::Video || !snapshot.video_processing_enabled {
+        return record_realtime_video_fallback(
+            &state,
+            "当前源不是视频或视频处理开关未开启".to_owned(),
+        );
+    }
+    let generation = snapshot.playback_generation;
+    let source_path = PathBuf::from(&source.source_path);
+    let source_start_ms = snapshot.current_position_ms;
+    let paused = snapshot.playback_state != PlaybackState::Playing;
+
+    let compiled = compile_gpu83_realtime_parameters(&request.params)?;
+    if !compiled.support.fully_supported {
+        let count = compiled.support.ignored_active_parameter_count();
+        let examples = compiled
+            .support
+            .ignored_active_parameter_examples(3)
+            .join("、");
+        return record_realtime_video_fallback(
+            &state,
+            format!("当前快照含 {count} 个 GPU83 未接入参数：{examples}"),
+        );
+    }
+    let final_effect_window = app.get_webview_window("final-effect").ok_or_else(|| {
+        CommandErrorDto::new(
+            "final_effect_window_missing",
+            "最终效果窗口尚未打开，无法准备实时画面",
+        )
+    })?;
+    let host_window_id = final_effect_host_window_id(&final_effect_window)?;
+    let runtime_root = runtime_resource_target_root(&app)
+        .map_err(|error| CommandErrorDto::new("media_resource_dir_failed", error))?;
+    let executable = resolve_mpv_executable(&runtime_root)
+        .map_err(|error| CommandErrorDto::new("mpv_resource_invalid", error.to_string()))?;
+    let resource_dir = app.path().resource_dir().map_err(|error| {
+        CommandErrorDto::new(
+            "mpv_shader_resource_dir_failed",
+            format!("读取 mpv shader 资源目录失败：{error}"),
+        )
+    })?;
+    let shader_path = resource_dir.join("resources/shaders/gpu83.hook");
+    let shader = resolve_mpv_shader(&resource_dir, &shader_path)
+        .map_err(|error| CommandErrorDto::new("mpv_shader_invalid", error.to_string()))?;
+
+    let identity = VideoPlanIdentity {
+        session_id: generation,
+        playback_generation: generation,
+        source_revision: request.source_revision,
+        parameter_revision: request.sequence,
+        sequence: request.sequence,
+    };
+    let plan = RealtimeVideoPlan {
+        slot: VideoPlanSlot::NPlus1,
+        identity,
+        target_pts_ms: request.target_absolute_position_ms,
+        period_ms: request.period_ms,
+        seed: request.seed,
+        prepared: true,
+        commands: compiled.commands,
+        parameter_support: compiled.support,
+    };
+    let n2 = request
+        .next_sequence
+        .zip(request.next_target_absolute_position_ms)
+        .map(|(sequence, target_pts_ms)| CycleSlotStatus {
+            sequence,
+            target_pts_ms,
+            status: CycleSlotState::Planned,
+        });
+    let mut runtime = state.realtime_video_runtime.lock().map_err(|_| {
+        CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏")
+    })?;
+    state.ensure_running()?;
+    runtime
+        .prepare(
+            PrepareRealtimeRenderer {
+                executable,
+                shader,
+                source_path: &source_path,
+                host_window_id,
+                source_start_ms,
+                paused,
+                plan,
+                n2,
+                session_id: generation,
+            },
+            unix_now_ms(),
+        )
+        .map_err(|error| CommandErrorDto::new("realtime_video_prepare_failed", error.to_string()))
+}
+
+#[tauri::command]
+pub fn commit_realtime_video_plan(
+    window: Window,
+    state: State<'_, AppState>,
+    request: CommitRealtimeVideoPlanRequestDto,
+) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    state.ensure_running()?;
+    let snapshot = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot();
+    if request.playback_generation != snapshot.playback_generation
+        || request.source_revision != VIDEO_BACKEND_SOURCE_REVISION
+    {
+        return Err(CommandErrorDto::new(
+            "stale_realtime_video_plan",
+            "实时画面提交绑定的播放代次已过期",
+        ));
+    }
+    let identity = VideoPlanIdentity {
+        session_id: request.playback_generation,
+        playback_generation: request.playback_generation,
+        source_revision: request.source_revision,
+        parameter_revision: request.sequence,
+        sequence: request.sequence,
+    };
+    let mut runtime = state.realtime_video_runtime.lock().map_err(|_| {
+        CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏")
+    })?;
+    state.ensure_running()?;
+    runtime
+        .commit(
+            &VideoCommitGate {
+                identity,
+                media_pts_ms: request.media_pts_ms,
+            },
+            unix_now_ms(),
+        )
+        .map_err(|error| CommandErrorDto::new("realtime_video_commit_failed", error.to_string()))
+}
+
+#[tauri::command]
+pub fn sync_realtime_video_renderer(
+    window: Window,
+    state: State<'_, AppState>,
+    request: SyncRealtimeVideoRendererRequestDto,
+) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    state.ensure_running()?;
+    let generation = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot()
+        .playback_generation;
+    if generation != request.playback_generation {
+        return Err(CommandErrorDto::new(
+            "stale_realtime_video_sync",
+            "实时画面同步消息属于旧播放代次",
+        ));
+    }
+    let mut runtime = state.realtime_video_runtime.lock().map_err(|_| {
+        CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏")
+    })?;
+    state.ensure_running()?;
+    runtime
+        .synchronize(request.position_ms, request.paused, unix_now_ms())
+        .map_err(|error| CommandErrorDto::new("realtime_video_sync_failed", error.to_string()))?;
+    Ok(runtime.status())
+}
+
+#[tauri::command]
+pub fn stop_realtime_video_renderer(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let mut runtime = state.realtime_video_runtime.lock().map_err(|_| {
+        CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏")
+    })?;
+    runtime.stop();
+    Ok(runtime.status())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4176,7 +5598,7 @@ fn commit_audio_cycle_candidate_blocking(
         .lock()
         .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
         .snapshot();
-    let snapshot_dto = || PlaybackSnapshotDto::from(snapshot.clone());
+    let snapshot_dto = || state.snapshot_from_core(snapshot.clone());
     let duration_ms = source_duration_ms(&snapshot)?;
     let live_clock = match validate_audio_sync_clock(
         AudioSyncClock::from(&request),
@@ -4480,7 +5902,7 @@ fn commit_audio_cycle_candidate_blocking(
             .lock()
             .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
         playback.commit_validated_audio_stream_configuration(candidate_state.configuration);
-        PlaybackSnapshotDto::from(playback.snapshot())
+        state.snapshot(&playback)
     };
     if let Some(mut old) = old {
         old.stop_preserving_output();
@@ -4888,6 +6310,449 @@ pub fn cleanup_local_caches_command(
 }
 
 #[tauri::command]
+pub fn release_media_processing_artifact(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: ReleaseMediaProcessingArtifactRequestDto,
+) -> Result<bool, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?
+        .join("media-processing");
+    let path = PathBuf::from(request.path);
+    let protected = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot();
+    if protected.current_video_reference.as_deref() == path.to_str()
+        || protected.pending_video_reference.as_deref() == path.to_str()
+    {
+        return Ok(false);
+    }
+    remove_managed_media_processing_artifact(&cache_dir, &path)
+}
+
+#[tauri::command]
+pub fn discard_media_processing_candidate(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: DiscardMediaProcessingCandidateRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let reason = request.reason.trim();
+    if reason.is_empty() || reason.len() > 1_024 {
+        return Err(CommandErrorDto::new(
+            "media_candidate_discard_reason_invalid",
+            "候选丢弃原因必须为 1..=1024 字节",
+        ));
+    }
+    let _ = state.reap_finished_video_media_worker()?;
+    let (artifact_path, snapshot) = state.with_playback_window(&window, |playback| {
+        let artifact_path = playback.discard_media_processing_candidate(
+            request.plan_id.trim(),
+            request.sequence,
+            request.playback_generation,
+            request.source_revision,
+            reason,
+        );
+        Ok((artifact_path, state.snapshot(playback)))
+    })?;
+    if let Some(path) = artifact_path {
+        let cache_dir = app
+            .path()
+            .app_cache_dir()
+            .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?
+            .join("media-processing");
+        remove_managed_media_processing_artifact(&cache_dir, Path::new(&path))?;
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn release_audio_media_candidate(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: ReleaseAudioMediaCandidateRequestDto,
+) -> Result<bool, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?
+        .join("media-processing");
+    let path = PathBuf::from(request.path);
+    let snapshot = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot();
+    if snapshot.current_audio_artifact_reference.as_deref() == path.to_str()
+        || snapshot.pending_audio_artifact_reference.as_deref() == path.to_str()
+    {
+        return Ok(false);
+    }
+    remove_managed_media_processing_artifact(&cache_dir, &path)
+}
+
+#[tauri::command]
+pub fn discard_audio_media_candidate(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: DiscardAudioMediaCandidateRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let reason = request.reason.trim();
+    if reason.is_empty() || reason.len() > 1_024 {
+        return Err(CommandErrorDto::new(
+            "audio_media_candidate_discard_reason_invalid",
+            "声音候选丢弃原因必须为 1..=1024 字节",
+        ));
+    }
+    let _ = state.reap_finished_audio_media_worker()?;
+    let (artifact_path, snapshot) = state.with_playback_window(&window, |playback| {
+        let artifact_path = playback.discard_audio_media_candidate(
+            request.plan_id.trim(),
+            request.sequence,
+            request.playback_generation,
+            request.source_revision,
+            reason,
+        );
+        Ok((artifact_path, state.snapshot(playback)))
+    })?;
+    if let Some(path) = artifact_path {
+        let cache_dir = app
+            .path()
+            .app_cache_dir()
+            .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?
+            .join("media-processing");
+        remove_managed_media_processing_artifact(&cache_dir, Path::new(&path))?;
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn commit_audio_media_candidate(
+    window: Window,
+    state: State<'_, AppState>,
+    request: AudioMediaCandidateIdentityRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    let _ = state.reap_finished_audio_media_worker()?;
+    state.playback_action(&window, |playback| {
+        playback.commit_audio_media_candidate(
+            request.plan_id.trim(),
+            request.sequence,
+            request.playback_generation,
+            request.source_revision,
+        );
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub fn prepare_audio_media_candidate(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: PrepareAudioMediaCandidateRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
+    let _ = state.reap_finished_audio_media_worker()?;
+    if state.audio_media_worker_is_running()? {
+        return Err(CommandErrorDto::new(
+            "media_worker_already_running",
+            "当前已有本地媒体候选 FFmpeg 在执行",
+        ));
+    }
+    let plan_id = request.plan_id.trim().to_owned();
+    if plan_id.is_empty() || plan_id.len() > 128 {
+        return Err(CommandErrorDto::new(
+            "audio_media_plan_id_invalid",
+            "声音候选 plan_id 必须为 1..=128 字节的非空字符串",
+        ));
+    }
+    if request.sequence == 0 {
+        return Err(CommandErrorDto::new(
+            "audio_media_sequence_invalid",
+            "声音候选 sequence 必须大于 0",
+        ));
+    }
+    if request.valid_until_absolute_position_ms <= request.target_absolute_position_ms {
+        return Err(CommandErrorDto::new(
+            "audio_media_target_window_invalid",
+            "声音候选有效终点必须晚于目标绝对媒体时间",
+        ));
+    }
+    let covered_duration_ms = request
+        .valid_until_absolute_position_ms
+        .checked_sub(request.target_absolute_position_ms)
+        .ok_or_else(|| {
+            CommandErrorDto::new(
+                "audio_media_target_window_invalid",
+                "声音候选绝对媒体窗口计算失败",
+            )
+        })?;
+    if covered_duration_ms > request.output_duration_ms {
+        return Err(CommandErrorDto::new(
+            "audio_media_output_window_too_short",
+            "声音候选输出时长不能覆盖目标绝对媒体窗口",
+        ));
+    }
+
+    let (
+        source_path,
+        source_duration_ms,
+        source_audio_start_ms,
+        source_audio_end_ms,
+        source_sample_rate_hz,
+        generation,
+        revision,
+        single,
+    ) = {
+        let playback = state
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+        let snapshot = playback.snapshot();
+        if snapshot.pending_audio_media_plan_id.is_some() {
+            return Err(CommandErrorDto::new(
+                "audio_media_candidate_pending",
+                "已有待提交声音候选，请先提交或丢弃",
+            ));
+        }
+        let source = snapshot
+            .source_media
+            .as_ref()
+            .ok_or_else(|| CommandErrorDto::new("source_media_required", "请先导入一个源媒体"))?;
+        if !snapshot.audio_processing_enabled {
+            return Err(CommandErrorDto::new(
+                "audio_processing_disabled",
+                "普通声音处理尚未开启",
+            ));
+        }
+        (
+            source.source_path.clone(),
+            source.duration_ms,
+            source.audio_start_ms,
+            source.audio_end_ms,
+            source.audio_sample_rate_hz,
+            snapshot.playback_generation,
+            snapshot.audio_stream_revision,
+            snapshot.source_media_pool.len() == 1,
+        )
+    };
+    if request.playback_generation != generation || request.source_revision != revision {
+        return Err(CommandErrorDto::new(
+            "stale_audio_media_candidate",
+            "声音候选绑定的播放代次或源修订已过期",
+        ));
+    }
+    if request.loop_source && !single {
+        return Err(CommandErrorDto::new(
+            "audio_media_source_loop_invalid",
+            "只有单项播放池声音候选允许跨 EOF 循环当前源媒体",
+        ));
+    }
+    validate_audio_candidate_source_window(
+        source_duration_ms,
+        source_audio_start_ms,
+        source_audio_end_ms,
+        request.source_start_ms,
+        request.output_duration_ms,
+        request.loop_source,
+    )?;
+
+    let target_root = runtime_resource_target_root(&app)
+        .map_err(|error| CommandErrorDto::new("runtime_resource_directory_unavailable", error))?;
+    let (ffmpeg_path, ffprobe_path) = configured_media_engine_paths_with_resource_dir(&target_root)
+        .map_err(|error| CommandErrorDto::new("media_engine_unavailable", error.to_string()))?;
+    let ambient_sound = resolve_user_ambient_sound(
+        &app,
+        &ffmpeg_path,
+        request.ambient_sound_path.as_deref(),
+        audio_mix_requires_ambient_sound(&request.params, &request.audio_variants),
+    )?;
+    let ambient_sound_path = ambient_sound
+        .as_ref()
+        .map(|selection| selection.path.clone());
+    build_audio_stream_filter_graph_with_ambient(
+        &request.params,
+        &request.audio_variants,
+        source_sample_rate_hz,
+        autolive_portaudio_output::DEFAULT_SAMPLE_RATE_HZ,
+        ambient_sound_path.is_some(),
+    )
+    .map_err(|error| CommandErrorDto::new("audio_stream_filter_invalid", error.to_string()))?;
+    let configuration = ValidatedAudioStreamConfiguration::new(
+        request.params.clone(),
+        request.audio_variants.clone(),
+    )
+    .map_err(|errors| {
+        CommandErrorDto::new(
+            "audio_stream_params_invalid",
+            errors
+                .iter()
+                .map(|error| format!("{}: {}", error.field, error.message))
+                .collect::<Vec<_>>()
+                .join("；"),
+        )
+    })?;
+
+    let candidate = state.with_playback(&window, |playback| {
+        let current = playback.snapshot();
+        if current.playback_generation != request.playback_generation
+            || current.audio_stream_revision != request.source_revision
+        {
+            return Err(CommandErrorDto::new(
+                "stale_audio_media_candidate",
+                "声音候选绑定的播放代次或源修订已过期",
+            ));
+        }
+        let candidate = PendingAudioMediaCandidateIdentity {
+            plan_id: plan_id.clone(),
+            sequence: request.sequence,
+            playback_generation: current.playback_generation,
+            source_revision: current.audio_stream_revision,
+            target_absolute_position_ms: request.target_absolute_position_ms,
+            source_start_ms: request.source_start_ms,
+            output_duration_ms: request.output_duration_ms,
+            valid_until_absolute_position_ms: request.valid_until_absolute_position_ms,
+        };
+        playback
+            .mark_audio_media_processing_running(candidate, configuration.clone())
+            .map_err(command_error_from_playback)
+    })?;
+    *state.ambient_sound.lock().map_err(|_| {
+        CommandErrorDto::new("ambient_sound_path_lock_failed", "环境声素材状态锁已损坏")
+    })? = ambient_sound;
+
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?
+        .join("media-processing");
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| CommandErrorDto::new("media_cache_nonce_failed", error.to_string()))?
+        .as_nanos();
+    let output_path = cache_dir.join(format!(
+        "processed-audio-g{generation}-s{}-{nonce}.m4a",
+        candidate.sequence
+    ));
+    let staging_path = cache_dir.join(format!(
+        "processed-audio-g{generation}-s{}-{nonce}.partial.m4a",
+        candidate.sequence
+    ));
+    let defaults = MediaEffectParams::default();
+    let media_request = MediaRenderRequest {
+        ffmpeg_path,
+        ffprobe_path,
+        input_mp4_path: PathBuf::from(source_path),
+        // 独立声音候选明确不映射视频流，即使输入是视频文件。
+        source_has_video: false,
+        ambient_input_path: ambient_sound_path,
+        source_duration_ms,
+        source_start_ms: request.source_start_ms,
+        output_duration_ms: request.output_duration_ms,
+        loop_source: request.loop_source,
+        staging_output_path: staging_path,
+        output_mp4_path: output_path.clone(),
+        video_processing_enabled: false,
+        audio_processing_enabled: true,
+        source_audio_sample_rate_hz: source_sample_rate_hz,
+        video: defaults.video,
+        audio: request.params,
+        audio_variants: request.audio_variants,
+        advanced: defaults.advanced,
+        timeout_seconds: MEDIA_CANDIDATE_TIMEOUT_SECONDS,
+        target: MediaRenderTarget::StandardMp4,
+    };
+    if let Err(error) = build_media_render_args(&media_request) {
+        state.with_playback(&window, |playback| {
+            playback.mark_audio_media_processing_failed(error.to_string());
+            Ok(())
+        })?;
+        return state.with_playback(&window, |playback| Ok(state.snapshot(playback)));
+    }
+
+    let cancellation = CancellationToken::new();
+    let playback = Arc::clone(&state.playback);
+    let completed = Arc::new(AtomicBool::new(false));
+    let completed_for_thread = Arc::clone(&completed);
+    let worker_cancellation = cancellation.clone();
+    let thread_app = app.clone();
+    let worker_candidate = candidate.clone();
+    let handle = thread::spawn(move || {
+        let progress_playback = Arc::clone(&playback);
+        let result = render_media_with_progress(&media_request, &worker_cancellation, |percent| {
+            if let Ok(mut playback) = progress_playback.lock() {
+                playback.mark_audio_media_processing_progress(percent);
+            }
+        });
+        if let Ok(mut playback) = playback.lock() {
+            match result {
+                Ok(rendered) => match allow_local_playback_asset_file(
+                    &thread_app,
+                    &rendered.output_mp4_path,
+                    "audio_media_asset_scope_failed",
+                    "处理后声音",
+                ) {
+                    Ok(()) => {
+                        if playback
+                            .mark_audio_media_processing_ready(
+                                &worker_candidate,
+                                rendered.output_mp4_path.display().to_string(),
+                                rendered.output_mp4_sha256,
+                            )
+                            .is_err()
+                        {
+                            let _ = std::fs::remove_file(rendered.output_mp4_path);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = std::fs::remove_file(rendered.output_mp4_path);
+                        playback.mark_audio_media_processing_failed(error.message);
+                    }
+                },
+                Err(error) => playback.mark_audio_media_processing_failed(error.to_string()),
+            }
+        } else if let Ok(rendered) = result {
+            let _ = std::fs::remove_file(rendered.output_mp4_path);
+        }
+        completed_for_thread.store(true, Ordering::Release);
+    });
+    if let Err(task) = state.install_audio_media_worker(BackgroundWorkerTask {
+        cancellation,
+        completed,
+        handle,
+    }) {
+        task.cancellation.cancel();
+        let _ = task.handle.join();
+        let _ = std::fs::remove_file(output_path);
+        state.with_playback(&window, |playback| {
+            playback.mark_audio_media_processing_failed("当前已有本地媒体候选 FFmpeg 在执行");
+            Ok(())
+        })?;
+        return Err(CommandErrorDto::new(
+            "media_worker_already_running",
+            "当前已有本地媒体候选 FFmpeg 在执行",
+        ));
+    }
+    state.with_playback(&window, |playback| Ok(state.snapshot(playback)))
+}
+
+#[tauri::command]
 pub fn start_media_processing(
     window: Window,
     app: AppHandle,
@@ -4895,11 +6760,48 @@ pub fn start_media_processing(
     request: StartMediaProcessingRequestDto,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
     state.ensure_main_window(&window)?;
-    let _ = state.reap_finished_media_worker()?;
-    if state.media_worker_is_running()? {
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
+    let _ = state.reap_finished_video_media_worker()?;
+    if state.video_media_worker_is_running()? {
         return Err(CommandErrorDto::new(
             "media_worker_already_running",
             "当前已有本地媒体处理 Worker 在执行",
+        ));
+    }
+    let plan_id = request.plan_id.trim().to_owned();
+    if plan_id.is_empty() || plan_id.len() > 128 {
+        return Err(CommandErrorDto::new(
+            "media_processing_plan_id_invalid",
+            "媒体候选 plan_id 必须为 1..=128 字节的非空字符串",
+        ));
+    }
+    if request.sequence == 0 {
+        return Err(CommandErrorDto::new(
+            "media_processing_sequence_invalid",
+            "媒体候选 sequence 必须大于 0",
+        ));
+    }
+    if request.valid_until_absolute_position_ms <= request.target_absolute_position_ms {
+        return Err(CommandErrorDto::new(
+            "media_processing_target_window_invalid",
+            "媒体候选有效终点必须晚于目标绝对媒体时间",
+        ));
+    }
+    let covered_absolute_duration_ms = request
+        .valid_until_absolute_position_ms
+        .checked_sub(request.target_absolute_position_ms)
+        .ok_or_else(|| {
+            CommandErrorDto::new(
+                "media_processing_target_window_invalid",
+                "媒体候选绝对媒体窗口计算失败",
+            )
+        })?;
+    if covered_absolute_duration_ms > request.output_duration_ms {
+        return Err(CommandErrorDto::new(
+            "media_processing_output_window_too_short",
+            "媒体候选输出时长不能覆盖目标绝对媒体窗口",
         ));
     }
     let validation = request.params.validate();
@@ -4913,28 +6815,98 @@ pub fn start_media_processing(
                 .join("；"),
         ));
     }
-    let (source_path, generation, video_enabled, audio_enabled, source_audio_sample_rate_hz) = {
+    let scope = request.scope.as_deref().unwrap_or("both");
+    match scope {
+        "video" | "audio" | "both" => {}
+        _ => {
+            return Err(CommandErrorDto::new(
+                "media_processing_scope_invalid",
+                "媒体处理 scope 只能是 video、audio 或 both",
+            ));
+        }
+    };
+    if request.require_atomic_video_admission {
+        if scope != "video" {
+            return Err(CommandErrorDto::new(
+                "media_processing_atomic_video_scope_invalid",
+                "83 项原子视频准入只允许用于独立 video 候选",
+            ));
+        }
+        build_atomic_media_video_effect_plan(&request.params.video, &request.params.advanced)
+            .map_err(|errors| {
+                CommandErrorDto::new(
+                    "media_processing_atomic_video_params_invalid",
+                    errors
+                        .iter()
+                        .map(|error| format!("{}: {}", error.field, error.reason))
+                        .collect::<Vec<_>>()
+                        .join("；"),
+                )
+            })?;
+    }
+    let (
+        source_path,
+        source_duration_ms,
+        generation,
+        source_has_video,
+        video_enabled,
+        audio_enabled,
+        source_audio_start_ms,
+        source_audio_end_ms,
+        source_audio_sample_rate_hz,
+        audio_stream_revision,
+        single_source_pool,
+    ) = {
         let playback = state
             .playback
             .lock()
             .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
         let snapshot = playback.snapshot();
-        let source_path = snapshot
+        let source = snapshot
             .source_media
             .as_ref()
-            .map(|source| source.source_path.clone())
-            .ok_or_else(|| CommandErrorDto::new("source_media_required", "请先导入一个源视频"))?;
+            .ok_or_else(|| CommandErrorDto::new("source_media_required", "请先导入一个源媒体"))?;
+        let source_path = source.source_path.clone();
         (
             source_path,
+            source.duration_ms,
             snapshot.playback_generation,
-            snapshot.video_processing_enabled,
-            snapshot.audio_processing_enabled,
-            snapshot
-                .source_media
-                .as_ref()
-                .and_then(|source| source.audio_sample_rate_hz),
+            source.media_kind == MediaKind::Video,
+            snapshot.video_processing_enabled
+                && source.media_kind == MediaKind::Video
+                && matches!(scope, "video" | "both"),
+            snapshot.audio_processing_enabled && matches!(scope, "audio" | "both"),
+            source.audio_start_ms,
+            source.audio_end_ms,
+            source.audio_sample_rate_hz,
+            snapshot.audio_stream_revision,
+            snapshot.source_media_pool.len() == 1,
         )
     };
+    if request.loop_source && !single_source_pool {
+        return Err(CommandErrorDto::new(
+            "media_processing_source_loop_invalid",
+            "只有单项播放池候选允许跨 EOF 循环当前源媒体",
+        ));
+    }
+    if request.playback_generation != generation
+        || (scope != "video" && request.source_revision != audio_stream_revision)
+    {
+        return Err(CommandErrorDto::new(
+            "stale_media_processing_candidate",
+            "媒体候选绑定的播放代次或源修订已过期",
+        ));
+    }
+    if audio_enabled {
+        validate_audio_candidate_source_window(
+            source_duration_ms,
+            source_audio_start_ms,
+            source_audio_end_ms,
+            request.source_start_ms,
+            request.output_duration_ms,
+            request.loop_source,
+        )?;
+    }
     let audio_variants = request.audio_variants.unwrap_or_default();
     if !video_enabled && !audio_enabled {
         return state.with_playback(&window, |playback| Ok(state.snapshot(playback)));
@@ -4963,7 +6935,7 @@ pub fn start_media_processing(
             &app,
             &ffmpeg_path,
             request.ambient_sound_path.as_deref(),
-            request.params.audio.ambient_sound_mix_percent > f64::EPSILON,
+            audio_mix_requires_ambient_sound(&request.params.audio, &audio_variants),
         )?
     } else {
         None
@@ -4981,7 +6953,16 @@ pub fn start_media_processing(
         )
         .map_err(|error| CommandErrorDto::new("audio_stream_filter_invalid", error.to_string()))?;
     }
-    state.with_playback(&window, |playback| {
+    let candidate_identity = state.with_playback(&window, |playback| {
+        let current = playback.snapshot();
+        if current.playback_generation != request.playback_generation
+            || (scope != "video" && current.audio_stream_revision != request.source_revision)
+        {
+            return Err(CommandErrorDto::new(
+                "stale_media_processing_candidate",
+                "媒体候选绑定的播放代次或源修订已过期",
+            ));
+        }
         if audio_enabled {
             playback
                 .set_audio_stream_configuration(
@@ -4999,57 +6980,64 @@ pub fn start_media_processing(
                     )
                 })?;
         }
+        let candidate_identity = PendingMediaCandidateIdentity {
+            plan_id: plan_id.clone(),
+            sequence: request.sequence,
+            playback_generation: current.playback_generation,
+            source_revision: playback.snapshot().audio_stream_revision,
+            target_absolute_position_ms: request.target_absolute_position_ms,
+            source_start_ms: request.source_start_ms,
+            output_duration_ms: request.output_duration_ms,
+            valid_until_absolute_position_ms: request.valid_until_absolute_position_ms,
+        };
         playback
-            .mark_media_processing_running()
-            .map_err(command_error_from_playback)
+            .mark_media_processing_running_with_candidate(candidate_identity.clone())
+            .map_err(command_error_from_playback)?;
+        Ok(candidate_identity)
     })?;
     if audio_enabled {
         *state.ambient_sound.lock().map_err(|_| {
             CommandErrorDto::new("ambient_sound_path_lock_failed", "环境声素材状态锁已损坏")
         })? = ambient_sound;
     }
-    // 普通声音处理不生成临时 MP4。PortAudio 直接从源视频解码并套用滤镜图；
-    // 没有硬件出口时，WebView 仍播放原视频流并保留实时预览回退。
-    if audio_enabled && !video_enabled {
-        return state.with_playback(&window, |playback| {
-            playback.mark_audio_processing_runtime();
-            Ok(state.snapshot(playback))
-        });
-    }
     let cache_dir = app
         .path()
         .app_cache_dir()
         .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?
         .join("media-processing");
-    // ponytail: 开渲前不清缓存；正在播的 processed 被删会静音
     std::fs::create_dir_all(&cache_dir)
         .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map_err(|error| CommandErrorDto::new("media_cache_nonce_failed", error.to_string()))?
         .as_nanos();
-    let output_mp4_path = cache_dir.join(format!("processed-g{generation}-{nonce}.mp4"));
-    let staging_output_path =
-        cache_dir.join(format!("processed-g{generation}-{nonce}.partial.mp4"));
-    let timeout_seconds = request.timeout_seconds.unwrap_or(6 * 60 * 60);
+    let sequence = candidate_identity.sequence;
+    let output_mp4_path =
+        cache_dir.join(format!("processed-g{generation}-s{sequence}-{nonce}.mp4"));
+    let staging_output_path = cache_dir.join(format!(
+        "processed-g{generation}-s{sequence}-{nonce}.partial.mp4"
+    ));
     let media_request = MediaRenderRequest {
         ffmpeg_path,
         ffprobe_path,
         input_mp4_path: PathBuf::from(&source_path),
+        source_has_video,
+        ambient_input_path: ambient_sound_path,
+        source_duration_ms,
+        source_start_ms: request.source_start_ms,
+        output_duration_ms: request.output_duration_ms,
+        loop_source: request.loop_source,
         staging_output_path,
         output_mp4_path: output_mp4_path.clone(),
         video_processing_enabled: video_enabled,
-        // 声音处理走 PortAudio 的实时 FFmpeg PCM 流，不写入视频缓存；
-        // 视频缓存只编码视觉效果，并复制源 AAC 作为 WebView 回退音轨。
-        audio_processing_enabled: false,
+        audio_processing_enabled: audio_enabled,
         source_audio_sample_rate_hz,
         video: request.params.video.clone(),
         audio: request.params.audio.clone(),
-        // 音频变体已在上方用经路径和 FFmpeg 解码校验的用户素材/打包底噪完成实时图校验并保存；
-        // 此请求只生成视频缓存，不能在没有音频第二输入时重复校验声音变体。
-        audio_variants: Vec::new(),
+        audio_variants,
         advanced: request.params.advanced.clone(),
-        timeout_seconds,
+        timeout_seconds: MEDIA_CANDIDATE_TIMEOUT_SECONDS,
+        target: MediaRenderTarget::StandardMp4,
     };
     if let Err(error) = build_media_render_args(&media_request) {
         state.with_playback(&window, |playback| {
@@ -5064,51 +7052,62 @@ pub fn start_media_processing(
     let completed_for_thread = Arc::clone(&completed);
     let worker_cancellation = cancellation.clone();
     let thread_app = app.clone();
+    let worker_candidate_identity = candidate_identity.clone();
     let handle = thread::spawn(move || {
-        let result = render_media(&media_request, &worker_cancellation);
+        let progress_playback = Arc::clone(&playback);
+        let result = render_media_with_progress(&media_request, &worker_cancellation, |percent| {
+            if let Ok(mut playback) = progress_playback.lock() {
+                if playback.snapshot().playback_generation == generation {
+                    playback.mark_video_processing_progress(percent);
+                }
+            }
+        });
         if let Ok(mut playback) = playback.lock() {
-            let current_generation = playback.snapshot().playback_generation;
-            if current_generation == generation {
+            if playback.snapshot().playback_generation == generation {
                 match result {
-                    Ok(rendered) => {
-                        match allow_local_playback_asset_file(
-                            &thread_app,
-                            &rendered.output_mp4_path,
-                            "media_processing_asset_scope_failed",
-                            "处理后视频",
-                        ) {
-                            Ok(()) => {
-                                let _ = playback.mark_media_processing_ready(
-                                    generation,
-                                    rendered.output_mp4_path.display().to_string(),
-                                    rendered.output_mp4_sha256,
-                                );
+                    Ok(rendered) => match allow_local_playback_asset_file(
+                        &thread_app,
+                        &rendered.output_mp4_path,
+                        "media_processing_asset_scope_failed",
+                        "处理后音视频",
+                    ) {
+                        Ok(()) => {
+                            let accepted = playback.mark_media_processing_ready_for_candidate(
+                                &worker_candidate_identity,
+                                rendered.output_mp4_path.display().to_string(),
+                                rendered.output_mp4_sha256,
+                            );
+                            if accepted.is_err() {
+                                let _ = std::fs::remove_file(rendered.output_mp4_path);
                             }
-                            Err(error) => playback.mark_media_processing_failed(error.message),
                         }
-                    }
+                        Err(error) => {
+                            let _ = std::fs::remove_file(rendered.output_mp4_path);
+                            playback.mark_media_processing_failed(error.message)
+                        }
+                    },
                     Err(error) => playback.mark_media_processing_failed(error.to_string()),
                 }
-            } else {
-                // 根因：generation 漂移时若不清 processing，UI 会永久卡死并拒启新任务
-                playback.mark_media_processing_failed(format!(
-                    "媒体处理结果已过期（generation {generation} → {current_generation}），请重新应用"
-                ));
+            } else if let Ok(rendered) = result {
+                let _ = std::fs::remove_file(rendered.output_mp4_path);
             }
+        } else if let Ok(rendered) = result {
+            let _ = std::fs::remove_file(rendered.output_mp4_path);
         }
         completed_for_thread.store(true, Ordering::Release);
     });
-    if let Err(task) = state.install_media_worker(BackgroundWorkerTask {
+    if let Err(task) = state.install_video_media_worker(BackgroundWorkerTask {
         cancellation,
         completed,
         handle,
     }) {
         task.cancellation.cancel();
-        let _join_result = task.handle.join();
-        let _ = state.with_playback(&window, |playback| {
+        let _ = task.handle.join();
+        let _ = std::fs::remove_file(output_mp4_path);
+        state.with_playback(&window, |playback| {
             playback.mark_media_processing_failed("当前已有本地媒体处理 Worker 在执行");
             Ok(())
-        });
+        })?;
         return Err(CommandErrorDto::new(
             "media_worker_already_running",
             "当前已有本地媒体处理 Worker 在执行",
@@ -5192,9 +7191,12 @@ fn disable_media_processing_on_final_effect_close(app: &AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
-    let _ = state.stop_media_worker();
+    let _ = state.stop_media_workers();
     let _ = state.stop_speech_worker();
     let _ = state.stop_audio_mixer();
+    if let Ok(mut runtime) = state.realtime_video_runtime.lock() {
+        runtime.stop();
+    }
     // 关窗释放 PortAudio，避免设备被占。
     if let Ok(mut preferred) = state.audio_output_preferred.lock() {
         *preferred = false;
@@ -5211,11 +7213,19 @@ fn disable_media_processing_on_final_effect_close(app: &AppHandle) {
 fn attach_final_effect_close_cleanup(app: &AppHandle, window: &tauri::WebviewWindow) {
     let app_handle = app.clone();
     window.on_window_event(move |event| {
+        let destroyed = matches!(event, tauri::WindowEvent::Destroyed);
         if matches!(
             event,
             tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
         ) {
             disable_media_processing_on_final_effect_close(&app_handle);
+        }
+        if destroyed {
+            if let Err(error) = purge_media_processing_cache(&app_handle) {
+                eprintln!(
+                    "failed to purge media processing cache after final effect close: {error}"
+                );
+            }
         }
     });
 }
@@ -5234,7 +7244,7 @@ pub async fn open_final_effect_window(
             })?;
         false
     } else {
-        // ponytail: 先默认尺寸创建，有分辨率时立刻按工作区 clamp 调整
+        // 先按默认尺寸创建；窗口加载后由最终效果页的 resize effect 调整。
         let window =
             WebviewWindowBuilder::new(&app, "final-effect", WebviewUrl::App("index.html".into()))
                 .title("GpAutoLive 最终效果")
@@ -5249,8 +7259,12 @@ pub async fn open_final_effect_window(
         attach_final_effect_close_cleanup(&app, &window);
         true
     };
-    if let Some(request) = request {
-        let _ = resize_final_effect_window_for_app(&app, request)?;
+    // Wry 创建新窗口时只把任务排入主事件循环；此时立即读取
+    // monitor/size 会在 WebView2 仍在创建时无界等待。已有窗口才在此处调整。
+    if !created {
+        if let Some(request) = request {
+            let _ = resize_final_effect_window_for_app(&app, request, false)?;
+        }
     }
     Ok(FinalEffectWindowDto {
         label: "final-effect".to_owned(),
@@ -5282,7 +7296,7 @@ pub fn resize_final_effect_window(
             "当前窗口不允许调整播放窗口尺寸",
         ));
     }
-    resize_final_effect_window_for_app(&app, request)
+    resize_final_effect_window_for_app(&app, request, false)
 }
 
 fn resolve_final_effect_monitor(
@@ -5306,6 +7320,7 @@ fn resolve_final_effect_monitor(
 fn resize_final_effect_window_for_app(
     app: &AppHandle,
     request: ResizeFinalEffectWindowRequestDto,
+    center_after_resize: bool,
 ) -> Result<FinalEffectWindowSizeDto, CommandErrorDto> {
     let window = app.get_webview_window("final-effect").ok_or_else(|| {
         CommandErrorDto::new(
@@ -5375,12 +7390,14 @@ fn resize_final_effect_window_for_app(
         .map_err(|error| {
             CommandErrorDto::new("final_effect_window_resize_failed", error.to_string())
         })?;
-    if let Err(error) = window.center() {
-        let _ = window.set_size(PhysicalSize::new(previous_size.width, previous_size.height));
-        return Err(CommandErrorDto::new(
-            "final_effect_window_resize_failed",
-            error.to_string(),
-        ));
+    if center_after_resize {
+        if let Err(error) = window.center() {
+            let _ = window.set_size(PhysicalSize::new(previous_size.width, previous_size.height));
+            return Err(CommandErrorDto::new(
+                "final_effect_window_resize_failed",
+                error.to_string(),
+            ));
+        }
     }
 
     Ok(FinalEffectWindowSizeDto {
@@ -5395,6 +7412,9 @@ pub fn start_playback(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
     let snapshot = state.playback_action(&window, PlaybackCore::start)?;
     state.resume_audio_output(&app)?;
     Ok(snapshot)
@@ -5405,6 +7425,9 @@ pub fn pause_playback(
     window: Window,
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
     let snapshot = state.playback_action(&window, PlaybackCore::pause)?;
     state.pause_audio_output()?;
     Ok(snapshot)
@@ -5416,6 +7439,9 @@ pub fn resume_playback(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
     let snapshot = state.playback_action(&window, PlaybackCore::resume)?;
     state.resume_audio_output(&app)?;
     Ok(snapshot)
@@ -5442,9 +7468,17 @@ pub fn stop_playback(
     window: Window,
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
+    state.stop_media_workers()?;
     state.stop_audio_for_playback()?;
     state.stop_speech_worker()?;
-    state.stop_media_worker()?;
+    state
+        .realtime_video_runtime
+        .lock()
+        .map_err(|_| CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏"))?
+        .stop();
     state.with_playback_window(&window, |playback| {
         playback.stop();
         Ok(state.snapshot(playback))
@@ -5465,7 +7499,7 @@ pub fn complete_playback_loop(
         request.playback_generation,
         request.target_loop_index,
     ) {
-        Ok(false) => return Ok(PlaybackSnapshotDto::from(current)),
+        Ok(false) => return Ok(state.snapshot_from_core(current)),
         Err(message) => {
             return Err(CommandErrorDto::new(
                 "invalid_playback_loop_target",
@@ -5526,18 +7560,23 @@ fn complete_playback_item_inner(
     .map_err(|message| CommandErrorDto::new("invalid_playback_item_identity", message))?;
     if !should_advance {
         return Ok(CompletePlaybackItemResultDto {
-            snapshot: PlaybackSnapshotDto::from(current),
+            snapshot: state.snapshot_from_core(current),
             source_changed: false,
         });
     }
 
     let source_will_change = current.source_media_pool.len() > 1;
     if source_will_change {
+        state.stop_audio_media_worker()?;
         state.stop_audio_for_playback()?;
         state.stop_speech_worker()?;
-        state.stop_media_worker()?;
     } else {
         state.stop_speech_worker()?;
+    }
+
+    if source_will_change {
+        state.stop_video_media_worker()?;
+        state.stop_realtime_video_runtime()?;
     }
 
     let (mut snapshot, source_changed) = state.with_playback_window(window, |playback| {
@@ -5583,12 +7622,33 @@ fn complete_playback_item_inner(
 #[tauri::command]
 pub fn commit_media_processing_if_ready(
     window: Window,
+    app: AppHandle,
     state: State<'_, AppState>,
+    request: CommitMediaProcessingRequestDto,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    state.playback_action(&window, |playback| {
-        playback.commit_media_processing_if_ready();
-        Ok(())
-    })
+    let _ = state.reap_finished_video_media_worker()?;
+    let (outcome, snapshot) = state.with_playback_window(&window, |playback| {
+        let outcome = playback.commit_media_processing_if_ready(
+            request.plan_id.trim(),
+            request.sequence,
+            request.playback_generation,
+            request.source_revision,
+            request.observed_absolute_position_ms,
+        );
+        Ok((outcome, state.snapshot(playback)))
+    })?;
+    if let MediaProcessingCommitOutcome::Expired {
+        artifact_path: Some(path),
+    } = outcome
+    {
+        let cache_dir = app
+            .path()
+            .app_cache_dir()
+            .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?
+            .join("media-processing");
+        remove_managed_media_processing_artifact(&cache_dir, Path::new(&path))?;
+    }
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -5597,20 +7657,23 @@ pub fn set_processing_switches(
     state: State<'_, AppState>,
     request: ProcessingSwitchesRequestDto,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    let should_stop_media_worker = {
+    let (video_switch_changed, audio_switch_changed) = {
         let playback = state
             .playback
             .lock()
             .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
         let snapshot = playback.snapshot();
-        snapshot.video_processing_enabled != request.video_processing_enabled
-            || snapshot.audio_processing_enabled != request.audio_processing_enabled
-            || (snapshot.audio_processing_enabled
-                && snapshot.realtime_audio_variant_enabled
-                    != request.realtime_audio_variant_enabled)
+        (
+            snapshot.video_processing_enabled != request.video_processing_enabled,
+            snapshot.audio_processing_enabled != request.audio_processing_enabled,
+        )
     };
-    if should_stop_media_worker {
-        state.stop_media_worker()?;
+    if video_switch_changed {
+        state.stop_video_media_worker()?;
+        state.stop_realtime_video_runtime()?;
+    }
+    if audio_switch_changed {
+        state.stop_audio_media_worker()?;
     }
     if !request.realtime_audio_variant_enabled {
         state.stop_speech_worker()?;
@@ -5636,7 +7699,7 @@ pub fn set_audio_processing_profile(
     request: AudioProcessingProfileRequestDto,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
     // 只更新配置，不打断正在跑的 FFmpeg；新参数由下一轮 start_media_processing 消费。
-    let _ = state.reap_finished_media_worker()?;
+    let _ = state.reap_finished_audio_media_worker()?;
     state.with_playback(&window, |playback| {
         playback
             .set_audio_processing_profile(request.profile)
@@ -5657,22 +7720,29 @@ pub fn set_audio_processing_profile(
 fn validate_interlude_processing_request(
     request: &StartPortAudioInterludeRequestDto,
 ) -> Result<(), CommandErrorDto> {
-    ValidatedAudioStreamConfiguration::new(request.audio.clone(), request.audio_variants.clone())
-        .map_err(|errors| {
-        CommandErrorDto::new(
-            "interlude_audio_stream_params_invalid",
-            errors
-                .iter()
-                .map(|error| format!("{}: {}", error.field, error.message))
-                .collect::<Vec<_>>()
-                .join("；"),
-        )
-    })?;
-    if let Some((index, _)) = request
-        .audio_variants
+    validate_interlude_audio_params(&request.audio, &request.audio_variants)
+}
+
+fn validate_interlude_audio_params(
+    audio: &AudioEffectParams,
+    audio_variants: &[AudioEffectParams],
+) -> Result<(), CommandErrorDto> {
+    ValidatedAudioStreamConfiguration::new(audio.clone(), audio_variants.to_vec()).map_err(
+        |errors| {
+            CommandErrorDto::new(
+                "interlude_audio_stream_params_invalid",
+                errors
+                    .iter()
+                    .map(|error| format!("{}: {}", error.field, error.message))
+                    .collect::<Vec<_>>()
+                    .join("；"),
+            )
+        },
+    )?;
+    if let Some((index, _)) = audio_variants
         .iter()
         .enumerate()
-        .find(|(_, variant)| variant.playback_speed != request.audio.playback_speed)
+        .find(|(_, variant)| variant.playback_speed != audio.playback_speed)
     {
         return Err(CommandErrorDto::new(
             "interlude_audio_variant_speed_mismatch",
@@ -5784,9 +7854,9 @@ pub fn set_interlude_config(
         )
     })?;
     state.ensure_running()?;
-    state.with_playback(&window, move |playback| {
+    state.with_playback(&window, |playback| {
         playback.set_interlude_snapshot(snapshot.clone());
-        Ok(PlaybackSnapshotDto::from(playback.snapshot()))
+        Ok(state.snapshot(playback))
     })
 }
 
@@ -5796,7 +7866,7 @@ pub async fn start_portaudio_interlude(
     app: AppHandle,
     state: State<'_, AppState>,
     request: StartPortAudioInterludeRequestDto,
-) -> Result<(), CommandErrorDto> {
+) -> Result<StartPortAudioInterludeResultDto, CommandErrorDto> {
     state.ensure_playback_window(&window)?;
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -5883,7 +7953,7 @@ fn prepare_webview_interlude_blocking(
         &app,
         &ffmpeg_path,
         state.ambient_sound_selection()?.as_ref(),
-        request.audio.ambient_sound_mix_percent > f64::EPSILON,
+        audio_mix_requires_ambient_sound(&request.audio, &request.audio_variants),
     ) {
         Ok(selection) => selection,
         Err(error) => {
@@ -5983,7 +8053,11 @@ fn start_portaudio_interlude_blocking(
     app: AppHandle,
     state: AppState,
     request: StartPortAudioInterludeRequestDto,
-) -> Result<(), CommandErrorDto> {
+) -> Result<StartPortAudioInterludeResultDto, CommandErrorDto> {
+    let operation_token = state
+        .interlude_prepare_token
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
     let _prepare_guard = state.interlude_prepare_lock.lock().map_err(|_| {
         CommandErrorDto::new(
             "interlude_prepare_lock_failed",
@@ -5991,6 +8065,7 @@ fn start_portaudio_interlude_blocking(
         )
     })?;
     state.ensure_running()?;
+    ensure_interlude_operation_current(&state, operation_token)?;
     validate_interlude_processing_request(&request)?;
     let snapshot = state
         .playback
@@ -6026,7 +8101,7 @@ fn start_portaudio_interlude_blocking(
         &app,
         &ffmpeg_path,
         state.ambient_sound_selection()?.as_ref(),
-        request.audio.ambient_sound_mix_percent > f64::EPSILON,
+        audio_mix_requires_ambient_sound(&request.audio, &request.audio_variants),
     )?;
     let ambient_sound_path = ambient_sound.map(|selection| selection.path);
     let filter_plan = build_audio_stream_filter_graph_with_ambient(
@@ -6038,16 +8113,16 @@ fn start_portaudio_interlude_blocking(
     )
     .map_err(|error| CommandErrorDto::new("interlude_audio_filter_invalid", error.to_string()))?;
 
-    state.stop_interlude_mixer()?;
+    state.stop_interlude_mixer_current()?;
     let minimum_ready_ms = usize::try_from(output_status.playback_watermark_ms)
         .unwrap_or(AUDIO_CANDIDATE_COMMIT_TAIL_MS)
         .max(AUDIO_CANDIDATE_COMMIT_TAIL_MS);
     // 插话是立即叠加，不是远期候选；只预热硬件水位即可，避免固定等待 1 秒。
     let buffer_ms = minimum_ready_ms;
     let started_at = Instant::now();
-    let mut task = AudioMixerTask::start_scheduled_candidate_with_filter_and_variant_count(
+    let mut task = AudioMixerTask::start_finite_scheduled_candidate_with_filter_and_variant_count(
         ffmpeg_path,
-        canonical_path,
+        canonical_path.clone(),
         output_status.sample_rate_hz,
         0,
         0,
@@ -6065,6 +8140,10 @@ fn start_portaudio_interlude_blocking(
     )
     .map_err(|error| CommandErrorDto::new("interlude_decoder_start_failed", error))?;
     while !task.is_ready() {
+        if let Err(error) = ensure_interlude_operation_current(&state, operation_token) {
+            task.stop_preserving_output();
+            return Err(error);
+        }
         if let Err(error) = state.ensure_running() {
             task.stop_preserving_output();
             return Err(error);
@@ -6089,6 +8168,11 @@ fn start_portaudio_interlude_blocking(
         task.stop_preserving_output();
         return Err(error);
     }
+    ensure_interlude_operation_current(&state, operation_token)?;
+    let generation = state
+        .interlude_session_generation
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
     if let Err(error) = output_control.start_interlude(
         task.output_track(),
         AudioInterludeMixConfig {
@@ -6101,11 +8185,19 @@ fn start_portaudio_interlude_blocking(
         task.stop_preserving_output();
         return Err(CommandErrorDto::new("interlude_output_start_failed", error));
     }
+    if let Err(error) = ensure_interlude_operation_current(&state, operation_token) {
+        let _ = output_control.stop_interlude();
+        task.stop_preserving_output();
+        return Err(error);
+    }
     let replaced = match state.interlude_mixer.lock() {
-        Ok(mut current) => current.replace(task),
+        Ok(mut current) => current.replace(ActiveInterludeMixer {
+            generation,
+            source_path: canonical_path,
+            task,
+        }),
         Err(_) => {
             let _ = output_control.stop_interlude();
-            task.stop_preserving_output();
             return Err(CommandErrorDto::new(
                 "interlude_mixer_lock_failed",
                 "PortAudio 插话混音状态锁已损坏",
@@ -6113,16 +8205,306 @@ fn start_portaudio_interlude_blocking(
         }
     };
     if let Some(mut replaced) = replaced {
-        replaced.stop_preserving_output();
+        replaced.task.stop_preserving_output();
     }
-    Ok(())
+    Ok(StartPortAudioInterludeResultDto { generation })
+}
+
+fn ensure_interlude_operation_current(
+    state: &AppState,
+    operation_token: u64,
+) -> Result<(), CommandErrorDto> {
+    if state.interlude_prepare_token.load(Ordering::Acquire) == operation_token {
+        Ok(())
+    } else {
+        Err(CommandErrorDto::new(
+            "interlude_operation_stale",
+            "插话操作已被更新的开始、切换或停止请求取消",
+        ))
+    }
 }
 
 fn db_to_linear_gain(db: f64, maximum: f32) -> f32 {
     if !db.is_finite() {
         return 0.0;
     }
+    if db <= -60.0 {
+        return 0.0;
+    }
     (10_f64.powf(db / 20.0) as f32).clamp(0.0, maximum)
+}
+
+fn validate_portaudio_media_gain(
+    request: &SetPortAudioMediaVolumeRequestDto,
+) -> Result<f32, CommandErrorDto> {
+    if !request.volume.is_finite() || !(0.0..=1.0).contains(&request.volume) {
+        return Err(CommandErrorDto::new(
+            "portaudio_media_volume_invalid",
+            "PortAudio 主媒体音量必须是 0–1 的有限数值",
+        ));
+    }
+    Ok(if request.muted {
+        0.0
+    } else {
+        request.volume as f32
+    })
+}
+
+fn validate_portaudio_interlude_gain(volume_db: f64) -> Result<f32, CommandErrorDto> {
+    if !volume_db.is_finite() || !(-60.0..=12.0).contains(&volume_db) {
+        return Err(CommandErrorDto::new(
+            "portaudio_interlude_volume_invalid",
+            "PortAudio 插话音量必须是 -60–12dB 的有限数值",
+        ));
+    }
+    Ok(db_to_linear_gain(volume_db, 4.0))
+}
+
+#[tauri::command]
+pub fn set_portaudio_media_volume(
+    window: Window,
+    state: State<'_, AppState>,
+    request: SetPortAudioMediaVolumeRequestDto,
+) -> Result<(), CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let gain = validate_portaudio_media_gain(&request)?;
+    state
+        .audio_output_control()?
+        .set_media_gain(gain)
+        .map_err(|error| CommandErrorDto::new("portaudio_media_volume_update_failed", error))
+}
+
+#[tauri::command]
+pub fn set_portaudio_interlude_volume(
+    window: Window,
+    state: State<'_, AppState>,
+    request: SetPortAudioInterludeVolumeRequestDto,
+) -> Result<(), CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let gain = validate_portaudio_interlude_gain(request.volume_db)?;
+    state
+        .audio_output_control()?
+        .set_interlude_gain(gain)
+        .map_err(|error| CommandErrorDto::new("portaudio_interlude_volume_update_failed", error))
+}
+
+#[tauri::command]
+pub async fn switch_portaudio_interlude_preset(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: SwitchPortAudioInterludePresetRequestDto,
+) -> Result<SwitchPortAudioInterludePresetResultDto, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        switch_portaudio_interlude_preset_blocking(app, state, request)
+    })
+    .await
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "interlude_switch_task_failed",
+            format!("PortAudio 插话声音预设切换任务失败：{error}"),
+        )
+    })?
+}
+
+fn switch_portaudio_interlude_preset_blocking(
+    app: AppHandle,
+    state: AppState,
+    request: SwitchPortAudioInterludePresetRequestDto,
+) -> Result<SwitchPortAudioInterludePresetResultDto, CommandErrorDto> {
+    if request.generation == 0 {
+        return Err(CommandErrorDto::new(
+            "interlude_generation_invalid",
+            "插话会话代际必须大于 0",
+        ));
+    }
+    if request.media_position_ms > MAX_INTERLUDE_MEDIA_POSITION_MS {
+        return Err(CommandErrorDto::new(
+            "interlude_media_position_invalid",
+            "插话媒体位置超过允许的 24 小时上限",
+        ));
+    }
+    validate_interlude_audio_params(&request.audio, &request.audio_variants)?;
+    let _prepare_guard = state.interlude_prepare_lock.lock().map_err(|_| {
+        CommandErrorDto::new(
+            "interlude_prepare_lock_failed",
+            "PortAudio 插话创建锁已损坏",
+        )
+    })?;
+    state.ensure_running()?;
+    let operation_token = state
+        .interlude_prepare_token
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    let source_path = {
+        let current = state.interlude_mixer.lock().map_err(|_| {
+            CommandErrorDto::new(
+                "interlude_mixer_lock_failed",
+                "PortAudio 插话混音状态锁已损坏",
+            )
+        })?;
+        let active = current.as_ref().ok_or_else(|| {
+            CommandErrorDto::new("interlude_not_active", "当前没有活动的 PortAudio 插话")
+        })?;
+        if active.generation != request.generation {
+            return Err(CommandErrorDto::new(
+                "interlude_generation_stale",
+                "插话会话代际已过期，保留当前插话预设",
+            ));
+        }
+        active.source_path.clone()
+    };
+    let snapshot = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot();
+    let source_path_text = source_path.to_string_lossy();
+    let canonical_path = validate_interlude_audio_path(&snapshot, &source_path_text)?;
+    let output_control = state.audio_output_control()?;
+    let output_status = output_control
+        .status()
+        .filter(|status| {
+            status.health.application_running
+                && matches!(
+                    status.health.hardware_state,
+                    autolive_portaudio_output::PortAudioHardwareState::Active
+                )
+                && !status.callback_paused
+        })
+        .ok_or_else(|| {
+            CommandErrorDto::new(
+                "interlude_portaudio_inactive",
+                "PortAudio 实际出口未处于活动状态，保留当前插话预设",
+            )
+        })?;
+    let target_root = runtime_resource_target_root(&app)
+        .map_err(|error| CommandErrorDto::new("media_resource_dir_failed", error))?;
+    let (ffmpeg_path, _) = configured_media_engine_paths_with_resource_dir(&target_root)
+        .map_err(|error| CommandErrorDto::new("media_engine_unavailable", error.to_string()))?;
+    let ambient_sound = resolve_active_ambient_sound(
+        &app,
+        &ffmpeg_path,
+        state.ambient_sound_selection()?.as_ref(),
+        audio_mix_requires_ambient_sound(&request.audio, &request.audio_variants),
+    )?;
+    let ambient_sound_path = ambient_sound.map(|selection| selection.path);
+    let filter_plan = build_audio_stream_filter_graph_with_ambient(
+        &request.audio,
+        &request.audio_variants,
+        None,
+        output_status.sample_rate_hz,
+        ambient_sound_path.is_some(),
+    )
+    .map_err(|error| CommandErrorDto::new("interlude_audio_filter_invalid", error.to_string()))?;
+    let minimum_ready_ms = usize::try_from(output_status.playback_watermark_ms)
+        .unwrap_or(AUDIO_CANDIDATE_COMMIT_TAIL_MS)
+        .max(AUDIO_CANDIDATE_COMMIT_TAIL_MS);
+    let started_at = Instant::now();
+    let mut pending =
+        AudioMixerTask::start_finite_scheduled_candidate_with_filter_and_variant_count(
+            ffmpeg_path,
+            canonical_path,
+            output_status.sample_rate_hz,
+            request.media_position_ms,
+            request.media_position_ms,
+            Some(filter_plan.filter_graph),
+            filter_plan.quality_pitch,
+            filter_plan.pcm_effects,
+            filter_plan
+                .requires_ambient_input
+                .then_some(ambient_sound_path)
+                .flatten(),
+            request.audio.playback_speed,
+            minimum_ready_ms,
+            minimum_ready_ms,
+            started_at,
+        )
+        .map_err(|error| CommandErrorDto::new("interlude_decoder_start_failed", error))?;
+    while !pending.is_ready() {
+        if let Err(error) = ensure_interlude_operation_current(&state, operation_token) {
+            pending.stop_preserving_output();
+            return Err(error);
+        }
+        if let Err(error) = state.ensure_running() {
+            pending.stop_preserving_output();
+            return Err(error);
+        }
+        if let Some(error) = pending.failure() {
+            pending.stop_preserving_output();
+            return Err(CommandErrorDto::new(
+                "interlude_decode_failed",
+                format!("插话候选解码失败，保留当前预设：{error}"),
+            ));
+        }
+        if started_at.elapsed() >= Duration::from_millis(PORTAUDIO_SWITCH_READY_TIMEOUT_MS) {
+            pending.stop_preserving_output();
+            return Err(CommandErrorDto::new(
+                "interlude_decode_timeout",
+                "插话候选未在 5000ms 内达到安全水位，保留当前预设",
+            ));
+        }
+        thread::sleep(Duration::from_millis(PORTAUDIO_SWITCH_READY_POLL_MS));
+    }
+    ensure_interlude_operation_current(&state, operation_token)?;
+    let generation_is_current = {
+        let current = state.interlude_mixer.lock().map_err(|_| {
+            CommandErrorDto::new(
+                "interlude_mixer_lock_failed",
+                "PortAudio 插话混音状态锁已损坏",
+            )
+        })?;
+        current
+            .as_ref()
+            .is_some_and(|active| active.generation == request.generation)
+    };
+    if !generation_is_current {
+        pending.stop_preserving_output();
+        return Err(CommandErrorDto::new(
+            "interlude_generation_stale",
+            "插话会话代际已过期，保留当前插话预设",
+        ));
+    }
+    output_control
+        .crossfade_interlude_to(pending.output_track())
+        .map_err(|error| {
+            pending.stop_preserving_output();
+            CommandErrorDto::new("interlude_output_switch_failed", error)
+        })?;
+    if let Err(error) = ensure_interlude_operation_current(&state, operation_token) {
+        let _ = output_control.stop_interlude();
+        pending.stop_preserving_output();
+        return Err(error);
+    }
+    let replaced = {
+        let mut current = state.interlude_mixer.lock().map_err(|_| {
+            CommandErrorDto::new(
+                "interlude_mixer_lock_failed",
+                "PortAudio 插话混音状态锁已损坏",
+            )
+        })?;
+        match current.as_mut() {
+            Some(active) if active.generation == request.generation => {
+                std::mem::swap(&mut active.task, &mut pending);
+                true
+            }
+            _ => false,
+        }
+    };
+    if !replaced {
+        pending.stop_preserving_output();
+        return Err(CommandErrorDto::new(
+            "interlude_generation_stale",
+            "插话在提交候选前已经停止或切换，候选已释放",
+        ));
+    }
+    pending.stop_preserving_output();
+    Ok(SwitchPortAudioInterludePresetResultDto {
+        generation: request.generation,
+        media_position_ms: request.media_position_ms,
+    })
 }
 
 #[tauri::command]
@@ -6131,6 +8513,7 @@ pub fn pause_portaudio_interlude(
     state: State<'_, AppState>,
 ) -> Result<(), CommandErrorDto> {
     state.ensure_playback_window(&window)?;
+    state.interlude_prepare_token.fetch_add(1, Ordering::AcqRel);
     state
         .audio_output_control()?
         .pause_interlude()
@@ -6155,13 +8538,20 @@ pub fn stop_portaudio_interlude(
     state: State<'_, AppState>,
 ) -> Result<(), CommandErrorDto> {
     state.ensure_playback_window(&window)?;
+    state.interlude_prepare_token.fetch_add(1, Ordering::AcqRel);
+    state
+        .interlude_session_generation
+        .fetch_add(1, Ordering::AcqRel);
+    if let Ok(control) = state.audio_output_control() {
+        let _ = control.stop_interlude();
+    }
     let _prepare_guard = state.interlude_prepare_lock.lock().map_err(|_| {
         CommandErrorDto::new(
             "interlude_prepare_lock_failed",
             "PortAudio 插话创建锁已损坏",
         )
     })?;
-    state.stop_interlude_mixer()
+    state.stop_interlude_mixer_current()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -6369,6 +8759,19 @@ pub fn restore_original_audio(
 }
 
 #[tauri::command]
+pub fn restore_original_video(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    state.ensure_playback_window(&window)?;
+    state.stop_realtime_video_runtime()?;
+    state.with_playback_window(&window, |playback| {
+        playback.restore_original_video();
+        Ok(state.snapshot(playback))
+    })
+}
+
+#[tauri::command]
 pub fn stage_audio_variant_candidate(
     window: Window,
     state: State<'_, AppState>,
@@ -6442,17 +8845,21 @@ pub fn get_snapshot(
     window: Window,
     state: State<'_, AppState>,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    // 轮询时回收已完成 Worker，避免状态一直停在 processing。
-    let _ = state.reap_finished_media_worker()?;
-    let worker_running = state.media_worker_is_running()?;
+    // 轮询时分别回收已完成 Worker，避免任一领域一直停在 processing。
+    let _ = state.reap_finished_video_media_worker()?;
+    let _ = state.reap_finished_audio_media_worker()?;
+    let video_worker_running = state.video_media_worker_is_running()?;
+    let audio_worker_running = state.audio_media_worker_is_running()?;
     let clear_stale_processing = |playback: &mut PlaybackCore| {
         let snapshot = playback.snapshot();
-        let stuck = !worker_running
-            && (snapshot.audio_processing_status == "processing"
-                || snapshot.video_processing_status == "processing");
-        if stuck {
+        if !video_worker_running && snapshot.video_processing_status == "processing" {
             playback.mark_media_processing_failed(
-                "媒体处理 Worker 已结束但状态未更新，已恢复可用（请重新应用）",
+                "视频处理 Worker 已结束但状态未更新，已恢复可用（请重新应用）",
+            );
+        }
+        if !audio_worker_running && snapshot.audio_processing_status == "processing" {
+            playback.mark_audio_media_processing_failed(
+                "声音处理 Worker 已结束但状态未更新，已恢复可用（请重新应用）",
             );
         }
     };
@@ -6528,6 +8935,11 @@ fn command_error_from_playback(error: PlaybackError) -> CommandErrorDto {
         PlaybackError::SourceMediaRequired => "source_media_required",
         PlaybackError::SourceMediaPoolEmpty => "source_media_pool_empty",
         PlaybackError::SourceMediaPoolTooLarge { .. } => "source_media_pool_too_large",
+        PlaybackError::SourceMediaPoolIndexOutOfBounds { .. } => {
+            "source_media_pool_index_out_of_bounds"
+        }
+        PlaybackError::SourceMediaPathEmpty { .. } => "empty_source_media_path",
+        PlaybackError::DuplicateSourceMediaPath { .. } => "duplicate_source_media_path",
         PlaybackError::InvalidMediaProcessingOutput => "invalid_media_processing_output",
         PlaybackError::StaleMediaProcessing => "stale_media_processing",
         PlaybackError::InvalidTransition { .. } => "invalid_playback_transition",
@@ -6714,46 +9126,200 @@ mod tests {
     use super::development_executable_ready;
     use super::{
         absolute_media_position_ms, add_wall_clock_delay_to_media_position_ms,
-        ambient_sound_source_label, audio_crossfade_error_code, audio_cycle_cancel_matches_pending,
-        audio_cycle_commit_due, audio_cycle_crossfade_failure,
+        ambient_sound_source_label, apply_source_media_order, audio_crossfade_error_code,
+        audio_cycle_cancel_matches_pending, audio_cycle_commit_due, audio_cycle_crossfade_failure,
         audio_cycle_target_is_within_horizon, audio_cycle_target_validation_code,
-        audio_sync_clock_rejection_code, db_to_linear_gain, insert_canonical_source_path,
-        is_retryable_audio_mixer_error, mark_audio_resume_failure,
+        audio_mix_requires_ambient_sound, audio_sync_clock_rejection_code,
+        compile_gpu83_realtime_parameters, db_to_linear_gain, ensure_interlude_operation_current,
+        insert_canonical_source_path, is_retryable_audio_mixer_error, join_background_worker_until,
+        lock_current_media_import, mark_audio_resume_failure, reorder_source_media_pool,
         resolve_audio_candidate_pcm_position_ms, resolve_audio_commit_position_ms,
         resolve_audio_output_latency_ms, resolve_audio_sync_clock,
         scheduled_candidate_commit_tail_ms, should_complete_playback_item,
         should_complete_playback_loop, should_defer_source_sync_for_pending_candidate,
-        signed_millis_delta, take_pending_audio_mixer, validate_audio_sync_clock,
+        signed_millis_delta, source_media_index_by_path, take_pending_audio_mixer,
+        validate_audio_candidate_source_window, validate_audio_sync_clock,
+        validate_portaudio_interlude_gain, validate_portaudio_media_gain,
         validate_source_media_paths, validate_source_media_pool_count,
         webview_interlude_original_fallback, AmbientSoundSource, AppState, AudioSyncClock,
-        BackgroundWorkerTask, CommandErrorDto, PlaybackSnapshotDto, AUDIO_SYNC_CLOCK_EXPIRED,
-        MAX_SOURCE_MEDIA_PATH_BYTES,
+        BackgroundWorkerTask, CommandErrorDto, PlaybackSnapshotDto,
+        SetPortAudioMediaVolumeRequestDto, AUDIO_CANDIDATE_OUTSIDE_SOURCE_AUDIO_WINDOW_CODE,
+        AUDIO_SYNC_CLOCK_EXPIRED, MAX_SOURCE_MEDIA_PATH_BYTES,
     };
     use autolive_desktop_core::cancellation::CancellationToken;
-    use autolive_desktop_core::media_effect_params::AudioEffectParams;
-    use autolive_desktop_core::media_library::SourceMediaDto;
+    use autolive_desktop_core::media_effect_params::{AudioEffectParams, MediaEffectParams};
+    use autolive_desktop_core::media_library::{MediaCompatibilityMode, MediaKind, SourceMediaDto};
+    use autolive_desktop_core::realtime_video_backend::MpvCommand;
     use autolive_desktop_core::runtime_resource_task::RuntimeResourceTaskShutdown;
     use autolive_desktop_core::PlaybackCore;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn playback_test_source(file_name: &str) -> SourceMediaDto {
         SourceMediaDto {
             source_path: format!("C:/videos/{file_name}"),
+            playback_reference: format!("C:/videos/{file_name}"),
+            media_kind: MediaKind::Video,
+            compatibility_mode: MediaCompatibilityMode::Direct,
             file_name: file_name.to_owned(),
             file_size_bytes: 1,
             duration_ms: Some(1_000),
             width: Some(1280),
             height: Some(720),
             frame_rate_fps: Some(30.0),
+            audio_start_ms: Some(0),
+            audio_end_ms: Some(1_000),
             audio_sample_rate_hz: Some(48_000),
             audio_channel_count: Some(2),
+            video_codec_name: Some("h264".to_owned()),
+            audio_codec_name: Some("aac".to_owned()),
             mp4_sha256: None,
             mp4_hash_status: "disabled".to_owned(),
         }
+    }
+
+    #[test]
+    fn gpu83_cycle_compiles_to_one_atomic_shader_options_command() {
+        let compiled = compile_gpu83_realtime_parameters(&MediaEffectParams::default())
+            .expect("default GPU83 snapshot");
+        assert_eq!(compiled.commands.len(), 1);
+        assert!(matches!(
+            &compiled.commands[0],
+            MpvCommand::SetShaderOptions { options }
+                if options.as_str().contains("al_brightness_percent=0")
+        ));
+        assert!(compiled.support.fully_supported);
+
+        let mut unavailable = MediaEffectParams::default();
+        unavailable.video.frame_rate_jitter_percent = 1.0;
+        let compiled = compile_gpu83_realtime_parameters(&unavailable)
+            .expect("valid but not-yet-mapped GPU83 snapshot");
+        assert_eq!(compiled.commands.len(), 1);
+        assert!(!compiled.support.fully_supported);
+        assert!(compiled.support.parameters.iter().any(|parameter| {
+            parameter.field == "video.frame_rate_jitter_percent"
+                && parameter.active
+                && !parameter.supported
+        }));
+    }
+
+    #[test]
+    fn audio_candidate_source_window_accepts_unknown_metadata() {
+        assert!(validate_audio_candidate_source_window(
+            Some(60_000),
+            None,
+            None,
+            55_000,
+            5_000,
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn audio_candidate_source_window_rejects_disjoint_multi_item_tail() {
+        let error = validate_audio_candidate_source_window(
+            Some(44_468),
+            Some(0),
+            Some(44_102),
+            44_200,
+            268,
+            false,
+        )
+        .expect_err("the container-only tail must not start an audio worker");
+
+        assert_eq!(error.code, AUDIO_CANDIDATE_OUTSIDE_SOURCE_AUDIO_WINDOW_CODE);
+    }
+
+    #[test]
+    fn audio_candidate_source_window_accepts_partial_multi_item_overlap() {
+        assert!(validate_audio_candidate_source_window(
+            Some(44_468),
+            Some(1_000),
+            Some(44_102),
+            43_800,
+            668,
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn audio_candidate_source_window_accepts_single_item_wrap_into_next_audio_window() {
+        assert!(validate_audio_candidate_source_window(
+            Some(44_468),
+            Some(0),
+            Some(44_102),
+            44_200,
+            1_000,
+            true,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn audio_candidate_source_window_rejects_single_item_gap_without_wrap_overlap() {
+        let error = validate_audio_candidate_source_window(
+            Some(60_000),
+            Some(10_000),
+            Some(20_000),
+            30_000,
+            5_000,
+            true,
+        )
+        .expect_err("a looped request can still be wholly inside the source audio gap");
+
+        assert_eq!(error.code, AUDIO_CANDIDATE_OUTSIDE_SOURCE_AUDIO_WINDOW_CODE);
+    }
+
+    #[test]
+    fn audio_candidate_source_window_treats_touching_boundaries_as_disjoint() {
+        assert!(validate_audio_candidate_source_window(
+            Some(60_000),
+            Some(10_000),
+            Some(20_000),
+            20_000,
+            5_000,
+            false,
+        )
+        .is_err());
+        assert!(validate_audio_candidate_source_window(
+            Some(60_000),
+            Some(10_000),
+            Some(20_000),
+            5_000,
+            5_000,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ambient_sound_is_required_when_any_audio_variant_uses_it() {
+        let base = AudioEffectParams::default();
+        let mut variant = base.clone();
+        variant.ambient_sound_mix_percent = 0.1;
+
+        assert!(!audio_mix_requires_ambient_sound(&base, &[]));
+        assert!(audio_mix_requires_ambient_sound(&base, &[variant]));
+    }
+
+    #[test]
+    fn superseded_media_import_cannot_acquire_commit_ownership() {
+        let state = AppState::default();
+        let first = state
+            .begin_media_import()
+            .expect("first import should start");
+        let second = state
+            .begin_media_import()
+            .expect("second import should supersede the first");
+
+        assert!(first.cancellation.is_cancelled());
+        assert!(lock_current_media_import(&state, &first).is_err());
+        assert!(lock_current_media_import(&state, &second).is_ok());
     }
 
     #[cfg(unix)]
@@ -6809,6 +9375,78 @@ mod tests {
         }
     }
 
+    fn release_controlled_background_worker() -> (
+        BackgroundWorkerTask,
+        CancellationToken,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let cancellation = CancellationToken::new();
+        let cancellation_observer = cancellation.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_for_thread = Arc::clone(&completed);
+        let (release, released) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = released.recv();
+            completed_for_thread.store(true, Ordering::Release);
+        });
+        (
+            BackgroundWorkerTask {
+                cancellation,
+                completed,
+                handle,
+            },
+            cancellation_observer,
+            release,
+        )
+    }
+
+    #[test]
+    fn media_worker_stop_timeout_keeps_the_slot_owned_and_rejects_replacement() {
+        let state = AppState::default();
+        let (worker, cancellation, release) = release_controlled_background_worker();
+        state
+            .install_video_media_worker(worker)
+            .expect("video worker should be installed");
+
+        let started_at = Instant::now();
+        let error = state
+            .stop_media_worker_slot(
+                &state.video_media_worker,
+                "video_media_worker_lock_failed",
+                "视频 Worker 状态锁已损坏",
+                "视频 Worker",
+                Duration::from_millis(20),
+            )
+            .expect_err("a worker that ignores cancellation should time out");
+
+        assert_eq!(error.code, "media_worker_stop_timeout");
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+        assert!(cancellation.is_cancelled());
+        assert!(state.video_media_worker.lock().unwrap().is_some());
+
+        let replacement = cancellable_background_worker();
+        let replacement = state
+            .install_video_media_worker(replacement)
+            .expect_err("timed out worker must keep the domain slot occupied");
+        replacement.cancellation.cancel();
+        replacement
+            .handle
+            .join()
+            .expect("rejected replacement should stop");
+
+        release.send(()).expect("blocked worker should be released");
+        assert_eq!(
+            join_background_worker_until(
+                &state.video_media_worker,
+                "视频 Worker 状态锁已损坏",
+                Instant::now(),
+                Duration::from_secs(1),
+            )
+            .expect("released worker should join"),
+            RuntimeResourceTaskShutdown::Joined
+        );
+    }
+
     #[test]
     fn app_shutdown_cancels_and_joins_every_background_worker() {
         let state = AppState::default();
@@ -6819,8 +9457,11 @@ mod tests {
             .install_speech_worker(cancellable_background_worker())
             .expect("speech worker should be installed");
         state
-            .install_media_worker(cancellable_background_worker())
-            .expect("media worker should be installed");
+            .install_video_media_worker(cancellable_background_worker())
+            .expect("video worker should be installed");
+        state
+            .install_audio_media_worker(cancellable_background_worker())
+            .expect("audio worker should be installed");
 
         let shutdown = state
             .shutdown_all(Duration::from_secs(1))
@@ -6832,7 +9473,8 @@ mod tests {
             .expect("cache protections should be readable")
             .is_empty());
         assert!(state.speech_worker.lock().unwrap().is_none());
-        assert!(state.media_worker.lock().unwrap().is_none());
+        assert!(state.video_media_worker.lock().unwrap().is_none());
+        assert!(state.audio_media_worker.lock().unwrap().is_none());
         assert_eq!(
             state
                 .begin_audio_mixer_prepare()
@@ -6843,8 +9485,15 @@ mod tests {
 
         let late_worker = cancellable_background_worker();
         let late_worker = state
-            .install_media_worker(late_worker)
-            .expect_err("shutdown gate must reject a late worker");
+            .install_video_media_worker(late_worker)
+            .expect_err("shutdown gate must reject a late video worker");
+        late_worker.cancellation.cancel();
+        late_worker.handle.join().expect("late worker should stop");
+
+        let late_worker = cancellable_background_worker();
+        let late_worker = state
+            .install_audio_media_worker(late_worker)
+            .expect_err("shutdown gate must reject a late audio worker");
         late_worker.cancellation.cancel();
         late_worker.handle.join().expect("late worker should stop");
     }
@@ -6960,8 +9609,73 @@ mod tests {
     fn interlude_decibel_values_are_bounded_for_the_portaudio_bus() {
         assert!((db_to_linear_gain(0.0, 4.0) - 1.0).abs() < f32::EPSILON);
         assert!((db_to_linear_gain(-12.0, 1.0) - 0.251_188_64).abs() < 1e-6);
+        assert_eq!(db_to_linear_gain(-60.0, 1.0), 0.0);
         assert_eq!(db_to_linear_gain(12.0, 1.0), 1.0);
         assert_eq!(db_to_linear_gain(f64::NAN, 1.0), 0.0);
+    }
+
+    #[test]
+    fn portaudio_media_volume_validation_keeps_mute_on_the_main_bus_only() {
+        assert_eq!(
+            validate_portaudio_media_gain(&SetPortAudioMediaVolumeRequestDto {
+                volume: 0.4,
+                muted: false,
+            })
+            .unwrap(),
+            0.4
+        );
+        assert_eq!(
+            validate_portaudio_media_gain(&SetPortAudioMediaVolumeRequestDto {
+                volume: 0.4,
+                muted: true,
+            })
+            .unwrap(),
+            0.0
+        );
+        for volume in [-0.01, 1.01, f64::NAN] {
+            assert_eq!(
+                validate_portaudio_media_gain(&SetPortAudioMediaVolumeRequestDto {
+                    volume,
+                    muted: false,
+                })
+                .unwrap_err()
+                .code,
+                "portaudio_media_volume_invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn portaudio_interlude_volume_keeps_its_independent_decibel_range() {
+        assert_eq!(validate_portaudio_interlude_gain(-60.0).unwrap(), 0.0);
+        assert!((validate_portaudio_interlude_gain(12.0).unwrap() - 3.981_071_7).abs() < 1e-6);
+        for volume_db in [-60.01, 12.01, f64::INFINITY] {
+            assert_eq!(
+                validate_portaudio_interlude_gain(volume_db)
+                    .unwrap_err()
+                    .code,
+                "portaudio_interlude_volume_invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn newer_interlude_operation_invalidates_stale_candidate_commit() {
+        let state = AppState::default();
+        let token = state
+            .interlude_prepare_token
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        assert!(ensure_interlude_operation_current(&state, token).is_ok());
+
+        state.interlude_prepare_token.fetch_add(1, Ordering::AcqRel);
+
+        assert_eq!(
+            ensure_interlude_operation_current(&state, token)
+                .unwrap_err()
+                .code,
+            "interlude_operation_stale"
+        );
     }
 
     #[test]
@@ -7141,18 +9855,180 @@ mod tests {
     }
 
     #[test]
-    fn video_only_cache_request_does_not_revalidate_realtime_audio_variants() {
+    fn independent_audio_candidate_is_bounded_audio_only_and_uses_its_worker_slot() {
+        let source = include_str!("commands.rs");
+        let function = source
+            .split("pub fn prepare_audio_media_candidate")
+            .nth(1)
+            .expect("independent audio candidate command")
+            .split("pub fn start_media_processing")
+            .next()
+            .expect("independent audio candidate command end");
+
+        assert!(function.contains("source_has_video: false"));
+        assert!(function.contains("video_processing_enabled: false"));
+        assert!(function.contains("audio_processing_enabled: true"));
+        assert!(function.contains(".partial.m4a"));
+        assert!(function.contains("processed-audio-g"));
+        assert!(function.contains("state.install_audio_media_worker"));
+        assert!(!function.contains("thread::spawn(move || thread::spawn"));
+    }
+
+    #[test]
+    fn audio_source_window_is_checked_before_processing_state_changes() {
+        let source = include_str!("commands.rs");
+        let independent_audio = source
+            .split("pub fn prepare_audio_media_candidate")
+            .nth(1)
+            .expect("independent audio candidate command")
+            .split("pub fn start_media_processing")
+            .next()
+            .expect("independent audio candidate command end");
+        let combined_media = source
+            .split("pub fn start_media_processing")
+            .nth(1)
+            .expect("combined media command")
+            .split("pub async fn direct_model_chat")
+            .next()
+            .expect("combined media command end");
+
+        let independent_validation = independent_audio
+            .find("validate_audio_candidate_source_window(")
+            .expect("independent audio source window validation");
+        let independent_state_change = independent_audio
+            .find("mark_audio_media_processing_running(")
+            .expect("independent audio processing state change");
+        assert!(independent_validation < independent_state_change);
+
+        let combined_validation = combined_media
+            .find("validate_audio_candidate_source_window(")
+            .expect("combined media audio source window validation");
+        let combined_state_change = combined_media
+            .find("mark_media_processing_running_with_candidate(")
+            .expect("combined media processing state change");
+        assert!(combined_validation < combined_state_change);
+    }
+
+    #[test]
+    fn candidate_discard_commands_never_stop_processing_workers() {
+        let source = include_str!("commands.rs");
+        let video_discard = source
+            .split("pub fn discard_media_processing_candidate")
+            .nth(1)
+            .expect("video discard command")
+            .split("pub fn release_audio_media_candidate")
+            .next()
+            .expect("video discard command end");
+        let audio_discard = source
+            .split("pub fn discard_audio_media_candidate")
+            .nth(1)
+            .expect("audio discard command")
+            .split("pub fn commit_audio_media_candidate")
+            .next()
+            .expect("audio discard command end");
+
+        assert!(!video_discard.contains("stop_video_media_worker"));
+        assert!(!audio_discard.contains("stop_audio_media_worker"));
+    }
+
+    #[test]
+    fn media_processing_respects_independent_video_and_audio_scopes() {
         let source = include_str!("commands.rs");
         let request = source
-            .split("let media_request = MediaRenderRequest")
+            .split("pub fn start_media_processing")
             .nth(1)
-            .expect("start_media_processing media request")
-            .split("if let Err(error) = build_media_render_args")
+            .expect("start_media_processing function")
+            .split("pub fn direct_model_chat")
             .next()
-            .expect("media request end");
+            .expect("start_media_processing function end");
 
-        assert!(request.contains("audio_processing_enabled: false"));
-        assert!(request.contains("audio_variants: Vec::new()"));
+        assert!(request.contains("matches!(scope, \"video\" | \"both\")"));
+        assert!(request.contains("matches!(scope, \"audio\" | \"both\")"));
+        assert!(request.contains("scope != \"video\" && request.source_revision"));
+        assert!(request.contains("if audio_enabled"));
+        assert!(request.contains("MediaRenderRequest"));
+        assert!(request.contains("audio_processing_enabled: audio_enabled"));
+        assert!(request.contains("render_media_with_progress("));
+        assert!(request.contains(".partial.mp4"));
+        let audio_commit = request
+            .find(".set_audio_stream_configuration(")
+            .expect("audio configuration should commit");
+        let candidate_identity = request
+            .find("let candidate_identity = PendingMediaCandidateIdentity")
+            .expect("candidate identity should be created");
+        assert!(audio_commit < candidate_identity);
+        assert!(request.contains("source_revision: playback.snapshot().audio_stream_revision"));
+        assert!(!request.contains("spawn_video_effect_stream_session("));
+    }
+
+    #[test]
+    fn video_backend_plan_identity_does_not_depend_on_audio_stream_revision() {
+        let source = include_str!("commands.rs");
+        let prepare = source
+            .split("pub fn prepare_realtime_video_plan")
+            .nth(1)
+            .expect("prepare realtime video function")
+            .split("pub fn commit_realtime_video_plan")
+            .next()
+            .expect("prepare realtime video function end");
+        let commit = source
+            .split("pub fn commit_realtime_video_plan")
+            .nth(1)
+            .expect("commit realtime video function")
+            .split("pub fn sync_realtime_video_renderer")
+            .next()
+            .expect("commit realtime video function end");
+
+        for function in [prepare, commit] {
+            assert!(function.contains("playback_generation"));
+            assert!(!function.contains("snapshot.audio_stream_revision"));
+        }
+        assert!(prepare.contains("request.source_revision != VIDEO_BACKEND_SOURCE_REVISION"));
+        assert!(commit.contains("request.source_revision != VIDEO_BACKEND_SOURCE_REVISION"));
+        assert!(prepare.contains("source_revision: request.source_revision"));
+        assert!(commit.contains("source_revision: request.source_revision"));
+        let support_gate = prepare
+            .find("if !compiled.support.fully_supported")
+            .expect("unsupported GPU83 fields must be rejected");
+        let renderer_prepare = prepare
+            .find("runtime\n        .prepare")
+            .expect("renderer prepare call");
+        assert!(support_gate < renderer_prepare);
+    }
+
+    #[test]
+    fn realtime_video_fallback_is_truthful_original_without_old_ffmpeg_ipc() {
+        let source = include_str!("commands.rs");
+        let fallback = source
+            .split("fn record_realtime_video_fallback")
+            .nth(1)
+            .expect("realtime fallback helper")
+            .split("fn final_effect_host_window_id")
+            .next()
+            .expect("realtime fallback helper end");
+
+        assert!(fallback.contains("record_source_backend"));
+        assert!(!fallback.contains("record_ffmpeg_backend"));
+        let removed_command = ["pub fn activate_", "ffmpeg_video_backend"].concat();
+        assert!(!source.contains(&removed_command));
+    }
+
+    #[test]
+    fn changing_file_processing_switches_stops_only_the_matching_worker() {
+        let source = include_str!("commands.rs");
+        let command = source
+            .split("pub fn set_processing_switches")
+            .nth(1)
+            .expect("set_processing_switches function")
+            .split("pub fn set_audio_processing_profile")
+            .next()
+            .expect("set_processing_switches function end");
+
+        assert!(command.contains("if video_switch_changed"));
+        assert!(command.contains("state.stop_video_media_worker()?;"));
+        assert!(!command.contains("media_video_stream"));
+        assert!(command.contains("if audio_switch_changed"));
+        assert!(command.contains("state.stop_audio_media_worker()?"));
     }
 
     #[test]
@@ -7351,6 +10227,73 @@ mod tests {
         assert!(
             validate_source_media_paths(&["a".repeat(MAX_SOURCE_MEDIA_PATH_BYTES + 1)]).is_err()
         );
+    }
+
+    #[test]
+    fn playback_pool_path_identity_rejects_stale_or_invalid_reorders() {
+        let pool = vec![playback_test_source("a.mp4"), playback_test_source("b.mp4")];
+        let a = pool[0].source_path.clone();
+        let b = pool[1].source_path.clone();
+
+        assert_eq!(
+            source_media_index_by_path(&pool, &b).expect("stable path should resolve"),
+            1
+        );
+        let reordered = reorder_source_media_pool(&pool, &[b.clone(), a.clone()])
+            .expect("complete unique order should be accepted");
+        assert_eq!(reordered[0].source_path, b);
+        assert_eq!(reordered[1].source_path, a.clone());
+
+        assert!(source_media_index_by_path(&pool, "missing.mp4").is_err());
+        assert!(reorder_source_media_pool(&pool, std::slice::from_ref(&a)).is_err());
+        assert!(reorder_source_media_pool(&pool, &[a.clone(), a]).is_err());
+    }
+
+    #[test]
+    fn playback_pool_same_order_is_an_idempotent_no_op() {
+        let mut playback = PlaybackCore::default();
+        playback
+            .set_source_pool(vec![
+                playback_test_source("a.mp4"),
+                playback_test_source("b.mp4"),
+            ])
+            .expect("pool should be valid");
+        playback.start().expect("pool should start");
+        let before = playback.snapshot();
+        let source_paths = before
+            .source_media_pool
+            .iter()
+            .map(|source| source.source_path.clone())
+            .collect::<Vec<_>>();
+
+        apply_source_media_order(&mut playback, &source_paths)
+            .expect("same order should be accepted");
+
+        assert_eq!(playback.snapshot(), before);
+    }
+
+    #[test]
+    fn playback_commands_share_the_pool_transition_boundary() {
+        let source = include_str!("commands.rs");
+        for (start, end) in [
+            ("pub fn start_media_processing", "pub fn direct_model_chat"),
+            ("pub fn start_playback", "pub fn pause_playback"),
+            ("pub fn pause_playback", "pub fn resume_playback"),
+            ("pub fn resume_playback", "pub fn update_playback_position"),
+            ("pub fn stop_playback", "pub fn complete_playback_loop"),
+        ] {
+            let body = source
+                .split(start)
+                .nth(1)
+                .expect("command should exist")
+                .split(end)
+                .next()
+                .expect("command end should exist");
+            assert!(
+                body.contains("playback_transition.lock()"),
+                "{start} must serialize with pool edits"
+            );
+        }
     }
 
     #[test]

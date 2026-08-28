@@ -137,9 +137,10 @@ func TestMetricRouteIncludesAdminModelLeaseList(t *testing.T) {
 func TestMetricsExposeRateLimitAndAuditFailureCounters(t *testing.T) {
 	handler := newTestRouter(t)
 	start := make(chan struct{})
-	responses := make(chan int, 6)
+	const attempts = 21
+	responses := make(chan int, attempts)
 	var group sync.WaitGroup
-	for attempt := 0; attempt < 6; attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		group.Add(1)
 		go func() {
 			defer group.Done()
@@ -166,8 +167,8 @@ func TestMetricsExposeRateLimitAndAuditFailureCounters(t *testing.T) {
 			t.Fatalf("login status = %d, want 401 or 429", status)
 		}
 	}
-	if unauthorized != 5 || rateLimited != 1 {
-		t.Fatalf("login statuses = unauthorized %d, rate_limited %d; want 5/1", unauthorized, rateLimited)
+	if unauthorized != authLoginAccountRateLimitPolicy.burst || rateLimited != 1 {
+		t.Fatalf("login statuses = unauthorized %d, rate_limited %d; want %d/1", unauthorized, rateLimited, authLoginAccountRateLimitPolicy.burst)
 	}
 
 	metricsRec := doJSON(t, handler, http.MethodGet, "/metrics", nil, "", "")

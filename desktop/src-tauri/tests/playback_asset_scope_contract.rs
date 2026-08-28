@@ -31,7 +31,7 @@ fn imported_source_video_is_registered_with_tauri_asset_scope() {
 }
 
 #[test]
-fn processed_video_is_registered_before_it_becomes_pending_playback() {
+fn media_processing_builds_one_audio_video_candidate_file() {
     let source = std::fs::read_to_string("src/commands.rs")
         .expect("commands.rs should be readable from the crate root");
     let command = command_body(
@@ -40,17 +40,13 @@ fn processed_video_is_registered_before_it_becomes_pending_playback() {
         "#[tauri::command]\npub fn direct_model_chat(",
     );
 
-    let registration = command
-        .find("allow_local_playback_asset_file(")
-        .expect("the rendered video should enter the asset scope");
-    let state_commit = command
-        .find("playback.mark_media_processing_ready(")
-        .expect("the rendered video should become pending playback");
-
-    assert!(
-        registration < state_commit,
-        "scope registration must succeed before processed playback is exposed"
-    );
+    assert!(command.contains("MediaRenderRequest"));
+    assert!(command.contains("audio_processing_enabled: audio_enabled"));
+    assert!(command.contains("render_media_with_progress("));
+    assert!(command.contains(".partial.mp4"));
+    assert!(command.contains("mark_media_processing_ready_for_candidate("));
+    assert!(!command.contains("spawn_video_effect_stream_session("));
+    assert!(!source.contains("MediaStreamTask::start("));
 }
 
 #[test]

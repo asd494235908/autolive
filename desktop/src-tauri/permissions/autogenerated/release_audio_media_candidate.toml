@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-release-audio-media-candidate"
+description = "Enables the release_audio_media_candidate command without any pre-configured scope."
+commands.allow = ["release_audio_media_candidate"]
+
+[[permission]]
+identifier = "deny-release-audio-media-candidate"
+description = "Denies the release_audio_media_candidate command without any pre-configured scope."
+commands.deny = ["release_audio_media_candidate"]

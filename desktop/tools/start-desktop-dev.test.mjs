@@ -8,6 +8,22 @@ import { resolveDevEnvironment } from './start-desktop-dev.mjs';
 
 const desktopRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
+test('开发启动默认使用固定测试控制面并允许显式环境变量覆盖', () => {
+  const defaults = resolveDevEnvironment({ root: desktopRoot, env: {} });
+  assert.equal(defaults.VITE_CONTROL_PLANE_BASE_URL, 'http://101.96.208.132:9090');
+  assert.equal(defaults.VITE_CONTROL_PLANE_ENV, 'test');
+
+  const overrides = resolveDevEnvironment({
+    root: desktopRoot,
+    env: {
+      VITE_CONTROL_PLANE_BASE_URL: 'https://control.example.com',
+      VITE_CONTROL_PLANE_ENV: 'production',
+    },
+  });
+  assert.equal(overrides.VITE_CONTROL_PLANE_BASE_URL, 'https://control.example.com');
+  assert.equal(overrides.VITE_CONTROL_PLANE_ENV, 'production');
+});
+
 test('开发启动只自动注入 FFmpeg 资源', () => {
   const environment = resolveDevEnvironment({
     root: desktopRoot,
@@ -64,14 +80,18 @@ test('测试 Tauri capability 只放行明确的测试控制面 origin', () => {
   assert.ok(testConfig.app.security.capabilities.includes('test-control-plane'));
   assert.deepEqual(testHttpPermission.allow, [
     { url: 'http://127.0.0.1:18090/**' },
-    { url: 'https://admin.example.com/**' },
     { url: 'http://101.96.208.132:9090/**' },
+    { url: 'https://admin.example.com/**' },
   ]);
   assert.equal(
     defaultCapability.permissions.find((permission) => permission?.identifier === 'http:default')?.allow.some(
       (entry) => entry.url.includes('101.96.208.132'),
     ),
     false,
+  );
+  assert.equal(
+    testHttpPermission.allow.some((entry) => entry.url === 'http://101.96.208.132:9090/**'),
+    true,
   );
 });
 

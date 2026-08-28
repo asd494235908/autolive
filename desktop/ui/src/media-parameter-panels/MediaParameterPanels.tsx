@@ -1,9 +1,8 @@
-import { useEffect, useId, useRef, useState, type CSSProperties } from 'react';
-import { Alert, Card, Progress, Spin, Tag, Typography, theme } from 'antd';
+import { memo, useId, useState, type CSSProperties } from 'react';
+import { Alert, Card, Spin, Tag, Typography, theme } from 'antd';
 
 import {
   MEDIA_PARAMETER_DEFINITIONS,
-  MEDIA_PARAMETER_STATUS_LABELS,
   VISUAL_BAND_FREQUENCIES_HZ,
   getMediaParameterPath,
   type MediaParameterDefinition,
@@ -17,11 +16,9 @@ import type {
 } from './media-parameter-types';
 import {
   REFERENCE_IMAGE_ACCENT_COLORS,
-  createMediaParameterValueSignature,
   createRandomParameterAccents,
   type ParameterAccent,
 } from './parameter-panel-feedback';
-import { normalizeMediaParameterProgress } from './media-parameter-progress';
 import './media-parameter-panels.css';
 
 const SECTION_LABELS: Record<MediaParameterSection, string> = {
@@ -33,12 +30,6 @@ const SECTION_LABELS: Record<MediaParameterSection, string> = {
 const PARAMETER_ACCENT_PATHS = (['video', 'advanced', 'audio'] as const).flatMap((section) => (
   MEDIA_PARAMETER_DEFINITIONS[section].map(getMediaParameterPath)
 ));
-
-const STATUS_COLORS: Record<MediaParameterStatus, string> = {
-  implemented: 'success',
-  planned: 'warning',
-  pending_confirmation: 'default',
-};
 
 const numberFormatter = new Intl.NumberFormat('zh-CN', {
   maximumFractionDigits: 3,
@@ -69,12 +60,10 @@ function NumericValue({
   definition,
   value,
   labelId,
-  progressColor,
 }: {
   definition: NumericParameterDefinition;
   value: unknown;
   labelId: string;
-  progressColor: string;
 }) {
   const numericValue = getSafeNumber(value);
   const emptyText = definition.kind === 'readonly-number' ? '尚未测量' : '未设置';
@@ -83,102 +72,70 @@ function NumericValue({
     : `${formatNumber(numericValue)}${definition.unit ? ` ${definition.unit}` : ''}`;
 
   return (
-    <div aria-labelledby={labelId} className="media-parameter-card__numeric-value">
-      <Typography.Text className="media-parameter-card__value" strong>
-        {valueText}
-      </Typography.Text>
-      <div className="media-parameter-card__progress">
-        <Progress
-          aria-label={`${definition.label}：${valueText}；范围 ${definition.min}–${definition.max}${definition.unit ? ` ${definition.unit}` : ''}`}
-          percent={normalizeMediaParameterProgress(numericValue, definition.min, definition.max)}
-          showInfo={false}
-          size={[4, 4]}
-          steps={16}
-          strokeColor={progressColor}
-        />
-      </div>
-    </div>
+    <Typography.Text aria-labelledby={labelId} className="media-parameter-card__value" strong>
+      {valueText}
+    </Typography.Text>
   );
 }
 
-function BandWeightsValue({
+const BandWeightCards = memo(function BandWeightCards({
   value,
-  labelId,
   definition,
   progressColor,
+  status,
 }: {
   value: unknown;
-  labelId: string;
   definition: Extract<MediaParameterDefinition, { kind: 'band-weights' }>;
   progressColor: string;
+  status: MediaParameterStatus;
 }) {
   const weights = typeof value === 'object' && value !== null
     ? value as Record<string, unknown>
     : {};
 
   return (
-    <div aria-labelledby={labelId} className="media-parameter-card__bands">
+    <>
       {VISUAL_BAND_FREQUENCIES_HZ.map((frequencyHz) => {
         const weight = getSafeNumber(weights[String(frequencyHz)]);
         const valueText = weight === null ? '未设置' : `${formatNumber(weight)} ${definition.unit}`;
         return (
-          <div className="media-parameter-card__band" key={frequencyHz}>
-            <div className="media-parameter-card__band-label">
-              <span>{frequencyHz} Hz</span>
-              <span>{valueText}</span>
+          <Card
+            className="media-parameter-card media-parameter-card--band"
+            key={frequencyHz}
+            size="small"
+            style={{ '--media-parameter-accent': progressColor, borderInlineStartColor: progressColor } as CSSProperties}
+            styles={{ body: { padding: 4 } }}
+          >
+            <div className="media-parameter-card__header">
+              <Typography.Text>{frequencyHz} Hz 权重</Typography.Text>
+              <div className="media-parameter-card__result">
+                <Typography.Text className="media-parameter-card__value" strong>{valueText}</Typography.Text>
+                {status === 'implemented' ? null : <Tag color={status === 'planned' ? 'warning' : 'default'}>{status === 'planned' ? '正式需求·待实现' : '待确认'}</Tag>}
+              </div>
             </div>
-            <div className="media-parameter-card__progress">
-              <Progress
-                aria-label={`${frequencyHz} Hz 权重：${valueText}；范围 ${definition.min}–${definition.max} ${definition.unit}`}
-                percent={normalizeMediaParameterProgress(weight, definition.min, definition.max)}
-                showInfo={false}
-                size={[4, 4]}
-                steps={10}
-                strokeColor={progressColor}
-              />
-            </div>
-          </div>
+          </Card>
         );
       })}
-    </div>
+    </>
   );
-}
+});
 
-function ParameterCard({
+const MediaParameterCard = memo(function MediaParameterCard({
   definition,
-  params,
+  rawValue,
   status,
   idBase,
   progressColor,
   cardPadding,
 }: {
   definition: MediaParameterDefinition;
-  params: MediaEffectParams;
+  rawValue: unknown;
   status: MediaParameterStatus;
   idBase: string;
   progressColor: string;
   cardPadding: number;
 }) {
   const labelId = `${idBase}-${definition.section}-${definition.field}-label`;
-  const rawValue = params[definition.section][definition.field];
-  const valueSignature = createMediaParameterValueSignature(rawValue);
-  const previousValueSignature = useRef(valueSignature);
-  const [flashGeneration, setFlashGeneration] = useState(0);
-
-  useEffect(() => {
-    if (previousValueSignature.current === valueSignature) return;
-    previousValueSignature.current = valueSignature;
-    setFlashGeneration((current) => current + 1);
-  }, [valueSignature]);
-
-  const baseCardClassName = definition.kind === 'band-weights'
-    ? 'media-parameter-card media-parameter-card--band-weights'
-    : 'media-parameter-card';
-  const cardClassName = flashGeneration === 0
-    ? baseCardClassName
-    : flashGeneration % 2 === 1
-      ? `${baseCardClassName} media-parameter-card--flash-a`
-      : `${baseCardClassName} media-parameter-card--flash-b`;
   const cardStyle: CSSProperties & { '--media-parameter-accent': string } = {
     '--media-parameter-accent': progressColor,
     borderInlineStartColor: progressColor,
@@ -193,26 +150,16 @@ function ParameterCard({
         <NumericValue
           definition={definition}
           labelId={labelId}
-          progressColor={progressColor}
           value={rawValue}
         />
       );
       break;
-    case 'band-weights':
-      valueDisplay = (
-        <BandWeightsValue
-          definition={definition}
-          labelId={labelId}
-          progressColor={progressColor}
-          value={rawValue}
-        />
-      );
-      break;
+    case 'band-weights': valueDisplay = null; break;
     case 'boolean':
       valueDisplay = (
-        <Tag color={rawValue === true ? 'success' : 'default'}>
+        <Typography.Text className="media-parameter-card__value" strong>
           {getStaticValue(definition, rawValue)}
-        </Tag>
+        </Typography.Text>
       );
       break;
     case 'select':
@@ -227,23 +174,25 @@ function ParameterCard({
 
   return (
     <Card
-      className={cardClassName}
+      className="media-parameter-card"
       size="small"
       style={cardStyle}
       styles={{ body: { padding: cardPadding } }}
     >
       <div className="media-parameter-card__header">
         <Typography.Text id={labelId} strong>{definition.label}</Typography.Text>
-        <Tag className="media-parameter-card__status" color={STATUS_COLORS[status]}>
-          {MEDIA_PARAMETER_STATUS_LABELS[status]}
-        </Tag>
-      </div>
-      <div aria-labelledby={labelId} className="media-parameter-card__value-area">
-        {valueDisplay}
+        <div aria-labelledby={labelId} className="media-parameter-card__result">
+          {valueDisplay}
+          {status === 'implemented' ? null : (
+            <Tag className="media-parameter-card__status" color={status === 'planned' ? 'warning' : 'default'}>
+              {status === 'planned' ? '正式需求·待实现' : '待确认'}
+            </Tag>
+          )}
+        </div>
       </div>
     </Card>
   );
-}
+});
 
 function groupDefinitions(definitions: readonly MediaParameterDefinition[]) {
   const groups = new Map<string, MediaParameterDefinition[]>();
@@ -271,60 +220,73 @@ function ParameterSection({
   cardPadding: number;
 }) {
   const sectionHeadingId = `${idBase}-${section}-heading`;
+  const groupedDefinitions = groupDefinitions(MEDIA_PARAMETER_DEFINITIONS[section]);
+  const visibleParameterCount = MEDIA_PARAMETER_DEFINITIONS[section].reduce(
+    (count, definition) => count + (definition.kind === 'band-weights' ? VISUAL_BAND_FREQUENCIES_HZ.length : 1),
+    0,
+  );
   return (
     <section aria-labelledby={sectionHeadingId} className="media-parameter-section">
-      <Typography.Text
-        className="media-parameter-section__title"
-        id={sectionHeadingId}
-        strong
-      >
-        {SECTION_LABELS[section]}
-      </Typography.Text>
-      {groupDefinitions(MEDIA_PARAMETER_DEFINITIONS[section]).map(([group, groupItems]) => {
-        const groupHeadingId = `${idBase}-${section}-${group}-heading`;
-        return (
-          <section aria-labelledby={groupHeadingId} className="media-parameter-section__group" key={group}>
-            <Typography.Text
-              className="media-parameter-section__group-title"
-              id={groupHeadingId}
-              strong
-            >
-              {group}
-            </Typography.Text>
-            <div className="media-parameter-section__grid">
-              {groupItems.map((definition) => {
-                const path = getMediaParameterPath(definition);
-                const cardAccentColor = REFERENCE_IMAGE_ACCENT_COLORS[parameterAccents[path]];
-                return (
-                  <ParameterCard
-                    cardPadding={cardPadding}
-                    definition={definition}
-                    idBase={idBase}
-                    key={path}
-                    params={params}
-                    progressColor={cardAccentColor}
-                    status={statusOverrides?.[path] ?? definition.status}
-                  />
-                );
-              })}
-            </div>
-          </section>
-        );
-      })}
+      <div className="media-parameter-section__heading">
+        <Typography.Text
+          className="media-parameter-section__title"
+          id={sectionHeadingId}
+          strong
+        >
+          {SECTION_LABELS[section]}
+        </Typography.Text>
+        <Typography.Text className="media-parameter-section__summary">
+          {visibleParameterCount} 项 · 只读快照
+        </Typography.Text>
+      </div>
+      <div className="media-parameter-section__grid">
+        {groupedDefinitions.flatMap(([, groupItems]) => (
+          groupItems.map((definition) => {
+            const path = getMediaParameterPath(definition);
+            const cardAccentColor = REFERENCE_IMAGE_ACCENT_COLORS[parameterAccents[path]];
+            const status = statusOverrides?.[path] ?? definition.status;
+            if (definition.kind === 'band-weights') {
+              return (
+                <BandWeightCards
+                  definition={definition}
+                  key={path}
+                  progressColor={cardAccentColor}
+                  status={status}
+                  value={params[definition.section][definition.field]}
+                />
+              );
+            }
+            return (
+              <MediaParameterCard
+                cardPadding={cardPadding}
+                definition={definition}
+                idBase={idBase}
+                key={path}
+                progressColor={cardAccentColor}
+                rawValue={params[definition.section][definition.field]}
+                status={status}
+              />
+            );
+          })
+        ))}
+      </div>
     </section>
   );
 }
 
-export function MediaParameterPanels({
+export const MediaParameterPanels = memo(function MediaParameterPanels({
   value,
   loading = false,
   error = null,
   statusOverrides,
   audioControls,
+  sections = ['video', 'advanced', 'audio'],
 }: MediaParameterPanelsProps) {
   const idBase = useId().replace(/:/g, '');
   const [parameterAccents] = useState(() => createRandomParameterAccents(PARAMETER_ACCENT_PATHS));
   const { token } = theme.useToken();
+  const hasVideoLane = sections.some((section) => section === 'video' || section === 'advanced');
+  const hasAudioLane = sections.includes('audio');
 
   return (
     <div aria-busy={loading} className="media-parameter-panels">
@@ -338,48 +300,42 @@ export function MediaParameterPanels({
           type="error"
         />
       ) : null}
-      <div aria-label="参数接入状态说明" className="media-parameter-panels__legend">
-        {(Object.keys(MEDIA_PARAMETER_STATUS_LABELS) as MediaParameterStatus[]).map((status) => (
-          <Tag color={STATUS_COLORS[status]} key={status}>{MEDIA_PARAMETER_STATUS_LABELS[status]}</Tag>
-        ))}
-      </div>
       <Spin spinning={loading} tip="正在读取媒体参数">
-        <div className="media-parameter-panels__columns">
-          <div className="media-parameter-panels__lane media-parameter-panels__lane--video">
-            <ParameterSection
-              cardPadding={token.paddingXXS}
-              idBase={idBase}
-              parameterAccents={parameterAccents}
-              params={value}
-              section="video"
-              statusOverrides={statusOverrides}
-            />
-            <ParameterSection
-              cardPadding={token.paddingXXS}
-              idBase={idBase}
-              parameterAccents={parameterAccents}
-              params={value}
-              section="advanced"
-              statusOverrides={statusOverrides}
-            />
-          </div>
-          <div className="media-parameter-panels__lane media-parameter-panels__lane--audio">
-            {audioControls ? (
-              <div className="media-parameter-panels__audio-controls">
-                {audioControls}
-              </div>
-            ) : null}
-            <ParameterSection
-              cardPadding={token.paddingXXS}
-              idBase={idBase}
-              parameterAccents={parameterAccents}
-              params={value}
-              section="audio"
-              statusOverrides={statusOverrides}
-            />
-          </div>
+        <div className={`media-parameter-panels__columns${hasVideoLane && hasAudioLane ? ' media-parameter-panels__columns--split' : ''}`}>
+          {hasVideoLane ? (
+            <div className="media-parameter-panels__lane media-parameter-panels__lane--video">
+              {sections.filter((section) => section === 'video' || section === 'advanced').map((section) => (
+                <ParameterSection
+                  cardPadding={token.paddingXXS}
+                  idBase={idBase}
+                  key={section}
+                  parameterAccents={parameterAccents}
+                  params={value}
+                  section={section}
+                  statusOverrides={statusOverrides}
+                />
+              ))}
+            </div>
+          ) : null}
+          {hasAudioLane ? (
+            <div className="media-parameter-panels__lane media-parameter-panels__lane--audio">
+              {audioControls ? (
+                <div className="media-parameter-panels__audio-controls">
+                  {audioControls}
+                </div>
+              ) : null}
+              <ParameterSection
+                cardPadding={token.paddingXXS}
+                idBase={idBase}
+                parameterAccents={parameterAccents}
+                params={value}
+                section="audio"
+                statusOverrides={statusOverrides}
+              />
+            </div>
+          ) : null}
         </div>
       </Spin>
     </div>
   );
-}
+});

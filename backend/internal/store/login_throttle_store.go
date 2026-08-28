@@ -26,6 +26,9 @@ type LoginThrottleRetentionCleaner interface {
 const (
 	LoginThrottleBucketAccount = "account"
 	LoginThrottleBucketAddress = "address"
+
+	loginAccountFailureThreshold = 5
+	loginAddressFailureThreshold = 50
 )
 
 type LoginThrottleBucket struct {
@@ -36,12 +39,16 @@ type LoginThrottleBucket struct {
 var _ LoginThrottleStore = (*PostgresRepository)(nil)
 var _ LoginThrottleRetentionCleaner = (*PostgresRepository)(nil)
 
-func LoginFailureBackoff(failureCount int) time.Duration {
-	if failureCount < 5 {
+func LoginFailureBackoff(bucketType string, failureCount int) time.Duration {
+	threshold := loginAccountFailureThreshold
+	if bucketType == LoginThrottleBucketAddress {
+		threshold = loginAddressFailureThreshold
+	}
+	if failureCount < threshold {
 		return 0
 	}
 	delay := 30 * time.Second
-	for count := 5; count < failureCount && delay < 15*time.Minute; count++ {
+	for count := threshold; count < failureCount && delay < 15*time.Minute; count++ {
 		delay *= 2
 	}
 	if delay > 15*time.Minute {
@@ -101,7 +108,7 @@ func (s *PostgresRepository) RecordLoginFailure(ctx context.Context, buckets []L
 		`, bucket.Type, bucket.Hash, now).Scan(&failureCount); err != nil {
 			return postgresOperationError(operationCtx, fmt.Errorf("increment login throttle: %w", err))
 		}
-		blockedUntil := now.Add(LoginFailureBackoff(failureCount))
+		blockedUntil := now.Add(LoginFailureBackoff(bucket.Type, failureCount))
 		if _, err := tx.ExecContext(operationCtx, `UPDATE auth_login_throttles SET blocked_until = $3 WHERE bucket_type = $1 AND bucket_hash = $2`, bucket.Type, bucket.Hash, blockedUntil); err != nil {
 			return postgresOperationError(operationCtx, fmt.Errorf("persist login throttle: %w", err))
 		}

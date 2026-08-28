@@ -1,0 +1,222 @@
+//!PARAM PTS
+//!TYPE float
+0.0
+
+//!PARAM al_brightness_percent
+//!TYPE float
+//!MINIMUM -100.0
+//!MAXIMUM 100.0
+0.0
+
+//!PARAM al_saturation_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 200.0
+100.0
+
+//!PARAM al_blur_radius_px
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 8.0
+0.0
+
+//!PARAM al_contrast_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 200.0
+100.0
+
+//!PARAM al_hue_degrees
+//!TYPE float
+//!MINIMUM -180.0
+//!MAXIMUM 180.0
+0.0
+
+//!PARAM al_sharpen_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 100.0
+0.0
+
+//!PARAM al_noise_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 8.0
+0.0
+
+//!PARAM al_detail_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 50.0
+0.0
+
+//!PARAM al_crop_edge_smoothing
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.5
+
+//!PARAM al_pixel_scale_percent
+//!TYPE float
+//!MINIMUM 95.0
+//!MAXIMUM 105.0
+100.0
+
+//!PARAM al_pixel_jitter_px
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 2.0
+0.0
+
+//!PARAM al_dynamic_crop_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 4.0
+0.0
+
+//!PARAM al_space_x_px
+//!TYPE float
+//!MINIMUM -4.0
+//!MAXIMUM 4.0
+0.0
+
+//!PARAM al_space_y_px
+//!TYPE float
+//!MINIMUM -4.0
+//!MAXIMUM 4.0
+0.0
+
+//!PARAM al_rotation_degrees
+//!TYPE float
+//!MINIMUM -180.0
+//!MAXIMUM 180.0
+0.0
+
+//!PARAM al_vignette_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 100.0
+0.0
+
+//!PARAM al_highlights_percent
+//!TYPE float
+//!MINIMUM -100.0
+//!MAXIMUM 100.0
+0.0
+
+//!PARAM al_shadows_percent
+//!TYPE float
+//!MINIMUM -100.0
+//!MAXIMUM 100.0
+0.0
+
+//!PARAM al_red_lock_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_edge_softness_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 100.0
+0.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive verified realtime pixel effects
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN 1
+//!COMPUTE 8 8
+
+float al_hash(vec2 point) {
+    return fract(sin(dot(point, vec2(127.1, 311.7))) * 43758.5453123);
+}
+
+mat2 al_rotation(float radians) {
+    float cosine_value = cos(radians);
+    float sine_value = sin(radians);
+    return mat2(cosine_value, -sine_value, sine_value, cosine_value);
+}
+
+vec3 al_hue_rotate(vec3 color, float radians) {
+    const mat3 to_yiq = mat3(
+        0.299, 0.587, 0.114,
+        0.596, -0.275, -0.321,
+        0.212, -0.523, 0.311
+    );
+    const mat3 from_yiq = mat3(
+        1.0, 0.956, 0.621,
+        1.0, -0.272, -0.647,
+        1.0, -1.106, 1.703
+    );
+    vec3 yiq = to_yiq * color;
+    float cosine_value = cos(radians);
+    float sine_value = sin(radians);
+    yiq.yz = mat2(cosine_value, -sine_value, sine_value, cosine_value) * yiq.yz;
+    return from_yiq * yiq;
+}
+
+void hook() {
+    ivec2 output_pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 output_size = ivec2(HOOKED_size);
+    if (any(greaterThanEqual(output_pixel, output_size))) {
+        return;
+    }
+
+    vec2 source_uv = HOOKED_map(gl_GlobalInvocationID);
+    vec2 centered_uv = source_uv - vec2(0.5);
+    float rotation_radians = radians(al_rotation_degrees);
+    centered_uv = al_rotation(-rotation_radians) * centered_uv;
+
+    float scale = max(al_pixel_scale_percent / 100.0, 0.01);
+    float crop_scale = max(1.0 - 2.0 * al_dynamic_crop_percent / 100.0, 0.01);
+    centered_uv /= scale * crop_scale;
+
+    vec2 pixel_size = HOOKED_pt;
+    centered_uv += pixel_size * vec2(al_space_x_px, al_space_y_px);
+    float jitter_phase = PTS * 6.28318530718;
+    centered_uv += pixel_size * al_pixel_jitter_px
+        * vec2(sin(jitter_phase * 1.61803398875), cos(jitter_phase * 1.41421356237));
+
+    vec2 transformed_uv = centered_uv + vec2(0.5);
+    vec2 sampled_uv = clamp(transformed_uv, vec2(0.0), vec2(1.0));
+    vec4 source_color = HOOKED_tex(sampled_uv);
+
+    vec2 tap = pixel_size * max(al_blur_radius_px, 1.0);
+    vec4 neighbor_color = (
+        HOOKED_tex(clamp(sampled_uv + vec2(tap.x, 0.0), vec2(0.0), vec2(1.0)))
+        + HOOKED_tex(clamp(sampled_uv - vec2(tap.x, 0.0), vec2(0.0), vec2(1.0)))
+        + HOOKED_tex(clamp(sampled_uv + vec2(0.0, tap.y), vec2(0.0), vec2(1.0)))
+        + HOOKED_tex(clamp(sampled_uv - vec2(0.0, tap.y), vec2(0.0), vec2(1.0)))
+    ) * 0.25;
+
+    float blur_mix = clamp(al_blur_radius_px / 8.0 + al_edge_softness_percent / 100.0, 0.0, 1.0);
+    vec4 color = mix(source_color, neighbor_color, blur_mix);
+    float detail_gain = al_sharpen_percent / 100.0 + al_detail_percent / 100.0;
+    color.rgb += detail_gain * (source_color.rgb - neighbor_color.rgb);
+
+    float luma = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+    color.rgb += vec3(al_brightness_percent / 100.0);
+    color.rgb = (color.rgb - vec3(0.5)) * (al_contrast_percent / 100.0) + vec3(0.5);
+    color.rgb = mix(vec3(luma), color.rgb, al_saturation_percent / 100.0);
+    color.rgb = al_hue_rotate(color.rgb, radians(al_hue_degrees));
+    color.rgb += vec3(al_shadows_percent / 100.0 * (1.0 - luma));
+    color.rgb += vec3(al_highlights_percent / 100.0 * luma);
+
+    float noise_value = al_hash(vec2(output_pixel) + vec2(PTS, PTS * 0.61803398875)) - 0.5;
+    color.rgb += vec3(noise_value * al_noise_percent / 100.0);
+
+    float radius = length(source_uv - vec2(0.5)) * 1.41421356237;
+    float vignette_factor = mix(1.0, clamp(1.0 - radius * radius, 0.0, 1.0), al_vignette_percent / 100.0);
+    color.rgb *= vignette_factor;
+
+    float source_edge = min(min(transformed_uv.x, transformed_uv.y), min(1.0 - transformed_uv.x, 1.0 - transformed_uv.y));
+    float edge_width = max(al_crop_edge_smoothing * max(pixel_size.x, pixel_size.y) * 8.0, 0.000001);
+    float crop_weight = smoothstep(0.0, edge_width, source_edge);
+    color = mix(HOOKED_tex(source_uv), color, crop_weight);
+    color.r = mix(color.r, source_color.r, clamp(al_red_lock_enabled, 0.0, 1.0));
+
+    imageStore(out_image, output_pixel, clamp(color, 0.0, 1.0));
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-restore-original-audio"
+description = "Enables the restore_original_audio command without any pre-configured scope."
+commands.allow = ["restore_original_audio"]
+
+[[permission]]
+identifier = "deny-restore-original-audio"
+description = "Denies the restore_original_audio command without any pre-configured scope."
+commands.deny = ["restore_original_audio"]

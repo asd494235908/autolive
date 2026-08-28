@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-portaudio-interlude-volume"
+description = "Enables the set_portaudio_interlude_volume command without any pre-configured scope."
+commands.allow = ["set_portaudio_interlude_volume"]
+
+[[permission]]
+identifier = "deny-set-portaudio-interlude-volume"
+description = "Denies the set_portaudio_interlude_volume command without any pre-configured scope."
+commands.deny = ["set_portaudio_interlude_volume"]

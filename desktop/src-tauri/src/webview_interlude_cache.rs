@@ -754,4 +754,93 @@ mod tests {
         assert!(result.output_size_bytes > 44);
         let _ = std::fs::remove_dir_all(cache_dir);
     }
+
+    #[test]
+    fn packaged_ffmpeg_extracts_only_audio_from_a_video_interlude() {
+        let (Some(ffmpeg), Some(ffprobe)) = (
+            std::env::var_os("AUTOLIVE_TEST_FFMPEG"),
+            std::env::var_os("AUTOLIVE_TEST_FFPROBE"),
+        ) else {
+            return;
+        };
+        let cache_dir = std::env::temp_dir().join(format!(
+            "autolive-webview-video-interlude-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&cache_dir).expect("create video render fixture");
+        let source = cache_dir.join("source.mkv");
+        let status = crate::background_process::background_command(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:r=10:d=0.2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=0.2",
+                "-shortest",
+                "-c:v",
+                "ffv1",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&source)
+            .status()
+            .expect("create video source fixture");
+        assert!(status.success());
+
+        let plan = build_audio_stream_filter_graph_with_ambient(
+            &AudioEffectParams::default(),
+            &[],
+            Some(48_000),
+            48_000,
+            false,
+        )
+        .expect("build video interlude filter plan");
+        let result = render_webview_interlude_cache(WebViewInterludeCacheRequest {
+            ffmpeg_path: ffmpeg.into(),
+            source_path: source,
+            ambient_source_path: None,
+            filter_graph: plan.filter_graph,
+            quality_pitch: plan.quality_pitch,
+            pcm_effects: plan.pcm_effects,
+            sample_rate_hz: 48_000,
+            output_bitrate_kbps: 192,
+            cache_dir: cache_dir.clone(),
+            timeout: std::time::Duration::from_secs(20),
+        })
+        .expect("extract video audio into WebView interlude cache");
+
+        assert_eq!(
+            result
+                .output_path
+                .extension()
+                .and_then(|value| value.to_str()),
+            Some("m4a")
+        );
+        let probe = crate::background_process::background_command(ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(&result.output_path)
+            .output()
+            .expect("probe rendered interlude cache");
+        assert!(probe.status.success());
+        assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "audio");
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
 }

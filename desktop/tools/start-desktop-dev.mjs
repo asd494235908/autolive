@@ -18,6 +18,8 @@ function isExecutable(path) {
 
 export function resolveDevEnvironment({ root = desktopRoot, env = process.env } = {}) {
   const environment = { ...env };
+  environment.VITE_CONTROL_PLANE_BASE_URL ||= 'http://101.96.208.132:9090';
+  environment.VITE_CONTROL_PLANE_ENV ||= 'test';
   const extension = process.platform === 'win32' ? '.exe' : '';
   const ffmpegPath = join(root, 'src-tauri', 'binaries', `ffmpeg${extension}`);
   const ffprobePath = join(root, 'src-tauri', 'binaries', `ffprobe${extension}`);

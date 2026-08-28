@@ -6,12 +6,14 @@
 > 前置方案：`2026-08-20-prewarmed-audio-cycle-switching-implementation-plan.md`
 > 适用范围：桌面端普通声音处理、视频运行时参数、最终播放窗口、Rust/Tauri 音频候选生命周期、PortAudio 输出
 
+> 覆盖声明（2026-08-28）：本方案只保留权威媒体时钟、独立计划器和声音候选生命周期原则；联动周期、视频文件候选和 MSE 调度已废止。视频主链以 [`mpv/libplacebo 实时 GPU 主链实施方案`](./2026-08-28-mpv-libplacebo实时GPU主链实施方案.md) 为准。
+
 ## 0. 实施结果（2026-08-20）
 
 - 已新增纯 TypeScript 两周期计划器，声音和视频均只保留 N+1/N+2 两个轻量计划；N+2 不含 candidate ID、PCM、PID 或 Rust 任务。
 - 最终播放窗口发布带 generation/source revision/epoch/sequence 的绝对视频媒体时钟；主窗口只使用该时钟盖目标和判断到期，`Date.now()` 不再参与周期目标计算。
 - 跨窗口音频 prepare 已删除旧 `target_at_ms`，只接受 `target_absolute_position_ms`；最终窗口不再进行“剩余墙钟时间 → 媒体时间”的二次换算。
-- 已增加独立/联动模式。联动范围取声音和视频范围交集；无交集时拒绝启用。联动目标到期而音频候选未就绪时整轮保持旧效果。
+- 历史上曾增加独立/联动模式；其中联动范围求交和共享目标已被 2026-08-27 决策废止，当前只保留独立模式。
 - Rust 仍只接收 N+1，保持 current + pending 最多两个 FFmpeg 音频任务；循环完成命令增加 generation + target loop 幂等校验。
 - PortAudio 环缓待播量和硬件输出延迟按 playback rate 从墙钟时间换算成媒体时间后再参与提交位置校正；callback 数据路径未增加业务逻辑或锁。
 - 同步/提交请求现已携带 generation、循环代次、视频时长、单轮位置和绝对位置；FFmpeg seek 使用单轮位置，PortAudio 时间线始终使用未回绕绝对位置，跨 72–75 秒循环不再丢失整轮。

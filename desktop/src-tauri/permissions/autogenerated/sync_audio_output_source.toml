@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sync-audio-output-source"
+description = "Enables the sync_audio_output_source command without any pre-configured scope."
+commands.allow = ["sync_audio_output_source"]
+
+[[permission]]
+identifier = "deny-sync-audio-output-source"
+description = "Denies the sync_audio_output_source command without any pre-configured scope."
+commands.deny = ["sync_audio_output_source"]

@@ -2,14 +2,18 @@ use autolive_desktop_core::cancellation::CancellationToken;
 use autolive_desktop_core::media_effect_params::{
     AudioEffectParams, NaturalVoiceMode, VideoEffectParams,
 };
-#[cfg(unix)]
-use autolive_desktop_core::media_engine::probe_media_engine_with_paths;
 use autolive_desktop_core::media_engine::{
-    build_media_render_args, configured_media_engine_paths_with_resource_dir, render_media,
-    MediaEngineError, MediaRenderRequest,
+    build_audio_stream_filter_graph_with_ambient, build_media_render_args,
+    configured_media_engine_paths_with_resource_dir, render_media, MediaEngineError,
+    MediaRenderRequest, MediaRenderTarget,
+};
+#[cfg(unix)]
+use autolive_desktop_core::media_engine::{
+    probe_media_engine_with_paths, render_media_with_progress,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -50,6 +54,12 @@ fn request(directory: &TestDir) -> MediaRenderRequest {
         ffmpeg_path,
         ffprobe_path,
         input_mp4_path: directory.path().join("source.mp4"),
+        source_has_video: true,
+        ambient_input_path: None,
+        source_duration_ms: Some(1_000),
+        source_start_ms: 250,
+        output_duration_ms: 500,
+        loop_source: false,
         staging_output_path: directory.path().join("staging.partial.mp4"),
         output_mp4_path: directory.path().join("processed.mp4"),
         video_processing_enabled: true,
@@ -60,7 +70,94 @@ fn request(directory: &TestDir) -> MediaRenderRequest {
         audio_variants: Vec::new(),
         advanced: Default::default(),
         timeout_seconds: 2,
+        target: MediaRenderTarget::StandardMp4,
     }
+}
+
+#[test]
+fn bounded_render_seeks_the_source_and_limits_the_output_duration() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.source_start_ms = 12_345;
+    input.output_duration_ms = 8_750;
+    input.source_duration_ms = Some(30_000);
+
+    let args = build_media_render_args(&input).expect("bounded request should build");
+    let values = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let input_index = values
+        .iter()
+        .position(|value| value == "-i")
+        .expect("source input flag");
+    assert_eq!(
+        &values[input_index - 4..input_index],
+        ["-ss", "12.345", "-t", "8.750"]
+    );
+    assert!(values.windows(2).any(|pair| pair == ["-t", "8.750"]));
+}
+
+#[test]
+fn looped_render_bounds_the_primary_input_before_reverse_audio_filters() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.loop_source = true;
+    input.source_start_ms = 250;
+    input.output_duration_ms = 500;
+    input.audio.fade_out_ms = 200;
+
+    let args = build_media_render_args(&input).expect("looped request should build");
+    let values = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let input_index = values
+        .iter()
+        .position(|value| value == "-i")
+        .expect("source input flag");
+
+    assert_eq!(
+        &values[input_index - 6..input_index],
+        ["-stream_loop", "-1", "-ss", "0.250", "-t", "0.500"]
+    );
+    assert!(audio_graph(&values).contains("areverse"));
+}
+
+#[test]
+fn bounded_render_rejects_empty_or_out_of_range_windows() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+
+    input.output_duration_ms = 0;
+    assert!(matches!(
+        build_media_render_args(&input),
+        Err(MediaEngineError::InvalidParameters { .. })
+    ));
+
+    input.output_duration_ms = 500;
+    input.source_start_ms = 1_000;
+    assert!(matches!(
+        build_media_render_args(&input),
+        Err(MediaEngineError::InvalidParameters { .. })
+    ));
+
+    input.source_start_ms = 750;
+    assert!(matches!(
+        build_media_render_args(&input),
+        Err(MediaEngineError::InvalidParameters { .. })
+    ));
+
+    input.loop_source = true;
+    let args = build_media_render_args(&input).expect("single-item loop may cross EOF");
+    let values = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(values.windows(2).any(|pair| pair == ["-stream_loop", "-1"]));
 }
 
 fn fixture_file(directory: &TestDir, name: &str) -> PathBuf {
@@ -98,6 +195,30 @@ fn configured_media_paths_treat_the_argument_as_the_verified_target_root() {
         .expect("verified target root should resolve deterministic media paths");
 
     assert_eq!(paths, (expected_ffmpeg, expected_ffprobe));
+}
+
+#[test]
+fn render_loop_shares_one_deadline_and_gates_encoder_fallback() {
+    let source = include_str!("../src/media_engine.rs");
+    let render_start = source
+        .find("pub fn render_media_with_progress(")
+        .expect("render_media_with_progress should exist");
+    let render_end = source[render_start..]
+        .find("fn media_render_deadline(")
+        .map(|offset| render_start + offset)
+        .expect("deadline helper should follow render_media");
+    let render_body = &source[render_start..render_end];
+
+    assert_eq!(render_body.matches("media_render_deadline(").count(), 1);
+    assert!(!render_body.contains("probe_media_engine_with_paths("));
+    assert!(!render_body.contains("let started = Instant::now()"));
+    assert!(render_body.contains("encoder_failure_allows_retry(&encoder, &error)"));
+    assert!(render_body.contains("if !can_try_next"));
+    assert!(render_body.contains(".stdout(Stdio::piped())"));
+    assert!(render_body.contains("mpsc::sync_channel(8)"));
+    assert!(render_body.matches("join_progress_reader(").count() >= 5);
+    assert!(render_body.contains("remaining_deadline_millis(render_deadline"));
+    assert!(render_body.contains("validate_audio_content(\n            &request.ffmpeg_path,\n            &request.staging_output_path,\n            render_deadline,"));
 }
 
 #[cfg(unix)]
@@ -180,7 +301,7 @@ fn select_h264_encoder_falls_back_when_ffmpeg_is_unusable() {
 }
 
 #[test]
-fn render_plan_keeps_video_copy_when_only_audio_processing_is_enabled() {
+fn audio_processing_reencodes_video_for_an_exact_candidate_start() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
@@ -192,10 +313,94 @@ fn render_plan_keeps_video_copy_when_only_audio_processing_is_enabled() {
         .map(|value| value.to_string_lossy().into_owned())
         .collect();
 
-    assert!(values.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+    assert!(values.windows(2).any(|pair| {
+        pair[0] == "-c:v"
+            && matches!(
+                pair[1].as_str(),
+                "libopenh264" | "h264_nvenc" | "h264_amf" | "h264_qsv" | "h264_mf"
+            )
+    }));
+    assert!(!values.windows(2).any(|pair| pair == ["-c:v", "copy"]));
     assert!(values.windows(2).any(|pair| pair == ["-c:a", "aac"]));
     assert!(!values.iter().any(|value| value == "-vf"));
     assert!(values.iter().any(|value| value == "-filter_complex"));
+}
+
+#[test]
+fn render_plan_keeps_stream_copy_when_no_processing_is_requested() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.video_processing_enabled = false;
+    input.audio_processing_enabled = false;
+
+    let args = build_media_render_args(&input).expect("passthrough args should be valid");
+    let values = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    assert!(values.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+    assert!(values.windows(2).any(|pair| pair == ["-c:a", "copy"]));
+}
+
+#[test]
+fn pure_audio_candidate_accepts_audio_extensions_without_video_mapping() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    input.input_mp4_path = directory.path().join("source.mp3");
+    fs::write(&input.input_mp4_path, b"source").expect("audio source should be written");
+    input.source_has_video = false;
+    input.video_processing_enabled = false;
+    input.audio_processing_enabled = true;
+    input.staging_output_path = directory.path().join("staging.partial.m4a");
+    input.output_mp4_path = directory.path().join("processed.m4a");
+
+    let args = build_media_render_args(&input).expect("pure audio candidate should be valid");
+    let values = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    assert!(!values.iter().any(|value| value == "0:v:0?"));
+    assert!(!values.iter().any(|value| value == "-c:v"));
+    assert!(values.windows(2).any(|pair| pair == ["-c:a", "aac"]));
+}
+
+#[test]
+fn independent_audio_candidate_covers_the_requested_duration_after_speed_change() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.source_has_video = false;
+    input.video_processing_enabled = false;
+    input.staging_output_path = directory.path().join("staging.partial.m4a");
+    input.output_mp4_path = directory.path().join("processed.m4a");
+    input.output_duration_ms = 5_500;
+    input.source_duration_ms = Some(60_000);
+    input.audio.playback_speed = 1.25;
+    input.audio_variants = vec![AudioEffectParams {
+        playback_speed: 1.5,
+        ..input.audio.clone()
+    }];
+
+    let args = build_media_render_args(&input).expect("audio candidate should be valid");
+    let values = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let input_index = values
+        .iter()
+        .position(|value| value == "-i")
+        .expect("source input flag");
+    assert_eq!(&values[input_index - 2..input_index], ["-t", "8.250"]);
+    let graph = audio_graph(&values);
+    assert!(graph.contains(
+        "[aout]apad=whole_dur=5.500,atrim=duration=5.500,asetpts=PTS-STARTPTS[aout_bounded]"
+    ));
+    assert!(values
+        .windows(2)
+        .any(|pair| pair == ["-map", "[aout_bounded]"]));
 }
 
 #[test]
@@ -260,17 +465,11 @@ fn render_accepts_pitch_shift_with_fallback_sample_rate() {
 }
 
 #[test]
-fn offline_render_rejects_pcm_runtime_or_missing_input_audio_parameters() {
+fn offline_render_only_rejects_effects_that_require_a_missing_input() {
     let directory = TestDir::new();
-    let cases: [AudioParameterCase; 3] = [
-        ("audio.ambient_sound_mix_percent", |audio| {
-            audio.ambient_sound_mix_percent = 1.0
-        }),
-        ("audio 的 MFCC/SNR", |audio| audio.mfcc_shift_percent = 1.0),
-        ("audio.formant_shift_percent", |audio| {
-            audio.formant_shift_percent = 1.0
-        }),
-    ];
+    let cases: [AudioParameterCase; 1] = [("audio.ambient_sound_mix_percent", |audio| {
+        audio.ambient_sound_mix_percent = 1.0
+    })];
 
     for (field, configure) in cases {
         let mut input = request(&directory);
@@ -284,6 +483,23 @@ fn offline_render_rejects_pcm_runtime_or_missing_input_audio_parameters() {
             "{field}: {error:?}"
         );
     }
+}
+
+#[test]
+fn offline_render_keeps_pending_pcm_fields_without_blocking_mapped_audio_effects() {
+    let directory = TestDir::new();
+    let mut input = request(&directory);
+    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.audio.mfcc_shift_percent = 1.0;
+    input.audio.formant_shift_percent = 1.0;
+    input.audio.input_gain_db = 1.0;
+
+    let args = build_media_render_args(&input).expect("mapped effects should still render");
+    let values = args
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(audio_graph(&values).contains("volume="));
 }
 
 #[test]
@@ -386,7 +602,7 @@ fn render_maps_environment_noise_with_ffmpeg_native_mix() {
         .expect("environment noise must use filter_complex");
 
     assert!(graph.contains("anoisesrc=color=white:amplitude="));
-    assert!(graph.contains("amix=inputs=2:weights=0.920000 0.080000:duration=first"));
+    assert!(graph.contains("amix=inputs=2:weights=0.920000 0.080000:duration=shortest"));
     assert!(!graph.contains("loudnorm="));
     assert!(graph.contains("aresample="));
     assert!(values
@@ -555,7 +771,7 @@ fn render_maps_advanced_visual_wave_effects() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(joined.contains("geq=lum="), "{joined}");
-    assert!(joined.contains("sin(2*PI*20"), "{joined}");
+    assert!(joined.contains("sin(2*PI*30"), "{joined}");
 }
 
 #[test]
@@ -617,7 +833,7 @@ fn render_mixes_audio_variants_to_single_bus_with_equal_weights() {
         .expect("filter_complex should be present for k>1");
 
     assert!(graph.contains("asplit=2"));
-    assert!(graph.contains("amix=inputs=2:weights=0.500000 0.500000:duration=first"));
+    assert!(graph.contains("amix=inputs=2:weights=0.500000 0.500000:duration=shortest"));
     assert!(graph.contains("highpass=f=50"));
     assert!(!graph.contains("loudnorm="));
     assert!(graph.contains("aresample="));
@@ -625,6 +841,103 @@ fn render_mixes_audio_variants_to_single_bus_with_equal_weights() {
         .windows(2)
         .any(|pair| pair[0] == "-map" && pair[1] == "[aout]"));
     assert!(!values.iter().any(|value| value == "-af"));
+}
+
+#[test]
+fn packaged_ffmpeg_keeps_nonzero_timestamp_multi_branch_mix_audible() {
+    let Some(ffmpeg) = std::env::var_os("AUTOLIVE_TEST_FFMPEG") else {
+        return;
+    };
+    let audio = AudioEffectParams {
+        ambient_sound_mix_percent: 10.0,
+        ..Default::default()
+    };
+    let variants = [
+        AudioEffectParams {
+            dry_wet_percent: 25.0,
+            environment_noise_percent: 0.01,
+            environment_noise_dbfs: -60.0,
+            ambient_sound_mix_percent: 10.0,
+            ..Default::default()
+        },
+        AudioEffectParams {
+            dry_wet_percent: 35.0,
+            environment_noise_percent: 0.01,
+            environment_noise_dbfs: -60.0,
+            ambient_sound_mix_percent: 10.0,
+            ..Default::default()
+        },
+    ];
+    let graph =
+        build_audio_stream_filter_graph_with_ambient(&audio, &variants, Some(48_000), 48_000, true)
+            .expect("multi-branch graph should build")
+            .filter_graph;
+
+    for fragment in [
+        "asplit=2[a0][a1]",
+        "[processed0]asplit=2",
+        "[processed1]asplit=2",
+        "anoisesrc=color=white",
+        "[1:a:0]asetpts=PTS-STARTPTS,aformat=",
+        "[variant_bus][ambient]amix=inputs=2",
+    ] {
+        assert!(graph.contains(fragment), "{fragment}: {graph}");
+    }
+
+    let output = Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=0.4,asetpts=PTS+5/TB",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=stereo:d=0.4,asetpts=PTS+5/TB",
+            "-filter_complex",
+            &graph,
+            "-map",
+            "[aout]",
+            "-t",
+            "0.400",
+            "-c:a",
+            "pcm_f32le",
+            "-f",
+            "f32le",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("packaged FFmpeg should run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout.len() % std::mem::size_of::<f32>(), 0);
+    let samples = output
+        .stdout
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("one f32 sample")))
+        .collect::<Vec<_>>();
+    assert!(
+        !samples.is_empty(),
+        "nonzero source PTS must still produce PCM"
+    );
+    assert!(samples.iter().all(|sample| sample.is_finite()));
+    let peak = samples
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f32, f32::max);
+    let rms =
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt();
+    assert!(peak > 0.01, "mixed PCM peak is silent: {peak}");
+    assert!(rms > 0.001, "mixed PCM RMS is silent: {rms}");
 }
 
 #[test]
@@ -646,7 +959,7 @@ fn render_uses_source_relative_output_chain_for_single_audio_variant() {
     let filter = audio_graph(&values);
     assert!(filter.contains("asplit=1"));
     assert!(filter.contains("aformat=sample_fmts=fltp:channel_layouts=stereo"));
-    assert!(filter.contains("amix=inputs=1:weights=1.000000:duration=first"));
+    assert!(filter.contains("amix=inputs=1:weights=1.000000:duration=shortest"));
     assert!(filter.contains("highpass=f=50"));
     assert!(filter.contains("adenorm=level=-351:type=ac"));
     assert!(!filter.contains("loudnorm="));
@@ -668,7 +981,9 @@ fn render_uses_source_relative_output_chain_for_single_audio_variant() {
         .find("amix=inputs=1")
         .expect("final amix should exist");
     let highpass = filter.find("highpass=f=50").expect("highpass should exist");
-    let aresample = filter.find("aresample=").expect("aresample should exist");
+    let aresample = filter
+        .rfind("aresample=")
+        .expect("final aresample should exist");
     assert!(amix < highpass && highpass < aresample);
     assert!(filter.contains("equalizer=f=1000"));
     assert!(!values.iter().any(|value| value == "-af"));
@@ -694,7 +1009,8 @@ fn render_maps_native_video_noise_and_detail_filters() {
         .expect("video filter should be present");
 
     assert!(filter.contains("unsharp=5:5:0.050000"));
-    assert!(filter.contains("noise=alls=2.000000:allf=t+u"));
+    assert!(filter.contains("noise=alls=1:allf=t+u"));
+    assert!(filter.contains("enable='lt(mod(n*7919+38000\\,100000)\\,2000)'"));
 }
 
 #[test]
@@ -770,7 +1086,7 @@ fn render_commits_verified_output_after_probe_and_hash() {
     input.ffmpeg_path = executable_script(
         &directory,
         "ffmpeg-copy",
-        "#!/bin/sh\nif [ \"$2\" = \"-version\" ]; then printf '%s\\n' 'ffmpeg version test'; exit 0; fi\nlast=\"\"\nfor arg in \"$@\"; do last=\"$arg\"; done\n/bin/cp \"$5\" \"$last\"\n",
+        "#!/bin/sh\nif [ \"$2\" = \"-version\" ]; then printf '%s\\n' 'ffmpeg version test'; exit 0; fi\ninput=\"\"\nlast=\"\"\nprevious=\"\"\nfor arg in \"$@\"; do if [ \"$previous\" = \"-i\" ]; then input=\"$arg\"; fi; previous=\"$arg\"; last=\"$arg\"; done\nprintf '%s\\n' 'out_time_us=500000' 'progress=continue'\n/bin/cp \"$input\" \"$last\"\n",
     );
     input.ffprobe_path = executable_script(
         &directory,
@@ -778,11 +1094,16 @@ fn render_commits_verified_output_after_probe_and_hash() {
         "#!/bin/sh\nif [ \"$2\" = \"-version\" ]; then printf '%s\\n' 'ffprobe version test'; fi\nexit 0\n",
     );
 
-    let result = render_media(&input, &CancellationToken::new()).expect("output should commit");
+    let mut progress = Vec::new();
+    let result = render_media_with_progress(&input, &CancellationToken::new(), |percent| {
+        progress.push(percent);
+    })
+    .expect("output should commit");
 
     assert_eq!(result.output_mp4_path, input.output_mp4_path);
     assert_eq!(result.output_size_bytes, 6);
     assert_eq!(result.output_mp4_sha256.len(), 64);
+    assert_eq!(progress, [50, 100]);
     assert_eq!(
         fs::read(&input.output_mp4_path).expect("output should exist"),
         b"source"

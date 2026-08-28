@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-clear-playback-pool"
+description = "Enables the clear_playback_pool command without any pre-configured scope."
+commands.allow = ["clear_playback_pool"]
+
+[[permission]]
+identifier = "deny-clear-playback-pool"
+description = "Denies the clear_playback_pool command without any pre-configured scope."
+commands.deny = ["clear_playback_pool"]
