@@ -54,6 +54,13 @@ fn retain_unregistered_realtime_speech_commands() {
 
 fn main() -> ExitCode {
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .manage(AppState::default())
@@ -231,6 +238,31 @@ mod tests {
         assert!(
             source.contains("#![cfg_attr(not(debug_assertions), windows_subsystem = \"windows\")]")
         );
+    }
+
+    #[test]
+    fn second_launch_activates_the_existing_main_window() {
+        let source = include_str!("main.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source should exist");
+        let single_instance = production
+            .find(".plugin(tauri_plugin_single_instance::init")
+            .expect("single-instance plugin should be registered");
+        let dialog = production
+            .find(".plugin(tauri_plugin_dialog::init())")
+            .expect("dialog plugin should be registered");
+        let callback = &production[single_instance..dialog];
+
+        assert!(
+            single_instance < dialog,
+            "single-instance plugin must run first"
+        );
+        assert!(callback.contains("get_webview_window(\"main\")"));
+        assert!(callback.contains("window.unminimize()"));
+        assert!(callback.contains("window.show()"));
+        assert!(callback.contains("window.set_focus()"));
     }
 
     #[test]

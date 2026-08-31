@@ -352,7 +352,7 @@ test('Tauri scripts use the package binary lookup that works on Windows', () => 
   assert.doesNotMatch(`${packageJson.scripts['tauri:dev']}\n${buildSource}`, /\.\/ui\/node_modules\/\.bin\/tauri/);
 });
 
-test('测试包固定使用测试控制面和测试 Tauri 配置', () => {
+test('测试包固定使用测试控制面、测试 Tauri 配置和 Release GUI 构建', () => {
   const previous = {
     baseUrl: process.env.VITE_CONTROL_PLANE_BASE_URL,
     environment: process.env.VITE_CONTROL_PLANE_ENV,
@@ -379,18 +379,18 @@ test('测试包固定使用测试控制面和测试 Tauri 配置', () => {
     assert.equal(process.env.AUTOLIVE_TAURI_CONFIG, 'src-tauri/tauri.test.conf.json');
     assert.equal(process.env.AUTOLIVE_BUILD_PROFILE, 'test');
     assert.match(process.env.CARGO_TARGET_DIR, /src-tauri[\\/]target-test-package$/);
-    assert.match(process.env.AUTOLIVE_BUNDLE_SOURCE_DIR, /target-test-package[\\/]debug[\\/]bundle$/);
-    assert.match(process.env.AUTOLIVE_RELEASE_EXECUTABLE, /target-test-package[\\/]debug[\\/]autolive-desktop-core\.exe$/);
+    assert.match(process.env.AUTOLIVE_BUNDLE_SOURCE_DIR, /target-test-package[\\/]release[\\/]bundle$/);
+    assert.match(process.env.AUTOLIVE_RELEASE_EXECUTABLE, /target-test-package[\\/]release[\\/]autolive-desktop-core\.exe$/);
     assert.match(process.env.AUTOLIVE_PACKAGE_ROOT, /desktop[\\/]package-test$/);
     assert.deepEqual(tauriBuildArguments('x86_64-pc-windows-msvc'), [
       'build',
       '--config',
       'src-tauri/tauri.test.conf.json',
-      '--debug',
       '--no-sign',
       '--bundles',
       'nsis',
     ]);
+    assert.equal(tauriBuildArguments('x86_64-pc-windows-msvc').includes('--debug'), false);
   } finally {
     for (const [key, value] of Object.entries({
       VITE_CONTROL_PLANE_BASE_URL: previous.baseUrl,

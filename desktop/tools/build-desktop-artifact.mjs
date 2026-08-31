@@ -12,8 +12,8 @@ function configuredTargetRoot() {
   return resolve(process.env.CARGO_TARGET_DIR?.trim() || resolve(desktopRoot, 'src-tauri', 'target'));
 }
 
-function configuredBuildDirectory(profile = process.env.AUTOLIVE_BUILD_PROFILE?.trim() || '') {
-  return profile === 'test' ? 'debug' : 'release';
+function configuredBuildDirectory() {
+  return 'release';
 }
 
 export function applyBuildProfile(profile = process.argv.includes('--profile=test') ? 'test' : '') {
@@ -27,9 +27,9 @@ export function applyBuildProfile(profile = process.argv.includes('--profile=tes
   process.env.AUTOLIVE_TAURI_CONFIG = 'src-tauri/tauri.test.conf.json';
   process.env.AUTOLIVE_BUILD_PROFILE = 'test';
   process.env.CARGO_TARGET_DIR ||= resolve(desktopRoot, 'src-tauri', 'target-test-package');
-  const debugRoot = resolve(configuredTargetRoot(), 'debug');
-  process.env.AUTOLIVE_BUNDLE_SOURCE_DIR ||= resolve(debugRoot, 'bundle');
-  process.env.AUTOLIVE_RELEASE_EXECUTABLE ||= resolve(debugRoot, 'autolive-desktop-core.exe');
+  const releaseRoot = resolve(configuredTargetRoot(), 'release');
+  process.env.AUTOLIVE_BUNDLE_SOURCE_DIR ||= resolve(releaseRoot, 'bundle');
+  process.env.AUTOLIVE_RELEASE_EXECUTABLE ||= resolve(releaseRoot, 'autolive-desktop-core.exe');
   process.env.AUTOLIVE_PACKAGE_ROOT ||= resolve(desktopRoot, 'package-test');
 }
 
@@ -39,7 +39,7 @@ export function tauriBuildArguments(
   const config = process.env.AUTOLIVE_TAURI_CONFIG?.trim() || 'src-tauri/tauri.conf.json';
   const argumentsList = ['build', '--config', config];
   if (process.env.AUTOLIVE_BUILD_PROFILE === 'test') {
-    argumentsList.push('--debug', '--no-sign');
+    argumentsList.push('--no-sign');
   }
   if (targetTriple === 'x86_64-pc-windows-msvc') {
     argumentsList.push('--bundles', 'nsis');
