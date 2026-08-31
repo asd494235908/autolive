@@ -190,19 +190,19 @@ impl VideoFrameScheduler {
 
         let generation_advanced =
             observation.identity.playback_generation > current.identity.playback_generation;
+        let epoch_advanced =
+            generation_advanced || observation.schedule_epoch > current.schedule_epoch;
         if !generation_advanced && observation.schedule_epoch < current.schedule_epoch {
             return Ok(VideoFrameScheduleDecision::ignore(
                 VideoScheduleIgnoreReason::StaleEpoch,
             ));
         }
-        if !generation_advanced && observation.identity.sequence < current.identity.sequence {
+        if !epoch_advanced && observation.identity.sequence < current.identity.sequence {
             return Ok(VideoFrameScheduleDecision::ignore(
                 VideoScheduleIgnoreReason::StaleSequence,
             ));
         }
 
-        let epoch_advanced =
-            generation_advanced || observation.schedule_epoch > current.schedule_epoch;
         let source_changed =
             observation.identity.source_revision != current.identity.source_revision;
         if generation_advanced && !observation.boundary.is_reset()
@@ -914,6 +914,36 @@ mod tests {
                 VideoScheduleBoundary::LoopBoundary,
             ))
             .expect("loop epoch");
+        assert_eq!(schedule(&looped).epoch_elapsed_ms, 0);
+    }
+
+    #[test]
+    fn loop_epoch_accepts_the_new_segment_sequence_restart() {
+        let params = MediaEffectParams::default();
+        let mut scheduler = VideoFrameScheduler::new();
+        scheduler
+            .decide(observation(
+                &identity(5, 14),
+                &params,
+                1,
+                70_000,
+                false,
+                VideoScheduleBoundary::Startup,
+            ))
+            .expect("first loop");
+
+        let looped = scheduler
+            .decide(observation(
+                &identity(5, 1),
+                &params,
+                2,
+                0,
+                false,
+                VideoScheduleBoundary::LoopBoundary,
+            ))
+            .expect("next loop");
+
+        assert_eq!(looped.action, VideoScheduleAction::Apply);
         assert_eq!(schedule(&looped).epoch_elapsed_ms, 0);
     }
 

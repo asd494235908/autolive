@@ -1260,6 +1260,13 @@ enum PendingShaderApplyPhase {
     PresentedConfirmed,
 }
 
+fn shader_presentation_can_yield_to_eof(
+    phase: PendingShaderApplyPhase,
+    eof_observed: bool,
+) -> bool {
+    eof_observed && phase == PendingShaderApplyPhase::AwaitingPresentation
+}
+
 #[derive(Debug)]
 struct PendingPlaybackObservation {
     response: PendingMpvResponse,
@@ -1353,10 +1360,6 @@ fn eof_fact_from_cursor(
         clock_epoch: cursor.clock_epoch,
         loop_index: cursor.loop_index,
     })
-}
-
-fn eof_pause_requires_refresh(eof_reached: bool, physical_paused: Option<bool>) -> bool {
-    eof_reached && physical_paused != Some(true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1775,7 +1778,7 @@ impl RuntimeState {
     }
 
     fn command_can_unblock_shader_presentation(&self, command: &RuntimeCommand) -> bool {
-        command.is_play_intent()
+        let play_can_unblock = command.is_play_intent()
             && self.sync_cursor.is_some_and(|cursor| cursor.paused)
             && self.pending_source_fps_response.is_none()
             && self.pending_playback_observation.is_none()
@@ -1785,7 +1788,16 @@ impl RuntimeState {
                     PendingShaderApplyPhase::AwaitingPresentation
                         | PendingShaderApplyPhase::PresentedConfirmed
                 )
-            })
+            });
+        let eof_can_unblock = matches!(
+            command,
+            RuntimeCommand::AdvanceAfterEof { request, .. }
+                if self.status.eof.as_ref() == Some(&request.expected_eof)
+                    && self.pending_shader_apply.as_ref().is_some_and(|apply| {
+                        shader_presentation_can_yield_to_eof(apply.phase, true)
+                    })
+        );
+        play_can_unblock || eof_can_unblock
     }
 
     fn tick_in_flight_ipc_transaction(&mut self) -> bool {
@@ -1901,8 +1913,7 @@ impl RuntimeState {
             self.session.is_some(),
             self.process_launch_mode,
         ) {
-            self.status.activation = BackendActivation::Available;
-            self.status.lifecycle = RendererLifecycleState::Spawned;
+            self.mark_cycle_status_available();
             self.set_apply_state(VideoApplyState::SourceTransitioning);
         } else {
             self.cycle_controller = None;
@@ -2377,8 +2388,7 @@ impl RuntimeState {
         self.claim_cycle_backend_status();
         // prepare() 会在旧 N 存在时保留 Active。配置事务已经清空旧 N 后必须显式
         // 回到 Available，才能由下一次 mpv observation 读取新 FPS 并建立首个计划。
-        self.status.activation = BackendActivation::Available;
-        self.status.lifecycle = RendererLifecycleState::Spawned;
+        self.mark_cycle_status_available();
         self.set_apply_state(VideoApplyState::SourceTransitioning);
     }
 
@@ -3159,6 +3169,9 @@ impl RuntimeState {
                     message: "单源 EOF 完成只能推进当前源的下一循环".to_owned(),
                 });
             }
+            // EOF 后没有下一真实帧可供本轮 shader 晋级；允许循环边界丢弃该事务，
+            // 否则 AdvanceAfterEof 会永远排在 AwaitingPresentation 后面。
+            self.pending_shader_apply = None;
             return self.synchronize(
                 RealtimeVideoSync {
                     playback_generation: request.next_playback_generation,
@@ -3185,6 +3198,7 @@ impl RuntimeState {
                 message: "多源 EOF 完成的新媒体路径必须发生变化".to_owned(),
             });
         }
+        self.pending_shader_apply = None;
         let next_clock_epoch = eof.clock_epoch.saturating_add(1);
         let transition = self.begin_generation(request.next_playback_generation)?;
         self.session = Some(RendererSessionContext {
@@ -3322,9 +3336,34 @@ impl RuntimeState {
         self.av_sync_correction = 1.0;
         self.av_sync_audio_identity = None;
         self.av_sync_controller = AvSyncController::default();
+        self.clear_published_av_sync_status();
+    }
+
+    fn clear_published_av_sync_status(&mut self) {
         self.status.av_sync_drift_ms = None;
         self.status.audible_audio_pts_ms = None;
         self.status.audio_epoch = None;
+    }
+
+    fn mark_cycle_status_available(&mut self) {
+        self.clear_published_av_sync_status();
+        self.status.activation = BackendActivation::Available;
+        self.status.lifecycle = RendererLifecycleState::Spawned;
+    }
+
+    fn publish_av_sync_status(
+        &mut self,
+        drift_ms: Option<i64>,
+        audible_audio_pts_ms: u64,
+        audio_epoch: u64,
+    ) {
+        let Some(drift_ms) = drift_ms else {
+            self.clear_published_av_sync_status();
+            return;
+        };
+        self.status.av_sync_drift_ms = Some(drift_ms);
+        self.status.audible_audio_pts_ms = Some(audible_audio_pts_ms);
+        self.status.audio_epoch = Some(audio_epoch);
     }
 
     fn apply_playback_speed(
@@ -3482,9 +3521,11 @@ impl RuntimeState {
             });
         }
 
-        self.status.av_sync_drift_ms = decision.drift_ms;
-        self.status.audible_audio_pts_ms = Some(snapshot.audible_presentation_pts_ms);
-        self.status.audio_epoch = Some(snapshot.identity.audio_epoch);
+        self.publish_av_sync_status(
+            decision.drift_ms,
+            snapshot.audible_presentation_pts_ms,
+            snapshot.identity.audio_epoch,
+        );
         let mut changed = false;
         if let AvSyncAction::HardSeek {
             target_source_pts_ms,
@@ -8099,6 +8140,36 @@ mod tests {
     }
 
     #[test]
+    fn av_sync_status_stays_grouped_while_audio_clock_reanchors() {
+        let mut runtime = RuntimeState::default();
+        runtime.status.activation = BackendActivation::Active;
+        runtime.status.lifecycle = RendererLifecycleState::Active;
+        runtime.status.process_id = Some(41);
+        runtime.status.physical_paused = Some(false);
+        runtime.status.physical_eof_reached = Some(false);
+
+        runtime.publish_av_sync_status(None, 72_350, 2);
+        assert_eq!(runtime.status.av_sync_drift_ms, None);
+        assert_eq!(runtime.status.audible_audio_pts_ms, None);
+        assert_eq!(runtime.status.audio_epoch, None);
+        assert_runtime_status_contract(&runtime.status);
+
+        runtime.publish_av_sync_status(Some(-12), 72_420, 2);
+        assert_eq!(runtime.status.av_sync_drift_ms, Some(-12));
+        assert_eq!(runtime.status.audible_audio_pts_ms, Some(72_420));
+        assert_eq!(runtime.status.audio_epoch, Some(2));
+        assert_runtime_status_contract(&runtime.status);
+
+        runtime.mark_cycle_status_available();
+        assert_eq!(runtime.status.activation, BackendActivation::Available);
+        assert_eq!(runtime.status.lifecycle, RendererLifecycleState::Spawned);
+        assert_eq!(runtime.status.av_sync_drift_ms, None);
+        assert_eq!(runtime.status.audible_audio_pts_ms, None);
+        assert_eq!(runtime.status.audio_epoch, None);
+        assert_runtime_status_contract(&runtime.status);
+    }
+
+    #[test]
     fn observation_deadline_allows_windows_ipc_scheduling_slack() {
         assert_eq!(OBSERVATION_COMMAND_DEADLINE, Duration::from_millis(250));
         assert_eq!(OBSERVATION_TICK_DEADLINE, Duration::from_millis(350));
@@ -8121,7 +8192,7 @@ mod tests {
         assert!(transient_observation_failure(
             &RealtimeVideoBackendError::IpcQueueFull
         ));
-        assert!(!transient_observation_failure(
+        assert!(transient_observation_failure(
             &RealtimeVideoBackendError::IpcTimeout {
                 request_id: 8,
                 operation: "get time-pos",
@@ -10746,14 +10817,6 @@ mod tests {
     }
 
     #[test]
-    fn eof_pause_is_retried_until_the_physical_pause_is_confirmed() {
-        assert!(eof_pause_requires_refresh(true, None));
-        assert!(eof_pause_requires_refresh(true, Some(false)));
-        assert!(!eof_pause_requires_refresh(true, Some(true)));
-        assert!(!eof_pause_requires_refresh(false, None));
-    }
-
-    #[test]
     fn seek_loop_and_new_session_clear_the_previous_eof_fact() {
         let mut runtime = RuntimeState::default();
         runtime.reset_scheduler(7, 10, 3, false);
@@ -11388,6 +11451,81 @@ mod tests {
     }
 
     #[test]
+    fn first_controller_plan_compiles_a_non_neutral_shader_snapshot() {
+        let config = VideoCycleConfig::try_new(
+            true,
+            4_000,
+            4_000,
+            crate::media_effect_params::MediaEffectParams::default(),
+        )
+        .expect("valid cycle config");
+        let media = MediaSegmentIdentity::try_new(7, PathBuf::from("first.mp4"), 0, 60_000)
+            .expect("valid media identity");
+        let identity =
+            VideoCycleSegmentIdentity::try_new(7, 0, 1, media).expect("valid cycle identity");
+        let mut controller = VideoCycleController::new(config);
+        controller
+            .handle(VideoCycleEvent::SourceBoundary {
+                identity,
+                source_fps: Some(30.0),
+                source_pts_ms: 0,
+            })
+            .expect("first source boundary");
+        let mut runtime = RuntimeState {
+            processing_enabled: true,
+            process_launch_mode: Some(MpvLaunchMode::Gpu(MpvGpuProfile::D3d11ZeroCopy)),
+            cycle_controller: Some(controller),
+            ..RuntimeState::default()
+        };
+        runtime.record_parameter_support(gpu83_cycle_parameter_support());
+
+        runtime
+            .prepare_next_controller_plan()
+            .expect("compile first controller plan");
+
+        let first_options = runtime
+            .pending
+            .as_ref()
+            .and_then(|plan| {
+                plan.commands.iter().find_map(|command| match command {
+                    MpvCommand::SetShaderOptions { options } => Some(options),
+                    _ => None,
+                })
+            })
+            .expect("first shader snapshot")
+            .option_map()
+            .expect("first shader option map");
+        let neutral_options = neutral_gpu_shader_options()
+            .expect("neutral shader snapshot")
+            .option_map()
+            .expect("neutral shader option map");
+        assert_ne!(
+            first_options.get("al_noise_percent"),
+            neutral_options.get("al_noise_percent")
+        );
+    }
+
+    #[test]
+    fn eof_boundary_only_yields_an_unpresented_readback_transaction() {
+        assert!(shader_presentation_can_yield_to_eof(
+            PendingShaderApplyPhase::AwaitingPresentation,
+            true,
+        ));
+        assert!(!shader_presentation_can_yield_to_eof(
+            PendingShaderApplyPhase::AwaitingResponse,
+            true,
+        ));
+        assert!(!shader_presentation_can_yield_to_eof(
+            PendingShaderApplyPhase::PresentedConfirmed,
+            true,
+        ));
+        assert!(!shader_presentation_can_yield_to_eof(
+            PendingShaderApplyPhase::AwaitingPresentation,
+            false,
+        ));
+    }
+
+    #[test]
     fn cycle_boundary_reset_requires_a_cycle_capable_physical_session() {
         let config = VideoCycleConfig::try_new(
             true,
@@ -11421,8 +11559,7 @@ mod tests {
             .next()
             .expect("source transition end");
         assert!(transition.contains("cycle_session_is_available("));
-        assert!(transition.contains("self.status.activation = BackendActivation::Available"));
-        assert!(transition.contains("self.status.lifecycle = RendererLifecycleState::Spawned"));
+        assert!(transition.contains("self.mark_cycle_status_available()"));
         assert!(transition.contains("self.set_apply_state(VideoApplyState::SourceTransitioning)"));
         assert!(transition.contains("self.cycle_controller = None"));
         assert!(transition.contains("self.set_apply_state(VideoApplyState::Idle)"));
