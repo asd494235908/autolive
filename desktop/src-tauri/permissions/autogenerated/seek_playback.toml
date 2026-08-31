@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-seek-playback"
+description = "Enables the seek_playback command without any pre-configured scope."
+commands.allow = ["seek_playback"]
+
+[[permission]]
+identifier = "deny-seek-playback"
+description = "Denies the seek_playback command without any pre-configured scope."
+commands.deny = ["seek_playback"]

@@ -1,7 +1,8 @@
 //! PortAudio 可听时钟驱动的 mpv 视频同步决策器。
 //!
-//! 本模块不执行 IPC、不读取系统时钟。调用方提交同一代次、同一同步 epoch 的
-//! 单调观测，控制器只返回有界速度、迟到帧策略或特殊边界的一次性对齐动作。
+//! 本模块不执行 IPC、不读取系统时钟。调用方负责校验媒体段身份与时长，并只提交
+//! 同一源内坐标、同一代次、同一同步 epoch 的单调观测；控制器只返回有界速度、
+//! 迟到帧策略或特殊边界的一次性对齐动作。
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AvSyncConfig {
@@ -11,8 +12,6 @@ pub struct AvSyncConfig {
     pub moderate_drift_ms: i64,
     /// 超过此值时暂停新参数提交，并等待收敛或请求恢复。
     pub critical_drift_ms: i64,
-    /// 速度校正预计回到稳态所用的保守时间窗。
-    pub settle_horizon_ms: u64,
     /// 相对基础速度允许的最大瞬时调整量。
     pub max_speed_delta: f64,
     /// 严重偏差持续多久后请求调用方建立恢复 epoch。
@@ -25,8 +24,7 @@ impl Default for AvSyncConfig {
             stable_drift_ms: 20,
             moderate_drift_ms: 60,
             critical_drift_ms: 80,
-            settle_horizon_ms: 500,
-            max_speed_delta: 0.16,
+            max_speed_delta: 0.02,
             recovery_request_after_ms: 240,
         }
     }
@@ -40,9 +38,8 @@ impl AvSyncConfig {
             stable_drift_ms,
             moderate_drift_ms,
             critical_drift_ms: self.critical_drift_ms.max(moderate_drift_ms),
-            settle_horizon_ms: self.settle_horizon_ms.max(1),
             max_speed_delta: if self.max_speed_delta.is_finite() {
-                self.max_speed_delta.clamp(0.0, 0.5)
+                self.max_speed_delta.clamp(0.0, 0.02)
             } else {
                 Self::default().max_speed_delta
             },
@@ -68,8 +65,10 @@ pub struct AvSyncObservation {
     pub sync_epoch: u64,
     /// 调用方提供的单调时间，仅用于判断持续偏差，不得使用墙钟。
     pub observed_at_ms: u64,
-    pub audible_audio_pts_ms: Option<i64>,
-    pub mpv_presented_pts_ms: Option<i64>,
+    /// 当前媒体文件内的 PortAudio 可听位置；身份无效或越界时调用方必须传 `None`。
+    pub audible_source_pts_ms: Option<i64>,
+    /// 当前媒体文件内的 mpv 已呈现位置；身份无效或越界时调用方必须传 `None`。
+    pub mpv_source_pts_ms: Option<i64>,
     pub playing: bool,
     pub buffering: bool,
     pub seeking: bool,
@@ -121,7 +120,7 @@ pub enum AvSyncAction {
         reason: RecoveryReason,
     },
     HardSeek {
-        target_video_pts_ms: i64,
+        target_source_pts_ms: i64,
         reason: HardSeekReason,
     },
 }
@@ -129,7 +128,7 @@ pub enum AvSyncAction {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AvSyncDecision {
     pub action: AvSyncAction,
-    /// `mpv_presented_pts_ms - audible_audio_pts_ms`；负值表示视频落后。
+    /// `mpv_source_pts_ms - audible_source_pts_ms`；负值表示视频落后。
     pub drift_ms: Option<i64>,
     pub speed: f64,
     pub drop_late_frames: bool,
@@ -196,17 +195,6 @@ impl AvSyncController {
             return AvSyncDecision::new(AvSyncAction::Ignore { reason }, None);
         }
 
-        let identity_changed = self.identity != Some(incoming);
-        if identity_changed {
-            let first_identity = self.identity.is_none();
-            self.identity = Some(incoming);
-            self.last_observed_at_ms = None;
-            self.critical_since_ms = None;
-            self.recovery_requested = false;
-            self.pending_hard_alignment = hard_seek_reason(observation.boundary)
-                .or(first_identity.then_some(HardSeekReason::Startup));
-        }
-
         if self
             .last_observed_at_ms
             .is_some_and(|last| observation.observed_at_ms < last)
@@ -217,6 +205,16 @@ impl AvSyncController {
                 },
                 None,
             );
+        }
+
+        let identity_changed = self.identity != Some(incoming);
+        if identity_changed {
+            let first_identity = self.identity.is_none();
+            self.identity = Some(incoming);
+            self.critical_since_ms = None;
+            self.recovery_requested = false;
+            self.pending_hard_alignment = hard_seek_reason(observation.boundary)
+                .or(first_identity.then_some(HardSeekReason::Startup));
         }
         self.last_observed_at_ms = Some(observation.observed_at_ms);
 
@@ -230,22 +228,27 @@ impl AvSyncController {
             return self.hold(HoldReason::NotPlaying);
         }
 
-        let (Some(audio_pts_ms), Some(video_pts_ms)) = (
-            observation.audible_audio_pts_ms,
-            observation.mpv_presented_pts_ms,
+        let (Some(audio_source_pts_ms), Some(mpv_source_pts_ms)) = (
+            observation.audible_source_pts_ms,
+            observation.mpv_source_pts_ms,
         ) else {
             return self.hold(HoldReason::MissingClock);
         };
-        let drift_ms = video_pts_ms.saturating_sub(audio_pts_ms);
+        let drift_ms = mpv_source_pts_ms.saturating_sub(audio_source_pts_ms);
         let absolute_drift_ms = drift_ms.saturating_abs();
 
         if let Some(reason) = self.pending_hard_alignment.take() {
-            if absolute_drift_ms > self.config.stable_drift_ms {
+            let would_seek_backward = drift_ms > 0
+                && matches!(
+                    reason,
+                    HardSeekReason::Recovery | HardSeekReason::ClockAuthorityChanged
+                );
+            if absolute_drift_ms > self.config.stable_drift_ms && !would_seek_backward {
                 self.critical_since_ms = None;
                 self.recovery_requested = false;
                 return AvSyncDecision::new(
                     AvSyncAction::HardSeek {
-                        target_video_pts_ms: audio_pts_ms,
+                        target_source_pts_ms: audio_source_pts_ms,
                         reason,
                     },
                     Some(drift_ms),
@@ -259,7 +262,7 @@ impl AvSyncController {
             return AvSyncDecision::new(AvSyncAction::Maintain, Some(drift_ms));
         }
 
-        if absolute_drift_ms >= self.config.critical_drift_ms {
+        if absolute_drift_ms >= self.config.critical_drift_ms && drift_ms < 0 {
             if self.recovery_requested {
                 let mut decision = AvSyncDecision::new(
                     AvSyncAction::Hold {
@@ -291,12 +294,20 @@ impl AvSyncController {
             self.recovery_requested = false;
         }
 
-        let correction = (drift_ms as f64 / self.config.settle_horizon_ms as f64)
-            .clamp(-self.config.max_speed_delta, self.config.max_speed_delta);
+        let correction_delta = if absolute_drift_ms > self.config.moderate_drift_ms {
+            self.config.max_speed_delta
+        } else {
+            self.config.max_speed_delta / 2.0
+        };
         let mut decision = AvSyncDecision::new(AvSyncAction::AdjustSpeed, Some(drift_ms));
-        decision.speed = 1.0 - correction;
+        decision.speed = if drift_ms < 0 {
+            1.0 + correction_delta
+        } else {
+            1.0 - correction_delta
+        };
         decision.drop_late_frames = drift_ms < -self.config.moderate_drift_ms;
-        decision.pause_parameter_commits = absolute_drift_ms >= self.config.critical_drift_ms;
+        decision.pause_parameter_commits =
+            absolute_drift_ms >= self.config.critical_drift_ms && drift_ms < 0;
         decision
     }
 
@@ -317,6 +328,24 @@ impl AvSyncController {
         self.critical_since_ms = None;
         AvSyncDecision::new(AvSyncAction::Hold { reason }, None)
     }
+}
+
+/// 将 PortAudio 实际播放速率、视频调度速度与音画同步修正合并为唯一 mpv speed。
+pub fn compose_video_speed(
+    audio_playback_rate: f64,
+    scheduler_base_speed: f64,
+    sync_correction: f64,
+) -> Option<f64> {
+    if !audio_playback_rate.is_finite()
+        || !(0.5..=2.0).contains(&audio_playback_rate)
+        || !scheduler_base_speed.is_finite()
+        || !(0.5..=1.5).contains(&scheduler_base_speed)
+        || !sync_correction.is_finite()
+        || !(0.98..=1.02).contains(&sync_correction)
+    {
+        return None;
+    }
+    Some((audio_playback_rate * scheduler_base_speed * sync_correction).clamp(0.25, 4.0))
 }
 
 fn hard_seek_reason(boundary: SyncBoundary) -> Option<HardSeekReason> {
@@ -340,8 +369,8 @@ mod tests {
             playback_generation: 7,
             sync_epoch: 3,
             observed_at_ms,
-            audible_audio_pts_ms: Some(10_000),
-            mpv_presented_pts_ms: Some(10_000 + drift_ms),
+            audible_source_pts_ms: Some(10_000),
+            mpv_source_pts_ms: Some(10_000 + drift_ms),
             playing: true,
             buffering: false,
             seeking: false,
@@ -421,7 +450,7 @@ mod tests {
                 expected_action: AvSyncAction::AdjustSpeed,
                 speed_relation: std::cmp::Ordering::Less,
                 drop_late_frames: false,
-                pause_parameter_commits: true,
+                pause_parameter_commits: false,
             },
         ];
 
@@ -444,7 +473,14 @@ mod tests {
                 decision.pause_parameter_commits,
                 case.pause_parameter_commits
             );
-            assert!((0.84..=1.16).contains(&decision.speed));
+            let expected_delta = if case.drift_ms.unsigned_abs() > 60 {
+                0.02
+            } else if case.drift_ms.unsigned_abs() > 20 {
+                0.01
+            } else {
+                0.0
+            };
+            assert!(((decision.speed - 1.0).abs() - expected_delta).abs() < f64::EPSILON);
         }
     }
 
@@ -494,7 +530,7 @@ mod tests {
         assert_eq!(
             first.action,
             AvSyncAction::HardSeek {
-                target_video_pts_ms: 10_000,
+                target_source_pts_ms: 10_000,
                 reason: HardSeekReason::Recovery,
             }
         );
@@ -507,13 +543,27 @@ mod tests {
     }
 
     #[test]
+    fn recovery_never_seeks_backward_to_an_audio_clock_behind_video() {
+        let mut controller = running_controller();
+        let mut recovery = observation(3_000, 400);
+        recovery.sync_epoch = 4;
+        recovery.boundary = SyncBoundary::Recovery;
+
+        let decision = controller.decide(recovery);
+
+        assert_eq!(decision.action, AvSyncAction::AdjustSpeed);
+        assert!(decision.speed < 1.0);
+        assert!(!decision.pause_parameter_commits);
+    }
+
+    #[test]
     fn first_startup_with_large_drift_aligns_once() {
         let mut controller = AvSyncController::default();
         let first = controller.decide(observation(100, 0));
         assert_eq!(
             first.action,
             AvSyncAction::HardSeek {
-                target_video_pts_ms: 10_000,
+                target_source_pts_ms: 10_000,
                 reason: HardSeekReason::Startup,
             }
         );
@@ -589,10 +639,34 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_new_epoch_does_not_replace_the_current_identity() {
+        let mut controller = running_controller();
+        assert_eq!(
+            controller.decide(observation(0, 100)).action,
+            AvSyncAction::Maintain
+        );
+
+        let mut out_of_order_next_epoch = observation(-200, 90);
+        out_of_order_next_epoch.sync_epoch = 4;
+        out_of_order_next_epoch.boundary = SyncBoundary::UserSeek;
+        assert_eq!(
+            controller.decide(out_of_order_next_epoch).action,
+            AvSyncAction::Ignore {
+                reason: IgnoreReason::OutOfOrderSample,
+            }
+        );
+
+        assert_eq!(
+            controller.decide(observation(0, 140)).action,
+            AvSyncAction::Maintain
+        );
+    }
+
+    #[test]
     fn missing_clock_holds_base_speed_without_false_drift() {
         let mut controller = running_controller();
         let mut missing_audio = observation(0, 40);
-        missing_audio.audible_audio_pts_ms = None;
+        missing_audio.audible_source_pts_ms = None;
         let decision = controller.decide(missing_audio);
         assert_eq!(
             decision.action,
@@ -621,6 +695,150 @@ mod tests {
                 assert_eq!(decision.speed, 1.0);
             }
             assert!(!matches!(decision.action, AvSyncAction::HardSeek { .. }));
+        }
+    }
+
+    #[test]
+    fn synchronization_uses_one_and_two_percent_bands() {
+        let mut controller = running_controller();
+        assert_eq!(controller.decide(observation(-21, 40)).speed, 1.01);
+        assert_eq!(controller.decide(observation(60, 80)).speed, 0.99);
+        assert_eq!(controller.decide(observation(-61, 120)).speed, 1.02);
+        assert_eq!(controller.decide(observation(80, 160)).speed, 0.98);
+    }
+
+    #[test]
+    fn audio_scheduler_and_sync_speed_share_one_bounded_composition_point() {
+        assert_eq!(compose_video_speed(1.2, 1.0, 1.01), Some(1.212));
+        assert_eq!(compose_video_speed(2.0, 1.5, 1.02), Some(3.06));
+        assert_eq!(compose_video_speed(0.5, 0.5, 0.98), Some(0.25));
+        assert_eq!(compose_video_speed(f64::NAN, 1.0, 1.0), None);
+        assert_eq!(compose_video_speed(0.49, 1.0, 1.0), None);
+        assert_eq!(compose_video_speed(2.01, 1.0, 1.0), None);
+        assert_eq!(compose_video_speed(1.0, 0.49, 1.0), None);
+        assert_eq!(compose_video_speed(1.0, 1.51, 1.0), None);
+        assert_eq!(compose_video_speed(1.0, 1.0, 0.97), None);
+        assert_eq!(compose_video_speed(1.0, 1.0, 1.03), None);
+        assert_eq!(compose_video_speed(1.0, 1.0, f64::INFINITY), None);
+    }
+
+    #[test]
+    fn twentieth_loop_uses_source_pts_instead_of_presentation_pts() {
+        let source_duration_ms = 72_300_i64;
+        let loop_index = 20_i64;
+        let audible_source_pts_ms = 27_000_i64;
+        let audible_presentation_pts_ms = loop_index * source_duration_ms + audible_source_pts_ms;
+        assert_eq!(audible_presentation_pts_ms, 1_473_000);
+
+        let mut controller = running_controller();
+        let decision = controller.decide(AvSyncObservation {
+            playback_generation: 7,
+            sync_epoch: 4,
+            observed_at_ms: 40,
+            audible_source_pts_ms: Some(audible_source_pts_ms),
+            mpv_source_pts_ms: Some(27_100),
+            playing: true,
+            buffering: false,
+            seeking: false,
+            boundary: SyncBoundary::LoopBoundary,
+        });
+
+        assert_eq!(decision.drift_ms, Some(100));
+        assert_eq!(
+            decision.action,
+            AvSyncAction::HardSeek {
+                target_source_pts_ms: audible_source_pts_ms,
+                reason: HardSeekReason::LoopBoundary,
+            }
+        );
+    }
+
+    #[test]
+    fn caller_rejects_invalid_segment_identity_by_withholding_source_clock() {
+        let mut controller = running_controller();
+        let decision = controller.decide(AvSyncObservation {
+            playback_generation: 8,
+            sync_epoch: 4,
+            observed_at_ms: 40,
+            audible_source_pts_ms: None,
+            mpv_source_pts_ms: Some(27_000),
+            playing: true,
+            buffering: false,
+            seeking: false,
+            boundary: SyncBoundary::SourceChanged,
+        });
+
+        assert_eq!(
+            decision.action,
+            AvSyncAction::Hold {
+                reason: HoldReason::MissingClock,
+            }
+        );
+        assert_eq!(decision.drift_ms, None);
+    }
+
+    #[test]
+    fn paused_user_seek_boundary_never_emits_a_hard_seek() {
+        let mut controller = running_controller();
+        let decision = controller.decide(AvSyncObservation {
+            playback_generation: 7,
+            sync_epoch: 4,
+            observed_at_ms: 40,
+            audible_source_pts_ms: Some(27_000),
+            mpv_source_pts_ms: Some(27_100),
+            playing: false,
+            buffering: false,
+            seeking: false,
+            boundary: SyncBoundary::UserSeek,
+        });
+
+        assert_eq!(
+            decision.action,
+            AvSyncAction::Hold {
+                reason: HoldReason::NotPlaying,
+            }
+        );
+        assert_eq!(decision.speed, 1.0);
+        assert!(!matches!(decision.action, AvSyncAction::HardSeek { .. }));
+    }
+
+    #[test]
+    fn hard_seek_is_limited_to_explicit_alignment_boundaries() {
+        for (boundary, reason) in [
+            (SyncBoundary::Startup, HardSeekReason::Startup),
+            (SyncBoundary::SourceChanged, HardSeekReason::SourceChanged),
+            (SyncBoundary::UserSeek, HardSeekReason::UserSeek),
+            (SyncBoundary::LoopBoundary, HardSeekReason::LoopBoundary),
+        ] {
+            let mut controller = running_controller();
+            let mut input = observation(100, 40);
+            input.sync_epoch = 4;
+            input.boundary = boundary;
+
+            assert_eq!(
+                controller.decide(input).action,
+                AvSyncAction::HardSeek {
+                    target_source_pts_ms: 10_000,
+                    reason,
+                }
+            );
+        }
+
+        let mut controller = running_controller();
+        assert!(!matches!(
+            controller.decide(observation(100, 40)).action,
+            AvSyncAction::HardSeek { .. }
+        ));
+
+        for boundary in [SyncBoundary::Recovery, SyncBoundary::ClockAuthorityChanged] {
+            let mut controller = running_controller();
+            let mut input = observation(100, 40);
+            input.sync_epoch = 4;
+            input.boundary = boundary;
+            assert!(!matches!(
+                controller.decide(input).action,
+                AvSyncAction::HardSeek { .. }
+            ));
         }
     }
 }

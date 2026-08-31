@@ -4,6 +4,7 @@ import type { CSSProperties, ReactNode } from 'react';
 import { CompactNumberField } from './compact-number-field';
 
 type CycleRange = { minMs: number; maxMs: number };
+type CycleRangeEndpoint = 'min' | 'max';
 
 function formatCycleSeconds(milliseconds: number) {
   const seconds = milliseconds / 1000;
@@ -37,7 +38,7 @@ export function MediaCycleCard({
   statusColor?: string;
   accent: string;
   editable?: boolean;
-  onRangeChange?: (range: CycleRange) => void;
+  onRangeChange?: (endpoint: CycleRangeEndpoint, valueMs: number) => void;
   footer?: ReactNode;
 }) {
   return (
@@ -51,9 +52,9 @@ export function MediaCycleCard({
           <Typography.Text className="desktop-muted">范围</Typography.Text>
           {editable ? (
             <>
-              <CompactNumberField ariaLabel={`${title}最小秒`} min={1} max={60} size="small" value={range.minMs / 1000} onChange={(value) => typeof value === 'number' && onRangeChange?.({ minMs: value * 1000, maxMs: range.maxMs })} />
+              <CompactNumberField ariaLabel={`${title}最小秒`} min={1} max={range.maxMs / 1000} size="small" value={range.minMs / 1000} onChange={(value) => typeof value === 'number' && onRangeChange?.('min', value * 1000)} />
               <Typography.Text className="desktop-muted">—</Typography.Text>
-              <CompactNumberField ariaLabel={`${title}最大秒`} min={1} max={60} size="small" value={range.maxMs / 1000} onChange={(value) => typeof value === 'number' && onRangeChange?.({ minMs: range.minMs, maxMs: value * 1000 })} />
+              <CompactNumberField ariaLabel={`${title}最大秒`} min={range.minMs / 1000} max={60} size="small" value={range.maxMs / 1000} onChange={(value) => typeof value === 'number' && onRangeChange?.('max', value * 1000)} />
               <Typography.Text className="desktop-muted">秒</Typography.Text>
             </>
           ) : (

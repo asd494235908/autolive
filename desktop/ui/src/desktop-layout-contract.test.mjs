@@ -91,6 +91,10 @@ test('主页周期卡和正式参数面板使用 Ant Design 公开组件', async
   assert.match(cycleCard, /<Progress aria-label=\{`\$\{title\}下一计划进度`\}/);
   assert.match(cycleCard, /desktop-cycle-meta[\s\S]*?<CompactNumberField ariaLabel=\{`\$\{title\}最小秒`\}/);
   assert.match(cycleCard, /ariaLabel=\{`\$\{title\}(?:最小|最大)秒`\}[^>]*size="small"/);
+  assert.match(cycleCard, /最小秒[^\n]*max=\{range\.maxMs \/ 1000\}[^\n]*onRangeChange\?\.\('min', value \* 1000\)/);
+  assert.match(cycleCard, /最大秒[^\n]*min=\{range\.minMs \/ 1000\}[^\n]*onRangeChange\?\.\('max', value \* 1000\)/);
+  assert.match(app, /setAudioPeriodRange\(\(current\) => updatePeriodRangeEndpoint\(current, endpoint, valueMs\)\)/);
+  assert.match(app, /setVideoPeriodRange\(\(current\) => updatePeriodRangeEndpoint\(current, endpoint, valueMs\)\)/);
   assert.doesNotMatch(cycleCard, /desktop-cycle-inputs/);
   assert.match(panel, /titleIcon\?: ReactNode/);
   assert.match(panel, /subtitle\?: ReactNode/);
@@ -158,48 +162,19 @@ test('声音预设详情完整展示 35 个效果字段并格式化非数值类�
   assert.doesNotMatch(app, /AUDIO_VALUE_PRESETS\.filter\(\(preset\) => preset\.id !== 'p2[12]'\)/);
 });
 
-test('App 使用完整视频自动快照，并在实时流确认热更新后提交已生效字段', async () => {
+test('App 将完整视频参数快照交给 Rust 周期控制器', async () => {
   const app = await readSource('./App.tsx');
-  const plannedVideo = app.slice(
-    app.indexOf('type PlannedVideoCyclePayload'),
-    app.indexOf('function getActualAudioOutputLabel'),
-  );
-  const buildSeed = app.slice(
-    app.indexOf('function buildVideoCycleSeed('),
-    app.indexOf('function bindNextAudioCandidate('),
-  );
-  const applyCycle = app.slice(
-    app.indexOf('function applyPlannedVideoCycle('),
-    app.indexOf('function applyPlannedAudioCycle('),
-  );
-
-  assert.match(plannedVideo, /video: MediaEffectParams\['video'\]/);
-  assert.match(plannedVideo, /advanced: MediaEffectParams\['advanced'\]/);
-  assert.match(buildSeed, /sampleAutomaticVideoParameters\(\)/);
-  assert.match(applyCycle, /video: plan\.payload\.video/);
-  assert.match(applyCycle, /advanced: plan\.payload\.advanced/);
-  assert.match(applyCycle, /setMediaEffectParams\(nextParams\)/);
-  assert.doesNotMatch(applyCycle, /schedulePeriodRenderRef\.current|start_media_processing/);
-  assert.doesNotMatch(applyCycle, /update_video_effect_stream|video_stream/);
+  assert.match(app, /params: mediaEffectParams,[\s\S]*min_period_ms: videoPeriodRange\.minMs[\s\S]*max_period_ms: videoPeriodRange\.maxMs/);
+  assert.match(app, /configure_realtime_video_cycle/);
+  assert.doesNotMatch(app, /PlannedVideoCyclePayload|buildVideoCycleSeed|applyPlannedVideoCycle/);
   assert.doesNotMatch(app, /sampleSubtleVideoParams|sampleVideoCycle|sanitizeMappedVideoSample/);
 });
 
-test('视频真实渲染只有 mpv 提交 active 才提升参数，失败保持 Original', async () => {
+test('视频真实渲染只有 Rust active 指纹确认后才显示生效', async () => {
   const app = await readSource('./App.tsx');
-  const promotionStart = app.indexOf('function commitPreparedRealtimeVideoCandidate(');
-  const promotionEnd = app.indexOf('function commitCompletedAudioRender(', promotionStart);
-  const promotion = app.slice(promotionStart, promotionEnd);
-  const applyStart = app.indexOf('async function applyVideoProcessing(');
-  const applyEnd = app.indexOf('function commitPreparedRealtimeVideoCandidate(', applyStart);
-  const applyMedia = app.slice(applyStart, applyEnd);
-
-  assert.ok(promotionStart >= 0 && promotionEnd > promotionStart);
-  assert.match(applyMedia, /activeVideoRenderRef\.current\s*=/);
-  assert.match(applyMedia, /prepare_realtime_video_plan/);
-  assert.match(promotion, /status\?\.backend !== 'realtime_gpu' \|\| status\.activation !== 'active'/);
-  assert.match(promotion, /applyPlannedVideoCycle\(candidate\.videoCyclePlan\)/);
-  assert.match(promotion, /advanceIndependentVideoQueue\(clock\.absolute_position_ms\)/);
-  assert.doesNotMatch(applyMedia, /prepare_media_video_stream_period|video_stream|activate_ffmpeg_video_backend/);
+  assert.match(app, /effectiveMediaVideoBackend/);
+  assert.match(app, /\['source_transitioning', 'ready', 'applying', 'result_unknown', 'readback_confirmed', 'presented_confirmed'\]/);
+  assert.doesNotMatch(app, /activeVideoRenderRef|prepare_realtime_video_plan|commit_realtime_video_plan/);
 });
 
 test('播放池组件展示真实顺序、数量和当前项，并区分整批导入与追加媒体', async () => {

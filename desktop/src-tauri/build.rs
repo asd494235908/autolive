@@ -1,5 +1,8 @@
 mod build_support;
 
+const WINDOWS_MPV_MANIFEST_REFERENCE: &str =
+    include_str!("../third_party/mpv/x86_64-pc-windows-msvc/legal/mpv-runtime-manifest.json");
+
 fn main() {
     let profile = std::env::var("PROFILE").ok();
     let external_override = std::env::var("TAURI_CONFIG").ok();
@@ -13,6 +16,19 @@ fn main() {
         build_support::validate_release_runtime_resource_config(
             include_str!("tauri.conf.json"),
             external_override.as_deref(),
+        )
+        .unwrap_or_else(|message| panic!("{message}"));
+        let runtime_manifest = std::fs::read_to_string("runtime-resources.json")
+            .unwrap_or_else(|error| panic!("无法读取 runtime-resources.json：{error}"));
+        let build_target = std::env::var("TARGET")
+            .unwrap_or_else(|error| panic!("无法读取 Cargo TARGET：{error}"));
+        let windows_mpv_manifest_reference =
+            (build_target == "x86_64-pc-windows-msvc").then_some(WINDOWS_MPV_MANIFEST_REFERENCE);
+        build_support::validate_release_runtime_resource_tree(
+            &runtime_manifest,
+            std::path::Path::new("embedded-runtime-resources"),
+            &build_target,
+            windows_mpv_manifest_reference,
         )
         .unwrap_or_else(|message| panic!("{message}"));
     }
@@ -62,6 +78,7 @@ fn main() {
         "start_playback",
         "pause_playback",
         "resume_playback",
+        "seek_playback",
         "update_playback_position",
         "stop_playback",
         "complete_playback_loop",
@@ -75,9 +92,8 @@ fn main() {
         "set_audio_processing_profile",
         "set_interlude_config",
         "start_media_processing",
-        "prepare_realtime_video_plan",
-        "commit_realtime_video_plan",
-        "sync_realtime_video_renderer",
+        "ensure_original_video_renderer",
+        "configure_realtime_video_cycle",
         "stop_realtime_video_renderer",
         "release_media_processing_artifact",
         "restore_original_audio",

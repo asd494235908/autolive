@@ -255,10 +255,10 @@ fn validate_component_layout(
 ) -> Result<(), ManifestValidationError> {
     let valid = match file.component {
         ManifestComponent::Media => {
-            file.executable
-                && file
-                    .relative_path
-                    .starts_with(&format!("{target}/binaries/"))
+            let binaries_prefix = format!("{target}/binaries/");
+            let licenses_prefix = format!("{target}/binaries/licenses/");
+            file.relative_path.starts_with(&binaries_prefix)
+                && file.executable == !file.relative_path.starts_with(&licenses_prefix)
         }
     };
     if !valid {

@@ -1993,64 +1993,6 @@ fn gpu83_video_filter(
     })
 }
 
-/// 旧五字段 Vulkan 子集只保留给历史参数构图测试；生产路径统一走 GPU83。
-#[cfg(test)]
-fn legacy_vulkan_subset_filter(
-    video: &VideoEffectParams,
-    advanced: &AdvancedEffectParams,
-    input_on_vulkan: bool,
-) -> Option<VideoFilterPlan> {
-    if advanced != &AdvancedEffectParams::default() {
-        return None;
-    }
-
-    let defaults = VideoEffectParams::default();
-    let mut unsupported = video.clone();
-    unsupported.brightness_percent = defaults.brightness_percent;
-    unsupported.saturation_percent = defaults.saturation_percent;
-    unsupported.blur_radius_px = defaults.blur_radius_px;
-    unsupported.contrast_percent = defaults.contrast_percent;
-    unsupported.hue_rotation_degrees = defaults.hue_rotation_degrees;
-    unsupported.horizontal_flip_enabled = defaults.horizontal_flip_enabled;
-    unsupported.vertical_flip_enabled = defaults.vertical_flip_enabled;
-    if unsupported != defaults {
-        return None;
-    }
-
-    let mut filters = Vec::new();
-    if !input_on_vulkan {
-        filters.extend(["format=nv12".to_owned(), "hwupload".to_owned()]);
-    }
-    filters.push(format!(
-            "libplacebo=brightness={:.6}:contrast={:.6}:saturation={:.6}:hue={:.10}:upscaler=bilinear:downscaler=bilinear",
-            (video.brightness_percent / 100.0).clamp(-1.0, 1.0),
-            (video.contrast_percent / 100.0).clamp(0.0, 16.0),
-            (video.saturation_percent / 100.0).clamp(0.0, 16.0),
-            video
-                .hue_rotation_degrees
-                .to_radians()
-                .clamp(-std::f64::consts::PI, std::f64::consts::PI),
-        ));
-    if video.blur_radius_px > 0.0 {
-        filters.push(format!(
-            "gblur_vulkan=sigma={:.6}",
-            video.blur_radius_px.max(0.01)
-        ));
-    }
-    if video.horizontal_flip_enabled {
-        filters.push("hflip_vulkan".to_owned());
-    }
-    if video.vertical_flip_enabled {
-        filters.push("vflip_vulkan".to_owned());
-    }
-    filters.extend(["hwdownload".to_owned(), "format=nv12".to_owned()]);
-    Some(VideoFilterPlan {
-        serial_filter: filters.join(","),
-        complex_graph: None,
-        requires_variable_frame_rate: false,
-    })
-}
-
 fn video_filter(
     video: &VideoEffectParams,
     advanced: &AdvancedEffectParams,
@@ -2665,15 +2607,14 @@ mod tests {
         build_audio_stream_filter_graph_with_ambient, build_media_render_args_for_backend,
         build_media_render_args_with_video_encoder,
         configured_media_engine_paths_with_resource_dir, encoder_attempt_order_from_preferred,
-        encoder_failure_allows_retry, legacy_vulkan_subset_filter, media_render_deadline,
-        packaged_media_engine_paths, parse_max_volume_db, probe_audio_content_with_retry,
-        read_stderr_capture, read_stderr_tail, remaining_deadline_millis, run_command_with_timeout,
-        target_triple, validate_audio_content, validate_audio_input_decodable,
-        validate_audio_probe_output, validate_filter_support, validate_request_shape,
-        video_encoder_codec_args, video_filter, video_render_progress_percent,
-        FfmpegProgressParser, MediaEngineError, MediaOutputProgressWatchdog, MediaRenderRequest,
-        MediaRenderTarget, AUDIO_FINITE_GUARD_FILTER, FALLBACK_H264_ENCODER,
-        MAX_PROBE_STDOUT_BYTES,
+        encoder_failure_allows_retry, media_render_deadline, packaged_media_engine_paths,
+        parse_max_volume_db, probe_audio_content_with_retry, read_stderr_capture, read_stderr_tail,
+        remaining_deadline_millis, run_command_with_timeout, target_triple, validate_audio_content,
+        validate_audio_input_decodable, validate_audio_probe_output, validate_filter_support,
+        validate_request_shape, video_encoder_codec_args, video_filter,
+        video_render_progress_percent, FfmpegProgressParser, MediaEngineError,
+        MediaOutputProgressWatchdog, MediaRenderRequest, MediaRenderTarget,
+        AUDIO_FINITE_GUARD_FILTER, FALLBACK_H264_ENCODER, MAX_PROBE_STDOUT_BYTES,
     };
     use crate::media_effect_params::{
         AdvancedEffectParams, AudioEffectParams, NaturalVoiceMode, VideoEffectParams,
@@ -2808,35 +2749,7 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_filter_accepts_only_the_verified_gpu_parameter_subset() {
-        let video = VideoEffectParams {
-            brightness_percent: 0.2,
-            contrast_percent: 100.2,
-            saturation_percent: 99.8,
-            hue_rotation_degrees: 0.1,
-            blur_radius_px: 0.03,
-            ..VideoEffectParams::default()
-        };
-        let plan = legacy_vulkan_subset_filter(&video, &AdvancedEffectParams::default(), false)
-            .expect("verified Vulkan fields");
-        assert!(plan
-            .serial_filter
-            .contains("format=nv12,hwupload,libplacebo="));
-        assert!(plan.serial_filter.contains("gblur_vulkan=sigma=0.030000"));
-        assert!(plan.serial_filter.ends_with("hwdownload,format=nv12"));
-
-        let cpu_only = VideoEffectParams {
-            noise_percent: 0.05,
-            ..video
-        };
-        assert!(
-            legacy_vulkan_subset_filter(&cpu_only, &AdvancedEffectParams::default(), false)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn vulkan_render_args_use_vendor_neutral_filter_with_selected_encoder() {
+    fn forced_vulkan_render_rejects_partial_gpu83_snapshot() {
         let root = std::env::temp_dir().join(format!(
             "autolive-vulkan-filter-args-{}",
             std::process::id()
@@ -2869,25 +2782,14 @@ mod tests {
             timeout_seconds: 1,
             target: MediaRenderTarget::StandardMp4,
         };
-        let args = build_media_render_args_for_backend(&request, Some("h264_nvenc"), true, true)
-            .expect("Vulkan render args")
-            .into_iter()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+        let error = build_media_render_args_for_backend(&request, Some("h264_nvenc"), true, true)
+            .expect_err("部分 GPU83 快照不能强制进入旧 Vulkan 离线路径");
 
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["-init_hw_device", "vulkan=autolive_gpu:0"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["-filter_hw_device", "autolive_gpu"]));
-        assert!(args.windows(2).any(|pair| pair == ["-hwaccel", "vulkan"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["-hwaccel_output_format", "vulkan"]));
-        assert!(args.iter().any(|value| value.contains("libplacebo=")));
-        assert!(!args.iter().any(|value| value.contains("hwupload")));
-        assert!(args.windows(2).any(|pair| pair == ["-c:v", "h264_nvenc"]));
+        assert!(matches!(
+            error,
+            MediaEngineError::InvalidParameters { message }
+                if message == "当前活动视频参数不能由 Vulkan GPU83 滤镜完整执行"
+        ));
         let _ = fs::remove_dir_all(root);
     }
 

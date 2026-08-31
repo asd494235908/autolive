@@ -4,6 +4,7 @@ use crate::audio_cycle_switch::{
 use autolive_desktop_core::ambient_sound::{
     resolve_ambient_sound, revalidate_ambient_sound, AmbientSoundSource, ResolvedAmbientSound,
 };
+use autolive_desktop_core::audible_audio_clock::AudibleAudioClock;
 use autolive_desktop_core::audio_cycle_output::{
     AudioCycleOutputControl, AudioCycleOutputTask, AudioInterludeMixConfig, AudioOutputConfig,
     AudioTestTone, AudioTrackTimeline, AUDIO_CANDIDATE_DIGITAL_SILENCE_ERROR,
@@ -25,9 +26,6 @@ use autolive_desktop_core::interlude_player::{
     prepare_interlude_snapshot, InterludeAudioSelectionMode, InterludeAudioVariationMode,
     InterludeConfig, InterludeError, InterludeSnapshot,
 };
-use autolive_desktop_core::media_compatibility::{
-    cleanup_compatibility_files, prepare_media_compatibility, MediaCompatibilityRequest,
-};
 use autolive_desktop_core::media_effect_params::{
     AudioEffectParams, MediaEffectParams, ParameterValidationError,
 };
@@ -42,18 +40,16 @@ use autolive_desktop_core::media_library::{
     probe_user_selected_video_with_ffprobe, MediaKind, MediaProbeRequestDto, MediaProbeResultDto,
     SourceMediaDto,
 };
+use autolive_desktop_core::media_timeline::MediaSegmentIdentity;
+use autolive_desktop_core::media_video_cycle::VideoCycleConfig;
 use autolive_desktop_core::media_video_effects::build_atomic_media_video_effect_plan;
-use autolive_desktop_core::media_video_gpu_effects::{
-    build_gpu83_shader_snapshot, Gpu83ParameterCapability, GPU83_PARAMETER_MAPPINGS,
-};
 use autolive_desktop_core::realtime_video_backend::{
-    resolve_mpv_executable, resolve_mpv_shader, CompiledRealtimeParameters, MpvCommand,
-    MpvShaderOptions, ParameterSupportReport, ParameterSupportResult, RealtimeVideoParameter,
-    RealtimeVideoPlan, VideoBackend, VideoCommitGate, VideoPlanIdentity, VideoPlanSlot,
+    resolve_mpv_executable, resolve_mpv_shader, RealtimeVideoBackendError, VideoBackend,
 };
 use autolive_desktop_core::realtime_video_runtime::{
-    CycleSlotState, CycleSlotStatus, MediaVideoBackendRuntimeStatus, PrepareRealtimeRenderer,
-    RealtimeVideoRuntime,
+    AdvanceRealtimeVideoAfterEof, BackendActivation, ConfigureRealtimeVideoCycle,
+    MediaVideoBackendRuntimeStatus, PlaybackIntent, PlaybackIntentRequest, PrepareOriginalRenderer,
+    RealtimeVideoRuntime, VideoEofFact,
 };
 use autolive_desktop_core::runtime_resource_task::{
     RuntimeResourceTask, RuntimeResourceTaskShutdown,
@@ -82,11 +78,12 @@ use autolive_desktop_core::{
     PendingMediaCandidateIdentity, PlaybackCore, PlaybackSnapshot, PlaybackState,
     ValidatedAudioStreamConfiguration, MAX_SOURCE_MEDIA_POOL_ITEMS,
 };
+use autolive_native_video_host::{NativeVideoHost, NativeVideoHostError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, System};
@@ -98,7 +95,6 @@ use std::os::unix::process::CommandExt;
 
 const MACOS_NATIVE_TITLEBAR_HEIGHT: f64 = 32.0;
 const MEDIA_IMPORT_PROBE_TIMEOUT_MS: u64 = 10_000;
-const MEDIA_IMPORT_COMPATIBILITY_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
 const MAX_SOURCE_MEDIA_PATH_BYTES: usize = 32 * 1024;
 const PORTAUDIO_CALLBACK_STALL_MS: u64 = 1_500;
 const PORTAUDIO_PCM_STALL_MS: u64 = 1_500;
@@ -108,31 +104,15 @@ const PORTAUDIO_SWITCH_READY_POLL_MS: u64 = 10;
 const AUDIO_CYCLE_CANDIDATE_PRE_ROLL_MS: u64 = 250;
 const AUDIO_CYCLE_CANDIDATE_BUFFER_MS: usize = 750;
 const MAX_INTERLUDE_MEDIA_POSITION_MS: u64 = 24 * 60 * 60 * 1_000;
-const VIDEO_BACKEND_SOURCE_REVISION: u64 = 0;
 const MEDIA_CANDIDATE_TIMEOUT_SECONDS: u64 = 30 * 60;
 const MEDIA_WORKER_STOP_BUDGET: Duration = Duration::from_secs(3);
-struct PreparedMediaImports {
-    results: Vec<MediaProbeResultDto>,
-    created_compatibility_files: Vec<PathBuf>,
-}
-
+const NATIVE_VIDEO_HOST_MAIN_THREAD_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 struct MediaImportLease {
     generation: u64,
     cancellation: CancellationToken,
 }
 
-impl PreparedMediaImports {
-    fn retain_created_files(&mut self) {
-        self.created_compatibility_files.clear();
-    }
-}
-
-impl Drop for PreparedMediaImports {
-    fn drop(&mut self) {
-        cleanup_compatibility_files(std::mem::take(&mut self.created_compatibility_files));
-    }
-}
 const AUDIO_CYCLE_TARGET_HORIZON_MS: u64 = 60_000;
 const AUDIO_SYNC_CLOCK_EXPIRED: &str = "绝对媒体时间已经过期";
 const AUDIO_OUTPUT_RESUME_REQUIRED_CODE: &str = "audio_output_resume_required";
@@ -339,6 +319,53 @@ fn signed_millis_delta(left_ms: u64, right_ms: u64) -> i64 {
     }
 }
 
+fn audible_audio_track_timeline(
+    source_identity: &AudioMixerSourceIdentity,
+    loop_index: u64,
+    source_duration_ms: u64,
+    presentation_position_ms: u64,
+    playback_rate: f64,
+) -> Result<AudioTrackTimeline, CommandErrorDto> {
+    let source_path = source_identity.source_path.as_ref().ok_or_else(|| {
+        CommandErrorDto::new(
+            "audio_clock_source_missing",
+            "PortAudio 可听时钟缺少当前媒体源身份",
+        )
+    })?;
+    let source_path = PathBuf::from(source_path).canonicalize().map_err(|error| {
+        CommandErrorDto::new(
+            "audio_clock_source_invalid",
+            format!("PortAudio 可听时钟无法确认当前媒体源：{error}"),
+        )
+    })?;
+    let segment = MediaSegmentIdentity::try_new(
+        source_identity.playback_generation,
+        source_path,
+        loop_index,
+        source_duration_ms,
+    )
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "audio_clock_segment_invalid",
+            format!("PortAudio 可听时钟无法建立当前媒体段：{error:?}"),
+        )
+    })?;
+    let source_position_ms = segment
+        .source_pts_ms(presentation_position_ms)
+        .ok_or_else(|| {
+            CommandErrorDto::new(
+                "audio_clock_position_outside_segment",
+                "PortAudio 可听时钟的呈现时间不属于当前媒体段",
+            )
+        })?;
+    Ok(AudioTrackTimeline {
+        presentation_position_ms,
+        source_position_ms,
+        playback_rate,
+        segment,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     main_window_label: &'static str,
@@ -346,8 +373,8 @@ pub struct AppState {
     playback: Arc<Mutex<PlaybackCore>>,
     /// 串行化播放池原子替换和播放结束推进；禁止持有 playback 锁等待资源退出。
     playback_transition: Arc<Mutex<()>>,
-    /// 最终效果窗口最近一次上报视频 currentTime 的单调近似墙钟时间。
-    playback_position_observed_at: Arc<Mutex<Option<Instant>>>,
+    /// 最终效果窗口最近一次上报位置的媒体段身份与单调近似墙钟时间。
+    playback_position_observed_at: Arc<Mutex<Option<PlaybackPositionObservation>>>,
     speech_worker: Arc<Mutex<Option<BackgroundWorkerTask>>>,
     video_media_worker: Arc<Mutex<Option<BackgroundWorkerTask>>>,
     audio_media_worker: Arc<Mutex<Option<BackgroundWorkerTask>>>,
@@ -357,6 +384,8 @@ pub struct AppState {
     runtime_resource_task: Arc<RuntimeResourceTask>,
     /// 按值拥有 PortAudio 流和唯一环缓生产线程；None = WebView。
     audio_cycle_output: Arc<Mutex<Option<AudioCycleOutputTask>>>,
+    /// PortAudio 输出线程发布、mpv 运行时只读消费的实际可听 PTS 事实源。
+    audible_audio_clock: Arc<AudibleAudioClock>,
     /// FFmpeg 解码线程 → 音频混音线程；PortAudio 失败时整体停止并回退 WebView。
     audio_mixer: Arc<Mutex<Option<AudioMixerTask>>>,
     /// 随机插话只生产 PCM；实际叠加和 duck 仍由唯一 audio_cycle_output 完成。
@@ -394,7 +423,10 @@ pub struct AppState {
     /// 经路径校验和 FFmpeg 短时解码探测的环境声；用户素材优先，否则使用打包底噪。
     ambient_sound: Arc<Mutex<Option<ResolvedAmbientSound>>>,
     /// 单一实时画面进程所有者；任何窗口关闭、停止或应用退出都从这里回收 mpv。
-    realtime_video_runtime: Arc<Mutex<RealtimeVideoRuntime>>,
+    realtime_video_runtime: Arc<RealtimeVideoRuntime>,
+    realtime_video_eof_events: Arc<Mutex<Option<mpsc::Receiver<VideoEofFact>>>>,
+    realtime_video_eof_supervisor: Arc<Mutex<Option<RealtimeVideoEofSupervisorTask>>>,
+    native_video_host: Arc<Mutex<Option<NativeVideoHost>>>,
 }
 
 #[derive(Debug)]
@@ -430,6 +462,11 @@ impl Drop for AudioMixerRecoveryGuard {
 struct BackgroundWorkerTask {
     cancellation: CancellationToken,
     completed: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct RealtimeVideoEofSupervisorTask {
     handle: thread::JoinHandle<()>,
 }
 
@@ -480,10 +517,44 @@ fn join_background_worker_until(
     }
 }
 
+fn join_realtime_video_eof_supervisor_until(
+    worker: &Mutex<Option<RealtimeVideoEofSupervisorTask>>,
+    started_at: Instant,
+    budget: Duration,
+) -> Result<RuntimeResourceTaskShutdown, String> {
+    loop {
+        let finished = {
+            let mut worker = worker
+                .lock()
+                .map_err(|_| "EOF 监督线程状态锁已损坏".to_owned())?;
+            let Some(task) = worker.as_ref() else {
+                return Ok(RuntimeResourceTaskShutdown::Idle);
+            };
+            task.handle.is_finished().then(|| worker.take()).flatten()
+        };
+        if let Some(task) = finished {
+            task.handle
+                .join()
+                .map_err(|_| "EOF 监督线程异常终止".to_owned())?;
+            return Ok(RuntimeResourceTaskShutdown::Joined);
+        }
+        let elapsed = started_at.elapsed();
+        if elapsed >= budget {
+            return Ok(RuntimeResourceTaskShutdown::TimedOut);
+        }
+        thread::sleep(
+            budget
+                .saturating_sub(elapsed)
+                .min(Duration::from_millis(10)),
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FinalEffectWindowDto {
     pub label: String,
     pub created: bool,
+    pub video_host_ready: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -507,6 +578,14 @@ pub struct CacheCleanupResultDto {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdatePlaybackPositionRequestDto {
+    pub playback_generation: u64,
+    pub loop_index: u64,
+    pub position_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SeekPlaybackRequestDto {
+    pub playback_generation: u64,
     pub position_ms: u64,
 }
 
@@ -517,6 +596,13 @@ struct AudioSyncClock {
     position_ms: u64,
     duration_ms: u64,
     absolute_position_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlaybackPositionObservation {
+    playback_generation: u64,
+    loop_index: u64,
+    observed_at: Instant,
 }
 
 fn validate_audio_sync_clock(
@@ -1335,6 +1421,8 @@ pub async fn clear_runtime_resources(
 
 impl Default for AppState {
     fn default() -> Self {
+        let audible_audio_clock = Arc::new(AudibleAudioClock::default());
+        let (realtime_video_eof_sender, realtime_video_eof_receiver) = mpsc::sync_channel(1);
         Self {
             main_window_label: "main",
             shutting_down: Arc::new(AtomicBool::new(false)),
@@ -1348,6 +1436,7 @@ impl Default for AppState {
             media_import_generation: Arc::new(AtomicU64::new(0)),
             runtime_resource_task: Arc::new(RuntimeResourceTask::default()),
             audio_cycle_output: Arc::new(Mutex::new(None)),
+            audible_audio_clock: Arc::clone(&audible_audio_clock),
             audio_mixer: Arc::new(Mutex::new(None)),
             interlude_mixer: Arc::new(Mutex::new(None)),
             interlude_prepare_lock: Arc::new(Mutex::new(())),
@@ -1368,20 +1457,243 @@ impl Default for AppState {
             audio_output_last_pcm_frame_count: Arc::new(AtomicU64::new(0)),
             audio_output_last_pcm_progress_ms: Arc::new(AtomicU64::new(0)),
             ambient_sound: Arc::new(Mutex::new(None)),
-            realtime_video_runtime: Arc::new(Mutex::new(RealtimeVideoRuntime::default())),
+            realtime_video_runtime: Arc::new(
+                RealtimeVideoRuntime::with_audible_audio_clock_and_eof_sender(
+                    audible_audio_clock,
+                    realtime_video_eof_sender,
+                ),
+            ),
+            realtime_video_eof_events: Arc::new(Mutex::new(Some(realtime_video_eof_receiver))),
+            realtime_video_eof_supervisor: Arc::new(Mutex::new(None)),
+            native_video_host: Arc::new(Mutex::new(None)),
         }
     }
 }
 
+fn realtime_video_eof_rejection(
+    current: &PlaybackSnapshot,
+    status: &MediaVideoBackendRuntimeStatus,
+    eof: VideoEofFact,
+) -> Option<&'static str> {
+    if realtime_video_eof_reconciliation_required(current, status, eof) {
+        None
+    } else if current.playback_state != PlaybackState::Playing {
+        Some("playback_not_playing")
+    } else if current
+        .source_media
+        .as_ref()
+        .is_none_or(|source| source.media_kind != MediaKind::Video)
+    {
+        Some("current_source_not_video")
+    } else if current.playback_generation != eof.playback_generation {
+        Some("playback_generation_mismatch")
+    } else if current.loop_index != eof.loop_index {
+        Some("loop_index_mismatch")
+    } else if status.eof != Some(eof) {
+        Some("runtime_eof_identity_mismatch")
+    } else if status.backend_epoch != eof.backend_epoch {
+        Some("backend_epoch_mismatch")
+    } else if status.clock_epoch != Some(eof.clock_epoch) {
+        Some("clock_epoch_mismatch")
+    } else if status.loop_index != Some(eof.loop_index) {
+        Some("runtime_loop_index_mismatch")
+    } else if status.physical_eof_reached != Some(true) {
+        Some("physical_eof_not_confirmed")
+    } else if status.process_id.is_none() {
+        Some("managed_process_missing")
+    } else {
+        None
+    }
+}
+
+fn matching_single_video_source(current: &PlaybackSnapshot) -> bool {
+    current.source_media_pool.len() == 1
+        && current.source_media_index == 0
+        && current
+            .source_media
+            .as_ref()
+            .zip(current.source_media_pool.first())
+            .is_some_and(|(current, pooled)| {
+                current.media_kind == MediaKind::Video && current.source_path == pooled.source_path
+            })
+}
+
+fn realtime_video_eof_reconciliation_required(
+    current: &PlaybackSnapshot,
+    status: &MediaVideoBackendRuntimeStatus,
+    eof: VideoEofFact,
+) -> bool {
+    current.playback_state == PlaybackState::Playing
+        && matching_single_video_source(current)
+        && current.playback_generation == eof.playback_generation
+        && eof.loop_index.checked_add(1) == Some(current.loop_index)
+        && status.playback_generation == Some(eof.playback_generation)
+        && status.backend_epoch == eof.backend_epoch
+        && status.clock_epoch == Some(eof.clock_epoch)
+        && status.loop_index == Some(eof.loop_index)
+        && status.process_id.is_some()
+        && status.physical_eof_reached == Some(true)
+        && status.eof == Some(eof)
+}
+
+fn managed_video_owns_playback_completion(
+    current: &PlaybackSnapshot,
+    status: &MediaVideoBackendRuntimeStatus,
+) -> bool {
+    current
+        .source_media
+        .as_ref()
+        .is_some_and(|source| source.media_kind == MediaKind::Video)
+        && status.process_id.is_some()
+        && status.playback_generation == Some(current.playback_generation)
+}
+
+fn realtime_video_eof_ignored_reason(
+    current: &PlaybackSnapshot,
+    status: &MediaVideoBackendRuntimeStatus,
+    eof: VideoEofFact,
+) -> Option<&'static str> {
+    (current.playback_state == PlaybackState::Playing
+        && matching_single_video_source(current)
+        && current.playback_generation == eof.playback_generation
+        && eof.loop_index.checked_add(1) == Some(current.loop_index)
+        && status.playback_generation == Some(current.playback_generation)
+        && status.backend_epoch == eof.backend_epoch
+        && status.clock_epoch == Some(eof.clock_epoch)
+        && status.loop_index == Some(current.loop_index)
+        && status.process_id.is_some()
+        && status.physical_paused == Some(false)
+        && status.physical_eof_reached == Some(false)
+        && status.eof.is_none())
+    .then_some("already_advanced")
+}
+
 impl AppState {
-    fn stop_realtime_video_runtime(&self) -> Result<(), CommandErrorDto> {
-        self.realtime_video_runtime
+    pub fn start_realtime_video_eof_supervisor(&self, app: AppHandle) -> Result<(), String> {
+        let mut supervisor = self
+            .realtime_video_eof_supervisor
             .lock()
-            .map_err(|_| {
-                CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏")
-            })?
-            .stop();
+            .map_err(|_| "EOF 监督线程状态锁已损坏".to_owned())?;
+        if supervisor.is_some() {
+            return Ok(());
+        }
+        let receiver = self
+            .realtime_video_eof_events
+            .lock()
+            .map_err(|_| "EOF 事件接收器状态锁已损坏".to_owned())?
+            .take()
+            .ok_or_else(|| "EOF 事件接收器已被占用".to_owned())?;
+        let state = self.clone();
+        let handle = thread::Builder::new()
+            .name("realtime-video-eof-supervisor".to_owned())
+            .spawn(move || {
+                while !state.shutting_down.load(Ordering::Acquire) {
+                    match receiver.recv_timeout(Duration::from_millis(100)) {
+                        Ok(eof) => state.handle_realtime_video_eof_event(&app, eof),
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .map_err(|error| format!("启动 EOF 监督线程失败：{error}"))?;
+        *supervisor = Some(RealtimeVideoEofSupervisorTask { handle });
         Ok(())
+    }
+
+    fn handle_realtime_video_eof_event(&self, app: &AppHandle, eof: VideoEofFact) {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        let current = match self.playback.lock() {
+            Ok(playback) => playback.snapshot(),
+            Err(_) => {
+                eprintln!(
+                    "[realtime-video-eof] stage=rejected reason=playback_lock_failed playback_generation={} backend_epoch={} clock_epoch={} loop_index={}",
+                    eof.playback_generation, eof.backend_epoch, eof.clock_epoch, eof.loop_index
+                );
+                return;
+            }
+        };
+        let status = self.realtime_video_runtime.status();
+        let reconciliation_required =
+            realtime_video_eof_reconciliation_required(&current, &status, eof);
+        if let Some(reason) = realtime_video_eof_ignored_reason(&current, &status, eof) {
+            eprintln!(
+                "[realtime-video-eof] stage=ignored reason={} playback_generation={} backend_epoch={} clock_epoch={} loop_index={} current_loop_index={} source_media_index={}",
+                reason,
+                eof.playback_generation,
+                eof.backend_epoch,
+                eof.clock_epoch,
+                eof.loop_index,
+                current.loop_index,
+                current.source_media_index
+            );
+            return;
+        }
+        let rejection = realtime_video_eof_rejection(&current, &status, eof);
+        if let Some(reason) = rejection {
+            eprintln!(
+                "[realtime-video-eof] stage=rejected reason={} playback_generation={} backend_epoch={} clock_epoch={} loop_index={} source_media_index={}",
+                reason,
+                eof.playback_generation,
+                eof.backend_epoch,
+                eof.clock_epoch,
+                eof.loop_index,
+                current.source_media_index
+            );
+            return;
+        }
+        let request = CompletePlaybackItemRequestDto {
+            playback_generation: eof.playback_generation,
+            loop_index: eof.loop_index,
+            source_media_index: current.source_media_index,
+        };
+        match complete_playback_item_transaction(app, self, &request, Some(eof)) {
+            Ok(result) => {
+                let stage = if reconciliation_required {
+                    "reconciled"
+                } else {
+                    "completed"
+                };
+                eprintln!(
+                    "[realtime-video-eof] stage={} playback_generation={} backend_epoch={} clock_epoch={} loop_index={} next_playback_generation={} next_loop_index={} source_changed={}",
+                    stage,
+                    eof.playback_generation,
+                    eof.backend_epoch,
+                    eof.clock_epoch,
+                    eof.loop_index,
+                    result.snapshot.playback_generation,
+                    result.snapshot.loop_index,
+                    result.source_changed
+                );
+            }
+            Err(error) => eprintln!(
+                "[realtime-video-eof] stage=failed code={} playback_generation={} backend_epoch={} clock_epoch={} loop_index={}",
+                error.code,
+                eof.playback_generation,
+                eof.backend_epoch,
+                eof.clock_epoch,
+                eof.loop_index
+            ),
+        }
+    }
+
+    fn stop_realtime_video_runtime(&self) -> Result<(), CommandErrorDto> {
+        let playback_generation = self
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+            .snapshot()
+            .playback_generation;
+        self.realtime_video_runtime
+            .stop(playback_generation)
+            .map_err(|error| CommandErrorDto::new("realtime_video_lock_failed", error.to_string()))
+    }
+
+    fn suspend_realtime_video_runtime(&self) -> Result<(), CommandErrorDto> {
+        self.realtime_video_runtime
+            .suspend()
+            .map_err(|error| CommandErrorDto::new("realtime_video_lock_failed", error.to_string()))
     }
 
     fn begin_media_import(&self) -> Result<MediaImportLease, CommandErrorDto> {
@@ -1582,11 +1894,15 @@ impl AppState {
         let started_at = Instant::now();
         let mut first_error = None;
 
-        match self.realtime_video_runtime.lock() {
-            Ok(mut runtime) => runtime.stop(),
+        let playback_generation = match self.playback.lock() {
+            Ok(playback) => playback.snapshot().playback_generation,
             Err(_) => {
-                first_error.get_or_insert("实时画面运行时锁已损坏".to_owned());
+                first_error.get_or_insert("播放状态锁已损坏".to_owned());
+                0
             }
+        };
+        if let Err(error) = self.realtime_video_runtime.stop(playback_generation) {
+            first_error.get_or_insert(format!("停止实时画面运行时失败：{error}"));
         }
 
         match self.protected_webview_interlude_paths.lock() {
@@ -1610,17 +1926,6 @@ impl AppState {
         if let Err(error) = self.stop_audio_for_shutdown() {
             first_error.get_or_insert(error.message);
         }
-        if let Ok(playback) = self.playback.lock() {
-            cleanup_compatibility_files(
-                playback
-                    .snapshot()
-                    .source_media_pool
-                    .into_iter()
-                    .filter(|source| source.playback_reference != source.source_path)
-                    .map(|source| PathBuf::from(source.playback_reference)),
-            );
-        }
-
         let mut joined_any = false;
         let mut timed_out = false;
         for result in [
@@ -1639,6 +1944,11 @@ impl AppState {
             join_background_worker_until(
                 &self.audio_media_worker,
                 "声音 Worker 状态锁已损坏",
+                started_at,
+                budget,
+            ),
+            join_realtime_video_eof_supervisor_until(
+                &self.realtime_video_eof_supervisor,
                 started_at,
                 budget,
             ),
@@ -2050,13 +2360,17 @@ impl AppState {
                 "音轨提交前收到更新的停止、暂停或切换请求",
             ));
         }
-        if let Err(error) = self.audio_output_control()?.set_current(
-            task.output_track(),
-            AudioTrackTimeline {
-                media_position_ms: commit_absolute_position_ms,
-                playback_rate,
-            },
-        ) {
+        let timeline = audible_audio_track_timeline(
+            &source_identity,
+            observed_clock.loop_index,
+            observed_clock.duration_ms,
+            commit_absolute_position_ms,
+            playback_rate,
+        )?;
+        if let Err(error) = self
+            .audio_output_control()?
+            .set_current(task.output_track(), timeline)
+        {
             task.stop_preserving_output();
             return Err(CommandErrorDto::new(
                 "audio_cycle_output_commit_failed",
@@ -2349,7 +2663,17 @@ impl AppState {
                     "播放位置时钟锁已损坏",
                 )
             })?
-            .map(|observed_at| observed_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+            .and_then(|observation| {
+                (observation.playback_generation == snapshot.playback_generation
+                    && observation.loop_index == snapshot.loop_index)
+                    .then(|| {
+                        observation
+                            .observed_at
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64
+                    })
+            })
             .unwrap_or(0);
         if let Some(code) = audio_cycle_target_validation_code(
             current_absolute_position_ms,
@@ -2471,6 +2795,8 @@ impl AppState {
         candidate_start_absolute_position_ms: u64,
         preparation_started_at: Instant,
         playback_rate: f64,
+        loop_index: u64,
+        source_duration_ms: u64,
         source_identity: &AudioMixerSourceIdentity,
         operation_token: u64,
     ) -> Result<(), CommandErrorDto> {
@@ -2557,13 +2883,14 @@ impl AppState {
             candidate.stop_preserving_output();
             return Err(CommandErrorDto::new("audio_mixer_commit_failed", error));
         }
-        if let Err(error) = output_control.crossfade_to(
-            candidate.output_track(),
-            AudioTrackTimeline {
-                media_position_ms: commit_absolute_position_ms,
-                playback_rate,
-            },
-        ) {
+        let timeline = audible_audio_track_timeline(
+            source_identity,
+            loop_index,
+            source_duration_ms,
+            commit_absolute_position_ms,
+            playback_rate,
+        )?;
+        if let Err(error) = output_control.crossfade_to(candidate.output_track(), timeline) {
             candidate.stop_preserving_output();
             return Err(CommandErrorDto::new(
                 audio_crossfade_error_code(&error),
@@ -3102,6 +3429,12 @@ pub struct ProcessingSwitchesRequestDto {
     pub realtime_audio_variant_enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessingSwitchesResultDto {
+    pub snapshot: PlaybackSnapshotDto,
+    pub video_backend_status: MediaVideoBackendRuntimeStatus,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AudioProcessingProfileRequestDto {
     pub profile: AudioProcessingProfile,
@@ -3240,34 +3573,14 @@ pub struct StartMediaProcessingRequestDto {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PrepareRealtimeVideoPlanRequestDto {
+pub struct ConfigureRealtimeVideoCycleRequestDto {
     pub params: MediaEffectParams,
-    pub sequence: u64,
-    pub playback_generation: u64,
-    pub source_revision: u64,
-    pub target_absolute_position_ms: u64,
-    pub period_ms: u64,
-    pub seed: u64,
-    #[serde(default)]
-    pub next_sequence: Option<u64>,
-    #[serde(default)]
-    pub next_target_absolute_position_ms: Option<u64>,
+    pub min_period_ms: u64,
+    pub max_period_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CommitRealtimeVideoPlanRequestDto {
-    pub sequence: u64,
-    pub playback_generation: u64,
-    pub source_revision: u64,
-    pub media_pts_ms: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SyncRealtimeVideoRendererRequestDto {
-    pub playback_generation: u64,
-    pub position_ms: u64,
-    pub paused: bool,
-}
+pub struct EnsureOriginalVideoRendererRequestDto {}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommitMediaProcessingRequestDto {
@@ -3758,6 +4071,30 @@ impl AppState {
         action(&mut playback).map_err(command_error_from_playback)?;
         Ok(self.snapshot(&playback))
     }
+
+    fn playback_action_with_video_intent(
+        &self,
+        window: &Window,
+        action: impl FnOnce(&mut PlaybackCore) -> Result<(), PlaybackError>,
+        intent: PlaybackIntent,
+    ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+        self.ensure_playback_window(window)?;
+        let mut playback = self
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+        let mut staged = playback.clone();
+        if window.label() == self.main_window_label {
+            staged
+                .bind_window(window.label())
+                .map_err(command_error_from_playback)?;
+        }
+        action(&mut staged).map_err(command_error_from_playback)?;
+        let snapshot = self.snapshot(&staged);
+        apply_realtime_video_playback_intent(self, snapshot.playback_generation, intent)?;
+        *playback = staged;
+        Ok(snapshot)
+    }
 }
 
 #[tauri::command]
@@ -3811,21 +4148,13 @@ pub async fn append_local_videos(
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let import = state.begin_media_import()?;
-        let mut prepared = probe_local_video_paths(&app, request.paths, &import.cancellation)?;
-        let sources: Vec<_> = prepared
-            .results
-            .iter()
-            .map(|result| result.source.clone())
-            .collect();
-        let result = commit_playback_pool_edit(&window, &state, Some(&import), move |playback| {
+        let results = probe_local_video_paths(&app, request.paths, &import.cancellation)?;
+        let sources: Vec<_> = results.iter().map(|result| result.source.clone()).collect();
+        commit_playback_pool_edit(&window, &state, Some(&import), move |playback| {
             playback
                 .append_source_pool(sources.clone())
                 .map_err(command_error_from_playback)
-        });
-        if result.is_ok() {
-            prepared.retain_created_files();
-        }
-        result
+        })
     })
     .await
     .map_err(|error| {
@@ -3847,26 +4176,18 @@ pub async fn replace_playback_pool_item(
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let import = state.begin_media_import()?;
-        let mut prepared = probe_local_video_paths(&app, vec![request.path], &import.cancellation)?;
-        let replacement = prepared
-            .results
+        let mut results = probe_local_video_paths(&app, vec![request.path], &import.cancellation)?;
+        let replacement = results
             .pop()
             .ok_or_else(|| CommandErrorDto::new("media_probe_failed", "替换媒体未返回探测结果"))?;
-        let result = commit_playback_pool_edit(&window, &state, Some(&import), move |playback| {
+        commit_playback_pool_edit(&window, &state, Some(&import), move |playback| {
             let snapshot = playback.snapshot();
             let index =
                 source_media_index_by_path(&snapshot.source_media_pool, &request.source_path)?;
             playback
                 .replace_source_at(index, replacement.source.clone())
                 .map_err(command_error_from_playback)
-        });
-        match result {
-            Ok(snapshot) => {
-                prepared.retain_created_files();
-                Ok(snapshot)
-            }
-            Err(error) => Err(error),
-        }
+        })
     })
     .await
     .map_err(|error| {
@@ -3938,7 +4259,7 @@ fn probe_local_video_paths(
     app: &AppHandle,
     paths: Vec<String>,
     cancellation: &CancellationToken,
-) -> Result<PreparedMediaImports, CommandErrorDto> {
+) -> Result<Vec<MediaProbeResultDto>, CommandErrorDto> {
     validate_source_media_pool_count(paths.len())?;
     validate_source_media_paths(&paths)?;
     let target_root = runtime_resource_target_root(app).map_err(|error| {
@@ -3947,74 +4268,35 @@ fn probe_local_video_paths(
             format!("读取已验证媒体运行资源目录失败：{error}"),
         )
     })?;
-    let (ffmpeg_path, ffprobe_path) = configured_media_engine_paths_with_resource_dir(&target_root)
+    let (_, ffprobe_path) = configured_media_engine_paths_with_resource_dir(&target_root)
         .map_err(|error| CommandErrorDto::new("media_probe_failed", error.to_string()))?;
-    let cache_dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| CommandErrorDto::new("media_cache_dir_failed", error.to_string()))?
-        .join("media-compatibility");
     let mut canonical_paths = HashSet::with_capacity(paths.len());
     let mut results = Vec::with_capacity(paths.len());
-    let mut created_compatibility_files = Vec::new();
-    let prepared = (|| {
-        for path in paths {
-            let mut result = probe_user_selected_video_with_ffprobe(
-                &MediaProbeRequestDto { path },
-                &ffprobe_path,
-                MEDIA_IMPORT_PROBE_TIMEOUT_MS,
-                cancellation,
-            )
-            .map_err(command_error_from_media_library)?;
-            insert_canonical_source_path(&mut canonical_paths, &result.canonical_path)?;
-            let compatibility = prepare_media_compatibility(
-                &MediaCompatibilityRequest {
-                    ffmpeg_path: ffmpeg_path.clone(),
-                    ffprobe_path: ffprobe_path.clone(),
-                    cache_dir: cache_dir.clone(),
-                    source: result.source.clone(),
-                    timeout_seconds: MEDIA_IMPORT_COMPATIBILITY_TIMEOUT_SECONDS,
-                },
-                cancellation,
-            )
-            .map_err(|error| {
-                CommandErrorDto::new("media_compatibility_failed", error.to_string())
-            })?;
-            result.source.playback_reference = compatibility.playback_reference;
-            result.source.compatibility_mode = compatibility.mode;
-            if let Some(path) = compatibility.created_file {
-                created_compatibility_files.push(path);
-            }
-            results.push(result);
-        }
-        if cancellation.is_cancelled() {
-            return Err(command_error_from_media_library(
-                MediaLibraryError::Cancelled,
-            ));
-        }
-        for result in &results {
-            allow_local_playback_asset_file(
-                app,
-                Path::new(&result.source.source_path),
-                "source_media_asset_scope_failed",
-                "源媒体",
-            )?;
-            allow_local_playback_asset_file(
-                app,
-                Path::new(&result.source.playback_reference),
-                "playback_media_asset_scope_failed",
-                "媒体播放引用",
-            )?;
-        }
-        Ok(PreparedMediaImports {
-            results,
-            created_compatibility_files: created_compatibility_files.clone(),
-        })
-    })();
-    if prepared.is_err() {
-        cleanup_compatibility_files(created_compatibility_files);
+    for path in paths {
+        let result = probe_user_selected_video_with_ffprobe(
+            &MediaProbeRequestDto { path },
+            &ffprobe_path,
+            MEDIA_IMPORT_PROBE_TIMEOUT_MS,
+            cancellation,
+        )
+        .map_err(command_error_from_media_library)?;
+        insert_canonical_source_path(&mut canonical_paths, &result.canonical_path)?;
+        results.push(result);
     }
-    prepared
+    if cancellation.is_cancelled() {
+        return Err(command_error_from_media_library(
+            MediaLibraryError::Cancelled,
+        ));
+    }
+    for result in &results {
+        allow_local_playback_asset_file(
+            app,
+            Path::new(&result.source.source_path),
+            "source_media_asset_scope_failed",
+            "源媒体",
+        )?;
+    }
+    Ok(results)
 }
 
 fn probe_local_video_pool_blocking(
@@ -4025,8 +4307,7 @@ fn probe_local_video_pool_blocking(
 ) -> Result<(Vec<MediaProbeResultDto>, PlaybackSnapshotDto), CommandErrorDto> {
     state.ensure_main_window(&window)?;
     let import = state.begin_media_import()?;
-    let mut prepared = probe_local_video_paths(&app, paths, &import.cancellation)?;
-    let results = prepared.results.clone();
+    let results = probe_local_video_paths(&app, paths, &import.cancellation)?;
 
     let _transition_guard = state.playback_transition.lock().map_err(|_| {
         CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
@@ -4036,7 +4317,6 @@ fn probe_local_video_pool_blocking(
     state.stop_audio_for_playback()?;
     state.stop_speech_worker()?;
     state.stop_realtime_video_runtime()?;
-    let before = state.with_playback(&window, |playback| Ok(playback.snapshot()))?;
     let sources = results.iter().map(|result| result.source.clone()).collect();
     let snapshot = state.with_playback(&window, |playback| {
         playback
@@ -4044,10 +4324,7 @@ fn probe_local_video_pool_blocking(
             .map_err(command_error_from_playback)?;
         Ok(state.snapshot(playback))
     });
-    let snapshot = snapshot?;
-    prepared.retain_created_files();
-    cleanup_replaced_compatibility_files(&before, &snapshot);
-    Ok((results, snapshot))
+    Ok((results, snapshot?))
 }
 
 fn lock_current_media_import<'a>(
@@ -4095,29 +4372,10 @@ fn commit_playback_pool_edit(
     state.stop_audio_for_playback()?;
     state.stop_speech_worker()?;
     state.stop_realtime_video_runtime()?;
-    let snapshot = state.with_playback(window, |playback| {
+    state.with_playback(window, |playback| {
         edit(playback)?;
         Ok(state.snapshot(playback))
-    })?;
-    cleanup_replaced_compatibility_files(&current, &snapshot);
-    Ok(snapshot)
-}
-
-fn cleanup_replaced_compatibility_files(before: &PlaybackSnapshot, after: &PlaybackSnapshotDto) {
-    let retained: HashSet<&str> = after
-        .source_media_pool
-        .iter()
-        .map(|source| source.playback_reference.as_str())
-        .collect();
-    let removed = before
-        .source_media_pool
-        .iter()
-        .filter(|source| {
-            source.playback_reference != source.source_path
-                && !retained.contains(source.playback_reference.as_str())
-        })
-        .map(|source| PathBuf::from(&source.playback_reference));
-    cleanup_compatibility_files(removed);
+    })
 }
 
 #[tauri::command]
@@ -4196,160 +4454,114 @@ pub fn get_media_engine_capabilities(
     ))
 }
 
-fn collect_realtime_video_parameters(
-    params: &MediaEffectParams,
-) -> Result<Vec<RealtimeVideoParameter>, CommandErrorDto> {
-    fn walk(
-        path: &str,
-        current: &serde_json::Value,
-        defaults: &serde_json::Value,
-        output: &mut Vec<RealtimeVideoParameter>,
-    ) {
-        if let serde_json::Value::Object(fields) = current {
-            for (name, value) in fields {
-                let next_path = if path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{path}.{name}")
-                };
-                walk(
-                    &next_path,
-                    value,
-                    defaults.get(name).unwrap_or(&serde_json::Value::Null),
-                    output,
-                );
-            }
-            return;
+fn command_error_from_native_video_host(error: NativeVideoHostError) -> CommandErrorDto {
+    match error {
+        NativeVideoHostError::Destroyed => {
+            CommandErrorDto::new("native_video_host_destroyed", error.to_string())
         }
-        let active = current != defaults;
-        let value = current
-            .as_f64()
-            .or_else(|| {
-                current
-                    .as_bool()
-                    .map(|enabled| if enabled { 1.0 } else { 0.0 })
-            })
-            .unwrap_or(0.0);
-        output.push(if active {
-            RealtimeVideoParameter::active(path, value)
-        } else {
-            RealtimeVideoParameter::inactive(path, value)
-        });
+        NativeVideoHostError::Unsupported => {
+            CommandErrorDto::new("realtime_video_platform_unsupported", error.to_string())
+        }
+        NativeVideoHostError::InvalidParent
+        | NativeVideoHostError::NotReady
+        | NativeVideoHostError::WrongThread
+        | NativeVideoHostError::Platform(_) => {
+            CommandErrorDto::new("native_video_host_not_ready", error.to_string())
+        }
     }
-
-    let current = serde_json::json!({
-        "video": &params.video,
-        "advanced": &params.advanced,
-    });
-    let defaults = MediaEffectParams::default();
-    let defaults = serde_json::json!({
-        "video": &defaults.video,
-        "advanced": &defaults.advanced,
-    });
-    let mut output = Vec::new();
-    walk("", &current, &defaults, &mut output);
-    if output.is_empty() {
-        return Err(CommandErrorDto::new(
-            "realtime_video_params_empty",
-            "实时画面参数快照为空",
-        ));
-    }
-    Ok(output)
 }
 
-fn compile_gpu83_realtime_parameters(
-    params: &MediaEffectParams,
-) -> Result<CompiledRealtimeParameters, CommandErrorDto> {
-    let active_fields = collect_realtime_video_parameters(params)?
-        .into_iter()
-        .filter(|parameter| parameter.active)
-        .map(|parameter| parameter.field)
-        .collect::<HashSet<_>>();
-    let snapshot =
-        build_gpu83_shader_snapshot(&params.video, &params.advanced).map_err(|error| {
-            CommandErrorDto::new(
-                "gpu83_snapshot_invalid",
-                format!("GPU83 参数快照无效（{}:{}）", error.field, error.code),
-            )
-        })?;
-    let update = snapshot.mpv_property_update();
-    let options = MpvShaderOptions::parse(update.value)
-        .map_err(|error| CommandErrorDto::new("gpu83_snapshot_invalid", error.to_string()))?;
-    let parameters = snapshot
-        .entries
-        .into_iter()
-        .map(|entry| {
-            let mapping = GPU83_PARAMETER_MAPPINGS
-                .iter()
-                .find(|mapping| mapping.field_path == entry.field_path);
-            let supported = entry.capability == Gpu83ParameterCapability::ShaderParameter;
-            ParameterSupportResult {
-                field: entry.field_path.to_owned(),
-                active: active_fields.contains(entry.field_path),
-                supported,
-                mapping: supported.then(|| {
-                    format!(
-                        "mpv_shader_option:{}",
-                        mapping
-                            .map(|mapping| mapping.shader_option)
-                            .unwrap_or("unknown")
-                    )
-                }),
-                reason: match entry.capability {
-                    Gpu83ParameterCapability::ShaderParameter => None,
-                    Gpu83ParameterCapability::Unavailable(reason) => Some(reason.to_owned()),
-                },
-            }
-        })
-        .collect::<Vec<_>>();
-    let fully_supported = parameters
-        .iter()
-        .all(|parameter| !parameter.active || parameter.supported);
-    Ok(CompiledRealtimeParameters {
-        commands: vec![MpvCommand::SetShaderOptions { options }],
-        support: ParameterSupportReport {
-            backend: VideoBackend::RealtimeGpu,
-            fully_supported,
-            parameters,
-        },
-    })
+fn ready_final_effect_video_host_window_id(state: &AppState) -> Result<u64, CommandErrorDto> {
+    let host = state.native_video_host.lock().map_err(|_| {
+        CommandErrorDto::new("native_video_host_lock_failed", "专用视频宿主状态锁已损坏")
+    })?;
+    host.as_ref()
+        .ok_or_else(|| {
+            CommandErrorDto::new("native_video_host_not_ready", "专用视频宿主窗口尚未创建")
+        })?
+        .mpv_wid()
+        .map(u64::from)
+        .map_err(command_error_from_native_video_host)
 }
 
-fn record_realtime_video_fallback(
+async fn verify_mpv_video_surface(
+    app: &AppHandle,
     state: &AppState,
-    reason: String,
-) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
-    let mut runtime = state.realtime_video_runtime.lock().map_err(|_| {
-        CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏")
-    })?;
-    runtime.record_source_backend(reason);
-    Ok(runtime.status())
-}
-
-#[cfg(windows)]
-fn final_effect_host_window_id(window: &tauri::WebviewWindow) -> Result<u64, CommandErrorDto> {
-    let hwnd = window.hwnd().map_err(|error| {
-        CommandErrorDto::new(
-            "final_effect_window_handle_failed",
-            format!("读取最终效果窗口句柄失败：{error}"),
-        )
-    })?;
-    let value = hwnd.0 as usize as u64;
-    if value == 0 {
+    status: &MediaVideoBackendRuntimeStatus,
+) -> Result<(), CommandErrorDto> {
+    let Some(process_id) = status.process_id else {
+        if status.backend == VideoBackend::Source && status.activation == BackendActivation::Failed
+        {
+            return Ok(());
+        }
         return Err(CommandErrorDto::new(
-            "final_effect_window_handle_failed",
-            "最终效果窗口句柄无效",
+            "mpv_video_window_not_ready",
+            "mpv 已返回视频后端状态，但没有可验证的受管进程 PID",
         ));
+    };
+    let native_video_host = Arc::clone(&state.native_video_host);
+    let inspection =
+        match run_on_tauri_main_thread(app, "验证并提升专用视频宿主", move || {
+            let host = native_video_host.lock().map_err(|_| {
+                CommandErrorDto::new("native_video_host_lock_failed", "专用视频宿主状态锁已损坏")
+            })?;
+            let host = host.as_ref().ok_or_else(|| {
+                CommandErrorDto::new("native_video_host_not_ready", "专用视频宿主窗口尚未创建")
+            })?;
+            let inspection = host
+                .inspect_mpv_video_window(process_id)
+                .map_err(command_error_from_native_video_host)?;
+            if inspection.is_ready() {
+                host.promote_to_top()
+                    .map_err(command_error_from_native_video_host)?;
+            }
+            Ok(inspection)
+        })
+        .await
+        {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                let cleanup = state
+                    .suspend_realtime_video_runtime()
+                    .err()
+                    .map(|cleanup_error| format!("；会话回收失败：{}", cleanup_error.message))
+                    .unwrap_or_default();
+                return Err(CommandErrorDto::new(
+                    "mpv_video_window_not_ready",
+                    format!(
+                        "mpv 视频表面验证或专用宿主提升失败：{}{cleanup}",
+                        error.message
+                    ),
+                ));
+            }
+        };
+    if inspection.is_ready() {
+        return Ok(());
     }
-    Ok(value)
+    let cleanup = state
+        .suspend_realtime_video_runtime()
+        .err()
+        .map(|error| format!("；会话回收失败：{}", error.message))
+        .unwrap_or_default();
+    Err(CommandErrorDto::new(
+        "mpv_video_window_not_ready",
+        format!(
+            "mpv 进程 {process_id} 未在专用 HWND {} 下创建可见且非零尺寸的视频子窗口（枚举 {}，进程所属 {}，可见 {}，非零客户区 {}）{cleanup}",
+            inspection.host_window_id,
+            inspection.enumerated_descendants,
+            inspection.process_owned_descendants,
+            inspection.visible_process_descendants,
+            inspection.non_empty_process_descendants,
+        ),
+    ))
 }
 
-#[cfg(not(windows))]
-fn final_effect_host_window_id(_window: &tauri::WebviewWindow) -> Result<u64, CommandErrorDto> {
-    Err(CommandErrorDto::new(
-        "realtime_video_platform_unsupported",
-        "mpv 实时画面主链当前只支持 Windows",
-    ))
+fn should_verify_mpv_video_surface(
+    previous_process_id: Option<u32>,
+    status: &MediaVideoBackendRuntimeStatus,
+) -> bool {
+    let current_process_id = status.process_id;
+    current_process_id.is_none() || previous_process_id != current_process_id
 }
 
 #[tauri::command]
@@ -4357,23 +4569,134 @@ pub fn get_media_video_backend_status(
     window: Window,
     state: State<'_, AppState>,
 ) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    state
-        .realtime_video_runtime
-        .lock()
-        .map_err(|_| CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏"))
-        .map(|runtime| runtime.status())
+    state.ensure_playback_window(&window)?;
+    Ok(state.realtime_video_runtime.status())
 }
 
-#[tauri::command]
-pub fn prepare_realtime_video_plan(
+#[tauri::command(async)]
+pub async fn ensure_original_video_renderer(
     window: Window,
     app: AppHandle,
     state: State<'_, AppState>,
-    request: PrepareRealtimeVideoPlanRequestDto,
+    request: EnsureOriginalVideoRendererRequestDto,
+) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
+    let _ = request;
+    state.ensure_playback_window(&window)?;
+    let transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
+    state.ensure_running()?;
+    let snapshot = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot();
+    if !matches!(
+        snapshot.playback_state,
+        PlaybackState::Playing | PlaybackState::Paused
+    ) {
+        return Err(CommandErrorDto::new(
+            "original_video_playback_inactive",
+            "当前播放状态不需要启动 Original 画面",
+        ));
+    }
+    let source = snapshot
+        .source_media
+        .as_ref()
+        .ok_or_else(|| CommandErrorDto::new("source_media_required", "请先导入一个源媒体"))?;
+    if source.media_kind != MediaKind::Video {
+        return Err(CommandErrorDto::new(
+            "original_video_source_required",
+            "当前源不是视频，不能启动 Original 画面",
+        ));
+    }
+    let source_duration_ms = source
+        .duration_ms
+        .filter(|duration_ms| *duration_ms > 0)
+        .ok_or_else(|| {
+            CommandErrorDto::new(
+                "original_video_duration_required",
+                "当前视频缺少有效时长，不能启动 Original 画面",
+            )
+        })?;
+    let playback_generation = snapshot.playback_generation;
+    let loop_index = snapshot.loop_index;
+    let source_position_ms = snapshot
+        .current_position_ms
+        .min(source_duration_ms.saturating_sub(1));
+    let runtime_status = state.realtime_video_runtime.status();
+    let clock_epoch = runtime_status
+        .clock_epoch
+        .filter(|_| {
+            runtime_status.playback_generation == Some(playback_generation)
+                && runtime_status.loop_index == Some(loop_index)
+        })
+        .unwrap_or(1);
+    let backend_epoch = runtime_status.backend_epoch;
+    let source_path = PathBuf::from(&source.source_path);
+    let paused = snapshot.playback_state != PlaybackState::Playing;
+    let operation_lease = state
+        .realtime_video_runtime
+        .reserve_operation(playback_generation, clock_epoch, loop_index)
+        .map_err(|error| {
+            CommandErrorDto::new("original_video_renderer_stale", error.to_string())
+        })?;
+    drop(transition_guard);
+    let _final_effect_window = app.get_webview_window("final-effect").ok_or_else(|| {
+        CommandErrorDto::new(
+            "final_effect_window_missing",
+            "最终效果窗口尚未打开，无法启动 Original 画面",
+        )
+    })?;
+    let host_window_id = ready_final_effect_video_host_window_id(&state)?;
+    let runtime_root = runtime_resource_target_root(&app)
+        .map_err(|error| CommandErrorDto::new("media_resource_dir_failed", error))?;
+    let executable = resolve_mpv_executable(&runtime_root)
+        .map_err(|error| CommandErrorDto::new("mpv_resource_invalid", error.to_string()))?;
+    // Original 优先复用预载中性 shader 的 GPU 会话；shader 资源不可用时仍允许
+    // 退回普通 Original，避免视频处理资源故障阻断基础播放。
+    let resource_dir = app.path().resource_dir().map_err(|error| {
+        CommandErrorDto::new(
+            "mpv_shader_resource_dir_failed",
+            format!("读取 mpv shader 资源目录失败：{error}"),
+        )
+    })?;
+    let shader_path = resource_dir.join("resources/shaders/gpu83.hook");
+    let shader = resolve_mpv_shader(&resource_dir, &shader_path).ok();
+    let status = state
+        .realtime_video_runtime
+        .ensure_original_with_lease(
+            PrepareOriginalRenderer {
+                executable,
+                shader,
+                source_path,
+                host_window_id,
+                source_start_ms: source_position_ms,
+                source_duration_ms,
+                paused,
+                playback_generation,
+                clock_epoch,
+                loop_index,
+                backend_epoch,
+            },
+            operation_lease,
+        )
+        .map_err(|error| {
+            CommandErrorDto::new("original_video_renderer_failed", error.to_string())
+        })?;
+    verify_mpv_video_surface(&app, &state, &status).await?;
+    Ok(status)
+}
+
+#[tauri::command(async)]
+pub async fn configure_realtime_video_cycle(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: ConfigureRealtimeVideoCycleRequestDto,
 ) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
     state.ensure_main_window(&window)?;
-    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+    let transition_guard = state.playback_transition.lock().map_err(|_| {
         CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
     })?;
     state.ensure_running()?;
@@ -4387,59 +4710,72 @@ pub fn prepare_realtime_video_plan(
                 .join("；"),
         )
     })?;
-    if request.sequence == 0 || request.period_ms == 0 {
-        return Err(CommandErrorDto::new(
-            "realtime_video_plan_invalid",
-            "实时画面 sequence 和 period_ms 必须大于 0",
-        ));
-    }
+    let config = VideoCycleConfig::try_new(
+        true,
+        request.min_period_ms,
+        request.max_period_ms,
+        request.params.clone(),
+    )
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "realtime_video_cycle_config_invalid",
+            format!("Rust 视频周期配置无效：{error:?}"),
+        )
+    })?;
     let snapshot = state
         .playback
         .lock()
         .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
         .snapshot();
-    if request.playback_generation != snapshot.playback_generation
-        || request.source_revision != VIDEO_BACKEND_SOURCE_REVISION
-    {
-        return Err(CommandErrorDto::new(
-            "stale_realtime_video_plan",
-            "实时画面计划绑定的播放代次已过期",
-        ));
+    let playback_generation = snapshot.playback_generation;
+    let loop_index = snapshot.loop_index;
+    if !snapshot.video_processing_enabled {
+        return state
+            .realtime_video_runtime
+            .set_processing_enabled(false)
+            .map_err(|error| {
+                CommandErrorDto::new("realtime_video_switch_failed", error.to_string())
+            });
     }
     let source = snapshot
         .source_media
         .as_ref()
-        .ok_or_else(|| CommandErrorDto::new("source_media_required", "请先导入一个源媒体"))?;
-    if source.media_kind != MediaKind::Video || !snapshot.video_processing_enabled {
-        return record_realtime_video_fallback(
-            &state,
-            "当前源不是视频或视频处理开关未开启".to_owned(),
-        );
-    }
-    let generation = snapshot.playback_generation;
-    let source_path = PathBuf::from(&source.source_path);
-    let source_start_ms = snapshot.current_position_ms;
-    let paused = snapshot.playback_state != PlaybackState::Playing;
-
-    let compiled = compile_gpu83_realtime_parameters(&request.params)?;
-    if !compiled.support.fully_supported {
-        let count = compiled.support.ignored_active_parameter_count();
-        let examples = compiled
-            .support
-            .ignored_active_parameter_examples(3)
-            .join("、");
-        return record_realtime_video_fallback(
-            &state,
-            format!("当前快照含 {count} 个 GPU83 未接入参数：{examples}"),
-        );
-    }
-    let final_effect_window = app.get_webview_window("final-effect").ok_or_else(|| {
+        .filter(|source| source.media_kind == MediaKind::Video)
+        .ok_or_else(|| CommandErrorDto::new("source_video_required", "当前源必须是视频"))?;
+    let source_duration_ms = source
+        .duration_ms
+        .filter(|duration| *duration > 0)
+        .ok_or_else(|| {
+            CommandErrorDto::new(
+                "realtime_video_duration_required",
+                "当前视频缺少有效时长，不能启动 Rust 视频周期",
+            )
+        })?;
+    let runtime_status = state.realtime_video_runtime.status();
+    let clock_epoch = runtime_status
+        .clock_epoch
+        .filter(|_| {
+            runtime_status.playback_generation == Some(playback_generation)
+                && runtime_status.loop_index == Some(loop_index)
+        })
+        .unwrap_or(1);
+    let backend_epoch = runtime_status.backend_epoch;
+    let source_position_ms = runtime_status
+        .presented_pts_ms
+        .filter(|_| {
+            runtime_status.playback_generation == Some(playback_generation)
+                && runtime_status.clock_epoch == Some(clock_epoch)
+                && runtime_status.loop_index == Some(loop_index)
+        })
+        .unwrap_or(snapshot.current_position_ms)
+        .min(source_duration_ms.saturating_sub(1));
+    let _final_effect_window = app.get_webview_window("final-effect").ok_or_else(|| {
         CommandErrorDto::new(
             "final_effect_window_missing",
-            "最终效果窗口尚未打开，无法准备实时画面",
+            "最终效果窗口尚未打开，无法启动 Rust 视频周期",
         )
     })?;
-    let host_window_id = final_effect_host_window_id(&final_effect_window)?;
+    let host_window_id = ready_final_effect_video_host_window_id(&state)?;
     let runtime_root = runtime_resource_target_root(&app)
         .map_err(|error| CommandErrorDto::new("media_resource_dir_failed", error))?;
     let executable = resolve_mpv_executable(&runtime_root)
@@ -4450,141 +4786,89 @@ pub fn prepare_realtime_video_plan(
             format!("读取 mpv shader 资源目录失败：{error}"),
         )
     })?;
-    let shader_path = resource_dir.join("resources/shaders/gpu83.hook");
-    let shader = resolve_mpv_shader(&resource_dir, &shader_path)
-        .map_err(|error| CommandErrorDto::new("mpv_shader_invalid", error.to_string()))?;
-
-    let identity = VideoPlanIdentity {
-        session_id: generation,
-        playback_generation: generation,
-        source_revision: request.source_revision,
-        parameter_revision: request.sequence,
-        sequence: request.sequence,
-    };
-    let plan = RealtimeVideoPlan {
-        slot: VideoPlanSlot::NPlus1,
-        identity,
-        target_pts_ms: request.target_absolute_position_ms,
-        period_ms: request.period_ms,
-        seed: request.seed,
-        prepared: true,
-        commands: compiled.commands,
-        parameter_support: compiled.support,
-    };
-    let n2 = request
-        .next_sequence
-        .zip(request.next_target_absolute_position_ms)
-        .map(|(sequence, target_pts_ms)| CycleSlotStatus {
-            sequence,
-            target_pts_ms,
-            status: CycleSlotState::Planned,
-        });
-    let mut runtime = state.realtime_video_runtime.lock().map_err(|_| {
-        CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏")
-    })?;
-    state.ensure_running()?;
-    runtime
-        .prepare(
-            PrepareRealtimeRenderer {
+    let shader = resolve_mpv_shader(
+        &resource_dir,
+        &resource_dir.join("resources/shaders/gpu83.hook"),
+    )
+    .map_err(|error| CommandErrorDto::new("mpv_shader_invalid", error.to_string()))?;
+    let previous_process_id = runtime_status.process_id;
+    let status = state
+        .realtime_video_runtime
+        .configure_cycle(
+            ConfigureRealtimeVideoCycle {
                 executable,
                 shader,
-                source_path: &source_path,
+                source_path: PathBuf::from(&source.source_path),
                 host_window_id,
-                source_start_ms,
-                paused,
-                plan,
-                n2,
-                session_id: generation,
+                source_start_ms: source_position_ms,
+                source_duration_ms,
+                paused: snapshot.playback_state != PlaybackState::Playing,
+                session_id: playback_generation,
+                playback_generation,
+                clock_epoch,
+                loop_index,
+                backend_epoch,
+                config,
             },
             unix_now_ms(),
         )
-        .map_err(|error| CommandErrorDto::new("realtime_video_prepare_failed", error.to_string()))
+        .map_err(command_error_from_realtime_video_prepare)?;
+    drop(transition_guard);
+    if should_verify_mpv_video_surface(previous_process_id, &status) {
+        verify_mpv_video_surface(&app, &state, &status).await?;
+    }
+    Ok(status)
 }
 
-#[tauri::command]
-pub fn commit_realtime_video_plan(
-    window: Window,
-    state: State<'_, AppState>,
-    request: CommitRealtimeVideoPlanRequestDto,
-) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
-    state.ensure_main_window(&window)?;
-    state.ensure_running()?;
-    let snapshot = state
-        .playback
-        .lock()
-        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
-        .snapshot();
-    if request.playback_generation != snapshot.playback_generation
-        || request.source_revision != VIDEO_BACKEND_SOURCE_REVISION
-    {
-        return Err(CommandErrorDto::new(
-            "stale_realtime_video_plan",
-            "实时画面提交绑定的播放代次已过期",
-        ));
+fn command_error_from_realtime_video_prepare(error: RealtimeVideoBackendError) -> CommandErrorDto {
+    match error {
+        stale @ RealtimeVideoBackendError::StalePrepareBackendEpoch { .. } => {
+            CommandErrorDto::new("stale_realtime_video_backend_epoch", stale.to_string())
+        }
+        error => CommandErrorDto::new("realtime_video_prepare_failed", error.to_string()),
     }
-    let identity = VideoPlanIdentity {
-        session_id: request.playback_generation,
-        playback_generation: request.playback_generation,
-        source_revision: request.source_revision,
-        parameter_revision: request.sequence,
-        sequence: request.sequence,
+}
+
+fn command_error_from_realtime_video_sync(error: RealtimeVideoBackendError) -> CommandErrorDto {
+    let code = match &error {
+        RealtimeVideoBackendError::StaleSync { .. }
+        | RealtimeVideoBackendError::StalePrepareBackendEpoch { .. } => "stale_realtime_video_sync",
+        RealtimeVideoBackendError::SyncSuperseded { .. } => "realtime_video_sync_superseded",
+        RealtimeVideoBackendError::IpcQueueFull => "realtime_video_sync_busy",
+        RealtimeVideoBackendError::RuntimeTimeout { .. }
+        | RealtimeVideoBackendError::IpcTimeout { .. } => "realtime_video_sync_result_unknown",
+        RealtimeVideoBackendError::InvalidSync { .. }
+        | RealtimeVideoBackendError::InvalidCpu4Parameter { .. }
+        | RealtimeVideoBackendError::InvalidHostWindow
+        | RealtimeVideoBackendError::InvalidIpcPipe => "realtime_video_sync_invalid",
+        RealtimeVideoBackendError::InvalidResourceRoot { .. }
+        | RealtimeVideoBackendError::InvalidExecutable { .. }
+        | RealtimeVideoBackendError::InvalidShader { .. }
+        | RealtimeVideoBackendError::ResourceEscapesRoot { .. }
+        | RealtimeVideoBackendError::InvalidMediaPath { .. }
+        | RealtimeVideoBackendError::SpawnFailed { .. }
+        | RealtimeVideoBackendError::ProcessFailed { .. }
+        | RealtimeVideoBackendError::SerializeCommand(_)
+        | RealtimeVideoBackendError::PropertyUnavailable { .. }
+        | RealtimeVideoBackendError::MediaSwitchTimeout
+        | RealtimeVideoBackendError::MediaSwitchCancelled
+        | RealtimeVideoBackendError::IpcDisconnected(_)
+        | RealtimeVideoBackendError::IpcProtocol(_) => "realtime_video_sync_transport_failed",
     };
-    let mut runtime = state.realtime_video_runtime.lock().map_err(|_| {
-        CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏")
-    })?;
-    state.ensure_running()?;
-    runtime
-        .commit(
-            &VideoCommitGate {
-                identity,
-                media_pts_ms: request.media_pts_ms,
-            },
-            unix_now_ms(),
-        )
-        .map_err(|error| CommandErrorDto::new("realtime_video_commit_failed", error.to_string()))
+    CommandErrorDto::new(code, error.to_string())
 }
 
-#[tauri::command]
-pub fn sync_realtime_video_renderer(
-    window: Window,
-    state: State<'_, AppState>,
-    request: SyncRealtimeVideoRendererRequestDto,
-) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
-    state.ensure_playback_window(&window)?;
-    state.ensure_running()?;
-    let generation = state
-        .playback
-        .lock()
-        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
-        .snapshot()
-        .playback_generation;
-    if generation != request.playback_generation {
-        return Err(CommandErrorDto::new(
-            "stale_realtime_video_sync",
-            "实时画面同步消息属于旧播放代次",
-        ));
-    }
-    let mut runtime = state.realtime_video_runtime.lock().map_err(|_| {
-        CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏")
-    })?;
-    state.ensure_running()?;
-    runtime
-        .synchronize(request.position_ms, request.paused, unix_now_ms())
-        .map_err(|error| CommandErrorDto::new("realtime_video_sync_failed", error.to_string()))?;
-    Ok(runtime.status())
-}
-
-#[tauri::command]
+#[tauri::command(async)]
 pub fn stop_realtime_video_renderer(
     window: Window,
     state: State<'_, AppState>,
 ) -> Result<MediaVideoBackendRuntimeStatus, CommandErrorDto> {
     state.ensure_playback_window(&window)?;
-    let mut runtime = state.realtime_video_runtime.lock().map_err(|_| {
-        CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏")
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
     })?;
-    runtime.stop();
-    Ok(runtime.status())
+    state.stop_realtime_video_runtime()?;
+    Ok(state.realtime_video_runtime.status())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4933,8 +5217,17 @@ fn audio_output_status_dto(
                 .lock()
                 .ok()
                 .and_then(|observed_at| {
-                    observed_at.map(|observed_at| {
-                        observed_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+                    observed_at.and_then(|observation| {
+                        (observation.playback_generation == snapshot.playback_generation
+                            && observation.loop_index == snapshot.loop_index)
+                            .then(|| {
+                                observation
+                                    .observed_at
+                                    .elapsed()
+                                    .as_millis()
+                                    .min(u128::from(u64::MAX))
+                                    as u64
+                            })
                     })
                 });
         let Some(observed_elapsed_ms) = observed_elapsed_ms else {
@@ -5411,7 +5704,7 @@ fn set_audio_output_backend_blocking(
                 .unwrap_or(autolive_portaudio_output::DEFAULT_FRAMES_PER_BUFFER),
             channels: 2,
         };
-        let output = AudioCycleOutputTask::start(config)
+        let output = AudioCycleOutputTask::start(config, Arc::clone(&state.audible_audio_clock))
             .map_err(|error| CommandErrorDto::new("portaudio_start_failed", error))?;
         let mut output_slot = state.audio_cycle_output.lock().map_err(|_| {
             CommandErrorDto::new("audio_cycle_output_lock_failed", "音频周期输出状态锁已损坏")
@@ -5844,13 +6137,14 @@ fn commit_audio_cycle_candidate_blocking(
             snapshot: snapshot_dto(),
         });
     }
-    if let Err(reason) = output_control.crossfade_to(
-        candidate.output_track(),
-        AudioTrackTimeline {
-            media_position_ms: commit_absolute_position_ms,
-            playback_rate,
-        },
-    ) {
+    let timeline = audible_audio_track_timeline(
+        &source_identity,
+        request.loop_index,
+        request.duration_ms,
+        commit_absolute_position_ms,
+        playback_rate,
+    )?;
+    if let Err(reason) = output_control.crossfade_to(candidate.output_track(), timeline) {
         let mut candidate = candidate;
         candidate.stop_preserving_output();
         let (reason, reason_code) = audio_cycle_crossfade_failure(reason);
@@ -6200,6 +6494,8 @@ fn sync_audio_output_source_blocking(
             candidate_start_absolute_position_ms,
             preparation_started_at,
             playback_rate,
+            request.loop_index,
+            request.duration_ms,
             &source_identity,
             operation_token,
         );
@@ -6456,14 +6752,33 @@ pub fn commit_audio_media_candidate(
 }
 
 #[tauri::command]
-pub fn prepare_audio_media_candidate(
+pub async fn prepare_audio_media_candidate(
     window: Window,
     app: AppHandle,
     state: State<'_, AppState>,
     request: PrepareAudioMediaCandidateRequestDto,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
     state.ensure_main_window(&window)?;
-    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        prepare_audio_media_candidate_blocking(window, app, state, request)
+    })
+    .await
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "audio_candidate_dispatch_failed",
+            format!("声音候选后台准备任务失败：{error}"),
+        )
+    })?
+}
+
+fn prepare_audio_media_candidate_blocking(
+    window: Window,
+    app: AppHandle,
+    state: AppState,
+    request: PrepareAudioMediaCandidateRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    let transition_guard = state.playback_transition.lock().map_err(|_| {
         CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
     })?;
     let _ = state.reap_finished_audio_media_worker()?;
@@ -6570,6 +6885,17 @@ pub fn prepare_audio_media_candidate(
         request.output_duration_ms,
         request.loop_source,
     )?;
+    let candidate_identity = PendingAudioMediaCandidateIdentity {
+        plan_id: plan_id.clone(),
+        sequence: request.sequence,
+        playback_generation: generation,
+        source_revision: revision,
+        target_absolute_position_ms: request.target_absolute_position_ms,
+        source_start_ms: request.source_start_ms,
+        output_duration_ms: request.output_duration_ms,
+        valid_until_absolute_position_ms: request.valid_until_absolute_position_ms,
+    };
+    drop(transition_guard);
 
     let target_root = runtime_resource_target_root(&app)
         .map_err(|error| CommandErrorDto::new("runtime_resource_directory_unavailable", error))?;
@@ -6607,34 +6933,6 @@ pub fn prepare_audio_media_candidate(
         )
     })?;
 
-    let candidate = state.with_playback(&window, |playback| {
-        let current = playback.snapshot();
-        if current.playback_generation != request.playback_generation
-            || current.audio_stream_revision != request.source_revision
-        {
-            return Err(CommandErrorDto::new(
-                "stale_audio_media_candidate",
-                "声音候选绑定的播放代次或源修订已过期",
-            ));
-        }
-        let candidate = PendingAudioMediaCandidateIdentity {
-            plan_id: plan_id.clone(),
-            sequence: request.sequence,
-            playback_generation: current.playback_generation,
-            source_revision: current.audio_stream_revision,
-            target_absolute_position_ms: request.target_absolute_position_ms,
-            source_start_ms: request.source_start_ms,
-            output_duration_ms: request.output_duration_ms,
-            valid_until_absolute_position_ms: request.valid_until_absolute_position_ms,
-        };
-        playback
-            .mark_audio_media_processing_running(candidate, configuration.clone())
-            .map_err(command_error_from_playback)
-    })?;
-    *state.ambient_sound.lock().map_err(|_| {
-        CommandErrorDto::new("ambient_sound_path_lock_failed", "环境声素材状态锁已损坏")
-    })? = ambient_sound;
-
     let cache_dir = app
         .path()
         .app_cache_dir()
@@ -6648,11 +6946,11 @@ pub fn prepare_audio_media_candidate(
         .as_nanos();
     let output_path = cache_dir.join(format!(
         "processed-audio-g{generation}-s{}-{nonce}.m4a",
-        candidate.sequence
+        candidate_identity.sequence
     ));
     let staging_path = cache_dir.join(format!(
         "processed-audio-g{generation}-s{}-{nonce}.partial.m4a",
-        candidate.sequence
+        candidate_identity.sequence
     ));
     let defaults = MediaEffectParams::default();
     let media_request = MediaRenderRequest {
@@ -6679,12 +6977,63 @@ pub fn prepare_audio_media_candidate(
         target: MediaRenderTarget::StandardMp4,
     };
     if let Err(error) = build_media_render_args(&media_request) {
-        state.with_playback(&window, |playback| {
-            playback.mark_audio_media_processing_failed(error.to_string());
-            Ok(())
+        let _transition_guard = state.playback_transition.lock().map_err(|_| {
+            CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
         })?;
-        return state.with_playback(&window, |playback| Ok(state.snapshot(playback)));
+        return state.with_playback(&window, |playback| {
+            let current = playback.snapshot();
+            if current.playback_generation != request.playback_generation
+                || current.audio_stream_revision != request.source_revision
+            {
+                return Err(CommandErrorDto::new(
+                    "stale_audio_media_candidate",
+                    "声音候选绑定的播放代次或源修订已过期",
+                ));
+            }
+            playback
+                .mark_audio_media_processing_running(
+                    candidate_identity.clone(),
+                    configuration.clone(),
+                )
+                .map_err(command_error_from_playback)?;
+            playback.mark_audio_media_processing_failed(error.to_string());
+            Ok(state.snapshot(playback))
+        });
     }
+
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
+    let _ = state.reap_finished_audio_media_worker()?;
+    if state.audio_media_worker_is_running()? {
+        return Err(CommandErrorDto::new(
+            "media_worker_already_running",
+            "当前已有本地媒体候选 FFmpeg 在执行",
+        ));
+    }
+    let candidate = state.with_playback(&window, |playback| {
+        let current = playback.snapshot();
+        if current.playback_generation != request.playback_generation
+            || current.audio_stream_revision != request.source_revision
+        {
+            return Err(CommandErrorDto::new(
+                "stale_audio_media_candidate",
+                "声音候选绑定的播放代次或源修订已过期",
+            ));
+        }
+        if current.pending_audio_media_plan_id.is_some() {
+            return Err(CommandErrorDto::new(
+                "audio_media_candidate_pending",
+                "已有待提交声音候选，请先提交或丢弃",
+            ));
+        }
+        playback
+            .mark_audio_media_processing_running(candidate_identity.clone(), configuration.clone())
+            .map_err(command_error_from_playback)
+    })?;
+    *state.ambient_sound.lock().map_err(|_| {
+        CommandErrorDto::new("ambient_sound_path_lock_failed", "环境声素材状态锁已损坏")
+    })? = ambient_sound;
 
     let cancellation = CancellationToken::new();
     let playback = Arc::clone(&state.playback);
@@ -7187,16 +7536,160 @@ pub fn direct_model_chat(
     })
 }
 
+async fn run_on_tauri_main_thread<T, F>(
+    app: &AppHandle,
+    operation: &'static str,
+    task: F,
+) -> Result<T, CommandErrorDto>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, CommandErrorDto> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let task_cancelled = Arc::clone(&cancelled);
+    app.run_on_main_thread(move || {
+        // 排队超过调用方的有界等待后不得再迟到创建或替换 HWND。
+        if task_cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let _ignored = sender.send(task());
+    })
+    .map_err(|error| CommandErrorDto::new("native_video_host_not_ready", error.to_string()))?;
+    let received = tauri::async_runtime::spawn_blocking(move || {
+        receiver.recv_timeout(NATIVE_VIDEO_HOST_MAIN_THREAD_TIMEOUT)
+    })
+    .await
+    .map_err(|error| {
+        cancelled.store(true, Ordering::Release);
+        CommandErrorDto::new(
+            "native_video_host_not_ready",
+            format!("{operation}主线程任务异常结束：{error}"),
+        )
+    })?;
+    match received {
+        Ok(result) => result,
+        Err(error) => {
+            cancelled.store(true, Ordering::Release);
+            Err(CommandErrorDto::new(
+                "native_video_host_not_ready",
+                format!("{operation}等待 Tauri 主线程失败：{error}"),
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn create_final_effect_video_host(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    state: &AppState,
+) -> Result<bool, CommandErrorDto> {
+    let window = window.clone();
+    let native_video_host = Arc::clone(&state.native_video_host);
+    run_on_tauri_main_thread(app, "创建专用视频宿主", move || {
+        let parent = window.hwnd().map_err(|error| {
+            CommandErrorDto::new(
+                "native_video_host_not_ready",
+                format!("读取最终效果父窗口句柄失败：{error}"),
+            )
+        })?;
+        let parent_window_id = parent.0 as usize as u64;
+        let mut slot = native_video_host.lock().map_err(|_| {
+            CommandErrorDto::new("native_video_host_lock_failed", "专用视频宿主状态锁已损坏")
+        })?;
+        if let Some(host) = slot.as_ref() {
+            if host.parent_window_id() == parent_window_id {
+                match host.resize_to_parent_client() {
+                    Ok(()) => {
+                        return host
+                            .mpv_wid()
+                            .map(|_| true)
+                            .map_err(command_error_from_native_video_host)
+                    }
+                    Err(NativeVideoHostError::Destroyed) => {}
+                    Err(error) => return Err(command_error_from_native_video_host(error)),
+                }
+            }
+        }
+        if let Some(mut previous) = slot.take() {
+            if let Err(error) = previous.destroy() {
+                if error != NativeVideoHostError::Destroyed {
+                    return Err(command_error_from_native_video_host(error));
+                }
+            }
+        }
+        let host = NativeVideoHost::create(parent_window_id)
+            .map_err(command_error_from_native_video_host)?;
+        host.mpv_wid()
+            .map_err(command_error_from_native_video_host)?;
+        *slot = Some(host);
+        Ok(true)
+    })
+    .await
+}
+
+#[cfg(not(windows))]
+async fn create_final_effect_video_host(
+    _app: &AppHandle,
+    _window: &tauri::WebviewWindow,
+    _state: &AppState,
+) -> Result<bool, CommandErrorDto> {
+    Err(command_error_from_native_video_host(
+        NativeVideoHostError::Unsupported,
+    ))
+}
+
+fn resize_final_effect_video_host(state: &AppState) -> Result<bool, CommandErrorDto> {
+    let host = state.native_video_host.lock().map_err(|_| {
+        CommandErrorDto::new("native_video_host_lock_failed", "专用视频宿主状态锁已损坏")
+    })?;
+    let Some(host) = host.as_ref() else {
+        return Ok(false);
+    };
+    host.resize_to_parent_client()
+        .map_err(command_error_from_native_video_host)?;
+    if let Some(process_id) = state.realtime_video_runtime.status().process_id {
+        let inspection = host
+            .inspect_mpv_video_window(process_id)
+            .map_err(command_error_from_native_video_host)?;
+        if inspection.is_ready() {
+            host.promote_to_top()
+                .map_err(command_error_from_native_video_host)?;
+        }
+    }
+    Ok(true)
+}
+
+fn release_final_effect_video_host(app: &AppHandle) -> Result<(), CommandErrorDto> {
+    let Some(state) = app.try_state::<AppState>() else {
+        return Ok(());
+    };
+    let suspend_result = state.suspend_realtime_video_runtime();
+    let destroy_result = state
+        .native_video_host
+        .lock()
+        .map_err(|_| {
+            CommandErrorDto::new("native_video_host_lock_failed", "专用视频宿主状态锁已损坏")
+        })?
+        .take()
+        .map(|mut host| match host.destroy() {
+            Err(NativeVideoHostError::Destroyed) | Ok(()) => Ok(()),
+            Err(error) => Err(command_error_from_native_video_host(error)),
+        })
+        .unwrap_or(Ok(()));
+    suspend_result?;
+    destroy_result
+}
+
 fn disable_media_processing_on_final_effect_close(app: &AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
+    let _ = release_final_effect_video_host(app);
     let _ = state.stop_media_workers();
     let _ = state.stop_speech_worker();
     let _ = state.stop_audio_mixer();
-    if let Ok(mut runtime) = state.realtime_video_runtime.lock() {
-        runtime.stop();
-    }
     // 关窗释放 PortAudio，避免设备被占。
     if let Ok(mut preferred) = state.audio_output_preferred.lock() {
         *preferred = false;
@@ -7212,12 +7705,21 @@ fn disable_media_processing_on_final_effect_close(app: &AppHandle) {
 
 fn attach_final_effect_close_cleanup(app: &AppHandle, window: &tauri::WebviewWindow) {
     let app_handle = app.clone();
+    let cleanup_started = AtomicBool::new(false);
     window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Resized(_)) {
+            if let Some(state) = app_handle.try_state::<AppState>() {
+                if let Err(error) = resize_final_effect_video_host(&state) {
+                    eprintln!("failed to resize native video host: {error:?}");
+                }
+            }
+        }
         let destroyed = matches!(event, tauri::WindowEvent::Destroyed);
-        if matches!(
+        let closing = matches!(
             event,
             tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
-        ) {
+        );
+        if closing && !cleanup_started.swap(true, Ordering::AcqRel) {
             disable_media_processing_on_final_effect_close(&app_handle);
         }
         if destroyed {
@@ -7233,16 +7735,17 @@ fn attach_final_effect_close_cleanup(app: &AppHandle, window: &tauri::WebviewWin
 #[tauri::command]
 pub async fn open_final_effect_window(
     app: AppHandle,
+    state: State<'_, AppState>,
     request: Option<ResizeFinalEffectWindowRequestDto>,
 ) -> Result<FinalEffectWindowDto, CommandErrorDto> {
-    let created = if let Some(window) = app.get_webview_window("final-effect") {
+    let (window, created) = if let Some(window) = app.get_webview_window("final-effect") {
         window
             .show()
             .and_then(|_| window.set_focus())
             .map_err(|error| {
                 CommandErrorDto::new("final_effect_window_show_failed", error.to_string())
             })?;
-        false
+        (window, false)
     } else {
         // 先按默认尺寸创建；窗口加载后由最终效果页的 resize effect 调整。
         let window =
@@ -7257,7 +7760,7 @@ pub async fn open_final_effect_window(
                     CommandErrorDto::new("final_effect_window_create_failed", error.to_string())
                 })?;
         attach_final_effect_close_cleanup(&app, &window);
-        true
+        (window, true)
     };
     // Wry 创建新窗口时只把任务排入主事件循环；此时立即读取
     // monitor/size 会在 WebView2 仍在创建时无界等待。已有窗口才在此处调整。
@@ -7266,9 +7769,19 @@ pub async fn open_final_effect_window(
             let _ = resize_final_effect_window_for_app(&app, request, false)?;
         }
     }
+    let video_host_ready = match create_final_effect_video_host(&app, &window, &state).await {
+        Ok(ready) => ready,
+        Err(error) => {
+            if created {
+                let _ignored = window.close();
+            }
+            return Err(error);
+        }
+    };
     Ok(FinalEffectWindowDto {
         label: "final-effect".to_owned(),
         created,
+        video_host_ready,
     })
 }
 
@@ -7277,7 +7790,6 @@ pub fn close_final_effect_window(app: AppHandle) -> Result<bool, CommandErrorDto
     let Some(window) = app.get_webview_window("final-effect") else {
         return Ok(false);
     };
-    disable_media_processing_on_final_effect_close(&app);
     window.close().map_err(|error| {
         CommandErrorDto::new("final_effect_window_close_failed", error.to_string())
     })?;
@@ -7406,7 +7918,28 @@ fn resize_final_effect_window_for_app(
     })
 }
 
-#[tauri::command]
+fn apply_realtime_video_playback_intent(
+    state: &AppState,
+    playback_generation: u64,
+    intent: PlaybackIntent,
+) -> Result<(), CommandErrorDto> {
+    if state.realtime_video_runtime.status().process_id.is_none() {
+        return Ok(());
+    }
+    state
+        .realtime_video_runtime
+        .playback_intent(
+            PlaybackIntentRequest {
+                playback_generation,
+                intent,
+            },
+            unix_now_ms(),
+        )
+        .map(|_| ())
+        .map_err(command_error_from_realtime_video_sync)
+}
+
+#[tauri::command(async)]
 pub fn start_playback(
     window: Window,
     app: AppHandle,
@@ -7415,12 +7948,16 @@ pub fn start_playback(
     let _transition_guard = state.playback_transition.lock().map_err(|_| {
         CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
     })?;
-    let snapshot = state.playback_action(&window, PlaybackCore::start)?;
+    let snapshot = state.playback_action_with_video_intent(
+        &window,
+        PlaybackCore::start,
+        PlaybackIntent::Play,
+    )?;
     state.resume_audio_output(&app)?;
     Ok(snapshot)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pause_playback(
     window: Window,
     state: State<'_, AppState>,
@@ -7428,12 +7965,16 @@ pub fn pause_playback(
     let _transition_guard = state.playback_transition.lock().map_err(|_| {
         CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
     })?;
-    let snapshot = state.playback_action(&window, PlaybackCore::pause)?;
+    let snapshot = state.playback_action_with_video_intent(
+        &window,
+        PlaybackCore::pause,
+        PlaybackIntent::Pause,
+    )?;
     state.pause_audio_output()?;
     Ok(snapshot)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resume_playback(
     window: Window,
     app: AppHandle,
@@ -7442,8 +7983,61 @@ pub fn resume_playback(
     let _transition_guard = state.playback_transition.lock().map_err(|_| {
         CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
     })?;
-    let snapshot = state.playback_action(&window, PlaybackCore::resume)?;
+    let snapshot = state.playback_action_with_video_intent(
+        &window,
+        PlaybackCore::resume,
+        PlaybackIntent::Play,
+    )?;
     state.resume_audio_output(&app)?;
+    Ok(snapshot)
+}
+
+#[tauri::command(async)]
+pub fn seek_playback(
+    window: Window,
+    state: State<'_, AppState>,
+    request: SeekPlaybackRequestDto,
+) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
+    state.ensure_playback_window(&window)?;
+    let mut playback = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+    let current = playback.snapshot();
+    if request.playback_generation != current.playback_generation {
+        return Err(CommandErrorDto::new(
+            "stale_playback_seek",
+            "播放定位绑定的播放代次已过期",
+        ));
+    }
+    let duration_ms = current
+        .source_media
+        .as_ref()
+        .and_then(|source| source.duration_ms)
+        .filter(|duration_ms| *duration_ms > 0)
+        .ok_or_else(|| {
+            CommandErrorDto::new("playback_seek_duration_required", "当前媒体缺少有效时长")
+        })?;
+    if request.position_ms >= duration_ms {
+        return Err(CommandErrorDto::new(
+            "playback_seek_position_invalid",
+            "播放定位必须小于当前媒体时长",
+        ));
+    }
+    let mut staged = playback.clone();
+    staged.set_playback_position(request.position_ms);
+    let snapshot = state.snapshot(&staged);
+    apply_realtime_video_playback_intent(
+        &state,
+        snapshot.playback_generation,
+        PlaybackIntent::Seek {
+            position_ms: request.position_ms,
+        },
+    )?;
+    *playback = staged;
     Ok(snapshot)
 }
 
@@ -7454,16 +8048,38 @@ pub fn update_playback_position(
     request: UpdatePlaybackPositionRequestDto,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
     let snapshot = state.with_playback_window(&window, |playback| {
+        let current = playback.snapshot();
+        if request.playback_generation != current.playback_generation
+            || request.loop_index != current.loop_index
+        {
+            return Err(CommandErrorDto::new(
+                "stale_playback_position",
+                "播放位置上报绑定的媒体段已经变化",
+            ));
+        }
+        if !matches!(
+            current.playback_state,
+            PlaybackState::Playing | PlaybackState::Paused
+        ) {
+            return Err(CommandErrorDto::new(
+                "inactive_playback_position",
+                "非播放状态不能更新媒体位置",
+            ));
+        }
         playback.set_playback_position(request.position_ms);
         Ok(state.snapshot(playback))
     })?;
     if let Ok(mut observed_at) = state.playback_position_observed_at.lock() {
-        *observed_at = Some(Instant::now());
+        *observed_at = Some(PlaybackPositionObservation {
+            playback_generation: request.playback_generation,
+            loop_index: request.loop_index,
+            observed_at: Instant::now(),
+        });
     }
     Ok(snapshot)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn stop_playback(
     window: Window,
     state: State<'_, AppState>,
@@ -7474,61 +8090,77 @@ pub fn stop_playback(
     state.stop_media_workers()?;
     state.stop_audio_for_playback()?;
     state.stop_speech_worker()?;
-    state
-        .realtime_video_runtime
-        .lock()
-        .map_err(|_| CommandErrorDto::new("realtime_video_lock_failed", "实时画面运行时锁已损坏"))?
-        .stop();
+    state.stop_realtime_video_runtime()?;
     state.with_playback_window(&window, |playback| {
         playback.stop();
         Ok(state.snapshot(playback))
     })
 }
 
-#[tauri::command]
-pub fn complete_playback_loop(
+#[tauri::command(async)]
+pub async fn complete_playback_loop(
     window: Window,
     app: AppHandle,
     state: State<'_, AppState>,
     request: CompletePlaybackLoopRequestDto,
 ) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
-    let current = state.with_playback_window(&window, |playback| Ok(playback.snapshot()))?;
-    match should_complete_playback_loop(
-        current.playback_generation,
-        current.loop_index,
-        request.playback_generation,
-        request.target_loop_index,
-    ) {
-        Ok(false) => return Ok(state.snapshot_from_core(current)),
-        Err(message) => {
-            return Err(CommandErrorDto::new(
-                "invalid_playback_loop_target",
-                message,
-            ));
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let current = state.with_playback_window(&window, |playback| Ok(playback.snapshot()))?;
+        match should_complete_playback_loop(
+            current.playback_generation,
+            current.loop_index,
+            request.playback_generation,
+            request.target_loop_index,
+        ) {
+            Ok(false) => return Ok(state.snapshot_from_core(current)),
+            Err(message) => {
+                return Err(CommandErrorDto::new(
+                    "invalid_playback_loop_target",
+                    message,
+                ));
+            }
+            Ok(true) => {}
         }
-        Ok(true) => {}
-    }
-    complete_playback_item_inner(
-        &window,
-        &app,
-        state.inner(),
-        &CompletePlaybackItemRequestDto {
-            playback_generation: request.playback_generation,
-            loop_index: request.target_loop_index.saturating_sub(1),
-            source_media_index: current.source_media_index,
-        },
-    )
-    .map(|result| result.snapshot)
+        complete_playback_item_inner(
+            &window,
+            &app,
+            &state,
+            &CompletePlaybackItemRequestDto {
+                playback_generation: request.playback_generation,
+                loop_index: request.target_loop_index.saturating_sub(1),
+                source_media_index: current.source_media_index,
+            },
+        )
+        .map(|result| result.snapshot)
+    })
+    .await
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "playback_completion_dispatch_failed",
+            format!("播放循环完成任务失败：{error}"),
+        )
+    })?
 }
 
-#[tauri::command]
-pub fn complete_playback_item(
+#[tauri::command(async)]
+pub async fn complete_playback_item(
     window: Window,
     app: AppHandle,
     state: State<'_, AppState>,
     request: CompletePlaybackItemRequestDto,
 ) -> Result<CompletePlaybackItemResultDto, CommandErrorDto> {
-    complete_playback_item_inner(&window, &app, state.inner(), &request)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        complete_playback_item_inner(&window, &app, &state, &request)
+    })
+    .await
+    .map_err(|error| {
+        CommandErrorDto::new(
+            "playback_completion_dispatch_failed",
+            format!("播放项完成任务失败：{error}"),
+        )
+    })?
 }
 
 fn mark_audio_resume_failure(playback: &mut PlaybackCore, error: &CommandErrorDto) {
@@ -7538,17 +8170,46 @@ fn mark_audio_resume_failure(playback: &mut PlaybackCore, error: &CommandErrorDt
     ));
 }
 
-fn complete_playback_item_inner(
-    window: &Window,
-    app: &AppHandle,
-    state: &AppState,
+fn should_preserve_video_runtime_for_next_pool_item(snapshot: &PlaybackSnapshot) -> bool {
+    let pool_len = snapshot.source_media_pool.len();
+    if pool_len <= 1
+        || snapshot
+            .source_media
+            .as_ref()
+            .is_none_or(|source| source.media_kind != MediaKind::Video)
+    {
+        return false;
+    }
+    snapshot
+        .source_media_pool
+        .get((snapshot.source_media_index + 1) % pool_len)
+        .is_some_and(|source| source.media_kind == MediaKind::Video)
+}
+
+fn matching_managed_eof(
+    snapshot: &PlaybackSnapshot,
+    status: &MediaVideoBackendRuntimeStatus,
     request: &CompletePlaybackItemRequestDto,
-) -> Result<CompletePlaybackItemResultDto, CommandErrorDto> {
-    state.ensure_playback_window(window)?;
-    let _transition_guard = state.playback_transition.lock().map_err(|_| {
-        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
-    })?;
-    let current = state.with_playback_window(window, |playback| Ok(playback.snapshot()))?;
+    expected_eof: Option<VideoEofFact>,
+) -> Option<VideoEofFact> {
+    let eof = status.eof?;
+    (status.process_id.is_some()
+        && snapshot
+            .source_media
+            .as_ref()
+            .is_some_and(|source| source.media_kind == MediaKind::Video)
+        && eof.playback_generation == request.playback_generation
+        && eof.loop_index == request.loop_index
+        && eof.backend_epoch == status.backend_epoch
+        && expected_eof.is_none_or(|expected| expected == eof))
+    .then_some(eof)
+}
+
+fn stage_playback_item_completion(
+    playback: &PlaybackCore,
+    request: &CompletePlaybackItemRequestDto,
+) -> Result<Option<(PlaybackSnapshot, bool)>, CommandErrorDto> {
+    let current = playback.snapshot();
     let should_advance = should_complete_playback_item(
         current.playback_generation,
         current.loop_index,
@@ -7559,13 +8220,256 @@ fn complete_playback_item_inner(
     )
     .map_err(|message| CommandErrorDto::new("invalid_playback_item_identity", message))?;
     if !should_advance {
+        return Ok(None);
+    }
+
+    let mut staged = playback.clone();
+    let source_changed = staged
+        .complete_item()
+        .map_err(command_error_from_playback)?;
+    Ok(Some((staged.snapshot(), source_changed)))
+}
+
+fn playback_item_identity_matches(left: &PlaybackSnapshot, right: &PlaybackSnapshot) -> bool {
+    left.playback_generation == right.playback_generation
+        && left.loop_index == right.loop_index
+        && left.source_media_index == right.source_media_index
+        && left.current_position_ms == right.current_position_ms
+        && left
+            .source_media
+            .as_ref()
+            .map(|source| source.source_path.as_str())
+            == right
+                .source_media
+                .as_ref()
+                .map(|source| source.source_path.as_str())
+}
+
+fn commit_staged_playback_item_completion(
+    playback: &mut PlaybackCore,
+    request: &CompletePlaybackItemRequestDto,
+    staged: &PlaybackSnapshot,
+    staged_source_changed: bool,
+) -> Result<Option<(PlaybackSnapshot, bool)>, CommandErrorDto> {
+    let current = playback.snapshot();
+    let should_advance = should_complete_playback_item(
+        current.playback_generation,
+        current.loop_index,
+        current.source_media_index,
+        request.playback_generation,
+        request.loop_index,
+        request.source_media_index,
+    )
+    .map_err(|message| CommandErrorDto::new("invalid_playback_item_identity", message))?;
+    if !should_advance {
+        return Ok(None);
+    }
+
+    let mut latest_preview = playback.clone();
+    let preview_source_changed = latest_preview
+        .complete_item()
+        .map_err(command_error_from_playback)?;
+    let preview = latest_preview.snapshot();
+    if preview_source_changed != staged_source_changed
+        || !playback_item_identity_matches(&preview, staged)
+    {
+        return Err(CommandErrorDto::new(
+            "playback_completion_stage_mismatch",
+            "EOF 物理恢复后的播放项提交结果与预演身份不一致",
+        ));
+    }
+
+    let source_changed = playback
+        .complete_item()
+        .map_err(command_error_from_playback)?;
+    let committed = playback.snapshot();
+    debug_assert!(
+        source_changed == preview_source_changed
+            && playback_item_identity_matches(&committed, &preview),
+        "authoritative playback completion must match its validated latest preview"
+    );
+    Ok(Some((committed, source_changed)))
+}
+
+fn cleanup_uncommitted_advanced_eof_runtime(
+    state: &AppState,
+    expected_eof: VideoEofFact,
+    staged: &PlaybackSnapshot,
+    reason: &str,
+) -> String {
+    let status = state.realtime_video_runtime.status();
+    let runtime_is_staged = status.process_id.is_some()
+        && status.backend_epoch == expected_eof.backend_epoch
+        && status.playback_generation == Some(staged.playback_generation)
+        && status.loop_index == Some(staged.loop_index);
+    if !runtime_is_staged {
+        return "；运行时已被后续会话取代，未停止新会话".to_owned();
+    }
+    record_and_stop_failed_realtime_video_eof(
+        || {
+            state
+                .realtime_video_runtime
+                .record_source_backend(reason)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+        || {
+            state
+                .stop_realtime_video_runtime()
+                .map_err(|error| error.message)
+        },
+    )
+}
+
+fn complete_playback_item_inner(
+    window: &Window,
+    app: &AppHandle,
+    state: &AppState,
+    request: &CompletePlaybackItemRequestDto,
+) -> Result<CompletePlaybackItemResultDto, CommandErrorDto> {
+    state.ensure_playback_window(window)?;
+    complete_playback_item_transaction(app, state, request, None)
+}
+
+fn reconcile_late_managed_video_eof(
+    state: &AppState,
+    current: PlaybackSnapshot,
+    eof: VideoEofFact,
+) -> Result<CompletePlaybackItemResultDto, CommandErrorDto> {
+    let source = current
+        .source_media
+        .as_ref()
+        .filter(|source| source.media_kind == MediaKind::Video)
+        .ok_or_else(|| {
+            CommandErrorDto::new(
+                "realtime_video_eof_reconcile_invalid",
+                "迟到 EOF 收敛时当前源不是视频",
+            )
+        })?;
+    let source_duration_ms = source
+        .duration_ms
+        .filter(|duration| *duration > 0)
+        .ok_or_else(|| {
+            CommandErrorDto::new(
+                "realtime_video_eof_reconcile_invalid",
+                "迟到 EOF 收敛时当前视频缺少有效源时长",
+            )
+        })?;
+    let result = state.realtime_video_runtime.advance_after_eof(
+        AdvanceRealtimeVideoAfterEof {
+            expected_eof: eof,
+            next_playback_generation: current.playback_generation,
+            next_loop_index: current.loop_index,
+            next_source_path: PathBuf::from(&source.source_path),
+            next_source_duration_ms: source_duration_ms,
+            paused: false,
+        },
+        unix_now_ms(),
+    );
+    if let Err(error) = result {
+        let status = state.realtime_video_runtime.status();
+        if realtime_video_eof_ignored_reason(&current, &status, eof) == Some("already_advanced") {
+            return Ok(CompletePlaybackItemResultDto {
+                snapshot: state.snapshot_from_core(current),
+                source_changed: false,
+            });
+        }
+        let cleanup_detail = if realtime_video_eof_reconciliation_required(&current, &status, eof) {
+            record_and_stop_failed_realtime_video_eof(
+                || {
+                    state
+                        .realtime_video_runtime
+                        .record_source_backend(format!("迟到 EOF 收敛失败：{error}"))
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
+                || {
+                    state
+                        .stop_realtime_video_runtime()
+                        .map_err(|error| error.message)
+                },
+            )
+        } else {
+            "；运行时已被后续会话取代，未停止新会话".to_owned()
+        };
+        return Err(CommandErrorDto::new(
+            "realtime_video_eof_reconcile_failed",
+            format!("{error}{cleanup_detail}"),
+        ));
+    }
+    Ok(CompletePlaybackItemResultDto {
+        snapshot: state.snapshot_from_core(current),
+        source_changed: false,
+    })
+}
+
+fn complete_playback_item_transaction(
+    app: &AppHandle,
+    state: &AppState,
+    request: &CompletePlaybackItemRequestDto,
+    expected_eof: Option<VideoEofFact>,
+) -> Result<CompletePlaybackItemResultDto, CommandErrorDto> {
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
+    state.ensure_running()?;
+    let current = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot();
+    let video_status = state.realtime_video_runtime.status();
+    let managed_eof = matching_managed_eof(&current, &video_status, request, expected_eof);
+    let reconcile_late_eof = expected_eof
+        .filter(|eof| realtime_video_eof_reconciliation_required(&current, &video_status, *eof));
+    if expected_eof.is_some() && managed_eof.is_none() {
+        return Err(CommandErrorDto::new(
+            "stale_realtime_video_eof",
+            "EOF 监督事务开始前媒体或视频后端身份已经变化",
+        ));
+    }
+    if expected_eof.is_none() && managed_video_owns_playback_completion(&current, &video_status) {
+        return Ok(CompletePlaybackItemResultDto {
+            snapshot: state.snapshot_from_core(current),
+            source_changed: false,
+        });
+    }
+    let should_advance = should_complete_playback_item(
+        current.playback_generation,
+        current.loop_index,
+        current.source_media_index,
+        request.playback_generation,
+        request.loop_index,
+        request.source_media_index,
+    )
+    .map_err(|message| CommandErrorDto::new("invalid_playback_item_identity", message))?;
+    if !should_advance {
+        if let Some(eof) = reconcile_late_eof {
+            return reconcile_late_managed_video_eof(state, current, eof);
+        }
         return Ok(CompletePlaybackItemResultDto {
             snapshot: state.snapshot_from_core(current),
             source_changed: false,
         });
     }
 
+    let (staged_snapshot, staged_source_changed) = {
+        let playback = state
+            .playback
+            .lock()
+            .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?;
+        let Some(staged) = stage_playback_item_completion(&playback, request)? else {
+            return Ok(CompletePlaybackItemResultDto {
+                snapshot: state.snapshot(&playback),
+                source_changed: false,
+            });
+        };
+        staged
+    };
+
     let source_will_change = current.source_media_pool.len() > 1;
+    let preserve_video_runtime =
+        managed_eof.is_some() && should_preserve_video_runtime_for_next_pool_item(&current);
     if source_will_change {
         state.stop_audio_media_worker()?;
         state.stop_audio_for_playback()?;
@@ -7576,47 +8480,192 @@ fn complete_playback_item_inner(
 
     if source_will_change {
         state.stop_video_media_worker()?;
-        state.stop_realtime_video_runtime()?;
+        if !preserve_video_runtime {
+            state.stop_realtime_video_runtime()?;
+        }
     }
 
-    let (mut snapshot, source_changed) = state.with_playback_window(window, |playback| {
-        let snapshot = playback.snapshot();
-        let should_advance = should_complete_playback_item(
-            snapshot.playback_generation,
-            snapshot.loop_index,
-            snapshot.source_media_index,
-            request.playback_generation,
-            request.loop_index,
-            request.source_media_index,
-        )
-        .map_err(|message| CommandErrorDto::new("invalid_playback_item_identity", message))?;
-        if !should_advance {
-            return Ok((state.snapshot(playback), false));
+    let mut managed_runtime_advanced = false;
+    if let Some((expected_eof, next_source)) = managed_eof.zip(
+        staged_snapshot
+            .source_media
+            .as_ref()
+            .filter(|source| source.media_kind == MediaKind::Video),
+    ) {
+        let next_source_duration_ms = next_source
+            .duration_ms
+            .filter(|duration| *duration > 0)
+            .ok_or_else(|| {
+                CommandErrorDto::new(
+                    "realtime_video_eof_resume_invalid",
+                    "EOF 完成后的新视频缺少有效源时长",
+                )
+            })?;
+        if let Err(error) = state.realtime_video_runtime.advance_after_eof(
+            AdvanceRealtimeVideoAfterEof {
+                expected_eof,
+                next_playback_generation: staged_snapshot.playback_generation,
+                next_loop_index: staged_snapshot.loop_index,
+                next_source_path: PathBuf::from(&next_source.source_path),
+                next_source_duration_ms,
+                paused: false,
+            },
+            unix_now_ms(),
+        ) {
+            let detail = error.to_string();
+            let cleanup_required = failed_eof_requires_runtime_cleanup(&error);
+            // 两次物理恢复均失败后不保留 pause=true/eof=true 的僵死原生表面；
+            // 竞态拒绝不误杀更新后的健康会话，真实失败则释放并保留有界诊断。
+            let cleanup_detail = if cleanup_required {
+                record_and_stop_failed_realtime_video_eof(
+                    || {
+                        state
+                            .realtime_video_runtime
+                            .record_source_backend(format!("EOF 恢复失败：{detail}"))
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    },
+                    || {
+                        state
+                            .stop_realtime_video_runtime()
+                            .map_err(|error| error.message)
+                    },
+                )
+            } else {
+                String::new()
+            };
+            return Err(CommandErrorDto::new(
+                "realtime_video_eof_resume_failed",
+                format!("{detail}{cleanup_detail}"),
+            ));
         }
-        let source_changed = playback
-            .complete_item()
-            .map_err(command_error_from_playback)?;
-        Ok((state.snapshot(playback), source_changed))
-    })?;
+        managed_runtime_advanced = true;
+    }
+    let (mut snapshot, source_changed) = {
+        let mut playback = match state.playback.lock() {
+            Ok(playback) => playback,
+            Err(_) => {
+                let cleanup_detail = managed_eof
+                    .filter(|_| managed_runtime_advanced)
+                    .map(|eof| {
+                        cleanup_uncommitted_advanced_eof_runtime(
+                            state,
+                            eof,
+                            &staged_snapshot,
+                            "EOF 物理恢复后播放状态锁损坏，释放未提交运行时",
+                        )
+                    })
+                    .unwrap_or_default();
+                return Err(CommandErrorDto::new(
+                    "playback_lock_failed",
+                    format!("播放状态锁已损坏{cleanup_detail}"),
+                ));
+            }
+        };
+        let commit = commit_staged_playback_item_completion(
+            &mut playback,
+            request,
+            &staged_snapshot,
+            staged_source_changed,
+        );
+        match commit {
+            Ok(Some((_, source_changed))) => (state.snapshot(&playback), source_changed),
+            Ok(None) if !managed_runtime_advanced => {
+                return Ok(CompletePlaybackItemResultDto {
+                    snapshot: state.snapshot(&playback),
+                    source_changed: false,
+                });
+            }
+            Ok(None) => {
+                drop(playback);
+                let Some(eof) = managed_eof else {
+                    return Err(CommandErrorDto::new(
+                        "realtime_video_eof_identity_missing",
+                        "EOF 物理恢复后缺少受管运行时身份",
+                    ));
+                };
+                let cleanup_detail = cleanup_uncommitted_advanced_eof_runtime(
+                    state,
+                    eof,
+                    &staged_snapshot,
+                    "EOF 物理恢复后权威播放身份已变化，释放未提交运行时",
+                );
+                return Err(CommandErrorDto::new(
+                    "stale_realtime_video_eof_after_resume",
+                    format!("EOF 物理恢复后播放身份已变化{cleanup_detail}"),
+                ));
+            }
+            Err(error) => {
+                drop(playback);
+                if !managed_runtime_advanced {
+                    return Err(error);
+                }
+                let Some(eof) = managed_eof else {
+                    return Err(CommandErrorDto::new(
+                        "realtime_video_eof_identity_missing",
+                        "EOF 物理恢复后缺少受管运行时身份",
+                    ));
+                };
+                let cleanup_detail = cleanup_uncommitted_advanced_eof_runtime(
+                    state,
+                    eof,
+                    &staged_snapshot,
+                    "EOF 物理恢复后的逻辑提交与预演不一致，释放未提交运行时",
+                );
+                return Err(CommandErrorDto::new(
+                    error.code,
+                    format!("{}{cleanup_detail}", error.message),
+                ));
+            }
+        }
+    };
     if source_changed {
         if let Err(error) = state.resume_audio_output(app) {
             let committed_generation = snapshot.playback_generation;
             let committed_source_index = snapshot.source_media_index;
-            snapshot = state.with_playback_window(window, |playback| {
+            snapshot = {
+                let mut playback = state.playback.lock().map_err(|_| {
+                    CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏")
+                })?;
                 let current = playback.snapshot();
                 if current.playback_generation == committed_generation
                     && current.source_media_index == committed_source_index
                 {
-                    mark_audio_resume_failure(playback, &error);
+                    mark_audio_resume_failure(&mut playback, &error);
                 }
-                Ok(state.snapshot(playback))
-            })?;
+                state.snapshot(&playback)
+            };
         }
     }
     Ok(CompletePlaybackItemResultDto {
         snapshot,
         source_changed,
     })
+}
+
+fn failed_eof_requires_runtime_cleanup(error: &RealtimeVideoBackendError) -> bool {
+    !matches!(
+        error,
+        RealtimeVideoBackendError::StaleSync { .. }
+            | RealtimeVideoBackendError::SyncSuperseded { .. }
+            | RealtimeVideoBackendError::StalePrepareBackendEpoch { .. }
+    )
+}
+
+fn record_and_stop_failed_realtime_video_eof(
+    record_failure: impl FnOnce() -> Result<(), String>,
+    stop_runtime: impl FnOnce() -> Result<(), String>,
+) -> String {
+    let record_error = record_failure().err();
+    let stop_error = stop_runtime().err();
+    let mut detail = String::new();
+    if let Some(error) = record_error {
+        detail.push_str(&format!("；记录 EOF 失败状态失败：{error}"));
+    }
+    if let Some(error) = stop_error {
+        detail.push_str(&format!("；停止失败：{error}"));
+    }
+    detail
 }
 
 #[tauri::command]
@@ -7651,12 +8700,15 @@ pub fn commit_media_processing_if_ready(
     Ok(snapshot)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_processing_switches(
     window: Window,
     state: State<'_, AppState>,
     request: ProcessingSwitchesRequestDto,
-) -> Result<PlaybackSnapshotDto, CommandErrorDto> {
+) -> Result<ProcessingSwitchesResultDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    // 在触碰 worker/mpv 前完成窗口绑定校验，避免未授权窗口留下半提交运行时。
+    state.with_playback(&window, |_| Ok(()))?;
     let (video_switch_changed, audio_switch_changed) = {
         let playback = state
             .playback
@@ -7668,9 +8720,21 @@ pub fn set_processing_switches(
             snapshot.audio_processing_enabled != request.audio_processing_enabled,
         )
     };
+    let _video_transition_guard = if video_switch_changed {
+        Some(state.playback_transition.lock().map_err(|_| {
+            CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+        })?)
+    } else {
+        None
+    };
     if video_switch_changed {
         state.stop_video_media_worker()?;
-        state.stop_realtime_video_runtime()?;
+        state
+            .realtime_video_runtime
+            .set_processing_enabled(request.video_processing_enabled)
+            .map_err(|error| {
+                CommandErrorDto::new("realtime_video_switch_failed", error.to_string())
+            })?;
     }
     if audio_switch_changed {
         state.stop_audio_media_worker()?;
@@ -7689,7 +8753,10 @@ pub fn set_processing_switches(
     if !request.audio_processing_enabled && !request.realtime_audio_variant_enabled {
         state.stop_audio_mixer()?;
     }
-    Ok(snapshot)
+    Ok(ProcessingSwitchesResultDto {
+        snapshot,
+        video_backend_status: state.realtime_video_runtime.status(),
+    })
 }
 
 #[tauri::command]
@@ -9126,30 +10193,38 @@ mod tests {
     use super::development_executable_ready;
     use super::{
         absolute_media_position_ms, add_wall_clock_delay_to_media_position_ms,
-        ambient_sound_source_label, apply_source_media_order, audio_crossfade_error_code,
-        audio_cycle_cancel_matches_pending, audio_cycle_commit_due, audio_cycle_crossfade_failure,
-        audio_cycle_target_is_within_horizon, audio_cycle_target_validation_code,
-        audio_mix_requires_ambient_sound, audio_sync_clock_rejection_code,
-        compile_gpu83_realtime_parameters, db_to_linear_gain, ensure_interlude_operation_current,
+        ambient_sound_source_label, apply_source_media_order, audible_audio_track_timeline,
+        audio_crossfade_error_code, audio_cycle_cancel_matches_pending, audio_cycle_commit_due,
+        audio_cycle_crossfade_failure, audio_cycle_target_is_within_horizon,
+        audio_cycle_target_validation_code, audio_mix_requires_ambient_sound,
+        audio_sync_clock_rejection_code, command_error_from_realtime_video_prepare,
+        command_error_from_realtime_video_sync, commit_staged_playback_item_completion,
+        db_to_linear_gain, ensure_interlude_operation_current, failed_eof_requires_runtime_cleanup,
         insert_canonical_source_path, is_retryable_audio_mixer_error, join_background_worker_until,
-        lock_current_media_import, mark_audio_resume_failure, reorder_source_media_pool,
+        lock_current_media_import, managed_video_owns_playback_completion,
+        mark_audio_resume_failure, realtime_video_eof_ignored_reason,
+        realtime_video_eof_reconciliation_required, realtime_video_eof_rejection,
+        record_and_stop_failed_realtime_video_eof, reorder_source_media_pool,
         resolve_audio_candidate_pcm_position_ms, resolve_audio_commit_position_ms,
         resolve_audio_output_latency_ms, resolve_audio_sync_clock,
         scheduled_candidate_commit_tail_ms, should_complete_playback_item,
         should_complete_playback_loop, should_defer_source_sync_for_pending_candidate,
-        signed_millis_delta, source_media_index_by_path, take_pending_audio_mixer,
+        should_verify_mpv_video_surface, signed_millis_delta, source_media_index_by_path,
+        stage_playback_item_completion, take_pending_audio_mixer,
         validate_audio_candidate_source_window, validate_audio_sync_clock,
         validate_portaudio_interlude_gain, validate_portaudio_media_gain,
         validate_source_media_paths, validate_source_media_pool_count,
         webview_interlude_original_fallback, AmbientSoundSource, AppState, AudioSyncClock,
-        BackgroundWorkerTask, CommandErrorDto, PlaybackSnapshotDto,
-        SetPortAudioMediaVolumeRequestDto, AUDIO_CANDIDATE_OUTSIDE_SOURCE_AUDIO_WINDOW_CODE,
-        AUDIO_SYNC_CLOCK_EXPIRED, MAX_SOURCE_MEDIA_PATH_BYTES,
+        BackgroundWorkerTask, CommandErrorDto, MediaVideoBackendRuntimeStatus, PlaybackSnapshotDto,
+        RealtimeVideoBackendError, SetPortAudioMediaVolumeRequestDto,
+        AUDIO_CANDIDATE_OUTSIDE_SOURCE_AUDIO_WINDOW_CODE, AUDIO_SYNC_CLOCK_EXPIRED,
+        MAX_SOURCE_MEDIA_PATH_BYTES,
     };
+    use crate::audio_cycle_switch::AudioMixerSourceIdentity;
     use autolive_desktop_core::cancellation::CancellationToken;
-    use autolive_desktop_core::media_effect_params::{AudioEffectParams, MediaEffectParams};
+    use autolive_desktop_core::media_effect_params::AudioEffectParams;
     use autolive_desktop_core::media_library::{MediaCompatibilityMode, MediaKind, SourceMediaDto};
-    use autolive_desktop_core::realtime_video_backend::MpvCommand;
+    use autolive_desktop_core::realtime_video_runtime::VideoEofFact;
     use autolive_desktop_core::runtime_resource_task::RuntimeResourceTaskShutdown;
     use autolive_desktop_core::PlaybackCore;
     use std::collections::HashSet;
@@ -9179,31 +10254,6 @@ mod tests {
             mp4_sha256: None,
             mp4_hash_status: "disabled".to_owned(),
         }
-    }
-
-    #[test]
-    fn gpu83_cycle_compiles_to_one_atomic_shader_options_command() {
-        let compiled = compile_gpu83_realtime_parameters(&MediaEffectParams::default())
-            .expect("default GPU83 snapshot");
-        assert_eq!(compiled.commands.len(), 1);
-        assert!(matches!(
-            &compiled.commands[0],
-            MpvCommand::SetShaderOptions { options }
-                if options.as_str().contains("al_brightness_percent=0")
-        ));
-        assert!(compiled.support.fully_supported);
-
-        let mut unavailable = MediaEffectParams::default();
-        unavailable.video.frame_rate_jitter_percent = 1.0;
-        let compiled = compile_gpu83_realtime_parameters(&unavailable)
-            .expect("valid but not-yet-mapped GPU83 snapshot");
-        assert_eq!(compiled.commands.len(), 1);
-        assert!(!compiled.support.fully_supported);
-        assert!(compiled.support.parameters.iter().any(|parameter| {
-            parameter.field == "video.frame_rate_jitter_percent"
-                && parameter.active
-                && !parameter.supported
-        }));
     }
 
     #[test]
@@ -9550,6 +10600,34 @@ mod tests {
     }
 
     #[test]
+    fn audible_track_timeline_keeps_presentation_and_source_pts_distinct() {
+        let source_path = std::env::current_exe()
+            .expect("test executable path")
+            .to_string_lossy()
+            .into_owned();
+        let source_identity = AudioMixerSourceIdentity {
+            playback_generation: 9,
+            source_path: Some(source_path),
+            current_audio_source: None,
+            current_audio_reference: None,
+            current_audio_start_at_ms: 0,
+            audio_processing_enabled: true,
+            audio_stream_revision: 1,
+        };
+
+        let timeline = audible_audio_track_timeline(&source_identity, 20, 72_300, 1_473_000, 1.0)
+            .expect("matching presentation PTS should map to the current source segment");
+        assert_eq!(timeline.presentation_position_ms, 1_473_000);
+        assert_eq!(timeline.source_position_ms, 27_000);
+        assert_eq!(timeline.segment.presentation_start_ms, 1_446_000);
+
+        assert!(audible_audio_track_timeline(&source_identity, 20, 72_300, 27_000, 1.0,).is_err());
+        assert!(
+            audible_audio_track_timeline(&source_identity, 20, 72_300, 1_518_300, 1.0,).is_err()
+        );
+    }
+
+    #[test]
     fn stale_source_sync_clock_reanchors_to_the_current_absolute_media_time() {
         let requested = AudioSyncClock {
             playback_generation: 9,
@@ -9855,15 +10933,80 @@ mod tests {
     }
 
     #[test]
+    fn independent_audio_candidate_dispatches_blocking_prepare_off_tauri_thread() {
+        let source = include_str!("commands.rs");
+        let command = source
+            .split("pub async fn prepare_audio_media_candidate")
+            .nth(1)
+            .expect("independent audio candidate command must be async")
+            .split("fn prepare_audio_media_candidate_blocking")
+            .next()
+            .expect("independent audio candidate command end");
+        let blocking = source
+            .split("fn prepare_audio_media_candidate_blocking")
+            .nth(1)
+            .expect("independent audio candidate blocking helper")
+            .split("pub fn start_media_processing")
+            .next()
+            .expect("independent audio candidate helper end");
+
+        let authorization = command
+            .find("state.ensure_main_window(&window)?")
+            .expect("window authorization must stay in the async entry");
+        let dispatch = command
+            .find("tauri::async_runtime::spawn_blocking")
+            .expect("blocking preparation must use Tauri blocking dispatch");
+        assert!(authorization < dispatch);
+        assert!(command.contains("let state = state.inner().clone();"));
+        assert!(!command.contains("let window = window.clone();"));
+        assert!(!command.contains("let app = app.clone();"));
+        assert!(!command.contains("let request = request.clone();"));
+        assert!(command.contains("audio_candidate_dispatch_failed"));
+        for blocking_operation in [
+            "state.playback_transition.lock()",
+            "state.reap_finished_audio_media_worker()?",
+            "state.audio_media_worker_is_running()?",
+            "runtime_resource_target_root(&app)",
+            "resolve_user_ambient_sound(",
+            "build_audio_stream_filter_graph_with_ambient(",
+            "std::fs::create_dir_all(&cache_dir)",
+            "build_media_render_args(&media_request)",
+            "state.install_audio_media_worker",
+        ] {
+            assert!(
+                blocking.contains(blocking_operation),
+                "blocking helper must own operation: {blocking_operation}"
+            );
+            assert!(
+                !command.contains(blocking_operation),
+                "async entry must not run blocking operation: {blocking_operation}"
+            );
+        }
+        let stale_validation = blocking
+            .find("request.playback_generation != generation")
+            .expect("helper must reject stale generation and revision");
+        let worker_gate = blocking
+            .find("state.audio_media_worker_is_running()?")
+            .expect("helper must preserve the single-flight worker gate");
+        let state_change = blocking
+            .find("mark_audio_media_processing_running(")
+            .expect("helper must mark preparation running");
+        assert!(stale_validation < state_change);
+        assert!(worker_gate < state_change);
+        assert_eq!(blocking.matches("thread::spawn(move ||").count(), 1);
+        assert!(!blocking.contains("thread::spawn(move || thread::spawn"));
+    }
+
+    #[test]
     fn independent_audio_candidate_is_bounded_audio_only_and_uses_its_worker_slot() {
         let source = include_str!("commands.rs");
         let function = source
-            .split("pub fn prepare_audio_media_candidate")
+            .split("fn prepare_audio_media_candidate_blocking")
             .nth(1)
-            .expect("independent audio candidate command")
+            .expect("independent audio candidate blocking helper")
             .split("pub fn start_media_processing")
             .next()
-            .expect("independent audio candidate command end");
+            .expect("independent audio candidate helper end");
 
         assert!(function.contains("source_has_video: false"));
         assert!(function.contains("video_processing_enabled: false"));
@@ -9878,12 +11021,12 @@ mod tests {
     fn audio_source_window_is_checked_before_processing_state_changes() {
         let source = include_str!("commands.rs");
         let independent_audio = source
-            .split("pub fn prepare_audio_media_candidate")
+            .split("fn prepare_audio_media_candidate_blocking")
             .nth(1)
-            .expect("independent audio candidate command")
+            .expect("independent audio candidate blocking helper")
             .split("pub fn start_media_processing")
             .next()
-            .expect("independent audio candidate command end");
+            .expect("independent audio candidate helper end");
         let combined_media = source
             .split("pub fn start_media_processing")
             .nth(1)
@@ -9962,55 +11105,216 @@ mod tests {
     }
 
     #[test]
-    fn video_backend_plan_identity_does_not_depend_on_audio_stream_revision() {
+    fn realtime_video_commands_use_async_tauri_wrappers() {
         let source = include_str!("commands.rs");
-        let prepare = source
-            .split("pub fn prepare_realtime_video_plan")
-            .nth(1)
-            .expect("prepare realtime video function")
-            .split("pub fn commit_realtime_video_plan")
-            .next()
-            .expect("prepare realtime video function end");
-        let commit = source
-            .split("pub fn commit_realtime_video_plan")
-            .nth(1)
-            .expect("commit realtime video function")
-            .split("pub fn sync_realtime_video_renderer")
-            .next()
-            .expect("commit realtime video function end");
+        let compact_source = source.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        for function in [prepare, commit] {
-            assert!(function.contains("playback_generation"));
-            assert!(!function.contains("snapshot.audio_stream_revision"));
+        for command in [
+            "ensure_original_video_renderer",
+            "configure_realtime_video_cycle",
+            "start_playback",
+            "pause_playback",
+            "resume_playback",
+            "seek_playback",
+            "stop_playback",
+            "stop_realtime_video_renderer",
+            "set_processing_switches",
+        ] {
+            assert!(
+                compact_source.contains(&format!("#[tauri::command(async)] pub fn {command}"))
+                    || compact_source
+                        .contains(&format!("#[tauri::command(async)] pub async fn {command}")),
+                "{command} must use Tauri's async wrapper"
+            );
         }
-        assert!(prepare.contains("request.source_revision != VIDEO_BACKEND_SOURCE_REVISION"));
-        assert!(commit.contains("request.source_revision != VIDEO_BACKEND_SOURCE_REVISION"));
-        assert!(prepare.contains("source_revision: request.source_revision"));
-        assert!(commit.contains("source_revision: request.source_revision"));
-        let support_gate = prepare
-            .find("if !compiled.support.fully_supported")
-            .expect("unsupported GPU83 fields must be rejected");
-        let renderer_prepare = prepare
-            .find("runtime\n        .prepare")
-            .expect("renderer prepare call");
-        assert!(support_gate < renderer_prepare);
     }
 
     #[test]
-    fn realtime_video_fallback_is_truthful_original_without_old_ffmpeg_ipc() {
-        let source = include_str!("commands.rs");
-        let fallback = source
-            .split("fn record_realtime_video_fallback")
-            .nth(1)
-            .expect("realtime fallback helper")
-            .split("fn final_effect_host_window_id")
-            .next()
-            .expect("realtime fallback helper end");
+    fn stale_prepare_backend_epoch_has_a_stable_command_error_code() {
+        let error = command_error_from_realtime_video_prepare(
+            RealtimeVideoBackendError::StalePrepareBackendEpoch {
+                requested: 6,
+                current: 7,
+            },
+        );
 
-        assert!(fallback.contains("record_source_backend"));
-        assert!(!fallback.contains("record_ffmpeg_backend"));
-        let removed_command = ["pub fn activate_", "ffmpeg_video_backend"].concat();
-        assert!(!source.contains(&removed_command));
+        assert_eq!(error.code, "stale_realtime_video_backend_epoch");
+        assert!(error.message.contains("后端 epoch 已过期"));
+        assert!(!error.message.contains("mpv 进程"));
+        assert!(!error.message.contains("播放同步失败"));
+    }
+
+    #[test]
+    fn realtime_video_runtime_and_playback_intents_follow_owned_runtime_contract() {
+        let source = include_str!("commands.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production commands");
+        let compact_source = source.split_whitespace().collect::<String>();
+        let forbidden_runtime_lock = ["realtime_video_runtime", ".lock"].concat();
+        let forbidden_runtime_owner = ["Arc<Mutex<", "RealtimeVideoRuntime>>"].concat();
+        assert!(!compact_source.contains(&forbidden_runtime_lock));
+        assert!(!source.contains(&forbidden_runtime_owner));
+        assert!(source.contains("realtime_video_runtime: Arc<RealtimeVideoRuntime>"));
+
+        let seek_dto = source
+            .split("pub struct SeekPlaybackRequestDto")
+            .nth(1)
+            .expect("seek playback DTO")
+            .split("struct AudioSyncClock")
+            .next()
+            .expect("seek playback DTO end");
+        assert!(seek_dto.contains("pub playback_generation: u64"));
+        assert!(seek_dto.contains("pub position_ms: u64"));
+        assert!(!seek_dto.contains("clock_epoch"));
+        assert!(!seek_dto.contains("loop_index"));
+        assert!(!seek_dto.contains("backend_epoch"));
+
+        let playback = source
+            .split("fn apply_realtime_video_playback_intent")
+            .nth(1)
+            .expect("playback intent helper")
+            .split("pub fn start_playback")
+            .next()
+            .expect("playback intent helper end");
+        assert!(playback.contains("PlaybackIntentRequest"));
+        assert!(playback.contains("playback_generation"));
+        assert!(playback.contains(".playback_intent("));
+        assert!(!production.contains("SyncRealtimeVideoRendererRequestDto"));
+        assert!(!production.contains("pub fn sync_realtime_video_renderer"));
+    }
+
+    #[test]
+    fn realtime_video_sync_errors_have_stable_typed_codes() {
+        let cases = [
+            (
+                RealtimeVideoBackendError::StaleSync {
+                    field: "播放代次"
+                },
+                "stale_realtime_video_sync",
+            ),
+            (
+                RealtimeVideoBackendError::SyncSuperseded {
+                    operation: "同步请求",
+                },
+                "realtime_video_sync_superseded",
+            ),
+            (
+                RealtimeVideoBackendError::IpcQueueFull,
+                "realtime_video_sync_busy",
+            ),
+            (
+                RealtimeVideoBackendError::RuntimeTimeout {
+                    request_id: 7,
+                    operation: "同步播放时钟",
+                },
+                "realtime_video_sync_result_unknown",
+            ),
+            (
+                RealtimeVideoBackendError::IpcTimeout {
+                    request_id: 8,
+                    operation: "set pause",
+                },
+                "realtime_video_sync_result_unknown",
+            ),
+            (
+                RealtimeVideoBackendError::IpcDisconnected("pipe closed".to_owned()),
+                "realtime_video_sync_transport_failed",
+            ),
+            (
+                RealtimeVideoBackendError::InvalidSync {
+                    message: "位置越界".to_owned(),
+                },
+                "realtime_video_sync_invalid",
+            ),
+        ];
+
+        for (error, expected_code) in cases {
+            let mapped = command_error_from_realtime_video_sync(error);
+            assert_eq!(mapped.code, expected_code);
+            assert!(!mapped.message.is_empty());
+            assert_ne!(mapped.code, "realtime_video_sync_exhausted");
+        }
+    }
+
+    #[test]
+    fn original_video_renderer_preloads_optional_neutral_shader_without_audio_changes() {
+        let source = include_str!("commands.rs");
+        let command = source
+            .split("pub async fn ensure_original_video_renderer")
+            .nth(1)
+            .expect("ensure original video renderer command")
+            .split("pub async fn configure_realtime_video_cycle")
+            .next()
+            .expect("ensure original video renderer command end");
+
+        assert!(command.contains("ensure_playback_window"));
+        assert!(command.contains("PlaybackState::Playing | PlaybackState::Paused"));
+        assert!(!command.contains("set_processing_enabled"));
+        assert!(command.contains("source.media_kind != MediaKind::Video"));
+        assert!(command.contains("current_position_ms"));
+        assert!(command.contains(".min(source_duration_ms.saturating_sub(1))"));
+        assert!(!command.contains("request.position_ms"));
+        assert!(command.contains("source_duration_ms,"));
+        assert!(command.contains("resolve_mpv_executable"));
+        assert!(command.contains(".reserve_operation("));
+        assert!(command.contains(".ensure_original_with_lease("));
+        assert!(command.contains("PrepareOriginalRenderer {"));
+        assert!(command.contains("resolve_mpv_shader"));
+        assert!(command.contains("shader,"));
+        assert!(!command.contains("Audio"));
+    }
+
+    #[test]
+    fn verified_mpv_surface_is_promoted_without_covering_failed_startup() {
+        let source = include_str!("commands.rs");
+        let verification = source
+            .split("async fn verify_mpv_video_surface")
+            .nth(1)
+            .expect("mpv surface verification")
+            .split("#[tauri::command]")
+            .next()
+            .expect("mpv surface verification end");
+        let ready_gate = verification
+            .find("if inspection.is_ready()")
+            .expect("real mpv child readiness gate");
+        let promotion = verification
+            .find(".promote_to_top()")
+            .expect("native host promotion");
+        assert!(ready_gate < promotion);
+        assert!(verification.contains("run_on_tauri_main_thread"));
+        assert!(verification.contains("suspend_realtime_video_runtime"));
+        assert!(verification.contains("status.backend == VideoBackend::Source"));
+        assert!(verification.contains("status.activation == BackendActivation::Failed"));
+
+        let resize = source
+            .split("fn resize_final_effect_video_host")
+            .nth(1)
+            .expect("native host resize handler")
+            .split("fn release_final_effect_video_host")
+            .next()
+            .expect("native host resize handler end");
+        assert!(resize.contains("inspect_mpv_video_window(process_id)"));
+        assert!(resize.contains("if inspection.is_ready()"));
+        assert!(resize.contains(".promote_to_top()"));
+    }
+
+    #[test]
+    fn reused_mpv_process_does_not_repeat_native_surface_validation() {
+        let status = MediaVideoBackendRuntimeStatus {
+            process_id: Some(42),
+            ..MediaVideoBackendRuntimeStatus::default()
+        };
+
+        assert!(!should_verify_mpv_video_surface(Some(42), &status));
+        assert!(should_verify_mpv_video_surface(Some(41), &status));
+        assert!(should_verify_mpv_video_surface(None, &status));
+
+        assert!(should_verify_mpv_video_surface(
+            Some(42),
+            &MediaVideoBackendRuntimeStatus::default(),
+        ));
     }
 
     #[test]
@@ -10025,7 +11329,12 @@ mod tests {
             .expect("set_processing_switches function end");
 
         assert!(command.contains("if video_switch_changed"));
+        assert!(command.contains("state.ensure_main_window(&window)?;"));
+        assert!(command.contains("state.playback_transition.lock()"));
         assert!(command.contains("state.stop_video_media_worker()?;"));
+        assert!(command.contains(".set_processing_enabled(request.video_processing_enabled)"));
+        assert!(!command.contains("state.suspend_realtime_video_runtime()?;"));
+        assert!(!command.contains("state.stop_realtime_video_runtime()?;"));
         assert!(!command.contains("media_video_stream"));
         assert!(command.contains("if audio_switch_changed"));
         assert!(command.contains("state.stop_audio_media_worker()?"));
@@ -10149,6 +11458,451 @@ mod tests {
         assert!(should_complete_playback_item(7, 3, 1, 8, 0, 0).is_err());
         assert!(should_complete_playback_item(7, 3, 1, 7, 4, 1).is_err());
         assert!(should_complete_playback_item(7, 3, 1, 7, 3, 0).is_err());
+    }
+
+    #[test]
+    fn managed_eof_failure_does_not_advance_single_file_authoritative_playback() {
+        let mut playback = PlaybackCore::default();
+        playback
+            .set_source_pool(vec![playback_test_source("a.mp4")])
+            .expect("pool should be valid");
+        playback.start().expect("pool should start");
+        let before = playback.snapshot();
+        let request = super::CompletePlaybackItemRequestDto {
+            playback_generation: before.playback_generation,
+            loop_index: before.loop_index,
+            source_media_index: before.source_media_index,
+        };
+
+        let staged = stage_playback_item_completion(&playback, &request)
+            .expect("completion should stage")
+            .expect("current item should advance");
+
+        assert_eq!(playback.snapshot(), before);
+        assert_eq!(staged.0.loop_index, before.loop_index + 1);
+        assert_eq!(staged.0.source_media_index, before.source_media_index);
+    }
+
+    #[test]
+    fn managed_eof_failure_does_not_switch_multi_file_authoritative_playback() {
+        let mut playback = PlaybackCore::default();
+        playback
+            .set_source_pool(vec![
+                playback_test_source("a.mp4"),
+                playback_test_source("b.mp4"),
+            ])
+            .expect("pool should be valid");
+        playback.start().expect("pool should start");
+        let before = playback.snapshot();
+        let request = super::CompletePlaybackItemRequestDto {
+            playback_generation: before.playback_generation,
+            loop_index: before.loop_index,
+            source_media_index: before.source_media_index,
+        };
+
+        let staged = stage_playback_item_completion(&playback, &request)
+            .expect("completion should stage")
+            .expect("current item should advance");
+
+        assert_eq!(playback.snapshot(), before);
+        assert_eq!(staged.0.source_media_index, 1);
+        assert_eq!(
+            staged.0.source_media.expect("staged source").file_name,
+            "b.mp4"
+        );
+    }
+
+    #[test]
+    fn managed_eof_success_commits_latest_playback_exactly_once() {
+        let mut playback = PlaybackCore::default();
+        playback
+            .set_source_pool(vec![playback_test_source("a.mp4")])
+            .expect("pool should be valid");
+        playback.start().expect("pool should start");
+        let before = playback.snapshot();
+        let request = super::CompletePlaybackItemRequestDto {
+            playback_generation: before.playback_generation,
+            loop_index: before.loop_index,
+            source_media_index: before.source_media_index,
+        };
+        let staged = stage_playback_item_completion(&playback, &request)
+            .expect("completion should stage")
+            .expect("current item should advance");
+        playback.set_processing_switches(false, true, false);
+        playback.mark_audio_processing_runtime();
+
+        let committed =
+            commit_staged_playback_item_completion(&mut playback, &request, &staged.0, staged.1)
+                .expect("completion should commit")
+                .expect("current item should commit");
+        let duplicate =
+            commit_staged_playback_item_completion(&mut playback, &request, &staged.0, staged.1)
+                .expect("duplicate completion should be idempotent");
+
+        assert_eq!(committed.0.loop_index, before.loop_index + 1);
+        assert_eq!(playback.snapshot(), committed.0);
+        assert_eq!(committed.0.audio_processing_status, "runtime");
+        assert!(duplicate.is_none());
+    }
+
+    #[test]
+    fn managed_eof_stale_commit_does_not_overwrite_newer_playback() {
+        let mut playback = PlaybackCore::default();
+        playback
+            .set_source_pool(vec![playback_test_source("a.mp4")])
+            .expect("pool should be valid");
+        playback.start().expect("pool should start");
+        let before = playback.snapshot();
+        let request = super::CompletePlaybackItemRequestDto {
+            playback_generation: before.playback_generation,
+            loop_index: before.loop_index,
+            source_media_index: before.source_media_index,
+        };
+        let staged = stage_playback_item_completion(&playback, &request)
+            .expect("completion should stage")
+            .expect("current item should advance");
+        playback.stop();
+        let newer = playback.snapshot();
+
+        let committed =
+            commit_staged_playback_item_completion(&mut playback, &request, &staged.0, staged.1)
+                .expect("stale completion should be idempotent");
+
+        assert!(committed.is_none());
+        assert_eq!(playback.snapshot(), newer);
+    }
+
+    #[test]
+    fn managed_eof_transaction_advances_runtime_before_authoritative_commit() {
+        let source = include_str!("commands.rs");
+        let transaction = source
+            .split("fn complete_playback_item_transaction")
+            .nth(1)
+            .expect("completion transaction")
+            .split("fn failed_eof_requires_runtime_cleanup")
+            .next()
+            .expect("completion transaction end");
+        let stage = transaction
+            .find("stage_playback_item_completion")
+            .expect("staged completion");
+        let advance = transaction
+            .find(".advance_after_eof(")
+            .expect("physical EOF advance");
+        let commit = transaction
+            .find("commit_staged_playback_item_completion")
+            .expect("authoritative completion");
+
+        assert!(stage < advance);
+        assert!(advance < commit);
+        assert!(!transaction.contains("*playback = staged"));
+    }
+
+    #[test]
+    fn eof_supervisor_requires_matching_rust_playback_and_runtime_identity() {
+        let mut playback = PlaybackCore::default();
+        playback
+            .set_source_pool(vec![playback_test_source("a.mp4")])
+            .expect("pool should be valid");
+        playback.start().expect("pool should start");
+        let current = playback.snapshot();
+        let eof = VideoEofFact {
+            playback_generation: current.playback_generation,
+            backend_epoch: 9,
+            clock_epoch: 3,
+            loop_index: current.loop_index,
+        };
+        let status = MediaVideoBackendRuntimeStatus {
+            playback_generation: Some(eof.playback_generation),
+            backend_epoch: eof.backend_epoch,
+            clock_epoch: Some(eof.clock_epoch),
+            loop_index: Some(eof.loop_index),
+            process_id: Some(42),
+            physical_eof_reached: Some(true),
+            eof: Some(eof),
+            ..MediaVideoBackendRuntimeStatus::default()
+        };
+
+        assert_eq!(realtime_video_eof_rejection(&current, &status, eof), None);
+        assert_eq!(
+            realtime_video_eof_rejection(
+                &current,
+                &MediaVideoBackendRuntimeStatus {
+                    clock_epoch: Some(eof.clock_epoch.saturating_add(1)),
+                    ..status.clone()
+                },
+                eof,
+            ),
+            Some("clock_epoch_mismatch")
+        );
+        assert_eq!(
+            realtime_video_eof_rejection(
+                &current,
+                &MediaVideoBackendRuntimeStatus {
+                    physical_eof_reached: Some(false),
+                    ..status
+                },
+                eof,
+            ),
+            Some("physical_eof_not_confirmed")
+        );
+    }
+
+    #[test]
+    fn eof_supervisor_ignores_only_a_fully_advanced_single_source_eof() {
+        let mut playback = PlaybackCore::default();
+        playback
+            .set_source_pool(vec![playback_test_source("a.mp4")])
+            .expect("pool should be valid");
+        playback.start().expect("pool should start");
+        let before = playback.snapshot();
+        let eof = VideoEofFact {
+            playback_generation: before.playback_generation,
+            backend_epoch: 9,
+            clock_epoch: 3,
+            loop_index: before.loop_index,
+        };
+        playback.complete_item().expect("single source should loop");
+        let current = playback.snapshot();
+        let status = MediaVideoBackendRuntimeStatus {
+            playback_generation: Some(current.playback_generation),
+            backend_epoch: eof.backend_epoch,
+            clock_epoch: Some(eof.clock_epoch),
+            loop_index: Some(current.loop_index),
+            process_id: Some(42),
+            physical_paused: Some(false),
+            physical_eof_reached: Some(false),
+            eof: None,
+            ..MediaVideoBackendRuntimeStatus::default()
+        };
+
+        assert_eq!(
+            realtime_video_eof_ignored_reason(&current, &status, eof),
+            Some("already_advanced")
+        );
+
+        let stale_runtime = MediaVideoBackendRuntimeStatus {
+            playback_generation: Some(eof.playback_generation),
+            backend_epoch: eof.backend_epoch,
+            clock_epoch: Some(eof.clock_epoch),
+            loop_index: Some(eof.loop_index),
+            process_id: Some(42),
+            physical_paused: Some(true),
+            physical_eof_reached: Some(true),
+            eof: Some(eof),
+            ..MediaVideoBackendRuntimeStatus::default()
+        };
+        assert_eq!(
+            realtime_video_eof_ignored_reason(&current, &stale_runtime, eof),
+            None
+        );
+        assert!(realtime_video_eof_reconciliation_required(
+            &current,
+            &stale_runtime,
+            eof
+        ));
+        assert_eq!(
+            realtime_video_eof_rejection(&current, &stale_runtime, eof),
+            None
+        );
+
+        playback
+            .complete_item()
+            .expect("single source should loop again");
+        let too_far = playback.snapshot();
+        assert!(!realtime_video_eof_reconciliation_required(
+            &too_far,
+            &stale_runtime,
+            eof
+        ));
+        assert_eq!(
+            realtime_video_eof_rejection(&too_far, &stale_runtime, eof),
+            Some("loop_index_mismatch")
+        );
+        assert_eq!(
+            realtime_video_eof_ignored_reason(
+                &too_far,
+                &MediaVideoBackendRuntimeStatus {
+                    loop_index: Some(too_far.loop_index),
+                    ..status.clone()
+                },
+                eof,
+            ),
+            None
+        );
+
+        let cross_generation = VideoEofFact {
+            playback_generation: eof.playback_generation.saturating_add(1),
+            ..eof
+        };
+        assert_eq!(
+            realtime_video_eof_ignored_reason(&current, &status, cross_generation),
+            None
+        );
+        assert!(!realtime_video_eof_reconciliation_required(
+            &current,
+            &stale_runtime,
+            cross_generation
+        ));
+    }
+
+    #[test]
+    fn managed_mpv_owns_external_playback_completion() {
+        let mut playback = PlaybackCore::default();
+        playback
+            .set_source_pool(vec![playback_test_source("a.mp4")])
+            .expect("pool should be valid");
+        playback.start().expect("pool should start");
+        let current = playback.snapshot();
+        let managed = MediaVideoBackendRuntimeStatus {
+            playback_generation: Some(current.playback_generation),
+            process_id: Some(42),
+            ..MediaVideoBackendRuntimeStatus::default()
+        };
+
+        assert!(managed_video_owns_playback_completion(&current, &managed));
+        assert!(!managed_video_owns_playback_completion(
+            &current,
+            &MediaVideoBackendRuntimeStatus {
+                playback_generation: Some(current.playback_generation.saturating_add(1)),
+                ..managed.clone()
+            }
+        ));
+        assert!(!managed_video_owns_playback_completion(
+            &current,
+            &MediaVideoBackendRuntimeStatus {
+                process_id: None,
+                ..managed
+            }
+        ));
+    }
+
+    #[test]
+    fn eof_supervisor_is_runtime_event_driven_instead_of_status_poll_driven() {
+        let source = include_str!("commands.rs");
+        let supervisor = source
+            .split("pub fn start_realtime_video_eof_supervisor")
+            .nth(1)
+            .expect("EOF supervisor")
+            .split("fn stop_realtime_video_runtime")
+            .next()
+            .expect("EOF supervisor end");
+        assert!(supervisor.contains("receiver.recv_timeout(Duration::from_millis(100))"));
+        assert!(supervisor.contains("complete_playback_item_transaction"));
+        assert!(!supervisor.contains("get_media_video_backend_status"));
+        assert!(include_str!("main.rs")
+            .contains("state.start_realtime_video_eof_supervisor(app_handle.clone())"));
+    }
+
+    #[test]
+    fn failed_eof_records_diagnostics_before_always_stopping_runtime() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let detail = record_and_stop_failed_realtime_video_eof(
+            || {
+                calls.borrow_mut().push("record");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("stop");
+                Ok(())
+            },
+        );
+
+        assert_eq!(*calls.borrow(), vec!["record", "stop"]);
+        assert!(detail.is_empty());
+
+        calls.borrow_mut().clear();
+        let detail = record_and_stop_failed_realtime_video_eof(
+            || {
+                calls.borrow_mut().push("record");
+                Err("record-error".to_string())
+            },
+            || {
+                calls.borrow_mut().push("stop");
+                Err("stop-error".to_string())
+            },
+        );
+
+        assert_eq!(*calls.borrow(), vec!["record", "stop"]);
+        assert!(detail.contains("record-error"));
+        assert!(detail.contains("stop-error"));
+    }
+
+    #[test]
+    fn stale_eof_failure_does_not_release_a_superseding_runtime() {
+        assert!(!failed_eof_requires_runtime_cleanup(
+            &RealtimeVideoBackendError::StaleSync {
+                field: "clock_epoch"
+            }
+        ));
+        assert!(!failed_eof_requires_runtime_cleanup(
+            &RealtimeVideoBackendError::SyncSuperseded {
+                operation: "advance_after_eof",
+            }
+        ));
+        assert!(!failed_eof_requires_runtime_cleanup(
+            &RealtimeVideoBackendError::StalePrepareBackendEpoch {
+                requested: 4,
+                current: 5,
+            }
+        ));
+        assert!(failed_eof_requires_runtime_cleanup(
+            &RealtimeVideoBackendError::ProcessFailed {
+                operation: "resume_after_eof",
+                message: "physical EOF is stuck".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn playback_item_completion_preserves_managed_mpv_for_same_process_source_switch() {
+        let source = include_str!("commands.rs");
+        let completion = source
+            .split("fn complete_playback_item_inner")
+            .nth(1)
+            .expect("completion function")
+            .split("pub fn commit_media_processing_if_ready")
+            .next()
+            .expect("completion function end");
+
+        assert!(completion.contains("state.stop_video_media_worker()?;"));
+        assert!(completion.contains("let preserve_video_runtime ="));
+        assert!(completion.contains(
+            "managed_eof.is_some() && should_preserve_video_runtime_for_next_pool_item(&current);"
+        ));
+        assert!(completion.contains(
+            "if !preserve_video_runtime {\n            state.stop_realtime_video_runtime()?;"
+        ));
+        assert!(completion.contains("advance_after_eof"));
+        assert!(completion.contains("state.stop_realtime_video_runtime()"));
+    }
+
+    #[test]
+    fn audio_candidate_releases_playback_transition_during_probe_and_argument_building() {
+        let source = include_str!("commands.rs");
+        let body = source
+            .split("fn prepare_audio_media_candidate_blocking")
+            .nth(1)
+            .expect("audio candidate blocking helper")
+            .split("pub fn start_media_processing")
+            .next()
+            .expect("audio candidate helper end");
+        let release = body
+            .find("drop(transition_guard)")
+            .expect("transition lock must be released before expensive preparation");
+        let probe = body
+            .find("resolve_user_ambient_sound(")
+            .expect("ambient probe must remain present");
+        let build = body
+            .find("build_media_render_args(&media_request)")
+            .expect("render argument validation must remain present");
+        let reacquire = body
+            .rfind("state.playback_transition.lock()")
+            .expect("transition lock must be reacquired before commit");
+
+        assert!(release < probe);
+        assert!(release < build);
+        assert!(probe < reacquire);
+        assert!(build < reacquire);
     }
 
     #[test]
@@ -10279,7 +12033,8 @@ mod tests {
             ("pub fn start_media_processing", "pub fn direct_model_chat"),
             ("pub fn start_playback", "pub fn pause_playback"),
             ("pub fn pause_playback", "pub fn resume_playback"),
-            ("pub fn resume_playback", "pub fn update_playback_position"),
+            ("pub fn resume_playback", "pub fn seek_playback"),
+            ("pub fn seek_playback", "pub fn update_playback_position"),
             ("pub fn stop_playback", "pub fn complete_playback_loop"),
         ] {
             let body = source
@@ -10294,6 +12049,43 @@ mod tests {
                 "{start} must serialize with pool edits"
             );
         }
+    }
+
+    #[test]
+    fn video_intent_failure_cannot_commit_staged_playback_core() {
+        let source = include_str!("commands.rs");
+        let action = source
+            .split("fn playback_action_with_video_intent")
+            .nth(1)
+            .expect("transactional playback action")
+            .split("pub fn start_playback")
+            .next()
+            .expect("transactional playback action end");
+        let intent = action
+            .find("apply_realtime_video_playback_intent")
+            .expect("actor intent must be applied");
+        let commit = action
+            .find("*playback = staged")
+            .expect("staged PlaybackCore must commit");
+        assert!(intent < commit, "Core must commit only after actor success");
+
+        let seek = source
+            .split("pub fn seek_playback")
+            .nth(1)
+            .expect("seek command")
+            .split("pub fn update_playback_position")
+            .next()
+            .expect("seek command end");
+        let physical_seek = seek
+            .find("apply_realtime_video_playback_intent")
+            .expect("physical seek intent");
+        let logical_seek = seek
+            .find("*playback = staged")
+            .expect("logical seek commit");
+        assert!(
+            physical_seek < logical_seek,
+            "seek must not half-commit Core"
+        );
     }
 
     #[test]

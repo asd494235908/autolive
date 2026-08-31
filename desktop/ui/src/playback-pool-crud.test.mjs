@@ -45,6 +45,9 @@ test('播放池提供追加、替换、排序、删除和清空操作', async ()
   assert.match(panel, /aria-label="追加媒体"[\s\S]*onClick=\{onAppend\}/);
   assert.equal(panel.match(/error \? <Alert/g)?.length, 1);
   assert.match(app, /snapshotRequestRef\.current \+= 1;[\s\S]*snapshotRefHome\.current = nextSnapshot;[\s\S]*setSnapshot\(nextSnapshot\)/);
+  assert.match(app, /invokePlaybackSnapshot\('update_playback_position',[\s\S]*playback_generation: playbackGeneration,[\s\S]*loop_index: sourceClock\.loopIndex,[\s\S]*position_ms: positionMs/);
+  assert.match(app, /previousSnapshot\?\.playback_generation !== nextSnapshot\.playback_generation[\s\S]*mediaStateRef\.current = null;[\s\S]*setMediaState\(null\)/);
+  assert.match(app, /event\.data\.playback_generation !== snapshotRefHome\.current\?\.playback_generation\) return/);
   assert.match(app, /currentSource \? `第 \$\{\(snapshot\?\.source_media_index \?\? 0\) \+ 1\}\/\$\{sourceMediaPool\.length\} 项` : '等待导入'/);
 });
 

@@ -1,0 +1,19 @@
+--- a/configure
++++ b/configure
+@@ -5561,7 +5561,7 @@
+-if VSLANG=1033 $ar 2>&1 | grep -q ^Microsoft; then
++if VSLANG=1033 $ar 2>&1 | grep -Eq '^(Microsoft|warning: no input files, not writing output file)'; then
+     arflags="-nologo"
+     ar_o='-out:$@'
+ elif $ar 2>&1 | grep -q "\[D\] "; then
+     arflags="rcD"
+     ar_o='$@'
+ else
+@@ -6464,7 +6463,0 @@
+-#ifdef WINAPI_FAMILY
+-#include <winapifamily.h>
+-#if !WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+-#error not desktop
+-#endif
+-#endif
+-EOF

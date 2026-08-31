@@ -284,7 +284,7 @@ test('播放进度拖动保留本地值，松手后只提交一次 seek', async 
   );
 
   assert.match(controls, /value=\{mediaDisplayedTime\}/);
-  assert.match(dragHandler, /setMediaSeekDraft\([\s\S]*committed: false/);
+  assert.match(dragHandler, /committed: false[\s\S]*setMediaSeekDraft\(draft\)/);
   assert.doesNotMatch(dragHandler, /action: 'seek'/);
   assert.match(commitHandler, /action: 'seek'/);
 });

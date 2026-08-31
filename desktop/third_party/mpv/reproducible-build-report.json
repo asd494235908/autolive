@@ -1,0 +1,237 @@
+{
+  "artifacts": [
+    {
+      "format": "text",
+      "path": "build-log.txt",
+      "role": "build-log",
+      "sha256": "8430abc0b72c99287da0d15544cf356b052758b683a6ec995cb54ba3d2196e05",
+      "size": 512415
+    },
+    {
+      "format": "json",
+      "path": "build-parameters.json",
+      "role": "build-parameters",
+      "sha256": "14b946a39e4898760cc2f332e64a8fc4e81cc1e7324c1d3339a5f1279b2c05a7",
+      "size": 1909
+    },
+    {
+      "format": "tar-zst",
+      "path": "corresponding-source.tar.zst",
+      "role": "corresponding-source-archive",
+      "sha256": "fca9a82a2a1cb435b0b5410c9ecf4a843d19213032da1e09de812e0844a077d0",
+      "size": 91929802
+    },
+    {
+      "format": "text",
+      "path": "copyright-inventory.txt",
+      "role": "copyright-inventory",
+      "sha256": "52f085e66609d3d267a0b09f51a1b9cd59ccf05a28b9856bc1637910b0b993b1",
+      "size": 5703
+    },
+    {
+      "format": "cyclonedx-json",
+      "path": "sbom.cdx.json",
+      "role": "cyclonedx-sbom",
+      "sha256": "7467a8f53d6fde344eb8c557b75732ab8c62d742796e5da239098230737f792e",
+      "size": 26245
+    },
+    {
+      "format": "json",
+      "path": "dependency-lock.json",
+      "role": "dependency-lock",
+      "sha256": "aa8c6d67cd1864b03804f2f12d4a14c386296f2dac2c632aa8f773438450183d",
+      "size": 9441
+    },
+    {
+      "format": "json",
+      "path": "docker-host-evidence.json",
+      "role": "docker-host-evidence",
+      "sha256": "160a3bd4763c6acd5b849c42651250aafe2fcb46f0dd2d0e085204f69de61ae0",
+      "size": 2439
+    },
+    {
+      "format": "text",
+      "path": "license-inventory.txt",
+      "role": "license-inventory",
+      "sha256": "eb5dfa78bc0eb8df911e30d3af8f5f2dc637c30329da8a665184959eeac279a3",
+      "size": 5382
+    },
+    {
+      "format": "json",
+      "path": "meson-introspection.json",
+      "role": "meson-introspection",
+      "sha256": "03817e5aa7fc58e12e6328353b7909a46d41cd6f2097dc95c3d5ce66689138a6",
+      "size": 509164
+    },
+    {
+      "format": "pe",
+      "path": "mpv.exe",
+      "role": "mpv-executable",
+      "sha256": "5943e359f7fb034215212b69223e9f808cf44ba3697355d9c2c49bbd6cd38d65",
+      "size": 37645824
+    },
+    {
+      "format": "tar-zst",
+      "path": "patch-bundle.tar.zst",
+      "role": "patch-bundle",
+      "sha256": "af378a9db25b0922fe37b9bd234f410cac3296b19f0e14d67429e76a244e74ad",
+      "size": 1007
+    },
+    {
+      "format": "json",
+      "path": "pe-imports.json",
+      "role": "pe-imports",
+      "sha256": "28b74afa6716938916844309dce38d31217689c8fac1835808590bad05803119",
+      "size": 1197
+    },
+    {
+      "format": "spdx-json",
+      "path": "sbom.spdx.json",
+      "role": "spdx-sbom",
+      "sha256": "f570a6a34d4099a8ab348d9f99affd07a9e1b3458d91969b00ab6edebc840f1f",
+      "size": 22691
+    },
+    {
+      "format": "pe",
+      "path": "spirv-cross-c-shared.dll",
+      "role": "spirv-cross-runtime",
+      "sha256": "65a17e740af474f977ff0254ee085af7c327b6bb7fa733b805cd8c892420121f",
+      "size": 1960960
+    },
+    {
+      "format": "pe",
+      "path": "vulkan-1.dll",
+      "role": "vulkan-loader-runtime",
+      "sha256": "c03fb06d51aca4a529d157155263eefc92ee090883323da9eed25c379f873c6a",
+      "size": 663552
+    }
+  ],
+  "build_environment": {
+    "builder_image": "ghcr.io/llvm/ci-ubuntu-24.04@sha256:224c58f5d5f3f1d4b8f36dd3873b00a5d60c28065693165d875a9454ed914233",
+    "locale": "C.UTF-8",
+    "network": "none",
+    "path_prefix_map": "/work=/usr/src/autolive-mpv",
+    "source_date_epoch": 1787875200,
+    "source_mode": "locked_cache_only",
+    "target": "x86_64-pc-windows-msvc",
+    "timezone": "UTC"
+  },
+  "claim": "one_locked_cold_build_candidate",
+  "configured_inputs": {
+    "cache_inventory": [
+      "sources/fast-float-97b54ca9e75f5303507699d27c6b4f4efe4641a1.tar.gz",
+      "sources/ffmpeg-1d7b14f61d66fdf18f15204c613df9d65396c319.tar.gz",
+      "sources/freetype-526ec5c47b9ebccc4754c85ac0c0cdf7c85a5e9b.tar.gz",
+      "sources/fribidi-68162babff4f39c4e2dc164a5e825af93bda9983.tar.gz",
+      "sources/glslang-2ee090f606ace31e07f584b1c1b9ddf4909ce202.tar.gz",
+      "sources/harfbuzz-36cb489cb02ce4b92099669ba9f9bea348eff93f.tar.gz",
+      "sources/jinja-15206881c006c79667fe5154fe80c01c65410679.tar.gz",
+      "sources/lcms2-21c582a594fe5279f90c0b93437c398f93bf62b0.tar.gz",
+      "sources/libass-4a05d8127f525943ebf45fdc6497c9e665947f0d.tar.gz",
+      "sources/libplacebo-22ee762e8e0890fc54068beb670310f0edce7263.tar.gz",
+      "sources/markupsafe-297fc8e356e6836a62087949245d09a28e9f1b13.tar.gz",
+      "sources/mpv-7b8915bc1d04c7e1b61184e00c7fbfaab1911e75.tar.gz",
+      "sources/shaderc-7060a6615a1c6e2515e696651eea685524ecadb5.tar.gz",
+      "sources/spirv-cross-9c3c8e2cefdd8194b193bb8ed2fdff4d5527e382.tar.gz",
+      "sources/spirv-headers-942fe4b988359a0750b79f0ae7ed735994d3147d.tar.gz",
+      "sources/spirv-tools-f589ef005c49f6f19c8e78eb5269104ba293beb4.tar.gz",
+      "sources/vulkan-headers-74d8a6cb930c68ef617b202c3ff3c59d919e086b.tar.gz",
+      "sources/vulkan-loader-363f465abadab0a8dcfc5c85d2c691e9b0b788d6.tar.gz",
+      "sources/zstd-1.5.7.tar.gz",
+      "toolchain/llvm-project-22.1.4.src.tar.xz",
+      "toolchain/meson-1.9.0.tar.gz",
+      "toolchain/msvc-toolset-14.44.35207.tar.gz",
+      "toolchain/nasm-2.16.03.tar.xz",
+      "toolchain/pkgconf-2.5.1.tar.xz",
+      "toolchain/ucrt-10.0.26100.0.tar.gz",
+      "toolchain/windows-sdk-10.0.26100.0.tar.gz"
+    ],
+    "ffmpeg_arguments": [
+      "--target-os=win32",
+      "--arch=x86_64",
+      "--toolchain=msvc",
+      "--enable-static",
+      "--enable-cross-compile",
+      "--disable-shared",
+      "--disable-autodetect",
+      "--disable-debug",
+      "--disable-doc",
+      "--disable-network",
+      "--disable-programs"
+    ],
+    "meson_arguments": [
+      "--wrap-mode=nodownload",
+      "-Dauto_features=disabled",
+      "-Dbuild-date=false",
+      "-Ddefault_library=static",
+      "-Dfuzzers=false",
+      "-Dtests=false",
+      "-Dcplayer=true",
+      "-Dd3d11=enabled",
+      "-Dd3d-hwaccel=enabled",
+      "-Dlcms2=enabled",
+      "-Dshaderc=enabled",
+      "-Dspirv-cross=enabled",
+      "-Dvulkan=enabled",
+      "-Dwin32-threads=enabled",
+      "-Dcdda=disabled",
+      "-Dcplugins=disabled",
+      "-Ddvbin=disabled",
+      "-Ddvdnav=disabled",
+      "-Dgl=disabled",
+      "-Djavascript=disabled",
+      "-Dlibarchive=disabled",
+      "-Dlibavdevice=disabled",
+      "-Dlibbluray=disabled",
+      "-Dlibcurl=disabled",
+      "-Dlibmpv=false",
+      "-Dlua=disabled",
+      "-Dmanpage-build=disabled",
+      "-Dopenal=disabled",
+      "-Dsdl2-audio=disabled",
+      "-Dsdl2-gamepad=disabled",
+      "-Dsdl2-video=disabled",
+      "-Dsixel=disabled",
+      "-Dsubrandr=disabled",
+      "-Dvapoursynth=disabled",
+      "-Dwasapi=disabled"
+    ],
+    "spirv_cross_cmake_arguments": [
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW",
+      "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
+      "-DBUILD_SHARED_LIBS=OFF",
+      "-DSPIRV_CROSS_SHARED=ON",
+      "-DSPIRV_CROSS_CLI=OFF",
+      "-DSPIRV_CROSS_ENABLE_TESTS=OFF",
+      "-DSPIRV_CROSS_ENABLE_MSL=OFF",
+      "-DSPIRV_CROSS_ENABLE_CPP=OFF",
+      "-DSPIRV_CROSS_ENABLE_REFLECT=OFF",
+      "-DSPIRV_CROSS_ENABLE_UTIL=OFF"
+    ]
+  },
+  "dynamic_dependencies": [
+    "ADVAPI32.DLL",
+    "API-MS-WIN-CORE-PATH-L1-1-0.DLL",
+    "API-MS-WIN-SHCORE-SCALING-L1-1-1.DLL",
+    "AVRT.DLL",
+    "BCRYPT.DLL",
+    "CFGMGR32.DLL",
+    "DWMAPI.DLL",
+    "GDI32.DLL",
+    "IMM32.DLL",
+    "KERNEL32.DLL",
+    "NTDLL.DLL",
+    "OLE32.DLL",
+    "SHELL32.DLL",
+    "SHLWAPI.DLL",
+    "SPIRV-CROSS-C-SHARED.DLL",
+    "USER32.DLL",
+    "UXTHEME.DLL",
+    "VERSION.DLL",
+    "VULKAN-1.DLL"
+  ],
+  "lock_sha256": "5ee096c7f4da718cc8b74f2006d23ef39820e0ead92266bc41da1e69dad09135",
+  "schema_version": 2,
+  "scope": "phase7a_supply_candidate"
+}

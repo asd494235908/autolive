@@ -1,0 +1,67 @@
+//!PARAM al_local_blur_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_runtime_local_blur_active
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_local_blur_region_percent
+//!TYPE float
+//!MINIMUM 5.0
+//!MAXIMUM 50.0
+20.0
+
+//!PARAM al_local_blur_radius_px
+//!TYPE float
+//!MINIMUM 0.1
+//!MAXIMUM 16.0
+2.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive Phase 3A center-region local blur candidate
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN al_local_blur_enabled al_runtime_local_blur_active *
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+    if (al_local_blur_enabled <= 0.0 || al_runtime_local_blur_active <= 0.0) {
+        return source_color;
+    }
+
+    vec2 center_distance = abs(HOOKED_pos - vec2(0.5));
+    vec2 half_region = vec2(clamp(al_local_blur_region_percent / 200.0, 0.025, 0.25));
+    if (center_distance.x > half_region.x || center_distance.y > half_region.y) {
+        return source_color;
+    }
+
+    vec2 radius = HOOKED_pt * clamp(al_local_blur_radius_px, 0.1, 16.0);
+    vec2 sample_min = max(vec2(0.0), vec2(0.5) - half_region);
+    vec2 sample_max = min(vec2(1.0), vec2(0.5) + half_region);
+    vec3 blurred_rgb = (
+        source_color.rgb * 4.0
+        + HOOKED_tex(clamp(HOOKED_pos + vec2(radius.x, 0.0), sample_min, sample_max)).rgb * 2.0
+        + HOOKED_tex(clamp(HOOKED_pos - vec2(radius.x, 0.0), sample_min, sample_max)).rgb * 2.0
+        + HOOKED_tex(clamp(HOOKED_pos + vec2(0.0, radius.y), sample_min, sample_max)).rgb * 2.0
+        + HOOKED_tex(clamp(HOOKED_pos - vec2(0.0, radius.y), sample_min, sample_max)).rgb * 2.0
+        + HOOKED_tex(clamp(HOOKED_pos + radius, sample_min, sample_max)).rgb
+        + HOOKED_tex(clamp(HOOKED_pos - radius, sample_min, sample_max)).rgb
+        + HOOKED_tex(clamp(HOOKED_pos + vec2(radius.x, -radius.y), sample_min, sample_max)).rgb
+        + HOOKED_tex(clamp(HOOKED_pos + vec2(-radius.x, radius.y), sample_min, sample_max)).rgb
+    ) / 16.0;
+    float edge_distance = min(
+        half_region.x - center_distance.x,
+        half_region.y - center_distance.y
+    );
+    float feather_width = max(max(radius.x, radius.y), max(HOOKED_pt.x, HOOKED_pt.y));
+    float region_weight = smoothstep(0.0, feather_width, edge_distance);
+    float mix_weight = clamp(al_local_blur_enabled, 0.0, 1.0) * region_weight;
+
+    return vec4(mix(source_color.rgb, blurred_rgb, mix_weight), source_color.a);
+}

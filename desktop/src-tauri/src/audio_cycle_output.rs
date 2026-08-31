@@ -8,6 +8,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::audible_audio_clock::{
+    AudibleAudioClock, AudibleAudioClockObservation, AudioClockBoundary, AudioClockIdentity,
+};
 use crate::audio_mixer::{
     AudioMixerTrack, AUDIO_CANDIDATE_COMMIT_TAIL_MS, AUDIO_CROSSFADE_MS,
     AUDIO_POST_CROSSFADE_TAIL_MS,
@@ -15,6 +18,7 @@ use crate::audio_mixer::{
 use crate::audio_output_diagnostic::{
     AudioLowFrequencyDiagnosticSnapshot, LowFrequencyDiagnosticAnalyzer,
 };
+use crate::media_timeline::MediaSegmentIdentity;
 
 const OUTPUT_CHANNELS: usize = 2;
 const DIGITAL_SILENCE_PEAK: f32 = 0.000_000_1;
@@ -27,6 +31,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_millis(5_000);
 const CROSSFADE_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 const RING_CLEAR_TIMEOUT: Duration = Duration::from_millis(500);
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const AUDIBLE_CLOCK_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
 pub const AUDIO_CYCLE_CROSSFADE_MS: usize = AUDIO_CROSSFADE_MS;
 
 type ControlResponse = mpsc::Sender<Result<(), String>>;
@@ -55,10 +60,12 @@ pub struct AudioCycleOutputStatus {
     pub timeline_media_position_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AudioTrackTimeline {
-    pub media_position_ms: u64,
+    pub presentation_position_ms: u64,
+    pub source_position_ms: u64,
     pub playback_rate: f64,
+    pub segment: MediaSegmentIdentity,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -338,11 +345,14 @@ impl InterludeMixState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TimelineAnchor {
     callback_frame: u64,
-    media_position_ms: u64,
+    presentation_position_ms: u64,
+    source_position_ms: u64,
     playback_rate: f64,
+    identity: AudioClockIdentity,
+    boundary: AudioClockBoundary,
 }
 
 #[derive(Debug, Default)]
@@ -352,6 +362,82 @@ struct OutputTimeline {
 }
 
 impl OutputTimeline {
+    fn replace_current(
+        &mut self,
+        timeline: AudioTrackTimeline,
+        callback_frame: u64,
+        audible_clock: &AudibleAudioClock,
+    ) {
+        let boundary = self.boundary_for(&timeline);
+        self.active = Some(TimelineAnchor {
+            callback_frame,
+            presentation_position_ms: timeline.presentation_position_ms,
+            source_position_ms: timeline.source_position_ms,
+            playback_rate: normalized_playback_rate(timeline.playback_rate),
+            identity: AudioClockIdentity {
+                segment: timeline.segment,
+                audio_epoch: audible_clock.next_audio_epoch(),
+            },
+            boundary,
+        });
+        self.pending = None;
+        audible_clock.clear();
+    }
+
+    fn queue_crossfade(
+        &mut self,
+        timeline: AudioTrackTimeline,
+        callback_frame: u64,
+        audible_clock: &AudibleAudioClock,
+    ) {
+        let same_clock_identity = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.identity.segment == timeline.segment);
+        let (audio_epoch, boundary) = if same_clock_identity {
+            (
+                self.active
+                    .as_ref()
+                    .map(|active| active.identity.audio_epoch)
+                    .unwrap_or_else(|| audible_clock.next_audio_epoch()),
+                AudioClockBoundary::None,
+            )
+        } else {
+            (
+                audible_clock.next_audio_epoch(),
+                self.boundary_for(&timeline),
+            )
+        };
+        self.pending = Some(TimelineAnchor {
+            callback_frame,
+            presentation_position_ms: timeline.presentation_position_ms,
+            source_position_ms: timeline.source_position_ms,
+            playback_rate: normalized_playback_rate(timeline.playback_rate),
+            identity: AudioClockIdentity {
+                segment: timeline.segment,
+                audio_epoch,
+            },
+            boundary,
+        });
+    }
+
+    fn boundary_for(&self, timeline: &AudioTrackTimeline) -> AudioClockBoundary {
+        let Some(active) = self.active.as_ref() else {
+            return AudioClockBoundary::Startup;
+        };
+        if active.identity.segment.playback_generation != timeline.segment.playback_generation {
+            AudioClockBoundary::Startup
+        } else if active.identity.segment.source_path != timeline.segment.source_path
+            || active.identity.segment.source_duration_ms != timeline.segment.source_duration_ms
+        {
+            AudioClockBoundary::SourceChanged
+        } else if active.identity.segment.loop_index != timeline.segment.loop_index {
+            AudioClockBoundary::LoopBoundary
+        } else {
+            AudioClockBoundary::UserSeek
+        }
+    }
+
     fn media_position_ms(
         &mut self,
         output: &autolive_portaudio_output::PortAudioOutput,
@@ -374,13 +460,64 @@ impl OutputTimeline {
             .saturating_sub(latency_frames);
         if self
             .pending
+            .as_ref()
             .is_some_and(|anchor| audible_callback_frame >= anchor.callback_frame)
         {
             self.active = self.pending.take();
         }
-        self.active.map(|anchor| {
-            estimate_media_position_ms(anchor, audible_callback_frame, sample_rate_hz)
+        self.active.as_ref().and_then(|anchor| {
+            estimate_presentation_position_ms(anchor, audible_callback_frame, sample_rate_hz)
         })
+    }
+
+    fn publish_audible_clock(
+        &mut self,
+        output: &autolive_portaudio_output::PortAudioOutput,
+        audible_clock: &AudibleAudioClock,
+        playing: bool,
+        observed_at: Instant,
+    ) {
+        let health = output.stream_health();
+        let Some(actual_sample_rate_hz) = health.actual_sample_rate_hz.filter(|rate| *rate > 0)
+        else {
+            audible_clock.clear();
+            return;
+        };
+        let output_latency_us = health
+            .output_latency_us
+            .unwrap_or(0)
+            .max(u64::try_from(health.callback_output_buffer_dac_time_delta_us).unwrap_or(0));
+        let latency_frames = output_latency_us
+            .saturating_mul(u64::from(actual_sample_rate_hz))
+            .saturating_add(999_999)
+            .saturating_div(1_000_000);
+        let audible_callback_frame = health
+            .callback_pcm_frames_total
+            .saturating_sub(latency_frames);
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|anchor| audible_callback_frame >= anchor.callback_frame)
+        {
+            self.active = self.pending.take();
+        }
+        let Some(anchor) = self.active.as_ref() else {
+            audible_clock.clear();
+            return;
+        };
+        audible_clock.publish(AudibleAudioClockObservation {
+            identity: anchor.identity.clone(),
+            boundary: anchor.boundary,
+            presentation_anchor_pts_ms: anchor.presentation_position_ms,
+            source_anchor_pts_ms: anchor.source_position_ms,
+            source_anchor_callback_frame: anchor.callback_frame,
+            callback_pcm_frames_total: health.callback_pcm_frames_total,
+            actual_sample_rate_hz,
+            output_latency_us,
+            playback_rate: anchor.playback_rate,
+            playing,
+            observed_at,
+        });
     }
 }
 
@@ -392,17 +529,31 @@ fn normalized_playback_rate(playback_rate: f64) -> f64 {
     }
 }
 
-fn estimate_media_position_ms(
-    anchor: TimelineAnchor,
+fn estimate_presentation_position_ms(
+    anchor: &TimelineAnchor,
     audible_callback_frame: u64,
     sample_rate_hz: u32,
-) -> u64 {
-    let elapsed_frames = audible_callback_frame.saturating_sub(anchor.callback_frame);
+) -> Option<u64> {
+    if sample_rate_hz == 0 {
+        return None;
+    }
+    let elapsed_frames = audible_callback_frame.checked_sub(anchor.callback_frame)?;
     let elapsed_media_ms = (elapsed_frames as f64 * 1_000.0 * anchor.playback_rate
-        / f64::from(sample_rate_hz.max(1)))
-    .round()
-    .clamp(0.0, u64::MAX as f64) as u64;
-    anchor.media_position_ms.saturating_add(elapsed_media_ms)
+        / f64::from(sample_rate_hz))
+    .round();
+    if !elapsed_media_ms.is_finite()
+        || elapsed_media_ms < 0.0
+        || elapsed_media_ms >= u64::MAX as f64
+    {
+        return None;
+    }
+    let source_position_ms = anchor
+        .source_position_ms
+        .checked_add(elapsed_media_ms as u64)?;
+    anchor
+        .identity
+        .segment
+        .presentation_pts_ms(source_position_ms)
 }
 
 #[derive(Debug, Clone)]
@@ -420,7 +571,11 @@ pub struct AudioCycleOutputTask {
 }
 
 impl AudioCycleOutputTask {
-    pub fn start(config: AudioOutputConfig) -> Result<Self, String> {
+    pub fn start(
+        config: AudioOutputConfig,
+        audible_clock: Arc<AudibleAudioClock>,
+    ) -> Result<Self, String> {
+        audible_clock.clear();
         let status = Arc::new(Mutex::new(initial_status(config)));
         let diagnostic = Arc::new(Mutex::new(AudioLowFrequencyDiagnosticSnapshot::empty(
             config.sample_rate_hz,
@@ -458,6 +613,7 @@ impl AudioCycleOutputTask {
                     worker_status,
                     worker_diagnostic,
                     worker_failure,
+                    audible_clock,
                 );
             })
             .map_err(|error| format!("启动音频周期输出线程失败：{error}"))?;
@@ -634,7 +790,15 @@ fn output_loop(
     status: Arc<Mutex<AudioCycleOutputStatus>>,
     diagnostic: Arc<Mutex<AudioLowFrequencyDiagnosticSnapshot>>,
     failure: Arc<Mutex<Option<String>>>,
+    audible_clock: Arc<AudibleAudioClock>,
 ) {
+    struct AudibleClockLease(Arc<AudibleAudioClock>);
+    impl Drop for AudibleClockLease {
+        fn drop(&mut self) {
+            self.0.clear();
+        }
+    }
+    let _audible_clock_lease = AudibleClockLease(Arc::clone(&audible_clock));
     let sample_rate_hz = output.sample_rate_hz();
     let output_chunk_samples = OUTPUT_CHUNK_FRAMES * OUTPUT_CHANNELS;
     let output_channels = usize::from(output.channels().max(1));
@@ -662,6 +826,7 @@ fn output_loop(
     let mut paused = output.is_callback_paused();
     let mut media_gain = 1.0_f32;
     let mut last_status_refresh = Instant::now();
+    let mut last_audible_clock_refresh = Instant::now();
     let output_retry_interval = output_block_interval(sample_rate_hz, output.frames_per_buffer());
 
     loop {
@@ -712,14 +877,11 @@ fn output_loop(
                                     diagnostic_analyzer.observe_stereo_pcm(&samples);
                                     current = Some(track);
                                     let health = output.stream_health();
-                                    timeline.active = Some(TimelineAnchor {
-                                        callback_frame: health.callback_pcm_frames_total,
-                                        media_position_ms: next_timeline.media_position_ms,
-                                        playback_rate: normalized_playback_rate(
-                                            next_timeline.playback_rate,
-                                        ),
-                                    });
-                                    timeline.pending = None;
+                                    timeline.replace_current(
+                                        next_timeline,
+                                        health.callback_pcm_frames_total,
+                                        &audible_clock,
+                                    );
                                     let _ = response.send(Ok(()));
                                 }
                                 Ok(_) => {
@@ -885,6 +1047,7 @@ fn output_loop(
                     }
                     interlude_state = None;
                     timeline = OutputTimeline::default();
+                    audible_clock.clear();
                     diagnostic_analyzer.reset();
                     publish_diagnostic(&diagnostic, &mut diagnostic_analyzer);
                     paused = true;
@@ -912,6 +1075,15 @@ fn output_loop(
             update_status(&status, &output, Some(&mut timeline));
             publish_diagnostic(&diagnostic, &mut diagnostic_analyzer);
             last_status_refresh = Instant::now();
+        }
+        if last_audible_clock_refresh.elapsed() >= AUDIBLE_CLOCK_REFRESH_INTERVAL {
+            timeline.publish_audible_clock(
+                &output,
+                &audible_clock,
+                !paused && current.is_some(),
+                Instant::now(),
+            );
+            last_audible_clock_refresh = Instant::now();
         }
 
         // 初次 SetCurrent 需要在 callback 暂停时填入完整有效水位；
@@ -1000,15 +1172,13 @@ fn output_loop(
                                         / usize::from(output.channels().max(1)),
                                 )
                                 .unwrap_or(u64::MAX);
-                                timeline.pending = Some(TimelineAnchor {
-                                    callback_frame: health
+                                timeline.queue_crossfade(
+                                    switch.timeline,
+                                    health
                                         .callback_pcm_frames_total
                                         .saturating_add(ring_frames_before_fade),
-                                    media_position_ms: switch.timeline.media_position_ms,
-                                    playback_rate: normalized_playback_rate(
-                                        switch.timeline.playback_rate,
-                                    ),
-                                });
+                                    &audible_clock,
+                                );
                                 let _ = switch.response.send(Ok(()));
                             }
                             Ok(_) => {
@@ -1511,15 +1681,18 @@ fn stereo_samples_duration_ms(samples: usize, sample_rate_hz: u32, channels: usi
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_interlude_mix, apply_media_gain, build_test_tone, estimate_media_position_ms,
+        apply_interlude_mix, apply_media_gain, build_test_tone, estimate_presentation_position_ms,
         linear_crossfade, mix_pending_output_once, output_block_interval, pending_stereo_chunk,
         refill_pending_output_from_current, stereo_samples_for_ms,
         stereo_samples_for_output_samples, take_crossfade_pair_or_fade_in,
-        validate_candidate_signal, validate_resume_request, AudioInterludeMixConfig,
-        AudioMixerTrack, AudioTestTone, InterludeMixState, TimelineAnchor,
+        validate_candidate_signal, validate_resume_request, AudibleAudioClock, AudioClockBoundary,
+        AudioClockIdentity, AudioInterludeMixConfig, AudioMixerTrack, AudioTestTone,
+        AudioTrackTimeline, InterludeMixState, OutputTimeline, TimelineAnchor,
         AUDIO_CYCLE_CROSSFADE_MS,
     };
+    use crate::media_timeline::MediaSegmentIdentity;
     use std::collections::VecDeque;
+    use std::path::PathBuf;
 
     #[test]
     fn resume_rejects_an_empty_output_track() {
@@ -1902,13 +2075,80 @@ mod tests {
 
     #[test]
     fn callback_frames_advance_the_absolute_media_timeline_at_playback_rate() {
+        let segment =
+            MediaSegmentIdentity::try_new(1, PathBuf::from("source.mp4"), 0, 60_000).unwrap();
         let anchor = TimelineAnchor {
             callback_frame: 1_000,
-            media_position_ms: 20_000,
+            presentation_position_ms: 20_000,
+            source_position_ms: 20_000,
             playback_rate: 2.0,
+            identity: AudioClockIdentity {
+                segment,
+                audio_epoch: 1,
+            },
+            boundary: AudioClockBoundary::Startup,
         };
 
-        assert_eq!(estimate_media_position_ms(anchor, 5_410, 44_100), 20_200);
-        assert_eq!(estimate_media_position_ms(anchor, 500, 44_100), 20_000);
+        assert_eq!(
+            estimate_presentation_position_ms(&anchor, 5_410, 44_100),
+            Some(20_200)
+        );
+        assert_eq!(
+            estimate_presentation_position_ms(&anchor, 500, 44_100),
+            None
+        );
+    }
+
+    fn track_timeline(
+        source: &str,
+        loop_index: u64,
+        source_position_ms: u64,
+    ) -> AudioTrackTimeline {
+        let segment =
+            MediaSegmentIdentity::try_new(7, PathBuf::from(source), loop_index, 60_000).unwrap();
+        AudioTrackTimeline {
+            presentation_position_ms: segment.presentation_pts_ms(source_position_ms).unwrap(),
+            source_position_ms,
+            playback_rate: 1.0,
+            segment,
+        }
+    }
+
+    #[test]
+    fn same_source_n_plus_one_anchor_keeps_audio_epoch() {
+        let clock = AudibleAudioClock::default();
+        let mut timeline = OutputTimeline::default();
+        timeline.replace_current(track_timeline("source.mp4", 3, 1_000), 100, &clock);
+        let first_epoch = timeline.active.as_ref().unwrap().identity.audio_epoch;
+
+        timeline.queue_crossfade(track_timeline("source.mp4", 3, 2_000), 200, &clock);
+
+        let pending = timeline.pending.as_ref().unwrap();
+        assert_eq!(pending.identity.audio_epoch, first_epoch);
+        assert_eq!(pending.boundary, AudioClockBoundary::None);
+    }
+
+    #[test]
+    fn loop_source_and_seek_reanchors_create_distinct_audio_epochs() {
+        let clock = AudibleAudioClock::default();
+        let mut timeline = OutputTimeline::default();
+        timeline.replace_current(track_timeline("source-a.mp4", 0, 0), 0, &clock);
+        let startup = timeline.active.as_ref().unwrap().clone();
+
+        timeline.replace_current(track_timeline("source-a.mp4", 0, 5_000), 100, &clock);
+        let seek = timeline.active.as_ref().unwrap().clone();
+        assert!(seek.identity.audio_epoch > startup.identity.audio_epoch);
+        assert_eq!(seek.boundary, AudioClockBoundary::UserSeek);
+
+        timeline.queue_crossfade(track_timeline("source-a.mp4", 1, 0), 200, &clock);
+        let loop_boundary = timeline.pending.as_ref().unwrap().clone();
+        assert!(loop_boundary.identity.audio_epoch > seek.identity.audio_epoch);
+        assert_eq!(loop_boundary.boundary, AudioClockBoundary::LoopBoundary);
+
+        timeline.active = timeline.pending.take();
+        timeline.queue_crossfade(track_timeline("source-b.mp4", 1, 0), 300, &clock);
+        let source_boundary = timeline.pending.as_ref().unwrap();
+        assert!(source_boundary.identity.audio_epoch > loop_boundary.identity.audio_epoch);
+        assert_eq!(source_boundary.boundary, AudioClockBoundary::SourceChanged);
     }
 }

@@ -19,6 +19,14 @@ import { App as AntApp, Alert, Button, Card, Checkbox, Descriptions, Drawer, Emp
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { SyntheticEvent } from 'react';
 import { HashRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom';
+import {
+  createProcessingSwitchSingleFlight,
+  runProcessingSwitchSingleFlight,
+} from './processing-switch-single-flight';
+import {
+  clampRealtimeVideoSeekPositionMs,
+  managedVideoPresentedPosition,
+} from './realtime-video-sync';
 import { advanceInterludePresetPeriodPlan, buildInterludeScheduleKey, chooseInterludeIndex, createInterludePresetPeriodPlan, interludeFileNameFromPath, interludeIntervalMsToSeconds, interludeIntervalProgress, interludeIntervalSecondsToMs, interludePresetPeriodProgress, interludeVolumeDbToPercent, interludeVolumePercentToDb, INTERLUDE_LIMITS, INTERLUDE_PRESET_PERIOD_LIMITS, nextInterludeAtMs, resolveInterludeClockPlaybackRate, resolvePlaybackAudioSource, shouldPauseInterlude } from './interlude-player';
 import type { BaseAudioSource, InterludePresetPeriodPlan } from './interlude-player';
 import {
@@ -40,8 +48,6 @@ import {
   PERIOD_HARD_MIN_MS,
   normalizeAudioMixPickMax,
   normalizeAudioMixPickMin,
-  normalizeAudioPeriodRange,
-  normalizeVideoPeriodRange,
   loadAudioPeriodRange,
   loadVideoPeriodRange,
   sampleAudioCycle,
@@ -50,6 +56,7 @@ import {
   saveAudioPeriodRange,
   saveVideoPeriodRange,
   toRuntimePreviewParameters,
+  updatePeriodRangeEndpoint,
 } from './runtime-parameter-scheduler';
 import type { AudioCycleSample, PeriodRangeMs, RuntimePreviewParameters, SubtleAudioSample } from './runtime-parameter-scheduler';
 import {
@@ -63,14 +70,8 @@ import {
   recordAudioCycleRetryFailure,
 } from './audio-cycle-retry';
 import { appendAudioCycleSnapshot } from './audioCycleSnapshot';
-import {
-  alignMediaPositionToVideoFrame,
-  createMediaCycleQueue,
-  getMediaCycleProgressPercent,
-  resolveSourceBoundedVideoCycleQueueTargets,
-} from './media-cycle-planner';
+import { createMediaCycleQueue, getMediaCycleProgressPercent } from './media-cycle-planner';
 import type { MediaCyclePlan, MediaCycleQueue, MediaCycleSeed } from './media-cycle-planner';
-import { flushLatestPendingApply } from './media-apply-queue';
 import {
   createMediaArtifactTimeline,
   doesAudioWindowOverlapArtifact,
@@ -79,18 +80,29 @@ import type { MediaArtifactTimeline } from './media-artifact-timeline';
 import {
   isMediaArtifactIdentityCurrent,
   mapAbsolutePositionToCandidateTime,
-  mapAbsolutePositionToSourceClock,
   resolveMediaArtifactSwitchTime,
 } from './media-artifact-switch';
-import { AudioParameterControls, MediaParameterPanels, type MediaEffectParams } from './media-parameter-panels';
 import {
-  sampleAutomaticVideoParameters,
-} from './video-parameter-randomizer';
+  AudioParameterControls,
+  MediaParameterPanels,
+  type MediaEffectParams,
+  type MediaParameterPath,
+  type MediaParameterStatus,
+} from './media-parameter-panels';
 import { buildAudioCapabilityRows, resolveAudioStreamBranches } from './audio-processing-capabilities';
 import {
-  canUseRealtimeVideoBackend,
-  parseMediaVideoBackendStatus,
+  acceptMediaVideoBackendStatusResult,
+  canUseManagedNativeVideo,
+  createMediaVideoBackendIpcDiagnostic,
+  formatMediaVideoBackendDiagnostic,
+  isTerminalMediaVideoBackendStatus,
+  mediaVideoPresentationPtsMs,
+  parseMediaVideoBackendStatusResult,
   projectMediaVideoBackendStatus,
+  resolveManagedNativeVideoOwnership,
+  shouldEnsureOriginalVideoRenderer,
+  type ManagedNativeVideoOwnership,
+  type MediaVideoBackendDiagnostic,
   type MediaVideoBackendStatus,
 } from './media-video-backend-status';
 import {
@@ -105,6 +117,9 @@ import {
   resolveSynchronizedVideoPlaybackRate,
 } from './audio-playback-sync';
 import {
+  buildAuthoritativePlaybackClock,
+  didSourceMediaLoopWrap,
+  isMediaCycleTargetInAuthoritativeLoop,
   resolvePlaybackBoundaryDuration,
   shouldRestartCurrentSourceImmediately,
   shouldRestartPlayback,
@@ -181,6 +196,7 @@ const FIXED_SPEECH_ACK_TIMEOUT_MS = 3_000;
 const RUNTIME_RESOURCE_POLL_INTERVAL_MS = 500;
 const PLAYBACK_SNAPSHOT_POLL_MS = 1_000;
 const AUDIO_OUTPUT_STATUS_POLL_MS = 2_000;
+const VIDEO_BACKEND_STATUS_POLL_MS = 2_000;
 const AUDIO_VIDEO_REALIGN_THRESHOLD_MS = 80;
 const AUDIO_VIDEO_REALIGN_CONSECUTIVE_POLLS = 3;
 const AUDIO_VIDEO_REALIGN_COOLDOWN_MS = 10_000;
@@ -509,6 +525,35 @@ function resolveAudioSyncClock(
   });
 }
 
+function resolveFinalEffectAudioSyncClock(
+  snapshot: PlaybackSnapshot | null | undefined,
+  videoBackend: MediaVideoBackendStatus | null | undefined,
+  video: HTMLVideoElement | null,
+  localLoopIndex?: number,
+): AudioSyncClock | null {
+  if (snapshot?.source_media?.media_kind !== 'video') {
+    return resolveAudioSyncClock(snapshot, null, video, localLoopIndex);
+  }
+  const durationMs = snapshot.source_media.duration_ms;
+  if (
+    videoBackend?.playback_generation !== snapshot.playback_generation
+    || videoBackend.loop_index !== snapshot.loop_index
+    || typeof videoBackend.presented_pts_ms !== 'number'
+    || !Number.isSafeInteger(videoBackend.presented_pts_ms)
+    || typeof durationMs !== 'number'
+    || !Number.isSafeInteger(durationMs)
+    || durationMs <= 0
+  ) {
+    return null;
+  }
+  return createAudioSyncClock({
+    playbackGeneration: snapshot.playback_generation,
+    loopIndex: videoBackend.loop_index,
+    positionMs: Math.min(durationMs, Math.max(0, videoBackend.presented_pts_ms)),
+    durationMs,
+  });
+}
+
 type AudioOutputDevice = {
   id: string;
   name: string;
@@ -524,17 +569,6 @@ type PlannedAudioCyclePayload = {
   periodMs: number;
 };
 
-type PreparedVideoMediaCandidate = {
-  params: MediaEffectParams;
-  videoCyclePlan: MediaCyclePlan<PlannedVideoCyclePayload> | null;
-  videoEffectsEnabled: boolean;
-  realtimePrepared: boolean;
-  timeline: MediaArtifactTimeline;
-  sourcePath: string;
-  sourceMediaIndex: number;
-  playbackGeneration: number;
-};
-
 type PreparedAudioMediaCandidate = {
   audioCyclePlan: MediaCyclePlan<PlannedAudioCyclePayload>;
   timeline: MediaArtifactTimeline;
@@ -544,19 +578,18 @@ type PreparedAudioMediaCandidate = {
   artifactReference: string | null;
 };
 
-type PlannedVideoCyclePayload = {
-  seed: number;
-  videoEffectsEnabled: boolean;
-  skipVideoProcessing: boolean;
-  video: MediaEffectParams['video'];
-  advanced: MediaEffectParams['advanced'];
-  periodMs: number;
-};
-
 function getActualAudioOutputLabel(status: AudioOutputBackendStatus | null): 'PortAudio' | 'WebView' {
   return status?.running === true && status.selected_backend?.trim().toLowerCase() === 'portaudio'
     ? 'PortAudio'
     : 'WebView';
+}
+
+function hasManagedVideoProcess(status: MediaVideoBackendStatus | null): boolean {
+  return isSafeNonNegativeInteger(status?.process_id) && status.process_id > 0;
+}
+
+function isTerminalVideoSource(status: MediaVideoBackendStatus | null): boolean {
+  return status?.backend === 'source' && status.activation === 'active';
 }
 
 function getActualAudioStreamVariantCount(snapshot: PlaybackSnapshot | null): number | null {
@@ -580,6 +613,12 @@ type CacheCleanupResult = {
 type MediaParameterValidationResult = {
   valid: boolean;
   errors: Array<{ field: string; message: string }>;
+};
+
+type FinalEffectWindowResult = {
+  label: 'final-effect';
+  created: boolean;
+  video_host_ready: boolean;
 };
 
 const RUNTIME_PARAMETER_FIELDS: Array<keyof RuntimePreviewParameters> = [
@@ -858,6 +897,21 @@ function isPlaybackSnapshot(value: unknown): value is PlaybackSnapshot {
     && isInterludeSnapshot(record.interlude);
 }
 
+function parseFinalEffectWindowResult(value: unknown): FinalEffectWindowResult {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (
+      Object.keys(record).length === 3
+      && record.label === 'final-effect'
+      && typeof record.created === 'boolean'
+      && typeof record.video_host_ready === 'boolean'
+    ) {
+      return record as FinalEffectWindowResult;
+    }
+  }
+  throw new Error('独立播放器窗口响应无效，请重启桌面开发端后重试。');
+}
+
 function isPlaybackItemCompletionResult(value: unknown): value is PlaybackItemCompletionResult {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
@@ -1118,6 +1172,34 @@ async function invokePlaybackSnapshot(
   const response = await invoke<unknown>(command, args);
   if (!isPlaybackSnapshot(response)) throw new Error('桌面播放状态响应无效');
   return response;
+}
+
+class MediaVideoBackendResponseError extends Error {
+  constructor(readonly diagnostic: MediaVideoBackendDiagnostic) {
+    super(formatMediaVideoBackendDiagnostic(diagnostic));
+    this.name = 'MediaVideoBackendResponseError';
+  }
+}
+
+async function invokeProcessingSwitches(
+  args: Record<string, unknown>,
+): Promise<{
+  snapshot: PlaybackSnapshot;
+  videoBackendStatus: MediaVideoBackendStatus;
+}> {
+  const response = await invoke<unknown>('set_processing_switches', args);
+  if (!response || typeof response !== 'object' || Array.isArray(response)) {
+    throw new Error('处理开关响应无效');
+  }
+  const record = response as Record<string, unknown>;
+  if (!isPlaybackSnapshot(record.snapshot)) {
+    throw new Error('处理开关响应缺少权威播放状态');
+  }
+  const parsedVideoBackendStatus = parseMediaVideoBackendStatusResult(record.video_backend_status);
+  if (!parsedVideoBackendStatus.ok) {
+    throw new MediaVideoBackendResponseError(parsedVideoBackendStatus.error);
+  }
+  return { snapshot: record.snapshot, videoBackendStatus: parsedVideoBackendStatus.status };
 }
 
 async function invokeAudioOutputBackendStatus(
@@ -1558,6 +1640,8 @@ function FinalEffectWindow() {
   const loopGenerationRef = useRef<number | null>(null);
   const loopSequenceRef = useRef(0);
   const sourceAudioLoopIndexRef = useRef<number | null>(null);
+  const sourceAudioPositionMsRef = useRef<number | null>(null);
+  const suppressSourceAudioWrapRef = useRef(false);
   const clockSessionRef = useRef(crypto.randomUUID());
   const clockEpochRef = useRef(Date.now());
   const clockSequenceRef = useRef(0);
@@ -1629,6 +1713,9 @@ function FinalEffectWindow() {
   const interludeStopTimerRef = useRef<number | null>(null);
   const [sourceUrl, setSourceUrl] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<PlaybackSnapshot | null>(null);
+  const [mediaVideoBackendStatus, setMediaVideoBackendStatus] = useState<MediaVideoBackendStatus | null>(null);
+  const finalEffectVideoBackendStatusRef = useRef<MediaVideoBackendStatus | null>(null);
+  const managedNativeVideoOwnershipRef = useRef<ManagedNativeVideoOwnership | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [fixedSpeechActive, setFixedSpeechActive] = useState(false);
   const [interludeAudioUrl, setInterludeAudioUrl] = useState<string | null>(null);
@@ -1645,12 +1732,38 @@ function FinalEffectWindow() {
   const documentVisible = useDocumentVisibility();
   const finalEffectPollingActive = documentVisible && snapshot?.playback_state === 'playing';
   const currentMediaIsAudio = snapshot?.source_media?.media_kind === 'audio';
+  const currentMediaIsVideo = snapshot?.source_media?.media_kind === 'video';
   const portAudioSourcePath = null;
   const finalEffectMediaIdentity = buildFinalEffectMediaIdentity({
     playbackGeneration: snapshot?.playback_generation,
     sourceIdentity: sourceUrl,
   });
   const finalEffectLoadIdentity = `${finalEffectMediaIdentity ?? ''}:${sourceUrl ?? ''}`;
+  const managedNativeVideoExpectedIdentity = snapshot?.source_media?.media_kind === 'video'
+    && mediaVideoBackendStatus?.playback_generation === snapshot.playback_generation
+    && mediaVideoBackendStatus.clock_epoch !== null
+    && mediaVideoBackendStatus.loop_index !== null
+    ? {
+      playback_generation: snapshot.playback_generation,
+      clock_epoch: mediaVideoBackendStatus.clock_epoch,
+      loop_index: mediaVideoBackendStatus.loop_index,
+    }
+    : null;
+  const managedNativeVideoOwnership = resolveManagedNativeVideoOwnership(
+    managedNativeVideoOwnershipRef.current,
+    mediaVideoBackendStatus,
+    managedNativeVideoExpectedIdentity,
+    snapshot?.playback_state === 'playing' || snapshot?.playback_state === 'paused',
+  );
+  const managedNativeVideoOwnsPlayback = managedNativeVideoOwnership !== null;
+
+  useLayoutEffect(() => {
+    managedNativeVideoOwnershipRef.current = managedNativeVideoOwnership;
+  }, [
+    managedNativeVideoOwnership?.playback_generation,
+    managedNativeVideoOwnership?.clock_epoch,
+    managedNativeVideoOwnership?.loop_index,
+  ]);
 
   function clearVideoElement(element: HTMLVideoElement) {
     element.pause();
@@ -1717,6 +1830,7 @@ function FinalEffectWindow() {
     expectedIdentity: string | null,
   ): boolean {
     const currentSnapshot = snapshotRef.current;
+    const currentMediaIsVideo = currentSnapshot?.source_media?.media_kind === 'video';
     const currentSourceIdentity = playbackVideoUrl(currentSnapshot);
     const sourceIdentityElement = currentSnapshot?.source_media?.media_kind === 'video'
       ? sourceAudioRef.current
@@ -1764,6 +1878,21 @@ function FinalEffectWindow() {
   const snapshotPollInFlightRef = useRef(false);
 
   function applyPlayerSnapshot(nextSnapshot: PlaybackSnapshot) {
+    const previousSnapshot = snapshotRef.current;
+    if (previousSnapshot?.playback_generation !== nextSnapshot.playback_generation) {
+      playbackPositionRef.current = null;
+      loadedPlaybackGenerationRef.current = null;
+      lastRustPositionSyncAtRef.current = 0;
+      for (const element of [videoRef.current, sourceAudioRef.current]) {
+        if (!element) continue;
+        element.pause();
+        try {
+          element.currentTime = 0;
+        } catch {
+          // 新媒体元数据尚未就绪时，由 generation 绑定的加载 effect 从 0 开始。
+        }
+      }
+    }
     snapshotSyncVersionRef.current += 1;
     snapshotRef.current = nextSnapshot;
     const currentAudioTimeline = currentAudioArtifactTimeline(nextSnapshot);
@@ -3001,22 +3130,68 @@ function FinalEffectWindow() {
     const channel = playbackChannelRef.current;
     const video = videoRef.current;
     if (!channel || !video) return;
+    if (loopSyncPromiseRef.current !== null) return;
     const currentSnapshot = snapshotRef.current;
     const sourceAudio = sourceAudioRef.current;
-    const clockMedia = currentSnapshot?.source_media?.media_kind === 'video'
-      && sourceAudio
+    const sourceAudioIsUsable = currentSnapshot?.source_media?.media_kind === 'video'
+      && (currentSnapshot.source_media.audio_channel_count ?? 0) > 0
+      && sourceAudio !== null
+      && sourceAudio.error === null
+      && sourceAudio.readyState >= HTMLMediaElement.HAVE_METADATA
+      && Number.isFinite(sourceAudio.currentTime);
+    const clockMedia = sourceAudioIsUsable && sourceAudio
       ? sourceAudio
       : video;
     const duration = Number.isFinite(clockMedia.duration) && clockMedia.duration >= 0
       ? clockMedia.duration
       : 0;
-    const currentTime = clampMediaTime(clockMedia.currentTime, duration);
     const probedDurationMs = currentSnapshot?.source_media?.duration_ms;
     const durationMs = typeof probedDurationMs === 'number' && probedDurationMs > 0
       ? Math.round(probedDurationMs)
       : Math.max(0, Math.round(duration * 1_000));
-    const localPositionMs = Math.max(0, Math.round(currentTime * 1_000));
     const playbackGeneration = currentSnapshot?.playback_generation ?? 0;
+    const managedPositionMs = currentMediaIsVideo
+      ? (() => {
+        const status = finalEffectVideoBackendStatusRef.current;
+        if (status?.playback_generation !== playbackGeneration
+          || status.clock_epoch === null
+          || status.loop_index === null) return null;
+        return managedVideoPresentedPosition(status, {
+          playback_generation: playbackGeneration,
+          clock_epoch: status.clock_epoch,
+          loop_index: status.loop_index,
+        }, durationMs);
+      })()
+      : null;
+    if (currentMediaIsVideo && managedPositionMs === null) return;
+    const sourceAudioPositionMs = sourceAudioIsUsable && sourceAudio
+      ? Math.max(0, Math.round(clampMediaTime(sourceAudio.currentTime, duration) * 1_000))
+      : null;
+    if (sourceAudioPositionMs !== null) {
+      const previousPositionMs = sourceAudioPositionMsRef.current;
+      sourceAudioPositionMsRef.current = sourceAudioPositionMs;
+      const wrapSuppressed = suppressSourceAudioWrapRef.current;
+      suppressSourceAudioWrapRef.current = false;
+      if (
+        !wrapSuppressed
+        && !managedNativeVideoOwnsPlayback
+        && currentSnapshot?.playback_state === 'playing'
+        && currentSnapshot.source_media !== null
+        && currentSnapshot.source_media_index !== null
+        && currentSnapshot.source_media_pool.length === 1
+        && didSourceMediaLoopWrap(previousPositionMs, sourceAudioPositionMs, durationMs)
+      ) {
+        const restartToken = `${currentSnapshot.source_media.source_path}:${currentSnapshot.playback_generation}:${currentSnapshot.loop_index}`;
+        completeCurrentPlaybackLoop(video, restartToken, true);
+        return;
+      }
+    } else {
+      sourceAudioPositionMsRef.current = null;
+    }
+    const localPositionMs = currentMediaIsVideo
+      ? managedPositionMs ?? 0
+      : sourceAudioPositionMs
+        ?? Math.max(0, Math.round(clampMediaTime(clockMedia.currentTime, duration) * 1_000));
     const sourcePath = currentSnapshot?.source_media?.source_path ?? '';
     const identity = `${playbackGeneration}:${sourcePath}`;
     if (clockIdentityRef.current !== identity) {
@@ -3025,12 +3200,14 @@ function FinalEffectWindow() {
       clockSequenceRef.current = 0;
       sourceRevisionRef.current += 1;
     }
-    const directLoopIndex = Math.max(loopSequenceRef.current, currentSnapshot?.loop_index ?? 0);
-    const absolutePositionMs = directLoopIndex * durationMs + Math.min(durationMs, localPositionMs);
-    const sourceClock = mapAbsolutePositionToSourceClock(absolutePositionMs, durationMs);
+    const sourceClock = buildAuthoritativePlaybackClock({
+      loopIndex: currentSnapshot?.loop_index ?? 0,
+      positionMs: localPositionMs,
+      durationMs,
+    });
     if (!sourceClock) return;
     const positionMs = sourceClock.positionMs;
-    if (sourceAudio && currentSnapshot?.source_media?.media_kind === 'video') {
+    if (sourceAudioPositionMs !== null && sourceAudio && currentSnapshot?.source_media?.media_kind === 'video') {
       const previousAudioLoopIndex = sourceAudioLoopIndexRef.current;
       const sync = resolveSourceAudioSync(
         video.playbackRate,
@@ -3041,22 +3218,27 @@ function FinalEffectWindow() {
       sourceAudioLoopIndexRef.current = sourceClock.loopIndex;
       sourceAudio.playbackRate = sync.playbackRate;
       if (sync.hardRealign) {
+        suppressSourceAudioWrapRef.current = true;
         sourceAudio.currentTime = positionMs / 1_000;
         if (currentSnapshot.playback_state === 'playing' && sourceAudio.paused) {
           void sourceAudio.play().catch(() => undefined);
         }
       }
     }
-    loopSequenceRef.current = sourceClock.loopIndex;
+    loopSequenceRef.current = currentSnapshot?.loop_index ?? 0;
     clockSequenceRef.current += 1;
-    if (!Number.isSafeInteger(absolutePositionMs)) return;
+    const absolutePositionMs = sourceClock.absolutePositionMs;
     latestAbsolutePositionMsRef.current = absolutePositionMs;
     tryActivatePendingAudioArtifact(absolutePositionMs);
     const nowMs = Date.now();
     if (nowMs - lastRustPositionSyncAtRef.current >= 500) {
       lastRustPositionSyncAtRef.current = nowMs;
       void invokePlaybackSnapshot('update_playback_position', {
-        request: { position_ms: positionMs },
+        request: {
+          playback_generation: playbackGeneration,
+          loop_index: sourceClock.loopIndex,
+          position_ms: positionMs,
+        },
       }).catch(() => undefined);
     }
     try {
@@ -3069,7 +3251,9 @@ function FinalEffectWindow() {
         duration: durationMs / 1_000,
         volume: clampVolume(userVolumeRef.current),
         muted: userMutedRef.current,
-        paused: clockMedia.paused,
+        paused: currentMediaIsVideo
+          ? currentSnapshot?.playback_state !== 'playing'
+          : clockMedia.paused,
         playback_generation: playbackGeneration,
         source_revision: sourceRevisionRef.current,
         clock_session: clockSessionRef.current,
@@ -3079,10 +3263,14 @@ function FinalEffectWindow() {
         position_ms: positionMs,
         duration_ms: durationMs,
         absolute_position_ms: absolutePositionMs,
-        playback_rate: Number.isFinite(clockMedia.playbackRate) && clockMedia.playbackRate > 0
+        playback_rate: !currentMediaIsVideo
+          && Number.isFinite(clockMedia.playbackRate)
+          && clockMedia.playbackRate > 0
           ? clockMedia.playbackRate
           : 1,
-        clock_health: playbackClockHealthRef.current.status,
+        clock_health: currentMediaIsVideo
+          ? 'healthy'
+          : playbackClockHealthRef.current.status,
       } satisfies PlaybackMediaStateMessage);
     } catch {
       // 播放器关闭时通道可能已失效，媒体播放不应因此失败。
@@ -3100,7 +3288,10 @@ function FinalEffectWindow() {
       const sourcePositionSeconds = clampMediaTime(message.current_time, sourceDurationMs / 1_000);
       video.currentTime = sourcePositionSeconds;
       const sourceAudio = sourceAudioRef.current;
-      if (sourceAudio) sourceAudio.currentTime = sourcePositionSeconds;
+      if (sourceAudio) {
+        suppressSourceAudioWrapRef.current = true;
+        sourceAudio.currentTime = sourcePositionSeconds;
+      }
       const audio = audioRef.current;
       if (audio) {
         audio.currentTime = Math.max(0, sourcePositionSeconds - (snapshotRef.current?.current_audio_start_at_ms ?? 0) / 1000);
@@ -3372,6 +3563,10 @@ function FinalEffectWindow() {
   }, [snapshot]);
 
   useEffect(() => {
+    finalEffectVideoBackendStatusRef.current = mediaVideoBackendStatus;
+  }, [mediaVideoBackendStatus]);
+
+  useEffect(() => {
     userMutedRef.current = userMuted;
     syncUserAudioSettings();
   }, [userMuted]);
@@ -3401,6 +3596,59 @@ function FinalEffectWindow() {
     const timer = window.setInterval(refreshSnapshot, PLAYBACK_SNAPSHOT_POLL_MS);
     return () => window.clearInterval(timer);
   }, [documentVisible]);
+
+  useEffect(() => {
+    if (!documentVisible || snapshot?.source_media?.media_kind !== 'video') {
+      return;
+    }
+    let cancelled = false;
+    let inFlight = false;
+    const refreshStatus = () => {
+      if (inFlight) return;
+      inFlight = true;
+      void invoke<unknown>('get_media_video_backend_status')
+        .then((value) => {
+          if (cancelled) return;
+          const parsed = parseMediaVideoBackendStatusResult(value);
+          const current = finalEffectVideoBackendStatusRef.current;
+          const revisionAccepted = parsed.ok && (current === null
+            || parsed.status.status_revision > current.status_revision
+            || (parsed.status.status_revision === current.status_revision
+              && JSON.stringify(parsed.status) === JSON.stringify(current)));
+          if (parsed.ok
+            && parsed.status.playback_generation === snapshot.playback_generation
+            && revisionAccepted) {
+            finalEffectVideoBackendStatusRef.current = parsed.status;
+            setMediaVideoBackendStatus(parsed.status);
+          } else {
+            finalEffectVideoBackendStatusRef.current = null;
+            setMediaVideoBackendStatus(null);
+          }
+        })
+        .catch((cause) => {
+          if (!cancelled) {
+            finalEffectVideoBackendStatusRef.current = null;
+            setMediaVideoBackendStatus(null);
+            console.warn('[video-backend-status] IPC 调用失败', getDisplayErrorMessage(cause, '读取视频后端状态失败'));
+          }
+        })
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    refreshStatus();
+    const timer = window.setInterval(refreshStatus, VIDEO_BACKEND_STATUS_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [documentVisible, snapshot?.playback_generation, snapshot?.source_media?.media_kind]);
+
+  useEffect(() => {
+    if (!managedNativeVideoOwnsPlayback) return;
+    const video = videoRef.current;
+    if (video) clearVideoElement(video);
+  }, [managedNativeVideoOwnsPlayback]);
 
   // 最终效果窗自行探测 PortAudio，避免只依赖 BroadcastChannel 时序。
   useEffect(() => {
@@ -3472,9 +3720,9 @@ function FinalEffectWindow() {
             realignAttemptedForHz = targetRate;
             try {
               await loopSyncPromiseRef.current;
-              const syncClock = resolveAudioSyncClock(
+              const syncClock = resolveFinalEffectAudioSyncClock(
                 snapshotRef.current,
-                null,
+                finalEffectVideoBackendStatusRef.current,
                 videoRef.current,
                 loopSequenceRef.current,
               );
@@ -3750,9 +3998,9 @@ function FinalEffectWindow() {
           sync.reanchorLoopBoundary = false;
           try {
             await loopSyncPromiseRef.current;
-            const syncClock = resolveAudioSyncClock(
+            const syncClock = resolveFinalEffectAudioSyncClock(
               snapshotRef.current,
-              null,
+              finalEffectVideoBackendStatusRef.current,
               videoRef.current,
               loopSequenceRef.current,
             );
@@ -4034,6 +4282,7 @@ function FinalEffectWindow() {
       || !sourceUrl
       || expectedPlaybackGeneration === undefined
       || !expectedIdentity
+      || managedNativeVideoOwnsPlayback
     ) return;
     const resumeAt = resolvePlaybackResumePosition(
       playbackPositionRef.current,
@@ -4045,9 +4294,16 @@ function FinalEffectWindow() {
       video.removeEventListener('loadedmetadata', restore);
       loadedPlaybackGenerationRef.current = expectedPlaybackGeneration;
       setPlaybackError(null);
-      if (resumeAt > 0.05 && Number.isFinite(video.duration) && video.duration > 0) {
+      const sourceAudio = sourceAudioRef.current;
+      const restoreAt = sourceAudio
+        && sourceAudio.error === null
+        && sourceAudio.readyState >= HTMLMediaElement.HAVE_METADATA
+        && Number.isFinite(sourceAudio.currentTime)
+        ? sourceAudio.currentTime
+        : resumeAt;
+      if (restoreAt > 0.05 && Number.isFinite(video.duration) && video.duration > 0) {
         const safeEnd = Math.max(0, video.duration - 0.2);
-        const target = Math.min(resumeAt, safeEnd);
+        const target = Math.min(restoreAt, safeEnd);
         if (Math.abs(video.currentTime - target) > 0.05) {
           video.currentTime = target;
         }
@@ -4074,7 +4330,7 @@ function FinalEffectWindow() {
       cancelled = true;
       video.removeEventListener('loadedmetadata', restore);
     };
-  }, [finalEffectLoadIdentity, finalEffectMediaIdentity]);
+  }, [finalEffectLoadIdentity, finalEffectMediaIdentity, managedNativeVideoOwnsPlayback]);
 
   function restoreDryAudioOutput() {
     processedAudioPlayingRef.current = false;
@@ -4315,15 +4571,17 @@ function FinalEffectWindow() {
     }
     if (snapshot?.playback_state === 'playing') {
       window.speechSynthesis?.resume();
-      if (video.paused) {
-        void video.play().catch(() => setPlaybackError('播放已恢复，但系统阻止了自动播放，请点击播放区域继续。'));
+      const sourcePositionSeconds = sourceAudio.currentTime;
+      if (
+        !managedNativeVideoOwnsPlayback
+        && video.readyState >= HTMLMediaElement.HAVE_METADATA
+        && Number.isFinite(sourcePositionSeconds)
+        && Math.abs(video.currentTime - sourcePositionSeconds) > 0.08
+      ) {
+        video.currentTime = sourcePositionSeconds;
       }
-      const sourceDurationSeconds = (snapshot.source_media?.duration_ms ?? 0) / 1_000;
-      const sourcePositionSeconds = sourceDurationSeconds > 0
-        ? video.currentTime % sourceDurationSeconds
-        : video.currentTime;
-      if (Math.abs(sourceAudio.currentTime - sourcePositionSeconds) > 0.08) {
-        sourceAudio.currentTime = sourcePositionSeconds;
+      if (!managedNativeVideoOwnsPlayback && video.paused) {
+        void video.play().catch(() => setPlaybackError('播放已恢复，但系统阻止了自动播放，请点击播放区域继续。'));
       }
       if (sourceAudio.paused) {
         void sourceAudio.play().catch(() => setPlaybackError('原声音轨自动播放被拦截，请点击播放区域继续。'));
@@ -4343,7 +4601,7 @@ function FinalEffectWindow() {
       }
       resumeInterludePlayback();
     }
-  }, [audioDiagnosticsReady, audioUrl, snapshot?.playback_state, snapshot?.effective_audio_source, snapshot?.current_audio_source, sourceUrl, processedAudioReady]);
+  }, [audioDiagnosticsReady, audioUrl, snapshot?.playback_state, snapshot?.effective_audio_source, snapshot?.current_audio_source, sourceUrl, managedNativeVideoOwnsPlayback, processedAudioReady]);
 
   useEffect(() => {
     if (!snapshot || !sourceUrl) return;
@@ -4433,6 +4691,7 @@ function FinalEffectWindow() {
 
   function startPlaybackClockRecovery(
     video: HTMLVideoElement,
+    clockMedia: HTMLMediaElement,
     expectedIdentity: string,
     resumeAt: number,
   ) {
@@ -4443,8 +4702,8 @@ function FinalEffectWindow() {
     let cancelRecovery = () => undefined;
     const recovery = new Promise<void>((resolve, reject) => {
       const cleanup = () => {
-        video.removeEventListener('loadedmetadata', restoreAndPlay);
-        video.removeEventListener('error', fail);
+        clockMedia.removeEventListener('loadedmetadata', restoreAndPlay);
+        clockMedia.removeEventListener('error', fail);
         if (timeout !== null) window.clearTimeout(timeout);
       };
       const settle = (cause?: unknown) => {
@@ -4464,12 +4723,12 @@ function FinalEffectWindow() {
       const restoreAndPlay = () => {
         if (started || !isCurrentFinalEffectVideo(video, expectedIdentity)) return;
         started = true;
-        if (Number.isFinite(video.duration) && video.duration > 0) {
-          const safeEnd = Math.max(0, video.duration - 0.2);
-          video.currentTime = Math.min(Math.max(0, resumeAt), safeEnd);
+        if (Number.isFinite(clockMedia.duration) && clockMedia.duration > 0) {
+          const safeEnd = Math.max(0, clockMedia.duration - 0.2);
+          clockMedia.currentTime = Math.min(Math.max(0, resumeAt), safeEnd);
         }
-        suppressMediaEventRef.current = true;
-        void video.play().then(() => {
+        if (clockMedia === video) suppressMediaEventRef.current = true;
+        void clockMedia.play().then(() => {
           if (settled) return;
           if (!isCurrentFinalEffectVideo(video, expectedIdentity)) {
             settle(new Error('媒体源已切换'));
@@ -4484,7 +4743,7 @@ function FinalEffectWindow() {
           ) {
             audio.currentTime = Math.max(
               0,
-              video.currentTime - (currentSnapshot?.current_audio_start_at_ms ?? 0) / 1_000,
+              clockMedia.currentTime - (currentSnapshot?.current_audio_start_at_ms ?? 0) / 1_000,
             );
             void audio.play().catch(() => undefined);
           }
@@ -4502,18 +4761,18 @@ function FinalEffectWindow() {
         }).catch(settle);
       };
 
-      video.addEventListener('loadedmetadata', restoreAndPlay);
-      video.addEventListener('error', fail, { once: true });
+      clockMedia.addEventListener('loadedmetadata', restoreAndPlay);
+      clockMedia.addEventListener('error', fail, { once: true });
       timeout = window.setTimeout(
         () => settle(new Error('媒体恢复超时')),
         PLAYBACK_CLOCK_RECOVERY_TIMEOUT_MS,
       );
       clockLoadingGraceUntilRef.current = performance.now() + PLAYBACK_CLOCK_RECOVERY_TIMEOUT_MS;
-      suppressMediaEventRef.current = true;
-      video.pause();
+      if (clockMedia === video) suppressMediaEventRef.current = true;
+      clockMedia.pause();
       try {
-        video.load();
-        if (video.readyState >= HTMLMediaElement.HAVE_METADATA) queueMicrotask(restoreAndPlay);
+        clockMedia.load();
+        if (clockMedia.readyState >= HTMLMediaElement.HAVE_METADATA) queueMicrotask(restoreAndPlay);
       } catch (cause) {
         settle(cause);
       }
@@ -4524,14 +4783,14 @@ function FinalEffectWindow() {
       cancel: () => cancelRecovery(),
     };
     void recovery.catch((cause) => {
-      handlePlaybackClockFailure(video, expectedIdentity, cause);
+      handlePlaybackClockFailure(clockMedia, expectedIdentity, cause);
     }).finally(() => {
       if (clockRecoveryRef.current?.promise === recovery) clockRecoveryRef.current = null;
     });
   }
 
   function handlePlaybackClockFailure(
-    video: HTMLVideoElement,
+    clockMedia: HTMLMediaElement,
     expectedIdentity: string,
     cause: unknown,
   ) {
@@ -4547,7 +4806,7 @@ function FinalEffectWindow() {
     publishMediaState();
     // 播放时钟恢复属于最终效果窗内部自愈，失败也不能冒充用户暂停。
     // Rust 仍保持 playing，快照轮询会继续推动本地媒体重试。
-    void video.play().catch(() => undefined);
+    void clockMedia.play().catch(() => undefined);
     setPlaybackError(getDisplayErrorMessage(cause, '播放时钟自动恢复失败，已保持播放状态并继续尝试。'));
   }
 
@@ -4576,9 +4835,13 @@ function FinalEffectWindow() {
     let loadingEpisode = false;
     const currentClockMedia = (): HTMLMediaElement => {
       const currentSnapshot = snapshotRef.current;
+      const sourceAudio = sourceAudioRef.current;
       return currentSnapshot?.source_media?.media_kind === 'video'
-        && sourceAudioRef.current
-        ? sourceAudioRef.current
+        && (currentSnapshot.source_media.audio_channel_count ?? 0) > 0
+        && sourceAudio
+        && sourceAudio.error === null
+        && sourceAudio.readyState >= HTMLMediaElement.HAVE_METADATA
+        ? sourceAudio
         : video;
     };
     const samplePlaybackClock = (event?: Event) => {
@@ -4612,9 +4875,9 @@ function FinalEffectWindow() {
       }
       publishMediaState();
       if (result.recoveryRequested) {
-        startPlaybackClockRecovery(video, expectedIdentity, clockMedia.currentTime);
+        startPlaybackClockRecovery(video, clockMedia, expectedIdentity, clockMedia.currentTime);
       } else if (previousHealth.status !== 'stalled' && result.state.status === 'stalled') {
-        handlePlaybackClockFailure(video, expectedIdentity, new Error('媒体恢复后播放时钟仍未推进'));
+        handlePlaybackClockFailure(clockMedia, expectedIdentity, new Error('媒体恢复后播放时钟仍未推进'));
       }
     };
     const previousIdentity = playbackClockHealthRef.current.identity;
@@ -4628,14 +4891,24 @@ function FinalEffectWindow() {
       clockFailureHandledIdentityRef.current = null;
     }
     clockLoadingGraceUntilRef.current = performance.now() + 1_500;
-    mediaEvents.forEach((eventName) => video.addEventListener(eventName, samplePlaybackClock));
+    const sourceAudio = sourceAudioRef.current;
+    const observedMedia: HTMLMediaElement[] = snapshot?.source_media?.media_kind === 'video'
+      && (snapshot.source_media.audio_channel_count ?? 0) > 0
+      && sourceAudio
+      ? [video, sourceAudio]
+      : [video];
+    observedMedia.forEach((media) => {
+      mediaEvents.forEach((eventName) => media.addEventListener(eventName, samplePlaybackClock));
+    });
     samplePlaybackClock();
     const timer = snapshot?.playback_state === 'playing'
       ? window.setInterval(samplePlaybackClock, 250)
       : null;
     return () => {
       if (timer !== null) window.clearInterval(timer);
-      mediaEvents.forEach((eventName) => video.removeEventListener(eventName, samplePlaybackClock));
+      observedMedia.forEach((media) => {
+        mediaEvents.forEach((eventName) => media.removeEventListener(eventName, samplePlaybackClock));
+      });
       if (clockRecoveryRef.current?.identity === expectedIdentity) {
         clockRecoveryRef.current.cancel();
         clockRecoveryRef.current = null;
@@ -4757,10 +5030,11 @@ function FinalEffectWindow() {
       loopGenerationRef.current = snapshot?.playback_generation ?? null;
       loopSequenceRef.current = snapshot?.loop_index ?? 0;
       sourceAudioLoopIndexRef.current = null;
+      sourceAudioPositionMsRef.current = null;
+      suppressSourceAudioWrapRef.current = false;
       lastRestartTokenRef.current = null;
-    } else if ((snapshot?.loop_index ?? 0) > loopSequenceRef.current) {
-      loopSequenceRef.current = snapshot?.loop_index ?? loopSequenceRef.current;
     }
+    loopSequenceRef.current = snapshot?.loop_index ?? 0;
 
     if (snapshot?.playback_state === 'stopped') {
       sourceAudioLoopIndexRef.current = null;
@@ -4773,6 +5047,7 @@ function FinalEffectWindow() {
     suppressMediaEventRef.current = true;
     video.currentTime = 0;
     if (sourceAudioRef.current) {
+      suppressSourceAudioWrapRef.current = true;
       sourceAudioRef.current.currentTime = 0;
       void sourceAudioRef.current.play().catch(() => undefined);
     }
@@ -4799,7 +5074,24 @@ function FinalEffectWindow() {
     }
   }
 
-  function restartToNextLoop(video: HTMLVideoElement, restartToken: string) {
+  function completeCurrentPlaybackLoop(
+    video: HTMLVideoElement,
+    restartToken: string,
+    sourceAlreadyLooped = false,
+  ) {
+    if (
+      managedNativeVideoOwnsPlayback
+      || loopSyncPromiseRef.current !== null
+      || lastRestartTokenRef.current === restartToken
+    ) return;
+    restartToNextLoop(video, restartToken, sourceAlreadyLooped);
+  }
+
+  function restartToNextLoop(
+    video: HTMLVideoElement,
+    restartToken: string,
+    sourceAlreadyLooped = false,
+  ) {
     const currentSnapshot = snapshotRef.current;
     if (!currentSnapshot || currentSnapshot.source_media_index === null) return;
     lastRestartTokenRef.current = restartToken;
@@ -4808,8 +5100,9 @@ function FinalEffectWindow() {
       ?? (currentSnapshot.source_media ? 1 : 0);
     const restartImmediately = shouldRestartCurrentSourceImmediately(sourceCount);
     if (restartImmediately) {
-      loopSequenceRef.current += 1;
-      restartCurrentPlayback(video, '媒体已回到开头，但自动播放失败，请点击播放区域继续。');
+      if (!sourceAlreadyLooped) {
+        restartCurrentPlayback(video, '媒体已回到开头，但自动播放失败，请点击播放区域继续。');
+      }
     } else {
       const operationId = fixedSpeechOperationRef.current?.operationId;
       if (operationId) cancelFixedSpeech(operationId);
@@ -4827,6 +5120,13 @@ function FinalEffectWindow() {
         if (!isPlaybackItemCompletionResult(result)) {
           throw new Error('播放项切换响应无效');
         }
+        const latestSnapshot = snapshotRef.current;
+        if (
+          !latestSnapshot
+          || latestSnapshot.playback_generation !== currentSnapshot.playback_generation
+          || latestSnapshot.loop_index !== currentSnapshot.loop_index
+          || latestSnapshot.source_media_index !== currentSnapshot.source_media_index
+        ) return;
         const nextSnapshot = result.snapshot;
         if (result.source_changed && restartImmediately) {
           const operationId = fixedSpeechOperationRef.current?.operationId;
@@ -4841,6 +5141,13 @@ function FinalEffectWindow() {
         if (portAudioHardwareRef.current) syncAudioOutputSourceLatest(false, true);
       })
       .catch((cause) => {
+        const latestSnapshot = snapshotRef.current;
+        if (
+          !latestSnapshot
+          || latestSnapshot.playback_generation !== currentSnapshot.playback_generation
+          || latestSnapshot.loop_index !== currentSnapshot.loop_index
+          || latestSnapshot.source_media_index !== currentSnapshot.source_media_index
+        ) return;
         lastRestartTokenRef.current = null;
         loopSequenceRef.current = currentSnapshot.loop_index;
         if (!restartImmediately) {
@@ -4851,7 +5158,10 @@ function FinalEffectWindow() {
     const completion = loopSyncPromise.then(() => undefined);
     loopSyncPromiseRef.current = completion;
     void completion.finally(() => {
-      if (loopSyncPromiseRef.current === completion) loopSyncPromiseRef.current = null;
+      if (loopSyncPromiseRef.current === completion) {
+        loopSyncPromiseRef.current = null;
+        publishMediaState();
+      }
     });
   }
 
@@ -4862,6 +5172,7 @@ function FinalEffectWindow() {
       !currentSnapshot
       || currentSnapshot.playback_state !== 'playing'
       || !currentSourceKey
+      || managedNativeVideoOwnsPlayback
       || !isCurrentFinalEffectVideo(video, finalEffectMediaIdentity)
     ) return;
     const currentTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
@@ -4878,7 +5189,7 @@ function FinalEffectWindow() {
     const duration = resolvePlaybackBoundaryDuration({
       mediaDurationSeconds: video.duration,
       sourceDurationMs,
-      realtimeVideoStreamActive: false,
+      realtimeVideoStreamActive: managedNativeVideoOwnsPlayback,
     });
     const restartToken = `${currentSourceKey}:${currentSnapshot.playback_generation}:${loopSequenceRef.current}`;
     if (
@@ -4894,7 +5205,7 @@ function FinalEffectWindow() {
     ) {
       return;
     }
-    restartToNextLoop(video, restartToken);
+    completeCurrentPlaybackLoop(video, restartToken);
   }
 
   return (
@@ -4906,9 +5217,9 @@ function FinalEffectWindow() {
               <video
                 ref={videoRef}
                 crossOrigin="anonymous"
-                src={sourceUrl ?? undefined}
+                src={managedNativeVideoOwnsPlayback ? undefined : sourceUrl ?? undefined}
                 playsInline
-                preload="auto"
+                preload={managedNativeVideoOwnsPlayback ? 'none' : 'auto'}
                 muted
                 onClick={() => {
                   resumeAudioDiagnostics();
@@ -4935,8 +5246,8 @@ function FinalEffectWindow() {
                   maxHeight: 'none',
                   objectFit: 'contain',
                   display: 'block',
-                  opacity: currentMediaIsAudio ? 0 : 1,
-                  pointerEvents: currentMediaIsAudio ? 'none' : 'auto',
+                  opacity: currentMediaIsAudio || managedNativeVideoOwnsPlayback ? 0 : 1,
+                  pointerEvents: currentMediaIsAudio || managedNativeVideoOwnsPlayback ? 'none' : 'auto',
                   background: '#000',
                 }}
                 onError={(event) => {
@@ -5011,6 +5322,7 @@ function DesktopApp() {
   const [playbackActionBusy, setPlaybackActionBusy] = useState<'pause' | 'resume' | 'stop' | null>(null);
   const [videoProcessingEnabled, setVideoProcessingEnabled] = useState(false);
   const [audioProcessingEnabled, setAudioProcessingEnabled] = useState(false);
+  const [processingSwitchBusy, setProcessingSwitchBusy] = useState(false);
   const [fixedSpeechPresets, setFixedSpeechPresets] = useState<FixedSpeechPreset[]>(() => loadFixedSpeechPresets());
   const [selectedFixedSpeechPresetId, setSelectedFixedSpeechPresetId] = useState<string | null>(null);
   const [fixedSpeechPresetTitle, setFixedSpeechPresetTitle] = useState('');
@@ -5034,7 +5346,16 @@ function DesktopApp() {
   const [interludeSaveError, setInterludeSaveError] = useState<string | null>(null);
   const [interludeRuntime, setInterludeRuntime] = useState<InterludeRuntimeMessage | null>(null);
   const [mediaEngineCapabilities, setMediaEngineCapabilities] = useState<MediaEngineCapabilities | null>(null);
-  const [mediaVideoBackendStatus, setMediaVideoBackendStatus] = useState<MediaVideoBackendStatus | null>(null);
+  const [, setLastObservedMediaVideoBackendStatus] = useState<MediaVideoBackendStatus | null>(null);
+  const [acceptedMediaVideoBackendStatus, setAcceptedMediaVideoBackendStatus] = useState<MediaVideoBackendStatus | null>(null);
+  const [effectiveMediaVideoBackend, setEffectiveMediaVideoBackend] = useState<MediaVideoBackendStatus | null>(null);
+  const [lastConfirmedMediaVideoBackend, setLastConfirmedMediaVideoBackend] = useState<MediaVideoBackendStatus | null>(null);
+  // lastObserved 只保留诊断证据；所有控制、EOF 和展示投影只能读取已接收状态。
+  const mediaVideoBackendStatus = acceptedMediaVideoBackendStatus;
+  const [mediaVideoBackendDiagnostic, setMediaVideoBackendDiagnostic] = useState<MediaVideoBackendDiagnostic | null>(null);
+  const acceptedMediaVideoBackendStatusRef = useRef<MediaVideoBackendStatus | null>(null);
+  const mediaVideoBackendStatusRef = acceptedMediaVideoBackendStatusRef;
+  const [originalVideoEnsureRetryRevision, setOriginalVideoEnsureRetryRevision] = useState(0);
   const [audioOutputBackend, setAudioOutputBackend] = useState<AudioOutputBackendStatus | null>(null);
   const audioOutputBackendRef = useRef<AudioOutputBackendStatus | null>(null);
   const [audioOutputDevices, setAudioOutputDevices] = useState<AudioOutputDevice[]>([]);
@@ -5171,38 +5492,74 @@ function DesktopApp() {
   const playbackActionRequestRef = useRef(0);
   const processingSwitchRequestRef = useRef(0);
   const processingSwitchQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const videoProcessingSwitchRevisionRef = useRef(0);
+  const videoProcessingSwitchCommittedRevisionRef = useRef(0);
   const playbackChannelRef = useRef<BroadcastChannel | null>(null);
   const mediaStateRef = useRef<PlaybackMediaStateMessage | null>(null);
   const pictureInPictureVideoRef = useRef<HTMLVideoElement | null>(null);
   const pictureInPictureOperationRef = useRef(0);
   const pictureInPictureLoadedSourceRef = useRef<string | null>(null);
   const runtimeMessageRef = useRef<RuntimeParameterMessage | null>(null);
-  const runtimeSchedulerRef = useRef({ cycle: 0, lastChangeMs: null as number | null });
   const audioSchedulerRef = useRef({ cycle: 0, lastChangeMs: null as number | null });
   const mediaCyclePlanIdRef = useRef(0);
-  const mediaCandidateSequenceRef = useRef(0);
   const mediaCycleClockIdentityRef = useRef<string | null>(null);
   const audioCycleRetryRef = useRef(createAudioCycleRetryState());
-  const videoCycleRetryRef = useRef(createCycleRetryState());
   const audioFuturePlansRef = useRef<MediaCycleQueue<PlannedAudioCyclePayload> | null>(null);
-  const videoFuturePlansRef = useRef<MediaCycleQueue<PlannedVideoCyclePayload> | null>(null);
-  const pendingMediaApplyRef = useRef<{
-    params: MediaEffectParams;
-    mediaCandidate: PreparedVideoMediaCandidate;
-  } | null>(null);
-  const videoPrepareRetryRef = useRef(createCycleRetryState());
-  const videoPrepareRetryTimerRef = useRef<number | null>(null);
-  const videoPrepareRetryCandidateRef = useRef<PreparedVideoMediaCandidate | null>(null);
-  const activeVideoRenderRef = useRef<PreparedVideoMediaCandidate | null>(null);
+  const realtimeVideoCycleConfigurationKeyRef = useRef<string | null>(null);
   const activeAudioRenderRef = useRef<PreparedAudioMediaCandidate | null>(null);
   const audioCandidatePrepareInFlightRef = useRef(false);
-  const mediaApplyInFlightRef = useRef(false);
-  const realtimeVideoCommitInFlightRef = useRef(false);
+  const originalVideoEnsureAttemptRef = useRef<string | null>(null);
+  const originalVideoEnsureRetryRef = useRef(createCycleRetryState());
+  const originalVideoEnsureRetryTimerRef = useRef<number | null>(null);
   const mediaEffectParamsRef = useRef<MediaEffectParams | null>(null);
   const mediaEffectParamsMutationVersionRef = useRef(0);
   const audioProcessingEnabledRef = useRef(false);
   const videoProcessingEnabledRef = useRef(false);
+  const processingSwitchSingleFlightRef = useRef(createProcessingSwitchSingleFlight());
   const snapshotRefHome = useRef<PlaybackSnapshot | null>(null);
+  const setMediaVideoBackendStatus = useCallback((incoming: MediaVideoBackendStatus | null) => {
+    const playbackGeneration = snapshotRefHome.current?.playback_generation;
+    const current = mediaVideoBackendStatusRef.current;
+    const expectedIdentity = playbackGeneration !== undefined
+      ? {
+          playback_generation: playbackGeneration,
+          backend_epoch: 0,
+          clock_epoch: 1,
+          loop_index: 0,
+        }
+      : null;
+    const acceptance = acceptMediaVideoBackendStatusResult(current, incoming, expectedIdentity);
+    if (!acceptance.accepted) {
+      setLastObservedMediaVideoBackendStatus(acceptance.lastObserved);
+      setEffectiveMediaVideoBackend(null);
+      setMediaVideoBackendDiagnostic(acceptance.diagnostic);
+      return null;
+    }
+    mediaVideoBackendStatusRef.current = acceptance.status;
+    setAcceptedMediaVideoBackendStatus(acceptance.status);
+    setLastObservedMediaVideoBackendStatus(acceptance.lastObserved);
+    setEffectiveMediaVideoBackend(acceptance.effective);
+    if (acceptance.status.active_cycle_snapshot) {
+      setLastConfirmedMediaVideoBackend(acceptance.status);
+    }
+    setMediaVideoBackendDiagnostic(null);
+    return acceptance.status;
+  }, []);
+  const acceptMediaVideoBackendResponse = useCallback((value: unknown) => {
+    const parsed = parseMediaVideoBackendStatusResult(value);
+    if (!parsed.ok) {
+      setEffectiveMediaVideoBackend(null);
+      setMediaVideoBackendDiagnostic(parsed.error);
+      return null;
+    }
+    return setMediaVideoBackendStatus(parsed.status);
+  }, [setMediaVideoBackendStatus]);
+  const reportMediaVideoBackendInvokeFailure = useCallback((cause: unknown, fallback: string) => {
+    setEffectiveMediaVideoBackend(null);
+    setMediaVideoBackendDiagnostic(createMediaVideoBackendIpcDiagnostic(
+      getDisplayErrorMessage(cause, fallback),
+    ));
+  }, []);
   const audioDiagnosticDisplayRef = useRef<AudioDiagnosticDisplayHandle | null>(null);
 
   const refreshRuntimeResourceCapabilities = useCallback((
@@ -5235,7 +5592,7 @@ function DesktopApp() {
             runtimeResourceMountedRef.current
             && runtimeResourceActionTokenRef.current === expectedActionToken
           ) {
-            setMediaVideoBackendStatus(parseMediaVideoBackendStatus(status));
+            acceptMediaVideoBackendResponse(status);
           }
         })
         .catch((cause) => {
@@ -5243,12 +5600,12 @@ function DesktopApp() {
             runtimeResourceMountedRef.current
             && runtimeResourceActionTokenRef.current === expectedActionToken
           ) {
-            setMediaVideoBackendStatus(null);
+            reportMediaVideoBackendInvokeFailure(cause, '读取视频实际运行后端失败');
             setError(getDisplayErrorMessage(cause, '读取视频实际运行后端失败'));
           }
         });
     }
-  }, []);
+  }, [acceptMediaVideoBackendResponse, reportMediaVideoBackendInvokeFailure]);
 
   const applyRuntimeResourceStatus = useCallback(async (
     nextStatus: RuntimeResourceStatus,
@@ -5391,10 +5748,9 @@ function DesktopApp() {
     };
   }, [applyRuntimeResourceStatus, runtimeResourceStatus]);
 
-  const [runtimeCycle, setRuntimeCycle] = useState(0);
-  const [, setRuntimeLastChangeMs] = useState<number | null>(null);
   const [audioVariationCycle, setAudioVariationCycle] = useState(0);
   const [, setAudioLastChangeMs] = useState<number | null>(null);
+  const [videoCycleConfigureRevision, setVideoCycleConfigureRevision] = useState(0);
   // 每个预设显式包含 35 个可写字段；默认勾选 p01–p20；mix 默认关（单轨）；会话可持久化
   const [audioValuePresetIds, setAudioValuePresetIds] = useState<string[]>(() => {
     const saved = loadAudioMixSession();
@@ -5457,7 +5813,10 @@ function DesktopApp() {
     audioProcessingEnabledRef.current = audioProcessingEnabled;
   }, [audioProcessingEnabled]);
   useEffect(() => {
-    videoProcessingEnabledRef.current = videoProcessingEnabled;
+    if (videoProcessingSwitchRevisionRef.current
+      === videoProcessingSwitchCommittedRevisionRef.current) {
+      videoProcessingEnabledRef.current = videoProcessingEnabled;
+    }
   }, [videoProcessingEnabled]);
   useEffect(() => {
     snapshotRefHome.current = snapshot;
@@ -5567,81 +5926,6 @@ function DesktopApp() {
     };
   }
 
-  function buildVideoCycleSeed(
-    periodMs: number,
-    planId = nextMediaCyclePlanId('video'),
-  ): MediaCycleSeed<PlannedVideoCyclePayload> {
-    const base = mediaEffectParamsRef.current;
-    if (!base) {
-      throw new Error('生成视频周期计划前必须先加载媒体参数');
-    }
-    const videoEffectsEnabled = videoProcessingEnabledRef.current;
-    const sample = videoEffectsEnabled ? sampleAutomaticVideoParameters() : null;
-    return {
-      planId,
-      periodMediaMs: periodMs,
-      payload: {
-        seed: sample?.seed ?? 0,
-        videoEffectsEnabled,
-        skipVideoProcessing: false,
-        video: sample ? { ...base.video, ...sample.video } : base.video,
-        advanced: sample ? { ...base.advanced, ...sample.advanced } : base.advanced,
-        periodMs,
-      },
-    };
-  }
-
-  function createVideoMediaCycleQueue(
-    currentAbsolutePositionMs: number,
-    seeds: readonly [
-      MediaCycleSeed<PlannedVideoCyclePayload>,
-      MediaCycleSeed<PlannedVideoCyclePayload>,
-    ],
-    startSequence: number,
-    currentSnapshot: PlaybackSnapshot | null,
-  ): MediaCycleQueue<PlannedVideoCyclePayload> {
-    const source = currentSnapshot?.source_media;
-    const sourceDurationMs = source?.duration_ms;
-    const alignTarget = (targetAbsolutePositionMs: number) => alignMediaPositionToVideoFrame(
-      targetAbsolutePositionMs,
-      source?.frame_rate_fps,
-    );
-    const singleSourceLoop = currentSnapshot?.source_media_pool.length === 1
-      && source?.media_kind === 'video'
-      && typeof sourceDurationMs === 'number'
-      && Number.isSafeInteger(sourceDurationMs)
-      && sourceDurationMs > 0;
-    if (!singleSourceLoop || !source || typeof sourceDurationMs !== 'number') {
-      return createMediaCycleQueue(currentAbsolutePositionMs, seeds, startSequence, alignTarget);
-    }
-    const targets = resolveSourceBoundedVideoCycleQueueTargets(
-      currentAbsolutePositionMs,
-      seeds[0].periodMediaMs,
-      seeds[1].periodMediaMs,
-      sourceDurationMs,
-      alignTarget,
-    );
-    const boundSeed = (
-      startAbsolutePositionMs: number,
-      seed: MediaCycleSeed<PlannedVideoCyclePayload>,
-      target: (typeof targets)[number],
-    ): MediaCycleSeed<PlannedVideoCyclePayload> => {
-      const periodMediaMs = target.targetAbsolutePositionMs - startAbsolutePositionMs;
-      return {
-        ...seed,
-        periodMediaMs,
-        payload: {
-          ...seed.payload,
-          periodMs: periodMediaMs,
-          skipVideoProcessing: target.skipVideoProcessing,
-        },
-      };
-    };
-    const first = boundSeed(currentAbsolutePositionMs, seeds[0], targets[0]);
-    const second = boundSeed(targets[0].targetAbsolutePositionMs, seeds[1], targets[1]);
-    return createMediaCycleQueue(currentAbsolutePositionMs, [first, second], startSequence);
-  }
-
   function clearAudioFutureMediaCyclePlans() {
     audioFuturePlansRef.current = null;
     audioCycleRetryRef.current = clearAudioCycleRetry();
@@ -5687,17 +5971,6 @@ function DesktopApp() {
     );
   }
 
-  function scheduleVideoCycleRetry() {
-    const identity = mediaCycleClockIdentityRef.current;
-    videoFuturePlansRef.current = null;
-    if (!identity) return;
-    videoCycleRetryRef.current = recordCycleRetryFailure(
-      videoCycleRetryRef.current,
-      identity,
-      Date.now(),
-    );
-  }
-
   function wakeMediaCycleScheduling(_reason: 'healthy' | 'switch' | 'retry' = 'healthy') {
     const clock = mediaStateRef.current;
     const currentSnapshot = snapshotRefHome.current;
@@ -5709,121 +5982,18 @@ function DesktopApp() {
       || clock.clock_health !== 'healthy'
     ) return;
     const audioActive = audioProcessingEnabledRef.current;
-    const videoActive = currentSnapshot.source_media?.media_kind === 'video';
-    if (!audioActive && !videoActive) return;
-    if (!initializeFutureMediaCyclePlans(clock, audioActive, videoActive)) return;
-    void flushPendingMediaApply();
+    if (!audioActive) return;
+    if (!initializeFutureAudioCyclePlans(clock)) return;
     void prepareNextAudioMediaCandidate();
-    prepareNextVideoMediaCandidate();
   }
 
-  function resetVideoPrepareRetry(candidate?: PreparedVideoMediaCandidate) {
-    if (
-      candidate
-      && videoPrepareRetryCandidateRef.current
-      && videoPrepareRetryCandidateRef.current !== candidate
-    ) return;
-    if (videoPrepareRetryTimerRef.current !== null) {
-      window.clearTimeout(videoPrepareRetryTimerRef.current);
-      videoPrepareRetryTimerRef.current = null;
-    }
-    videoPrepareRetryRef.current = clearCycleRetry();
-    videoPrepareRetryCandidateRef.current = null;
-  }
-
-  function cancelVideoPrepareRetry() {
-    const candidate = videoPrepareRetryCandidateRef.current;
-    if (candidate && pendingMediaApplyRef.current?.mediaCandidate === candidate) {
-      pendingMediaApplyRef.current = null;
-    }
-    if (candidate && activeVideoRenderRef.current === candidate) {
-      activeVideoRenderRef.current = null;
-    }
-    resetVideoPrepareRetry();
-  }
-
-  function scheduleVideoPrepareRetry(
-    params: MediaEffectParams,
-    candidate: PreparedVideoMediaCandidate,
-  ) {
-    const clockIdentity = mediaCycleClockIdentityRef.current;
-    if (!clockIdentity) {
-      cancelVideoPrepareRetry();
-      return;
-    }
-    const retryIdentity = `${clockIdentity}:${candidate.timeline.planId}:${candidate.timeline.sequence}`;
-    const retry = recordCycleRetryFailure(
-      videoPrepareRetryRef.current,
-      retryIdentity,
-      Date.now(),
-    );
-    videoPrepareRetryRef.current = retry;
-    videoPrepareRetryCandidateRef.current = candidate;
-    pendingMediaApplyRef.current = { params, mediaCandidate: candidate };
-    if (retry.exhausted || retry.retryAtMs === null) {
-      pendingMediaApplyRef.current = null;
-      if (activeVideoRenderRef.current === candidate) activeVideoRenderRef.current = null;
-      videoCycleRetryRef.current = recordCycleRetryFailure(
-        videoCycleRetryRef.current,
-        clockIdentity,
-        Date.now(),
-      );
-      videoFuturePlansRef.current = null;
-      setError(videoCycleRetryRef.current.exhausted
-        ? '视频处理连续失败，已停止自动重试；可继续播放源视频并手动重试。'
-        : '视频 prepare 连续瞬时失败，稍后自动重建候选。');
-      return;
-    }
-    if (videoPrepareRetryTimerRef.current !== null) {
-      window.clearTimeout(videoPrepareRetryTimerRef.current);
-    }
-    videoPrepareRetryTimerRef.current = window.setTimeout(() => {
-      videoPrepareRetryTimerRef.current = null;
-      if (
-        videoPrepareRetryRef.current.identity !== retryIdentity
-        || mediaCycleClockIdentityRef.current !== clockIdentity
-        || !isVideoCandidatePlaybackActive(candidate)
-      ) {
-        cancelVideoPrepareRetry();
-        return;
-      }
-      void flushPendingMediaApply();
-    }, Math.max(0, retry.retryAtMs - Date.now()));
-  }
-
-  function clearVideoFutureMediaCyclePlans() {
-    resetVideoPrepareRetry();
-    videoFuturePlansRef.current = null;
-    activeVideoRenderRef.current = null;
-    pendingMediaApplyRef.current = null;
-    videoCycleRetryRef.current = clearCycleRetry();
-  }
-
-  function videoRenderIdentity(
-    planId: string,
-    sequence: number,
-    playbackGeneration: number,
-  ): string {
-    return `${playbackGeneration}:${sequence}:${planId}`;
-  }
-
-  function logVideoPeriodStage(
-    candidate: PreparedVideoMediaCandidate,
-    stage: 'plan' | 'prepare',
-    result: 'scheduled' | 'queued' | 'accepted' | 'not_started',
-  ) {
-    console.info('[video-period]', {
-      plan: candidate.timeline.planId,
-      sequence: candidate.timeline.sequence,
-      generation: candidate.playbackGeneration,
-      stage,
-      result,
-    });
+  function isVideoBackendEofPending(): boolean {
+    const eof = mediaVideoBackendStatusRef.current?.eof;
+    return eof !== null && eof !== undefined;
   }
 
   function clearFutureMediaCyclePlans() {
     discardAudioFutureMediaCyclePlans();
-    clearVideoFutureMediaCyclePlans();
     mediaCycleClockIdentityRef.current = null;
   }
 
@@ -5838,49 +6008,22 @@ function DesktopApp() {
       && clock.clock_health === 'healthy';
   }
 
-  function isVideoCandidatePlaybackActive(candidate: PreparedVideoMediaCandidate) {
-    const currentSnapshot = snapshotRefHome.current;
-    const clock = mediaStateRef.current;
-    if (
-      !currentSnapshot
-      || !clock
-      || currentSnapshot.playback_state?.toLowerCase() !== 'playing'
-      || clock.playback_generation !== currentSnapshot.playback_generation
-      || clock.paused
-      || clock.clock_health !== 'healthy'
-    ) return false;
-    return isVideoCandidateBoundToCurrentSource(candidate, currentSnapshot);
+  function isVideoProcessingSwitchCommitted() {
+    return videoProcessingSwitchRevisionRef.current
+        === videoProcessingSwitchCommittedRevisionRef.current
+      && snapshotRefHome.current?.video_processing_enabled
+        === videoProcessingEnabledRef.current;
   }
 
-  function isVideoCandidateBoundToCurrentSource(
-    candidate: PreparedVideoMediaCandidate,
-    currentSnapshot: PlaybackSnapshot,
-  ) {
-    const currentIndex = currentSnapshot.source_media_index;
-    if (currentIndex === null) return false;
-    return candidate.playbackGeneration === currentSnapshot.playback_generation
-      && candidate.sourceMediaIndex === currentIndex
-      && currentSnapshot.source_media?.source_path === candidate.sourcePath;
-  }
-
-  function initializeFutureMediaCyclePlans(
-    clock: PlaybackMediaStateMessage,
-    audioActive: boolean,
-    videoActive: boolean,
-  ): boolean {
+  function initializeFutureAudioCyclePlans(clock: PlaybackMediaStateMessage): boolean {
     const currentSnapshot = snapshotRefHome.current;
     const identity = `${clock.playback_generation}:${clock.source_revision}:${clock.clock_epoch}:${currentSnapshot?.loop_index ?? clock.loop_index}`;
     if (mediaCycleClockIdentityRef.current !== identity) {
       clearFutureMediaCyclePlans();
       mediaCycleClockIdentityRef.current = identity;
     }
-    const audioCandidateActive = audioActive && isAudioCycleRetryReady(
+    const audioCandidateActive = isAudioCycleRetryReady(
       audioCycleRetryRef.current,
-      identity,
-      Date.now(),
-    );
-    const videoCandidateActive = videoActive && isCycleRetryReady(
-      videoCycleRetryRef.current,
       identity,
       Date.now(),
     );
@@ -5889,74 +6032,25 @@ function DesktopApp() {
       (currentSnapshot?.current_audio_media_sequence ?? 0) + 1,
       (currentSnapshot?.pending_audio_media_sequence ?? 0) + 1,
     );
-    const nextVideoSequence = Math.max(
-      1,
-      mediaCandidateSequenceRef.current + 1,
-    );
     if (!audioCandidateActive) audioFuturePlansRef.current = null;
-    if (!videoCandidateActive) videoFuturePlansRef.current = null;
-    if (audioCandidateActive && videoCandidateActive && !audioFuturePlansRef.current && !videoFuturePlansRef.current) {
-      const firstAudioPeriod = samplePeriodMsInRange(audioPeriodRangeRef.current);
-      const secondAudioPeriod = samplePeriodMsInRange(audioPeriodRangeRef.current);
-      const firstAudio = buildAudioCycleSeed(firstAudioPeriod, audioCycleSampleRef.current?.presetIds);
-      const secondAudio = buildAudioCycleSeed(secondAudioPeriod, firstAudio?.payload.sample.presetIds);
-      if (!firstAudio || !secondAudio) return false;
-      const firstVideoPeriod = samplePeriodMsInRange(videoPeriodRangeRef.current);
-      const secondVideoPeriod = samplePeriodMsInRange(videoPeriodRangeRef.current);
-      const startSequence = Math.max(nextAudioSequence, nextVideoSequence);
+    if (audioCandidateActive && !audioFuturePlansRef.current) {
+      const firstPeriod = samplePeriodMsInRange(audioPeriodRangeRef.current);
+      const secondPeriod = samplePeriodMsInRange(audioPeriodRangeRef.current);
+      const first = buildAudioCycleSeed(firstPeriod, audioCycleSampleRef.current?.presetIds);
+      const second = buildAudioCycleSeed(secondPeriod, first?.payload.sample.presetIds);
+      if (!first || !second) return false;
       audioFuturePlansRef.current = createMediaCycleQueue(
         clock.absolute_position_ms,
-        [firstAudio, secondAudio],
-        startSequence,
+        [first, second],
+        nextAudioSequence,
       );
-      videoFuturePlansRef.current = createVideoMediaCycleQueue(
-        clock.absolute_position_ms,
-        [buildVideoCycleSeed(firstVideoPeriod), buildVideoCycleSeed(secondVideoPeriod)],
-        startSequence,
-        currentSnapshot,
-      );
-    } else {
-      if (audioCandidateActive && !audioFuturePlansRef.current) {
-        const firstPeriod = samplePeriodMsInRange(audioPeriodRangeRef.current);
-        const secondPeriod = samplePeriodMsInRange(audioPeriodRangeRef.current);
-        const first = buildAudioCycleSeed(firstPeriod, audioCycleSampleRef.current?.presetIds);
-        const second = buildAudioCycleSeed(secondPeriod, first?.payload.sample.presetIds);
-        if (!first || !second) return false;
-        audioFuturePlansRef.current = createMediaCycleQueue(
-          clock.absolute_position_ms,
-          [first, second],
-          nextAudioSequence,
-        );
-      }
-      if (videoCandidateActive && !videoFuturePlansRef.current) {
-        const firstPeriod = samplePeriodMsInRange(videoPeriodRangeRef.current);
-        const secondPeriod = samplePeriodMsInRange(videoPeriodRangeRef.current);
-        videoFuturePlansRef.current = createVideoMediaCycleQueue(
-          clock.absolute_position_ms,
-          [buildVideoCycleSeed(firstPeriod), buildVideoCycleSeed(secondPeriod)],
-          nextVideoSequence,
-          currentSnapshot,
-        );
-      }
     }
     const nextAudio = audioFuturePlansRef.current?.[0];
-    const nextVideo = videoFuturePlansRef.current?.[0];
     if (nextAudio) {
       nextAudioPeriodMsRef.current = nextAudio.periodMediaMs;
       setAudioPeriodMs(nextAudio.periodMediaMs);
     }
-    if (nextVideo) {
-      mediaCandidateSequenceRef.current = Math.max(
-        mediaCandidateSequenceRef.current,
-        videoFuturePlansRef.current?.[1].sequence ?? nextVideo.sequence,
-      );
-      nextVideoPeriodMsRef.current = nextVideo.periodMediaMs;
-      setVideoPeriodMs(nextVideo.periodMediaMs);
-    }
-    queueMicrotask(() => {
-      void prepareNextAudioMediaCandidate();
-      prepareNextVideoMediaCandidate();
-    });
+    queueMicrotask(() => void prepareNextAudioMediaCandidate());
     return true;
   }
 
@@ -6105,80 +6199,6 @@ function DesktopApp() {
     }
   }
 
-  function prepareNextVideoMediaCandidate() {
-    const currentSnapshot = snapshotRefHome.current;
-    const clock = mediaStateRef.current;
-    const source = currentSnapshot?.source_media;
-    const base = mediaEffectParamsRef.current;
-    const queue = videoFuturePlansRef.current;
-    if (
-      !currentSnapshot
-      || !clock
-      || !source
-      || source.media_kind !== 'video'
-      || !base
-      || !queue
-      || clock.playback_generation !== currentSnapshot.playback_generation
-    ) return;
-    if (
-      activeVideoRenderRef.current
-      || mediaApplyInFlightRef.current
-      || pendingRuntimeActionRef.current?.component === 'media'
-    ) return;
-    const plan = queue[0];
-    if (plan.payload.videoEffectsEnabled !== videoProcessingEnabledRef.current) {
-      clearVideoFutureMediaCyclePlans();
-      return;
-    }
-    const planned = createPlannedArtifactTimeline(
-      plan,
-      queue[1].targetAbsolutePositionMs,
-      currentSnapshot,
-      clock.source_revision,
-      0,
-    );
-    if (!planned) return;
-    const params = {
-      ...base,
-      video: plan.payload.video,
-      advanced: plan.payload.advanced,
-    };
-    const candidate: PreparedVideoMediaCandidate = {
-      params,
-      videoCyclePlan: plan,
-      videoEffectsEnabled: plan.payload.videoEffectsEnabled,
-      realtimePrepared: false,
-      // N+1 只覆盖本轮目标到 N+2 的窗口；N+2 仍只保存参数计划。
-      timeline: planned.timeline,
-      sourcePath: source.source_path,
-      sourceMediaIndex: currentSnapshot.source_media_index ?? 0,
-      playbackGeneration: currentSnapshot.playback_generation,
-    };
-    logVideoPeriodStage(candidate, 'plan', 'scheduled');
-    void applyVideoProcessing(params, candidate);
-  }
-
-  function applyPlannedVideoCycle(plan: MediaCyclePlan<PlannedVideoCyclePayload>) {
-    const currentParams = mediaEffectParamsRef.current;
-    if (!currentParams) return;
-    const nextParams = {
-      ...currentParams,
-      video: plan.payload.video,
-      advanced: plan.payload.advanced,
-    };
-    mediaEffectParamsMutationVersionRef.current += 1;
-    mediaEffectParamsRef.current = nextParams;
-    setMediaEffectParams(nextParams);
-    publishRuntimeParameterMessage(nextParams);
-    const current = runtimeSchedulerRef.current;
-    current.cycle += 1;
-    current.lastChangeMs = Date.now();
-    setRuntimeCycle(current.cycle);
-    setRuntimeLastChangeMs(current.lastChangeMs);
-    setVideoPeriodMs(plan.periodMediaMs);
-    nextVideoPeriodMsRef.current = plan.periodMediaMs;
-  }
-
   function applyPlannedAudioCycle(plan: MediaCyclePlan<PlannedAudioCyclePayload>) {
     commitAudioCycleSample(plan.payload.sample, {
       randomChangePeriodMs: plan.periodMediaMs,
@@ -6212,22 +6232,6 @@ function DesktopApp() {
     if (prepareCandidate) queueMicrotask(() => void prepareNextAudioMediaCandidate());
   }
 
-  function advanceIndependentVideoQueue(
-    committedAtAbsolutePositionMs: number,
-    prepareCandidate = true,
-  ) {
-    const queue = videoFuturePlansRef.current;
-    if (!queue) return;
-    const period = samplePeriodMsInRange(videoPeriodRangeRef.current);
-    videoFuturePlansRef.current = createVideoMediaCycleQueue(
-      committedAtAbsolutePositionMs,
-      [queue[1], buildVideoCycleSeed(period)],
-      queue[1].sequence,
-      snapshotRefHome.current,
-    );
-    if (prepareCandidate) queueMicrotask(() => prepareNextVideoMediaCandidate());
-  }
-
   const [runtimeChannelError, setRuntimeChannelError] = useState<string | null>(null);
   const [diagnosticSummary, setDiagnosticSummary] = useState<AudioDiagnosticSummary>({
     fresh: false,
@@ -6239,6 +6243,7 @@ function DesktopApp() {
     playbackGeneration: number;
     committed: boolean;
   } | null>(null);
+  const mediaSeekDraftRef = useRef<typeof mediaSeekDraft>(null);
   const [pictureInPictureActive, setPictureInPictureActive] = useState(false);
   const currentMediaIsVideo = snapshot?.source_media?.media_kind === 'video';
   const pictureInPictureSourceUrl = currentMediaIsVideo
@@ -6265,11 +6270,12 @@ function DesktopApp() {
     playbackChannelRef.current = channel;
     const handleMessage = (event: MessageEvent<unknown>) => {
       if (isPlaybackMediaStateMessage(event.data)) {
+        if (event.data.playback_generation !== snapshotRefHome.current?.playback_generation) return;
         const previous = mediaStateRef.current;
         if (!shouldAcceptPlaybackMediaState(previous, event.data)) return;
         mediaStateRef.current = event.data;
         setMediaState(event.data);
-        commitPreparedRealtimeVideoCandidate(event.data);
+        settlePendingMediaSeek(event.data);
         if (
           event.data.clock_health === 'healthy'
           && previous?.clock_health !== 'healthy'
@@ -6557,7 +6563,6 @@ function DesktopApp() {
     };
   }, [documentVisible, snapshot?.playback_state]);
 
-  const mediaWasProcessingRef = useRef(false);
 
   useEffect(() => {
     if (!documentVisible) return;
@@ -6594,7 +6599,10 @@ function DesktopApp() {
 
   useEffect(() => {
     if (!snapshot) return;
-    setVideoProcessingEnabled(snapshot.video_processing_enabled);
+    if (videoProcessingSwitchRevisionRef.current
+      === videoProcessingSwitchCommittedRevisionRef.current) {
+      setVideoProcessingEnabled(snapshot.video_processing_enabled);
+    }
     setAudioProcessingEnabled(snapshot.audio_processing_enabled);
   }, [snapshot?.audio_processing_enabled, snapshot?.video_processing_enabled]);
 
@@ -6722,28 +6730,87 @@ function DesktopApp() {
   const [audioPeriodRange, setAudioPeriodRange] = useState<PeriodRangeMs>(() => loadAudioPeriodRange());
   const [videoPeriodRange, setVideoPeriodRange] = useState<PeriodRangeMs>(() => loadVideoPeriodRange());
   const audioPeriodRangeRef = useRef(audioPeriodRange);
-  const videoPeriodRangeRef = useRef(videoPeriodRange);
   const nextAudioPeriodMsRef = useRef(samplePeriodMsInRange(audioPeriodRange));
-  const nextVideoPeriodMsRef = useRef(samplePeriodMsInRange(videoPeriodRange));
   const [, setAudioPeriodMs] = useState(() => nextAudioPeriodMsRef.current);
-  const [, setVideoPeriodMs] = useState(() => nextVideoPeriodMsRef.current);
   const playbackRequested = snapshot?.playback_state?.toLowerCase() === 'playing';
   const playbackActive = playbackRequested
     && mediaState?.playback_generation === snapshot?.playback_generation
     && mediaState.clock_health === 'healthy'
     && !mediaState.paused;
   const playbackClockBlocked = playbackRequested && !playbackActive;
-  // 暂停、停止或真实媒体时钟不健康时冻结周期，进度不使用墙钟补偿。
-  const runtimeActive = MPV_REALTIME_VIDEO_ENABLED
-    && playbackActive
-    && currentMediaIsVideo
-    && videoProcessingEnabled;
+  const videoProcessingSwitchCommitted = videoProcessingSwitchRevisionRef.current
+      === videoProcessingSwitchCommittedRevisionRef.current
+    && snapshot?.video_processing_enabled === videoProcessingEnabled;
+  // WebView 时钟只约束声音周期；视频周期由 Rust/mpv 时钟独立推进。
   const videoStreamActive = MPV_REALTIME_VIDEO_ENABLED
-    && playbackActive
+    && playbackRequested
     && currentMediaIsVideo
     && videoProcessingEnabled
+    && videoProcessingSwitchCommitted
     && Boolean(mediaEffectParams);
+  const videoBackendEofTransitionKey = mediaVideoBackendStatus?.eof
+    ? `${mediaVideoBackendStatus.eof.playback_generation}:${mediaVideoBackendStatus.eof.backend_epoch}:${mediaVideoBackendStatus.eof.clock_epoch}:${mediaVideoBackendStatus.eof.loop_index}`
+    : null;
   const audioPeriodActive = playbackActive && audioProcessingEnabled && Boolean(mediaEffectParams);
+
+  useEffect(() => {
+    const source = snapshot?.source_media;
+    if (
+      !MPV_REALTIME_VIDEO_ENABLED
+      || !snapshot
+      || source?.media_kind !== 'video'
+      || !['playing', 'paused'].includes(snapshot.playback_state.toLowerCase())
+      || !videoProcessingEnabled
+      || !videoProcessingSwitchCommitted
+      || !mediaEffectParams
+    ) {
+      realtimeVideoCycleConfigurationKeyRef.current = null;
+      return;
+    }
+    const request = {
+      params: mediaEffectParams,
+      min_period_ms: videoPeriodRange.minMs,
+      max_period_ms: videoPeriodRange.maxMs,
+    };
+    const configurationKey = JSON.stringify({
+      video: request.params.video,
+      advanced: request.params.advanced,
+      minPeriodMs: request.min_period_ms,
+      maxPeriodMs: request.max_period_ms,
+      playbackGeneration: snapshot.playback_generation,
+      sourcePath: source.source_path,
+    });
+    if (realtimeVideoCycleConfigurationKeyRef.current === configurationKey) return;
+    realtimeVideoCycleConfigurationKeyRef.current = configurationKey;
+    void invoke<unknown>('configure_realtime_video_cycle', { request })
+      .then((response) => {
+        if (realtimeVideoCycleConfigurationKeyRef.current !== configurationKey) return;
+        const parsed = parseMediaVideoBackendStatusResult(response);
+        if (!parsed.ok) {
+          setEffectiveMediaVideoBackend(null);
+          setMediaVideoBackendDiagnostic(parsed.error);
+          return;
+        }
+        setMediaVideoBackendStatus(parsed.status);
+      })
+      .catch((cause) => {
+        if (realtimeVideoCycleConfigurationKeyRef.current !== configurationKey) return;
+        realtimeVideoCycleConfigurationKeyRef.current = null;
+        reportMediaVideoBackendInvokeFailure(cause, '配置 Rust 视频周期失败');
+      });
+  }, [
+    mediaEffectParams,
+    reportMediaVideoBackendInvokeFailure,
+    setMediaVideoBackendStatus,
+    snapshot?.playback_generation,
+    snapshot?.playback_state,
+    snapshot?.source_media?.media_kind,
+    videoPeriodRange.maxMs,
+    videoPeriodRange.minMs,
+    videoCycleConfigureRevision,
+    videoProcessingEnabled,
+    videoProcessingSwitchCommitted,
+  ]);
 
   useEffect(() => {
     if (!AUTO_PORTAUDIO_ENABLED || !PORTAUDIO_FORMAL_SOURCE_SYNC_READY) {
@@ -6853,44 +6920,8 @@ function DesktopApp() {
     refreshAudioFutureMediaCyclePlansAfterSettingsChange();
   }, [audioPeriodRange]);
   useEffect(() => {
-    videoPeriodRangeRef.current = videoPeriodRange;
     saveVideoPeriodRange(videoPeriodRange);
-    clearVideoFutureMediaCyclePlans();
   }, [videoPeriodRange]);
-  useEffect(() => {
-    const current = activeVideoRenderRef.current;
-    const source = snapshot?.source_media;
-    if (
-      source?.media_kind !== 'video'
-      || (current !== null
-        && (!snapshot || !isVideoCandidateBoundToCurrentSource(current, snapshot)))
-    ) {
-      clearVideoFutureMediaCyclePlans();
-      pendingMediaApplyRef.current = null;
-    }
-  }, [
-    snapshot?.playback_generation,
-    snapshot?.source_media?.media_kind,
-    snapshot?.source_media?.source_path,
-  ]);
-  useEffect(() => {
-    if (!playbackActive) cancelVideoPrepareRetry();
-  }, [playbackActive]);
-  useEffect(() => () => {
-    if (videoPrepareRetryTimerRef.current !== null) {
-      window.clearTimeout(videoPrepareRetryTimerRef.current);
-    }
-  }, []);
-  useEffect(() => {
-    if (!runtimeActive || !runtimeBaseParameters) {
-      if (!videoProcessingEnabled) {
-        runtimeSchedulerRef.current = { cycle: 0, lastChangeMs: null };
-        setRuntimeCycle(0);
-        setRuntimeLastChangeMs(null);
-      }
-      return;
-    }
-  }, [runtimeActive, runtimeBaseParameters, videoProcessingEnabled]);
 
   useEffect(() => {
     if (!audioPeriodActive) {
@@ -6908,22 +6939,26 @@ function DesktopApp() {
 
   }, [audioPeriodActive, audioProcessingEnabled, playbackClockBlocked, snapshot?.source_media]);
 
-  // 定时器只负责唤醒；prepare/commit/apply 全部以最终播放窗的绝对媒体时间为准。
+  // WebView 定时器只唤醒声音候选；视频 prepare/commit 由 Rust/mpv 周期控制器负责。
   useEffect(() => {
-    if (!audioPeriodActive && !videoStreamActive) {
+    if (!audioPeriodActive) {
       if (playbackClockBlocked) return;
-      clearFutureMediaCyclePlans();
+      discardAudioFutureMediaCyclePlans();
       return;
     }
     let cancelled = false;
     const timer = window.setInterval(() => {
       if (cancelled) return;
       const clock = mediaStateRef.current;
-      if (!clock || clock.paused || clock.playback_generation !== snapshotRefHome.current?.playback_generation) return;
-      if (!initializeFutureMediaCyclePlans(clock, audioPeriodActive, videoStreamActive)) return;
+      if (
+        !clock
+        || clock.paused
+        || clock.playback_generation !== snapshotRefHome.current?.playback_generation
+        || clock.loop_index !== snapshotRefHome.current?.loop_index
+      ) return;
+      if (!initializeFutureAudioCyclePlans(clock)) return;
 
       void prepareNextAudioMediaCandidate();
-      prepareNextVideoMediaCandidate();
     }, 100);
     return () => {
       cancelled = true;
@@ -6933,8 +6968,6 @@ function DesktopApp() {
     ambientSoundPath,
     audioPeriodActive,
     playbackClockBlocked,
-    videoProcessingEnabled,
-    videoStreamActive,
   ]);
 
   function publishRuntimeParameterMessage(params: MediaEffectParams | null) {
@@ -6968,7 +7001,6 @@ function DesktopApp() {
   }, [
     audioProcessingEnabled,
     playbackActive,
-    runtimeActive,
     runtimeBaseParameters,
     snapshot?.playback_generation,
     snapshot?.playback_state,
@@ -6988,7 +7020,6 @@ function DesktopApp() {
     if (!mediaEffectParams) return;
     mediaEffectParamsMutationVersionRef.current += 1;
     if (section === 'audio') refreshAudioFutureMediaCyclePlansAfterSettingsChange();
-    else clearVideoFutureMediaCyclePlans();
     const next = {
       ...mediaEffectParams,
       [section]: { ...mediaEffectParams[section], [field]: value },
@@ -7217,7 +7248,12 @@ function DesktopApp() {
         && source.height > 0
           ? { width: source.width, height: source.height }
           : null;
-      await invoke('open_final_effect_window', request ? { request } : {});
+      const response = await invoke<unknown>('open_final_effect_window', request ? { request } : {});
+      const result = parseFinalEffectWindowResult(response);
+      if (!result.video_host_ready) {
+        setError('视频显示表面尚未就绪，请关闭最终效果窗口后重新打开再试。');
+        return false;
+      }
       return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '打开独立播放器失败');
@@ -7238,6 +7274,25 @@ function DesktopApp() {
     } catch {
       setError('播放器控制通道暂不可用，请重新打开播放器。');
     }
+  }
+
+  function settlePendingMediaSeek(clock: PlaybackMediaStateMessage) {
+    const draft = mediaSeekDraftRef.current;
+    if (
+      !draft?.committed
+      || draft.playbackGeneration !== clock.playback_generation
+      || Math.abs(Math.round(draft.value * 1_000) - clock.position_ms) > 250
+    ) return;
+    mediaSeekDraftRef.current = null;
+    setMediaSeekDraft((current) => (current === draft ? null : current));
+  }
+
+  function failPendingMediaSeek() {
+    const draft = mediaSeekDraftRef.current;
+    if (!draft?.committed) return;
+    mediaSeekDraftRef.current = null;
+    setMediaSeekDraft((current) => (current === draft ? null : current));
+    setError('视频定位尚未得到 Rust/mpv 物理确认，请稍后重试。');
   }
 
   async function togglePictureInPicture() {
@@ -7292,7 +7347,6 @@ function DesktopApp() {
     if (!shouldIssuePlaybackCommand(command, snapshotRefHome.current?.playback_state)) return;
     if (action === 'stop') {
       clearFutureMediaCyclePlans();
-      pendingMediaApplyRef.current = null;
     }
     const requestId = ++playbackActionRequestRef.current;
     setPlaybackActionBusy(action);
@@ -7312,6 +7366,7 @@ function DesktopApp() {
 
   async function startPlaybackFromHome() {
     // ponytail: 点播放才开窗+开播；导入只探测
+    await processingSwitchQueueRef.current;
     const opened = await openFinalEffectWindowFromHome();
     if (!opened) return;
     await runPlaybackAction('resume', 'start_playback');
@@ -7322,18 +7377,28 @@ function DesktopApp() {
     audio_processing_enabled: boolean;
     realtime_audio_variant_enabled: boolean;
   }) {
+    await runProcessingSwitchSingleFlight(
+      processingSwitchSingleFlightRef.current,
+      setProcessingSwitchBusy,
+      () => updateProcessingSwitchesOnce(next),
+    );
+  }
+
+  async function updateProcessingSwitchesOnce(next: {
+    video_processing_enabled: boolean;
+    audio_processing_enabled: boolean;
+    realtime_audio_variant_enabled: boolean;
+  }) {
     const requestId = ++processingSwitchRequestRef.current;
+    const videoSwitchChanged = next.video_processing_enabled !== videoProcessingEnabledRef.current;
     if (next.audio_processing_enabled !== audioProcessingEnabledRef.current) {
       discardAudioFutureMediaCyclePlans();
     }
-    if (next.video_processing_enabled !== videoProcessingEnabledRef.current) {
-      clearVideoFutureMediaCyclePlans();
+    if (videoSwitchChanged) {
+      videoProcessingSwitchRevisionRef.current += 1;
     }
+    const videoSwitchRevision = videoProcessingSwitchRevisionRef.current;
     mediaEffectParamsMutationVersionRef.current += 1;
-    pendingMediaApplyRef.current = null;
-    const videoJustEnabled = next.video_processing_enabled
-      && !videoProcessingEnabledRef.current
-      && snapshotRefHome.current?.source_media?.media_kind === 'video';
     const audioJustEnabled = next.audio_processing_enabled && !audioProcessingEnabledRef.current;
     audioProcessingEnabledRef.current = next.audio_processing_enabled;
     videoProcessingEnabledRef.current = next.video_processing_enabled;
@@ -7344,44 +7409,41 @@ function DesktopApp() {
       setAudioVariationCycle(0);
       setAudioLastChangeMs(null);
     }
-    if (videoJustEnabled) {
-      runtimeSchedulerRef.current = { cycle: 0, lastChangeMs: null };
-      setRuntimeCycle(0);
-      setRuntimeLastChangeMs(null);
-    }
     if (!next.audio_processing_enabled) {
       audioSchedulerRef.current = { cycle: 0, lastChangeMs: null };
       setAudioVariationCycle(0);
       setAudioLastChangeMs(null);
     }
-    if (!next.video_processing_enabled) {
-      activeVideoRenderRef.current = null;
-      void invoke<unknown>('stop_realtime_video_renderer')
-        .then((status) => setMediaVideoBackendStatus(parseMediaVideoBackendStatus(status)))
-        .catch(() => setMediaVideoBackendStatus(null));
-      runtimeSchedulerRef.current = { cycle: 0, lastChangeMs: null };
-      setRuntimeCycle(0);
-      setRuntimeLastChangeMs(null);
-    }
-    const request = processingSwitchQueueRef.current.then(() => invokePlaybackSnapshot(
-      'set_processing_switches',
+    const request = processingSwitchQueueRef.current.then(() => invokeProcessingSwitches(
       { request: next },
     ));
     processingSwitchQueueRef.current = request.then(() => undefined, () => undefined);
     try {
-      const nextSnapshot = await request;
+      const result = await request;
       if (requestId !== processingSwitchRequestRef.current) return;
+      const nextSnapshot = result.snapshot;
       snapshotRefHome.current = nextSnapshot;
+      setMediaVideoBackendStatus(result.videoBackendStatus);
+      videoProcessingEnabledRef.current = nextSnapshot.video_processing_enabled;
+      videoProcessingSwitchCommittedRevisionRef.current = videoSwitchRevision;
       setSnapshot(nextSnapshot);
       if (
         audioJustEnabled
-        || videoJustEnabled
         || nextSnapshot.source_media?.media_kind === 'video'
       ) {
         queueMicrotask(() => wakeMediaCycleScheduling('switch'));
       }
     } catch (cause) {
       if (requestId !== processingSwitchRequestRef.current) return;
+      if (cause instanceof MediaVideoBackendResponseError) {
+        setMediaVideoBackendDiagnostic(cause.diagnostic);
+      }
+      if (videoSwitchChanged) {
+        const authoritativeVideoEnabled = snapshotRefHome.current?.video_processing_enabled ?? false;
+        videoProcessingEnabledRef.current = authoritativeVideoEnabled;
+        videoProcessingSwitchCommittedRevisionRef.current = videoSwitchRevision;
+        setVideoProcessingEnabled(authoritativeVideoEnabled);
+      }
       setError(cause instanceof Error ? cause.message : '更新处理开关失败');
     }
   }
@@ -7389,7 +7451,6 @@ function DesktopApp() {
   async function resetVideoEffectParams() {
     if (!mediaEffectParams) return;
     const mutationVersion = ++mediaEffectParamsMutationVersionRef.current;
-    clearVideoFutureMediaCyclePlans();
     try {
       const defaults = await invoke<unknown>('get_default_media_effect_params');
       if (!isMediaEffectParams(defaults)) throw new Error('默认媒体参数响应无效');
@@ -7414,334 +7475,187 @@ function DesktopApp() {
 
   function retryVideoProcessing() {
     if (!videoStreamActive) return;
-    clearVideoFutureMediaCyclePlans();
-    wakeMediaCycleScheduling('retry');
+    realtimeVideoCycleConfigurationKeyRef.current = null;
+    setVideoCycleConfigureRevision((revision) => revision + 1);
   }
 
-  async function applyVideoProcessing(
-    paramsOverride?: MediaEffectParams,
-    mediaCandidateOverride?: PreparedVideoMediaCandidate | null,
-  ) {
-    function releaseUnstartedCandidate(candidate: PreparedVideoMediaCandidate | null | undefined) {
-      if (!candidate) return;
-      if (pendingMediaApplyRef.current?.mediaCandidate === candidate) {
-        pendingMediaApplyRef.current = null;
-      }
-      if (activeVideoRenderRef.current === candidate) activeVideoRenderRef.current = null;
-      logVideoPeriodStage(candidate, 'prepare', 'not_started');
-    }
-
-    const currentSnapshot = snapshotRefHome.current ?? snapshot;
-    if (!currentSnapshot) {
-      releaseUnstartedCandidate(mediaCandidateOverride);
-      return;
-    }
-    const sourceMediaIndex = mediaCandidateOverride?.sourceMediaIndex
-      ?? currentSnapshot.source_media_index;
-    const source = sourceMediaIndex === null || sourceMediaIndex === undefined
-      ? null
-      : currentSnapshot.source_media_pool[sourceMediaIndex] ?? null;
+  useEffect(() => {
+    const playbackState = snapshot?.playback_state?.toLowerCase();
     if (
-      !source
-      || source.media_kind !== 'video'
-      || (mediaCandidateOverride && mediaCandidateOverride.sourcePath !== source.source_path)
+      !MPV_REALTIME_VIDEO_ENABLED
+      || !currentMediaIsVideo
+      || !snapshot
+      || !['playing', 'paused'].includes(playbackState ?? '')
     ) {
-      releaseUnstartedCandidate(mediaCandidateOverride);
-      return;
-    }
-    const rawParams = paramsOverride ?? mediaEffectParams;
-    const params = rawParams
-      ? {
-          ...rawParams,
-          // 保留完整正式参数；Rust 媒体边界会再次校验并拒绝尚无真实执行条件的字段。
-          audio: { ...rawParams.audio },
-          video: { ...rawParams.video },
-          advanced: { ...rawParams.advanced },
-        }
-      : null;
-    if (!params) {
-      releaseUnstartedCandidate(mediaCandidateOverride);
-      return;
-    }
-    if (mediaApplyInFlightRef.current) {
-      if (mediaCandidateOverride) {
-        const previous = pendingMediaApplyRef.current?.mediaCandidate;
-        pendingMediaApplyRef.current = { params, mediaCandidate: mediaCandidateOverride };
-        if (
-          !previous
-          || videoRenderIdentity(
-            previous.timeline.planId,
-            previous.timeline.sequence,
-            previous.playbackGeneration,
-          ) !== videoRenderIdentity(
-            mediaCandidateOverride.timeline.planId,
-            mediaCandidateOverride.timeline.sequence,
-            mediaCandidateOverride.playbackGeneration,
-          )
-        ) {
-          logVideoPeriodStage(mediaCandidateOverride, 'prepare', 'queued');
-        }
+      if (originalVideoEnsureRetryTimerRef.current !== null) {
+        window.clearTimeout(originalVideoEnsureRetryTimerRef.current);
+        originalVideoEnsureRetryTimerRef.current = null;
       }
+      originalVideoEnsureRetryRef.current = clearCycleRetry();
+      originalVideoEnsureAttemptRef.current = null;
       return;
     }
-    // 资源等待态已经持有唯一恢复回调；禁止周期调度用新 token 覆盖它。
-    if (pendingRuntimeActionRef.current?.component === 'media') return;
-    mediaApplyInFlightRef.current = true;
-    const releasePreAcceptSlot = () => {
-      mediaApplyInFlightRef.current = false;
-      setMediaProcessingBusy(null);
-      queueMicrotask(() => void flushPendingMediaApply());
-    };
-    let validation: MediaParameterValidationResult;
-    try {
-      const validationResponse = await invoke<unknown>('validate_media_effect_params', {
-        request: params,
-      });
-      if (!isMediaParameterValidationResult(validationResponse)) {
-        throw new Error('媒体效果参数校验响应无效');
+    if (mediaVideoBackendStatus?.playback_generation === snapshot.playback_generation
+      && hasManagedVideoProcess(mediaVideoBackendStatus)) {
+      originalVideoEnsureRetryRef.current = clearCycleRetry();
+      originalVideoEnsureAttemptRef.current = null;
+      return;
+    }
+    if (!shouldEnsureOriginalVideoRenderer(
+      videoProcessingEnabled,
+      mediaVideoBackendStatus,
+      snapshot.playback_generation,
+    )) {
+      originalVideoEnsureRetryRef.current = clearCycleRetry();
+      originalVideoEnsureAttemptRef.current = null;
+      return;
+    }
+    const attemptKey = [
+      snapshot.playback_generation,
+      snapshot.source_media?.source_path ?? '',
+    ].join(':');
+    if (originalVideoEnsureRetryRef.current.identity !== null
+      && originalVideoEnsureRetryRef.current.identity !== attemptKey) {
+      if (originalVideoEnsureRetryTimerRef.current !== null) {
+        window.clearTimeout(originalVideoEnsureRetryTimerRef.current);
+        originalVideoEnsureRetryTimerRef.current = null;
       }
-      validation = validationResponse;
-    } catch (cause) {
-      releaseUnstartedCandidate(mediaCandidateOverride);
-      releasePreAcceptSlot();
-      if (!isMediaProcessingPlaybackActive(currentSnapshot.playback_generation)) return;
-      setError(getDisplayErrorMessage(cause, '媒体效果参数校验失败'));
-      return;
+      originalVideoEnsureRetryRef.current = clearCycleRetry();
     }
-    if (!isMediaProcessingPlaybackActive(currentSnapshot.playback_generation)) {
-      releaseUnstartedCandidate(mediaCandidateOverride);
-      releasePreAcceptSlot();
-      return;
-    }
-    if (!validation.valid) {
-      releaseUnstartedCandidate(mediaCandidateOverride);
-      releasePreAcceptSlot();
-      setError(validation.errors[0]?.message ?? '媒体效果参数校验失败');
-      return;
-    }
-    let mediaCandidate = mediaCandidateOverride ?? null;
-    if (!mediaCandidate) {
-      const clock = mediaStateRef.current;
-      const sourceDurationMs = source.duration_ms;
-      if (
-        !clock
-        || clock.playback_generation !== currentSnapshot.playback_generation
-        || typeof sourceDurationMs !== 'number'
-        || !Number.isSafeInteger(sourceDurationMs)
-        || sourceDurationMs <= 0
-      ) {
-        releasePreAcceptSlot();
-        return;
-      }
-      mediaCandidateSequenceRef.current += 1;
-      const targetAbsolutePositionMs = alignMediaPositionToVideoFrame(
-        clock.absolute_position_ms + 500,
-        source.frame_rate_fps,
-      );
-      const requestedValidUntilAbsolutePositionMs = targetAbsolutePositionMs + Math.max(
-        nextVideoPeriodMsRef.current,
-        1_000,
-      );
-      const sourceWindowEndMs = targetAbsolutePositionMs
-        - (targetAbsolutePositionMs % sourceDurationMs)
-        + sourceDurationMs;
-      const validUntilAbsolutePositionMs = currentSnapshot.source_media_pool.length === 1
-        ? requestedValidUntilAbsolutePositionMs
-        : Math.min(requestedValidUntilAbsolutePositionMs, sourceWindowEndMs);
-      if (validUntilAbsolutePositionMs <= targetAbsolutePositionMs) {
-        releasePreAcceptSlot();
-        return;
-      }
-      mediaCandidate = {
-        params,
-        videoCyclePlan: null,
-        videoEffectsEnabled: videoProcessingEnabledRef.current,
-        realtimePrepared: false,
-        timeline: createMediaArtifactTimeline({
-            planId: `video-manual-${mediaCandidateSequenceRef.current}`,
-            sequence: mediaCandidateSequenceRef.current,
-            playbackGeneration: currentSnapshot.playback_generation,
-            sourceRevision: clock.source_revision,
-            targetAbsolutePositionMs,
-            validUntilAbsolutePositionMs,
-            sourceDurationMs,
-            safetyTailMs: 0,
-          }),
-        sourcePath: source.source_path,
-        sourceMediaIndex: currentSnapshot.source_media_index ?? 0,
-        playbackGeneration: currentSnapshot.playback_generation,
-      };
-    }
-    if (
-      videoPrepareRetryCandidateRef.current
-      && videoPrepareRetryCandidateRef.current !== mediaCandidate
-    ) {
-      cancelVideoPrepareRetry();
-    }
-    setError(null);
-    setMediaProcessingBusy('video');
-    let retryScheduled = false;
-    try {
-      await ensureRuntimeResources('media', async () => {
-        if (!isVideoCandidatePlaybackActive(mediaCandidate)) {
-          releaseUnstartedCandidate(mediaCandidate);
-          return;
-        }
-        setMediaProcessingBusy('video');
-        try {
-          const clock = mediaStateRef.current;
-          if (!clock || !isVideoCandidatePlaybackActive(mediaCandidate)) {
-            releaseUnstartedCandidate(mediaCandidate);
-            return;
-          }
-          if (
-            activeVideoRenderRef.current
-            && activeVideoRenderRef.current !== mediaCandidate
-          ) {
-            releaseUnstartedCandidate(mediaCandidate);
-            return;
-          }
-          activeVideoRenderRef.current = mediaCandidate;
-          if (!MPV_REALTIME_VIDEO_ENABLED || !mediaCandidate.videoEffectsEnabled) {
-            releaseUnstartedCandidate(mediaCandidate);
-            return;
-          }
-          const queue = videoFuturePlansRef.current;
-          const nextPlan = queue?.[0].sequence === mediaCandidate.timeline.sequence
-            ? queue[1]
-            : null;
-          try {
-            const response = await invoke<unknown>('prepare_realtime_video_plan', {
-              request: {
-                params,
-                sequence: mediaCandidate.timeline.sequence,
-                playback_generation: mediaCandidate.timeline.playbackGeneration,
-                source_revision: VIDEO_BACKEND_SOURCE_REVISION,
-                target_absolute_position_ms: mediaCandidate.timeline.targetAbsolutePositionMs,
-                period_ms: mediaCandidate.videoCyclePlan?.periodMediaMs
-                  ?? mediaCandidate.timeline.outputDurationMs,
-                seed: mediaCandidate.videoCyclePlan?.payload.seed ?? 0,
-                next_sequence: nextPlan?.sequence ?? null,
-                next_target_absolute_position_ms: nextPlan?.targetAbsolutePositionMs ?? null,
-              },
-            });
-            const status = parseMediaVideoBackendStatus(response);
-            setMediaVideoBackendStatus(status);
-            if (canUseRealtimeVideoBackend(status)) {
-              mediaCandidate.realtimePrepared = true;
-              resetVideoPrepareRetry(mediaCandidate);
-              videoCycleRetryRef.current = clearCycleRetry();
-              logVideoPeriodStage(mediaCandidate, 'prepare', 'accepted');
-              return;
-            }
-          } catch (cause) {
-            setError(getDisplayErrorMessage(cause, '实时画面准备失败，保持 Original 并稍后重试'));
-            await invoke('stop_realtime_video_renderer').catch(() => undefined);
-            scheduleVideoPrepareRetry(params, mediaCandidate);
-            retryScheduled = true;
-            return;
-          }
-          await invoke('stop_realtime_video_renderer').catch(() => undefined);
-          releaseUnstartedCandidate(mediaCandidate);
-          if (mediaCandidate.videoCyclePlan) scheduleVideoCycleRetry();
-        } finally {
-          setMediaProcessingBusy(null);
-        }
-      }, (status) => {
-        releaseUnstartedCandidate(mediaCandidate);
-        setError(status.error || '实时画面资源准备已取消，当前保持 Original。');
-      });
-    } catch (cause) {
-      resetVideoPrepareRetry(mediaCandidate);
-      releaseUnstartedCandidate(mediaCandidate);
-      if (!isVideoCandidatePlaybackActive(mediaCandidate)) return;
-      setError(getDisplayErrorMessage(cause, '启动本地媒体处理失败'));
-    } finally {
-      mediaApplyInFlightRef.current = false;
-      setMediaProcessingBusy(null);
-      if (!retryScheduled) void flushPendingMediaApply();
-    }
-  }
-
-  function commitPreparedRealtimeVideoCandidate(clock: PlaybackMediaStateMessage) {
-    const candidate = activeVideoRenderRef.current;
-    if (
-      !candidate
-      || !candidate.realtimePrepared
-      || realtimeVideoCommitInFlightRef.current
-      || clock.playback_generation !== candidate.playbackGeneration
-      || clock.absolute_position_ms < candidate.timeline.targetAbsolutePositionMs
-    ) return;
-    realtimeVideoCommitInFlightRef.current = true;
-    void invoke<unknown>('commit_realtime_video_plan', {
-      request: {
-        sequence: candidate.timeline.sequence,
-        playback_generation: candidate.timeline.playbackGeneration,
-        source_revision: VIDEO_BACKEND_SOURCE_REVISION,
-        media_pts_ms: clock.absolute_position_ms,
-      },
+    if (!isCycleRetryReady(originalVideoEnsureRetryRef.current, attemptKey, Date.now())) return;
+    if (originalVideoEnsureAttemptRef.current === attemptKey) return;
+    originalVideoEnsureAttemptRef.current = attemptKey;
+    void invoke<unknown>('ensure_original_video_renderer', {
+      request: {},
     })
       .then((response) => {
-        const status = parseMediaVideoBackendStatus(response);
+        const currentSnapshot = snapshotRefHome.current;
+        if (
+          originalVideoEnsureAttemptRef.current !== attemptKey
+          || !shouldEnsureOriginalVideoRenderer(
+            videoProcessingEnabledRef.current,
+            mediaVideoBackendStatusRef.current,
+            snapshot.playback_generation,
+          )
+        ) return;
+        const parsed = parseMediaVideoBackendStatusResult(response);
+        if (!parsed.ok) {
+          setEffectiveMediaVideoBackend(null);
+          setMediaVideoBackendDiagnostic(parsed.error);
+          throw new Error(formatMediaVideoBackendDiagnostic(parsed.error));
+        }
+        const status = parsed.status;
+        setMediaVideoBackendDiagnostic(null);
         setMediaVideoBackendStatus(status);
-        if (status?.backend !== 'realtime_gpu' || status.activation !== 'active') {
-          candidate.realtimePrepared = false;
-          void invoke('stop_realtime_video_renderer').catch(() => undefined);
-          scheduleVideoPrepareRetry(candidate.params, candidate);
-          return;
+        if (
+          originalVideoEnsureAttemptRef.current !== attemptKey
+          || currentSnapshot?.playback_generation !== snapshot.playback_generation
+          || currentSnapshot.source_media?.media_kind !== 'video'
+          || !['playing', 'paused'].includes(currentSnapshot.playback_state.toLowerCase())
+        ) return;
+        if (
+          status?.backend !== 'source'
+          || status.activation !== 'active'
+          || !hasManagedVideoProcess(status)
+        ) {
+          throw new Error(status?.demotion_reason ?? '受管 Original 播放器未进入活动状态');
         }
-        if (candidate.videoCyclePlan) applyPlannedVideoCycle(candidate.videoCyclePlan);
-        else {
-          mediaEffectParamsRef.current = candidate.params;
-          setMediaEffectParams(candidate.params);
+        if (originalVideoEnsureRetryTimerRef.current !== null) {
+          window.clearTimeout(originalVideoEnsureRetryTimerRef.current);
+          originalVideoEnsureRetryTimerRef.current = null;
         }
-        activeVideoRenderRef.current = null;
-        if (candidate.videoCyclePlan) {
-          advanceIndependentVideoQueue(clock.absolute_position_ms);
+        originalVideoEnsureRetryRef.current = clearCycleRetry();
+        setMediaVideoBackendStatus(status);
+        if (videoProcessingEnabledRef.current) {
+          queueMicrotask(() => wakeMediaCycleScheduling('switch'));
         }
       })
       .catch((cause) => {
-        candidate.realtimePrepared = false;
-        setError(getDisplayErrorMessage(cause, '实时画面周期提交失败，保持 Original 并稍后重试'));
-        void invoke('stop_realtime_video_renderer').catch(() => undefined);
-        scheduleVideoPrepareRetry(candidate.params, candidate);
-      })
-      .finally(() => {
-        realtimeVideoCommitInFlightRef.current = false;
-        void flushPendingMediaApply();
+        if (originalVideoEnsureAttemptRef.current !== attemptKey) return;
+        setError(getDisplayErrorMessage(cause, 'Original 播放器启动失败，当前保留 WebView 兼容画面'));
+        void invoke<unknown>('get_media_video_backend_status')
+          .then((response) => {
+            const parsed = parseMediaVideoBackendStatusResult(response);
+            if (parsed.ok) {
+              setMediaVideoBackendDiagnostic(null);
+              setMediaVideoBackendStatus(parsed.status);
+            } else {
+              setEffectiveMediaVideoBackend(null);
+              setMediaVideoBackendDiagnostic(parsed.error);
+            }
+          })
+          .catch(() => undefined);
+        const retry = recordCycleRetryFailure(
+          originalVideoEnsureRetryRef.current,
+          attemptKey,
+          Date.now(),
+        );
+        originalVideoEnsureRetryRef.current = retry;
+        if (retry.exhausted || retry.retryAtMs === null) {
+          setError('Original 播放器连续启动失败，已停止自动重试；当前保留 WebView 兼容画面。');
+          return;
+        }
+        originalVideoEnsureRetryTimerRef.current = window.setTimeout(() => {
+          originalVideoEnsureRetryTimerRef.current = null;
+          if (originalVideoEnsureRetryRef.current.identity !== attemptKey) return;
+          originalVideoEnsureAttemptRef.current = null;
+          setOriginalVideoEnsureRetryRevision((revision) => revision + 1);
+        }, Math.max(0, retry.retryAtMs - Date.now()));
       });
-  }
-
-  useEffect(() => {
-    if (mediaState) commitPreparedRealtimeVideoCandidate(mediaState);
   }, [
-    mediaState?.absolute_position_ms,
-    mediaState?.playback_generation,
+    currentMediaIsVideo,
+    snapshot?.playback_generation,
+    snapshot?.playback_state,
+    snapshot?.source_media?.source_path,
+    videoProcessingEnabled,
     mediaVideoBackendStatus?.activation,
     mediaVideoBackendStatus?.backend,
-    ],
-  );
+    mediaVideoBackendStatus?.backend_epoch,
+    mediaVideoBackendStatus?.playback_generation,
+    mediaVideoBackendStatus?.process_id,
+    originalVideoEnsureRetryRevision,
+  ]);
+
+  useEffect(() => () => {
+    if (originalVideoEnsureRetryTimerRef.current !== null) {
+      window.clearTimeout(originalVideoEnsureRetryTimerRef.current);
+      originalVideoEnsureRetryTimerRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
-    if (
-      !mediaState
-      || mediaVideoBackendStatus?.backend !== 'realtime_gpu'
-      || !['available', 'active'].includes(mediaVideoBackendStatus.activation)
-    ) return;
-    void invoke('sync_realtime_video_renderer', {
-      request: {
-        playback_generation: mediaState.playback_generation,
-        position_ms: mediaState.position_ms,
-        paused: playbackDisplayState !== 'playing',
-      },
-    }).catch(() => {
-      // 连续播放期间不轮询 IPC；仅在代次或播放/暂停状态变化时同步，失败由下轮提交降级。
-    });
+    if (!documentVisible || !currentMediaIsVideo) return;
+    let cancelled = false;
+    let inFlight = false;
+    const refreshStatus = () => {
+      if (inFlight) return;
+      inFlight = true;
+      void invoke<unknown>('get_media_video_backend_status')
+        .then((response) => {
+          if (cancelled) return;
+          acceptMediaVideoBackendResponse(response);
+        })
+        .catch((cause) => {
+          // 保留 lastObserved 仅供诊断；有效投影立即 fail closed。
+          if (!cancelled) {
+            reportMediaVideoBackendInvokeFailure(cause, '轮询视频实际运行后端失败');
+          }
+        })
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    refreshStatus();
+    const timer = window.setInterval(refreshStatus, VIDEO_BACKEND_STATUS_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, [
-    mediaState?.playback_generation,
-    playbackDisplayState,
-    mediaVideoBackendStatus?.activation,
-    mediaVideoBackendStatus?.backend,
+    acceptMediaVideoBackendResponse,
+    currentMediaIsVideo,
+    documentVisible,
+    reportMediaVideoBackendInvokeFailure,
   ]);
 
   function commitCompletedAudioRender(currentSnapshot: PlaybackSnapshot) {
@@ -7819,43 +7733,6 @@ function DesktopApp() {
     snapshot?.audio_processing_status,
   ]);
 
-  async function flushPendingMediaApply() {
-    const pending = pendingMediaApplyRef.current;
-    const currentSnapshot = snapshotRefHome.current;
-    const clock = mediaStateRef.current;
-    if (!pending || !currentSnapshot?.source_media || !clock) return;
-    if (
-      currentSnapshot.playback_state?.toLowerCase() !== 'playing'
-      || clock.playback_generation !== currentSnapshot.playback_generation
-      || clock.paused
-      || clock.clock_health !== 'healthy'
-    ) return;
-    await flushLatestPendingApply(
-      pendingMediaApplyRef,
-      () => (
-        mediaApplyInFlightRef.current
-        || pendingRuntimeActionRef.current?.component === 'media'
-        || (activeVideoRenderRef.current !== null
-          && pending.mediaCandidate !== activeVideoRenderRef.current)
-      ),
-      (latest) => applyVideoProcessing(latest.params, latest.mediaCandidate),
-    );
-  }
-
-  // 声音 Worker 结束后稍等再续跑排队任务，避免连续重渲打断听感。
-  useEffect(() => {
-    const processing = snapshot?.audio_processing_status === 'processing';
-    if (mediaWasProcessingRef.current && !processing) {
-      const timer = window.setTimeout(() => {
-        void flushPendingMediaApply();
-      }, 2_500);
-      mediaWasProcessingRef.current = false;
-      return () => window.clearTimeout(timer);
-    }
-    mediaWasProcessingRef.current = Boolean(processing);
-    if (playbackActive) void flushPendingMediaApply();
-  }, [playbackActive, snapshot?.audio_processing_status]);
-
   async function cleanupLocalCaches() {
     if (cacheCleanupBusy) return;
     setCacheCleanupError(null);
@@ -7876,6 +7753,16 @@ function DesktopApp() {
   }
 
   function applyPlaybackPoolSnapshot(nextSnapshot: PlaybackSnapshot) {
+    const previousSnapshot = snapshotRefHome.current;
+    if (
+      previousSnapshot?.playback_generation !== nextSnapshot.playback_generation
+      || previousSnapshot?.source_media?.source_path !== nextSnapshot.source_media?.source_path
+    ) {
+      mediaStateRef.current = null;
+      setMediaState(null);
+      mediaSeekDraftRef.current = null;
+      setMediaSeekDraft(null);
+    }
     snapshotRequestRef.current += 1;
     snapshotRefHome.current = nextSnapshot;
     setSnapshot(nextSnapshot);
@@ -8153,7 +8040,6 @@ function DesktopApp() {
     }
   }
 
-  const nextVideoPlan = videoFuturePlansRef.current?.[0];
   const nextAudioPlan = audioFuturePlansRef.current?.[0];
   const mediaCycleClockIdentity = mediaState && snapshot
     ? `${mediaState.playback_generation}:${mediaState.source_revision}:${mediaState.clock_epoch}:${snapshot.loop_index}`
@@ -8165,25 +8051,55 @@ function DesktopApp() {
     && ['playing', 'paused'].includes(snapshot.playback_state.toLowerCase())
       ? mediaState.absolute_position_ms
       : null;
-  const scheduledVideoProgressPercent = currentMediaIsVideo
-    ? getMediaCycleProgressPercent(nextVideoPlan, mediaCycleAbsolutePositionMs)
-    : 0;
-  const runtimeProgressPercent = scheduledVideoProgressPercent;
-  const activeVideoCandidate = activeVideoRenderRef.current;
-  const activeVideoCandidateMatchesPlan = Boolean(
-    nextVideoPlan
-    && snapshot
-    && activeVideoCandidate?.videoCyclePlan?.planId === nextVideoPlan.planId
-    && activeVideoCandidate.videoCyclePlan.sequence === nextVideoPlan.sequence
-    && activeVideoCandidate.playbackGeneration === snapshot.playback_generation,
+  const backendVideoCycle = mediaVideoBackendDiagnostic === null
+    && mediaVideoBackendStatus !== null
+    && mediaVideoBackendStatus.playback_generation === snapshot?.playback_generation
+    && mediaVideoBackendStatus.n?.status === 'active'
+    && mediaVideoBackendStatus.presented_pts_ms !== null
+      ? mediaVideoBackendStatus
+      : null;
+  const backendVideoCycleDurationMs = backendVideoCycle?.n1
+    && backendVideoCycle.n
+    && backendVideoCycle.n1.target_pts_ms > backendVideoCycle.n.target_pts_ms
+      ? backendVideoCycle.n1.target_pts_ms - backendVideoCycle.n.target_pts_ms
+      : null;
+  const backendVideoPresentationPtsMs = mediaVideoPresentationPtsMs(
+    backendVideoCycle,
+    snapshot?.source_media?.duration_ms,
   );
-  const currentVideoCandidatePreparing = activeVideoCandidateMatchesPlan
-    && !activeVideoCandidate?.realtimePrepared;
-  const currentVideoCandidateReady = activeVideoCandidateMatchesPlan
-    && activeVideoCandidate?.realtimePrepared === true;
-  const currentVideoCandidatePresented = mediaVideoBackendStatus?.backend === 'realtime_gpu'
-    && mediaVideoBackendStatus.activation === 'active';
-  const currentVideoCandidateFailed = mediaVideoBackendStatus?.activation === 'failed';
+  const backendVideoProgressPercent = backendVideoCycle
+    && backendVideoCycle.n
+    && backendVideoCycleDurationMs !== null
+    && backendVideoPresentationPtsMs !== null
+      ? Math.min(100, Math.max(0,
+          (backendVideoPresentationPtsMs - backendVideoCycle.n.target_pts_ms)
+          / backendVideoCycleDurationMs
+          * 100,
+        ))
+      : null;
+  const runtimeProgressPercent = backendVideoProgressPercent ?? 0;
+  const runtimeCycleDisplay = backendVideoCycle?.confirmed_change_count ?? 0;
+  const currentVideoCandidatePresented = Boolean(effectiveMediaVideoBackend
+    && effectiveMediaVideoBackend.playback_generation === snapshot?.playback_generation
+    && effectiveMediaVideoBackend.backend !== 'source');
+  const currentVideoCandidateFailed = Boolean(mediaVideoBackendDiagnostic === null
+    && mediaVideoBackendStatus
+    && mediaVideoBackendStatus?.playback_generation === snapshot?.playback_generation
+    && (mediaVideoBackendStatus.activation === 'failed'
+      || mediaVideoBackendStatus.apply_state === 'failed'));
+  const currentVideoCandidatePending = Boolean(mediaVideoBackendDiagnostic === null
+    && mediaVideoBackendStatus
+    && mediaVideoBackendStatus?.playback_generation === snapshot?.playback_generation
+    && ['source_transitioning', 'ready', 'applying', 'result_unknown', 'readback_confirmed', 'presented_confirmed']
+      .includes(mediaVideoBackendStatus.apply_state));
+  const currentVideoCycleMissing = Boolean(videoProcessingEnabled
+    && mediaVideoBackendDiagnostic === null
+    && mediaVideoBackendStatus
+    && mediaVideoBackendStatus.playback_generation === snapshot?.playback_generation
+    && mediaVideoBackendStatus.process_id !== null
+    && mediaVideoBackendStatus.fallback_floor_mode !== 'original'
+    && mediaVideoBackendStatus.backend === 'source'
+    && mediaVideoBackendStatus.apply_state === 'idle');
   const audioProgressPercent = audioProcessingEnabled && currentSource
     ? getMediaCycleProgressPercent(nextAudioPlan, mediaCycleAbsolutePositionMs)
     : 0;
@@ -8200,19 +8116,13 @@ function DesktopApp() {
   const mediaCurrentTime = clampMediaTime(mediaState?.current_time ?? 0, mediaDuration);
   const mediaDisplayedTime = mediaSeekDraft?.value ?? mediaCurrentTime;
   useEffect(() => {
-    if (
-      !mediaSeekDraft?.committed
-      || !mediaState
-      || mediaSeekDraft.playbackGeneration !== mediaState.playback_generation
-      || Math.abs(mediaState.current_time - mediaSeekDraft.value) > 0.25
-    ) return;
-    setMediaSeekDraft(null);
+    mediaSeekDraftRef.current = mediaSeekDraft;
   }, [mediaSeekDraft, mediaState]);
   useEffect(() => {
     if (!mediaSeekDraft?.committed) return;
-    const timeout = window.setTimeout(() => setMediaSeekDraft((current) => (
-      current === mediaSeekDraft ? null : current
-    )), 3_000);
+    const timeout = window.setTimeout(() => {
+      if (mediaSeekDraftRef.current === mediaSeekDraft) failPendingMediaSeek();
+    }, 3_000);
     return () => window.clearTimeout(timeout);
   }, [mediaSeekDraft]);
   const playbackClockNotice = !mediaState
@@ -8220,10 +8130,10 @@ function DesktopApp() {
     || mediaState.clock_health === 'healthy'
     ? null
     : mediaState.clock_health === 'buffering'
-      ? { type: 'info' as const, message: '播放器正在缓冲，声音和画面周期已冻结。' }
+      ? { type: 'info' as const, message: 'WebView 声音时钟正在缓冲，声音周期已冻结；视频周期仍由 Rust/mpv 时钟推进。' }
       : mediaState.clock_health === 'recovering'
-        ? { type: 'warning' as const, message: '播放时钟停滞，正在自动恢复。' }
-        : { type: 'error' as const, message: '播放时钟停滞且自动恢复失败，已保持播放状态并继续尝试；如画面仍不推进，请停止后重新播放。' };
+        ? { type: 'warning' as const, message: 'WebView 声音时钟停滞，正在恢复声音同步；视频周期不受影响。' }
+        : { type: 'error' as const, message: 'WebView 声音时钟恢复失败，已保持播放状态并继续尝试；视频周期仍由 Rust/mpv 时钟推进。' };
   const playbackClockCycleStatus = playbackClockNotice === null
     ? null
     : mediaState?.clock_health === 'buffering'
@@ -8239,15 +8149,19 @@ function DesktopApp() {
   const videoProcessingStatus: ProcessingStatusKey = currentMediaIsVideo
     ? !videoProcessingEnabled
       ? 'disabled'
-      : currentVideoCandidateFailed
-      ? 'failed'
-      : currentVideoCandidatePreparing
+      : videoBackendEofTransitionKey !== null
         ? 'processing'
-        : currentVideoCandidateReady || currentVideoCandidatePresented
-          ? 'ready'
-          : mediaEngineCapabilities?.available
-            ? 'configured'
-            : 'unavailable'
+        : currentVideoCycleMissing
+          ? 'failed'
+          : currentVideoCandidateFailed
+            ? 'failed'
+            : currentVideoCandidatePresented
+              ? 'ready'
+              : currentVideoCandidatePending
+                ? 'processing'
+                : mediaEngineCapabilities?.available
+                  ? 'configured'
+                  : 'unavailable'
     : 'not_applicable';
   const videoCycleStatus = !currentSource
     ? '等待导入'
@@ -8255,26 +8169,32 @@ function DesktopApp() {
       ? '当前音频素材不适用'
       : !videoProcessingEnabled
         ? '视频滤镜关闭，保持 Original'
-        : currentVideoCandidateFailed
-          ? '当前视频候选失败，等待重试'
-          : currentVideoCandidateReady
-            ? '候选已准备，等待周期提交'
-            : currentVideoCandidatePreparing
-              ? '候选处理中'
+        : videoBackendEofTransitionKey !== null
+          ? 'EOF 切换中，等待后端推进'
+          : currentVideoCycleMissing
+            ? 'Rust 视频周期未建立'
+            : currentVideoCandidateFailed
+              ? '当前视频候选失败，等待重试'
               : currentVideoCandidatePresented
-                ? '候选已呈现，准备下一周期'
-                : nextVideoPlan
-                  ? '等待候选准备'
-                  : getProcessingStatusLabel(videoProcessingStatus);
+                ? 'Rust/mpv 已确认当前视频周期生效'
+                : currentVideoCandidatePending
+                  ? `Rust/mpv ${mediaVideoBackendStatus?.apply_state ?? 'ready'}，等待物理呈现确认`
+                  : mediaVideoBackendStatus?.backend === 'source'
+                    ? '源画面播放中 · 等待 Rust 视频周期接管'
+                    : getProcessingStatusLabel(videoProcessingStatus);
   const videoCycleStatusColor = !currentSource || !currentMediaIsVideo || !videoProcessingEnabled
     ? 'default'
-    : currentVideoCandidateFailed
-      ? 'error'
-      : currentVideoCandidateReady || currentVideoCandidatePresented
-        ? 'warning'
-        : currentVideoCandidatePreparing
-          ? 'processing'
-          : getProcessingStatusColor(videoProcessingStatus);
+    : videoBackendEofTransitionKey !== null
+      ? 'processing'
+      : currentVideoCycleMissing
+        ? 'error'
+        : currentVideoCandidateFailed
+          ? 'error'
+          : currentVideoCandidatePresented
+            ? 'success'
+            : currentVideoCandidatePending
+              ? 'processing'
+              : getProcessingStatusColor(videoProcessingStatus);
   const audioProcessingStatus = getProcessingStatusKey(
     snapshot?.audio_processing_status,
     audioProcessingEnabled,
@@ -8283,9 +8203,43 @@ function DesktopApp() {
   const actualAudioOutputLabel = getActualAudioOutputLabel(audioOutputBackend);
   const actualAudioStreamVariantCount = getActualAudioStreamVariantCount(snapshot);
   const videoBackendStatusView = useMemo(
-    () => projectMediaVideoBackendStatus(mediaVideoBackendStatus),
-    [mediaVideoBackendStatus],
+    () => projectMediaVideoBackendStatus(mediaVideoBackendStatus, mediaVideoBackendDiagnostic),
+    [mediaVideoBackendDiagnostic, mediaVideoBackendStatus],
   );
+  const displayedVideoBackend = useMemo(() => {
+    if (effectiveMediaVideoBackend?.active_cycle_snapshot
+      && effectiveMediaVideoBackend.playback_generation === snapshot?.playback_generation) {
+      return effectiveMediaVideoBackend;
+    }
+    if (lastConfirmedMediaVideoBackend?.playback_generation !== snapshot?.playback_generation) return null;
+    if (!mediaVideoBackendStatus
+      || mediaVideoBackendStatus.playback_generation !== snapshot?.playback_generation
+      || mediaVideoBackendStatus.backend === 'source') return null;
+    return lastConfirmedMediaVideoBackend;
+  }, [effectiveMediaVideoBackend, lastConfirmedMediaVideoBackend, mediaVideoBackendStatus, snapshot?.playback_generation]);
+  const displayedVideoEffectParams = useMemo<MediaEffectParams | null>(() => {
+    if (!mediaEffectParams) return null;
+    if (!videoProcessingEnabled || !currentMediaIsVideo) return mediaEffectParams;
+    const activeSnapshot = displayedVideoBackend?.active_cycle_snapshot;
+    return {
+      audio: mediaEffectParams.audio,
+      video: activeSnapshot?.video ?? mediaEffectParams.video,
+      advanced: activeSnapshot?.advanced ?? mediaEffectParams.advanced,
+    };
+  }, [currentMediaIsVideo, displayedVideoBackend?.active_cycle_snapshot, mediaEffectParams, videoProcessingEnabled]);
+  const displayedVideoParameterStatusOverrides = useMemo<
+    Partial<Record<MediaParameterPath, MediaParameterStatus>> | undefined
+  >(() => {
+    if (!displayedVideoBackend?.active_cycle_snapshot) return undefined;
+    return Object.fromEntries(
+      displayedVideoBackend.parameter_support.parameters
+        .filter((parameter) => parameter.field.startsWith('video.') || parameter.field.startsWith('advanced.'))
+        .map((parameter) => [
+          parameter.field as MediaParameterPath,
+          parameter.supported ? 'implemented' : 'pending_confirmation',
+        ]),
+    );
+  }, [displayedVideoBackend]);
   const actualAudioMixLabel = actualAudioStreamVariantCount === null
     ? '未上报（兼容旧快照）'
     : actualAudioOutputLabel === 'PortAudio'
@@ -8457,27 +8411,45 @@ function DesktopApp() {
               tooltip={{ formatter: (value) => formatMediaTime(value ?? 0) }}
               onChange={(value) => {
                 if (!mediaState) return;
-                setMediaSeekDraft({
+                const draft = {
                   value: clampMediaTime(value, mediaDuration),
                   playbackGeneration: mediaState.playback_generation,
                   committed: false,
-                });
+                };
+                mediaSeekDraftRef.current = draft;
+                setMediaSeekDraft(draft);
               }}
               onChangeComplete={(value) => {
                 if (!mediaState) return;
-                const currentTime = clampMediaTime(value, mediaDuration);
-                setMediaSeekDraft({
+                const sourceDurationMs = snapshotRefHome.current?.source_media?.duration_ms
+                  ?? mediaState.duration_ms;
+                const positionMs = clampRealtimeVideoSeekPositionMs(value, sourceDurationMs);
+                const currentTime = positionMs / 1_000;
+                const draft = {
                   value: currentTime,
                   playbackGeneration: mediaState.playback_generation,
                   committed: true,
-                });
+                };
+                mediaSeekDraftRef.current = draft;
+                setMediaSeekDraft(draft);
                 clearFutureMediaCyclePlans();
-                postPlaybackMediaControl({
-                  version: 1,
-                  type: 'playback-media-control',
-                  action: 'seek',
-                  current_time: currentTime,
-                  playback_generation: mediaState.playback_generation,
+                void invokePlaybackSnapshot('seek_playback', {
+                  request: {
+                    playbackGeneration: mediaState.playback_generation,
+                    positionMs,
+                  },
+                }).then((nextSnapshot) => {
+                  applyPlaybackPoolSnapshot(nextSnapshot);
+                  postPlaybackMediaControl({
+                    version: 1,
+                    type: 'playback-media-control',
+                    action: 'seek',
+                    current_time: currentTime,
+                    playback_generation: mediaState.playback_generation,
+                  });
+                }).catch((cause) => {
+                  failPendingMediaSeek();
+                  setError(getDisplayErrorMessage(cause, '播放定位失败'));
                 });
               }}
             />
@@ -8680,7 +8652,7 @@ function DesktopApp() {
                 statusColor={!audioProcessingEnabled ? 'default' : playbackClockCycleStatus?.color ?? getProcessingStatusColor(audioProcessingStatus)}
                 accent="#df66ed"
                 editable
-                onRangeChange={(range) => setAudioPeriodRange(normalizeAudioPeriodRange(range.minMs, range.maxMs))}
+                onRangeChange={(endpoint, valueMs) => setAudioPeriodRange((current) => updatePeriodRangeEndpoint(current, endpoint, valueMs))}
               />
               <AudioProcessingPanel
                 ariaLabel="普通声音处理状态"
@@ -8742,6 +8714,8 @@ function DesktopApp() {
                     size="small"
                     aria-label="视频处理"
                     checked={videoProcessingEnabled}
+                    loading={processingSwitchBusy}
+                    disabled={processingSwitchBusy}
                     onChange={(checked) => void updateProcessingSwitches({
                       video_processing_enabled: checked,
                       audio_processing_enabled: audioProcessingEnabledRef.current,
@@ -8775,19 +8749,25 @@ function DesktopApp() {
               title="视频周期"
               icon={<PictureOutlined />}
               range={videoPeriodRange}
-              changes={runtimeCycle}
+              changes={runtimeCycleDisplay}
               progress={runtimeProgressPercent}
               status={videoCycleStatus}
               statusColor={videoCycleStatusColor}
               accent="#38b8f8"
               editable={currentMediaIsVideo}
-              onRangeChange={(range) => setVideoPeriodRange(normalizeVideoPeriodRange(range.minMs, range.maxMs))}
+              onRangeChange={(endpoint, valueMs) => setVideoPeriodRange((current) => updatePeriodRangeEndpoint(current, endpoint, valueMs))}
+              footer={backendVideoCycle?.n ? (
+                <Typography.Text className="desktop-muted">
+                  第 {backendVideoCycle.n.sequence} 轮 · 上次变化 {formatMediaTime(backendVideoCycle.n.target_pts_ms / 1_000)} · mpv PTS {formatMediaTime((backendVideoCycle.presented_pts_ms ?? 0) / 1_000)}
+                </Typography.Text>
+              ) : undefined}
             />
-            {mediaEffectParams ? (
+            {displayedVideoEffectParams ? (
               <MediaParameterPanels
-                value={mediaEffectParams}
+                value={displayedVideoEffectParams}
                 loading={false}
                 error={null}
+                statusOverrides={displayedVideoParameterStatusOverrides}
                 sections={VIDEO_PARAMETER_SECTIONS}
               />
             ) : (

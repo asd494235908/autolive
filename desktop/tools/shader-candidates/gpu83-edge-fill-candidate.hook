@@ -1,0 +1,47 @@
+//!PARAM al_edge_fill_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_edge_feather_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 100.0
+0.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive Phase 3A bounded edge fill candidate
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN al_edge_fill_enabled
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+    if (al_edge_fill_enabled <= 0.0) {
+        return source_color;
+    }
+
+    float feather_percent = clamp(al_edge_feather_percent, 0.0, 100.0);
+    float border_pixels = clamp(
+        floor(2.0 + feather_percent * 0.14 + 0.5),
+        2.0,
+        16.0
+    );
+    vec2 border_uv = HOOKED_pt * border_pixels;
+    vec2 filled_position = clamp(
+        HOOKED_pos,
+        border_uv,
+        vec2(1.0) - border_uv
+    );
+    if (all(equal(filled_position, HOOKED_pos))) {
+        return source_color;
+    }
+
+    vec3 filled_rgb = HOOKED_tex(filled_position).rgb;
+    float fill_weight = feather_percent <= 0.0
+        ? 1.0
+        : feather_percent / 100.0;
+    return vec4(mix(source_color.rgb, filled_rgb, fill_weight), source_color.a);
+}

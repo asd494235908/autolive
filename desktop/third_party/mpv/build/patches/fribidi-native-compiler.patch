@@ -1,0 +1,5 @@
+--- a/gen.tab/meson.build
++++ b/gen.tab/meson.build
+@@ -3 +3 @@
+-native_cc = meson.get_compiler('c')
++native_cc = meson.get_compiler('c', native: true)

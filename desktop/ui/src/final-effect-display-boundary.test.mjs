@@ -74,10 +74,10 @@ test('纯音频继续复用主媒体时钟，但渲染表面透明且不参与�
   assert.match(sourceGuard, /isBoundedString\(record\.playback_reference, false\)/);
   assert.match(sourceGuard, /\['direct', 'remuxed', 'transcoded'\]\.includes\(record\.compatibility_mode as string\)/);
   assert.match(finalEffectWindow, /const currentMediaIsAudio = snapshot\?\.source_media\?\.media_kind === 'audio'/);
-  assert.match(finalEffectWindow, /opacity: currentMediaIsAudio \? 0 : 1/);
+  assert.match(finalEffectWindow, /opacity: currentMediaIsAudio \|\| managedNativeVideoOwnsPlayback \? 0 : 1/);
   assert.doesNotMatch(finalEffectWindow, /video_stream|VideoMseStreamController|MediaSource|SourceBuffer/);
   assert.match(desktopApp, /const currentMediaIsVideo = snapshot\?\.source_media\?\.media_kind === 'video'/);
-  assert.match(desktopApp, /const runtimeActive = MPV_REALTIME_VIDEO_ENABLED[\s\S]*playbackActive[\s\S]*currentMediaIsVideo[\s\S]*videoProcessingEnabled/);
+  assert.match(desktopApp, /const videoStreamActive = MPV_REALTIME_VIDEO_ENABLED[\s\S]*playbackRequested[\s\S]*currentMediaIsVideo[\s\S]*videoProcessingEnabled/);
   assert.match(desktopApp, /const pictureInPictureSourceUrl = currentMediaIsVideo[\s\S]*playbackVideoUrl\(snapshot\)/);
   assert.match(desktopApp, /当前音频素材不适用/);
 });
@@ -144,12 +144,12 @@ test('最终效果窗内部 play、pause 与 reload 不得改写 Rust 播放状�
   const videoStart = finalEffectWindow.indexOf('<video');
   const videoElement = finalEffectWindow.slice(videoStart, finalEffectWindow.indexOf('<audio', videoStart));
 
-  assert.match(recovery, /video\.pause\(\);[\s\S]*video\.load\(\)/);
+  assert.match(recovery, /clockMedia\.pause\(\);[\s\S]*clockMedia\.load\(\)/);
   assert.doesNotMatch(recovery, /pause_playback/);
   assert.doesNotMatch(recoveryFailure, /pause_playback/);
-  assert.doesNotMatch(recoveryFailure, /video\.pause\(\)/);
+  assert.doesNotMatch(recoveryFailure, /clockMedia\.pause\(\)/);
   assert.doesNotMatch(recoveryFailure, /播放已暂停/);
-  assert.match(recoveryFailure, /video\.play\(\)/);
+  assert.match(recoveryFailure, /clockMedia\.play\(\)/);
   assert.doesNotMatch(videoElement, /onPause=\{[\s\S]*pause_playback/);
   assert.doesNotMatch(videoElement, /onPlay=\{[\s\S]*(?:resume_playback|start_playback)/);
 });
@@ -172,7 +172,7 @@ test('播放中开启普通声音不停播，PortAudio 未就绪时保持 WebVie
   const app = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
   const switchUpdate = app.slice(
     app.indexOf('async function updateProcessingSwitches('),
-    app.indexOf('async function applyVideoProcessing'),
+    app.indexOf('async function resetVideoEffectParams()'),
   );
   const backendMessage = app.slice(
     app.indexOf('if (isAudioOutputBackendMessage(event.data))'),
@@ -204,6 +204,24 @@ test('处理开关变化后按仍启用的音视频域重建候选文件', async
   assert.match(updateSwitches, /next\.video_processing_enabled[\s\S]*next\.audio_processing_enabled/);
   assert.match(updateSwitches, /wakeMediaCycleScheduling\('switch'\)/);
   assert.doesNotMatch(updateSwitches, /applyVideoProcessing\(|schedulePeriodRenderRef\.current/);
+});
+
+test('视频参数面板始终展示全部参数，确认间隙保留同代上一轮值且不写回配置基线', async () => {
+  const app = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+  const desktopApp = app.slice(app.indexOf('function DesktopApp()'));
+
+  assert.match(desktopApp, /const \[lastConfirmedMediaVideoBackend, setLastConfirmedMediaVideoBackend\] = useState/);
+  assert.match(desktopApp, /acceptance\.status\.active_cycle_snapshot[\s\S]*setLastConfirmedMediaVideoBackend\(acceptance\.status\)/);
+  assert.match(desktopApp, /const displayedVideoBackend\s*=\s*useMemo/);
+  assert.match(desktopApp, /effectiveMediaVideoBackend\?\.active_cycle_snapshot[\s\S]*effectiveMediaVideoBackend\.playback_generation === snapshot\?\.playback_generation/);
+  assert.match(desktopApp, /lastConfirmedMediaVideoBackend\?\.playback_generation !== snapshot\?\.playback_generation/);
+  assert.match(desktopApp, /const displayedVideoEffectParams\s*=\s*useMemo/);
+  assert.match(desktopApp, /displayedVideoBackend\?\.active_cycle_snapshot/);
+  assert.match(desktopApp, /video: activeSnapshot\?\.video \?\? mediaEffectParams\.video/);
+  assert.match(desktopApp, /advanced: activeSnapshot\?\.advanced \?\? mediaEffectParams\.advanced/);
+  assert.match(desktopApp, /<MediaParameterPanels[\s\S]*value=\{displayedVideoEffectParams\}[\s\S]*sections=\{VIDEO_PARAMETER_SECTIONS\}/);
+  assert.doesNotMatch(desktopApp, /setMediaEffectParams\([^)]*active_cycle_snapshot/);
+  assert.doesNotMatch(desktopApp, /当前视频周期参数待确认/);
 });
 
 test('同一渲染帧快速开启声音和画面时合并最新值，且旧响应不覆盖最新快照', async () => {
@@ -249,31 +267,19 @@ test('异步音频出口和周期提交始终从最新播放引用生成组合�
   assert.doesNotMatch(portAudioHandler, /setRuntimeVideoFilter|setSourceUrl|setActiveVideoSlot|applyPlayerSnapshot/);
 });
 
-test('关闭视频处理时不启动 mpv 周期，最终效果窗保持 Original 直播', async () => {
+test('关闭视频处理时不配置 Rust 周期，最终效果窗保持 Original 直播', async () => {
   const app = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
   const finalEffectWindow = app.slice(
     app.indexOf('function FinalEffectWindow()'),
     app.indexOf('function DesktopApp()'),
   );
-  const prepareNext = app.slice(
-    app.indexOf('function prepareNextVideoMediaCandidate()'),
-    app.indexOf('function applyPlannedVideoCycle('),
-  );
-  const applyMedia = app.slice(
-    app.indexOf('async function applyVideoProcessing('),
-    app.indexOf('function commitPreparedRealtimeVideoCandidate('),
-  );
-
-  assert.match(app, /const videoStreamActive = MPV_REALTIME_VIDEO_ENABLED[\s\S]*playbackActive[\s\S]*currentMediaIsVideo[\s\S]*videoProcessingEnabled[\s\S]*Boolean\(mediaEffectParams\)/);
-  assert.match(prepareNext, /videoEffectsEnabled:\s*plan\.payload\.videoEffectsEnabled/);
+  assert.match(app, /const videoStreamActive = MPV_REALTIME_VIDEO_ENABLED[\s\S]*playbackRequested[\s\S]*currentMediaIsVideo[\s\S]*videoProcessingEnabled[\s\S]*videoProcessingSwitchCommitted[\s\S]*Boolean\(mediaEffectParams\)/);
+  assert.match(app, /!videoProcessingEnabled[\s\S]*realtimeVideoCycleConfigurationKeyRef\.current = null/);
+  assert.match(app, /'configure_realtime_video_cycle'/);
   assert.match(finalEffectWindow, /<video[\s\S]*src=\{sourceUrl \?\? undefined\}/);
-  assert.match(applyMedia, /!MPV_REALTIME_VIDEO_ENABLED \|\| !mediaCandidate\.videoEffectsEnabled[\s\S]*releaseUnstartedCandidate\(mediaCandidate\)[\s\S]*return/);
-  assert.match(applyMedia, /prepare_realtime_video_plan/);
-  assert.doesNotMatch(applyMedia, /prepare_media_video_stream_period|video_stream|MediaSource|SourceBuffer/);
+  assert.doesNotMatch(app, /prepare_realtime_video_plan|commit_realtime_video_plan|prepareNextVideoMediaCandidate|commitPreparedRealtimeVideoCandidate/);
   assert.match(app, /function retryVideoProcessing\(\) \{\s*if \(!videoStreamActive\) return;/);
   assert.match(app, /onAction=\{videoStreamActive \? retryVideoProcessing : undefined\}/);
-  assert.doesNotMatch(applyMedia, /scope:\s*'video'/);
-  assert.doesNotMatch(applyMedia, /audio_variants|ambient_sound_path|['"]both['"]/);
 });
 
 test('Original 直播保留时钟与兜底，同时启用 mpv 实时处理调度', async () => {
@@ -326,7 +332,7 @@ test('独立音频候选复用隐藏 A/B 音频槽，并按视频绝对时钟提
   assert.doesNotMatch(activate, /commit_media_processing_if_ready|setActiveVideoSlot/);
 });
 
-test('seek 与播放时钟恢复都直接作用于 Original video', async () => {
+test('显式 seek 同时对齐画面与原声，自动恢复只作用于真实主时钟', async () => {
   const app = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
   const finalEffectWindow = app.slice(
     app.indexOf('function FinalEffectWindow()'),
@@ -342,10 +348,56 @@ test('seek 与播放时钟恢复都直接作用于 Original video', async () => 
   );
 
   assert.match(seek, /video\.currentTime = sourcePositionSeconds/);
+  assert.match(seek, /sourceAudio\.currentTime = sourcePositionSeconds/);
   assert.doesNotMatch(seek, /videoMseControllerRef|controller\.seek\(|seek_media_video_stream/);
-  assert.match(recovery, /video\.load\(\)/);
-  assert.match(recovery, /video\.currentTime = Math\.min\(Math\.max\(0, resumeAt\), safeEnd\)/);
+  assert.match(recovery, /clockMedia\.load\(\)/);
+  assert.match(recovery, /clockMedia\.currentTime = Math\.min\(Math\.max\(0, resumeAt\), safeEnd\)/);
+  assert.match(finalEffectWindow, /startPlaybackClockRecovery\(video, clockMedia, expectedIdentity, clockMedia\.currentTime\)/);
   assert.doesNotMatch(app, /read_media_video_stream_chunk|MediaSource|SourceBuffer|video_stream/);
+});
+
+test('受管视频以 mpv PTS 为唯一视频时钟，WebView 原声只跟随同步', async () => {
+  const app = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+  const finalEffectWindow = app.slice(
+    app.indexOf('function FinalEffectWindow()'),
+    app.indexOf('function DesktopApp()'),
+  );
+  const publish = finalEffectWindow.slice(
+    finalEffectWindow.indexOf('function publishMediaState()'),
+    finalEffectWindow.indexOf('function applyPlaybackMediaControl('),
+  );
+  const playbackStateEffect = finalEffectWindow.slice(
+    finalEffectWindow.indexOf("if (snapshot?.audio_processing_status !== 'failed')"),
+    finalEffectWindow.indexOf("useEffect(() => {\n    if (!snapshot || !sourceUrl) return;"),
+  );
+
+  assert.match(publish, /const sourceAudioPositionMs =/);
+  assert.match(publish, /if \(currentMediaIsVideo && managedPositionMs === null\) return/);
+  assert.match(publish, /const localPositionMs = currentMediaIsVideo[\s\S]*\? managedPositionMs \?\? 0[\s\S]*: sourceAudioPositionMs/);
+  assert.match(publish, /clock_health: currentMediaIsVideo[\s\S]*\? 'healthy'/);
+  assert.match(playbackStateEffect, /if \(!managedNativeVideoOwnsPlayback && video\.paused\)/);
+  assert.match(playbackStateEffect, /const sourcePositionSeconds = sourceAudio\.currentTime/);
+  assert.match(playbackStateEffect, /video\.currentTime = sourcePositionSeconds/);
+  assert.doesNotMatch(playbackStateEffect, /sourceAudio\.currentTime = sourcePositionSeconds/);
+  assert.match(playbackStateEffect, /managedNativeVideoOwnsPlayback,[\s\S]*processedAudioReady/);
+});
+
+test('受管视频的 PortAudio 重锚只使用 Rust 已呈现 PTS', async () => {
+  const app = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+  const resolver = app.slice(
+    app.indexOf('function resolveFinalEffectAudioSyncClock('),
+    app.indexOf('type AudioOutputDevice'),
+  );
+  const sourceSync = app.slice(
+    app.indexOf('function syncAudioOutputSourceLatest('),
+    app.indexOf('useEffect(() => {', app.indexOf('function syncAudioOutputSourceLatest(')),
+  );
+
+  assert.match(resolver, /source_media\?\.media_kind !== 'video'/);
+  assert.match(resolver, /videoBackend\.presented_pts_ms/);
+  assert.match(resolver, /videoBackend\?\.playback_generation !== snapshot\.playback_generation/);
+  assert.match(sourceSync, /resolveFinalEffectAudioSyncClock\([\s\S]*finalEffectVideoBackendStatusRef\.current/);
+  assert.doesNotMatch(sourceSync, /resolveAudioSyncClock\([\s\S]*videoRef\.current/);
 });
 
 test('播放快照不再携带旧视频文件候选与 MSE 会话', async () => {
@@ -369,7 +421,7 @@ test('候选局部时间只用于播放器内部，主窗口继续接收源媒�
 
   assert.match(publish, /current_time: positionMs \/ 1_000/);
   assert.match(publish, /duration: durationMs \/ 1_000/);
-  assert.match(publish, /const absolutePositionMs = directLoopIndex \* durationMs \+ Math\.min\(durationMs, localPositionMs\)/);
+  assert.match(publish, /buildAuthoritativePlaybackClock\(\{[\s\S]*loopIndex: currentSnapshot\?\.loop_index \?\? 0[\s\S]*positionMs: localPositionMs[\s\S]*const absolutePositionMs = sourceClock\.absolutePositionMs/);
 });
 
 test('独立声音 N+1 使用预选变体并同步 Rust 返回的实际 revision', async () => {
@@ -402,9 +454,8 @@ test('单项池源音轨原生循环，并按 Original 绝对时钟持续轻量�
 test('视频周期目标按源帧率对齐，声音周期保持原毫秒时间线', async () => {
   const app = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
 
-  assert.match(app, /alignMediaPositionToVideoFrame/);
-  assert.match(app, /function createVideoMediaCycleQueue\([\s\S]*resolveSourceBoundedVideoCycleQueueTargets/);
-  assert.match(app, /videoFuturePlansRef\.current = createVideoMediaCycleQueue\(/);
+  assert.match(app, /invoke<unknown>\('configure_realtime_video_cycle', \{ request \}\)/);
+  assert.doesNotMatch(app, /alignMediaPositionToVideoFrame|createVideoMediaCycleQueue|videoFuturePlansRef/);
   assert.match(app, /audioFuturePlansRef\.current = createMediaCycleQueue\(/);
 });
 
@@ -438,13 +489,7 @@ test('候选迟到时保持当前输出，成功提交后从最新时钟晋升 N
     app.indexOf('function commitCompletedAudioRender('),
     app.indexOf('async function flushPendingMediaApply('),
   );
-  const videoCommit = app.slice(
-    app.indexOf('function commitPreparedRealtimeVideoCandidate('),
-    app.indexOf('function commitCompletedAudioRender('),
-  );
-
   assert.doesNotMatch(scheduler, /validUntilAbsolutePositionMs|discardExpired/);
   assert.match(audioCommit, /advanceIndependentAudioQueue\([\s\S]*mediaStateRef\.current\?\.absolute_position_ms/);
-  assert.match(videoCommit, /clock\.absolute_position_ms < candidate\.timeline\.targetAbsolutePositionMs/);
-  assert.match(videoCommit, /advanceIndependentVideoQueue\(clock\.absolute_position_ms\)/);
+  assert.doesNotMatch(app, /commitPreparedRealtimeVideoCandidate|advanceIndependentVideoQueue/);
 });

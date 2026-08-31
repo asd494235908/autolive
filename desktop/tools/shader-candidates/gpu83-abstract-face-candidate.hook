@@ -1,0 +1,76 @@
+//!PARAM al_abstract_face_count
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 10.0
+0.0
+
+//!PARAM al_abstract_face_size_percent
+//!TYPE float
+//!MINIMUM 1.0
+//!MAXIMUM 10.0
+2.0
+
+//!PARAM al_abstract_face_opacity_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 30.0
+0.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive Phase 3A abstract geometric face candidate
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN al_abstract_face_count al_abstract_face_opacity_percent *
+
+float al_box_distance(vec2 point, vec2 half_extent) {
+    vec2 edge = abs(point) - half_extent;
+    return length(max(edge, vec2(0.0))) + min(max(edge.x, edge.y), 0.0);
+}
+
+vec2 al_face_center(int index) {
+    float face_index = float(index);
+    return vec2(
+        0.1 + 0.2 * mod(face_index, 5.0),
+        0.28 + 0.44 * floor(face_index / 5.0)
+    );
+}
+
+float al_face_mask(vec2 point) {
+    float outline = 1.0 - smoothstep(0.025, 0.04, abs(al_box_distance(point, vec2(0.45))));
+    float left_eye = 1.0 - smoothstep(0.04, 0.06, length(point - vec2(-0.18, -0.14)));
+    float right_eye = 1.0 - smoothstep(0.04, 0.06, length(point - vec2(0.18, -0.14)));
+    float mouth = 1.0 - smoothstep(
+        0.0,
+        0.02,
+        al_box_distance(point - vec2(0.0, 0.18), vec2(0.18, 0.025))
+    );
+    return max(max(outline, left_eye), max(right_eye, mouth));
+}
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+    int face_count = int(clamp(floor(al_abstract_face_count + 0.5), 0.0, 10.0));
+    float opacity = clamp(al_abstract_face_opacity_percent / 100.0, 0.0, 0.3);
+    if (face_count == 0 || opacity <= 0.0) {
+        return source_color;
+    }
+
+    int column = int(clamp(floor(HOOKED_pos.x * 5.0), 0.0, 4.0));
+    int row = int(clamp(floor(HOOKED_pos.y * 2.0), 0.0, 1.0));
+    int slot_index = row * 5 + column;
+    if (slot_index >= face_count) {
+        return source_color;
+    }
+
+    float face_width = clamp(al_abstract_face_size_percent / 100.0, 0.01, 0.1);
+    vec2 face_scale = vec2(face_width, face_width * HOOKED_size.x / HOOKED_size.y);
+    vec2 face_point = (HOOKED_pos - al_face_center(slot_index)) / face_scale;
+    if (any(greaterThan(abs(face_point), vec2(0.55)))) {
+        return source_color;
+    }
+
+    float mask = al_face_mask(face_point);
+    vec3 result = mix(source_color.rgb, vec3(1.0), opacity * clamp(mask, 0.0, 1.0));
+    return vec4(result, source_color.a);
+}

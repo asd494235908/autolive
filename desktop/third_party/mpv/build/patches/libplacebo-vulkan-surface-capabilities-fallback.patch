@@ -1,0 +1,20 @@
+diff --git a/src/vulkan/swapchain.c b/src/vulkan/swapchain.c
+--- a/src/vulkan/swapchain.c
++++ b/src/vulkan/swapchain.c
+@@ -573,5 +573,15 @@ static bool update_swapchain_info(struct priv *p, VkSwapchainCreateInfoKHR *info,
+     VkSurfaceCapabilities2KHR surface_caps = {
+         .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
+     };
+-    VK(vk->GetPhysicalDeviceSurfaceCapabilities2KHR(vk->physd, &surface_info, &surface_caps));
++    VkResult result = vk->GetPhysicalDeviceSurfaceCapabilities2KHR(vk->physd,
++                                                                    &surface_info,
++                                                                    &surface_caps);
++    if (result == VK_ERROR_UNKNOWN) {
++        PL_WARN(vk, "Extended surface capabilities query failed with "
++                    "VK_ERROR_UNKNOWN, retrying the basic query");
++        VK(vk->GetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physd, p->surf,
++                                                       &caps));
++        goto caps_ready;
++    }
++    VK(result);
+     caps = surface_caps.surfaceCapabilities;

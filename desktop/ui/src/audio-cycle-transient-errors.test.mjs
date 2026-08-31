@@ -184,48 +184,39 @@ test('人工重试保留另一媒体域的队列，并且只在播放时钟有�
   );
   const videoRetry = app.slice(
     app.indexOf('function retryVideoProcessing('),
-    app.indexOf('async function applyVideoProcessing('),
+    app.indexOf('useEffect(() => {', app.indexOf('function retryVideoProcessing(')),
   );
 
   assert.match(audioRetry, /if \(!audioPeriodActive\) return/);
   assert.match(audioRetry, /wakeMediaCycleScheduling\('retry'\)/);
   assert.match(videoRetry, /if \(!videoStreamActive\) return/);
-  assert.match(videoRetry, /wakeMediaCycleScheduling\('retry'\)/);
+  assert.match(videoRetry, /realtimeVideoCycleConfigurationKeyRef\.current = null/);
+  assert.match(videoRetry, /setVideoCycleConfigureRevision/);
 });
 
-test('暂停不刷新排队视频，停止会取消排队重试且不会在停止后报告处理失败', async () => {
+test('暂停与不健康 WebView 时钟只冻结音频候选，视频无前端重试队列', async () => {
   const app = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
   const activeGate = app.slice(
     app.indexOf('function isMediaProcessingPlaybackActive('),
-    app.indexOf('function initializeFutureMediaCyclePlans('),
+    app.indexOf('function initializeFutureAudioCyclePlans('),
   );
   const audioPrepare = app.slice(
     app.indexOf('async function prepareAudioMediaCandidate('),
-    app.indexOf('function prepareNextVideoMediaCandidate('),
+    app.indexOf('function applyPlannedAudioCycle('),
   );
   const playbackAction = app.slice(
     app.indexOf('async function runPlaybackAction('),
     app.indexOf('async function startPlaybackFromHome('),
   );
-  const flush = app.slice(
-    app.indexOf('async function flushPendingMediaApply('),
-    app.indexOf('async function cleanupLocalCaches('),
+  const videoConfigure = app.slice(
+    app.indexOf('// WebView 时钟只约束声音周期；视频周期由 Rust/mpv 时钟独立推进。'),
+    app.indexOf('if (!AUTO_PORTAUDIO_ENABLED', app.indexOf("invoke<unknown>('configure_realtime_video_cycle'")),
   );
-  const videoApply = app.slice(
-    app.indexOf('async function applyVideoProcessing('),
-    app.indexOf('function commitPreparedRealtimeVideoCandidate('),
-  );
-
-  assert.match(playbackAction, /action === 'stop'[\s\S]*pendingMediaApplyRef\.current = null/);
-  assert.match(flush, /snapshotRefHome\.current[\s\S]*mediaStateRef\.current/);
-  assert.match(flush, /playback_state\?\.toLowerCase\(\) !== 'playing'/);
-  assert.match(flush, /clock\.paused[\s\S]*clock\.clock_health !== 'healthy'/);
-  assert.match(flush, /if \(playbackActive\) void flushPendingMediaApply\(\)/);
+  assert.match(playbackAction, /action === 'stop'[\s\S]*clearFutureMediaCyclePlans\(\)/);
   assert.match(activeGate, /playback_state\?\.toLowerCase\(\) === 'playing'/);
   assert.match(activeGate, /clock\.playback_generation === playbackGeneration[\s\S]*!clock\.paused[\s\S]*clock\.clock_health === 'healthy'/);
   assert.match(audioPrepare, /await invokePlaybackSnapshot\('prepare_audio_media_candidate'[\s\S]*if \(!isMediaProcessingPlaybackActive\(candidate\.playbackGeneration\)\) return/);
-  assert.ok(
-    [...videoApply.matchAll(/isMediaProcessingPlaybackActive\(currentSnapshot\.playback_generation\)/g)].length >= 2,
-  );
-  assert.match(videoApply, /isVideoCandidatePlaybackActive\(mediaCandidate\)/);
+  assert.doesNotMatch(app, /videoCycleRetryRef|scheduleVideoPrepareRetry|pendingMediaApplyRef/);
+  assert.match(videoConfigure, /invoke<unknown>\('configure_realtime_video_cycle'/);
+  assert.doesNotMatch(videoConfigure, /clock_health|isMediaProcessingPlaybackActive|isVideoCandidatePlaybackActive/);
 });

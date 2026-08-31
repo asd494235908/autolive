@@ -245,6 +245,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "autolive-desktop-core"
 version = "0.1.0"
 dependencies = [
+ "autolive-native-video-host",
  "autolive-portaudio-output",
  "autolive-signalsmith-stretch",
  "cap-std",
@@ -262,6 +263,14 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-http",
  "tauri-runtime",
+ "win32job",
+]
+
+[[package]]
+name = "autolive-native-video-host"
+version = "0.1.0"
+dependencies = [
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -5303,6 +5312,16 @@ dependencies = [
  "thiserror 2.0.20",
  "windows 0.61.3",
  "windows-core 0.61.2",
+]
+
+[[package]]
+name = "win32job"
+version = "2.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c6a6724ccfbf34154a8691bd868b0fcd2be2ca3f7b47b32614654f1a01b191c"
+dependencies = [
+ "thiserror 1.0.69",
+ "windows 0.61.3",
 ]
 
 [[package]]

@@ -22,6 +22,10 @@ const GPU_UPDATE_COUNT = 200;
 const CPU4_UPDATE_COUNT = 160;
 const UPDATE_SETTLE_MS = 20;
 const MIN_FRAME_BUDGET_SAMPLES = 100;
+export const UPDATE_CONTINUITY_IPC_COMMAND_COUNT = 5;
+const MAX_UPDATE_OPTION_SNAPSHOTS = 256;
+const MAX_UPDATE_OPTION_SNAPSHOT_BYTES = 32 * 1024;
+const MAX_UPDATE_OPTION_SNAPSHOTS_BYTES = 1024 * 1024;
 const CPU4_FILTER =
   '@autolive_cpu4:lavfi=[eq@autolive_cpu4_eq=brightness=0:contrast=1:saturation=1,hue@autolive_cpu4_hue=h=0:s=1]';
 const SHADER_ERROR =
@@ -33,10 +37,44 @@ const SHADER_COMPILE =
 const VERIFIED_MPV_SOURCE_REF = '7b8915bc1d';
 const VERIFIED_MPV_VERSION_TOKEN = 'g7b8915bc1';
 const VERIFIED_MPV_SHA256 = '09dc5c350a70b536cc91015e7a856f77c933fa9d7f4c41563666e51c998a0243';
-const VERIFIED_SHADER_SHA256 = '05245e09441c9864acab8cc6c008618f120e2c5291106d242205345b93ee6848';
-const VERIFIED_SHADER_PARAMETER_COUNT = 20;
+const VERIFIED_SHADER_SHA256 = '5b426433152f898eb2174bb84893747767aa77f1eb2b310cd7db1f2c4f0a1b40';
+const VERIFIED_SHADER_PARAMETER_COUNT = 80;
 const VERIFIED_MPV_SOURCE_URL =
   `https://github.com/mpv-player/mpv/blob/${VERIFIED_MPV_SOURCE_REF}/video/out/vo_gpu_next.c`;
+const DEFAULT_MPV_IDENTITY = Object.freeze({
+  versionToken: VERIFIED_MPV_VERSION_TOKEN,
+  expectedSha256: VERIFIED_MPV_SHA256,
+  sourceRef: VERIFIED_MPV_SOURCE_REF,
+  sourceUrl: VERIFIED_MPV_SOURCE_URL,
+});
+
+export function validateMpvIdentity(identity) {
+  if (!identity || typeof identity !== 'object' || Array.isArray(identity)) {
+    throw new Error('mpv 身份无效');
+  }
+  if (typeof identity.versionToken !== 'string' || identity.versionToken.length === 0 || identity.versionToken.length > 128) {
+    throw new Error('mpv 身份版本令牌无效');
+  }
+  if (!/^[a-f0-9]{64}$/.test(identity.expectedSha256 ?? '')) {
+    throw new Error('mpv 身份 SHA-256 无效');
+  }
+  if (!/^[a-f0-9]{10,40}$/.test(identity.sourceRef ?? '')) {
+    throw new Error('mpv 身份源码提交无效');
+  }
+  if (
+    typeof identity.sourceUrl !== 'string'
+    || !identity.sourceUrl.startsWith('https://github.com/mpv-player/mpv/')
+    || !identity.sourceUrl.includes(identity.sourceRef)
+  ) {
+    throw new Error('mpv 身份源码地址无效');
+  }
+  return Object.freeze({
+    versionToken: identity.versionToken,
+    expectedSha256: identity.expectedSha256,
+    sourceRef: identity.sourceRef,
+    sourceUrl: identity.sourceUrl,
+  });
+}
 
 export const SAMPLE_SPECS = Object.freeze([
   ...[24, 25, 30, 50, 60].map((fps) =>
@@ -167,22 +205,51 @@ function passSamplesByDescription(voPasses) {
 export function observeFrameBudgetSample(voPasses) {
   const passes = Array.isArray(voPasses?.fresh) ? voPasses.fresh : [];
   if (passes.length === 0) return null;
-  const descriptions = new Set();
   let totalNs = 0;
-  for (const pass of passes) {
+  const telemetry = [];
+  for (const [index, pass] of passes.entries()) {
     if (
-      typeof pass?.desc !== 'string' || pass.desc.length === 0 || descriptions.has(pass.desc) ||
+      typeof pass?.desc !== 'string' || pass.desc.length === 0 ||
       typeof pass.last !== 'number' || !Number.isFinite(pass.last) || pass.last < 0 ||
       !Number.isSafeInteger(pass.count) || pass.count < 0 ||
       !Array.isArray(pass.samples) ||
       pass.samples.some((value) => typeof value !== 'number' || !Number.isFinite(value) || value < 0)
     ) return null;
-    descriptions.add(pass.desc);
+    telemetry.push([index, pass.desc, pass.count, pass.samples]);
     totalNs += pass.last;
   }
   return {
     totalNs,
-    passDescriptions: [...descriptions],
+    telemetryIdentity: JSON.stringify(telemetry),
+    passDescriptions: passes.map(({ desc }) => desc),
+  };
+}
+
+function validTelemetryIdentity(identity) {
+  if (typeof identity !== 'string' || identity.length === 0) return false;
+  try {
+    const passes = JSON.parse(identity);
+    return Array.isArray(passes) && passes.length > 0 && JSON.stringify(passes) === identity &&
+      passes.every((pass, index) => Array.isArray(pass) && pass.length === 4 &&
+        pass[0] === index && typeof pass[1] === 'string' && pass[1].length > 0 &&
+        Number.isSafeInteger(pass[2]) && pass[2] >= 0 && Array.isArray(pass[3]) &&
+        pass[3].every((value) => typeof value === 'number' && Number.isFinite(value) && value >= 0));
+  } catch {
+    return false;
+  }
+}
+
+export function advanceFrameBudgetObservation(previousTelemetryIdentity, observation) {
+  if (previousTelemetryIdentity !== null && !validTelemetryIdentity(previousTelemetryIdentity)) {
+    throw new Error('上一 vo-passes telemetryIdentity 无效');
+  }
+  if (observation === null) return { accepted: false, telemetryIdentity: previousTelemetryIdentity };
+  if (!validTelemetryIdentity(observation?.telemetryIdentity)) {
+    throw new Error('vo-passes telemetryIdentity 无效');
+  }
+  return {
+    accepted: observation.telemetryIdentity !== previousTelemetryIdentity,
+    telemetryIdentity: observation.telemetryIdentity,
   };
 }
 
@@ -211,13 +278,13 @@ export function buildFrameBudgetEvidence(
       return {
         status: 'unverified', sourceFps: sample.fps, frameIntervalBudgetMs,
         gpuProcessingP99TargetMs, sampleCount: count, minimumSamples,
-        reason: `参数更新期间仅采集到 ${count} 个按源帧间隔分隔的有效 vo-passes 快照，少于门禁要求的 ${minimumSamples} 帧`,
+        reason: `参数更新期间仅采集到 ${count} 份按源帧间隔分隔且相邻不重复的有效 vo-passes 统计快照，少于门禁要求的 ${minimumSamples} 份`,
       };
     }
     const timing = summarizeLatencies(observedFrameTotalsNs.map((value) => value / 1_000_000));
     return {
       status: timing.p99Ms <= gpuProcessingP99TargetMs ? 'passed' : 'failed',
-      source: 'mpv vo-passes.fresh per-frame last totals observed during parameter updates',
+      source: 'mpv vo-passes.fresh last totals from adjacent distinct telemetry snapshots during parameter updates',
       sourceFps: sample.fps,
       frameIntervalBudgetMs,
       gpuProcessingP99TargetMs,
@@ -300,21 +367,122 @@ export function buildDropFrameTimelineEvidence(samples) {
   }
   const increments = Object.fromEntries(fields.map((field) => [field, 0]));
   const resets = Object.fromEntries(fields.map((field) => [field, 0]));
+  const resetEvents = [];
   for (let index = 1; index < samples.length; index += 1) {
     for (const field of fields) {
       const previous = samples[index - 1][field];
       const current = samples[index][field];
-      if (current < previous) resets[field] += 1;
+      if (current < previous) {
+        resets[field] += 1;
+        resetEvents.push({ field, sampleIndex: index, previous, current });
+      }
       else increments[field] += current - previous;
     }
   }
   return {
-    status: fields.some((field) => increments[field] > 0) ? 'failed' : 'passed',
+    status: fields.some((field) => increments[field] > 0) || resetEvents.length > 0 ? 'failed' : 'passed',
     sampleCount: samples.length,
     increments,
     resets,
+    resetEvents,
     before: samples[0],
     after: samples.at(-1),
+  };
+}
+
+export function buildUpdatePlaybackTimelineEvidence(samples, updateCount, sample) {
+  const expectedSampleCount = Number.isSafeInteger(updateCount) && updateCount > 0
+    ? updateCount + 1
+    : null;
+  const fps = sample?.fps;
+  const sampleDurationSeconds = sample?.duration;
+  if (
+    expectedSampleCount === null || !Array.isArray(samples) ||
+    samples.length !== expectedSampleCount ||
+    !Number.isSafeInteger(fps) || fps < 1 ||
+    typeof sampleDurationSeconds !== 'number' || !Number.isFinite(sampleDurationSeconds) ||
+    samples.some(({ mediaPtsSeconds, observedAtMs } = {}) =>
+      typeof mediaPtsSeconds !== 'number' || !Number.isFinite(mediaPtsSeconds) || mediaPtsSeconds < 0 ||
+      typeof observedAtMs !== 'number' || !Number.isFinite(observedAtMs) || observedAtMs < 0)
+  ) {
+    return {
+      status: 'failed',
+      sampleCount: Array.isArray(samples) ? samples.length : 0,
+      expectedSampleCount,
+      reason: '参数更新阶段 PTS 时间线缺失、数量不符或含非法值',
+    };
+  }
+  const resetEvents = [];
+  const stagnationEvents = [];
+  const excessivePauseEvents = [];
+  const maximumNewPauseSeconds = 1 / fps;
+  for (let index = 1; index < samples.length; index += 1) {
+    const previous = samples[index - 1];
+    const current = samples[index];
+    const mediaDeltaSeconds = current.mediaPtsSeconds - previous.mediaPtsSeconds;
+    const wallDeltaSeconds = (current.observedAtMs - previous.observedAtMs) / 1_000;
+    if (wallDeltaSeconds <= 0) {
+      return {
+        status: 'failed',
+        sampleCount: samples.length,
+        expectedSampleCount,
+        reason: '参数更新阶段单调时钟未严格推进',
+      };
+    }
+    if (mediaDeltaSeconds < 0) {
+      resetEvents.push({
+        sampleIndex: index,
+        previous: previous.mediaPtsSeconds,
+        current: current.mediaPtsSeconds,
+      });
+    } else if (mediaDeltaSeconds === 0) {
+      stagnationEvents.push({ sampleIndex: index, mediaPtsSeconds: current.mediaPtsSeconds, wallDeltaSeconds });
+    }
+    const newPauseSeconds = wallDeltaSeconds - Math.max(mediaDeltaSeconds, 0);
+    if (newPauseSeconds > maximumNewPauseSeconds + 0.001) {
+      excessivePauseEvents.push({ sampleIndex: index, mediaDeltaSeconds, wallDeltaSeconds, newPauseSeconds });
+    }
+  }
+  const before = samples[0].mediaPtsSeconds;
+  const after = samples.at(-1).mediaPtsSeconds;
+  const advanced = after > before;
+  const remainingDurationSeconds = sampleDurationSeconds - after;
+  const remainingWindowPassed = remainingDurationSeconds >= 2;
+  const passed = resetEvents.length === 0 && stagnationEvents.length === 0 &&
+    excessivePauseEvents.length === 0 && advanced && remainingWindowPassed;
+  return {
+    status: passed ? 'passed' : 'failed',
+    sampleCount: samples.length,
+    expectedSampleCount,
+    before,
+    after,
+    deltaSeconds: Number((after - before).toFixed(9)),
+    monotonicNonDecreasing: resetEvents.length === 0,
+    strictlyAdvancing: stagnationEvents.length === 0,
+    advanced,
+    loopOrResetDetected: resetEvents.length > 0,
+    resetEvents,
+    stagnationEvents,
+    excessivePauseEvents,
+    maximumNewPauseSeconds,
+    observedUpdateDurationSeconds: Number(
+      ((samples.at(-1).observedAtMs - samples[0].observedAtMs) / 1_000).toFixed(9),
+    ),
+    remainingDurationSeconds: Number(remainingDurationSeconds.toFixed(9)),
+    minimumRemainingDurationSeconds: 2,
+    remainingWindowPassed,
+    reason:
+      resetEvents.length > 0
+        ? '参数更新阶段 PTS 回退，检测到跨 loop 或时间轴重置'
+        : stagnationEvents.length > 0
+          ? '参数更新阶段 PTS 停滞，不能证明画面连续推进'
+          : excessivePauseEvents.length > 0
+            ? '参数更新阶段相对单调时钟的新增停顿超过一个视频帧'
+            : !advanced
+              ? '参数更新阶段 PTS 未推进，不能证明连续播放'
+              : !remainingWindowPassed
+                ? '参数更新结束时样本剩余播放窗口不足两秒'
+                : undefined,
   };
 }
 
@@ -322,7 +490,13 @@ function compileLogLines(text) {
   return String(text).split(/\r?\n/).filter((line) => SHADER_COMPILE.test(line));
 }
 
-export function shaderCompilationEvidence(beforeUpdates, afterUpdates, sourceContractMatched = false) {
+export function shaderCompilationEvidence(
+  beforeUpdates,
+  afterUpdates,
+  sourceContractMatched = false,
+  mpvIdentity = DEFAULT_MPV_IDENTITY,
+) {
+  const identity = validateMpvIdentity(mpvIdentity);
   const beforeStreams = typeof beforeUpdates === 'string' ? { combined: beforeUpdates } : beforeUpdates;
   const afterStreams = typeof afterUpdates === 'string' ? { combined: afterUpdates } : afterUpdates;
   const streamNames = [...new Set([...Object.keys(beforeStreams), ...Object.keys(afterStreams)])];
@@ -356,8 +530,8 @@ export function shaderCompilationEvidence(beforeUpdates, afterUpdates, sourceCon
           : '日志未出现重复编译候选，但 mpv 版本不匹配已审计源码提交',
     sourceContract: {
       matched: sourceContractMatched,
-      ref: VERIFIED_MPV_SOURCE_REF,
-      url: VERIFIED_MPV_SOURCE_URL,
+      ref: identity.sourceRef,
+      url: identity.sourceUrl,
     },
   };
 }
@@ -413,6 +587,59 @@ export function buildShaderOptions(parameters, updateIndex) {
     .join(',');
 }
 
+export function validateUpdateOptionSnapshots(updateOptionSnapshots, shaderParameters = null) {
+  if (updateOptionSnapshots === null) return null;
+  if (
+    !Array.isArray(updateOptionSnapshots) || updateOptionSnapshots.length === 0 ||
+    updateOptionSnapshots.length > MAX_UPDATE_OPTION_SNAPSHOTS
+  ) throw new Error('updateOptionSnapshots 必须是非空且有界的字符串数组');
+  if (
+    !Array.isArray(shaderParameters) || shaderParameters.length === 0 ||
+    shaderParameters.some(({ name }) => typeof name !== 'string' || !/^al_[A-Za-z0-9_]+$/.test(name))
+  ) throw new Error('updateOptionSnapshots 需要非空 shaderParameters 证明完整字段集合');
+  let totalBytes = 0;
+  const expectedNames = shaderParameters.map(({ name }) => name);
+  if (new Set(expectedNames).size !== expectedNames.length) throw new Error('shaderParameters 含重复字段');
+  const expectedNameSet = new Set(expectedNames);
+  const parameterByName = new Map(shaderParameters.map((parameter) => [parameter.name, parameter]));
+  let snapshotOrder = null;
+  const snapshots = updateOptionSnapshots.map((snapshot) => {
+    if (typeof snapshot !== 'string') throw new Error('updateOptionSnapshots 只能包含字符串');
+    const bytes = Buffer.byteLength(snapshot, 'utf8');
+    totalBytes += bytes;
+    if (bytes === 0 || bytes > MAX_UPDATE_OPTION_SNAPSHOT_BYTES || !/^[\x20-\x7e]+$/.test(snapshot)) {
+      throw new Error('updateOptionSnapshots 含空值、超长值或非 ASCII 可打印字符');
+    }
+    const entries = snapshot.split(',');
+    if (entries.length === 0 || entries.length > 256) throw new Error('updateOptionSnapshots 参数数量无效');
+    const names = [];
+    const seen = new Set();
+    for (const entry of entries) {
+      const match = /^(al_[A-Za-z0-9_]+)=[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.exec(entry);
+      if (!match || seen.has(match[1])) throw new Error('updateOptionSnapshots 含非法或重复参数');
+      const value = Number(entry.slice(entry.indexOf('=') + 1));
+      const parameter = parameterByName.get(match[1]);
+      if (!Number.isFinite(value)) throw new Error('updateOptionSnapshots 含非有限参数值');
+      if (Number.isFinite(parameter?.minimum) && value < parameter.minimum
+        || Number.isFinite(parameter?.maximum) && value > parameter.maximum) {
+        throw new Error(`updateOptionSnapshots 参数越界：${match[1]}=${value}`);
+      }
+      seen.add(match[1]);
+      names.push(match[1]);
+    }
+    if (names.length !== expectedNames.length || names.some((name) => !expectedNameSet.has(name))) {
+      throw new Error('updateOptionSnapshots 必须使用完整参数集合，且精确等于 shaderParameters 字段');
+    }
+    if (snapshotOrder === null) snapshotOrder = names;
+    else if (names.some((name, index) => name !== snapshotOrder[index])) {
+      throw new Error('updateOptionSnapshots 各快照必须使用相同字段顺序');
+    }
+    return snapshot;
+  });
+  if (totalBytes > MAX_UPDATE_OPTION_SNAPSHOTS_BYTES) throw new Error('updateOptionSnapshots 总大小超过上限');
+  return snapshots;
+}
+
 const CPU4_FIELDS = Object.freeze({
   brightness_percent: Object.freeze({ minimum: -100, maximum: 100, target: 'eq@autolive_cpu4_eq', command: 'brightness', convert: (value) => value / 100 }),
   contrast_percent: Object.freeze({ minimum: 0, maximum: 200, target: 'eq@autolive_cpu4_eq', command: 'contrast', convert: (value) => value / 100 }),
@@ -466,7 +693,10 @@ export function cpu4Snapshot(index) {
   };
 }
 
-export function buildMpvArguments({ backend, mediaPath, shaderPath, pipeName, renderSize, cpu4 = false }) {
+export function buildMpvArguments({
+  backend, mediaPath, shaderPath, shaderPaths = null, pipeName, renderSize, cpu4 = false,
+  hiddenWindow = false, fullscreenWindow = false, allowNoShaderStart = false,
+}) {
   assertManagedPipe(pipeName);
   if (!['d3d11', 'vulkan', 'cpu4'].includes(backend)) throw new Error(`不支持的 mpv 后端：${backend}`);
   if (cpu4 !== (backend === 'cpu4')) throw new Error('CPU4 启动标记与后端不一致');
@@ -474,10 +704,8 @@ export function buildMpvArguments({ backend, mediaPath, shaderPath, pipeName, re
   const height = finiteNumber(renderSize?.height, 'render height', 1, 8192);
   const argumentsList = [
     '--no-config',
-    '--load-scripts=no',
     '--input-default-bindings=no',
     '--input-vo-keyboard=no',
-    '--osc=no',
     '--terminal=yes',
     '--input-terminal=no',
     '--idle=no',
@@ -491,10 +719,36 @@ export function buildMpvArguments({ backend, mediaPath, shaderPath, pipeName, re
     '--msg-level=all=warn,vo/gpu-next=info,libplacebo=info',
     `--input-ipc-server=${pipeName}`,
   ];
+  if (hiddenWindow) {
+    argumentsList.push(
+      '--focus-on=never',
+      '--show-in-taskbar=no',
+      '--border=no',
+      '--video-unscaled=yes',
+      '--hidpi-window-scale=no',
+      '--auto-window-resize=no',
+    );
+  }
+  if (fullscreenWindow) {
+    argumentsList.push('--fullscreen=yes', '--fs-screen=current');
+  }
   if (backend === 'd3d11') argumentsList.push('--gpu-api=d3d11', '--gpu-context=d3d11', '--hwdec=d3d11va');
   if (backend === 'vulkan') argumentsList.push('--gpu-api=vulkan', '--gpu-context=winvk', '--hwdec=d3d11va-copy');
   if (backend === 'cpu4') argumentsList.push('--gpu-api=d3d11', '--gpu-context=d3d11', '--hwdec=no', `--vf=${CPU4_FILTER}`);
-  if (!cpu4) argumentsList.push(`--glsl-shaders=${shaderPath}`);
+  if (!cpu4) {
+    if (shaderPaths === null) {
+      argumentsList.push(`--glsl-shaders=${shaderPath}`);
+    } else {
+      if (!Array.isArray(shaderPaths) || shaderPaths.length > 16
+        || shaderPaths.some((path) => typeof path !== 'string' || path.length === 0)) {
+        throw new Error('GPU shader 文件列表无效');
+      }
+      if (shaderPaths.length === 0 && allowNoShaderStart !== true) {
+        throw new Error('零 shader 启动必须显式启用 allowNoShaderStart');
+      }
+      argumentsList.push(...shaderPaths.map((path) => `--glsl-shader=${path}`));
+    }
+  }
   argumentsList.push('--', mediaPath);
   return argumentsList;
 }
@@ -539,9 +793,26 @@ async function runCaptured(executable, argumentsList, { timeoutMs = 30_000, maxB
   });
 }
 
-export async function generateSamples(ffmpegPath, directory, run = runCaptured) {
+export async function generateSamples(
+  ffmpegPath,
+  directory,
+  run = runCaptured,
+  sampleSpecs = SAMPLE_SPECS,
+) {
+  if (!Array.isArray(sampleSpecs) || sampleSpecs.length === 0 || sampleSpecs.length > 16) {
+    throw new Error('验收样本规格必须是非空且有界的数组');
+  }
   const samples = [];
-  for (const spec of SAMPLE_SPECS) {
+  for (const spec of sampleSpecs) {
+    if (
+      !/^[A-Za-z0-9-]+$/.test(spec?.name) ||
+      !Number.isSafeInteger(spec.width) || spec.width < 1 || spec.width > 8192 ||
+      !Number.isSafeInteger(spec.height) || spec.height < 1 || spec.height > 8192 ||
+      !Number.isSafeInteger(spec.fps) || spec.fps < 1 || spec.fps > 240 ||
+      typeof spec.duration !== 'number' || !Number.isFinite(spec.duration) ||
+      spec.duration < 0.25 || spec.duration > 60 ||
+      typeof spec.gateRole !== 'string' || spec.gateRole.length === 0 || spec.gateRole.length > 64
+    ) throw new Error('验收样本规格无效');
     const path = join(directory, `${spec.name}.mp4`);
     const argumentsList = [
       '-hide_banner', '-loglevel', 'error', '-y',
@@ -761,6 +1032,19 @@ async function dropFrameCounters(ipc) {
   };
 }
 
+async function readUpdatePlaybackPosition(ipc) {
+  const position = await optionalProperty(ipc, 'time-pos/full');
+  if (typeof position !== 'number' || !Number.isFinite(position) || position < 0) {
+    throw new Error('参数更新阶段缺少有限的 time-pos/full PTS');
+  }
+  return position;
+}
+
+async function captureUpdatePlaybackPosition(ipc) {
+  const mediaPtsSeconds = await readUpdatePlaybackPosition(ipc);
+  return { mediaPtsSeconds, observedAtMs: performance.now() };
+}
+
 function shaderFailures(stderr) {
   return stderr.split(/\r?\n/).filter((line) => SHADER_ERROR.test(line)).slice(0, 20);
 }
@@ -774,14 +1058,50 @@ export function classifyAttemptError(error) {
   return { status: unavailable ? 'unavailable' : 'failed', error: message };
 }
 
-async function runMpvAttempt({
-  mpvPath, shaderPath, sample, backend, shaderParameters, sourceContractMatched,
-  updateCount = GPU_UPDATE_COUNT,
+export function requireStableSessionPid(startPid, ipcPid, childPid, stage) {
+  if (
+    !Number.isSafeInteger(startPid) || startPid <= 0 ||
+    !Number.isSafeInteger(ipcPid) || ipcPid <= 0 ||
+    !Number.isSafeInteger(childPid) || childPid <= 0 ||
+    startPid !== ipcPid || startPid !== childPid
+  ) {
+    throw new Error(`mpv PID 在${stage}不完整或不一致：${startPid ?? 'none'}/${ipcPid ?? 'none'}/${childPid ?? 'none'}`);
+  }
+  return ipcPid;
+}
+
+export function renderTargetMatchesSample(sample, osdDimensions) {
+  return Number.isSafeInteger(sample?.width) && sample.width > 0 &&
+    Number.isSafeInteger(sample?.height) && sample.height > 0 &&
+    osdDimensions?.w === sample.width && osdDimensions?.h === sample.height;
+}
+
+export function qualifyFrameBudgetForRenderTarget(frameBudget, renderTargetMatched) {
+  if (renderTargetMatched || frameBudget.status !== 'passed') return frameBudget;
+  return {
+    ...frameBudget,
+    status: 'unverified',
+    reason: '实际渲染表面与样本分辨率不一致，原始计时样本仅供诊断，不构成全分辨率帧预算通过证据',
+  };
+}
+
+export async function runMpvAttempt({
+  mpvPath, shaderPath, shaderPaths = null, sample, backend, shaderParameters, sourceContractMatched,
+  mpvIdentity = DEFAULT_MPV_IDENTITY,
+  updateCount = GPU_UPDATE_COUNT, hiddenWindow = false, fullscreenWindow = false,
+  allowNoShaderStart = false,
+  sessionSetup = null, sessionProbe = null, updateOptionSnapshots = null,
+  requireUpdatePlaybackContinuity = false,
 }) {
+  if (sessionSetup !== null && typeof sessionSetup !== 'function') throw new Error('sessionSetup 必须是函数');
+  if (sessionProbe !== null && typeof sessionProbe !== 'function') throw new Error('sessionProbe 必须是函数');
+  if (typeof requireUpdatePlaybackContinuity !== 'boolean') throw new Error('requireUpdatePlaybackContinuity 必须是布尔值');
+  const fixedOptionSnapshots = validateUpdateOptionSnapshots(updateOptionSnapshots, shaderParameters);
   const pipeName = managedPipeName();
   const renderSize = { width: sample.width, height: sample.height };
   const argumentsList = buildMpvArguments({
-    backend, mediaPath: sample.path, shaderPath, pipeName, renderSize, cpu4: false,
+    backend, mediaPath: sample.path, shaderPath, shaderPaths, pipeName, renderSize, cpu4: false,
+    hiddenWindow, fullscreenWindow, allowNoShaderStart,
   });
   const startedAt = new Date().toISOString();
   const child = spawn(mpvPath, argumentsList, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -793,29 +1113,60 @@ async function runMpvAttempt({
     ipc = new JsonIpcClient(await connectPipe(pipeName));
     await waitForVo(ipc);
     await waitForFirstFrame(ipc);
-    const voPassesBeforeUpdates = await optionalProperty(ipc, 'vo-passes');
-    const dropsBeforeUpdates = await dropFrameCounters(ipc);
-    const dropFrameTimeline = [dropsBeforeUpdates];
-    const ipcPidBefore = await optionalProperty(ipc, 'pid');
+    const ipcPidBeforeSetup = requireStableSessionPid(
+      pid, await optionalProperty(ipc, 'pid'), child.pid ?? null, 'sessionSetup 前',
+    );
+    const sessionSetupEvidence = sessionSetup === null
+      ? null
+      : await sessionSetup({ ipc, child, pid, sample, backend });
+    const ipcPidAfterSetup = requireStableSessionPid(
+      pid, await optionalProperty(ipc, 'pid'), child.pid ?? null, 'sessionSetup 后',
+    );
     const logsBeforeUpdates = { stdout: readStdout().text, stderr: readStderr().text };
+    const ipcPidBeforeProbe = requireStableSessionPid(
+      pid, await optionalProperty(ipc, 'pid'), child.pid ?? null, 'sessionProbe 前',
+    );
+    const dropsBeforeProbe = await dropFrameCounters(ipc);
+    const sessionProbeEvidence = sessionProbe === null
+      ? null
+      : await sessionProbe({ ipc, child, pid, sample, backend });
+    const ipcPidAfterProbe = requireStableSessionPid(
+      pid, await optionalProperty(ipc, 'pid'), child.pid ?? null, 'sessionProbe 后',
+    );
+    const dropsAfterProbe = await dropFrameCounters(ipc);
+    const voPassesBeforeUpdates = await optionalProperty(ipc, 'vo-passes');
+    const dropFrameTimeline = [dropsBeforeProbe, dropsAfterProbe];
     const expectedDecoder = backend === 'd3d11' ? 'd3d11va' : 'd3d11va-copy';
     const latencies = [];
     const observedFrameTotalsNs = [];
+    let lastTelemetryIdentity = null;
     const observationSettleMs = frameObservationSettleMs(sample);
+    const updatePlaybackPositions = requireUpdatePlaybackContinuity
+      ? [await captureUpdatePlaybackPosition(ipc)]
+      : null;
     for (let index = 0; index < updateCount; index += 1) {
-      const options = buildShaderOptions(shaderParameters, index);
+      const options = fixedOptionSnapshots === null
+        ? buildShaderOptions(shaderParameters, index)
+        : fixedOptionSnapshots[index % fixedOptionSnapshots.length];
       const start = performance.now();
       await ipc.send(['set_property', 'glsl-shader-opts', options]);
       latencies.push(performance.now() - start);
       if (child.exitCode !== null || child.signalCode !== null || child.pid !== pid) throw new Error('mpv 在参数更新期间重启或退出');
       await sleep(observationSettleMs);
       const observation = observeFrameBudgetSample(await optionalProperty(ipc, 'vo-passes'));
-      if (observation) observedFrameTotalsNs.push(observation.totalNs);
+      const advancement = advanceFrameBudgetObservation(lastTelemetryIdentity, observation);
+      lastTelemetryIdentity = advancement.telemetryIdentity;
+      if (advancement.accepted) observedFrameTotalsNs.push(observation.totalNs);
       dropFrameTimeline.push(await dropFrameCounters(ipc));
+      if (updatePlaybackPositions !== null) {
+        updatePlaybackPositions.push(await captureUpdatePlaybackPosition(ipc));
+      }
     }
     await sleep(100);
     const decoder = await optionalProperty(ipc, 'hwdec-current');
-    const ipcPidAfter = await optionalProperty(ipc, 'pid');
+    const ipcPidAfter = requireStableSessionPid(
+      pid, await optionalProperty(ipc, 'pid'), child.pid ?? null, '参数更新后',
+    );
     const sourceVideoParams = await optionalProperty(ipc, 'video-params');
     const outputVideoParams = await optionalProperty(ipc, 'video-out-params');
     const osdDimensions = await optionalProperty(ipc, 'osd-dimensions');
@@ -841,72 +1192,103 @@ async function runMpvAttempt({
       logsBeforeUpdates,
       { stdout: stdout.text, stderr: stderr.text },
       sourceContractMatched,
+      mpvIdentity,
     );
     const frameBudget = buildFrameBudgetEvidence(
       sample, voPasses, voPassesBeforeUpdates, MIN_FRAME_BUDGET_SAMPLES, observedFrameTotalsNs,
     );
     const dropFrames = buildDropFrameTimelineEvidence(dropFrameTimeline);
-    const pidUnchanged =
-      pid !== null && child.pid === pid &&
-      (ipcPidBefore === null || ipcPidBefore === pid) &&
-      (ipcPidAfter === null || ipcPidAfter === pid);
+    const updatePlaybackTimeline = updatePlaybackPositions === null
+      ? null
+      : buildUpdatePlaybackTimelineEvidence(updatePlaybackPositions, updateCount, sample);
+    const pidUnchanged = [ipcPidBeforeSetup, ipcPidAfterSetup, ipcPidBeforeProbe, ipcPidAfterProbe, ipcPidAfter]
+      .every((value) => value === pid) && child.pid === pid;
+    const renderTargetMatched = renderTargetMatchesSample(sample, osdDimensions);
+    const frameBudgetEvidence = qualifyFrameBudgetForRenderTarget(frameBudget, renderTargetMatched);
     const validationErrors = [];
     if (!voConfigured) validationErrors.push('更新后 vo-configured 不为 true');
     if (stdout.overflow || stderr.overflow) validationErrors.push('mpv stdout/stderr 超过有界捕获上限');
     if (failures.length > 0) validationErrors.push(`检测到 shader/hook 错误：${failures.join(' | ')}`);
-    if (!pidUnchanged) validationErrors.push(`mpv PID 在更新期间发生变化：${pid}/${ipcPidBefore} -> ${child.pid}/${ipcPidAfter}`);
+    if (!pidUnchanged) {
+      validationErrors.push(
+        `mpv PID 证据链不一致：start=${pid}，beforeSetup=${ipcPidBeforeSetup}，afterSetup=${ipcPidAfterSetup}，beforeProbe=${ipcPidBeforeProbe}，afterProbe=${ipcPidAfterProbe}，afterUpdates=${ipcPidAfter}，child=${child.pid ?? 'none'}`,
+      );
+    }
     if (sourceVideoParams?.w !== sample.width || sourceVideoParams?.h !== sample.height) {
       validationErrors.push(`源分辨率证据不符：期望 ${sample.width}x${sample.height}，实际 ${sourceVideoParams?.w ?? 'unknown'}x${sourceVideoParams?.h ?? 'unknown'}`);
     }
-    if (frameBudget.status === 'failed') validationErrors.push(`GPU 帧预算未通过：P99 ${frameBudget.timing?.p99Ms}ms`);
+    if (!renderTargetMatched) {
+      validationErrors.push(`渲染表面分辨率证据不符：期望 ${sample.width}x${sample.height}，实际 ${osdDimensions?.w ?? 'unknown'}x${osdDimensions?.h ?? 'unknown'}`);
+    }
+    if (frameBudgetEvidence.status === 'failed') validationErrors.push(`GPU 帧预算未通过：P99 ${frameBudgetEvidence.timing?.p99Ms}ms`);
     if (dropFrames.status === 'failed') validationErrors.push('参数更新期间出现视频输出或解码器丢帧');
+    if (updatePlaybackTimeline?.status !== undefined && updatePlaybackTimeline.status !== 'passed') {
+      validationErrors.push(updatePlaybackTimeline.reason ?? '参数更新阶段 PTS 连续性未通过');
+    }
     if (decoder !== expectedDecoder) validationErrors.push(`${backend} 未使用要求的 ${expectedDecoder}，实际为 ${decoder ?? 'none'}`);
-    const unverified = frameBudget.status === 'unverified' || dropFrames.status === 'unverified' || compilation.status === 'unverified';
+    const unverified = frameBudgetEvidence.status === 'unverified' || dropFrames.status === 'unverified' || compilation.status === 'unverified';
     return {
       status: validationErrors.length > 0 || compilation.status === 'failed' ? 'failed' : unverified ? 'unverified' : 'passed',
       error: validationErrors.length > 0 ? validationErrors.join('；') : undefined,
       validationErrors,
       backend, sample: sample.name, sampleGateRole: sample.gateRole, startedAt,
-      pidBefore: pid, pidAfter: child.pid ?? null, ipcPidBefore, ipcPidAfter, pidUnchanged,
+      pidBefore: pid, pidAfter: child.pid ?? null,
+      ipcPidBeforeSetup, ipcPidAfterSetup, ipcPidBeforeProbe, ipcPidAfterProbe, ipcPidAfter, pidUnchanged,
       updateLatency: summarizeLatencies(latencies), evidence,
       resolutionEvidence: {
-        source: { expectedWidth: sample.width, expectedHeight: sample.height, actualWidth: sourceVideoParams.w, actualHeight: sourceVideoParams.h },
+        source: {
+          expectedWidth: sample.width,
+          expectedHeight: sample.height,
+          actualWidth: sourceVideoParams?.w ?? null,
+          actualHeight: sourceVideoParams?.h ?? null,
+        },
         decodedOutput: outputVideoParams,
         windowRenderTarget: {
           requested: renderSize,
           actual: osdDimensions,
-          matched: osdDimensions?.w === sample.width && osdDimensions?.h === sample.height,
+          matched: renderTargetMatched,
         },
-        fullResolutionRenderBudget:
-          osdDimensions?.w === sample.width && osdDimensions?.h === sample.height ? 'measured' : 'not_measured',
+        fullResolutionRenderBudget: renderTargetMatched ? 'measured' : 'unverified',
         note:
-          osdDimensions?.w === sample.width && osdDimensions?.h === sample.height
+          renderTargetMatched
             ? '源帧与窗口渲染目标均为样本分辨率'
-            : '窗口受当前显示器工作区限制；vo-passes 仍覆盖源分辨率 MAIN hook 与实际窗口缩放，但不冒充同分辨率显示输出',
+            : '实际窗口渲染目标与样本分辨率不一致，本次帧预算不得通过',
       },
-      frameBudgetEvidence: frameBudget,
+      frameBudgetEvidence,
       dropFrameEvidence: dropFrames,
+      updatePlaybackTimelineEvidence: updatePlaybackTimeline,
       shaderCompilationEvidence: compilation,
+      sessionSetupEvidence,
+      sessionProbeEvidence,
+      updateOptionSnapshotCount: fixedOptionSnapshots?.length ?? null,
       shaderParameterCount: shaderParameters.length, stdoutBytes: stdout.bytes, stderrBytes: stderr.bytes,
       stderrShaderErrors: stderrFailures, shaderErrors: failures,
     };
   } catch (error) {
+    const stdout = readStdout();
     const stderr = readStderr();
     return {
       ...classifyAttemptError(error), backend, sample: sample.name, startedAt, pidBefore: pid, pidAfter: child.pid ?? null,
-      pidUnchanged: pid !== null && child.pid === pid, stderrBytes: stderr.bytes, stderrOverflow: stderr.overflow,
-      shaderErrors: shaderFailures(stderr.text), stderrTail: stderr.text.split(/\r?\n/).filter(Boolean).slice(-20),
+      pidUnchanged: false,
+      stdoutBytes: stdout.bytes, stdoutOverflow: stdout.overflow,
+      stdoutTail: stdout.text.split(/\r?\n/).filter(Boolean).slice(-20),
+      stderrBytes: stderr.bytes, stderrOverflow: stderr.overflow,
+      stderrTail: stderr.text.split(/\r?\n/).filter(Boolean).slice(-20),
+      shaderErrors: shaderFailures(`${stdout.text}\n${stderr.text}`),
     };
   } finally {
     await terminateMpv(child, ipc);
   }
 }
 
-async function runCpu4Attempt({ mpvPath, sample, updateCount = CPU4_UPDATE_COUNT }) {
+async function runCpu4Attempt({
+  mpvPath, sample, updateCount = CPU4_UPDATE_COUNT, hiddenWindow = false, fullscreenWindow = false,
+}) {
   const pipeName = managedPipeName();
   const renderSize = { width: sample.width, height: sample.height };
   const argumentsList = buildMpvArguments({
     backend: 'cpu4', mediaPath: sample.path, shaderPath: '', pipeName, renderSize, cpu4: true,
+    hiddenWindow, fullscreenWindow,
   });
   const child = spawn(mpvPath, argumentsList, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   const readStdout = boundedOutputCollector(child.stdout);
@@ -923,6 +1305,7 @@ async function runCpu4Attempt({ mpvPath, sample, updateCount = CPU4_UPDATE_COUNT
     const ipcPidBefore = await optionalProperty(ipc, 'pid');
     const latencies = [];
     const observedFrameTotalsNs = [];
+    let lastTelemetryIdentity = null;
     const observationSettleMs = frameObservationSettleMs(sample);
     let transientCommandRetries = 0;
     for (let index = 0; index < updateCount; index += 1) {
@@ -935,7 +1318,9 @@ async function runCpu4Attempt({ mpvPath, sample, updateCount = CPU4_UPDATE_COUNT
       if (child.exitCode !== null || child.signalCode !== null || child.pid !== pid) throw new Error('mpv 在 CPU4 更新期间重启或退出');
       await sleep(observationSettleMs);
       const observation = observeFrameBudgetSample(await optionalProperty(ipc, 'vo-passes'));
-      if (observation) observedFrameTotalsNs.push(observation.totalNs);
+      const advancement = advanceFrameBudgetObservation(lastTelemetryIdentity, observation);
+      lastTelemetryIdentity = advancement.telemetryIdentity;
+      if (advancement.accepted) observedFrameTotalsNs.push(observation.totalNs);
       dropFrameTimeline.push(await dropFrameCounters(ipc));
     }
     await sleep(100);
@@ -945,12 +1330,17 @@ async function runCpu4Attempt({ mpvPath, sample, updateCount = CPU4_UPDATE_COUNT
     const ipcPidAfter = await optionalProperty(ipc, 'pid');
     const voConfigured = (await ipc.send(['get_property', 'vo-configured'])).data === true;
     const currentVo = await optionalProperty(ipc, 'current-vo');
+    const sourceVideoParams = await optionalProperty(ipc, 'video-params');
+    const outputVideoParams = await optionalProperty(ipc, 'video-out-params');
+    const osdDimensions = await optionalProperty(ipc, 'osd-dimensions');
     const stdout = readStdout();
     const stderr = readStderr();
     const filterErrors = `${stdout.text}\n${stderr.text}`.split(/\r?\n/).filter((line) => CPU4_ERROR.test(line)).slice(0, 20);
-    const frameBudget = buildFrameBudgetEvidence(
+    const rawFrameBudget = buildFrameBudgetEvidence(
       sample, voPasses, voPassesBeforeUpdates, MIN_FRAME_BUDGET_SAMPLES, observedFrameTotalsNs,
     );
+    const renderTargetMatched = renderTargetMatchesSample(sample, osdDimensions);
+    const frameBudget = qualifyFrameBudgetForRenderTarget(rawFrameBudget, renderTargetMatched);
     const dropFrames = buildDropFrameTimelineEvidence(dropFrameTimeline);
     const pidUnchanged =
       pid !== null && child.pid === pid &&
@@ -961,6 +1351,12 @@ async function runCpu4Attempt({ mpvPath, sample, updateCount = CPU4_UPDATE_COUNT
     if (!pidUnchanged) validationErrors.push(`CPU4 mpv PID 在更新期间发生变化：${pid}/${ipcPidBefore} -> ${child.pid}/${ipcPidAfter}`);
     if (stdout.overflow || stderr.overflow) validationErrors.push('CPU4 mpv stdout/stderr 超过有界捕获上限');
     if (filterErrors.length > 0) validationErrors.push(`检测到 CPU4 滤镜错误：${filterErrors.join(' | ')}`);
+    if (sourceVideoParams?.w !== sample.width || sourceVideoParams?.h !== sample.height) {
+      validationErrors.push(`CPU4 源分辨率证据不符：期望 ${sample.width}x${sample.height}，实际 ${sourceVideoParams?.w ?? 'unknown'}x${sourceVideoParams?.h ?? 'unknown'}`);
+    }
+    if (!renderTargetMatched) {
+      validationErrors.push(`CPU4 渲染表面分辨率证据不符：期望 ${sample.width}x${sample.height}，实际 ${osdDimensions?.w ?? 'unknown'}x${osdDimensions?.h ?? 'unknown'}`);
+    }
     if (frameBudget.status === 'failed') validationErrors.push(`CPU4 帧预算未通过：P99 ${frameBudget.timing?.p99Ms}ms`);
     if (dropFrames.status === 'failed') validationErrors.push('CPU4 参数更新期间出现视频输出或解码器丢帧');
     const unverified = frameBudget.status === 'unverified' || dropFrames.status === 'unverified';
@@ -973,14 +1369,29 @@ async function runCpu4Attempt({ mpvPath, sample, updateCount = CPU4_UPDATE_COUNT
       updateCount, commandsPerUpdate: 4, filter: CPU4_FILTER, voConfigured, currentVo, firstFrameTimePos,
       transientCommandRetries,
       filterErrors, stdoutBytes: stdout.bytes, stderrBytes: stderr.bytes,
+      resolutionEvidence: {
+        source: {
+          expectedWidth: sample.width,
+          expectedHeight: sample.height,
+          actualWidth: sourceVideoParams?.w ?? null,
+          actualHeight: sourceVideoParams?.h ?? null,
+        },
+        decodedOutput: outputVideoParams,
+        windowRenderTarget: { requested: renderSize, actual: osdDimensions, matched: renderTargetMatched },
+        fullResolutionRenderBudget: renderTargetMatched ? 'measured' : 'unverified',
+      },
       frameBudgetEvidence: frameBudget,
       dropFrameEvidence: dropFrames,
     };
   } catch (error) {
+    const stdout = readStdout();
     const stderr = readStderr();
     return {
       ...classifyAttemptError(error), backend: 'cpu4', sample: sample.name, pidBefore: pid, pidAfter: child.pid ?? null,
-      pidUnchanged: pid !== null && child.pid === pid, stderrBytes: stderr.bytes, stderrOverflow: stderr.overflow,
+      pidUnchanged: pid !== null && child.pid === pid,
+      stdoutBytes: stdout.bytes, stdoutOverflow: stdout.overflow,
+      stdoutTail: stdout.text.split(/\r?\n/).filter(Boolean).slice(-20),
+      stderrBytes: stderr.bytes, stderrOverflow: stderr.overflow,
       stderrTail: stderr.text.split(/\r?\n/).filter(Boolean).slice(-20),
     };
   } finally {
@@ -988,7 +1399,8 @@ async function runCpu4Attempt({ mpvPath, sample, updateCount = CPU4_UPDATE_COUNT
   }
 }
 
-async function versionEvidence(paths) {
+export async function versionEvidence(paths, mpvIdentity = DEFAULT_MPV_IDENTITY) {
+  const identity = validateMpvIdentity(mpvIdentity);
   const [mpv, ffmpeg, ffmpegLicense, mpvSha256] = await Promise.all([
     runCaptured(paths.mpv, ['--version'], { timeoutMs: 10_000 }),
     runCaptured(paths.ffmpeg, ['-version'], { timeoutMs: 10_000 }),
@@ -996,8 +1408,8 @@ async function versionEvidence(paths) {
     sha256File(paths.mpv),
   ]);
   const mpvLines = mpv.split(/\r?\n/).slice(0, 12);
-  const versionMatched = mpvLines[0]?.includes(VERIFIED_MPV_VERSION_TOKEN) === true;
-  const binaryMatched = mpvSha256 === VERIFIED_MPV_SHA256;
+  const versionMatched = mpvLines[0]?.includes(identity.versionToken) === true;
+  const binaryMatched = mpvSha256 === identity.expectedSha256;
   return {
     mpv: mpvLines,
     ffmpeg: ffmpeg.split(/\r?\n/).slice(0, 12),
@@ -1008,9 +1420,9 @@ async function versionEvidence(paths) {
       status: versionMatched && binaryMatched ? 'matched' : 'unverified',
       versionMatched,
       binaryMatched,
-      expectedSha256: VERIFIED_MPV_SHA256,
-      ref: VERIFIED_MPV_SOURCE_REF,
-      url: VERIFIED_MPV_SOURCE_URL,
+      expectedSha256: identity.expectedSha256,
+      ref: identity.sourceRef,
+      url: identity.sourceUrl,
       evidence: '该提交按路径缓存 user hook、原位更新参数，并在播放中保留 renderer cache',
     },
   };
@@ -1024,9 +1436,34 @@ export function finalReportStatus(attempts) {
   return 'unavailable';
 }
 
-export async function runPhase1Gate({ paths = DEFAULT_PATHS, updateCount = GPU_UPDATE_COUNT } = {}) {
+export function maximumValidatedResolutionClaim(status, attempts) {
+  const gpuAttempts = attempts.filter(({ backend }) => backend !== 'cpu4');
+  const sourceMatches = (attempt) => {
+    const source = attempt.resolutionEvidence?.source;
+    return Number.isSafeInteger(source?.expectedWidth) && source.expectedWidth > 0 &&
+      Number.isSafeInteger(source?.expectedHeight) && source.expectedHeight > 0 &&
+      source.actualWidth === source.expectedWidth && source.actualHeight === source.expectedHeight;
+  };
+  return status === 'passed' && gpuAttempts.length > 0 &&
+    gpuAttempts.every((attempt) =>
+      attempt.resolutionEvidence?.windowRenderTarget?.matched === true && sourceMatches(attempt)) &&
+    gpuAttempts.some((attempt) =>
+      attempt.resolutionEvidence?.source?.expectedWidth === 1920 &&
+      attempt.resolutionEvidence.source.expectedHeight === 1080)
+    ? '1920x1080'
+    : null;
+}
+
+export async function runPhase1Gate({
+  paths = DEFAULT_PATHS,
+  updateCount = GPU_UPDATE_COUNT,
+  mpvIdentity = DEFAULT_MPV_IDENTITY,
+  fullscreenWindow = false,
+} = {}) {
   if (process.platform !== 'win32') throw new Error('Phase 1 实机门禁只支持 Windows');
   if (!Number.isSafeInteger(updateCount) || updateCount <= 0) throw new Error('GPU 更新次数无效');
+  if (typeof fullscreenWindow !== 'boolean') throw new Error('fullscreenWindow 必须是布尔值');
+  const identity = validateMpvIdentity(mpvIdentity);
   await Promise.all([
     assertRegularFile(paths.ffmpeg, 'ffmpeg'),
     assertRegularFile(paths.mpv, 'mpv'),
@@ -1046,7 +1483,7 @@ export async function runPhase1Gate({ paths = DEFAULT_PATHS, updateCount = GPU_U
     status: 'failed',
   };
   try {
-    report.versions = await versionEvidence(paths);
+    report.versions = await versionEvidence(paths, identity);
     const sourceContractMatched = report.versions.mpvSourceContract.status === 'matched';
     const shaderSource = await readFile(paths.shader, 'utf8');
     const shaderParameters = parseShaderParameters(shaderSource);
@@ -1059,14 +1496,21 @@ export async function runPhase1Gate({ paths = DEFAULT_PATHS, updateCount = GPU_U
       for (const backend of ['d3d11', 'vulkan']) {
         report.attempts.push(await runMpvAttempt({
           mpvPath: paths.mpv, shaderPath: paths.shader, sample, backend, shaderParameters,
-          sourceContractMatched, updateCount,
+          sourceContractMatched, mpvIdentity: identity, updateCount,
+          hiddenWindow: fullscreenWindow, fullscreenWindow,
         }));
       }
     }
     const cpuSample = report.samples.find(({ name }) => name === '1080p-60fps') ?? report.samples[0];
-    report.attempts.push(await runCpu4Attempt({ mpvPath: paths.mpv, sample: cpuSample }));
+    report.attempts.push(await runCpu4Attempt({
+      mpvPath: paths.mpv,
+      sample: cpuSample,
+      hiddenWindow: fullscreenWindow,
+      fullscreenWindow,
+    }));
+    report.status = finalReportStatus(report.attempts);
     report.claims = {
-      maximumValidatedResolution: '1920x1080',
+      maximumValidatedResolution: maximumValidatedResolutionClaim(report.status, report.attempts),
       perFrameBudget:
         report.attempts.filter(({ backend }) => backend !== 'cpu4').every(({ frameBudgetEvidence }) => frameBudgetEvidence?.status === 'passed')
           ? 'passed'
@@ -1078,7 +1522,6 @@ export async function runPhase1Gate({ paths = DEFAULT_PATHS, updateCount = GPU_U
       operationalGpuUpdatesCompleted:
         report.attempts.filter(({ backend }) => backend !== 'cpu4').every(({ updateLatency }) => updateLatency?.count === updateCount),
     };
-    report.status = finalReportStatus(report.attempts);
     report.finishedAt = new Date().toISOString();
     return report;
   } finally {

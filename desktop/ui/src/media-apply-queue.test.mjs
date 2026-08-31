@@ -79,49 +79,18 @@ test('暂停、停止或旧代次门禁阻止刷新时保留 pending，恢复后
   assert.equal(pendingRef.current, null);
 });
 
-test('App 在两种异步完成顺序都触发刷新，且不使用 React busy state 互斥', async () => {
+test('App 不再维护视频 apply queue，音频候选仍独立提交', async () => {
   const app = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
-  const apply = app.slice(
-    app.indexOf('async function applyVideoProcessing('),
-    app.indexOf('function commitPreparedRealtimeVideoCandidate('),
-  );
-  const commit = app.slice(
-    app.indexOf('function commitPreparedRealtimeVideoCandidate('),
-    app.indexOf('useEffect(() => {', app.indexOf('function commitPreparedRealtimeVideoCandidate(')),
-  );
-  const flush = app.slice(
-    app.indexOf('async function flushPendingMediaApply('),
-    app.indexOf('async function cleanupLocalCaches('),
-  );
-
-  assert.match(apply, /mediaApplyInFlightRef\.current = false;[\s\S]*flushPendingMediaApply\(\)/);
-  assert.match(commit, /realtimeVideoCommitInFlightRef\.current = false;[\s\S]*flushPendingMediaApply\(\)/);
-  assert.doesNotMatch(flush, /mediaProcessingBusy/);
+  assert.doesNotMatch(app, /mediaApplyInFlightRef|realtimeVideoCommitInFlightRef|flushPendingMediaApply/);
+  assert.match(app, /prepareNextAudioMediaCandidate/);
+  assert.match(app, /commitCompletedAudioRender/);
 });
 
-test('视频 prepare 瞬时失败使用有界退避，暂停停止与换代会取消旧重试', async () => {
+test('视频周期配置幂等重试，不再保留 WebView prepare 退避', async () => {
   const app = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
-  const videoApply = app.slice(
-    app.indexOf('async function applyVideoProcessing('),
-    app.indexOf('function commitPreparedRealtimeVideoCandidate('),
-  );
-  const realtimeCommit = app.slice(
-    app.indexOf('function commitPreparedRealtimeVideoCandidate('),
-    app.indexOf('useEffect(() => {', app.indexOf('function commitPreparedRealtimeVideoCandidate(')),
-  );
-  const clearVideoPlans = app.slice(
-    app.indexOf('function clearVideoFutureMediaCyclePlans('),
-    app.indexOf('function videoRenderIdentity('),
-  );
-
-  assert.match(videoApply, /scheduleVideoPrepareRetry\(params, mediaCandidate\)/);
-  assert.match(realtimeCommit, /scheduleVideoPrepareRetry\(candidate\.params, candidate\)/);
-  assert.doesNotMatch(realtimeCommit, /FFmpeg 回退/);
-  assert.doesNotMatch(videoApply, /setTimeout\(\(\) => void flushPendingMediaApply\(\), 250\)/);
-  assert.match(clearVideoPlans, /resetVideoPrepareRetry\(\)/);
-  assert.match(clearVideoPlans, /pendingMediaApplyRef\.current = null/);
-  assert.match(app, /if \(!playbackActive\) cancelVideoPrepareRetry\(\)/);
-  assert.match(app, /videoCycleRetryRef\.current = recordCycleRetryFailure/);
+  assert.match(app, /realtimeVideoCycleConfigurationKeyRef/);
+  assert.match(app, /setVideoCycleConfigureRevision/);
+  assert.doesNotMatch(app, /scheduleVideoPrepareRetry|videoCycleRetryRef|pendingMediaApplyRef/);
 });
 
 test('当前普通声音链不再调用实时话术候选 commit 命令', async () => {

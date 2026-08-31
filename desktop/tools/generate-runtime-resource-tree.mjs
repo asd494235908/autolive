@@ -1,15 +1,35 @@
-import { closeSync, cpSync, mkdirSync, openSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { readDesktopVersion } from './desktop-version.mjs';
+import {
+  assertExactRegularFileTree,
+  commitStagedPaths,
+  temporarySiblingPath,
+  validatePreparedMpvRuntimeRelease,
+  validatePreparedMpvRuntimeFiles,
+  WINDOWS_PREPARED_FILES,
+  WINDOWS_TARGET,
+} from './mpv-runtime-release.mjs';
 
 const desktopRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const supportedTargets = new Set([
   'x86_64-apple-darwin',
   'aarch64-apple-darwin',
-  'x86_64-pc-windows-msvc',
+  WINDOWS_TARGET,
 ]);
 
 export const RESOURCE_RELEASE = readDesktopVersion().release;
@@ -29,9 +49,7 @@ function detectTargetTriple() {
   if (process.platform === 'darwin') {
     return process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin';
   }
-  if (process.platform === 'win32' && process.arch === 'x64') {
-    return 'x86_64-pc-windows-msvc';
-  }
+  if (process.platform === 'win32' && process.arch === 'x64') return WINDOWS_TARGET;
   return null;
 }
 
@@ -85,31 +103,42 @@ function releaseFiles(root, executable, componentRoot = root) {
   return files;
 }
 
-function copyComponentFiles({ target, sourceRoot, outputRoot }) {
-  const releaseRoot = join(outputRoot, 'autolive-resources', RESOURCE_RELEASE);
-  const components = [
-    { name: 'binaries', scope: target, executable: true, component: 'media' },
-  ];
-
-  rmSync(releaseRoot, { recursive: true, force: true });
-  return components.flatMap(({ name, scope, executable, component }) => {
-    const source = join(sourceRoot, name);
-    const destination = join(releaseRoot, scope, name);
-    cpSync(source, destination, { recursive: true, dereference: true });
-    removeReleaseExcludedEntries(destination);
-    return releaseFiles(destination, executable).map((file) => ({
-      ...file,
-      component,
-      relative_path: `${scope}/${name}/${file.relative_path}`,
-    }));
-  });
+function sameCopiedFiles(sourceFiles, copiedFiles) {
+  const identity = (files) => files
+    .map(({ relative_path, size_bytes, sha256 }) => ({ relative_path, size_bytes, sha256 }))
+    .sort((left, right) => left.relative_path.localeCompare(right.relative_path));
+  if (JSON.stringify(identity(sourceFiles)) !== JSON.stringify(identity(copiedFiles))) {
+    throw new Error('Windows 运行资源 staging 的文件集、大小或 SHA-256 与准备树不一致');
+  }
 }
 
-function writeJsonAtomically(path, value) {
+function copyComponentFiles({ target, sourceRoot, releaseRoot }) {
+  const source = join(sourceRoot, 'binaries');
+  const destination = join(releaseRoot, target, 'binaries');
+  const sourceFiles = target === WINDOWS_TARGET ? releaseFiles(source, true) : null;
+  cpSync(source, destination, { recursive: true, dereference: true });
+  if (target !== WINDOWS_TARGET) removeReleaseExcludedEntries(destination);
+  const copied = releaseFiles(destination, true).map((file) => ({
+    ...file,
+    executable: !file.relative_path.startsWith('licenses/'),
+    component: 'media',
+    relative_path: `${target}/binaries/${file.relative_path}`,
+  }));
+  if (sourceFiles !== null) {
+    sameCopiedFiles(
+      sourceFiles,
+      copied.map((file) => ({
+        ...file,
+        relative_path: file.relative_path.slice(`${target}/binaries/`.length),
+      })),
+    );
+  }
+  return copied;
+}
+
+function writeJson(path, value) {
   mkdirSync(dirname(path), { recursive: true });
-  const temporaryPath = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`);
-  renameSync(temporaryPath, path);
+  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function writeDeploymentInventory(scopeRoot, scope) {
@@ -123,53 +152,90 @@ function writeDeploymentInventory(scopeRoot, scope) {
     }))
     .sort((left, right) => left.relative_path.localeCompare(right.relative_path));
   const inventory = { schema: 1, release: RESOURCE_RELEASE, scope, files };
-  writeJsonAtomically(join(scopeRoot, DEPLOY_INVENTORY), inventory);
+  writeJson(join(scopeRoot, DEPLOY_INVENTORY), inventory);
   return inventory;
 }
 
-function stageEmbeddedResourceTree({ releaseRoot, sourceRoot, target }) {
-  const embeddedRoot = join(sourceRoot, EMBEDDED_RESOURCE_DIRECTORY);
-  rmSync(embeddedRoot, { recursive: true, force: true });
-  mkdirSync(embeddedRoot, { recursive: true });
-  cpSync(join(releaseRoot, target), join(embeddedRoot, target), {
-    recursive: true,
-    dereference: true,
-  });
-  return embeddedRoot;
+function stageEmbeddedResourceTree({ releaseRoot, embeddedRoot, target }) {
+  mkdirSync(join(embeddedRoot, target), { recursive: true });
+  cpSync(
+    join(releaseRoot, target, 'binaries'),
+    join(embeddedRoot, target, 'binaries'),
+    { recursive: true, dereference: true },
+  );
 }
 
-export function buildRuntimeResourceRelease({
+export async function buildRuntimeResourceRelease({
   target = process.env.AUTOLIVE_TARGET_TRIPLE || detectTargetTriple(),
   sourceRoot = join(desktopRoot, 'src-tauri'),
   outputRoot = join(desktopRoot, 'resource-release'),
   manifestPath = join(desktopRoot, 'src-tauri', 'runtime-resources.json'),
+  mpvSourceRoot = resolve(
+    process.env.AUTOLIVE_MPV_SOURCE_DIR ?? join(desktopRoot, 'third_party', 'mpv'),
+  ),
+  mpvReleaseGate = validatePreparedMpvRuntimeRelease,
+  supplyGate,
 } = {}) {
   assertSupportedTarget(target);
-  const files = copyComponentFiles({ target, sourceRoot, outputRoot });
-  const manifest = {
-    schema_version: 1,
-    release: RESOURCE_RELEASE,
-    target,
-    base_url: RESOURCE_BASE_URL,
-    files: files.sort((left, right) => left.relative_path.localeCompare(right.relative_path)),
-  };
-  writeJsonAtomically(manifestPath, manifest);
+  const binariesRoot = join(sourceRoot, 'binaries');
+  let mpvRelease = null;
+  if (target === WINDOWS_TARGET) {
+    assertExactRegularFileTree(binariesRoot, WINDOWS_PREPARED_FILES, 'Windows 准备运行资源树');
+    mpvRelease = await mpvReleaseGate({
+      binariesRoot,
+      mpvSourceRoot,
+      target,
+      mode: 'release',
+      supplyGate,
+    });
+  }
+
   const releaseRoot = join(outputRoot, 'autolive-resources', RESOURCE_RELEASE);
-  const embeddedRoot = stageEmbeddedResourceTree({ releaseRoot, sourceRoot, target });
-  writeDeploymentInventory(join(releaseRoot, target), target);
-  return { manifestPath, releaseRoot, embeddedRoot, manifest };
+  const embeddedRoot = join(sourceRoot, EMBEDDED_RESOURCE_DIRECTORY);
+  const releaseStage = temporarySiblingPath(releaseRoot);
+  const embeddedStage = temporarySiblingPath(embeddedRoot);
+  const manifestStage = temporarySiblingPath(manifestPath);
+  try {
+    mkdirSync(releaseStage, { recursive: true });
+    const files = copyComponentFiles({ target, sourceRoot, releaseRoot: releaseStage });
+    if (target === WINDOWS_TARGET) {
+      validatePreparedMpvRuntimeFiles({
+        binariesRoot: join(releaseStage, target, 'binaries'),
+        release: mpvRelease,
+        mode: 'release',
+      });
+    }
+    const manifest = {
+      schema_version: 1,
+      release: RESOURCE_RELEASE,
+      target,
+      base_url: RESOURCE_BASE_URL,
+      files: files.sort((left, right) => left.relative_path.localeCompare(right.relative_path)),
+    };
+    stageEmbeddedResourceTree({ releaseRoot: releaseStage, embeddedRoot: embeddedStage, target });
+    writeDeploymentInventory(join(releaseStage, target), target);
+    writeJson(manifestStage, manifest);
+    commitStagedPaths([
+      { target: releaseRoot, staged: releaseStage },
+      { target: embeddedRoot, staged: embeddedStage },
+      { target: manifestPath, staged: manifestStage },
+    ]);
+    return { manifestPath, releaseRoot, embeddedRoot, manifest };
+  } finally {
+    for (const staged of [releaseStage, embeddedStage, manifestStage]) {
+      if (existsSync(staged)) rmSync(staged, { recursive: true, force: true });
+    }
+  }
 }
 
-function main() {
-  const result = buildRuntimeResourceRelease();
+async function main() {
+  const result = await buildRuntimeResourceRelease();
   console.log(`已生成运行资源发布树：${result.releaseRoot}`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  try {
-    main();
-  } catch (error) {
+  main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
-  }
+  });
 }

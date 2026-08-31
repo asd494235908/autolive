@@ -1,0 +1,176 @@
+//!PARAM al_random_graphic_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_random_graphic_count
+//!TYPE float
+//!MINIMUM 1.0
+//!MAXIMUM 32.0
+4.0
+
+//!PARAM al_random_graphic_opacity_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 50.0
+0.0
+
+//!PARAM al_random_graphic_size_px
+//!TYPE float
+//!MINIMUM 1.0
+//!MAXIMUM 64.0
+4.0
+
+//!PARAM al_overlay_offset_px
+//!TYPE float
+//!MINIMUM -10.0
+//!MAXIMUM 10.0
+0.0
+
+//!PARAM al_pip_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_pip_scale_percent
+//!TYPE float
+//!MINIMUM 10.0
+//!MAXIMUM 50.0
+24.0
+
+//!PARAM al_pip_opacity_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 100.0
+100.0
+
+//!PARAM al_pip_rotation_degrees
+//!TYPE float
+//!MINIMUM -15.0
+//!MAXIMUM 15.0
+0.0
+
+//!PARAM al_runtime_pip_jitter_x_px
+//!TYPE float
+//!MINIMUM -4.0
+//!MAXIMUM 4.0
+0.0
+
+//!PARAM al_runtime_pip_jitter_y_px
+//!TYPE float
+//!MINIMUM -4.0
+//!MAXIMUM 4.0
+0.0
+
+//!PARAM al_runtime_random_graphic_seed
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 16777215.0
+0.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive Phase 3A deterministic same-frame overlays candidate
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN al_random_graphic_enabled al_random_graphic_opacity_percent * al_pip_enabled al_pip_opacity_percent * +
+
+float al_overlay_hash(float value) {
+    return fract(sin(value * 12.9898 + 78.233) * 43758.5453);
+}
+
+float al_overlay_seeded_hash(float slot, float salt, vec2 seed_parts) {
+    float base_input = slot + salt;
+    if (seed_parts.x <= 0.0 && seed_parts.y <= 0.0) {
+        return al_overlay_hash(base_input);
+    }
+    float low_component = al_overlay_hash(base_input + seed_parts.x);
+    float high_component = al_overlay_hash(base_input + seed_parts.y + 4096.0);
+    return fract(low_component + high_component * 0.61803398875);
+}
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+    vec3 result = source_color.rgb;
+    vec2 offset_uv = vec2(clamp(al_overlay_offset_px, -10.0, 10.0)) * HOOKED_pt;
+
+    float pip_weight = clamp(al_pip_enabled, 0.0, 1.0)
+        * clamp(al_pip_opacity_percent / 100.0, 0.0, 1.0);
+    if (pip_weight > 0.0) {
+        float pip_scale = clamp(al_pip_scale_percent / 100.0, 0.1, 0.5);
+        vec2 pip_size = vec2(pip_scale);
+        vec2 runtime_pip_jitter_uv = vec2(
+            clamp(al_runtime_pip_jitter_x_px, -4.0, 4.0),
+            clamp(al_runtime_pip_jitter_y_px, -4.0, 4.0)
+        ) * HOOKED_pt;
+        vec2 pip_max = vec2(0.98) + offset_uv + runtime_pip_jitter_uv;
+        vec2 pip_min = pip_max - pip_size;
+        vec2 pip_center = (pip_min + pip_max) * 0.5;
+        float angle = radians(clamp(al_pip_rotation_degrees, -15.0, 15.0));
+        float sine = sin(angle);
+        float cosine = cos(angle);
+        vec2 centered = HOOKED_pos - pip_center;
+        vec2 rotated_local = vec2(
+            cosine * centered.x + sine * centered.y,
+            -sine * centered.x + cosine * centered.y
+        );
+        vec2 sample_pos = rotated_local / pip_size + vec2(0.5);
+
+        if (all(greaterThanEqual(sample_pos, vec2(0.0)))
+                && all(lessThanEqual(sample_pos, vec2(1.0)))) {
+            result = mix(result, HOOKED_tex(sample_pos).rgb, pip_weight);
+        }
+    }
+
+    float graphic_weight = clamp(al_random_graphic_enabled, 0.0, 1.0)
+        * clamp(al_random_graphic_opacity_percent / 100.0, 0.0, 0.5);
+    if (graphic_weight > 0.0) {
+        vec2 graphic_pos = HOOKED_pos - offset_uv;
+        if (all(greaterThanEqual(graphic_pos, vec2(0.0)))
+                && all(lessThan(graphic_pos, vec2(1.0)))) {
+            vec2 grid_size = vec2(8.0, 4.0);
+            vec2 cell = floor(graphic_pos * grid_size);
+            int slot_index = int(cell.y) * 8 + int(cell.x);
+            int graphic_count = int(clamp(floor(al_random_graphic_count + 0.5), 1.0, 32.0));
+
+            if (slot_index < graphic_count) {
+                float slot = float(slot_index);
+                float seed = floor(clamp(al_runtime_random_graphic_seed, 0.0, 16777215.0));
+                vec2 seed_parts = vec2(mod(seed, 4096.0), floor(seed / 4096.0));
+                float graphic_size = clamp(al_random_graphic_size_px, 1.0, 64.0);
+                vec2 cell_pixels = HOOKED_size / grid_size;
+                vec2 center_margin = min(
+                    vec2(0.45),
+                    vec2(graphic_size * 0.5 + 1.0) / cell_pixels
+                );
+                vec2 random_position = vec2(
+                    al_overlay_seeded_hash(slot, 1.0, seed_parts),
+                    al_overlay_seeded_hash(slot, 37.0, seed_parts)
+                );
+                vec2 center_in_cell = mix(center_margin, vec2(1.0) - center_margin, random_position);
+                vec2 center = (cell + center_in_cell) / grid_size;
+                vec2 point_px = (graphic_pos - center) * HOOKED_size;
+                float half_size = graphic_size * 0.5;
+                float shape_selector = al_overlay_seeded_hash(slot, 73.0, seed_parts);
+                float shape_distance = shape_selector < 0.5
+                    ? length(point_px)
+                    : max(abs(point_px.x), abs(point_px.y));
+                float mask = 1.0 - smoothstep(
+                    max(0.0, half_size - 1.0),
+                    half_size + 1.0,
+                    shape_distance
+                );
+                vec3 graphic_color = vec3(
+                    0.35 + 0.65 * al_overlay_seeded_hash(slot, 101.0, seed_parts),
+                    0.35 + 0.65 * al_overlay_seeded_hash(slot, 149.0, seed_parts),
+                    0.35 + 0.65 * al_overlay_seeded_hash(slot, 197.0, seed_parts)
+                );
+                result = mix(result, graphic_color, graphic_weight * mask);
+            }
+        }
+    }
+
+    return vec4(result, source_color.a);
+}

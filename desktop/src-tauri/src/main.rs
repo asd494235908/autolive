@@ -11,25 +11,24 @@ use commands::{
     append_local_videos, cancel_audio_cycle_candidate, cancel_runtime_resource_install,
     cleanup_local_caches_command, cleanup_stale_generated_caches, clear_playback_pool,
     clear_runtime_resources, close_final_effect_window, commit_audio_cycle_candidate,
-    commit_audio_media_candidate, commit_media_processing_if_ready, commit_realtime_video_plan,
-    complete_playback_item, complete_playback_loop, discard_audio_media_candidate,
-    discard_media_processing_candidate, get_audio_cycle_diagnostic,
+    commit_audio_media_candidate, commit_media_processing_if_ready, complete_playback_item,
+    complete_playback_loop, configure_realtime_video_cycle, discard_audio_media_candidate,
+    discard_media_processing_candidate, ensure_original_video_renderer, get_audio_cycle_diagnostic,
     get_audio_output_backend_status, get_default_media_effect_params, get_device_runtime_info,
     get_media_engine_capabilities, get_media_video_backend_status, get_runtime_resource_status,
     get_snapshot, import_runtime_resource_directory, install_runtime_resources,
     list_audio_output_devices, open_final_effect_window, pause_playback, pause_portaudio_interlude,
     play_portaudio_test_tone, prepare_audio_cycle_candidate, prepare_audio_media_candidate,
-    prepare_realtime_video_plan, prepare_webview_interlude, probe_local_mp4, probe_local_video,
-    probe_local_videos, purge_media_processing_cache, release_audio_media_candidate,
-    release_media_processing_artifact, release_webview_interlude_cache, remove_playback_pool_item,
-    reorder_playback_pool_items, replace_playback_pool_item, resize_final_effect_window,
-    restore_original_audio, restore_original_video, resume_playback, resume_portaudio_interlude,
+    prepare_webview_interlude, probe_local_mp4, probe_local_video, probe_local_videos,
+    purge_media_processing_cache, release_audio_media_candidate, release_media_processing_artifact,
+    release_webview_interlude_cache, remove_playback_pool_item, reorder_playback_pool_items,
+    replace_playback_pool_item, resize_final_effect_window, restore_original_audio,
+    restore_original_video, resume_playback, resume_portaudio_interlude, seek_playback,
     set_audio_output_backend, set_audio_processing_profile, set_interlude_config,
     set_portaudio_interlude_volume, set_portaudio_media_volume, set_processing_switches,
     start_media_processing, start_playback, start_portaudio_interlude, stop_playback,
     stop_portaudio_interlude, stop_realtime_video_renderer, switch_portaudio_interlude_preset,
-    sync_audio_output_source, sync_realtime_video_renderer, update_playback_position,
-    validate_media_effect_params, AppState,
+    sync_audio_output_source, update_playback_position, validate_media_effect_params, AppState,
 };
 use control_plane_auth::{
     clear_legacy_auth_credentials, get_or_create_control_plane_device_id,
@@ -103,6 +102,7 @@ fn main() -> ExitCode {
             start_playback,
             pause_playback,
             resume_playback,
+            seek_playback,
             update_playback_position,
             stop_playback,
             complete_playback_loop,
@@ -113,9 +113,8 @@ fn main() -> ExitCode {
             set_audio_processing_profile,
             set_interlude_config,
             start_media_processing,
-            prepare_realtime_video_plan,
-            commit_realtime_video_plan,
-            sync_realtime_video_renderer,
+            ensure_original_video_renderer,
+            configure_realtime_video_cycle,
             stop_realtime_video_renderer,
             prepare_audio_media_candidate,
             restore_original_audio,
@@ -143,6 +142,10 @@ fn main() -> ExitCode {
     };
     app.run(|app_handle, event| {
         if matches!(&event, RunEvent::Ready) {
+            let state = app_handle.state::<AppState>();
+            if let Err(error) = state.start_realtime_video_eof_supervisor(app_handle.clone()) {
+                eprintln!("failed to start realtime video EOF supervisor: {error}");
+            }
             if let Err(error) = purge_media_processing_cache(app_handle) {
                 eprintln!("failed to purge stale media processing cache: {error}");
             }

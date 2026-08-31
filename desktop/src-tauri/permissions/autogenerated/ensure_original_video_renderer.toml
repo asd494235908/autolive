@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ensure-original-video-renderer"
+description = "Enables the ensure_original_video_renderer command without any pre-configured scope."
+commands.allow = ["ensure_original_video_renderer"]
+
+[[permission]]
+identifier = "deny-ensure-original-video-renderer"
+description = "Denies the ensure_original_video_renderer command without any pre-configured scope."
+commands.deny = ["ensure_original_video_renderer"]

@@ -21,6 +21,7 @@ const {
   normalizeAudioMixPickMin,
   normalizeAudioPeriodRange,
   normalizeVideoPeriodRange,
+  updatePeriodRangeEndpoint,
   samplePeriodMsInRange,
   normalizeAudioVariationPeriod,
   normalizeVideoVariationPeriod,
@@ -31,13 +32,12 @@ const {
   buildAudioVariantsFromCycle,
   equalMixWeights,
   loadAudioMixSession,
+  loadVideoPeriodRange,
   pickAudioPresetIds,
   sampleAudioCycle,
   saveAudioMixSession,
   AUDIO_MIX_SESSION_STORAGE_KEY,
   sampleSubtleAudioParams,
-  sampleSubtleVideoParams,
-  sampleVideoCycle,
   sanitizeAudioPresetValues,
   toRuntimePreviewParameters,
 } = runtimeModule;
@@ -71,18 +71,31 @@ test('运行时消息使用已提交媒体参数而不是旧默认视频值', ()
   assert.equal(payload.video_hue_rotation_degrees, -3);
 });
 
-test('视频周期 seed 可复现完整 N+1/N+2 参数快照', () => {
-  assert.deepEqual(sampleVideoCycle(123), sampleVideoCycle(123));
-  assert.notDeepEqual(sampleVideoCycle(123), sampleVideoCycle(124));
-});
-
 test('音视频周期区间归一化并保证 min≤max', () => {
   assert.deepEqual(normalizeAudioPeriodRange(3_000, 6_000), { minMs: 3_000, maxMs: 6_000 });
   assert.deepEqual(normalizeAudioPeriodRange(6_000, 3_000), { minMs: 3_000, maxMs: 6_000 });
   assert.deepEqual(normalizeAudioPeriodRange(500, 90_000), { minMs: 1_000, maxMs: 60_000 });
   assert.deepEqual(normalizeVideoPeriodRange(8_000, 15_000), { minMs: 8_000, maxMs: 15_000 });
   assert.deepEqual(normalizeAudioPeriodRange(undefined, undefined), { minMs: 3_000, maxMs: 5_000 });
-  assert.deepEqual(normalizeVideoPeriodRange(undefined, undefined), { minMs: 20_000, maxMs: 30_000 });
+  assert.deepEqual(normalizeVideoPeriodRange(undefined, undefined), { minMs: 5_000, maxMs: 8_000 });
+});
+
+test('周期端点编辑只更新当前输入且不交换另一端点', () => {
+  const range = { minMs: 8_000, maxMs: 15_000 };
+
+  assert.deepEqual(updatePeriodRangeEndpoint(range, 'min', 10_000), { minMs: 10_000, maxMs: 15_000 });
+  assert.deepEqual(updatePeriodRangeEndpoint(range, 'max', 12_000), { minMs: 8_000, maxMs: 12_000 });
+  assert.deepEqual(updatePeriodRangeEndpoint(range, 'min', 20_000), { minMs: 15_000, maxMs: 15_000 });
+  assert.deepEqual(updatePeriodRangeEndpoint(range, 'max', 3_000), { minMs: 8_000, maxMs: 8_000 });
+});
+
+test('视频周期缺省使用 5–8 秒且保留已有合法本地值', () => {
+  assert.deepEqual(loadVideoPeriodRange({ getItem: () => null }), { minMs: 5_000, maxMs: 8_000 });
+  assert.deepEqual(
+    loadVideoPeriodRange({ getItem: () => JSON.stringify({ minMs: 1_000, maxMs: 60_000 }) }),
+    { minMs: 1_000, maxMs: 60_000 },
+  );
+  assert.deepEqual(loadVideoPeriodRange({ getItem: () => '12000' }), { minMs: 12_000, maxMs: 12_000 });
 });
 
 test('周期区间闭区间随机含端点', () => {
@@ -393,32 +406,4 @@ test('buildAudioVariantsFromCycle 只共享共同时间轴与混音后总线字�
   assert.equal(variants[0].dry_wet_percent, getAudioValuePreset(cycle.presetIds[0]).values.dry_wet_percent);
   assert.equal(variants[0].spectral_perturbation_percent, getAudioValuePreset(cycle.presetIds[0]).values.spectral_perturbation_percent);
   assert.equal(variants[0].voice_library_id, getAudioValuePreset(cycle.presetIds[0]).values.voice_library_id);
-});
-
-test('视频效果采样写入正式参数范围且可注入随机源', () => {
-  let i = 0;
-  const sequence = [0, 0.5, 1, 0.25, 0.75, 0.1, 0.9, 0.4, 0.6, 0.2, 0.8, 0.3, 0.7];
-  const sample = sampleSubtleVideoParams(() => sequence[i++ % sequence.length]);
-  assert.ok(sample.brightness_percent >= -3 && sample.brightness_percent <= 3);
-  assert.ok(sample.contrast_percent >= 97 && sample.contrast_percent <= 103);
-  assert.ok(sample.saturation_percent >= 97 && sample.saturation_percent <= 103);
-  assert.ok(sample.hue_rotation_degrees >= -3 && sample.hue_rotation_degrees <= 3);
-  assert.ok(sample.blur_radius_px >= 0 && sample.blur_radius_px <= 0.4);
-  assert.ok(sample.pixel_scale_percent >= 99.5 && sample.pixel_scale_percent <= 100.5);
-  assert.ok(sample.space_x_offset_px >= -0.5 && sample.space_x_offset_px <= 0.5);
-  assert.ok(sample.space_y_offset_px >= -0.5 && sample.space_y_offset_px <= 0.5);
-  assert.ok(sample.sharpen_percent >= 0 && sample.sharpen_percent <= 3);
-  assert.ok(sample.noise_percent >= 0 && sample.noise_percent <= 0.5);
-  // 未映射字段必须保持契约默认，否则 FFmpeg Worker 会拒渲染
-  assert.equal(sample.crop_edge_smoothing, 0.5);
-  assert.equal(sample.frame_rate_jitter_percent, 0);
-  assert.equal(sample.frame_rate_perturbation_frequency_hz, 0.1);
-  assert.equal(sample.frame_rate_perturbation_amplitude_fps, 0);
-  assert.equal(sample.frame_inner_perturbation_percent, 0);
-  assert.equal(sample.frame_inter_perturbation_percent, 0);
-  assert.equal(sample.color_space_conversion_strength_percent, 0);
-  const again = sampleSubtleVideoParams(() => 0);
-  assert.equal(again.brightness_percent, -3);
-  assert.equal(again.contrast_percent, 97);
-  assert.equal(again.crop_edge_smoothing, 0.5);
 });

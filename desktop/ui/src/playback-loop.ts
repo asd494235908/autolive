@@ -12,6 +12,82 @@ type 播放重启判断输入 = {
 
 const 接近结束阈值秒 = 0.05;
 
+type 权威播放时钟输入 = {
+  loopIndex: number;
+  positionMs: number;
+  durationMs: number;
+};
+
+export function buildAuthoritativePlaybackClock({
+  loopIndex,
+  positionMs,
+  durationMs,
+}: 权威播放时钟输入): {
+  loopIndex: number;
+  positionMs: number;
+  absolutePositionMs: number;
+} | null {
+  if (
+    !Number.isSafeInteger(loopIndex)
+    || loopIndex < 0
+    || !Number.isSafeInteger(positionMs)
+    || positionMs < 0
+    || !Number.isSafeInteger(durationMs)
+    || durationMs <= 0
+  ) return null;
+  const boundedPositionMs = Math.min(positionMs, durationMs);
+  const absolutePositionMs = loopIndex * durationMs + boundedPositionMs;
+  if (!Number.isSafeInteger(absolutePositionMs)) return null;
+  return { loopIndex, positionMs: boundedPositionMs, absolutePositionMs };
+}
+
+export function didSourceMediaLoopWrap(
+  previousPositionMs: number | null,
+  currentPositionMs: number,
+  durationMs: number,
+): boolean {
+  if (
+    previousPositionMs === null
+    || !Number.isFinite(previousPositionMs)
+    || !Number.isFinite(currentPositionMs)
+    || !Number.isFinite(durationMs)
+    || durationMs <= 0
+  ) return false;
+  const boundaryWindowMs = Math.min(1_000, Math.max(100, durationMs * 0.05));
+  return previousPositionMs >= durationMs - boundaryWindowMs
+    && currentPositionMs <= boundaryWindowMs;
+}
+
+export function isMediaCycleTargetInAuthoritativeLoop({
+  targetAbsolutePositionMs,
+  durationMs,
+  mediaLoopIndex,
+  authoritativeLoopIndex,
+}: {
+  targetAbsolutePositionMs: number;
+  durationMs: number;
+  mediaLoopIndex: number;
+  authoritativeLoopIndex: number;
+}): boolean {
+  const targetLoopIndex = resolveAbsolutePlaybackLoopIndex(targetAbsolutePositionMs, durationMs);
+  if (!Number.isSafeInteger(mediaLoopIndex) || !Number.isSafeInteger(authoritativeLoopIndex)) return false;
+  return mediaLoopIndex === authoritativeLoopIndex
+    && targetLoopIndex === authoritativeLoopIndex;
+}
+
+export function resolveAbsolutePlaybackLoopIndex(
+  absolutePositionMs: number,
+  durationMs: number,
+): number | null {
+  if (
+    !Number.isSafeInteger(absolutePositionMs)
+    || absolutePositionMs < 0
+    || !Number.isSafeInteger(durationMs)
+    || durationMs <= 0
+  ) return null;
+  return Math.floor(absolutePositionMs / durationMs);
+}
+
 export function resolveMseSourceTimeSeconds(
   streamTimeSeconds: number,
   sourceStreamOriginMs: number,

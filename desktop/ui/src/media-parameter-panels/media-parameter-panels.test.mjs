@@ -114,12 +114,22 @@ test('状态、频段和关键真实链路声明保持稳定', async () => {
   assert.equal(statusByPath.get('audio.high_frequency_perturbation_enabled'), 'implemented');
   assert.equal(statusByPath.get('audio.current_formant_hz'), 'implemented');
   assert.equal(statusByPath.get('video.brightness_percent'), 'implemented');
+  assert.equal(statusByPath.get('video.color_space_conversion_enabled'), 'planned');
+  assert.equal(statusByPath.get('video.color_space_conversion_strength_percent'), 'planned');
   assert.equal(statusByPath.get('video.frame_rate_jitter_percent'), 'implemented');
   assert.equal(statusByPath.get('video.edge_softness_percent'), 'implemented');
   assert.equal(statusByPath.get('advanced.picture_in_picture_enabled'), 'implemented');
   assert.equal(statusByPath.get('advanced.local_blur_enabled'), 'implemented');
   assert.equal(statusByPath.get('advanced.band_weights'), 'implemented');
-  assert.ok(all.every(({ status }) => status === 'implemented'));
+  const plannedPaths = all
+    .filter(({ status }) => status === 'planned')
+    .map(({ section, field }) => `${section}.${field}`)
+    .sort();
+  assert.deepEqual(plannedPaths, [
+    'video.color_space_conversion_enabled',
+    'video.color_space_conversion_strength_percent',
+  ]);
+  assert.ok(all.every(({ status }) => status === 'implemented' || status === 'planned'));
   assert.ok(all.every(({ field }) => !/research|ocr/i.test(field)));
 });
 
@@ -464,10 +474,10 @@ test('单张参数卡只接收当前字段值，并使用 React memo 跳过无�
   assert.match(componentSource, /export const MediaParameterPanels\s*=\s*memo\(/);
 });
 
-test('全部正式参数已接入，同时主参数面板保持只读职责', async () => {
+test('未准入颜色参数如实标记，同时主参数面板保持只读职责', async () => {
   const definitionsSource = await readFile(new URL('./parameter-definitions.ts', import.meta.url), 'utf8');
   const panelSource = await readFile(new URL('./MediaParameterPanels.tsx', import.meta.url), 'utf8');
 
-  assert.doesNotMatch(definitionsSource, /status: 'planned'/);
+  assert.equal((definitionsSource.match(/status: 'planned'/g) ?? []).length, 2);
   assert.doesNotMatch(panelSource, /InputNumber|Slider|Switch|onChange/);
 });

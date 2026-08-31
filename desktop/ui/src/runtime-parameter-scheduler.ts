@@ -102,9 +102,9 @@ export const PERIOD_HARD_MAX_MS = 60_000;
 // 普通声音新配置与恢复默认使用 3–5s；已有本地保存值继续按原值读取。
 export const DEFAULT_AUDIO_PERIOD_MIN_MS = 3_000;
 export const DEFAULT_AUDIO_PERIOD_MAX_MS = 5_000;
-// ponytail: 默认加长到 20–30s，给 83 项 period 处理留墙钟；用户仍可改回更短
-export const DEFAULT_VIDEO_PERIOD_MIN_MS = 20_000;
-export const DEFAULT_VIDEO_PERIOD_MAX_MS = 30_000;
+// 视频新配置默认使用 5–8s；已有本地保存值继续按原值读取。
+export const DEFAULT_VIDEO_PERIOD_MIN_MS = 5_000;
+export const DEFAULT_VIDEO_PERIOD_MAX_MS = 8_000;
 
 /** @deprecated 兼容旧常量名 */
 export const DEFAULT_AUDIO_VARIATION_PERIOD_MS = DEFAULT_AUDIO_PERIOD_MIN_MS;
@@ -129,6 +129,7 @@ function normalizePeriodMs(
 }
 
 export type PeriodRangeMs = { minMs: number; maxMs: number };
+export type PeriodRangeEndpoint = 'min' | 'max';
 
 /** 归一化用户填写的 min–max；保证 hard 范围内且 min≤max。 */
 export function normalizePeriodRangeMs(
@@ -144,6 +145,18 @@ export function normalizePeriodRangeMs(
     max = swap;
   }
   return { minMs: min, maxMs: max };
+}
+
+/** 编辑单个端点时固定另一端；越界只收敛当前端点，不交换两端。 */
+export function updatePeriodRangeEndpoint(
+  current: PeriodRangeMs,
+  endpoint: PeriodRangeEndpoint,
+  valueMs: number,
+): PeriodRangeMs {
+  const next = normalizePeriodMs(valueMs, endpoint === 'min' ? current.minMs : current.maxMs);
+  return endpoint === 'min'
+    ? { minMs: Math.min(next, current.maxMs), maxMs: current.maxMs }
+    : { minMs: current.minMs, maxMs: Math.max(next, current.minMs) };
 }
 
 export function normalizeAudioPeriodRange(
@@ -208,11 +221,6 @@ function roundTo(value: number, digits: number): number {
   const scale = 10 ** digits;
   return Math.round(value * scale) / scale;
 }
-
-function finiteClamp(value: number, fallback: number, minimum: number, maximum: number): number {
-  return Number.isFinite(value) ? Math.min(maximum, Math.max(minimum, value)) : fallback;
-}
-
 
 export const AUDIO_MIX_PICK_HARD_MAX = 4;
 export const DEFAULT_AUDIO_MIX_PICK_MIN = 1;
@@ -554,82 +562,4 @@ export function sampleSubtleAudioParams(
   random = Math.random,
 ): SubtleAudioSample {
   return sampleAudioCycle(selectedPresetIds, { mixEnabled: false, random }).values;
-}
-
-/** 与音频同周期的视频效果微调；写入 mediaEffectParams.video 后实时预览/应用共用。 */
-export type SubtleVideoSample = {
-  brightness_percent: number;
-  contrast_percent: number;
-  saturation_percent: number;
-  hue_rotation_degrees: number;
-  blur_radius_px: number;
-  pixel_scale_percent: number;
-  space_x_offset_px: number;
-  space_y_offset_px: number;
-  sharpen_percent: number;
-  noise_percent: number;
-  detail_enhancement_percent: number;
-  dynamic_crop_percent: number;
-  pixel_jitter_px: number;
-  crop_edge_smoothing: number;
-  frame_rate_jitter_percent: number;
-  frame_rate_perturbation_frequency_hz: number;
-  frame_rate_perturbation_amplitude_fps: number;
-  frame_inner_perturbation_percent: number;
-  frame_inter_perturbation_percent: number;
-  color_space_conversion_strength_percent: number;
-};
-
-export type VideoCycleSample = {
-  seed: number;
-  values: SubtleVideoSample;
-};
-
-export function sampleVideoCycle(seed = Math.floor(Math.random() * 0x7fffffff)): VideoCycleSample {
-  const normalizedSeed = Number.isFinite(seed) ? Math.floor(seed) >>> 0 : 0;
-  return {
-    seed: normalizedSeed,
-    values: sampleSubtleVideoParams(mulberry32(normalizedSeed)),
-  };
-}
-
-/** FFmpeg 已映射的视频微扰；未映射字段保持契约默认，避免 Worker 拒渲染。 */
-export function sampleSubtleVideoParams(random = Math.random): SubtleVideoSample {
-  const inRange = (min: number, max: number) => min + random() * (max - min);
-  return sanitizeMappedVideoSample({
-    brightness_percent: roundTo(inRange(-3, 3), 2),
-    contrast_percent: roundTo(inRange(97, 103), 2),
-    saturation_percent: roundTo(inRange(97, 103), 2),
-    hue_rotation_degrees: roundTo(inRange(-3, 3), 2),
-    blur_radius_px: roundTo(inRange(0, 0.4), 2),
-    pixel_scale_percent: roundTo(inRange(99.5, 100.5), 2),
-    space_x_offset_px: roundTo(inRange(-0.5, 0.5), 2),
-    space_y_offset_px: roundTo(inRange(-0.5, 0.5), 2),
-    sharpen_percent: roundTo(inRange(0, 3), 2),
-    noise_percent: roundTo(inRange(0, 0.5), 2),
-    detail_enhancement_percent: roundTo(inRange(0, 2), 2),
-    dynamic_crop_percent: roundTo(inRange(0, 0.3), 2),
-    pixel_jitter_px: roundTo(inRange(0, 0.2), 2),
-    // 自动周期目前不主动改变这些参数；用户手动配置仍会进入已接入 Worker。
-    crop_edge_smoothing: 0.5,
-    frame_rate_jitter_percent: 0,
-    frame_rate_perturbation_frequency_hz: 0.1,
-    frame_rate_perturbation_amplitude_fps: 0,
-    frame_inner_perturbation_percent: 0,
-    frame_inter_perturbation_percent: 0,
-    color_space_conversion_strength_percent: 0,
-  });
-}
-
-export function sanitizeMappedVideoSample(values: SubtleVideoSample): SubtleVideoSample {
-  return {
-    ...values,
-    crop_edge_smoothing: finiteClamp(values.crop_edge_smoothing, 0.5, 0, 1),
-    frame_rate_jitter_percent: finiteClamp(values.frame_rate_jitter_percent, 0, 0, 2),
-    frame_rate_perturbation_frequency_hz: finiteClamp(values.frame_rate_perturbation_frequency_hz, 0.1, 0.01, 2),
-    frame_rate_perturbation_amplitude_fps: finiteClamp(values.frame_rate_perturbation_amplitude_fps, 0, 0, 2),
-    frame_inner_perturbation_percent: finiteClamp(values.frame_inner_perturbation_percent, 0, 0, 2),
-    frame_inter_perturbation_percent: finiteClamp(values.frame_inter_perturbation_percent, 0, 0, 20),
-    color_space_conversion_strength_percent: finiteClamp(values.color_space_conversion_strength_percent, 0, 0, 100),
-  };
 }

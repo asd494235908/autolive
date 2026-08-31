@@ -2,6 +2,7 @@ use crate::media_effect_params::{AdvancedEffectParams, VideoEffectParams};
 use crate::media_video_effects::{
     atomic_media_video_ui_applied_fields, build_atomic_media_video_effect_plan,
 };
+use crate::media_video_frame_scheduler::{VideoFrameSchedule, MAX_RANDOM_GRAPHIC_SEED};
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 
@@ -12,8 +13,9 @@ pub const GPU83_SHADER_RESOURCE_PATH: &str = "shaders/gpu83.hook";
 pub const GPU83_SHADER_OPTIONS_PROPERTY: &str = "glsl-shader-opts";
 
 pub const GPU83_PARAMETER_COUNT: usize = 83;
-const REQUIRES_MPV_SCHEDULER: &str = "requires_mpv_frame_scheduler";
 const REQUIRES_HISTORY_TEXTURE: &str = "requires_history_or_secondary_texture";
+// mpv 的 renderer color-map 状态不能与 glsl-shader-opts 组成同帧事务；
+// 未取得源/目标色彩元数据时也不得用固定 RGB 矩阵冒充感知色域映射。
 const ALGORITHM_NOT_VERIFIED: &str = "algorithm_semantics_not_verified";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +28,7 @@ pub enum Gpu83ExecutionClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gpu83ParameterCapability {
     ShaderParameter,
+    ScheduledParameter,
     Unavailable(&'static str),
 }
 
@@ -122,7 +125,7 @@ macro_rules! visual_band {
             field_path: $path,
             shader_option: $option,
             execution_class: Gpu83ExecutionClass::PixelShader,
-            capability: Gpu83ParameterCapability::Unavailable(ALGORITHM_NOT_VERIFIED),
+            capability: AVAILABLE,
             required: true,
             read: |_, advanced| advanced.band_weights.get(&$frequency).copied(),
         }
@@ -132,8 +135,7 @@ macro_rules! visual_band {
 const AVAILABLE: Gpu83ParameterCapability = Gpu83ParameterCapability::ShaderParameter;
 const UNVERIFIED: Gpu83ParameterCapability =
     Gpu83ParameterCapability::Unavailable(ALGORITHM_NOT_VERIFIED);
-const SCHEDULER: Gpu83ParameterCapability =
-    Gpu83ParameterCapability::Unavailable(REQUIRES_MPV_SCHEDULER);
+const SCHEDULER: Gpu83ParameterCapability = Gpu83ParameterCapability::ScheduledParameter;
 const HISTORY: Gpu83ParameterCapability =
     Gpu83ParameterCapability::Unavailable(REQUIRES_HISTORY_TEXTURE);
 
@@ -333,14 +335,14 @@ pub static GPU83_PARAMETER_MAPPINGS: [Gpu83ParameterMapping; GPU83_PARAMETER_COU
         "al_image_repair_enabled",
         image_repair_enabled,
         PixelShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     video_value!(
         "video.image_repair_strength_percent",
         "al_image_repair_strength_percent",
         image_repair_strength_percent,
         PixelShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     video_flag!(
         "video.frame_rate_lock_enabled",
@@ -354,70 +356,70 @@ pub static GPU83_PARAMETER_MAPPINGS: [Gpu83ParameterMapping; GPU83_PARAMETER_COU
         "al_target_frequency_hz",
         target_frequency_hz,
         PixelShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_optional!(
         "advanced.core_frequency_hz",
         "al_core_frequency_hz",
         core_frequency_hz,
         PixelShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.wave_intensity",
         "al_wave_intensity",
         wave_intensity,
         PixelShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.wave_level",
         "al_wave_level",
         wave_level,
         PixelShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.wave_grain_count",
         "al_wave_grain_count",
         wave_grain_count,
         PixelShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.dynamic_eq_threshold",
         "al_dynamic_eq_threshold",
         dynamic_eq_threshold,
         PixelShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.channel_offset_percent",
         "al_channel_offset_percent",
         channel_offset_percent,
         PixelShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.space_dimension",
         "al_space_dimension",
         space_dimension,
         PixelShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.frequency_space_x_offset_px",
         "al_frequency_space_x_px",
         frequency_space_x_offset_px,
         PixelShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.frequency_space_y_offset_px",
         "al_frequency_space_y_px",
         frequency_space_y_offset_px,
         PixelShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.frame_perturbation_probability_percent",
@@ -431,42 +433,42 @@ pub static GPU83_PARAMETER_MAPPINGS: [Gpu83ParameterMapping; GPU83_PARAMETER_COU
         "al_random_graphic_opacity_percent",
         random_graphic_opacity_percent,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.random_graphic_size_px",
         "al_random_graphic_size_px",
         random_graphic_size_px,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.abstract_face_count",
         "al_abstract_face_count",
         abstract_face_count,
         CompositeShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.abstract_face_size_percent",
         "al_abstract_face_size_percent",
         abstract_face_size_percent,
         CompositeShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.abstract_face_opacity_percent",
         "al_abstract_face_opacity_percent",
         abstract_face_opacity_percent,
         CompositeShader,
-        UNVERIFIED
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.overlay_offset_px",
         "al_overlay_offset_px",
         overlay_offset_px,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.slice_length_ms",
@@ -480,7 +482,7 @@ pub static GPU83_PARAMETER_MAPPINGS: [Gpu83ParameterMapping; GPU83_PARAMETER_COU
         "al_slice_min_length_ms",
         slice_min_length_ms,
         FrameScheduling,
-        SCHEDULER
+        HISTORY
     ),
     advanced_value!(
         "advanced.slice_trigger_interval_ms",
@@ -494,77 +496,77 @@ pub static GPU83_PARAMETER_MAPPINGS: [Gpu83ParameterMapping; GPU83_PARAMETER_COU
         "al_random_graphic_enabled",
         random_graphic_enabled,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.random_graphic_count",
         "al_random_graphic_count",
         random_graphic_count,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_flag!(
         "advanced.picture_in_picture_enabled",
         "al_pip_enabled",
         picture_in_picture_enabled,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.picture_in_picture_scale_percent",
         "al_pip_scale_percent",
         picture_in_picture_scale_percent,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.picture_in_picture_opacity_percent",
         "al_pip_opacity_percent",
         picture_in_picture_opacity_percent,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.picture_in_picture_rotation_degrees",
         "al_pip_rotation_degrees",
         picture_in_picture_rotation_degrees,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.picture_in_picture_pixel_jitter_px",
         "al_pip_jitter_px",
         picture_in_picture_pixel_jitter_px,
         CompositeShader,
-        HISTORY
+        SCHEDULER
     ),
     advanced_flag!(
         "advanced.picture_in_picture_timeline_locked",
         "al_pip_timeline_locked",
         picture_in_picture_timeline_locked,
         FrameScheduling,
-        SCHEDULER
+        HISTORY
     ),
     advanced_flag!(
         "advanced.local_blur_enabled",
         "al_local_blur_enabled",
         local_blur_enabled,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.local_blur_region_percent",
         "al_local_blur_region_percent",
         local_blur_region_percent,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.local_blur_radius_px",
         "al_local_blur_radius_px",
         local_blur_radius_px,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.local_blur_interval_ms",
@@ -578,14 +580,14 @@ pub static GPU83_PARAMETER_MAPPINGS: [Gpu83ParameterMapping; GPU83_PARAMETER_COU
         "al_edge_fill_enabled",
         edge_fill_enabled,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_value!(
         "advanced.edge_feather_percent",
         "al_edge_feather_percent",
         edge_feather_percent,
         CompositeShader,
-        HISTORY
+        AVAILABLE
     ),
     advanced_flag!(
         "advanced.transform_smoothing_enabled",
@@ -844,16 +846,19 @@ pub fn build_gpu83_shader_snapshot(
                 code: "non_finite_value",
             });
         }
-        if mapping.capability == Gpu83ParameterCapability::ShaderParameter {
-            if let Some(value) = value {
+        match mapping.capability {
+            Gpu83ParameterCapability::ShaderParameter => {
+                let shader_value = value.unwrap_or(0.0);
                 options.push(format!(
                     "{}={}",
                     mapping.shader_option,
-                    format_shader_number(value)
+                    format_shader_number(shader_value)
                 ));
             }
-        } else {
-            unavailable_fields.push(mapping.field_path);
+            Gpu83ParameterCapability::ScheduledParameter => {}
+            Gpu83ParameterCapability::Unavailable(_) => {
+                unavailable_fields.push(mapping.field_path);
+            }
         }
         entries.push(Gpu83SnapshotEntry {
             field_path: mapping.field_path,
@@ -882,6 +887,107 @@ pub fn build_gpu83_shader_snapshot(
         unavailable_fields,
         shader_options: options.join(","),
     })
+}
+
+/// 将一个视频周期的静态调度输入合并为一条完整 shader 属性快照。
+/// 周期内的门控、抖动和旋转只由 shader 自动 `PTS` 推导，运行时不得逐帧重写属性。
+pub fn build_gpu83_scheduled_shader_update(
+    video: &VideoEffectParams,
+    advanced: &AdvancedEffectParams,
+    schedule: &VideoFrameSchedule,
+) -> Result<MpvShaderOptionsUpdate, Gpu83SnapshotError> {
+    let mut update = build_gpu83_shader_snapshot(video, advanced)?.mpv_property_update();
+    let source_fps = schedule.target_fps / schedule.base_video_speed;
+    for (field, value) in [("schedule.source_fps", source_fps)] {
+        if !value.is_finite() {
+            return Err(Gpu83SnapshotError {
+                field: field.to_owned(),
+                code: "non_finite_value",
+            });
+        }
+    }
+    if schedule.random_graphic_seed > MAX_RANDOM_GRAPHIC_SEED {
+        return Err(Gpu83SnapshotError {
+            field: "schedule.random_graphic_seed".to_owned(),
+            code: "out_of_range",
+        });
+    }
+
+    for (option, value) in [
+        (
+            "al_runtime_epoch_start_seconds",
+            schedule.media_pts_ms as f64 / 1_000.0,
+        ),
+        ("al_runtime_source_fps", source_fps.clamp(1.0, 240.0)),
+        (
+            "al_runtime_random_seed",
+            f64::from(schedule.random_graphic_seed),
+        ),
+        (
+            "al_runtime_frame_inner_percent",
+            video.frame_inner_perturbation_percent,
+        ),
+        (
+            "al_runtime_frame_inter_percent",
+            video.frame_inter_perturbation_percent,
+        ),
+        (
+            "al_runtime_frame_probability_percent",
+            advanced.frame_perturbation_probability_percent,
+        ),
+        (
+            "al_runtime_slice_length_seconds",
+            advanced.slice_length_ms as f64 / 1_000.0,
+        ),
+        (
+            "al_runtime_slice_interval_seconds",
+            advanced.slice_trigger_interval_ms as f64 / 1_000.0,
+        ),
+        (
+            "al_runtime_pip_jitter_px",
+            advanced.picture_in_picture_pixel_jitter_px,
+        ),
+        (
+            "al_runtime_local_blur_interval_seconds",
+            advanced.local_blur_interval_ms as f64 / 1_000.0,
+        ),
+        (
+            "al_runtime_smoothing_enabled",
+            enabled(advanced.transform_smoothing_enabled),
+        ),
+        (
+            "al_runtime_smoothing_seconds",
+            advanced.transform_smoothing_duration_ms as f64 / 1_000.0,
+        ),
+        (
+            "al_runtime_highlight_enabled",
+            enabled(advanced.highlight_perturbation_enabled),
+        ),
+        (
+            "al_runtime_highlight_interval_seconds",
+            advanced.highlight_perturbation_interval_ms as f64 / 1_000.0,
+        ),
+        (
+            "al_runtime_async_rotation_enabled",
+            enabled(advanced.asynchronous_rotation_enabled),
+        ),
+        (
+            "al_runtime_async_rotation_min_degrees",
+            advanced.asynchronous_rotation_min_degrees,
+        ),
+        (
+            "al_runtime_async_rotation_max_degrees",
+            advanced.asynchronous_rotation_max_degrees,
+        ),
+    ] {
+        if !update.value.is_empty() {
+            update.value.push(',');
+        }
+        update.value.push_str(option);
+        update.value.push('=');
+        update.value.push_str(&format_shader_number(value));
+    }
+    Ok(update)
 }
 
 fn format_shader_number(value: f64) -> String {
@@ -995,14 +1101,6 @@ fn gpu83_shader(video: &VideoEffectParams, advanced: &AdvancedEffectParams) -> S
         ("P_INTER", video.frame_inter_perturbation_percent / 100.0),
         ("P_SPACE_X", video.space_x_offset_px),
         ("P_SPACE_Y", video.space_y_offset_px),
-        (
-            "P_COLOR_SPACE",
-            video.color_space_conversion_strength_percent / 100.0,
-        ),
-        (
-            "P_COLOR_SPACE_ON",
-            enabled(video.color_space_conversion_enabled),
-        ),
         ("P_ROTATION", video.rotation_degrees.to_radians()),
         ("P_VIGNETTE", video.vignette_percent / 100.0),
         ("P_HIGHLIGHTS", video.highlights_percent / 100.0),
@@ -1150,7 +1248,6 @@ vec4 hook(){
  c.rgb+=clamp(P_SHARP+P_DETAIL,0.0,1.5)*(c.rgb-n.rgb); c.rgb=mix(c.rgb,n.rgb,P_REPAIR_ON*P_REPAIR*0.35);
  float lum=dot(c.rgb,vec3(0.2126,0.7152,0.0722)); vec3 original=c.rgb;
  c.rgb+=vec3(P_SHADOWS*(1.0-lum)+P_HIGHLIGHTS*lum)*0.12;
- c.rgb=mix(c.rgb,vec3(lum)+vec3(c.r-c.b,c.g-c.r,c.b-c.g)*0.25,P_COLOR_SPACE_ON*P_COLOR_SPACE);
  c.r=mix(c.r,original.r,P_RED_LOCK); c.rgb+=vec3(A_CHANNEL,-A_CHANNEL*0.5,A_CHANNEL*0.25)*(carrier+A_EQ*bands);
  c.rgb+=(h12(uv*HOOKED_size+fr)-0.5)*(P_NOISE+A_WAVE_LEVEL/max(A_GRAINS,1.0));
  float vig=smoothstep(0.8,0.2,length(uv-0.5)); c.rgb*=mix(1.0,vig,P_VIGNETTE);
@@ -1173,7 +1270,38 @@ vec4 hook(){
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::realtime_video_backend::VideoPlanIdentity;
     use std::collections::BTreeSet;
+
+    fn active_schedule() -> VideoFrameSchedule {
+        VideoFrameSchedule {
+            identity: VideoPlanIdentity {
+                session_id: 1,
+                playback_generation: 2,
+                source_revision: 3,
+                parameter_revision: 4,
+                sequence: 5,
+            },
+            schedule_epoch: 1,
+            media_pts_ms: 1_000,
+            epoch_elapsed_ms: 1_000,
+            frame_index: 30,
+            target_fps: 30.0,
+            base_video_speed: 1.0,
+            frame_rate_locked: false,
+            frame_inner_active: true,
+            frame_inter_active: true,
+            frame_probability_active: true,
+            slice_active: true,
+            random_graphic_seed: 12_345_678,
+            local_blur_active: true,
+            highlight_active: true,
+            pip_jitter_x_px: 1.25,
+            pip_jitter_y_px: -2.5,
+            asynchronous_rotation_degrees: 3.125,
+            transform_easing: 0.5,
+        }
+    }
 
     #[test]
     fn mapping_is_the_exact_unique_gpu83_contract() {
@@ -1195,6 +1323,152 @@ mod tests {
                 .count(),
             12
         );
+        let capability_counts = GPU83_PARAMETER_MAPPINGS.iter().fold(
+            (0, 0, 0, 0),
+            |(shader, scheduler, color, history), mapping| match mapping.capability {
+                Gpu83ParameterCapability::ShaderParameter => {
+                    (shader + 1, scheduler, color, history)
+                }
+                Gpu83ParameterCapability::ScheduledParameter => {
+                    (shader, scheduler + 1, color, history)
+                }
+                Gpu83ParameterCapability::Unavailable(ALGORITHM_NOT_VERIFIED) => {
+                    (shader, scheduler, color + 1, history)
+                }
+                Gpu83ParameterCapability::Unavailable(REQUIRES_HISTORY_TEXTURE) => {
+                    (shader, scheduler, color, history + 1)
+                }
+                Gpu83ParameterCapability::Unavailable(_) => unreachable!("未知 capability 原因"),
+            },
+        );
+        assert_eq!(capability_counts, (61, 18, 2, 2));
+        assert_eq!(
+            GPU83_PARAMETER_MAPPINGS
+                .iter()
+                .filter(|mapping| {
+                    mapping.capability
+                        == Gpu83ParameterCapability::Unavailable(REQUIRES_HISTORY_TEXTURE)
+                })
+                .map(|mapping| mapping.field_path)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "advanced.picture_in_picture_timeline_locked",
+                "advanced.slice_min_length_ms",
+            ])
+        );
+        assert_eq!(
+            GPU83_PARAMETER_MAPPINGS
+                .iter()
+                .find(|mapping| {
+                    mapping.field_path == "advanced.picture_in_picture_pixel_jitter_px"
+                })
+                .map(|mapping| mapping.capability),
+            Some(Gpu83ParameterCapability::ScheduledParameter)
+        );
+    }
+
+    #[test]
+    fn renderer_color_management_contract_stays_fail_closed() {
+        let color_mappings = GPU83_PARAMETER_MAPPINGS
+            .iter()
+            .filter(|mapping| {
+                matches!(
+                    mapping.field_path,
+                    "video.color_space_conversion_strength_percent"
+                        | "video.color_space_conversion_enabled"
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(color_mappings.len(), 2);
+        assert!(color_mappings.iter().all(|mapping| {
+            mapping.capability == Gpu83ParameterCapability::Unavailable(ALGORITHM_NOT_VERIFIED)
+                && mapping.execution_class == Gpu83ExecutionClass::PixelShader
+        }));
+
+        for forbidden in [
+            "//!PARAM al_color_space_strength_percent",
+            "//!PARAM al_color_space_enabled",
+            "color.rgb.gbr",
+            "color.rgb.brg",
+            "color_space_weight",
+        ] {
+            assert!(
+                !GPU83_SHADER_SOURCE.contains(forbidden),
+                "未定义 primaries/TRC/range/输出标签时禁止固定 RGB 变换: {forbidden}"
+            );
+        }
+
+        let legacy_shader = gpu83_shader(
+            &VideoEffectParams {
+                color_space_conversion_enabled: true,
+                color_space_conversion_strength_percent: 100.0,
+                ..VideoEffectParams::default()
+            },
+            &AdvancedEffectParams::default(),
+        );
+        for forbidden in ["P_COLOR_SPACE", "vec3(lum)+vec3(c.r-c.b"] {
+            assert!(
+                !legacy_shader.contains(forbidden),
+                "旧兼容 shader 也不得保留固定色偏伪语义: {forbidden}"
+            );
+        }
+
+        let video = VideoEffectParams {
+            color_space_conversion_enabled: true,
+            color_space_conversion_strength_percent: 100.0,
+            ..VideoEffectParams::default()
+        };
+        let snapshot = build_gpu83_shader_snapshot(&video, &AdvancedEffectParams::default())
+            .expect("合法输入必须形成 fail-closed 能力快照");
+        assert!(snapshot
+            .unavailable_fields
+            .contains(&"video.color_space_conversion_enabled"));
+        assert!(snapshot
+            .unavailable_fields
+            .contains(&"video.color_space_conversion_strength_percent"));
+        assert!(!snapshot.shader_options.contains("al_color_space_enabled="));
+        assert!(!snapshot
+            .shader_options
+            .contains("al_color_space_strength_percent="));
+    }
+
+    #[test]
+    fn blocked_phase3_fields_never_leak_into_base_or_scheduled_shader_snapshots() {
+        let video = VideoEffectParams {
+            color_space_conversion_enabled: true,
+            color_space_conversion_strength_percent: 37.5,
+            ..VideoEffectParams::default()
+        };
+        let advanced = AdvancedEffectParams {
+            picture_in_picture_enabled: true,
+            picture_in_picture_timeline_locked: false,
+            ..AdvancedEffectParams::default()
+        };
+        let snapshot = build_gpu83_shader_snapshot(&video, &advanced)
+            .expect("合法但未准入的字段必须形成 fail-closed 快照");
+        assert_eq!(
+            snapshot.unavailable_fields,
+            vec![
+                "video.color_space_conversion_strength_percent",
+                "video.color_space_conversion_enabled",
+                "advanced.slice_min_length_ms",
+                "advanced.picture_in_picture_timeline_locked",
+            ]
+        );
+
+        let scheduled = build_gpu83_scheduled_shader_update(&video, &advanced, &active_schedule())
+            .expect("调度快照不得绕过 Phase 3 未准入门禁");
+        assert!(scheduled.value.contains("al_runtime_pip_jitter_px="));
+        for forbidden_option in [
+            "al_color_space_strength_percent=",
+            "al_color_space_enabled=",
+            "al_slice_min_length_ms=",
+            "al_pip_timeline_locked=",
+        ] {
+            assert!(!snapshot.shader_options.contains(forbidden_option));
+            assert!(!scheduled.value.contains(forbidden_option));
+        }
     }
 
     #[test]
@@ -1255,6 +1529,129 @@ mod tests {
         assert!(!update.value.contains("NaN"));
         assert!(!update.value.contains("inf"));
         assert!(update.value.contains("al_brightness_percent=0"));
+        assert!(update.value.contains("al_target_frequency_hz=0"));
+        assert!(update.value.contains("al_core_frequency_hz=0"));
+    }
+
+    #[test]
+    fn every_cycle_snapshot_appends_static_pts_inputs() {
+        let video = VideoEffectParams::default();
+        let advanced = AdvancedEffectParams::default();
+        let base = build_gpu83_shader_snapshot(&video, &advanced)
+            .expect("default parameters are valid")
+            .mpv_property_update();
+        let scheduled = build_gpu83_scheduled_shader_update(&video, &advanced, &active_schedule())
+            .expect("default parameters must produce a complete cycle snapshot");
+
+        assert_eq!(scheduled.property, base.property);
+        assert!(scheduled.value.starts_with(&format!("{},", base.value)));
+        assert!(scheduled.value.contains("al_runtime_epoch_start_seconds=1"));
+        assert!(scheduled.value.contains("al_runtime_source_fps=30"));
+        assert!(scheduled.value.contains("al_runtime_frame_inner_percent=0"));
+    }
+
+    #[test]
+    fn active_schedule_appends_runtime_options_once_in_fixed_order() {
+        let video = VideoEffectParams {
+            frame_inner_perturbation_percent: 1.0,
+            frame_inter_perturbation_percent: 2.0,
+            ..VideoEffectParams::default()
+        };
+        let advanced = AdvancedEffectParams {
+            frame_perturbation_probability_percent: 10.0,
+            random_graphic_enabled: true,
+            picture_in_picture_enabled: true,
+            picture_in_picture_pixel_jitter_px: 4.0,
+            local_blur_enabled: true,
+            highlight_perturbation_enabled: true,
+            asynchronous_rotation_enabled: true,
+            transform_smoothing_enabled: true,
+            ..AdvancedEffectParams::default()
+        };
+        let base = build_gpu83_shader_snapshot(&video, &advanced)
+            .expect("configured parameters are valid")
+            .mpv_property_update();
+        let update = build_gpu83_scheduled_shader_update(&video, &advanced, &active_schedule())
+            .expect("active schedule is valid");
+        let prefix = format!("{},", base.value);
+        let runtime = update
+            .value
+            .strip_prefix(&prefix)
+            .expect("runtime options must follow the base snapshot");
+
+        assert_eq!(
+            runtime.split(',').collect::<Vec<_>>(),
+            vec![
+                "al_runtime_epoch_start_seconds=1",
+                "al_runtime_source_fps=30",
+                "al_runtime_random_seed=12345678",
+                "al_runtime_frame_inner_percent=1",
+                "al_runtime_frame_inter_percent=2",
+                "al_runtime_frame_probability_percent=10",
+                "al_runtime_slice_length_seconds=5",
+                "al_runtime_slice_interval_seconds=15",
+                "al_runtime_pip_jitter_px=4",
+                "al_runtime_local_blur_interval_seconds=10",
+                "al_runtime_smoothing_enabled=1",
+                "al_runtime_smoothing_seconds=0.8",
+                "al_runtime_highlight_enabled=1",
+                "al_runtime_highlight_interval_seconds=10",
+                "al_runtime_async_rotation_enabled=1",
+                "al_runtime_async_rotation_min_degrees=-1",
+                "al_runtime_async_rotation_max_degrees=1",
+            ]
+        );
+    }
+
+    #[test]
+    fn asynchronous_rotation_is_committed_as_static_pts_input() {
+        let advanced = AdvancedEffectParams {
+            asynchronous_rotation_enabled: true,
+            transform_smoothing_enabled: false,
+            ..AdvancedEffectParams::default()
+        };
+        let update = build_gpu83_scheduled_shader_update(
+            &VideoEffectParams::default(),
+            &advanced,
+            &active_schedule(),
+        )
+        .expect("asynchronous rotation schedule is valid");
+
+        assert!(update.value.contains("al_runtime_async_rotation_enabled=1"));
+        assert!(update
+            .value
+            .contains("al_runtime_async_rotation_min_degrees=-1"));
+        assert!(update
+            .value
+            .contains("al_runtime_async_rotation_max_degrees=1"));
+        assert!(update.value.contains("al_runtime_smoothing_enabled=0"));
+    }
+
+    #[test]
+    fn scheduled_snapshot_rejects_non_finite_runtime_values() {
+        let mut schedule = active_schedule();
+        schedule.target_fps = f64::NAN;
+        let error = build_gpu83_scheduled_shader_update(
+            &VideoEffectParams::default(),
+            &AdvancedEffectParams::default(),
+            &schedule,
+        )
+        .expect_err("non-finite schedule values must be rejected before serialization");
+
+        assert_eq!(error.field, "schedule.source_fps");
+        assert_eq!(error.code, "non_finite_value");
+
+        let mut schedule = active_schedule();
+        schedule.random_graphic_seed = MAX_RANDOM_GRAPHIC_SEED + 1;
+        let error = build_gpu83_scheduled_shader_update(
+            &VideoEffectParams::default(),
+            &AdvancedEffectParams::default(),
+            &schedule,
+        )
+        .expect_err("shader seed must stay exactly representable by f32");
+
+        assert_eq!(error.field, "schedule.random_graphic_seed");
+        assert_eq!(error.code, "out_of_range");
     }
 
     #[test]
@@ -1290,11 +1687,16 @@ mod tests {
     }
 
     #[test]
-    fn shader_declares_exactly_the_available_dynamic_options() {
+    fn shader_declares_exactly_the_available_and_static_pts_options() {
         let declared = GPU83_SHADER_SOURCE
             .lines()
             .filter_map(|line| line.strip_prefix("//!PARAM "))
-            .filter(|name| *name != "PTS")
+            .filter(|name| *name != "PTS" && !name.starts_with("al_runtime_"))
+            .collect::<BTreeSet<_>>();
+        let runtime = GPU83_SHADER_SOURCE
+            .lines()
+            .filter_map(|line| line.strip_prefix("//!PARAM "))
+            .filter(|name| name.starts_with("al_runtime_"))
             .collect::<BTreeSet<_>>();
         let available = GPU83_PARAMETER_MAPPINGS
             .iter()
@@ -1302,5 +1704,17 @@ mod tests {
             .map(|mapping| mapping.shader_option)
             .collect::<BTreeSet<_>>();
         assert_eq!(declared, available);
+        assert_eq!(runtime.len(), 19);
+        assert!(runtime.contains("al_runtime_plan_hi"));
+        assert!(runtime.contains("al_runtime_plan_lo"));
+        assert!(GPU83_SHADER_SOURCE.contains("max(PTS - al_runtime_epoch_start_seconds"));
+        for removed_per_frame_output in [
+            "al_runtime_frame_inner_active",
+            "al_runtime_pip_jitter_x_px",
+            "al_runtime_async_rotation_degrees",
+            "al_runtime_transform_easing",
+        ] {
+            assert!(!runtime.contains(removed_per_frame_output));
+        }
     }
 }

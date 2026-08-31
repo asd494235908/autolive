@@ -1,0 +1,9 @@
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -95 +95,5 @@
+-    set(GLSLANG_ENABLE_INSTALL $<NOT:${SKIP_GLSLANG_INSTALL}>)
++    if(SKIP_GLSLANG_INSTALL)
++      set(GLSLANG_ENABLE_INSTALL OFF)
++    else()
++      set(GLSLANG_ENABLE_INSTALL ON)
++    endif()

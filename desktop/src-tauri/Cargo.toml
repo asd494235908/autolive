@@ -10,9 +10,11 @@ path = "src/lib.rs"
 
 [build-dependencies]
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 tauri-build = { version = "2.0.0", features = [] }
 
 [dependencies]
+autolive-native-video-host = { path = "crates/autolive-native-video-host" }
 autolive-portaudio-output = { path = "../crates/autolive-portaudio-output" }
 autolive-signalsmith-stretch = { path = "../crates/autolive-signalsmith-stretch" }
 cap-std = "=4.0.2"
@@ -29,6 +31,9 @@ tauri = { version = "2.0.0", features = ["protocol-asset"] }
 tauri-runtime = "2.0.0"
 tauri-plugin-dialog = "2.0.0"
 tauri-plugin-http = "2.5.9"
+
+[target.'cfg(windows)'.dependencies]
+win32job = "=2.0.3"
 
 [lints.rust]
 unsafe_code = "forbid"

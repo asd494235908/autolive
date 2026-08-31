@@ -315,16 +315,16 @@
       "description": "Permission identifier",
       "oneOf": [
         {
-          "description": "Minimal playback commands required by the final-effect window.\n#### This permission set includes:\n\n- `allow-cancel-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-complete-playback-item`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-get-audio-output-backend-status`\n- `allow-get-snapshot`\n- `allow-pause-playback`\n- `allow-pause-portaudio-interlude`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-prepare-webview-interlude`\n- `allow-release-media-processing-artifact`\n- `allow-release-audio-media-candidate`\n- `allow-release-webview-interlude-cache`\n- `allow-resize-final-effect-window`\n- `allow-restore-original-audio`\n- `allow-restore-original-video`\n- `allow-resume-playback`\n- `allow-resume-portaudio-interlude`\n- `allow-set-audio-output-backend`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-stop-portaudio-interlude`\n- `allow-sync-audio-output-source`\n- `allow-sync-realtime-video-renderer`\n- `allow-stop-realtime-video-renderer`\n- `allow-update-playback-position`",
+          "description": "Minimal playback commands required by the final-effect window.\n#### This permission set includes:\n\n- `allow-cancel-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-ensure-original-video-renderer`\n- `allow-complete-playback-item`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-get-audio-output-backend-status`\n- `allow-get-media-video-backend-status`\n- `allow-get-snapshot`\n- `allow-pause-playback`\n- `allow-pause-portaudio-interlude`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-prepare-webview-interlude`\n- `allow-release-media-processing-artifact`\n- `allow-release-audio-media-candidate`\n- `allow-release-webview-interlude-cache`\n- `allow-resize-final-effect-window`\n- `allow-restore-original-audio`\n- `allow-restore-original-video`\n- `allow-resume-playback`\n- `allow-resume-portaudio-interlude`\n- `allow-set-audio-output-backend`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-stop-portaudio-interlude`\n- `allow-sync-audio-output-source`\n- `allow-stop-realtime-video-renderer`\n- `allow-update-playback-position`",
           "type": "string",
           "const": "final-effect-commands",
-          "markdownDescription": "Minimal playback commands required by the final-effect window.\n#### This permission set includes:\n\n- `allow-cancel-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-complete-playback-item`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-get-audio-output-backend-status`\n- `allow-get-snapshot`\n- `allow-pause-playback`\n- `allow-pause-portaudio-interlude`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-prepare-webview-interlude`\n- `allow-release-media-processing-artifact`\n- `allow-release-audio-media-candidate`\n- `allow-release-webview-interlude-cache`\n- `allow-resize-final-effect-window`\n- `allow-restore-original-audio`\n- `allow-restore-original-video`\n- `allow-resume-playback`\n- `allow-resume-portaudio-interlude`\n- `allow-set-audio-output-backend`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-stop-portaudio-interlude`\n- `allow-sync-audio-output-source`\n- `allow-sync-realtime-video-renderer`\n- `allow-stop-realtime-video-renderer`\n- `allow-update-playback-position`"
+          "markdownDescription": "Minimal playback commands required by the final-effect window.\n#### This permission set includes:\n\n- `allow-cancel-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-ensure-original-video-renderer`\n- `allow-complete-playback-item`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-get-audio-output-backend-status`\n- `allow-get-media-video-backend-status`\n- `allow-get-snapshot`\n- `allow-pause-playback`\n- `allow-pause-portaudio-interlude`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-prepare-webview-interlude`\n- `allow-release-media-processing-artifact`\n- `allow-release-audio-media-candidate`\n- `allow-release-webview-interlude-cache`\n- `allow-resize-final-effect-window`\n- `allow-restore-original-audio`\n- `allow-restore-original-video`\n- `allow-resume-playback`\n- `allow-resume-portaudio-interlude`\n- `allow-set-audio-output-backend`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-stop-portaudio-interlude`\n- `allow-sync-audio-output-source`\n- `allow-stop-realtime-video-renderer`\n- `allow-update-playback-position`"
         },
         {
-          "description": "Commands available to the authenticated main application window.\n#### This permission set includes:\n\n- `allow-probe-local-video`\n- `allow-probe-local-videos`\n- `allow-append-local-videos`\n- `allow-replace-playback-pool-item`\n- `allow-reorder-playback-pool-items`\n- `allow-remove-playback-pool-item`\n- `allow-clear-playback-pool`\n- `allow-probe-local-mp4`\n- `allow-get-device-runtime-info`\n- `allow-get-media-engine-capabilities`\n- `allow-get-media-video-backend-status`\n- `allow-get-audio-output-backend-status`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-list-audio-output-devices`\n- `allow-set-audio-output-backend`\n- `allow-sync-audio-output-source`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-cancel-audio-cycle-candidate`\n- `allow-play-portaudio-test-tone`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-prepare-webview-interlude`\n- `allow-release-webview-interlude-cache`\n- `allow-pause-portaudio-interlude`\n- `allow-resume-portaudio-interlude`\n- `allow-stop-portaudio-interlude`\n- `allow-get-runtime-resource-status`\n- `allow-install-runtime-resources`\n- `allow-cancel-runtime-resource-install`\n- `allow-import-runtime-resource-directory`\n- `allow-clear-runtime-resources`\n- `allow-cleanup-local-caches-command`\n- `allow-prepare-audio-media-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-release-audio-media-candidate`\n- `allow-get-default-media-effect-params`\n- `allow-start-playback`\n- `allow-pause-playback`\n- `allow-resume-playback`\n- `allow-update-playback-position`\n- `allow-stop-playback`\n- `allow-complete-playback-loop`\n- `allow-complete-playback-item`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-set-processing-switches`\n- `allow-set-audio-processing-profile`\n- `allow-set-interlude-config`\n- `allow-start-media-processing`\n- `allow-prepare-realtime-video-plan`\n- `allow-commit-realtime-video-plan`\n- `allow-sync-realtime-video-renderer`\n- `allow-stop-realtime-video-renderer`\n- `allow-release-media-processing-artifact`\n- `allow-restore-original-audio`\n- `allow-get-snapshot`\n- `allow-validate-media-effect-params`\n- `allow-get-or-create-control-plane-device-id`\n- `allow-login-control-plane-session`\n- `allow-restore-control-plane-session`\n- `allow-refresh-control-plane-session`\n- `allow-logout-control-plane-session`\n- `allow-retry-pending-control-plane-logout`\n- `allow-clear-legacy-auth-credentials`\n- `allow-open-final-effect-window`\n- `allow-close-final-effect-window`\n- `allow-resize-final-effect-window`",
+          "description": "Commands available to the authenticated main application window.\n#### This permission set includes:\n\n- `allow-probe-local-video`\n- `allow-probe-local-videos`\n- `allow-append-local-videos`\n- `allow-replace-playback-pool-item`\n- `allow-reorder-playback-pool-items`\n- `allow-remove-playback-pool-item`\n- `allow-clear-playback-pool`\n- `allow-probe-local-mp4`\n- `allow-get-device-runtime-info`\n- `allow-get-media-engine-capabilities`\n- `allow-get-media-video-backend-status`\n- `allow-get-audio-output-backend-status`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-list-audio-output-devices`\n- `allow-set-audio-output-backend`\n- `allow-sync-audio-output-source`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-cancel-audio-cycle-candidate`\n- `allow-play-portaudio-test-tone`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-prepare-webview-interlude`\n- `allow-release-webview-interlude-cache`\n- `allow-pause-portaudio-interlude`\n- `allow-resume-portaudio-interlude`\n- `allow-stop-portaudio-interlude`\n- `allow-get-runtime-resource-status`\n- `allow-install-runtime-resources`\n- `allow-cancel-runtime-resource-install`\n- `allow-import-runtime-resource-directory`\n- `allow-clear-runtime-resources`\n- `allow-cleanup-local-caches-command`\n- `allow-prepare-audio-media-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-release-audio-media-candidate`\n- `allow-get-default-media-effect-params`\n- `allow-start-playback`\n- `allow-pause-playback`\n- `allow-resume-playback`\n- `allow-seek-playback`\n- `allow-update-playback-position`\n- `allow-stop-playback`\n- `allow-complete-playback-loop`\n- `allow-complete-playback-item`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-set-processing-switches`\n- `allow-set-audio-processing-profile`\n- `allow-set-interlude-config`\n- `allow-start-media-processing`\n- `allow-ensure-original-video-renderer`\n- `allow-configure-realtime-video-cycle`\n- `allow-stop-realtime-video-renderer`\n- `allow-release-media-processing-artifact`\n- `allow-restore-original-audio`\n- `allow-get-snapshot`\n- `allow-validate-media-effect-params`\n- `allow-get-or-create-control-plane-device-id`\n- `allow-login-control-plane-session`\n- `allow-restore-control-plane-session`\n- `allow-refresh-control-plane-session`\n- `allow-logout-control-plane-session`\n- `allow-retry-pending-control-plane-logout`\n- `allow-clear-legacy-auth-credentials`\n- `allow-open-final-effect-window`\n- `allow-close-final-effect-window`\n- `allow-resize-final-effect-window`",
           "type": "string",
           "const": "main-commands",
-          "markdownDescription": "Commands available to the authenticated main application window.\n#### This permission set includes:\n\n- `allow-probe-local-video`\n- `allow-probe-local-videos`\n- `allow-append-local-videos`\n- `allow-replace-playback-pool-item`\n- `allow-reorder-playback-pool-items`\n- `allow-remove-playback-pool-item`\n- `allow-clear-playback-pool`\n- `allow-probe-local-mp4`\n- `allow-get-device-runtime-info`\n- `allow-get-media-engine-capabilities`\n- `allow-get-media-video-backend-status`\n- `allow-get-audio-output-backend-status`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-list-audio-output-devices`\n- `allow-set-audio-output-backend`\n- `allow-sync-audio-output-source`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-cancel-audio-cycle-candidate`\n- `allow-play-portaudio-test-tone`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-prepare-webview-interlude`\n- `allow-release-webview-interlude-cache`\n- `allow-pause-portaudio-interlude`\n- `allow-resume-portaudio-interlude`\n- `allow-stop-portaudio-interlude`\n- `allow-get-runtime-resource-status`\n- `allow-install-runtime-resources`\n- `allow-cancel-runtime-resource-install`\n- `allow-import-runtime-resource-directory`\n- `allow-clear-runtime-resources`\n- `allow-cleanup-local-caches-command`\n- `allow-prepare-audio-media-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-release-audio-media-candidate`\n- `allow-get-default-media-effect-params`\n- `allow-start-playback`\n- `allow-pause-playback`\n- `allow-resume-playback`\n- `allow-update-playback-position`\n- `allow-stop-playback`\n- `allow-complete-playback-loop`\n- `allow-complete-playback-item`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-set-processing-switches`\n- `allow-set-audio-processing-profile`\n- `allow-set-interlude-config`\n- `allow-start-media-processing`\n- `allow-prepare-realtime-video-plan`\n- `allow-commit-realtime-video-plan`\n- `allow-sync-realtime-video-renderer`\n- `allow-stop-realtime-video-renderer`\n- `allow-release-media-processing-artifact`\n- `allow-restore-original-audio`\n- `allow-get-snapshot`\n- `allow-validate-media-effect-params`\n- `allow-get-or-create-control-plane-device-id`\n- `allow-login-control-plane-session`\n- `allow-restore-control-plane-session`\n- `allow-refresh-control-plane-session`\n- `allow-logout-control-plane-session`\n- `allow-retry-pending-control-plane-logout`\n- `allow-clear-legacy-auth-credentials`\n- `allow-open-final-effect-window`\n- `allow-close-final-effect-window`\n- `allow-resize-final-effect-window`"
+          "markdownDescription": "Commands available to the authenticated main application window.\n#### This permission set includes:\n\n- `allow-probe-local-video`\n- `allow-probe-local-videos`\n- `allow-append-local-videos`\n- `allow-replace-playback-pool-item`\n- `allow-reorder-playback-pool-items`\n- `allow-remove-playback-pool-item`\n- `allow-clear-playback-pool`\n- `allow-probe-local-mp4`\n- `allow-get-device-runtime-info`\n- `allow-get-media-engine-capabilities`\n- `allow-get-media-video-backend-status`\n- `allow-get-audio-output-backend-status`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-list-audio-output-devices`\n- `allow-set-audio-output-backend`\n- `allow-sync-audio-output-source`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-cancel-audio-cycle-candidate`\n- `allow-play-portaudio-test-tone`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-prepare-webview-interlude`\n- `allow-release-webview-interlude-cache`\n- `allow-pause-portaudio-interlude`\n- `allow-resume-portaudio-interlude`\n- `allow-stop-portaudio-interlude`\n- `allow-get-runtime-resource-status`\n- `allow-install-runtime-resources`\n- `allow-cancel-runtime-resource-install`\n- `allow-import-runtime-resource-directory`\n- `allow-clear-runtime-resources`\n- `allow-cleanup-local-caches-command`\n- `allow-prepare-audio-media-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-release-audio-media-candidate`\n- `allow-get-default-media-effect-params`\n- `allow-start-playback`\n- `allow-pause-playback`\n- `allow-resume-playback`\n- `allow-seek-playback`\n- `allow-update-playback-position`\n- `allow-stop-playback`\n- `allow-complete-playback-loop`\n- `allow-complete-playback-item`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-set-processing-switches`\n- `allow-set-audio-processing-profile`\n- `allow-set-interlude-config`\n- `allow-start-media-processing`\n- `allow-ensure-original-video-renderer`\n- `allow-configure-realtime-video-cycle`\n- `allow-stop-realtime-video-renderer`\n- `allow-release-media-processing-artifact`\n- `allow-restore-original-audio`\n- `allow-get-snapshot`\n- `allow-validate-media-effect-params`\n- `allow-get-or-create-control-plane-device-id`\n- `allow-login-control-plane-session`\n- `allow-restore-control-plane-session`\n- `allow-refresh-control-plane-session`\n- `allow-logout-control-plane-session`\n- `allow-retry-pending-control-plane-logout`\n- `allow-clear-legacy-auth-credentials`\n- `allow-open-final-effect-window`\n- `allow-close-final-effect-window`\n- `allow-resize-final-effect-window`"
         },
         {
           "description": "Enables the append_local_videos command without any pre-configured scope.",
@@ -393,12 +393,6 @@
           "markdownDescription": "Enables the commit_media_processing_if_ready command without any pre-configured scope."
         },
         {
-          "description": "Enables the commit_realtime_video_plan command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-commit-realtime-video-plan",
-          "markdownDescription": "Enables the commit_realtime_video_plan command without any pre-configured scope."
-        },
-        {
           "description": "Enables the complete_playback_item command without any pre-configured scope.",
           "type": "string",
           "const": "allow-complete-playback-item",
@@ -411,6 +405,12 @@
           "markdownDescription": "Enables the complete_playback_loop command without any pre-configured scope."
         },
         {
+          "description": "Enables the configure_realtime_video_cycle command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-configure-realtime-video-cycle",
+          "markdownDescription": "Enables the configure_realtime_video_cycle command without any pre-configured scope."
+        },
+        {
           "description": "Enables the discard_audio_media_candidate command without any pre-configured scope.",
           "type": "string",
           "const": "allow-discard-audio-media-candidate",
@@ -421,6 +421,12 @@
           "type": "string",
           "const": "allow-discard-media-processing-candidate",
           "markdownDescription": "Enables the discard_media_processing_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ensure_original_video_renderer command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ensure-original-video-renderer",
+          "markdownDescription": "Enables the ensure_original_video_renderer command without any pre-configured scope."
         },
         {
           "description": "Enables the get_audio_cycle_diagnostic command without any pre-configured scope.",
@@ -543,12 +549,6 @@
           "markdownDescription": "Enables the prepare_audio_media_candidate command without any pre-configured scope."
         },
         {
-          "description": "Enables the prepare_realtime_video_plan command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-prepare-realtime-video-plan",
-          "markdownDescription": "Enables the prepare_realtime_video_plan command without any pre-configured scope."
-        },
-        {
           "description": "Enables the prepare_webview_interlude command without any pre-configured scope.",
           "type": "string",
           "const": "allow-prepare-webview-interlude",
@@ -657,6 +657,12 @@
           "markdownDescription": "Enables the retry_pending_control_plane_logout command without any pre-configured scope."
         },
         {
+          "description": "Enables the seek_playback command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-seek-playback",
+          "markdownDescription": "Enables the seek_playback command without any pre-configured scope."
+        },
+        {
           "description": "Enables the set_audio_output_backend command without any pre-configured scope.",
           "type": "string",
           "const": "allow-set-audio-output-backend",
@@ -741,12 +747,6 @@
           "markdownDescription": "Enables the sync_audio_output_source command without any pre-configured scope."
         },
         {
-          "description": "Enables the sync_realtime_video_renderer command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-sync-realtime-video-renderer",
-          "markdownDescription": "Enables the sync_realtime_video_renderer command without any pre-configured scope."
-        },
-        {
           "description": "Enables the update_playback_position command without any pre-configured scope.",
           "type": "string",
           "const": "allow-update-playback-position",
@@ -825,12 +825,6 @@
           "markdownDescription": "Denies the commit_media_processing_if_ready command without any pre-configured scope."
         },
         {
-          "description": "Denies the commit_realtime_video_plan command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-commit-realtime-video-plan",
-          "markdownDescription": "Denies the commit_realtime_video_plan command without any pre-configured scope."
-        },
-        {
           "description": "Denies the complete_playback_item command without any pre-configured scope.",
           "type": "string",
           "const": "deny-complete-playback-item",
@@ -843,6 +837,12 @@
           "markdownDescription": "Denies the complete_playback_loop command without any pre-configured scope."
         },
         {
+          "description": "Denies the configure_realtime_video_cycle command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-configure-realtime-video-cycle",
+          "markdownDescription": "Denies the configure_realtime_video_cycle command without any pre-configured scope."
+        },
+        {
           "description": "Denies the discard_audio_media_candidate command without any pre-configured scope.",
           "type": "string",
           "const": "deny-discard-audio-media-candidate",
@@ -853,6 +853,12 @@
           "type": "string",
           "const": "deny-discard-media-processing-candidate",
           "markdownDescription": "Denies the discard_media_processing_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ensure_original_video_renderer command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ensure-original-video-renderer",
+          "markdownDescription": "Denies the ensure_original_video_renderer command without any pre-configured scope."
         },
         {
           "description": "Denies the get_audio_cycle_diagnostic command without any pre-configured scope.",
@@ -975,12 +981,6 @@
           "markdownDescription": "Denies the prepare_audio_media_candidate command without any pre-configured scope."
         },
         {
-          "description": "Denies the prepare_realtime_video_plan command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-prepare-realtime-video-plan",
-          "markdownDescription": "Denies the prepare_realtime_video_plan command without any pre-configured scope."
-        },
-        {
           "description": "Denies the prepare_webview_interlude command without any pre-configured scope.",
           "type": "string",
           "const": "deny-prepare-webview-interlude",
@@ -1089,6 +1089,12 @@
           "markdownDescription": "Denies the retry_pending_control_plane_logout command without any pre-configured scope."
         },
         {
+          "description": "Denies the seek_playback command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-seek-playback",
+          "markdownDescription": "Denies the seek_playback command without any pre-configured scope."
+        },
+        {
           "description": "Denies the set_audio_output_backend command without any pre-configured scope.",
           "type": "string",
           "const": "deny-set-audio-output-backend",
@@ -1171,12 +1177,6 @@
           "type": "string",
           "const": "deny-sync-audio-output-source",
           "markdownDescription": "Denies the sync_audio_output_source command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the sync_realtime_video_renderer command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-sync-realtime-video-renderer",
-          "markdownDescription": "Denies the sync_realtime_video_renderer command without any pre-configured scope."
         },
         {
           "description": "Denies the update_playback_position command without any pre-configured scope.",

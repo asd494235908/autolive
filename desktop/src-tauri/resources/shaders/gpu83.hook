@@ -1,3 +1,4 @@
+// BEGIN desktop/tools/shader-candidates/gpu83-baseline-candidate.hook
 //!PARAM PTS
 //!TYPE float
 0.0
@@ -141,21 +142,21 @@ mat2 al_rotation(float radians) {
 }
 
 vec3 al_hue_rotate(vec3 color, float radians) {
-    const mat3 to_yiq = mat3(
-        0.299, 0.587, 0.114,
-        0.596, -0.275, -0.321,
-        0.212, -0.523, 0.311
-    );
-    const mat3 from_yiq = mat3(
-        1.0, 0.956, 0.621,
-        1.0, -0.272, -0.647,
-        1.0, -1.106, 1.703
-    );
-    vec3 yiq = to_yiq * color;
+    if (abs(radians) <= 0.000001) {
+        return color;
+    }
+    float y = dot(color, vec3(0.299, 0.587, 0.114));
+    float i = dot(color, vec3(0.596, -0.275, -0.321));
+    float q = dot(color, vec3(0.212, -0.523, 0.311));
     float cosine_value = cos(radians);
     float sine_value = sin(radians);
-    yiq.yz = mat2(cosine_value, -sine_value, sine_value, cosine_value) * yiq.yz;
-    return from_yiq * yiq;
+    float rotated_i = cosine_value * i - sine_value * q;
+    float rotated_q = sine_value * i + cosine_value * q;
+    return vec3(
+        y + 0.956 * rotated_i + 0.621 * rotated_q,
+        y - 0.272 * rotated_i - 0.647 * rotated_q,
+        y - 1.106 * rotated_i + 1.703 * rotated_q
+    );
 }
 
 void hook() {
@@ -197,9 +198,9 @@ void hook() {
     float detail_gain = al_sharpen_percent / 100.0 + al_detail_percent / 100.0;
     color.rgb += detail_gain * (source_color.rgb - neighbor_color.rgb);
 
-    float luma = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
     color.rgb += vec3(al_brightness_percent / 100.0);
     color.rgb = (color.rgb - vec3(0.5)) * (al_contrast_percent / 100.0) + vec3(0.5);
+    float luma = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
     color.rgb = mix(vec3(luma), color.rgb, al_saturation_percent / 100.0);
     color.rgb = al_hue_rotate(color.rgb, radians(al_hue_degrees));
     color.rgb += vec3(al_shadows_percent / 100.0 * (1.0 - luma));
@@ -212,11 +213,1031 @@ void hook() {
     float vignette_factor = mix(1.0, clamp(1.0 - radius * radius, 0.0, 1.0), al_vignette_percent / 100.0);
     color.rgb *= vignette_factor;
 
-    float source_edge = min(min(transformed_uv.x, transformed_uv.y), min(1.0 - transformed_uv.x, 1.0 - transformed_uv.y));
-    float edge_width = max(al_crop_edge_smoothing * max(pixel_size.x, pixel_size.y) * 8.0, 0.000001);
-    float crop_weight = smoothstep(0.0, edge_width, source_edge);
-    color = mix(HOOKED_tex(source_uv), color, crop_weight);
+    bool has_geometry_transform = abs(al_rotation_degrees) > 0.000001
+        || abs(al_pixel_scale_percent - 100.0) > 0.000001
+        || al_dynamic_crop_percent > 0.000001
+        || abs(al_space_x_px) > 0.000001
+        || abs(al_space_y_px) > 0.000001
+        || al_pixel_jitter_px > 0.000001;
+    if (has_geometry_transform) {
+        float source_edge = min(min(transformed_uv.x, transformed_uv.y), min(1.0 - transformed_uv.x, 1.0 - transformed_uv.y));
+        float edge_width = max(al_crop_edge_smoothing * max(pixel_size.x, pixel_size.y) * 8.0, 0.000001);
+        float crop_weight = smoothstep(0.0, edge_width, source_edge);
+        color = mix(HOOKED_tex(source_uv), color, crop_weight);
+    }
     color.r = mix(color.r, source_color.r, clamp(al_red_lock_enabled, 0.0, 1.0));
 
     imageStore(out_image, output_pixel, clamp(color, 0.0, 1.0));
 }
+// END desktop/tools/shader-candidates/gpu83-baseline-candidate.hook
+
+// BEGIN desktop/tools/shader-candidates/gpu83-image-repair-candidate.hook
+//!PARAM al_image_repair_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_image_repair_strength_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 100.0
+0.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive verified realtime edge-aware image repair
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN al_image_repair_enabled al_image_repair_strength_percent *
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+    float repair_mix = clamp(al_image_repair_enabled, 0.0, 1.0)
+        * clamp(al_image_repair_strength_percent / 100.0, 0.0, 1.0);
+    if (repair_mix <= 0.0) {
+        return source_color;
+    }
+
+    vec2 pixel_size = HOOKED_pt;
+    vec3 left = HOOKED_tex(clamp(HOOKED_pos - vec2(pixel_size.x, 0.0), vec2(0.0), vec2(1.0))).rgb;
+    vec3 right = HOOKED_tex(clamp(HOOKED_pos + vec2(pixel_size.x, 0.0), vec2(0.0), vec2(1.0))).rgb;
+    vec3 up = HOOKED_tex(clamp(HOOKED_pos - vec2(0.0, pixel_size.y), vec2(0.0), vec2(1.0))).rgb;
+    vec3 down = HOOKED_tex(clamp(HOOKED_pos + vec2(0.0, pixel_size.y), vec2(0.0), vec2(1.0))).rgb;
+
+    float left_weight = 1.0 / (1.0 + 64.0 * dot(left - source_color.rgb, left - source_color.rgb));
+    float right_weight = 1.0 / (1.0 + 64.0 * dot(right - source_color.rgb, right - source_color.rgb));
+    float up_weight = 1.0 / (1.0 + 64.0 * dot(up - source_color.rgb, up - source_color.rgb));
+    float down_weight = 1.0 / (1.0 + 64.0 * dot(down - source_color.rgb, down - source_color.rgb));
+    float weight_sum = 1.0 + left_weight + right_weight + up_weight + down_weight;
+    vec3 repaired_color = (
+        source_color.rgb
+        + left * left_weight
+        + right * right_weight
+        + up * up_weight
+        + down * down_weight
+    ) / weight_sum;
+
+    return vec4(mix(source_color.rgb, repaired_color, repair_mix), source_color.a);
+}
+// END desktop/tools/shader-candidates/gpu83-image-repair-candidate.hook
+
+// BEGIN desktop/tools/shader-candidates/gpu83-abstract-face-candidate.hook
+//!PARAM al_abstract_face_count
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 10.0
+0.0
+
+//!PARAM al_abstract_face_size_percent
+//!TYPE float
+//!MINIMUM 1.0
+//!MAXIMUM 10.0
+2.0
+
+//!PARAM al_abstract_face_opacity_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 30.0
+0.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive verified realtime abstract geometric face
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN al_abstract_face_count al_abstract_face_opacity_percent *
+
+float al_box_distance(vec2 point, vec2 half_extent) {
+    vec2 edge = abs(point) - half_extent;
+    return length(max(edge, vec2(0.0))) + min(max(edge.x, edge.y), 0.0);
+}
+
+vec2 al_face_center(int index) {
+    float face_index = float(index);
+    return vec2(
+        0.1 + 0.2 * mod(face_index, 5.0),
+        0.28 + 0.44 * floor(face_index / 5.0)
+    );
+}
+
+float al_face_mask(vec2 point) {
+    float outline = 1.0 - smoothstep(0.025, 0.04, abs(al_box_distance(point, vec2(0.45))));
+    float left_eye = 1.0 - smoothstep(0.04, 0.06, length(point - vec2(-0.18, -0.14)));
+    float right_eye = 1.0 - smoothstep(0.04, 0.06, length(point - vec2(0.18, -0.14)));
+    float mouth = 1.0 - smoothstep(
+        0.0,
+        0.02,
+        al_box_distance(point - vec2(0.0, 0.18), vec2(0.18, 0.025))
+    );
+    return max(max(outline, left_eye), max(right_eye, mouth));
+}
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+    int face_count = int(clamp(floor(al_abstract_face_count + 0.5), 0.0, 10.0));
+    float opacity = clamp(al_abstract_face_opacity_percent / 100.0, 0.0, 0.3);
+    if (face_count == 0 || opacity <= 0.0) {
+        return source_color;
+    }
+
+    int column = int(clamp(floor(HOOKED_pos.x * 5.0), 0.0, 4.0));
+    int row = int(clamp(floor(HOOKED_pos.y * 2.0), 0.0, 1.0));
+    int slot_index = row * 5 + column;
+    if (slot_index >= face_count) {
+        return source_color;
+    }
+
+    float face_width = clamp(al_abstract_face_size_percent / 100.0, 0.01, 0.1);
+    vec2 face_scale = vec2(face_width, face_width * HOOKED_size.x / HOOKED_size.y);
+    vec2 face_point = (HOOKED_pos - al_face_center(slot_index)) / face_scale;
+    if (any(greaterThan(abs(face_point), vec2(0.55)))) {
+        return source_color;
+    }
+
+    float mask = al_face_mask(face_point);
+    vec3 result = mix(source_color.rgb, vec3(1.0), opacity * clamp(mask, 0.0, 1.0));
+    return vec4(result, source_color.a);
+}
+// END desktop/tools/shader-candidates/gpu83-abstract-face-candidate.hook
+
+// BEGIN desktop/tools/shader-candidates/gpu83-same-frame-overlays-candidate.hook
+//!PARAM al_random_graphic_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_random_graphic_count
+//!TYPE float
+//!MINIMUM 1.0
+//!MAXIMUM 32.0
+4.0
+
+//!PARAM al_random_graphic_opacity_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 50.0
+0.0
+
+//!PARAM al_random_graphic_size_px
+//!TYPE float
+//!MINIMUM 1.0
+//!MAXIMUM 64.0
+4.0
+
+//!PARAM al_overlay_offset_px
+//!TYPE float
+//!MINIMUM -10.0
+//!MAXIMUM 10.0
+0.0
+
+//!PARAM al_pip_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_pip_scale_percent
+//!TYPE float
+//!MINIMUM 10.0
+//!MAXIMUM 50.0
+24.0
+
+//!PARAM al_pip_opacity_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 100.0
+100.0
+
+//!PARAM al_pip_rotation_degrees
+//!TYPE float
+//!MINIMUM -15.0
+//!MAXIMUM 15.0
+0.0
+
+//!PARAM al_runtime_epoch_start_seconds
+//!TYPE float
+0.0
+
+//!PARAM al_runtime_source_fps
+//!TYPE float
+//!MINIMUM 1.0
+//!MAXIMUM 240.0
+60.0
+
+//!PARAM al_runtime_random_seed
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 16777215.0
+0.0
+
+//!PARAM al_runtime_plan_hi
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 16777215.0
+0.0
+
+//!PARAM al_runtime_plan_lo
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 16777215.0
+0.0
+
+//!PARAM al_runtime_frame_inner_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 100.0
+0.0
+
+//!PARAM al_runtime_frame_inter_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 100.0
+0.0
+
+//!PARAM al_runtime_frame_probability_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 100.0
+0.0
+
+//!PARAM al_runtime_slice_length_seconds
+//!TYPE float
+//!MINIMUM 0.001
+1.0
+
+//!PARAM al_runtime_slice_interval_seconds
+//!TYPE float
+//!MINIMUM 0.001
+5.0
+
+//!PARAM al_runtime_pip_jitter_px
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 4.0
+0.0
+
+//!PARAM al_runtime_local_blur_interval_seconds
+//!TYPE float
+//!MINIMUM 0.001
+1.0
+
+//!PARAM al_runtime_smoothing_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_runtime_smoothing_seconds
+//!TYPE float
+//!MINIMUM 0.001
+0.1
+
+//!PARAM al_runtime_highlight_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_runtime_highlight_interval_seconds
+//!TYPE float
+//!MINIMUM 0.001
+1.0
+
+//!PARAM al_runtime_async_rotation_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_runtime_async_rotation_min_degrees
+//!TYPE float
+//!MINIMUM -15.0
+//!MAXIMUM 15.0
+0.0
+
+//!PARAM al_runtime_async_rotation_max_degrees
+//!TYPE float
+//!MINIMUM -15.0
+//!MAXIMUM 15.0
+0.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive verified realtime deterministic same-frame overlays
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN al_random_graphic_enabled al_random_graphic_opacity_percent * al_pip_enabled al_pip_opacity_percent * +
+
+float al_overlay_hash(float value) {
+    return fract(sin(value * 12.9898 + 78.233) * 43758.5453);
+}
+
+float al_overlay_seeded_hash(float slot, float salt, vec2 seed_parts) {
+    float base_input = slot + salt;
+    if (seed_parts.x <= 0.0 && seed_parts.y <= 0.0) {
+        return al_overlay_hash(base_input);
+    }
+    float low_component = al_overlay_hash(base_input + seed_parts.x);
+    float high_component = al_overlay_hash(base_input + seed_parts.y + 4096.0);
+    return fract(low_component + high_component * 0.61803398875);
+}
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+    vec3 result = source_color.rgb;
+    vec2 offset_uv = vec2(clamp(al_overlay_offset_px, -10.0, 10.0)) * HOOKED_pt;
+
+    float pip_weight = clamp(al_pip_enabled, 0.0, 1.0)
+        * clamp(al_pip_opacity_percent / 100.0, 0.0, 1.0);
+    if (pip_weight > 0.0) {
+        float pip_scale = clamp(al_pip_scale_percent / 100.0, 0.1, 0.5);
+        vec2 pip_size = vec2(pip_scale);
+        float elapsed_seconds = max(PTS - al_runtime_epoch_start_seconds, 0.0);
+        float frame_bucket = floor(elapsed_seconds * clamp(al_runtime_source_fps, 1.0, 240.0));
+        float jitter_angle = 6.28318530718 * al_overlay_hash(
+            frame_bucket + floor(al_runtime_random_seed) + 211.0
+        );
+        vec2 runtime_pip_jitter_uv = clamp(al_runtime_pip_jitter_px, 0.0, 4.0)
+            * vec2(cos(jitter_angle), sin(jitter_angle)) * HOOKED_pt;
+        vec2 pip_max = vec2(0.98) + offset_uv + runtime_pip_jitter_uv;
+        vec2 pip_min = pip_max - pip_size;
+        vec2 pip_center = (pip_min + pip_max) * 0.5;
+        float angle = radians(clamp(al_pip_rotation_degrees, -15.0, 15.0));
+        float sine = sin(angle);
+        float cosine = cos(angle);
+        vec2 centered = HOOKED_pos - pip_center;
+        vec2 rotated_local = vec2(
+            cosine * centered.x + sine * centered.y,
+            -sine * centered.x + cosine * centered.y
+        );
+        vec2 sample_pos = rotated_local / pip_size + vec2(0.5);
+
+        if (all(greaterThanEqual(sample_pos, vec2(0.0)))
+                && all(lessThanEqual(sample_pos, vec2(1.0)))) {
+            result = mix(result, HOOKED_tex(sample_pos).rgb, pip_weight);
+        }
+    }
+
+    float graphic_weight = clamp(al_random_graphic_enabled, 0.0, 1.0)
+        * clamp(al_random_graphic_opacity_percent / 100.0, 0.0, 0.5);
+    if (graphic_weight > 0.0) {
+        vec2 graphic_pos = HOOKED_pos - offset_uv;
+        if (all(greaterThanEqual(graphic_pos, vec2(0.0)))
+                && all(lessThan(graphic_pos, vec2(1.0)))) {
+            vec2 grid_size = vec2(8.0, 4.0);
+            vec2 cell = floor(graphic_pos * grid_size);
+            int slot_index = int(cell.y) * 8 + int(cell.x);
+            int graphic_count = int(clamp(floor(al_random_graphic_count + 0.5), 1.0, 32.0));
+
+            if (slot_index < graphic_count) {
+                float slot = float(slot_index);
+                float seed = floor(clamp(al_runtime_random_seed, 0.0, 16777215.0));
+                vec2 seed_parts = vec2(mod(seed, 4096.0), floor(seed / 4096.0));
+                float graphic_size = clamp(al_random_graphic_size_px, 1.0, 64.0);
+                vec2 cell_pixels = HOOKED_size / grid_size;
+                vec2 center_margin = min(
+                    vec2(0.45),
+                    vec2(graphic_size * 0.5 + 1.0) / cell_pixels
+                );
+                vec2 random_position = vec2(
+                    al_overlay_seeded_hash(slot, 1.0, seed_parts),
+                    al_overlay_seeded_hash(slot, 37.0, seed_parts)
+                );
+                vec2 center_in_cell = mix(center_margin, vec2(1.0) - center_margin, random_position);
+                vec2 center = (cell + center_in_cell) / grid_size;
+                vec2 point_px = (graphic_pos - center) * HOOKED_size;
+                float half_size = graphic_size * 0.5;
+                float shape_selector = al_overlay_seeded_hash(slot, 73.0, seed_parts);
+                float shape_distance = shape_selector < 0.5
+                    ? length(point_px)
+                    : max(abs(point_px.x), abs(point_px.y));
+                float mask = 1.0 - smoothstep(
+                    max(0.0, half_size - 1.0),
+                    half_size + 1.0,
+                    shape_distance
+                );
+                vec3 graphic_color = vec3(
+                    0.35 + 0.65 * al_overlay_seeded_hash(slot, 101.0, seed_parts),
+                    0.35 + 0.65 * al_overlay_seeded_hash(slot, 149.0, seed_parts),
+                    0.35 + 0.65 * al_overlay_seeded_hash(slot, 197.0, seed_parts)
+                );
+                result = mix(result, graphic_color, graphic_weight * mask);
+            }
+        }
+    }
+
+    return vec4(result, source_color.a);
+}
+// END desktop/tools/shader-candidates/gpu83-same-frame-overlays-candidate.hook
+
+// BEGIN desktop/tools/shader-candidates/gpu83-local-blur-candidate.hook
+//!PARAM al_local_blur_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_local_blur_region_percent
+//!TYPE float
+//!MINIMUM 5.0
+//!MAXIMUM 50.0
+20.0
+
+//!PARAM al_local_blur_radius_px
+//!TYPE float
+//!MINIMUM 0.1
+//!MAXIMUM 16.0
+2.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive verified realtime center-region local blur
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN al_local_blur_enabled
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+    float elapsed_seconds = max(PTS - al_runtime_epoch_start_seconds, 0.0);
+    float interval_seconds = max(al_runtime_local_blur_interval_seconds, 0.001);
+    float pulse_seconds = max(
+        min(al_runtime_slice_length_seconds, interval_seconds * 0.5),
+        0.1
+    );
+    float local_blur_active = 1.0 - step(
+        pulse_seconds,
+        mod(elapsed_seconds, interval_seconds)
+    );
+    if (al_local_blur_enabled <= 0.0 || local_blur_active <= 0.0) {
+        return source_color;
+    }
+
+    vec2 center_distance = abs(HOOKED_pos - vec2(0.5));
+    vec2 half_region = vec2(clamp(al_local_blur_region_percent / 200.0, 0.025, 0.25));
+    if (center_distance.x > half_region.x || center_distance.y > half_region.y) {
+        return source_color;
+    }
+
+    vec2 radius = HOOKED_pt * clamp(al_local_blur_radius_px, 0.1, 16.0);
+    vec2 sample_min = max(vec2(0.0), vec2(0.5) - half_region);
+    vec2 sample_max = min(vec2(1.0), vec2(0.5) + half_region);
+    vec3 blurred_rgb = (
+        source_color.rgb * 4.0
+        + HOOKED_tex(clamp(HOOKED_pos + vec2(radius.x, 0.0), sample_min, sample_max)).rgb * 2.0
+        + HOOKED_tex(clamp(HOOKED_pos - vec2(radius.x, 0.0), sample_min, sample_max)).rgb * 2.0
+        + HOOKED_tex(clamp(HOOKED_pos + vec2(0.0, radius.y), sample_min, sample_max)).rgb * 2.0
+        + HOOKED_tex(clamp(HOOKED_pos - vec2(0.0, radius.y), sample_min, sample_max)).rgb * 2.0
+        + HOOKED_tex(clamp(HOOKED_pos + radius, sample_min, sample_max)).rgb
+        + HOOKED_tex(clamp(HOOKED_pos - radius, sample_min, sample_max)).rgb
+        + HOOKED_tex(clamp(HOOKED_pos + vec2(radius.x, -radius.y), sample_min, sample_max)).rgb
+        + HOOKED_tex(clamp(HOOKED_pos + vec2(-radius.x, radius.y), sample_min, sample_max)).rgb
+    ) / 16.0;
+    float edge_distance = min(
+        half_region.x - center_distance.x,
+        half_region.y - center_distance.y
+    );
+    float feather_width = max(max(radius.x, radius.y), max(HOOKED_pt.x, HOOKED_pt.y));
+    float region_weight = smoothstep(0.0, feather_width, edge_distance);
+    float mix_weight = clamp(al_local_blur_enabled, 0.0, 1.0) * region_weight;
+
+    return vec4(mix(source_color.rgb, blurred_rgb, mix_weight), source_color.a);
+}
+// END desktop/tools/shader-candidates/gpu83-local-blur-candidate.hook
+
+// BEGIN desktop/tools/shader-candidates/gpu83-edge-fill-candidate.hook
+//!PARAM al_edge_fill_enabled
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_edge_feather_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 100.0
+0.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive verified realtime bounded edge fill
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN al_edge_fill_enabled
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+    if (al_edge_fill_enabled <= 0.0) {
+        return source_color;
+    }
+
+    float feather_percent = clamp(al_edge_feather_percent, 0.0, 100.0);
+    float border_pixels = clamp(
+        floor(2.0 + feather_percent * 0.14 + 0.5),
+        2.0,
+        16.0
+    );
+    vec2 border_uv = HOOKED_pt * border_pixels;
+    vec2 filled_position = clamp(
+        HOOKED_pos,
+        border_uv,
+        vec2(1.0) - border_uv
+    );
+    if (all(equal(filled_position, HOOKED_pos))) {
+        return source_color;
+    }
+
+    vec3 filled_rgb = HOOKED_tex(filled_position).rgb;
+    float fill_weight = feather_percent <= 0.0
+        ? 1.0
+        : feather_percent / 100.0;
+    return vec4(mix(source_color.rgb, filled_rgb, fill_weight), source_color.a);
+}
+// END desktop/tools/shader-candidates/gpu83-edge-fill-candidate.hook
+
+// BEGIN desktop/tools/shader-candidates/gpu83-channel-offset-candidate.hook
+//!PARAM al_channel_offset_percent
+//!TYPE float
+//!MINIMUM -10.0
+//!MAXIMUM 10.0
+0.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive verified realtime floating-point channel offset
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN al_channel_offset_percent
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+    float channel_offset = clamp(al_channel_offset_percent, -10.0, 10.0) / 100.0;
+    if (channel_offset == 0.0) {
+        return source_color;
+    }
+
+    vec3 shifted_rgb = clamp(
+        vec3(
+            source_color.r + channel_offset,
+            source_color.g,
+            source_color.b - channel_offset
+        ),
+        vec3(0.0),
+        vec3(1.0)
+    );
+    return vec4(shifted_rgb, source_color.a);
+}
+// END desktop/tools/shader-candidates/gpu83-channel-offset-candidate.hook
+
+// BEGIN desktop/tools/shader-candidates/gpu83-spatial-modulation-candidate.hook
+//!PARAM al_target_frequency_hz
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 20000.0
+0.0
+
+//!PARAM al_core_frequency_hz
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 20000.0
+0.0
+
+//!PARAM al_wave_intensity
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_wave_level
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_wave_grain_count
+//!TYPE float
+//!MINIMUM 1.0
+//!MAXIMUM 100.0
+20.0
+
+//!PARAM al_dynamic_eq_threshold
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 20.0
+10.0
+
+//!PARAM al_space_dimension
+//!TYPE float
+//!MINIMUM 1.0
+//!MAXIMUM 3.0
+2.0
+
+//!PARAM al_frequency_space_x_px
+//!TYPE float
+//!MINIMUM -10.0
+//!MAXIMUM 10.0
+0.0
+
+//!PARAM al_frequency_space_y_px
+//!TYPE float
+//!MINIMUM -10.0
+//!MAXIMUM 10.0
+0.0
+
+//!PARAM al_band_65
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_92
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_131
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_188
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_267
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_381
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_544
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_777
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_1110
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_1585
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_2263
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_20000
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive verified realtime same-frame spatial modulation
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN 1
+
+const float AL_TAU = 6.283185307179586;
+const float AL_MIN_FREQUENCY_HZ = 65.0;
+const float AL_MAX_FREQUENCY_HZ = 20000.0;
+const float AL_MIN_SPATIAL_CYCLES = 1.0;
+const float AL_MAX_SPATIAL_CYCLES = 32.0;
+const float AL_WAVE_LEVEL_CODE_DELTA = 4.0;
+
+float al_frequency_position(float frequency_hz) {
+    float bounded_hz = clamp(
+        frequency_hz,
+        AL_MIN_FREQUENCY_HZ,
+        AL_MAX_FREQUENCY_HZ
+    );
+    return log2(bounded_hz / AL_MIN_FREQUENCY_HZ)
+        / log2(AL_MAX_FREQUENCY_HZ / AL_MIN_FREQUENCY_HZ);
+}
+
+float al_spatial_cycles(float frequency_hz) {
+    return mix(
+        AL_MIN_SPATIAL_CYCLES,
+        AL_MAX_SPATIAL_CYCLES,
+        al_frequency_position(frequency_hz)
+    );
+}
+
+float al_same_frame_grain(vec2 pixel_position) {
+    return fract(sin(dot(floor(pixel_position), vec2(61.0, 131.0))) * 43758.5453123);
+}
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+
+    float band_65_delta = al_band_65 - 1.0;
+    float band_92_delta = al_band_92 - 1.0;
+    float band_131_delta = al_band_131 - 1.0;
+    float band_188_delta = al_band_188 - 1.0;
+    float band_267_delta = al_band_267 - 1.0;
+    float band_381_delta = al_band_381 - 1.0;
+    float band_544_delta = al_band_544 - 1.0;
+    float band_777_delta = al_band_777 - 1.0;
+    float band_1110_delta = al_band_1110 - 1.0;
+    float band_1585_delta = al_band_1585 - 1.0;
+    float band_2263_delta = al_band_2263 - 1.0;
+    float band_20000_delta = al_band_20000 - 1.0;
+    float band_energy =
+        abs(band_65_delta)
+        + abs(band_92_delta)
+        + abs(band_131_delta)
+        + abs(band_188_delta)
+        + abs(band_267_delta)
+        + abs(band_381_delta)
+        + abs(band_544_delta)
+        + abs(band_777_delta)
+        + abs(band_1110_delta)
+        + abs(band_1585_delta)
+        + abs(band_2263_delta)
+        + abs(band_20000_delta);
+
+    bool target_active = al_target_frequency_hz >= AL_MIN_FREQUENCY_HZ;
+    bool band_active = band_energy > 0.0000001;
+    bool wave_active = al_wave_intensity > 0.0;
+    bool level_active = al_wave_level > 0.0;
+    if (!target_active && !band_active && !wave_active && !level_active) {
+        return source_color;
+    }
+
+    float weighted_cycles = 0.0;
+    float band_phase = 0.0;
+    if (band_active) {
+        weighted_cycles = (
+            1.0000000000 * abs(band_65_delta)
+            + 2.8797786721 * abs(band_92_delta)
+            + 4.7920634272 * abs(band_131_delta)
+            + 6.7467479808 * abs(band_188_delta)
+            + 8.6449531136 * abs(band_267_delta)
+            + 10.5688280110 * abs(band_381_delta)
+            + 12.4959449192 * abs(band_544_delta)
+            + 14.4249082230 * abs(band_777_delta)
+            + 16.3548662821 * abs(band_1110_delta)
+            + 18.2823864174 * abs(band_1585_delta)
+            + 20.2092711278 * abs(band_2263_delta)
+            + 32.0000000000 * abs(band_20000_delta)
+        ) / band_energy;
+        band_phase = (
+            band_65_delta
+            + band_92_delta * 2.0
+            + band_131_delta * 3.0
+            + band_188_delta * 4.0
+            + band_267_delta * 5.0
+            + band_381_delta * 6.0
+            + band_544_delta * 7.0
+            + band_777_delta * 8.0
+            + band_1110_delta * 9.0
+            + band_1585_delta * 10.0
+            + band_2263_delta * 11.0
+            + band_20000_delta * 12.0
+        ) * AL_TAU;
+    }
+
+    bool carrier_active = target_active || band_active || wave_active;
+    float luminance_delta = 0.0;
+    if (carrier_active) {
+        float carrier_cycles = target_active
+            ? al_spatial_cycles(al_target_frequency_hz)
+            : weighted_cycles;
+        if (target_active && band_active) {
+            carrier_cycles = mix(
+                carrier_cycles,
+                weighted_cycles,
+                min(band_energy, 0.25)
+            );
+        }
+        if (wave_active) {
+            float grain_count = clamp(al_wave_grain_count, 1.0, 100.0);
+            if (!target_active && !band_active) {
+                carrier_cycles = grain_count;
+            }
+            carrier_cycles += clamp(al_wave_intensity, 0.0, 1.0) * grain_count;
+        }
+
+        vec2 position = HOOKED_pos;
+        if (wave_active) {
+            position += vec2(
+                clamp(al_frequency_space_x_px, -10.0, 10.0) * HOOKED_pt.x,
+                clamp(al_frequency_space_y_px, -10.0, 10.0) * HOOKED_pt.y
+            );
+        }
+        float dimension = clamp(floor(al_space_dimension + 0.5), 1.0, 3.0);
+        float spatial_position = position.x;
+        if (dimension >= 2.0) {
+            spatial_position += position.y;
+        }
+        if (dimension >= 3.0) {
+            spatial_position += length(position - vec2(0.5)) * 1.41421356237;
+        }
+
+        float core_phase = 0.0;
+        if (target_active) {
+            float core_frequency_hz = al_core_frequency_hz >= AL_MIN_FREQUENCY_HZ
+                ? al_core_frequency_hz
+                : al_target_frequency_hz;
+            core_phase = al_frequency_position(core_frequency_hz) * AL_TAU;
+        }
+        float carrier = sin(
+            AL_TAU * carrier_cycles * spatial_position + core_phase + band_phase
+        );
+        float band_amplitude = 0.0;
+        if (target_active || band_active) {
+            float band_limit = al_dynamic_eq_threshold <= 0.0000001
+                ? 20.0
+                : clamp(al_dynamic_eq_threshold, 0.0, 20.0);
+            band_amplitude = min(1.0 + band_energy * 4.0, band_limit);
+        }
+        float wave_amplitude = wave_active
+            ? max(clamp(al_wave_intensity, 0.0, 1.0) * 12.0, 1.0)
+            : 0.0;
+        luminance_delta += (band_amplitude + wave_amplitude) * carrier;
+    }
+
+    if (level_active && al_same_frame_grain(HOOKED_pos / HOOKED_pt) < al_wave_level) {
+        luminance_delta += AL_WAVE_LEVEL_CODE_DELTA;
+    }
+    vec3 modulated_rgb = clamp(
+        source_color.rgb + vec3(luminance_delta / 255.0),
+        vec3(0.0),
+        vec3(1.0)
+    );
+    return vec4(modulated_rgb, source_color.a);
+}
+// END desktop/tools/shader-candidates/gpu83-spatial-modulation-candidate.hook
+
+// BEGIN desktop/tools/shader-candidates/gpu83-scheduler-gates-candidate.hook
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive verified realtime bounded scheduler gates
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN 1
+
+const float AL_FRAME_INNER_CODE_DELTA = 16.0;
+const float AL_FRAME_INNER_MASK_EDGE = 2.0;
+
+vec2 al_scheduler_rotate(vec2 position, float angle) {
+    float sine = sin(angle);
+    float cosine = cos(angle);
+    mat2 rotation = mat2(cosine, -sine, sine, cosine);
+    return rotation * (position - vec2(0.5)) + vec2(0.5);
+}
+
+float al_scheduler_hash(float bucket, float salt) {
+    return fract(sin(
+        bucket * 12.9898 + floor(al_runtime_random_seed) * 0.001 + salt
+    ) * 43758.5453);
+}
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+
+    float elapsed_seconds = max(PTS - al_runtime_epoch_start_seconds, 0.0);
+    float source_fps = clamp(al_runtime_source_fps, 1.0, 240.0);
+    float frame_bucket = floor(elapsed_seconds * source_fps);
+    float inner_probability = clamp(al_runtime_frame_inner_percent / 100.0, 0.0, 1.0);
+    float inter_probability = clamp(al_runtime_frame_inter_percent / 100.0, 0.0, 1.0);
+    float frame_probability = clamp(
+        al_runtime_frame_probability_percent / 100.0,
+        0.0,
+        1.0
+    );
+    float inner_gate = step(0.000001, inner_probability) * step(
+        al_scheduler_hash(frame_bucket, 17.0),
+        inner_probability
+    );
+    float inter_gate = step(0.000001, inter_probability) * step(
+        al_scheduler_hash(frame_bucket, 43.0),
+        inter_probability
+    );
+    float probability_gate = step(0.000001, frame_probability) * step(
+        al_scheduler_hash(frame_bucket, 79.0),
+        frame_probability
+    );
+    float interval_seconds = max(al_runtime_slice_interval_seconds, 0.001);
+    float slice_length_seconds = min(
+        max(al_runtime_slice_length_seconds, 0.001),
+        interval_seconds
+    );
+    float slice_phase = mod(elapsed_seconds, interval_seconds);
+    float slice_gate = 1.0 - step(slice_length_seconds, slice_phase);
+    float highlight_gate = clamp(al_runtime_highlight_enabled, 0.0, 1.0)
+        * (1.0 - step(
+            0.05,
+            mod(elapsed_seconds, max(al_runtime_highlight_interval_seconds, 0.001))
+        ));
+    float easing = 1.0;
+    if (al_runtime_smoothing_enabled > 0.0) {
+        float smoothing_seconds = min(
+            max(al_runtime_smoothing_seconds, 0.001),
+            slice_length_seconds * 0.5
+        );
+        float edge_distance = min(slice_phase, slice_length_seconds - slice_phase);
+        easing = smoothstep(0.0, smoothing_seconds, max(edge_distance, 0.0));
+    }
+    easing *= slice_gate;
+    float rotation_midpoint = (
+        al_runtime_async_rotation_min_degrees
+        + al_runtime_async_rotation_max_degrees
+    ) * 0.5;
+    float rotation_amplitude = (
+        al_runtime_async_rotation_max_degrees
+        - al_runtime_async_rotation_min_degrees
+    ) * 0.5;
+    float angle_degrees = clamp(al_runtime_async_rotation_enabled, 0.0, 1.0)
+        * (rotation_midpoint + rotation_amplitude
+            * sin(6.28318530718 * slice_phase / interval_seconds));
+    float transform_weight = slice_gate * easing;
+    float angle = radians(angle_degrees) * transform_weight;
+    float slice_shift_uv = 2.0 * HOOKED_pt.x * transform_weight;
+
+    float inter_mix = inter_gate * 0.2;
+    float probability_strength = probability_gate;
+
+    bool has_luma_effect = inner_gate > 0.0
+        || probability_strength > 0.0
+        || highlight_gate > 0.0;
+    bool has_transform = abs(angle) > 0.0000001 || slice_shift_uv > 0.0;
+    if (!has_luma_effect && inter_mix <= 0.0 && !has_transform) {
+        return source_color;
+    }
+
+    vec2 sample_position = HOOKED_pos;
+    if (slice_shift_uv > 0.0) {
+        float slice_band = step(0.3333333, HOOKED_pos.y)
+            * (1.0 - step(0.6666667, HOOKED_pos.y));
+        sample_position.x += slice_shift_uv * slice_band;
+    }
+    if (abs(angle) > 0.0000001) {
+        sample_position = al_scheduler_rotate(sample_position, angle);
+    }
+    sample_position = clamp(sample_position, vec2(0.0), vec2(1.0));
+
+    vec3 result = source_color.rgb;
+    if (has_transform) {
+        result = HOOKED_tex(sample_position).rgb;
+    }
+
+    if (inter_mix > 0.0) {
+        vec2 neighbor_position = clamp(
+            sample_position + HOOKED_pt * vec2(1.0, -1.0),
+            vec2(0.0),
+            vec2(1.0)
+        );
+        result = mix(result, HOOKED_tex(neighbor_position).rgb, inter_mix);
+    }
+
+    vec2 pixel = floor(HOOKED_pos / HOOKED_pt);
+    float signed_pattern = mod(floor(pixel.x / 8.0) + floor(pixel.y / 8.0), 2.0) < 1.0
+        ? -1.0
+        : 1.0;
+    float inner_mask = mod(pixel.x, 8.0) < AL_FRAME_INNER_MASK_EDGE
+        && mod(pixel.y, 8.0) < AL_FRAME_INNER_MASK_EDGE ? 1.0 : 0.0;
+    float inner_delta = inner_gate
+        * inner_mask
+        * signed_pattern
+        * (AL_FRAME_INNER_CODE_DELTA / 255.0);
+    float probability_pattern = mod(pixel.x + pixel.y, 2.0) < 1.0 ? -1.0 : 1.0;
+    float probability_delta = probability_strength
+        * probability_pattern
+        * (10.0 / 255.0);
+    float highlight_delta = highlight_gate / 255.0;
+
+    result = clamp(
+        result + vec3(inner_delta + probability_delta + highlight_delta),
+        vec3(0.0),
+        vec3(1.0)
+    );
+    return vec4(result, source_color.a);
+}
+// END desktop/tools/shader-candidates/gpu83-scheduler-gates-candidate.hook

@@ -719,7 +719,9 @@ fn portaudio_interlude_commands_are_registered_on_the_single_output_path() {
     assert!(implementation.contains("request.audio.playback_speed"));
     assert_eq!(
         implementation
-            .matches("AudioMixerTask::start_scheduled_candidate")
+            .matches(
+                "AudioMixerTask::start_finite_scheduled_candidate_with_filter_and_variant_count",
+            )
             .count(),
         2
     );

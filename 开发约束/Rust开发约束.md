@@ -1,6 +1,6 @@
 > 本文件是本项目的 Rust 开发约束。它基于外部规范整理，适用于本项目实际技术栈；如与用户当前要求、仓库事实或 `AGENTS.md` 冲突，以优先级更高的规则为准。
 >
-> 产品范围同步（2026-08-24）：本版本不开发实时话术幻化。Rust/Tauri 不得新增或开放 speech-to-speech、VAD/ASR/LLM/TTS、实时话术候选换轨或对应模型租约入口。参考图中的媒体效果参数全部属于正式需求；未映射算法必须保持“待实现/未接入”。
+> 产品范围同步（2026-08-30）：本版本不开发实时话术幻化。Rust/Tauri 不得新增或开放 speech-to-speech、ASR/LLM/TTS、实时变声、实时话术候选换轨或对应模型租约入口。当前允许实施“麦克风插话”和“ZLMediaKit RTMP/RTMPS 直推”两项正式需求；后者必须由 Rust 单一会话所有者直接读取活动源和最终 PCM，使用受管 FFmpeg、成熟 libplacebo/GPU 编码能力及有界取消/重试，禁止 shell 拼接、窗口捕获、Go 媒体中转和无界队列。详细边界以 [`ZLMediaKit RTMP GPU 直推实施方案`](../docs/superpowers/plans/2026-08-30-ZLMediaKit-RTMP-GPU直推实施方案.md) 为准；实现和真实服务器门禁完成前保持“待实施/未接入”。
 
 ## 本项目补充约束
 

@@ -6,8 +6,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { archiveDesktopArtifacts, detectTargetTriple } from './archive-desktop-artifact.mjs';
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const bundleRoot = resolve(desktopRoot, 'src-tauri', 'target', 'release', 'bundle');
 export const TEST_CONTROL_PLANE_BASE_URL = 'http://101.96.208.132:9090';
+
+function configuredTargetRoot() {
+  return resolve(process.env.CARGO_TARGET_DIR?.trim() || resolve(desktopRoot, 'src-tauri', 'target'));
+}
+
+function configuredBuildDirectory(profile = process.env.AUTOLIVE_BUILD_PROFILE?.trim() || '') {
+  return profile === 'test' ? 'debug' : 'release';
+}
 
 export function applyBuildProfile(profile = process.argv.includes('--profile=test') ? 'test' : '') {
   if (profile !== 'test') return;
@@ -18,6 +25,12 @@ export function applyBuildProfile(profile = process.argv.includes('--profile=tes
   process.env.VITE_CONTROL_PLANE_BASE_URL = TEST_CONTROL_PLANE_BASE_URL;
   process.env.VITE_CONTROL_PLANE_ENV = 'test';
   process.env.AUTOLIVE_TAURI_CONFIG = 'src-tauri/tauri.test.conf.json';
+  process.env.AUTOLIVE_BUILD_PROFILE = 'test';
+  process.env.CARGO_TARGET_DIR ||= resolve(desktopRoot, 'src-tauri', 'target-test-package');
+  const debugRoot = resolve(configuredTargetRoot(), 'debug');
+  process.env.AUTOLIVE_BUNDLE_SOURCE_DIR ||= resolve(debugRoot, 'bundle');
+  process.env.AUTOLIVE_RELEASE_EXECUTABLE ||= resolve(debugRoot, 'autolive-desktop-core.exe');
+  process.env.AUTOLIVE_PACKAGE_ROOT ||= resolve(desktopRoot, 'package-test');
 }
 
 export function tauriBuildArguments(
@@ -25,6 +38,9 @@ export function tauriBuildArguments(
 ) {
   const config = process.env.AUTOLIVE_TAURI_CONFIG?.trim() || 'src-tauri/tauri.conf.json';
   const argumentsList = ['build', '--config', config];
+  if (process.env.AUTOLIVE_BUILD_PROFILE === 'test') {
+    argumentsList.push('--debug', '--no-sign');
+  }
   if (targetTriple === 'x86_64-pc-windows-msvc') {
     argumentsList.push('--bundles', 'nsis');
     return argumentsList;
@@ -34,7 +50,10 @@ export function tauriBuildArguments(
   return argumentsList;
 }
 
-export function cleanBundleOutputForTarget(targetTriple, root = bundleRoot) {
+export function cleanBundleOutputForTarget(
+  targetTriple,
+  root = resolve(configuredTargetRoot(), configuredBuildDirectory(), 'bundle'),
+) {
   if (targetTriple !== 'x86_64-pc-windows-msvc') return null;
   const resolvedRoot = resolve(root);
   const outputDirectory = resolve(resolvedRoot, 'nsis');

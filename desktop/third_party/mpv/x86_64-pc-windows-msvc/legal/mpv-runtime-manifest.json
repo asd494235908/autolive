@@ -26,18 +26,28 @@
       "license_expression": "LGPL-2.1-or-later",
       "license_file": "LGPL-2.1.txt",
       "source_file": "SOURCE.md"
-    },
-    "d3dcompiler_43": {
-      "license_expression": "LicenseRef-Microsoft-DirectX-Redistributable-EULA",
-      "license_file": "D3DCOMPILER_43-EULA.txt"
     }
+  },
+  "audit": {
+    "release_review_status": "blocked",
+    "corresponding_source_complete": false,
+    "third_party_notices_reviewed": false
   },
   "files": {
     "mpv.exe": {
       "sha256": "09dc5c350a70b536cc91015e7a856f77c933fa9d7f4c41563666e51c998a0243"
     },
-    "d3dcompiler_43.dll": {
-      "sha256": "4b074a3976399dc735484f5d43d04b519b7bdee8ac719d9ab8ed6bd4e6be0345"
+    "legal/Copyright.txt": {
+      "sha256": "3c7ade77e690e23f9ff8ee70eed158e515abd7cc635c39d5635ea15168a22ae1"
+    },
+    "legal/GPL-2.0.txt": {
+      "sha256": "4f2416509c30c4f0c4de101cc30c571e3be33fdb5c42cabc0d2915e8ed5ea51e"
+    },
+    "legal/LGPL-2.1.txt": {
+      "sha256": "45b837a6e3414b3067ff6b5e145d6c6a23444c499f5b08d285a8aad6d698b5ad"
+    },
+    "legal/SOURCE.md": {
+      "sha256": "96217f7b8e258111c0bcc15a1e36abd1528730abf76c62ba3c22e0d41e9fc8b7"
     }
   }
 }

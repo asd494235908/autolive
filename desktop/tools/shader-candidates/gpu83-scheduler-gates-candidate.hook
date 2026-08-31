@@ -1,0 +1,133 @@
+//!PARAM al_runtime_frame_inner_active
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_runtime_frame_inter_active
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_runtime_frame_probability_active
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_runtime_slice_active
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_runtime_highlight_active
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_runtime_async_rotation_degrees
+//!TYPE float
+//!MINIMUM -15.0
+//!MAXIMUM 15.0
+0.0
+
+//!PARAM al_runtime_transform_easing
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC GPU83 bounded scheduler gates candidate
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN 1
+
+const float AL_FRAME_INNER_CODE_DELTA = 16.0;
+const float AL_FRAME_INNER_MASK_EDGE = 2.0;
+
+vec2 al_scheduler_rotate(vec2 position, float angle) {
+    float sine = sin(angle);
+    float cosine = cos(angle);
+    mat2 rotation = mat2(cosine, -sine, sine, cosine);
+    return rotation * (position - vec2(0.5)) + vec2(0.5);
+}
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+
+    float inner_gate = clamp(al_runtime_frame_inner_active, 0.0, 1.0);
+    float inter_gate = clamp(al_runtime_frame_inter_active, 0.0, 1.0);
+    float probability_gate = clamp(al_runtime_frame_probability_active, 0.0, 1.0);
+    float highlight_gate = clamp(al_runtime_highlight_active, 0.0, 1.0);
+
+    float slice_gate = clamp(al_runtime_slice_active, 0.0, 1.0);
+    float easing = clamp(al_runtime_transform_easing, 0.0, 1.0);
+    float angle_degrees = clamp(al_runtime_async_rotation_degrees, -15.0, 15.0);
+    float transform_weight = slice_gate * easing;
+    float angle = radians(angle_degrees) * transform_weight;
+    float slice_shift_uv = 2.0 * HOOKED_pt.x * transform_weight;
+
+    float inter_mix = inter_gate * 0.2;
+    float probability_strength = probability_gate;
+
+    bool has_luma_effect = inner_gate > 0.0
+        || probability_strength > 0.0
+        || highlight_gate > 0.0;
+    bool has_transform = abs(angle) > 0.0000001 || slice_shift_uv > 0.0;
+    if (!has_luma_effect && inter_mix <= 0.0 && !has_transform) {
+        return source_color;
+    }
+
+    vec2 sample_position = HOOKED_pos;
+    if (slice_shift_uv > 0.0) {
+        float slice_band = step(0.3333333, HOOKED_pos.y)
+            * (1.0 - step(0.6666667, HOOKED_pos.y));
+        sample_position.x += slice_shift_uv * slice_band;
+    }
+    if (abs(angle) > 0.0000001) {
+        sample_position = al_scheduler_rotate(sample_position, angle);
+    }
+    sample_position = clamp(sample_position, vec2(0.0), vec2(1.0));
+
+    vec3 result = source_color.rgb;
+    if (has_transform) {
+        result = HOOKED_tex(sample_position).rgb;
+    }
+
+    if (inter_mix > 0.0) {
+        vec2 neighbor_position = clamp(
+            sample_position + HOOKED_pt * vec2(1.0, -1.0),
+            vec2(0.0),
+            vec2(1.0)
+        );
+        result = mix(result, HOOKED_tex(neighbor_position).rgb, inter_mix);
+    }
+
+    vec2 pixel = floor(HOOKED_pos / HOOKED_pt);
+    float signed_pattern = mod(floor(pixel.x / 8.0) + floor(pixel.y / 8.0), 2.0) < 1.0
+        ? -1.0
+        : 1.0;
+    float inner_mask = mod(pixel.x, 8.0) < AL_FRAME_INNER_MASK_EDGE
+        && mod(pixel.y, 8.0) < AL_FRAME_INNER_MASK_EDGE ? 1.0 : 0.0;
+    float inner_delta = inner_gate
+        * inner_mask
+        * signed_pattern
+        * (AL_FRAME_INNER_CODE_DELTA / 255.0);
+    float probability_pattern = mod(pixel.x + pixel.y, 2.0) < 1.0 ? -1.0 : 1.0;
+    float probability_delta = probability_strength
+        * probability_pattern
+        * (10.0 / 255.0);
+    float highlight_delta = highlight_gate / 255.0;
+
+    result = clamp(
+        result + vec3(inner_delta + probability_delta + highlight_delta),
+        vec3(0.0),
+        vec3(1.0)
+    );
+    return vec4(result, source_color.a);
+}

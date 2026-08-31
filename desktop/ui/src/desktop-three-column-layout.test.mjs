@@ -44,8 +44,8 @@ test('desktop page exposes the approved three-column layout contract', async () 
   assert.match(app, /audioCapabilityRows/);
   assert.match(app, /<MediaParameterPanels/);
   assert.doesNotMatch(app, /row\.key !== 'spectral_perturbation_percent'/);
-  assert.match(app, /!videoProcessingEnabledRef\.current/);
-  assert.match(app, /source\.media_kind !== 'video'/);
+  assert.match(app, /videoProcessingEnabledRef\.current/);
+  assert.match(app, /source\?\.media_kind !== 'video'/);
   assert.match(main, /<ConfigProvider\b/);
   assert.match(main, /<AntApp\b/);
   assert.match(css, /grid-template-columns:\s*320px minmax\(0,\s*1fr\) 272px/);
@@ -68,31 +68,27 @@ test('高级声音设置只保留参数重新生成，不提供手动声音处�
 test('当前 UI 的声音只走自动 M4A 候选，视频只走 mpv 正式入口', async () => {
   const app = await readFile(appPath, 'utf8');
   const audioStart = app.indexOf('async function prepareNextAudioMediaCandidate');
-  const audioEnd = app.indexOf('function prepareNextVideoMediaCandidate', audioStart);
+  const audioEnd = app.indexOf('function applyPlannedAudioCycle', audioStart);
   const audioPrepare = app.slice(audioStart, audioEnd);
-  const videoStart = app.indexOf('async function applyVideoProcessing');
-  const videoEnd = app.indexOf('function commitCompletedAudioRender', videoStart);
-  const videoApply = app.slice(videoStart, videoEnd);
 
   assert.ok(audioStart >= 0 && audioEnd > audioStart);
-  assert.ok(videoStart >= 0 && videoEnd > videoStart);
   assert.match(audioPrepare, /prepare_audio_media_candidate/);
   assert.doesNotMatch(audioPrepare, /start_media_processing/);
-  assert.match(videoApply, /prepare_realtime_video_plan/);
-  assert.match(videoApply, /commit_realtime_video_plan/);
-  assert.doesNotMatch(videoApply, /start_media_processing|prepare_audio_media_candidate/);
-  assert.doesNotMatch(videoApply, /audio_variants|ambient_sound_path|['"]both['"]/);
+  assert.match(app, /invoke<unknown>\('configure_realtime_video_cycle', \{ request \}\)/);
+  assert.match(app, /const request = \{[\s\S]*params: mediaEffectParams,[\s\S]*min_period_ms: videoPeriodRange\.minMs,[\s\S]*max_period_ms: videoPeriodRange\.maxMs/);
+  assert.doesNotMatch(app, /prepare_realtime_video_plan|commit_realtime_video_plan|sync_realtime_video_renderer/);
   assert.doesNotMatch(app, /prepare_media_video_stream|read_media_video_stream|ack_media_video_stream|commit_media_video_stream|VideoMse|video_stream/);
   assert.doesNotMatch(app, /schedulePeriodMediaRender|schedulePeriodRenderRef|audio-manual-/);
 });
 
-test('音频与视频卡片始终展示同一 N+1 的真实绝对媒体时钟进度', async () => {
+test('声音卡片使用 WebView 候选时钟，视频卡片使用 Rust 后端 PTS', async () => {
   const app = await readFile(appPath, 'utf8');
   assert.match(app, /mediaCycleClockIdentityRef\.current === mediaCycleClockIdentity/);
-  assert.match(app, /getMediaCycleProgressPercent\(nextVideoPlan, mediaCycleAbsolutePositionMs\)/);
   assert.match(app, /getMediaCycleProgressPercent\(nextAudioPlan, mediaCycleAbsolutePositionMs\)/);
-  assert.match(app, /const runtimeProgressPercent = scheduledVideoProgressPercent/);
-  assert.match(app, /<MediaCycleCard[\s\S]*?title="视频周期"[\s\S]*?range=\{videoPeriodRange\}[\s\S]*?changes=\{runtimeCycle\}[\s\S]*?progress=\{runtimeProgressPercent\}/);
+  assert.match(app, /const backendVideoCycle = mediaVideoBackendDiagnostic === null/);
+  assert.match(app, /const runtimeProgressPercent = backendVideoProgressPercent \?\? 0/);
+  assert.match(app, /const runtimeCycleDisplay = backendVideoCycle\?\.confirmed_change_count \?\? 0/);
+  assert.match(app, /<MediaCycleCard[\s\S]*?title="视频周期"[\s\S]*?range=\{videoPeriodRange\}[\s\S]*?changes=\{runtimeCycleDisplay\}[\s\S]*?progress=\{runtimeProgressPercent\}/);
   assert.match(app, /<MediaCycleCard[\s\S]*?title="声音周期"[\s\S]*?range=\{audioPeriodRange\}[\s\S]*?changes=\{audioVariationCycle\}[\s\S]*?progress=\{audioProgressPercent\}/);
   assert.doesNotMatch(app, /progress=\{videoProcessingStatus === 'processing' \? snapshot\?\.video_processing_progress_percent/);
   assert.match(
@@ -124,7 +120,7 @@ test('PortAudio Host API selector shows ASIO and only enables it when an ASIO de
     app,
     /const hasAsioOutputDevice\s*=\s*audioOutputDevices\.some\(\s*\(device\)\s*=>\s*device\.host_api\.trim\(\)\.toLowerCase\(\)\s*===\s*['"]asio['"]\s*,?\s*\)/,
   );
-  assert.match(deviceLoad, /if \(!isAudioOutputDeviceList\(devices\)\) \{[\s\S]*setAudioOutputDevices\(\[\]\)[\s\S]*return;[\s\S]*setAudioOutputDevices\(devices\)/);
+  assert.match(deviceLoad, /if \(!isAudioOutputDeviceList\(devices\)\) \{[\s\S]*setAudioOutputDevicesError\([\s\S]*return;[\s\S]*setAudioOutputDevices\(devices\)/);
   assert.doesNotMatch(deviceLoad, /filter[\s\S]*asio/i);
   assert.doesNotMatch(deviceOptions, /!==\s*['"]asio['"]/i);
   assert.match(deviceOptions, /device\.host_api\.trim\(\)\.toLowerCase\(\)\s*===\s*hostApi/);
@@ -251,7 +247,7 @@ test('声音 N+1/N+2 只预选参数，提交成功后才升级当前快照，�
   const commitEnd = app.indexOf('function sampleAndCommitAudioCycle', commitStart);
   const commit = app.slice(commitStart, commitEnd);
   const planStart = app.indexOf('function buildAudioCycleSeed');
-  const planEnd = app.indexOf('function buildVideoCycleSeed', planStart);
+  const planEnd = app.indexOf('function clearAudioFutureMediaCyclePlans', planStart);
   const plan = app.slice(planStart, planEnd);
   assert.ok(commitStart >= 0 && commitEnd > commitStart);
   assert.ok(planStart >= 0 && planEnd > planStart);
@@ -312,11 +308,12 @@ test('媒体效果参数使用正式模型和 IPC', async () => {
   const app = await readFile(appPath, 'utf8');
   const parameterTypes = await readFile(new URL('./media-parameter-panels/media-parameter-types.ts', import.meta.url), 'utf8');
 
-  assert.match(app, /import \{ AudioParameterControls, MediaParameterPanels, type MediaEffectParams \}/);
+  assert.match(app, /import \{[\s\S]*AudioParameterControls,[\s\S]*MediaParameterPanels,[\s\S]*type MediaEffectParams,[\s\S]*type MediaParameterPath,[\s\S]*type MediaParameterStatus,[\s\S]*\} from '\.\/media-parameter-panels';/);
   assert.match(parameterTypes, /export interface MediaEffectParams/);
   assert.match(parameterTypes, /advanced: AdvancedEffectParams/);
   assert.match(app, /invoke<unknown>\('get_default_media_effect_params'\)[\s\S]*isMediaEffectParams\(params\)/);
-  assert.match(app, /invoke<unknown>\('validate_media_effect_params'[\s\S]*isMediaParameterValidationResult\(validationResponse\)/);
+  assert.match(app, /invoke<unknown>\('configure_realtime_video_cycle', \{ request \}\)/);
+  assert.match(app, /params: mediaEffectParams/);
 });
 
 test('PortAudio 普通播放只有 audio_cycle_output 一个 PCM 生产者', async () => {

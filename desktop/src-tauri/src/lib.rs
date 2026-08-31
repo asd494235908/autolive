@@ -1,4 +1,5 @@
 pub mod ambient_sound;
+pub mod audible_audio_clock;
 pub mod audio_cycle_output;
 pub mod audio_feature_analysis;
 pub mod audio_mixer;
@@ -15,14 +16,17 @@ pub mod hashing;
 pub mod interlude_player;
 pub mod media_audio_effects;
 pub mod media_av_sync;
-pub mod media_compatibility;
 pub mod media_effect_params;
 pub mod media_engine;
 pub mod media_gpu_capabilities;
 pub mod media_library;
+pub mod media_timeline;
+pub mod media_video_cycle;
 pub mod media_video_effects;
+pub mod media_video_frame_scheduler;
 pub mod media_video_gpu_effects;
 pub mod realtime_video_backend;
+pub mod realtime_video_capability;
 pub mod realtime_video_runtime;
 pub mod runtime_resource_task;
 pub mod runtime_resources;
@@ -454,7 +458,9 @@ impl PlaybackCore {
             .source_media
             .as_ref()
             .and_then(|source| source.duration_ms)
-            .map_or(position_ms, |duration_ms| position_ms.min(duration_ms));
+            .map_or(position_ms, |duration_ms| {
+                position_ms.min(duration_ms.saturating_sub(1))
+            });
     }
 
     pub fn mark_media_processing_running(&mut self) -> Result<(), PlaybackError> {
@@ -1038,6 +1044,7 @@ impl PlaybackCore {
 
     pub fn start(&mut self) -> Result<(), PlaybackError> {
         self.require_source()?;
+        self.current_position_ms = 0;
         self.playback_state = PlaybackState::Playing;
         Ok(())
     }
@@ -1686,6 +1693,17 @@ mod tests {
     }
 
     #[test]
+    fn starting_a_ready_pool_discards_stale_position_reports() {
+        let mut core = PlaybackCore::default();
+        core.set_source(source());
+        core.set_playback_position(12_345);
+
+        core.start().expect("ready source should start");
+
+        assert_eq!(core.snapshot().current_position_ms, 0);
+    }
+
+    #[test]
     fn playback_pool_crud_rejects_invalid_counts_paths_and_indexes_without_mutation() {
         let mut core = PlaybackCore::default();
         core.set_source_pool(vec![source_named("a.mp4"), source_named("b.mp4")])
@@ -1747,7 +1765,7 @@ mod tests {
         core.set_source(source());
         core.set_playback_position(1_234);
 
-        assert_eq!(core.snapshot().current_position_ms, 1_000);
+        assert_eq!(core.snapshot().current_position_ms, 999);
     }
 
     #[test]

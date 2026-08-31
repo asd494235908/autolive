@@ -1,0 +1,8 @@
+--- a/meson.build
++++ b/meson.build
+@@ -197 +197 @@
+-    if cc.has_header('windows.h', required: false)
++    if host_machine.system() == 'windows' or cc.has_header('windows.h', required: false)
+@@ -212 +212 @@
+-            deps += cc.find_library('gdi32', required: true)
++            deps += declare_dependency(link_args: ['gdi32.lib'])

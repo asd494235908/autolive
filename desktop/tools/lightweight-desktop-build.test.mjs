@@ -334,5 +334,7 @@ test('本地发布与 smoke 产物不进入版本控制', () => {
   assert.match(gitignore, /^desktop\/resource-release\/$/m);
   assert.match(gitignore, /^desktop\/src-tauri\/binaries\/\*$/m);
   assert.match(gitignore, /^desktop\/package-smoke\/$/m);
+  assert.match(gitignore, /^desktop\/package-test\/$/m);
+  assert.match(gitignore, /^desktop\/src-tauri\/target-test-package\/$/m);
   assert.match(gitignore, /^desktop\/\.codex-worker-smoke\/$/m);
 });

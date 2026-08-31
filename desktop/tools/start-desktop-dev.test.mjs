@@ -72,12 +72,20 @@ test('测试 Tauri capability 只放行明确的测试控制面 origin', () => {
   const testConfig = JSON.parse(
     readFileSync(resolve(desktopRoot, 'src-tauri', 'tauri.test.conf.json'), 'utf8'),
   );
+  const productionConfig = JSON.parse(
+    readFileSync(resolve(desktopRoot, 'src-tauri', 'tauri.conf.json'), 'utf8'),
+  );
   const testHttpPermission = testCapability.permissions.find(
     (permission) => permission?.identifier === 'http:default',
   );
 
   assert.equal(testCapability.identifier, 'test-control-plane');
   assert.ok(testConfig.app.security.capabilities.includes('test-control-plane'));
+  assert.equal(
+    productionConfig.app.windows.find((windowConfig) => windowConfig.label === 'main')?.decorations,
+    false,
+  );
+  assert.equal(testConfig.app.windows, undefined);
   assert.deepEqual(testHttpPermission.allow, [
     { url: 'http://127.0.0.1:18090/**' },
     { url: 'http://101.96.208.132:9090/**' },

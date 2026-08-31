@@ -86,6 +86,50 @@ fn accepts_manifest_with_the_media_component() {
     .is_ok());
 }
 
+#[test]
+fn media_license_files_must_be_non_executable() {
+    let fixture = RangeFixture::new(FILE_BYTES);
+    let manifest = |relative_path: &str, executable: bool| {
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "release": "v0.1.0",
+            "target": TARGET,
+            "base_url": fixture.base_url(),
+            "files": [{
+                "component": "media",
+                "relative_path": relative_path,
+                "size_bytes": 1,
+                "sha256": "00".repeat(32),
+                "executable": executable
+            }]
+        }))
+        .expect("fixture manifest should serialize")
+    };
+    let license_path = "aarch64-apple-darwin/binaries/licenses/mpv/GPL-2.0.txt";
+
+    assert!(RuntimeResourceManifest::parse_and_validate(
+        &manifest(license_path, false),
+        ValidationMode::Test {
+            base_url: fixture.base_url(),
+        },
+    )
+    .is_ok());
+    assert!(RuntimeResourceManifest::parse_and_validate(
+        &manifest(license_path, true),
+        ValidationMode::Test {
+            base_url: fixture.base_url(),
+        },
+    )
+    .is_err());
+    assert!(RuntimeResourceManifest::parse_and_validate(
+        &manifest(FILE_PATH, false),
+        ValidationMode::Test {
+            base_url: fixture.base_url(),
+        },
+    )
+    .is_err());
+}
+
 #[derive(Clone)]
 enum FixtureMode {
     Range,

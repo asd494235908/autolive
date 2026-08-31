@@ -46,7 +46,7 @@ test('主窗口锁定 body 滚动，避免懒加载期间出现白闪和页面�
   assert.doesNotMatch(html, /body\s*\{[^}]*overflow-y:\s*auto;/);
 });
 
-test('Tauri 主窗口使用参考图尺寸、深色背景和无原生装饰', async () => {
+test('Tauri 主窗口使用默认启动尺寸、深色背景和无原生装饰', async () => {
   const [source, commands] = await Promise.all([
     readFile(new URL('../../src-tauri/tauri.conf.json', import.meta.url), 'utf8'),
     readFile(new URL('../../src-tauri/src/commands.rs', import.meta.url), 'utf8'),
@@ -58,8 +58,8 @@ test('Tauri 主窗口使用参考图尺寸、深色背景和无原生装饰', as
   assert.equal(config.productName, 'GpAutoLive');
   assert.equal(mainWindow.title, 'GpAutoLive');
   assert.match(commands, /\.title\("GpAutoLive 最终效果"\)/);
-  assert.equal(mainWindow.width, 1728);
-  assert.equal(mainWindow.height, 1044);
+  assert.equal(mainWindow.width, 1280);
+  assert.equal(mainWindow.height, 800);
   assert.equal(mainWindow.minWidth, 960);
   assert.equal(mainWindow.minHeight, 680);
   assert.equal(mainWindow.backgroundColor, '#0b0b0f');
@@ -308,9 +308,9 @@ test('停止、暂停或真实媒体时钟不健康时停止实时参数调度',
 
   assert.match(source, /const playbackRequested = snapshot\?\.playback_state\?\.toLowerCase\(\) === ['"]playing['"]/);
   assert.match(source, /const playbackActive = playbackRequested[\s\S]*mediaState\.clock_health === ['"]healthy['"][\s\S]*!mediaState\.paused/);
-  assert.match(source, /const runtimeActive = MPV_REALTIME_VIDEO_ENABLED[\s\S]*playbackActive[\s\S]*currentMediaIsVideo[\s\S]*videoProcessingEnabled/);
+  assert.match(source, /const videoStreamActive = MPV_REALTIME_VIDEO_ENABLED[\s\S]*playbackRequested[\s\S]*currentMediaIsVideo[\s\S]*videoProcessingEnabled/);
   assert.match(source, /const audioPeriodActive = playbackActive && audioProcessingEnabled/);
-  assert.match(source, /if \(!runtimeActive \|\| !runtimeBaseParameters\)/);
+  assert.match(source, /if \(!audioPeriodActive\)/);
   assert.match(source, /getProcessingStatusLabel\(audioProcessingStatus\)/);
 });
 
@@ -362,17 +362,10 @@ test('启动后的空闲初始化只检查 media 运行资源', async () => {
   assert.doesNotMatch(startupCapabilities, /ensureRuntimeResources\('voice'|voiceClone|voice_clone|XTTS|Demucs|Whisper/);
 });
 
-test('已有视频的视频处理先确保 media 并只进入 mpv', async () => {
+test('已有视频的视频处理只配置 Rust 受管 mpv 周期', async () => {
   const source = await readSource('App.tsx');
-  const mediaProcessing = source.slice(
-    source.indexOf('async function applyVideoProcessing'),
-    source.indexOf('async function cleanupLocalCaches'),
-  );
-
-  assert.match(mediaProcessing, /ensureRuntimeResources\('media',[\s\S]*prepare_realtime_video_plan/);
-  assert.match(source, /commit_realtime_video_plan/);
-  assert.match(source, /stop_realtime_video_renderer/);
+  assert.match(source, /configure_realtime_video_cycle/);
+  assert.doesNotMatch(source, /stop_realtime_video_renderer/);
+  assert.doesNotMatch(source, /prepare_realtime_video_plan|commit_realtime_video_plan/);
   assert.doesNotMatch(source, /prepare_media_video_stream|read_media_video_stream|ack_media_video_stream|commit_media_video_stream|VideoMse|video_stream/);
-  assert.doesNotMatch(mediaProcessing, /start_media_processing/);
-  assert.doesNotMatch(mediaProcessing, /audio_variants|ambient_sound_path|['"]both['"]/);
 });

@@ -758,52 +758,38 @@ fn render_accepts_valid_audio_variant_when_processing_is_disabled() {
 }
 
 #[test]
-fn render_maps_advanced_visual_wave_effects() {
+fn standard_mp4_compatibility_is_limited_to_cpu4_video_fields() {
     let directory = TestDir::new();
     let mut input = request(&directory);
     fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    input.advanced.wave_intensity = 0.5;
-
-    let args = build_media_render_args(&input).expect("advanced visual effect should be mapped");
-    let joined = args
-        .iter()
-        .map(|value| value.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(joined.contains("geq=lum="), "{joined}");
-    assert!(joined.contains("sin(2*PI*30"), "{joined}");
-}
-
-#[test]
-fn render_combines_picture_in_picture_local_blur_and_audio_in_one_graph() {
-    let directory = TestDir::new();
-    let mut input = request(&directory);
-    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
+    input.video.brightness_percent = 0.2;
+    input.video.contrast_percent = 100.2;
+    input.video.saturation_percent = 99.8;
+    input.video.hue_rotation_degrees = 0.1;
     input.video.color_space_conversion_enabled = true;
     input.video.color_space_conversion_strength_percent = 25.0;
     input.advanced.local_blur_enabled = true;
     input.advanced.picture_in_picture_enabled = true;
 
-    let args = build_media_render_args(&input).expect("branching video effects should be mapped");
+    let args = build_media_render_args(&input).expect("CPU4 compatibility args should build");
     let values = args
         .iter()
         .map(|value| value.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    let graph = audio_graph(&values);
-    for fragment in [
-        "[0:v:0]",
-        "colorspace=iall=bt601-6-625:all=bt709",
-        "gblur=sigma=",
-        "overlay=x=",
-        "[vout]",
-        "[0:a:0]",
-        "[aout]",
-    ] {
-        assert!(graph.contains(fragment), "{fragment}: {graph}");
-    }
-    assert!(values.windows(2).any(|pair| pair == ["-map", "[vout]"]));
+    let filter = values
+        .windows(2)
+        .find(|pair| pair[0] == "-vf")
+        .map(|pair| pair[1].clone())
+        .expect("CPU4 video filter should be present");
+
+    assert!(filter.contains("lutyuv="));
+    assert!(filter.contains("hue=h=0.100000:s=0.998000"));
+    assert!(!filter.contains("colorspace="));
+    assert!(!filter.contains("gblur="));
+    assert!(!filter.contains("overlay="));
+    assert!(!filter.contains("geq="));
     assert!(values.windows(2).any(|pair| pair == ["-map", "[aout]"]));
-    assert!(!values.iter().any(|value| value == "-vf"));
+    assert!(!values.windows(2).any(|pair| pair == ["-map", "[vout]"]));
 }
 
 #[test]
@@ -990,30 +976,6 @@ fn render_uses_source_relative_output_chain_for_single_audio_variant() {
 }
 
 #[test]
-fn render_maps_native_video_noise_and_detail_filters() {
-    let directory = TestDir::new();
-    let mut input = request(&directory);
-    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    input.video.noise_percent = 2.0;
-    input.video.detail_enhancement_percent = 5.0;
-
-    let args = build_media_render_args(&input).expect("native video filters should be mapped");
-    let values: Vec<String> = args
-        .iter()
-        .map(|value| value.to_string_lossy().into_owned())
-        .collect();
-    let filter = values
-        .windows(2)
-        .find(|pair| pair[0] == "-vf")
-        .map(|pair| pair[1].clone())
-        .expect("video filter should be present");
-
-    assert!(filter.contains("unsharp=5:5:0.050000"));
-    assert!(filter.contains("noise=alls=1:allf=t+u"));
-    assert!(filter.contains("enable='lt(mod(n*7919+38000\\,100000)\\,2000)'"));
-}
-
-#[test]
 fn render_maps_explicit_audio_sample_rate() {
     let directory = TestDir::new();
     let mut input = request(&directory);
@@ -1028,34 +990,6 @@ fn render_maps_explicit_audio_sample_rate() {
     let filter = audio_graph(&values);
 
     assert!(filter.contains("aresample=44100"));
-}
-
-#[test]
-fn render_maps_static_and_dynamic_video_motion_filters() {
-    let directory = TestDir::new();
-    let mut input = request(&directory);
-    fs::write(&input.input_mp4_path, b"source").expect("source should be written");
-    input.video.space_x_offset_px = 2.0;
-    input.video.space_y_offset_px = -1.0;
-    input.video.dynamic_crop_percent = 1.0;
-    input.video.pixel_jitter_px = 1.0;
-
-    let args = build_media_render_args(&input).expect("motion filters should be mapped");
-    let values: Vec<String> = args
-        .iter()
-        .map(|value| value.to_string_lossy().into_owned())
-        .collect();
-    let filter = values
-        .windows(2)
-        .find(|pair| pair[0] == "-vf")
-        .map(|pair| pair[1].clone())
-        .expect("video filter should be present");
-
-    assert!(filter.contains("crop=iw*"));
-    assert!(filter.contains("sin(n*0.07)"));
-    assert!(filter.contains("pad=iw+4:ih+4"));
-    assert!(filter.contains("crop=iw-4:ih-4"));
-    assert!(filter.contains("round(cos(n*0.91)"));
 }
 
 #[test]

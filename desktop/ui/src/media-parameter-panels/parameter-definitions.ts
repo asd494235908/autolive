@@ -93,8 +93,8 @@ export const VIDEO_PARAMETER_DEFINITIONS: readonly MediaParameterDefinition[] = 
   numberDefinition({ section: 'video', field: 'shadows_percent', group: '色彩', label: '阴影', status: 'implemented', min: -100, max: 100, step: 0.1, unit: '%', description: implementedVideoDescription }),
   numberDefinition({ section: 'video', field: 'vignette_percent', group: '色彩', label: '暗角', status: 'implemented', min: 0, max: 100, step: 0.1, unit: '%', description: implementedVideoDescription }),
   booleanDefinition({ section: 'video', field: 'red_channel_lock_enabled', group: '色彩', label: '红色通道保护', status: 'implemented', description: '已作为高光/阴影和色彩转换的红通道保护开关接入。' }),
-  booleanDefinition({ section: 'video', field: 'color_space_conversion_enabled', group: '色彩', label: '色域转换', status: 'implemented', description: implementedVideoDescription }),
-  numberDefinition({ section: 'video', field: 'color_space_conversion_strength_percent', group: '色彩', label: '色域转换强度', status: 'implemented', min: 0, max: 100, step: 0.1, unit: '%', description: implementedVideoDescription }),
+  booleanDefinition({ section: 'video', field: 'color_space_conversion_enabled', group: '色彩', label: '感知色域映射', status: 'planned', description: '候选合同已定义，外部 mpv JSON IPC 尚不能与 shader 快照做帧级原子提交。' }),
+  numberDefinition({ section: 'video', field: 'color_space_conversion_strength_percent', group: '色彩', label: '感知色域映射强度', status: 'planned', min: 0, max: 100, step: 0.1, unit: '%', description: '候选映射为 libplacebo perceptual_strength；完成原子提交和跨 HDR/驱动验证前不准入。' }),
 
   numberDefinition({ section: 'video', field: 'blur_radius_px', group: '清晰度', label: '模糊半径', status: 'implemented', min: 0, max: 8, step: 0.01, unit: 'px', description: implementedVideoDescription }),
   numberDefinition({ section: 'video', field: 'sharpen_percent', group: '清晰度', label: '锐化', status: 'implemented', min: 0, max: 100, step: 0.1, unit: '%', description: implementedVideoDescription }),

@@ -15,12 +15,12 @@
 //!DESC AutoLive Phase 3A edge-aware image repair candidate
 //!WIDTH HOOKED.w
 //!HEIGHT HOOKED.h
-//!WHEN 1
+//!WHEN al_image_repair_enabled al_image_repair_strength_percent *
 
 vec4 hook() {
     vec4 source_color = HOOKED_tex(HOOKED_pos);
     float repair_mix = clamp(al_image_repair_enabled, 0.0, 1.0)
-        * clamp(al_image_repair_strength_percent / 100.0, 0.0, 1.0) * 0.35;
+        * clamp(al_image_repair_strength_percent / 100.0, 0.0, 1.0);
     if (repair_mix <= 0.0) {
         return source_color;
     }

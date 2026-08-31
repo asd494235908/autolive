@@ -1,0 +1,302 @@
+//!PARAM al_target_frequency_hz
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 20000.0
+0.0
+
+//!PARAM al_core_frequency_hz
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 20000.0
+0.0
+
+//!PARAM al_wave_intensity
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_wave_level
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM al_wave_grain_count
+//!TYPE float
+//!MINIMUM 1.0
+//!MAXIMUM 100.0
+20.0
+
+//!PARAM al_dynamic_eq_threshold
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 20.0
+10.0
+
+//!PARAM al_space_dimension
+//!TYPE float
+//!MINIMUM 1.0
+//!MAXIMUM 3.0
+2.0
+
+//!PARAM al_frequency_space_x_px
+//!TYPE float
+//!MINIMUM -10.0
+//!MAXIMUM 10.0
+0.0
+
+//!PARAM al_frequency_space_y_px
+//!TYPE float
+//!MINIMUM -10.0
+//!MAXIMUM 10.0
+0.0
+
+//!PARAM al_band_65
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_92
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_131
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_188
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_267
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_381
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_544
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_777
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_1110
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_1585
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_2263
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!PARAM al_band_20000
+//!TYPE float
+//!MINIMUM 0.5
+//!MAXIMUM 1.5
+1.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive Phase 3A same-frame spatial modulation candidate
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN 1
+
+const float AL_TAU = 6.283185307179586;
+const float AL_MIN_FREQUENCY_HZ = 65.0;
+const float AL_MAX_FREQUENCY_HZ = 20000.0;
+const float AL_MIN_SPATIAL_CYCLES = 1.0;
+const float AL_MAX_SPATIAL_CYCLES = 32.0;
+const float AL_WAVE_LEVEL_CODE_DELTA = 4.0;
+
+float al_frequency_position(float frequency_hz) {
+    float bounded_hz = clamp(
+        frequency_hz,
+        AL_MIN_FREQUENCY_HZ,
+        AL_MAX_FREQUENCY_HZ
+    );
+    return log2(bounded_hz / AL_MIN_FREQUENCY_HZ)
+        / log2(AL_MAX_FREQUENCY_HZ / AL_MIN_FREQUENCY_HZ);
+}
+
+float al_spatial_cycles(float frequency_hz) {
+    return mix(
+        AL_MIN_SPATIAL_CYCLES,
+        AL_MAX_SPATIAL_CYCLES,
+        al_frequency_position(frequency_hz)
+    );
+}
+
+float al_same_frame_grain(vec2 pixel_position) {
+    return fract(sin(dot(floor(pixel_position), vec2(61.0, 131.0))) * 43758.5453123);
+}
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+
+    float band_65_delta = al_band_65 - 1.0;
+    float band_92_delta = al_band_92 - 1.0;
+    float band_131_delta = al_band_131 - 1.0;
+    float band_188_delta = al_band_188 - 1.0;
+    float band_267_delta = al_band_267 - 1.0;
+    float band_381_delta = al_band_381 - 1.0;
+    float band_544_delta = al_band_544 - 1.0;
+    float band_777_delta = al_band_777 - 1.0;
+    float band_1110_delta = al_band_1110 - 1.0;
+    float band_1585_delta = al_band_1585 - 1.0;
+    float band_2263_delta = al_band_2263 - 1.0;
+    float band_20000_delta = al_band_20000 - 1.0;
+    float band_energy =
+        abs(band_65_delta)
+        + abs(band_92_delta)
+        + abs(band_131_delta)
+        + abs(band_188_delta)
+        + abs(band_267_delta)
+        + abs(band_381_delta)
+        + abs(band_544_delta)
+        + abs(band_777_delta)
+        + abs(band_1110_delta)
+        + abs(band_1585_delta)
+        + abs(band_2263_delta)
+        + abs(band_20000_delta);
+
+    bool target_active = al_target_frequency_hz >= AL_MIN_FREQUENCY_HZ;
+    bool band_active = band_energy > 0.0000001;
+    bool wave_active = al_wave_intensity > 0.0;
+    bool level_active = al_wave_level > 0.0;
+    if (!target_active && !band_active && !wave_active && !level_active) {
+        return source_color;
+    }
+
+    float weighted_cycles = 0.0;
+    float band_phase = 0.0;
+    if (band_active) {
+        weighted_cycles = (
+            1.0000000000 * abs(band_65_delta)
+            + 2.8797786721 * abs(band_92_delta)
+            + 4.7920634272 * abs(band_131_delta)
+            + 6.7467479808 * abs(band_188_delta)
+            + 8.6449531136 * abs(band_267_delta)
+            + 10.5688280110 * abs(band_381_delta)
+            + 12.4959449192 * abs(band_544_delta)
+            + 14.4249082230 * abs(band_777_delta)
+            + 16.3548662821 * abs(band_1110_delta)
+            + 18.2823864174 * abs(band_1585_delta)
+            + 20.2092711278 * abs(band_2263_delta)
+            + 32.0000000000 * abs(band_20000_delta)
+        ) / band_energy;
+        band_phase = (
+            band_65_delta
+            + band_92_delta * 2.0
+            + band_131_delta * 3.0
+            + band_188_delta * 4.0
+            + band_267_delta * 5.0
+            + band_381_delta * 6.0
+            + band_544_delta * 7.0
+            + band_777_delta * 8.0
+            + band_1110_delta * 9.0
+            + band_1585_delta * 10.0
+            + band_2263_delta * 11.0
+            + band_20000_delta * 12.0
+        ) * AL_TAU;
+    }
+
+    bool carrier_active = target_active || band_active || wave_active;
+    float luminance_delta = 0.0;
+    if (carrier_active) {
+        float carrier_cycles = target_active
+            ? al_spatial_cycles(al_target_frequency_hz)
+            : weighted_cycles;
+        if (target_active && band_active) {
+            carrier_cycles = mix(
+                carrier_cycles,
+                weighted_cycles,
+                min(band_energy, 0.25)
+            );
+        }
+        if (wave_active) {
+            float grain_count = clamp(al_wave_grain_count, 1.0, 100.0);
+            if (!target_active && !band_active) {
+                carrier_cycles = grain_count;
+            }
+            carrier_cycles += clamp(al_wave_intensity, 0.0, 1.0) * grain_count;
+        }
+
+        vec2 position = HOOKED_pos;
+        if (wave_active) {
+            position += vec2(
+                clamp(al_frequency_space_x_px, -10.0, 10.0) * HOOKED_pt.x,
+                clamp(al_frequency_space_y_px, -10.0, 10.0) * HOOKED_pt.y
+            );
+        }
+        float dimension = clamp(floor(al_space_dimension + 0.5), 1.0, 3.0);
+        float spatial_position = position.x;
+        if (dimension >= 2.0) {
+            spatial_position += position.y;
+        }
+        if (dimension >= 3.0) {
+            spatial_position += length(position - vec2(0.5)) * 1.41421356237;
+        }
+
+        float core_phase = 0.0;
+        if (target_active) {
+            float core_frequency_hz = al_core_frequency_hz >= AL_MIN_FREQUENCY_HZ
+                ? al_core_frequency_hz
+                : al_target_frequency_hz;
+            core_phase = al_frequency_position(core_frequency_hz) * AL_TAU;
+        }
+        float carrier = sin(
+            AL_TAU * carrier_cycles * spatial_position + core_phase + band_phase
+        );
+        float band_amplitude = 0.0;
+        if (target_active || band_active) {
+            float band_limit = al_dynamic_eq_threshold <= 0.0000001
+                ? 20.0
+                : clamp(al_dynamic_eq_threshold, 0.0, 20.0);
+            band_amplitude = min(1.0 + band_energy * 4.0, band_limit);
+        }
+        float wave_amplitude = wave_active
+            ? max(clamp(al_wave_intensity, 0.0, 1.0) * 12.0, 1.0)
+            : 0.0;
+        luminance_delta += (band_amplitude + wave_amplitude) * carrier;
+    }
+
+    if (level_active && al_same_frame_grain(HOOKED_pos / HOOKED_pt) < al_wave_level) {
+        luminance_delta += AL_WAVE_LEVEL_CODE_DELTA;
+    }
+    vec3 modulated_rgb = clamp(
+        source_color.rgb + vec3(luminance_delta / 255.0),
+        vec3(0.0),
+        vec3(1.0)
+    );
+    return vec4(modulated_rgb, source_color.a);
+}

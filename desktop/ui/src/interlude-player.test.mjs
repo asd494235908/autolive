@@ -653,7 +653,7 @@ test('接入 Web Audio 的本地媒体会在 src 前启用匿名 CORS，避免�
   const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
 
   assert.match(appSource, /audioContextCleanupTimerRef/);
-  assert.match(appSource, /ref=\{videoRef\}[\s\S]{0,200}crossOrigin="anonymous"[\s\S]{0,200}src=\{sourceUrl \?\? undefined\}/);
+  assert.match(appSource, /ref=\{videoRef\}[\s\S]{0,200}crossOrigin="anonymous"[\s\S]{0,200}src=\{managedNativeVideoOwnsPlayback \? undefined : sourceUrl \?\? undefined\}/);
   assert.match(appSource, /ref=\{sourceAudioRef\}\s+crossOrigin="anonymous"\s+src=\{sourceUrl \?\? undefined\}/);
   assert.match(appSource, /ref=\{audioRef\}\s+crossOrigin="anonymous"\s+src=\{audioUrl \?\? undefined\}/);
   assert.match(appSource, /ref=\{processedAudioARef\}\s+crossOrigin="anonymous"/);
