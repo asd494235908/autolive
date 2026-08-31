@@ -33,7 +33,7 @@ fn release_gui_audio_decoder_is_hidden_without_swallowing_spawn_errors() {
     let main = std::fs::read_to_string("src/main.rs").expect("main.rs should exist");
     let mixer = std::fs::read_to_string("src/audio_mixer.rs").expect("audio mixer should exist");
 
-    assert!(main.contains("#![cfg_attr(not(debug_assertions), windows_subsystem = \"windows\")]"));
+    assert!(main.contains("any(not(debug_assertions), feature = \"package-gui\")"));
     assert!(mixer.contains("let mut command = background_command(ffmpeg_path);"));
     let spawn = mixer
         .split_once("let mut child = match command.spawn()")

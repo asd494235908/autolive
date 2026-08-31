@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+package-gui = []
+
 [lib]
 name = "autolive_desktop_core"
 path = "src/lib.rs"

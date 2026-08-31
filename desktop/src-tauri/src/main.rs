@@ -1,4 +1,7 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    any(not(debug_assertions), feature = "package-gui"),
+    windows_subsystem = "windows"
+)]
 
 mod audio_cycle_switch;
 mod commands;
@@ -235,9 +238,7 @@ mod tests {
     fn release_build_hides_the_windows_console_window() {
         let source = include_str!("main.rs");
 
-        assert!(
-            source.contains("#![cfg_attr(not(debug_assertions), windows_subsystem = \"windows\")]")
-        );
+        assert!(source.contains("any(not(debug_assertions), feature = \"package-gui\")"));
     }
 
     #[test]
