@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -71,10 +71,12 @@ test('Tauri 打包运行资源清单和内嵌媒体资源树', () => {
   assert.equal(config.bundle.active, true);
   assert.ok(config.bundle.resources.includes('runtime-resources.json'));
   assert.ok(config.bundle.resources.includes('embedded-runtime-resources'));
+  assert.ok(config.bundle.resources.includes('akvirtualcamera'));
   assert.ok(config.bundle.resources.includes('portaudio/portaudio_x64.dll'));
   assert.ok(config.bundle.resources.includes('portaudio/LICENSE.txt'));
   assert.ok(config.bundle.resources.includes('signalsmith-stretch/LICENSE.txt'));
   assert.ok(config.bundle.resources.includes('signalsmith-linear/LICENSE.txt'));
+  assert.ok(config.bundle.resources.includes('speexdsp/LICENSE.txt'));
   assert.equal(config.bundle.windows.nsis.installerHooks, './windows/hooks.nsh');
   assert.deepEqual(config.bundle.windows.webviewInstallMode, {
     type: 'offlineInstaller',
@@ -108,10 +110,13 @@ test('Windows 构建前只清理当前 NSIS bundle 输出目录', () => {
   const releaseRoot = join(root, 'target', 'release');
   const bundleRoot = join(releaseRoot, 'bundle');
   const nsisDir = join(bundleRoot, 'nsis');
+  const tauriNsisDir = join(releaseRoot, 'nsis', 'x64');
   const msiDir = join(bundleRoot, 'msi');
   mkdirSync(nsisDir, { recursive: true });
+  mkdirSync(tauriNsisDir, { recursive: true });
   mkdirSync(msiDir, { recursive: true });
   writeFileSync(join(nsisDir, 'stale-setup.exe'), 'stale');
+  writeFileSync(join(tauriNsisDir, 'nsis-output.exe'), 'stale-tauri');
   writeFileSync(join(msiDir, 'keep.msi'), 'keep');
   writeFileSync(join(releaseRoot, 'keep.exe'), 'keep');
 
@@ -120,11 +125,15 @@ test('Windows 构建前只清理当前 NSIS bundle 输出目录', () => {
     nsisDir,
   );
   assert.equal(existsSync(nsisDir), false);
+  assert.equal(existsSync(tauriNsisDir), false);
   assert.equal(existsSync(join(msiDir, 'keep.msi')), true);
   assert.equal(existsSync(join(releaseRoot, 'keep.exe')), true);
 
   const buildScript = readFileSync(buildScriptPath, 'utf8');
   const buildFunction = buildScript.slice(buildScript.indexOf('export function buildDesktopArtifacts'));
+  assert.match(buildScript, /stage-akvirtualcamera-resources\.mjs/);
+  assert.match(buildFunction, /AUTOLIVE_BUILD_PROFILE !== 'test'/);
+  assert.match(buildFunction, /cleanAkVirtualCameraTestResources\(\)/);
   assertInOrder(buildFunction, [
     'cleanBundleOutputForTarget(targetTriple)',
     "spawnSync('tauri'",
@@ -182,6 +191,7 @@ test('Windows 归档器同时交付 NSIS EXE 与 media-only portable', () => {
     readFileSync(join(destination, 'portable', 'ambient', 'LICENSE.txt'), 'utf8'),
     'ambient-license',
   );
+  assert.ok(existsSync(join(destination, 'portable', 'speexdsp', 'LICENSE.txt')));
   assert.equal(existsSync(join(destination, 'portable', 'ambient', 'unexpected.tmp')), false);
   assert.equal(existsSync(join(destination, 'msi')), false);
   assert.equal(existsSync(join(destination, 'portable', 'embedded-runtime-resources', 'common')), false);
@@ -195,6 +205,7 @@ test('Windows 归档器同时交付 NSIS EXE 与 media-only portable', () => {
     assert.equal(listing.status, 0, listing.stderr);
     assert.match(listing.stdout, /portable\/ambient\/low-level-room-tone\.wav/);
     assert.match(listing.stdout, /portable\/ambient\/LICENSE\.txt/);
+    assert.match(listing.stdout, /portable\/speexdsp\/LICENSE\.txt/);
     assert.doesNotMatch(listing.stdout, /unexpected\.tmp/);
   }
 });
@@ -240,6 +251,37 @@ test('Windows 归档器拒绝 NSIS 目录中的多个 EXE', () => {
   );
 });
 
+test('Windows 归档器兼容 Tauri 2.11 的 target/nsis/x64 输出布局', () => {
+  const root = mkdtempSync(join(tmpdir(), 'autolive-media-package-'));
+  const fixture = createWindowsArchiveFixture(root, [{
+    relative_path: 'x86_64-pc-windows-msvc/binaries/ffmpeg.exe',
+    content: 'ffmpeg',
+  }]);
+  rmSync(join(fixture.bundleSourceDir, 'nsis'), { force: true, recursive: true });
+  mkdirSync(join(root, 'target', 'release', 'nsis', 'x64'), { recursive: true });
+  writeFileSync(
+    join(root, 'target', 'release', 'nsis', 'x64', 'nsis-output.exe'),
+    'tauri-2.11-installer',
+  );
+  const ambientResourceDir = join(root, 'ambient');
+  mkdirSync(ambientResourceDir, { recursive: true });
+  writeFileSync(join(ambientResourceDir, 'low-level-room-tone.wav'), 'room-tone');
+  writeFileSync(join(ambientResourceDir, 'LICENSE.txt'), 'ambient-license');
+
+  const destination = archiveDesktopArtifacts({
+    targetTriple: 'x86_64-pc-windows-msvc',
+    ...fixture,
+    ambientResourceDir,
+    packageRoot: join(root, 'package'),
+    createPortableZip: false,
+  });
+
+  assert.equal(
+    readFileSync(join(destination, 'nsis', 'nsis-output.exe'), 'utf8'),
+    'tauri-2.11-installer',
+  );
+});
+
 test('Windows 归档器缺少正式 Tauri EXE 时失败', () => {
   const root = mkdtempSync(join(tmpdir(), 'autolive-media-package-'));
   const fixture = createWindowsArchiveFixture(root, [{
@@ -280,7 +322,7 @@ test('Windows 归档器拒绝包含重复路径的运行资源清单', () => {
   );
 });
 
-test('本地构建只准备 FFmpeg、生成发布树并构建桌面产物', () => {
+test('本地构建准备 FFmpeg、生成发布树并执行桌面产物构建', () => {
   const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
 
   for (const name of ['tauri:build', 'tauri:build:prepared-resources']) {

@@ -15,7 +15,7 @@ import {
   StopOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
-import { App as AntApp, Alert, Button, Card, Checkbox, Descriptions, Drawer, Empty, Input, InputNumber, Layout, Popconfirm, Segmented, Select, Slider, Space, Steps, Switch, Tag, Tooltip, Typography } from 'antd';
+import { App as AntApp, Alert, Button, Card, Checkbox, Descriptions, Drawer, Empty, Input, InputNumber, Layout, Popconfirm, Progress, Segmented, Select, Slider, Space, Steps, Switch, Tag, Tooltip, Typography } from 'antd';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { SyntheticEvent } from 'react';
 import { HashRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom';
@@ -34,6 +34,12 @@ import {
   saveInterludeConfig as saveInterludeConfigToStorage,
   type PersistedInterludeConfig,
 } from './interlude-config-storage';
+import {
+  DEFAULT_MICROPHONE_INTERLUDE_CONFIG,
+  loadMicrophoneInterludeConfig,
+  saveMicrophoneInterludeConfig,
+  type MicrophoneInterludeConfigLoadResult,
+} from './microphone-interlude-storage';
 import {
   AUDIO_MIX_PICK_HARD_MAX,
   AUDIO_VALUE_PRESETS,
@@ -141,6 +147,7 @@ import {
 import type { PlaybackClockHealth } from './playback-clock-health';
 import { scheduleAfterInitialPaint } from './startup-scheduler';
 import { getDisplayErrorMessage } from './errorDisplay';
+import { DouyinLivePanel } from './douyin-live-panel';
 import {
   isCurrentRuntimeResourceAction,
   isRuntimeResourceBusy,
@@ -190,6 +197,24 @@ import { InterludePresetParameterRow } from './desktop/interlude-preset-paramete
 import { MediaCycleCard } from './desktop/media-cycle-card';
 import { PlaybackPoolPanel, type PlaybackPoolSource } from './desktop/playback-pool-panel';
 import { PortAudioDevicePanel } from './desktop/portaudio-device-panel';
+import { RtmpOutputPanel, type RtmpOutputPanelConfig, type RtmpOutputPanelStatus } from './desktop/rtmp-output-panel';
+import { VirtualCameraOutputPanel, type VirtualCameraOutputStatus } from './desktop/virtual-camera-output-panel';
+import {
+  isMicrophoneInputDeviceList,
+  isMicrophoneInterludeStatus,
+  isMicrophonePriorityMessage,
+  isMicrophonePriorityRequestMessage,
+  isMicrophoneSensitivity,
+  isSelectedMicrophoneDeviceAvailable,
+  MICROPHONE_AUDIO_PRIORITY_LABEL,
+  MICROPHONE_SENSITIVITY_OPTIONS,
+  projectMicrophoneInterludeStatus,
+  type MicrophoneInputDevice,
+  type MicrophoneInterludeStatus,
+  type MicrophonePriorityMessage,
+  type MicrophonePriorityRequestMessage,
+  type MicrophoneSensitivity,
+} from './microphone-interlude';
 
 const PLAYBACK_CHANNEL_NAME = 'autolive-playback-ui-v1';
 const FIXED_SPEECH_ACK_TIMEOUT_MS = 3_000;
@@ -207,12 +232,23 @@ const MAX_IPC_STRING_LENGTH = 32_768;
 const MAX_IPC_OBJECT_FIELDS = 512;
 const MAX_IPC_VALUE_NODES = 4_096;
 const MAX_INTERLUDE_AUDIO_FILES = 1_000;
+const SYSTEM_DEFAULT_MICROPHONE_ID = '__system_default_microphone__';
 const VIDEO_BACKEND_SOURCE_REVISION = 0;
 const MPV_REALTIME_VIDEO_ENABLED = true;
 // PortAudio 运行后由最终效果窗静音 WebView 主轨，避免双播；失败则保持 WebView。
 const PORTAUDIO_FORMAL_SOURCE_SYNC_READY = true;
 const AUTO_PORTAUDIO_ENABLED = true;
 const AUTO_PORTAUDIO_RETRY_COOLDOWN_MS = 5_000;
+const DEFAULT_RTMP_OUTPUT_CONFIG: RtmpOutputPanelConfig = {
+  target_url: 'rtmp://127.0.0.1/live/stream',
+  video_enabled: true,
+  audio_enabled: true,
+  width: 1280,
+  height: 720,
+  fps: 30,
+  video_bitrate_kbps: 2_500,
+  audio_bitrate_kbps: 128,
+};
 const MEDIA_CANDIDATE_SAFETY_TAIL_MS = 500;
 // 首块截止必须服从用户设置的周期；GPU/CPU 都不能用额外墙钟追赶迟到候选。
 const AUDIO_CANDIDATE_OUTSIDE_SOURCE_AUDIO_WINDOW_CODE = 'audio_candidate_outside_source_audio_window';
@@ -1548,7 +1584,7 @@ function getInterludeValidationErrors(draft: InterludeConfigDraft): string[] {
   const errors: string[] = [];
   const inRange = (value: number, min: number, max: number) => Number.isFinite(value) && value >= min && value <= max;
 
-  if (draft.enabled && !draft.directory) errors.push('启用随机插话前必须选择媒体目录');
+  if (draft.enabled && !draft.directory) errors.push('启用插话文件前必须选择媒体目录');
   if (draft.audioSelectionMode === 'random' && draft.audioPresetIds.length === 0) errors.push('随机音轨至少保留一个声音预设');
   if (draft.audioSelectionMode === 'random' && draft.audioMixEnabled && (
     !inRange(draft.audioMixPickMin, 1, AUDIO_MIX_PICK_HARD_MAX)
@@ -1623,6 +1659,7 @@ function FinalEffectWindow() {
   const userVolumeRef = useRef(1);
   const audioUrlRef = useRef<string | null>(null);
   const fixedSpeechActiveRef = useRef(false);
+  const microphonePriorityActiveRef = useRef(false);
   const fixedSpeechOperationRef = useRef<{
     operationId: string;
     utterance: SpeechSynthesisUtterance | null;
@@ -2392,6 +2429,10 @@ function FinalEffectWindow() {
   }
 
   async function startFixedSpeech(message: Extract<FixedSpeechCommandMessage, { action: 'speak' }>) {
+    if (microphonePriorityActiveRef.current) {
+      publishFixedSpeechStatus(message.operation_id, 'cancelled');
+      return;
+    }
     const previousOperationId = fixedSpeechOperationRef.current?.operationId;
     if (previousOperationId) cancelFixedSpeech(previousOperationId);
     if (!('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') {
@@ -2404,7 +2445,7 @@ function FinalEffectWindow() {
       utterance: null,
       startTimer: null,
     };
-    // 固定话术从等待本地 voice 的 starting 阶段就暂停插话，避免等待期间又触发随机插话。
+    // 固定话术从等待本地 voice 的 starting 阶段就暂停插话，避免等待期间又触发插话文件。
     fixedSpeechActiveRef.current = true;
     setFixedSpeechActive(true);
     pauseInterludePlayback();
@@ -3327,7 +3368,26 @@ function FinalEffectWindow() {
       return;
     }
     playbackChannelRef.current = channel;
+    try {
+      channel.postMessage({
+        version: 1,
+        type: 'microphone-priority-request',
+      } satisfies MicrophonePriorityRequestMessage);
+    } catch {
+      // 主窗口尚未完成通道初始化时，后续状态边沿仍会重新发送快照。
+    }
     const handleMessage = (event: MessageEvent<unknown>) => {
+      if (isMicrophonePriorityMessage(event.data)) {
+        microphonePriorityActiveRef.current = event.data.speaking;
+        if (event.data.speaking) {
+          const operationId = fixedSpeechOperationRef.current?.operationId;
+          if (operationId) cancelFixedSpeech(operationId);
+          // 麦克风本地 VAD 已在 PortAudio callback 中立即压低主媒体；
+          // 这里同步清理 WebView 插话和固定话术，避免它们继续抢占优先级。
+          clearInterludePlayback({ releaseMs: 0, resetSchedule: true });
+        }
+        return;
+      }
       if (isFixedSpeechCommandMessage(event.data)) {
         if (event.data.action === 'cancel') cancelFixedSpeech(event.data.operation_id);
         else void startFixedSpeech(event.data);
@@ -4679,7 +4739,7 @@ function FinalEffectWindow() {
       currentSnapshot?.playback_state === 'playing' &&
       !shouldPauseInterlude({
         playbackState: currentSnapshot.playback_state,
-        fixedSpeechActive: fixedSpeechActiveRef.current,
+        fixedSpeechActive: fixedSpeechActiveRef.current || microphonePriorityActiveRef.current,
       })
     ) {
       void interludeAudio.play().catch((cause) => {
@@ -4963,10 +5023,10 @@ function FinalEffectWindow() {
 
       if (shouldPauseInterlude({
         playbackState: currentSnapshot.playback_state,
-        fixedSpeechActive: fixedSpeechActiveRef.current,
+        fixedSpeechActive: fixedSpeechActiveRef.current || microphonePriorityActiveRef.current,
       })) {
         // 视频暂停和固定话术朗读都只暂停当前插话；清理会丢失正在播放的插话，
-        // 导致朗读结束后随机插话播放器无法恢复。
+        // 导致朗读结束后插话文件播放器无法恢复。
         pauseInterludePlayback();
         return;
       }
@@ -5380,6 +5440,16 @@ function DesktopApp() {
   const autoPortAudioAttemptRef = useRef({ key: null as string | null, startedAtMs: 0, inFlight: false });
   const autoPortAudioRetryTimerRef = useRef<number | null>(null);
   const [autoPortAudioRetryRevision, setAutoPortAudioRetryRevision] = useState(0);
+  // RTMP 地址可能包含 stream key/token；第一版只保存在当前窗口内存，不写入普通本地存储。
+  const [rtmpOutputConfig, setRtmpOutputConfig] = useState<RtmpOutputPanelConfig>(
+    DEFAULT_RTMP_OUTPUT_CONFIG,
+  );
+  const [rtmpOutputStatus, setRtmpOutputStatus] = useState<RtmpOutputPanelStatus | null>(null);
+  const [rtmpOutputBusy, setRtmpOutputBusy] = useState(false);
+  const [rtmpOutputError, setRtmpOutputError] = useState<string | null>(null);
+  const [virtualCameraStatus, setVirtualCameraStatus] = useState<VirtualCameraOutputStatus | null>(null);
+  const [virtualCameraBusy, setVirtualCameraBusy] = useState(false);
+  const [virtualCameraError, setVirtualCameraError] = useState<string | null>(null);
 
   useLayoutEffect(() => {
     audioOutputBackendRef.current = audioOutputBackend;
@@ -5473,6 +5543,224 @@ function DesktopApp() {
       setAudioOutputBusy(false);
     }
   }
+
+  function updateRtmpOutputConfig(patch: Partial<RtmpOutputPanelConfig>) {
+    setRtmpOutputConfig((current) => ({ ...current, ...patch }));
+  }
+
+  function isRtmpOutputStatus(value: unknown): value is RtmpOutputPanelStatus {
+    if (!value || typeof value !== 'object') return false;
+    const record = value as Record<string, unknown>;
+    if (typeof record.state !== 'string') return false;
+    const nullableStringFields = ['error_code', 'error', 'target_url', 'encoder', 'video_filter_backend'];
+    if (nullableStringFields.some((field) => record[field] !== undefined && record[field] !== null && typeof record[field] !== 'string')) return false;
+    const nullableNumberFields = [
+      'session_generation', 'width', 'height', 'fps', 'video_bitrate_kbps', 'audio_bitrate_kbps',
+      'current_bitrate_kbps', 'process_id', 'retry_count', 'published_ms', 'output_bytes',
+      'last_progress_ms', 'dropped_audio_chunks',
+    ];
+    if (nullableNumberFields.some((field) => record[field] !== undefined && record[field] !== null
+      && (typeof record[field] !== 'number' || !Number.isFinite(record[field])))) return false;
+    if (record.video_enabled !== undefined && typeof record.video_enabled !== 'boolean') return false;
+    if (record.audio_enabled !== undefined && typeof record.audio_enabled !== 'boolean') return false;
+    if (record.source_identity !== undefined && record.source_identity !== null) {
+      const source = record.source_identity;
+      if (!source || typeof source !== 'object') return false;
+      const sourceRecord = source as Record<string, unknown>;
+      if (['playback_generation', 'source_media_index', 'loop_index', 'source_position_ms'].some((field) =>
+        typeof sourceRecord[field] !== 'number' || !Number.isFinite(sourceRecord[field]))) return false;
+      if (sourceRecord.source_duration_ms !== undefined && sourceRecord.source_duration_ms !== null
+        && (typeof sourceRecord.source_duration_ms !== 'number' || !Number.isFinite(sourceRecord.source_duration_ms))) return false;
+    }
+    return true;
+  }
+
+  async function refreshRtmpOutputStatus() {
+    try {
+      const value = await invoke<unknown>('get_rtmp_output_status');
+      if (!isRtmpOutputStatus(value)) throw new Error('RTMP 推流状态响应无效');
+      setRtmpOutputStatus(value);
+      setRtmpOutputError(value.error ?? null);
+    } catch (cause) {
+      setRtmpOutputError(getDisplayErrorMessage(cause, '读取 RTMP 推流状态失败'));
+    }
+  }
+
+  async function validateRtmpOutput() {
+    setRtmpOutputBusy(true);
+    setRtmpOutputError(null);
+    try {
+      const value = await invoke<unknown>('validate_rtmp_output_config', { request: rtmpOutputConfig });
+      if (!isRtmpOutputStatus(value)) throw new Error('RTMP 配置校验响应无效');
+      setRtmpOutputStatus(value);
+      setRtmpOutputError(value.error ?? null);
+    } catch (cause) {
+      setRtmpOutputError(getDisplayErrorMessage(cause, 'RTMP 配置校验失败'));
+    } finally {
+      setRtmpOutputBusy(false);
+    }
+  }
+
+  async function startRtmpOutput() {
+    setRtmpOutputBusy(true);
+    setRtmpOutputError(null);
+    try {
+      const value = await invoke<unknown>('start_rtmp_output', { request: rtmpOutputConfig });
+      if (!isRtmpOutputStatus(value)) throw new Error('RTMP 推流启动响应无效');
+      setRtmpOutputStatus(value);
+      setRtmpOutputError(value.error ?? null);
+    } catch (cause) {
+      setRtmpOutputError(getDisplayErrorMessage(cause, '启动 RTMP 推流失败'));
+    } finally {
+      setRtmpOutputBusy(false);
+    }
+  }
+
+  async function stopRtmpOutput() {
+    setRtmpOutputBusy(true);
+    setRtmpOutputError(null);
+    try {
+      const value = await invoke<unknown>('stop_rtmp_output');
+      if (!isRtmpOutputStatus(value)) throw new Error('RTMP 停止响应无效');
+      setRtmpOutputStatus(value);
+    } catch (cause) {
+      setRtmpOutputError(getDisplayErrorMessage(cause, '停止 RTMP 推流失败'));
+    } finally {
+      setRtmpOutputBusy(false);
+    }
+  }
+
+  function isVirtualCameraOutputStatus(value: unknown): value is VirtualCameraOutputStatus {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const record = value as Record<string, unknown>;
+    if (!['Unavailable', 'Installed', 'Starting', 'Ready', 'Streaming', 'Recovering', 'Failed', 'Stopping']
+      .includes(record.state as string)
+      || !isSafeNonNegativeInteger(record.generation)
+      || record.generation === 0
+      || !record.config || typeof record.config !== 'object' || Array.isArray(record.config)
+      || !record.metrics || typeof record.metrics !== 'object' || Array.isArray(record.metrics)) {
+      return false;
+    }
+    const config = record.config as Record<string, unknown>;
+    if (!isBoundedString(config.device_name, false)
+      || config.device_name !== 'GpAutoLive Camera'
+      || config.pixel_format !== 'YUY2'
+      || config.width !== 1280
+      || config.height !== 720
+      || config.fps !== 30
+      || config.zero_copy !== false) {
+      return false;
+    }
+    const metrics = record.metrics as Record<string, unknown>;
+    const metricFields = [
+      'frames_submitted',
+      'frames_delivered',
+      'frames_dropped',
+      'stale_frames_rejected',
+      'readback_count',
+    ];
+    if (!metricFields.every((field) => isSafeNonNegativeInteger(metrics[field]))
+      || !isNullableSafeNonNegativeInteger(metrics.readback_p99_us)
+      || (metrics.frames_delivered as number) > (metrics.frames_submitted as number)) {
+      return false;
+    }
+    if (record.downstream_client_count !== null
+      && !isSafeNonNegativeInteger(record.downstream_client_count)) return false;
+    if (isSafeNonNegativeInteger(record.downstream_client_count)
+      && record.downstream_client_count > 1024) return false;
+    if (record.last_error !== null && !isBoundedString(record.last_error)) return false;
+    if (record.gpu !== null) {
+      if (!record.gpu || typeof record.gpu !== 'object' || Array.isArray(record.gpu)) return false;
+      const gpu = record.gpu as Record<string, unknown>;
+      if (!isBoundedString(gpu.capture_api, false)
+        || !isBoundedString(gpu.adapter_name, false)
+        || !isBoundedString(gpu.feature_level, false)
+        || !isBoundedString(gpu.transport, false)
+        || (gpu.adapter_luid !== undefined && !isBoundedString(gpu.adapter_luid, false))
+        || !isSafeNonNegativeInteger(gpu.vendor_id)
+        || !isSafeNonNegativeInteger(gpu.device_id)
+        || gpu.vendor_id === 0
+        || gpu.capture_api !== 'windows_graphics_capture'
+        || gpu.transport !== 'akvcam_mmap_cpu'
+        || gpu.is_warp !== false
+        || gpu.gpu_scale !== true
+        || gpu.gpu_color_convert !== true
+        || gpu.zero_copy !== false
+        || gpu.width !== 1280
+        || gpu.height !== 720
+        || gpu.fps !== 30) return false;
+    }
+    return true;
+  }
+
+  async function refreshVirtualCameraStatus() {
+    try {
+      const value = await invoke<unknown>('get_virtual_camera_status');
+      if (!isVirtualCameraOutputStatus(value)) throw new Error('虚拟摄像头状态响应无效');
+      setVirtualCameraStatus(value);
+      setVirtualCameraError(value.last_error ?? null);
+    } catch (cause) {
+      setVirtualCameraError(getDisplayErrorMessage(cause, '读取虚拟摄像头状态失败'));
+    }
+  }
+
+  async function installOrRepairVirtualCamera() {
+    setVirtualCameraBusy(true);
+    setVirtualCameraError(null);
+    try {
+      const value = await invoke<unknown>('install_or_repair_virtual_camera');
+      if (!isVirtualCameraOutputStatus(value)) throw new Error('虚拟摄像头安装响应无效');
+      setVirtualCameraStatus(value);
+    } catch (cause) {
+      setVirtualCameraError(getDisplayErrorMessage(cause, '安装/修复虚拟摄像头失败'));
+      await refreshVirtualCameraStatus();
+    } finally {
+      setVirtualCameraBusy(false);
+    }
+  }
+
+  async function startVirtualCameraOutput() {
+    setVirtualCameraBusy(true);
+    setVirtualCameraError(null);
+    try {
+      const value = await invoke<unknown>('start_virtual_camera_output');
+      if (!isVirtualCameraOutputStatus(value)) throw new Error('虚拟摄像头启动响应无效');
+      setVirtualCameraStatus(value);
+    } catch (cause) {
+      setVirtualCameraError(getDisplayErrorMessage(cause, '启动虚拟摄像头输出失败'));
+      await refreshVirtualCameraStatus();
+    } finally {
+      setVirtualCameraBusy(false);
+    }
+  }
+
+  async function stopVirtualCameraOutput() {
+    setVirtualCameraBusy(true);
+    setVirtualCameraError(null);
+    try {
+      const value = await invoke<unknown>('stop_virtual_camera_output');
+      if (!isVirtualCameraOutputStatus(value)) throw new Error('虚拟摄像头停止响应无效');
+      setVirtualCameraStatus(value);
+    } catch (cause) {
+      setVirtualCameraError(getDisplayErrorMessage(cause, '停止虚拟摄像头输出失败'));
+    } finally {
+      setVirtualCameraBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!documentVisible) return undefined;
+    void refreshRtmpOutputStatus();
+    const timer = window.setInterval(() => void refreshRtmpOutputStatus(), 2_000);
+    return () => window.clearInterval(timer);
+  }, [documentVisible]);
+
+  useEffect(() => {
+    if (!documentVisible) return undefined;
+    void refreshVirtualCameraStatus();
+    const timer = window.setInterval(() => void refreshVirtualCameraStatus(), 2_000);
+    return () => window.clearInterval(timer);
+  }, [documentVisible]);
   const [mediaEffectParams, setMediaEffectParams] = useState<MediaEffectParams | null>(null);
   const [ambientSoundPath, setAmbientSoundPath] = useState<string | null>(null);
   const [cacheCleanup, setCacheCleanup] = useState<CacheCleanupResult | null>(null);
@@ -5772,10 +6060,209 @@ function DesktopApp() {
   const [audioSettingsDrawerOpen, setAudioSettingsDrawerOpen] = useState(false);
   const [interludeDrawerOpen, setInterludeDrawerOpen] = useState(false);
   const [fixedSpeechDrawerOpen, setFixedSpeechDrawerOpen] = useState(false);
+  const [microphoneDrawerOpen, setMicrophoneDrawerOpen] = useState(false);
+  const [microphoneStoredConfig] = useState<MicrophoneInterludeConfigLoadResult>(() => loadMicrophoneInterludeConfig());
+  const [microphoneConfigStorageError, setMicrophoneConfigStorageError] = useState<string | null>(
+    () => microphoneStoredConfig.error,
+  );
+  const [microphoneDevices, setMicrophoneDevices] = useState<MicrophoneInputDevice[]>([]);
+  const [microphoneDevicesError, setMicrophoneDevicesError] = useState<string | null>(null);
+  const [microphoneSelectedDeviceError, setMicrophoneSelectedDeviceError] = useState<string | null>(null);
+  const [microphoneDevicesRefreshing, setMicrophoneDevicesRefreshing] = useState(false);
+  const [microphoneDeviceId, setMicrophoneDeviceId] = useState<string | null>(
+    () => microphoneStoredConfig.config.device_id ?? DEFAULT_MICROPHONE_INTERLUDE_CONFIG.device_id,
+  );
+  const [microphoneSensitivity, setMicrophoneSensitivity] = useState<MicrophoneSensitivity>(
+    () => microphoneStoredConfig.config.sensitivity ?? DEFAULT_MICROPHONE_INTERLUDE_CONFIG.sensitivity,
+  );
+  const [microphoneAecEnabled, setMicrophoneAecEnabled] = useState(
+    () => microphoneStoredConfig.config.aec_enabled ?? DEFAULT_MICROPHONE_INTERLUDE_CONFIG.aec_enabled,
+  );
+  const [microphoneNoiseSuppressionEnabled, setMicrophoneNoiseSuppressionEnabled] = useState(
+    () => microphoneStoredConfig.config.noise_suppression_enabled ?? DEFAULT_MICROPHONE_INTERLUDE_CONFIG.noise_suppression_enabled,
+  );
+  const [microphoneAgcEnabled, setMicrophoneAgcEnabled] = useState(
+    () => microphoneStoredConfig.config.agc_enabled ?? DEFAULT_MICROPHONE_INTERLUDE_CONFIG.agc_enabled,
+  );
+  const [microphoneStatus, setMicrophoneStatus] = useState<MicrophoneInterludeStatus | null>(null);
+  const [microphoneIpcError, setMicrophoneIpcError] = useState<string | null>(null);
+  const [microphoneBusy, setMicrophoneBusy] = useState<'start' | 'stop' | null>(null);
+  const microphoneInitialConfigRef = useRef({
+    deviceId: microphoneDeviceId,
+    sensitivity: microphoneSensitivity,
+    aecEnabled: microphoneAecEnabled,
+    noiseSuppressionEnabled: microphoneNoiseSuppressionEnabled,
+    agcEnabled: microphoneAgcEnabled,
+  });
+  const microphoneStatusRequestInFlightRef = useRef(false);
+  const microphoneDevicesRequestInFlightRef = useRef(false);
+  const microphoneSpeakingRef = useRef(false);
+  const microphoneView = useMemo(
+    () => projectMicrophoneInterludeStatus(microphoneStatus),
+    [microphoneStatus],
+  );
+  const microphoneDevicesDisplayError = microphoneDevicesError ?? microphoneSelectedDeviceError;
 
   useEffect(() => {
     setAudioSettingsDrawerOpen(initialRoute === 'settings');
   }, [initialRoute]);
+
+  const refreshMicrophoneDevices = useCallback(async () => {
+    if (microphoneDevicesRequestInFlightRef.current) return;
+    microphoneDevicesRequestInFlightRef.current = true;
+    setMicrophoneDevicesRefreshing(true);
+    try {
+      const value = await invoke<unknown>('list_portaudio_input_devices');
+      if (!isMicrophoneInputDeviceList(value)) {
+        setMicrophoneDevicesError('麦克风设备列表响应无效，当前不可用。');
+        return;
+      }
+      if (value.length === 0) {
+        setMicrophoneDevices(value);
+        setMicrophoneDevicesError('未检测到可用的麦克风输入设备。');
+        setMicrophoneSelectedDeviceError(null);
+        return;
+      }
+      setMicrophoneDevices(value);
+      setMicrophoneDevicesError(null);
+      setMicrophoneSelectedDeviceError(
+        isSelectedMicrophoneDeviceAvailable(microphoneDeviceId, value)
+          ? null
+          : '已保存的麦克风设备当前不可用，请重新选择输入设备。',
+      );
+    } catch (cause) {
+      setMicrophoneDevicesError(getDisplayErrorMessage(cause, '麦克风设备枚举失败，当前不可用。'));
+    } finally {
+      microphoneDevicesRequestInFlightRef.current = false;
+      setMicrophoneDevicesRefreshing(false);
+    }
+  }, [microphoneDeviceId]);
+
+  const refreshMicrophoneStatus = useCallback(async () => {
+    if (microphoneStatusRequestInFlightRef.current) return;
+    microphoneStatusRequestInFlightRef.current = true;
+    try {
+      const value = await invoke<unknown>('get_microphone_interlude_status');
+      if (!isMicrophoneInterludeStatus(value)) {
+        setMicrophoneStatus(null);
+        setMicrophoneIpcError('麦克风状态响应无效，无法开始监听。');
+        return;
+      }
+      setMicrophoneStatus(value);
+      setMicrophoneIpcError(null);
+    } catch (cause) {
+      setMicrophoneStatus(null);
+      setMicrophoneIpcError(getDisplayErrorMessage(cause, '麦克风插话状态不可用。'));
+    } finally {
+      microphoneStatusRequestInFlightRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!microphoneDrawerOpen) return;
+    void refreshMicrophoneDevices();
+    void refreshMicrophoneStatus();
+  }, [microphoneDrawerOpen, refreshMicrophoneDevices, refreshMicrophoneStatus]);
+
+  useEffect(() => {
+    if (!microphoneDrawerOpen || !documentVisible) return;
+    const timer = window.setInterval(() => void refreshMicrophoneStatus(), 1_000);
+    return () => window.clearInterval(timer);
+  }, [documentVisible, microphoneDrawerOpen, refreshMicrophoneStatus]);
+
+  useEffect(() => {
+    const initial = microphoneInitialConfigRef.current;
+    if (microphoneDeviceId === initial.deviceId
+      && microphoneSensitivity === initial.sensitivity
+      && microphoneAecEnabled === initial.aecEnabled
+      && microphoneNoiseSuppressionEnabled === initial.noiseSuppressionEnabled
+      && microphoneAgcEnabled === initial.agcEnabled) return;
+    try {
+      saveMicrophoneInterludeConfig({
+        version: DEFAULT_MICROPHONE_INTERLUDE_CONFIG.version,
+        device_id: microphoneDeviceId,
+        sensitivity: microphoneSensitivity,
+        aec_enabled: microphoneAecEnabled,
+        noise_suppression_enabled: microphoneNoiseSuppressionEnabled,
+        agc_enabled: microphoneAgcEnabled,
+      });
+      setMicrophoneConfigStorageError(null);
+    } catch (cause) {
+      setMicrophoneConfigStorageError(getDisplayErrorMessage(cause, '麦克风配置保存失败，仍使用当前设置。'));
+    }
+  }, [microphoneAecEnabled, microphoneAgcEnabled, microphoneDeviceId, microphoneNoiseSuppressionEnabled, microphoneSensitivity]);
+
+  // 麦克风状态在播放窗口关闭设置抽屉时仍需持续刷新，才能把 VAD 的
+  // speaking/hangover 边沿及时广播给最终效果窗口。声音数据仍只在 Rust
+  // 进程内流转，这里传递的只是布尔优先级状态。
+  useEffect(() => {
+    const microphoneState = microphoneStatus?.state;
+    if (!documentVisible || !microphoneState || !['opening', 'armed', 'speaking', 'hangover'].includes(microphoneState)) {
+      return;
+    }
+    const timer = window.setInterval(() => void refreshMicrophoneStatus(), 250);
+    return () => window.clearInterval(timer);
+  }, [documentVisible, microphoneStatus?.state, refreshMicrophoneStatus]);
+
+  useEffect(() => {
+    const microphoneState = microphoneStatus?.state;
+    const speaking = microphoneState === 'speaking' || microphoneState === 'hangover';
+    if (speaking === microphoneSpeakingRef.current) return;
+    microphoneSpeakingRef.current = speaking;
+    try {
+      playbackChannelRef.current?.postMessage({
+        version: 1,
+        type: 'microphone-priority',
+        speaking,
+      } satisfies MicrophonePriorityMessage);
+    } catch {
+      // 最终效果窗口关闭时通道可能失效；PortAudio 门控仍在 Rust 侧生效。
+    }
+    if (speaking) cancelCurrentFixedSpeech();
+  }, [microphoneStatus?.state]);
+
+  const startMicrophoneInterlude = useCallback(async () => {
+    if (microphoneBusy) return;
+    setMicrophoneBusy('start');
+    setMicrophoneIpcError(null);
+    const request = {
+      enabled: true,
+      device_id: microphoneDeviceId,
+      sample_rate_hz: 48_000,
+      sensitivity: microphoneSensitivity,
+      aec_enabled: microphoneAecEnabled,
+      noise_suppression_enabled: microphoneNoiseSuppressionEnabled,
+      agc_enabled: microphoneAgcEnabled,
+    };
+    try {
+      await invoke('set_microphone_interlude_config', { config: request });
+      const value = await invoke<unknown>('start_microphone_interlude', { request: { config: request } });
+      if (!isMicrophoneInterludeStatus(value)) {
+        throw new Error('麦克风启动响应无效。');
+      }
+      setMicrophoneStatus(value);
+    } catch (cause) {
+      setMicrophoneIpcError(getDisplayErrorMessage(cause, '麦克风插话启动失败，当前不可用。'));
+      void refreshMicrophoneStatus();
+    } finally {
+      setMicrophoneBusy(null);
+    }
+  }, [microphoneAecEnabled, microphoneAgcEnabled, microphoneBusy, microphoneDeviceId, microphoneNoiseSuppressionEnabled, microphoneSensitivity]);
+
+  const stopMicrophoneInterlude = useCallback(async () => {
+    if (microphoneBusy) return;
+    setMicrophoneBusy('stop');
+    setMicrophoneIpcError(null);
+    try {
+      await invoke('stop_microphone_interlude');
+      await refreshMicrophoneStatus();
+    } catch (cause) {
+      setMicrophoneIpcError(getDisplayErrorMessage(cause, '麦克风插话停止失败，状态不可用。'));
+    } finally {
+      setMicrophoneBusy(null);
+    }
+  }, [microphoneBusy, refreshMicrophoneStatus]);
+
   const audioCycleSampleRef = useRef<AudioCycleSample | null>(null);
   const lastAudioCycleSnapshotSignatureRef = useRef<string | null>(null);
   const audioValuePresetIdsRef = useRef(audioValuePresetIds);
@@ -6268,7 +6755,28 @@ function DesktopApp() {
       return;
     }
     playbackChannelRef.current = channel;
+    try {
+      channel.postMessage({
+        version: 1,
+        type: 'microphone-priority',
+        speaking: microphoneSpeakingRef.current,
+      } satisfies MicrophonePriorityMessage);
+    } catch {
+      // 最终效果窗口稍后建立时会再次收到状态边沿；不阻塞主页初始化。
+    }
     const handleMessage = (event: MessageEvent<unknown>) => {
+      if (isMicrophonePriorityRequestMessage(event.data)) {
+        try {
+          channel.postMessage({
+            version: 1,
+            type: 'microphone-priority',
+            speaking: microphoneSpeakingRef.current,
+          } satisfies MicrophonePriorityMessage);
+        } catch {
+          // 请求方关闭时通道可能已失效；Rust 侧门控仍是最终事实源。
+        }
+        return;
+      }
       if (isPlaybackMediaStateMessage(event.data)) {
         if (event.data.playback_generation !== snapshotRefHome.current?.playback_generation) return;
         const previous = mediaStateRef.current;
@@ -6622,7 +7130,7 @@ function DesktopApp() {
       .catch((cause) => {
         setInterludeDraft(buildInterludeDraft(savedInterludeConfig));
         setInterludeDirty(true);
-        setInterludeSaveError(getDisplayErrorMessage(cause, '恢复已保存的随机插话配置失败'));
+        setInterludeSaveError(getDisplayErrorMessage(cause, '恢复已保存的插话文件配置失败'));
       })
       .finally(() => setInterludeSaving(false));
   }, [snapshot]);
@@ -8392,6 +8900,7 @@ function DesktopApp() {
             onRemove={(sourcePath) => void removePlaybackPoolItem(sourcePath)}
             onClear={() => void clearPlaybackPool()}
           />
+          <DouyinLivePanel />
 
           <DesktopPanel
             title="播放控制"
@@ -8804,10 +9313,35 @@ function DesktopApp() {
             />
           </DesktopPanel>
 
+          <DesktopPanel title="流媒体输出" className="desktop-compact-panel">
+            <RtmpOutputPanel
+              config={rtmpOutputConfig}
+              status={rtmpOutputStatus}
+              busy={rtmpOutputBusy}
+              error={rtmpOutputError}
+              onChange={updateRtmpOutputConfig}
+              onValidate={() => void validateRtmpOutput()}
+              onStart={() => void startRtmpOutput()}
+              onStop={() => void stopRtmpOutput()}
+            />
+          </DesktopPanel>
+
+          <DesktopPanel title="虚拟摄像头" className="desktop-compact-panel">
+            <VirtualCameraOutputPanel
+              status={virtualCameraStatus}
+              busy={virtualCameraBusy}
+              error={virtualCameraError}
+              onInstall={() => void installOrRepairVirtualCamera()}
+              onStart={() => void startVirtualCameraOutput()}
+              onStop={() => void stopVirtualCameraOutput()}
+            />
+          </DesktopPanel>
+
           <DesktopPanel title="声音功能" className="desktop-compact-panel">
             <div className="desktop-feature-actions">
               <Button icon={<SettingOutlined />} onClick={() => setAudioSettingsDrawerOpen(true)}>模式修改</Button>
-              <Button icon={<ThunderboltOutlined />} onClick={() => setInterludeDrawerOpen(true)}>随机插话</Button>
+              <Button icon={<ThunderboltOutlined />} onClick={() => setInterludeDrawerOpen(true)}>插话文件</Button>
+              <Button icon={<AudioOutlined />} onClick={() => setMicrophoneDrawerOpen(true)}>麦克风插话</Button>
             </div>
           </DesktopPanel>
 
@@ -8907,7 +9441,7 @@ function DesktopApp() {
       </DesktopShell>
 
       <FeatureDrawer
-        title="随机插话"
+        title="插话文件"
         description="递归扫描本地媒体目录及其子目录；视频仅使用音轨，不显示画面，并在插话期间自动压低主音轨。"
         width={560}
         open={interludeDrawerOpen}
@@ -8961,7 +9495,7 @@ function DesktopApp() {
             <div className="feature-drawer-parameter-group">
               <div className="feature-drawer-toggle-row">
                 <div><strong>启用状态</strong><Typography.Text>关闭后保留当前设置，但不会在播放过程中触发插话。</Typography.Text></div>
-                <Switch aria-label="启用随机插话" checked={interludeDraft.enabled} onChange={(enabled) => updateInterludeDraft({ enabled })} />
+                <Switch aria-label="启用插话文件" checked={interludeDraft.enabled} onChange={(enabled) => updateInterludeDraft({ enabled })} />
               </div>
               {interludePlaybackNotice ? <Alert type="warning" showIcon message={interludePlaybackNotice} /> : (
                 <Typography.Text className="desktop-muted">插话按独立随机周期运行，不会改变视频循环进度。</Typography.Text>
@@ -9107,6 +9641,163 @@ function DesktopApp() {
             </div>
           </div>
           {snapshot?.interlude?.error ? <Alert type="error" showIcon message={snapshot.interlude.error} style={{ marginTop: 10 }} /> : null}
+        </FeatureDrawerSection>
+      </FeatureDrawer>
+
+      <FeatureDrawer
+        title="麦克风插话"
+        description="本机实时监听用户说话；检测到说话时只保留麦克风声音并数字静音主媒体。"
+        width={560}
+        open={microphoneDrawerOpen}
+        onClose={() => setMicrophoneDrawerOpen(false)}
+        summary={(
+          <>
+            <Tag color={microphoneView.stateColor}>状态：{microphoneView.stateLabel}</Tag>
+            <Tag color={microphoneView.mediaMuted ? 'success' : 'default'}>{microphoneView.mediaMuted ? '主媒体数字静音中' : microphoneView.speaking ? '等待主媒体静音' : '主媒体正常'}</Tag>
+            {microphoneIpcError || microphoneDevicesDisplayError ? <Tag color="error">不可用</Tag> : null}
+          </>
+        )}
+        footer={(
+          <Space>
+            <Button
+              type="primary"
+              icon={<AudioOutlined />}
+              loading={microphoneBusy === 'start'}
+              disabled={microphoneBusy !== null || !microphoneStatus || !microphoneView.available || microphoneView.listening || microphoneDevices.length === 0 || microphoneDevicesRefreshing || microphoneDevicesDisplayError !== null}
+              onClick={() => void startMicrophoneInterlude()}
+            >开始监听</Button>
+              <Button
+                danger
+                icon={<StopOutlined />}
+                loading={microphoneBusy === 'stop'}
+                disabled={microphoneBusy !== null || !microphoneStatus || (!microphoneView.listening && microphoneStatus.state !== 'failed' && snapshot?.playback_state !== 'paused')}
+                onClick={() => void stopMicrophoneInterlude()}
+              >停止监听</Button>
+          </Space>
+        )}
+      >
+        <Alert
+          type="warning"
+          showIcon
+          message="代码已接入·待实机验收"
+          description="真实麦克风/扬声器回授、设备拔插恢复和长稳门禁尚未完成；当前状态不能代表 AEC 质量或最终延迟已验收。"
+        />
+        <Alert
+          type={microphoneStatus && !microphoneDevicesDisplayError ? 'info' : 'warning'}
+          showIcon
+          message={`优先级：${MICROPHONE_AUDIO_PRIORITY_LABEL}`}
+          description="VAD 只判断有人声或无人声，不识别、转写、上传或改写说话内容。音频仅在本机内存中处理，不录音、不上传。"
+        />
+        {microphoneConfigStorageError ? (
+          <Alert
+            type="warning"
+            showIcon
+            message={microphoneConfigStorageError}
+            description="可以修改下方任一配置以重新保存；监听状态不会写入本地存储。"
+            style={{ marginTop: 10 }}
+          />
+        ) : null}
+
+        <FeatureDrawerSection title="输入设备" description="只使用用户明确选择的设备；设备失效时不会静默切换。">
+          <FeatureDrawerField label="麦克风设备" htmlFor="microphone-interlude-device" hint={microphoneDevicesDisplayError ?? '打开选择框会重新读取本机输入设备。'}>
+            <Select
+              id="microphone-interlude-device"
+              aria-label="麦克风设备"
+              value={microphoneDeviceId ?? SYSTEM_DEFAULT_MICROPHONE_ID}
+              loading={microphoneDevicesRefreshing}
+              disabled={microphoneBusy !== null || microphoneView.listening}
+              onOpenChange={(open) => { if (open) void refreshMicrophoneDevices(); }}
+              onChange={(value) => {
+                const nextDeviceId = value === SYSTEM_DEFAULT_MICROPHONE_ID ? null : value;
+                setMicrophoneDeviceId(nextDeviceId);
+                setMicrophoneSelectedDeviceError(
+                  isSelectedMicrophoneDeviceAvailable(nextDeviceId, microphoneDevices)
+                    ? null
+                    : '所选麦克风设备当前不可用，请重新选择输入设备。',
+                );
+              }}
+              options={[
+                { value: SYSTEM_DEFAULT_MICROPHONE_ID, label: '系统默认麦克风' },
+                ...microphoneDevices.map((device) => ({
+                  value: device.id,
+                  label: `${device.name} · ${device.host_api} · ${device.max_input_channels} 输入`,
+                })),
+              ]}
+              style={{ width: '100%' }}
+            />
+          </FeatureDrawerField>
+          <FeatureDrawerField label="VAD 灵敏度" htmlFor="microphone-interlude-sensitivity" hint="只保存低、标准、高档位，不直接暴露算法内部阈值。">
+            <Select
+              id="microphone-interlude-sensitivity"
+              aria-label="VAD 灵敏度"
+              value={microphoneSensitivity}
+              disabled={microphoneBusy !== null || microphoneView.listening}
+              onChange={(value) => { if (isMicrophoneSensitivity(value)) setMicrophoneSensitivity(value); }}
+              options={MICROPHONE_SENSITIVITY_OPTIONS.map((option) => ({ value: option.value, label: option.label }))}
+              style={{ width: '100%' }}
+            />
+          </FeatureDrawerField>
+        </FeatureDrawerSection>
+
+        <FeatureDrawerSection title="音频清理配置" description="仅保存配置开关；是否实际生效以麦克风 IPC 状态快照为准。">
+          <div className="feature-drawer-toggle-row">
+            <div>
+              <strong>AEC 回声消除</strong>
+              <Typography.Text className="desktop-muted">减少扬声器声音回授。</Typography.Text>
+            </div>
+            <Switch
+              aria-label="AEC 回声消除"
+              checked={microphoneAecEnabled}
+              disabled={microphoneBusy !== null || microphoneView.listening}
+              onChange={setMicrophoneAecEnabled}
+            />
+          </div>
+          <div className="feature-drawer-toggle-row">
+            <div>
+              <strong>噪声抑制</strong>
+              <Typography.Text className="desktop-muted">降低持续背景噪声。</Typography.Text>
+            </div>
+            <Switch
+              aria-label="噪声抑制"
+              checked={microphoneNoiseSuppressionEnabled}
+              disabled={microphoneBusy !== null || microphoneView.listening}
+              onChange={setMicrophoneNoiseSuppressionEnabled}
+            />
+          </div>
+          <div className="feature-drawer-toggle-row">
+            <div>
+              <strong>自动增益</strong>
+              <Typography.Text className="desktop-muted">保持输入电平稳定。</Typography.Text>
+            </div>
+            <Switch
+              aria-label="自动增益"
+              checked={microphoneAgcEnabled}
+              disabled={microphoneBusy !== null || microphoneView.listening}
+              onChange={setMicrophoneAgcEnabled}
+            />
+          </div>
+        </FeatureDrawerSection>
+
+        <FeatureDrawerSection title="监听状态" description="下列数据来自麦克风 IPC 实际快照；设备或 DSP 故障时显示为不可用。">
+          <div className="feature-drawer-status-grid">
+            <div><Typography.Text>状态</Typography.Text><strong>{microphoneView.stateLabel}</strong></div>
+            <div><Typography.Text>采样率</Typography.Text><strong>{microphoneView.sampleRateLabel}</strong></div>
+            <div><Typography.Text>Host API</Typography.Text><strong>{microphoneStatus?.host_api ?? '未取得'}</strong></div>
+            <div><Typography.Text>设备</Typography.Text><strong>{microphoneStatus?.selected_device_name ?? '未取得'}</strong></div>
+          </div>
+          <FeatureDrawerField label="输入电平" hint={microphoneView.detail}>
+            <Progress percent={microphoneView.inputLevelPercent} status={microphoneView.speaking ? 'active' : undefined} />
+          </FeatureDrawerField>
+          <Descriptions column={{ xs: 1, sm: 2 }} size="small" bordered>
+            <Descriptions.Item label="AEC">{microphoneStatus ? (microphoneStatus.aec_active ? '已启用' : '未启用') : '未取得'}</Descriptions.Item>
+            <Descriptions.Item label="噪声抑制">{microphoneStatus ? (microphoneStatus.noise_suppression_active ? '已启用' : '未启用') : '未取得'}</Descriptions.Item>
+            <Descriptions.Item label="自动增益">{microphoneStatus ? (microphoneStatus.agc_active ? '已启用' : '未启用') : '未取得'}</Descriptions.Item>
+            <Descriptions.Item label="丢帧计数">{microphoneStatus?.dropped_frame_count ?? '未取得'}</Descriptions.Item>
+            <Descriptions.Item label="输入溢出">{microphoneStatus?.input_overflow_count ?? '未取得'}</Descriptions.Item>
+            <Descriptions.Item label="输出欠载">{microphoneStatus?.output_underflow_count ?? '未取得'}</Descriptions.Item>
+          </Descriptions>
+          {microphoneIpcError ? <Alert type="error" showIcon message={microphoneIpcError} style={{ marginTop: 10 }} /> : null}
+          {microphoneStatus?.error_message ? <Alert type="error" showIcon message={microphoneStatus.error_message} style={{ marginTop: 10 }} /> : null}
         </FeatureDrawerSection>
       </FeatureDrawer>
 

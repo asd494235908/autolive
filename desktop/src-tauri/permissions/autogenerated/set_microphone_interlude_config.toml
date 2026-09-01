@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-microphone-interlude-config"
+description = "Enables the set_microphone_interlude_config command without any pre-configured scope."
+commands.allow = ["set_microphone_interlude_config"]
+
+[[permission]]
+identifier = "deny-set-microphone-interlude-config"
+description = "Denies the set_microphone_interlude_config command without any pre-configured scope."
+commands.deny = ["set_microphone_interlude_config"]

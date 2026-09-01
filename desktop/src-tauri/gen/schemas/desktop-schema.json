@@ -321,10 +321,10 @@
           "markdownDescription": "Minimal playback commands required by the final-effect window.\n#### This permission set includes:\n\n- `allow-cancel-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-ensure-original-video-renderer`\n- `allow-complete-playback-item`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-get-audio-output-backend-status`\n- `allow-get-media-video-backend-status`\n- `allow-get-snapshot`\n- `allow-pause-playback`\n- `allow-pause-portaudio-interlude`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-prepare-webview-interlude`\n- `allow-release-media-processing-artifact`\n- `allow-release-audio-media-candidate`\n- `allow-release-webview-interlude-cache`\n- `allow-resize-final-effect-window`\n- `allow-restore-original-audio`\n- `allow-restore-original-video`\n- `allow-resume-playback`\n- `allow-resume-portaudio-interlude`\n- `allow-set-audio-output-backend`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-stop-portaudio-interlude`\n- `allow-sync-audio-output-source`\n- `allow-stop-realtime-video-renderer`\n- `allow-update-playback-position`"
         },
         {
-          "description": "Commands available to the authenticated main application window.\n#### This permission set includes:\n\n- `allow-probe-local-video`\n- `allow-probe-local-videos`\n- `allow-append-local-videos`\n- `allow-replace-playback-pool-item`\n- `allow-reorder-playback-pool-items`\n- `allow-remove-playback-pool-item`\n- `allow-clear-playback-pool`\n- `allow-probe-local-mp4`\n- `allow-get-device-runtime-info`\n- `allow-get-media-engine-capabilities`\n- `allow-get-media-video-backend-status`\n- `allow-get-audio-output-backend-status`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-list-audio-output-devices`\n- `allow-set-audio-output-backend`\n- `allow-sync-audio-output-source`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-cancel-audio-cycle-candidate`\n- `allow-play-portaudio-test-tone`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-prepare-webview-interlude`\n- `allow-release-webview-interlude-cache`\n- `allow-pause-portaudio-interlude`\n- `allow-resume-portaudio-interlude`\n- `allow-stop-portaudio-interlude`\n- `allow-get-runtime-resource-status`\n- `allow-install-runtime-resources`\n- `allow-cancel-runtime-resource-install`\n- `allow-import-runtime-resource-directory`\n- `allow-clear-runtime-resources`\n- `allow-cleanup-local-caches-command`\n- `allow-prepare-audio-media-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-release-audio-media-candidate`\n- `allow-get-default-media-effect-params`\n- `allow-start-playback`\n- `allow-pause-playback`\n- `allow-resume-playback`\n- `allow-seek-playback`\n- `allow-update-playback-position`\n- `allow-stop-playback`\n- `allow-complete-playback-loop`\n- `allow-complete-playback-item`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-set-processing-switches`\n- `allow-set-audio-processing-profile`\n- `allow-set-interlude-config`\n- `allow-start-media-processing`\n- `allow-ensure-original-video-renderer`\n- `allow-configure-realtime-video-cycle`\n- `allow-stop-realtime-video-renderer`\n- `allow-release-media-processing-artifact`\n- `allow-restore-original-audio`\n- `allow-get-snapshot`\n- `allow-validate-media-effect-params`\n- `allow-get-or-create-control-plane-device-id`\n- `allow-login-control-plane-session`\n- `allow-restore-control-plane-session`\n- `allow-refresh-control-plane-session`\n- `allow-logout-control-plane-session`\n- `allow-retry-pending-control-plane-logout`\n- `allow-clear-legacy-auth-credentials`\n- `allow-open-final-effect-window`\n- `allow-close-final-effect-window`\n- `allow-resize-final-effect-window`",
+          "description": "Commands available to the authenticated main application window.\n#### This permission set includes:\n\n- `allow-probe-local-video`\n- `allow-probe-local-videos`\n- `allow-append-local-videos`\n- `allow-replace-playback-pool-item`\n- `allow-reorder-playback-pool-items`\n- `allow-remove-playback-pool-item`\n- `allow-clear-playback-pool`\n- `allow-probe-local-mp4`\n- `allow-get-device-runtime-info`\n- `allow-get-media-engine-capabilities`\n- `allow-get-media-video-backend-status`\n- `allow-get-audio-output-backend-status`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-get-rtmp-output-status`\n- `allow-validate-rtmp-output-config`\n- `allow-start-rtmp-output`\n- `allow-stop-rtmp-output`\n- `allow-get-virtual-camera-status`\n- `allow-install-or-repair-virtual-camera`\n- `allow-start-virtual-camera-output`\n- `allow-stop-virtual-camera-output`\n- `allow-list-audio-output-devices`\n- `allow-list-portaudio-input-devices`\n- `allow-set-audio-output-backend`\n- `allow-sync-audio-output-source`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-cancel-audio-cycle-candidate`\n- `allow-play-portaudio-test-tone`\n- `allow-start-portaudio-interlude`\n- `allow-start-microphone-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-prepare-webview-interlude`\n- `allow-release-webview-interlude-cache`\n- `allow-pause-portaudio-interlude`\n- `allow-resume-portaudio-interlude`\n- `allow-stop-portaudio-interlude`\n- `allow-stop-microphone-interlude`\n- `allow-get-microphone-interlude-status`\n- `allow-set-microphone-interlude-config`\n- `allow-get-runtime-resource-status`\n- `allow-install-runtime-resources`\n- `allow-cancel-runtime-resource-install`\n- `allow-import-runtime-resource-directory`\n- `allow-clear-runtime-resources`\n- `allow-cleanup-local-caches-command`\n- `allow-prepare-audio-media-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-release-audio-media-candidate`\n- `allow-get-default-media-effect-params`\n- `allow-start-playback`\n- `allow-pause-playback`\n- `allow-resume-playback`\n- `allow-seek-playback`\n- `allow-update-playback-position`\n- `allow-stop-playback`\n- `allow-complete-playback-loop`\n- `allow-complete-playback-item`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-set-processing-switches`\n- `allow-set-audio-processing-profile`\n- `allow-set-interlude-config`\n- `allow-start-media-processing`\n- `allow-ensure-original-video-renderer`\n- `allow-configure-realtime-video-cycle`\n- `allow-stop-realtime-video-renderer`\n- `allow-release-media-processing-artifact`\n- `allow-restore-original-audio`\n- `allow-get-snapshot`\n- `allow-validate-media-effect-params`\n- `allow-get-or-create-control-plane-device-id`\n- `allow-login-control-plane-session`\n- `allow-restore-control-plane-session`\n- `allow-refresh-control-plane-session`\n- `allow-logout-control-plane-session`\n- `allow-retry-pending-control-plane-logout`\n- `allow-clear-legacy-auth-credentials`\n- `allow-start-douyin-live-probe`\n- `allow-get-douyin-live-probe-status`\n- `allow-stop-douyin-live-probe`\n- `allow-open-final-effect-window`\n- `allow-close-final-effect-window`\n- `allow-resize-final-effect-window`",
           "type": "string",
           "const": "main-commands",
-          "markdownDescription": "Commands available to the authenticated main application window.\n#### This permission set includes:\n\n- `allow-probe-local-video`\n- `allow-probe-local-videos`\n- `allow-append-local-videos`\n- `allow-replace-playback-pool-item`\n- `allow-reorder-playback-pool-items`\n- `allow-remove-playback-pool-item`\n- `allow-clear-playback-pool`\n- `allow-probe-local-mp4`\n- `allow-get-device-runtime-info`\n- `allow-get-media-engine-capabilities`\n- `allow-get-media-video-backend-status`\n- `allow-get-audio-output-backend-status`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-list-audio-output-devices`\n- `allow-set-audio-output-backend`\n- `allow-sync-audio-output-source`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-cancel-audio-cycle-candidate`\n- `allow-play-portaudio-test-tone`\n- `allow-start-portaudio-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-prepare-webview-interlude`\n- `allow-release-webview-interlude-cache`\n- `allow-pause-portaudio-interlude`\n- `allow-resume-portaudio-interlude`\n- `allow-stop-portaudio-interlude`\n- `allow-get-runtime-resource-status`\n- `allow-install-runtime-resources`\n- `allow-cancel-runtime-resource-install`\n- `allow-import-runtime-resource-directory`\n- `allow-clear-runtime-resources`\n- `allow-cleanup-local-caches-command`\n- `allow-prepare-audio-media-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-release-audio-media-candidate`\n- `allow-get-default-media-effect-params`\n- `allow-start-playback`\n- `allow-pause-playback`\n- `allow-resume-playback`\n- `allow-seek-playback`\n- `allow-update-playback-position`\n- `allow-stop-playback`\n- `allow-complete-playback-loop`\n- `allow-complete-playback-item`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-set-processing-switches`\n- `allow-set-audio-processing-profile`\n- `allow-set-interlude-config`\n- `allow-start-media-processing`\n- `allow-ensure-original-video-renderer`\n- `allow-configure-realtime-video-cycle`\n- `allow-stop-realtime-video-renderer`\n- `allow-release-media-processing-artifact`\n- `allow-restore-original-audio`\n- `allow-get-snapshot`\n- `allow-validate-media-effect-params`\n- `allow-get-or-create-control-plane-device-id`\n- `allow-login-control-plane-session`\n- `allow-restore-control-plane-session`\n- `allow-refresh-control-plane-session`\n- `allow-logout-control-plane-session`\n- `allow-retry-pending-control-plane-logout`\n- `allow-clear-legacy-auth-credentials`\n- `allow-open-final-effect-window`\n- `allow-close-final-effect-window`\n- `allow-resize-final-effect-window`"
+          "markdownDescription": "Commands available to the authenticated main application window.\n#### This permission set includes:\n\n- `allow-probe-local-video`\n- `allow-probe-local-videos`\n- `allow-append-local-videos`\n- `allow-replace-playback-pool-item`\n- `allow-reorder-playback-pool-items`\n- `allow-remove-playback-pool-item`\n- `allow-clear-playback-pool`\n- `allow-probe-local-mp4`\n- `allow-get-device-runtime-info`\n- `allow-get-media-engine-capabilities`\n- `allow-get-media-video-backend-status`\n- `allow-get-audio-output-backend-status`\n- `allow-get-audio-cycle-diagnostic`\n- `allow-get-rtmp-output-status`\n- `allow-validate-rtmp-output-config`\n- `allow-start-rtmp-output`\n- `allow-stop-rtmp-output`\n- `allow-get-virtual-camera-status`\n- `allow-install-or-repair-virtual-camera`\n- `allow-start-virtual-camera-output`\n- `allow-stop-virtual-camera-output`\n- `allow-list-audio-output-devices`\n- `allow-list-portaudio-input-devices`\n- `allow-set-audio-output-backend`\n- `allow-sync-audio-output-source`\n- `allow-prepare-audio-cycle-candidate`\n- `allow-commit-audio-cycle-candidate`\n- `allow-cancel-audio-cycle-candidate`\n- `allow-play-portaudio-test-tone`\n- `allow-start-portaudio-interlude`\n- `allow-start-microphone-interlude`\n- `allow-switch-portaudio-interlude-preset`\n- `allow-set-portaudio-media-volume`\n- `allow-set-portaudio-interlude-volume`\n- `allow-prepare-webview-interlude`\n- `allow-release-webview-interlude-cache`\n- `allow-pause-portaudio-interlude`\n- `allow-resume-portaudio-interlude`\n- `allow-stop-portaudio-interlude`\n- `allow-stop-microphone-interlude`\n- `allow-get-microphone-interlude-status`\n- `allow-set-microphone-interlude-config`\n- `allow-get-runtime-resource-status`\n- `allow-install-runtime-resources`\n- `allow-cancel-runtime-resource-install`\n- `allow-import-runtime-resource-directory`\n- `allow-clear-runtime-resources`\n- `allow-cleanup-local-caches-command`\n- `allow-prepare-audio-media-candidate`\n- `allow-commit-audio-media-candidate`\n- `allow-discard-audio-media-candidate`\n- `allow-release-audio-media-candidate`\n- `allow-get-default-media-effect-params`\n- `allow-start-playback`\n- `allow-pause-playback`\n- `allow-resume-playback`\n- `allow-seek-playback`\n- `allow-update-playback-position`\n- `allow-stop-playback`\n- `allow-complete-playback-loop`\n- `allow-complete-playback-item`\n- `allow-commit-media-processing-if-ready`\n- `allow-discard-media-processing-candidate`\n- `allow-set-processing-switches`\n- `allow-set-audio-processing-profile`\n- `allow-set-interlude-config`\n- `allow-start-media-processing`\n- `allow-ensure-original-video-renderer`\n- `allow-configure-realtime-video-cycle`\n- `allow-stop-realtime-video-renderer`\n- `allow-release-media-processing-artifact`\n- `allow-restore-original-audio`\n- `allow-get-snapshot`\n- `allow-validate-media-effect-params`\n- `allow-get-or-create-control-plane-device-id`\n- `allow-login-control-plane-session`\n- `allow-restore-control-plane-session`\n- `allow-refresh-control-plane-session`\n- `allow-logout-control-plane-session`\n- `allow-retry-pending-control-plane-logout`\n- `allow-clear-legacy-auth-credentials`\n- `allow-start-douyin-live-probe`\n- `allow-get-douyin-live-probe-status`\n- `allow-stop-douyin-live-probe`\n- `allow-open-final-effect-window`\n- `allow-close-final-effect-window`\n- `allow-resize-final-effect-window`"
         },
         {
           "description": "Enables the append_local_videos command without any pre-configured scope.",
@@ -453,6 +453,12 @@
           "markdownDescription": "Enables the get_device_runtime_info command without any pre-configured scope."
         },
         {
+          "description": "Enables the get_douyin_live_probe_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-douyin-live-probe-status",
+          "markdownDescription": "Enables the get_douyin_live_probe_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_media_engine_capabilities command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-media-engine-capabilities",
@@ -465,10 +471,22 @@
           "markdownDescription": "Enables the get_media_video_backend_status command without any pre-configured scope."
         },
         {
+          "description": "Enables the get_microphone_interlude_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-microphone-interlude-status",
+          "markdownDescription": "Enables the get_microphone_interlude_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_or_create_control_plane_device_id command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-or-create-control-plane-device-id",
           "markdownDescription": "Enables the get_or_create_control_plane_device_id command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_rtmp_output_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-rtmp-output-status",
+          "markdownDescription": "Enables the get_rtmp_output_status command without any pre-configured scope."
         },
         {
           "description": "Enables the get_runtime_resource_status command without any pre-configured scope.",
@@ -483,10 +501,22 @@
           "markdownDescription": "Enables the get_snapshot command without any pre-configured scope."
         },
         {
+          "description": "Enables the get_virtual_camera_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-virtual-camera-status",
+          "markdownDescription": "Enables the get_virtual_camera_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the import_runtime_resource_directory command without any pre-configured scope.",
           "type": "string",
           "const": "allow-import-runtime-resource-directory",
           "markdownDescription": "Enables the import_runtime_resource_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the install_or_repair_virtual_camera command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-install-or-repair-virtual-camera",
+          "markdownDescription": "Enables the install_or_repair_virtual_camera command without any pre-configured scope."
         },
         {
           "description": "Enables the install_runtime_resources command without any pre-configured scope.",
@@ -499,6 +529,12 @@
           "type": "string",
           "const": "allow-list-audio-output-devices",
           "markdownDescription": "Enables the list_audio_output_devices command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_portaudio_input_devices command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-portaudio-input-devices",
+          "markdownDescription": "Enables the list_portaudio_input_devices command without any pre-configured scope."
         },
         {
           "description": "Enables the login_control_plane_session command without any pre-configured scope.",
@@ -681,6 +717,12 @@
           "markdownDescription": "Enables the set_interlude_config command without any pre-configured scope."
         },
         {
+          "description": "Enables the set_microphone_interlude_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-microphone-interlude-config",
+          "markdownDescription": "Enables the set_microphone_interlude_config command without any pre-configured scope."
+        },
+        {
           "description": "Enables the set_portaudio_interlude_volume command without any pre-configured scope.",
           "type": "string",
           "const": "allow-set-portaudio-interlude-volume",
@@ -699,10 +741,22 @@
           "markdownDescription": "Enables the set_processing_switches command without any pre-configured scope."
         },
         {
+          "description": "Enables the start_douyin_live_probe command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-douyin-live-probe",
+          "markdownDescription": "Enables the start_douyin_live_probe command without any pre-configured scope."
+        },
+        {
           "description": "Enables the start_media_processing command without any pre-configured scope.",
           "type": "string",
           "const": "allow-start-media-processing",
           "markdownDescription": "Enables the start_media_processing command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_microphone_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-microphone-interlude",
+          "markdownDescription": "Enables the start_microphone_interlude command without any pre-configured scope."
         },
         {
           "description": "Enables the start_playback command without any pre-configured scope.",
@@ -715,6 +769,30 @@
           "type": "string",
           "const": "allow-start-portaudio-interlude",
           "markdownDescription": "Enables the start_portaudio_interlude command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_rtmp_output command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-rtmp-output",
+          "markdownDescription": "Enables the start_rtmp_output command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_virtual_camera_output command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-virtual-camera-output",
+          "markdownDescription": "Enables the start_virtual_camera_output command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_douyin_live_probe command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-douyin-live-probe",
+          "markdownDescription": "Enables the stop_douyin_live_probe command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_microphone_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-microphone-interlude",
+          "markdownDescription": "Enables the stop_microphone_interlude command without any pre-configured scope."
         },
         {
           "description": "Enables the stop_playback command without any pre-configured scope.",
@@ -733,6 +811,18 @@
           "type": "string",
           "const": "allow-stop-realtime-video-renderer",
           "markdownDescription": "Enables the stop_realtime_video_renderer command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_rtmp_output command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-rtmp-output",
+          "markdownDescription": "Enables the stop_rtmp_output command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_virtual_camera_output command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-virtual-camera-output",
+          "markdownDescription": "Enables the stop_virtual_camera_output command without any pre-configured scope."
         },
         {
           "description": "Enables the switch_portaudio_interlude_preset command without any pre-configured scope.",
@@ -757,6 +847,12 @@
           "type": "string",
           "const": "allow-validate-media-effect-params",
           "markdownDescription": "Enables the validate_media_effect_params command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the validate_rtmp_output_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-validate-rtmp-output-config",
+          "markdownDescription": "Enables the validate_rtmp_output_config command without any pre-configured scope."
         },
         {
           "description": "Denies the append_local_videos command without any pre-configured scope.",
@@ -885,6 +981,12 @@
           "markdownDescription": "Denies the get_device_runtime_info command without any pre-configured scope."
         },
         {
+          "description": "Denies the get_douyin_live_probe_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-douyin-live-probe-status",
+          "markdownDescription": "Denies the get_douyin_live_probe_status command without any pre-configured scope."
+        },
+        {
           "description": "Denies the get_media_engine_capabilities command without any pre-configured scope.",
           "type": "string",
           "const": "deny-get-media-engine-capabilities",
@@ -897,10 +999,22 @@
           "markdownDescription": "Denies the get_media_video_backend_status command without any pre-configured scope."
         },
         {
+          "description": "Denies the get_microphone_interlude_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-microphone-interlude-status",
+          "markdownDescription": "Denies the get_microphone_interlude_status command without any pre-configured scope."
+        },
+        {
           "description": "Denies the get_or_create_control_plane_device_id command without any pre-configured scope.",
           "type": "string",
           "const": "deny-get-or-create-control-plane-device-id",
           "markdownDescription": "Denies the get_or_create_control_plane_device_id command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_rtmp_output_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-rtmp-output-status",
+          "markdownDescription": "Denies the get_rtmp_output_status command without any pre-configured scope."
         },
         {
           "description": "Denies the get_runtime_resource_status command without any pre-configured scope.",
@@ -915,10 +1029,22 @@
           "markdownDescription": "Denies the get_snapshot command without any pre-configured scope."
         },
         {
+          "description": "Denies the get_virtual_camera_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-virtual-camera-status",
+          "markdownDescription": "Denies the get_virtual_camera_status command without any pre-configured scope."
+        },
+        {
           "description": "Denies the import_runtime_resource_directory command without any pre-configured scope.",
           "type": "string",
           "const": "deny-import-runtime-resource-directory",
           "markdownDescription": "Denies the import_runtime_resource_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the install_or_repair_virtual_camera command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-install-or-repair-virtual-camera",
+          "markdownDescription": "Denies the install_or_repair_virtual_camera command without any pre-configured scope."
         },
         {
           "description": "Denies the install_runtime_resources command without any pre-configured scope.",
@@ -931,6 +1057,12 @@
           "type": "string",
           "const": "deny-list-audio-output-devices",
           "markdownDescription": "Denies the list_audio_output_devices command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_portaudio_input_devices command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-portaudio-input-devices",
+          "markdownDescription": "Denies the list_portaudio_input_devices command without any pre-configured scope."
         },
         {
           "description": "Denies the login_control_plane_session command without any pre-configured scope.",
@@ -1113,6 +1245,12 @@
           "markdownDescription": "Denies the set_interlude_config command without any pre-configured scope."
         },
         {
+          "description": "Denies the set_microphone_interlude_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-microphone-interlude-config",
+          "markdownDescription": "Denies the set_microphone_interlude_config command without any pre-configured scope."
+        },
+        {
           "description": "Denies the set_portaudio_interlude_volume command without any pre-configured scope.",
           "type": "string",
           "const": "deny-set-portaudio-interlude-volume",
@@ -1131,10 +1269,22 @@
           "markdownDescription": "Denies the set_processing_switches command without any pre-configured scope."
         },
         {
+          "description": "Denies the start_douyin_live_probe command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-douyin-live-probe",
+          "markdownDescription": "Denies the start_douyin_live_probe command without any pre-configured scope."
+        },
+        {
           "description": "Denies the start_media_processing command without any pre-configured scope.",
           "type": "string",
           "const": "deny-start-media-processing",
           "markdownDescription": "Denies the start_media_processing command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_microphone_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-microphone-interlude",
+          "markdownDescription": "Denies the start_microphone_interlude command without any pre-configured scope."
         },
         {
           "description": "Denies the start_playback command without any pre-configured scope.",
@@ -1147,6 +1297,30 @@
           "type": "string",
           "const": "deny-start-portaudio-interlude",
           "markdownDescription": "Denies the start_portaudio_interlude command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_rtmp_output command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-rtmp-output",
+          "markdownDescription": "Denies the start_rtmp_output command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_virtual_camera_output command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-virtual-camera-output",
+          "markdownDescription": "Denies the start_virtual_camera_output command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_douyin_live_probe command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-douyin-live-probe",
+          "markdownDescription": "Denies the stop_douyin_live_probe command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_microphone_interlude command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-microphone-interlude",
+          "markdownDescription": "Denies the stop_microphone_interlude command without any pre-configured scope."
         },
         {
           "description": "Denies the stop_playback command without any pre-configured scope.",
@@ -1165,6 +1339,18 @@
           "type": "string",
           "const": "deny-stop-realtime-video-renderer",
           "markdownDescription": "Denies the stop_realtime_video_renderer command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_rtmp_output command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-rtmp-output",
+          "markdownDescription": "Denies the stop_rtmp_output command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_virtual_camera_output command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-virtual-camera-output",
+          "markdownDescription": "Denies the stop_virtual_camera_output command without any pre-configured scope."
         },
         {
           "description": "Denies the switch_portaudio_interlude_preset command without any pre-configured scope.",
@@ -1189,6 +1375,12 @@
           "type": "string",
           "const": "deny-validate-media-effect-params",
           "markdownDescription": "Denies the validate_media_effect_params command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the validate_rtmp_output_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-validate-rtmp-output-config",
+          "markdownDescription": "Denies the validate_rtmp_output_config command without any pre-configured scope."
         },
         {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",

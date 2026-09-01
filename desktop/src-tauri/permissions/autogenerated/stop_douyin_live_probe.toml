@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-stop-douyin-live-probe"
+description = "Enables the stop_douyin_live_probe command without any pre-configured scope."
+commands.allow = ["stop_douyin_live_probe"]
+
+[[permission]]
+identifier = "deny-stop-douyin-live-probe"
+description = "Denies the stop_douyin_live_probe command without any pre-configured scope."
+commands.deny = ["stop_douyin_live_probe"]

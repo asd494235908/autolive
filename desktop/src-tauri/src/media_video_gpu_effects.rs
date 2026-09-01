@@ -1,6 +1,7 @@
 use crate::media_effect_params::{AdvancedEffectParams, VideoEffectParams};
 use crate::media_video_effects::{
     atomic_media_video_ui_applied_fields, build_atomic_media_video_effect_plan,
+    build_media_video_effect_plan,
 };
 use crate::media_video_frame_scheduler::{VideoFrameSchedule, MAX_RANDOM_GRAPHIC_SEED};
 use std::collections::{BTreeSet, HashSet};
@@ -1033,6 +1034,54 @@ pub fn build_gpu83_video_filter(
         return None;
     }
 
+    let serial_filter =
+        build_gpu83_static_filter_chain(video, advanced, input_on_vulkan, output_size);
+    Some(Gpu83VideoFilterPlan {
+        serial_filter,
+        applied_fields,
+        requires_variable_frame_rate: atomic.requires_variable_frame_rate,
+    })
+}
+
+/// 为 RTMP/RTMPS 直推构建一次性的 GPU83 静态过滤链。
+///
+/// FFmpeg/libplacebo 只能在进程启动时接收 `custom_shader_bin`，不能复用 mpv
+/// JSON IPC 的逐周期原子属性更新。因此这里仅验证参数快照并把值编译进 shader；
+/// 不可用的动态/历史字段不会被宣称为逐周期实时能力。
+pub fn build_gpu83_static_video_filter(
+    video: &VideoEffectParams,
+    advanced: &AdvancedEffectParams,
+    input_on_vulkan: bool,
+    output_size: Option<(u32, u32)>,
+) -> Option<Gpu83VideoFilterPlan> {
+    if video.horizontal_flip_enabled || video.vertical_flip_enabled {
+        return None;
+    }
+    let snapshot = build_gpu83_shader_snapshot(video, advanced).ok()?;
+    let effect_plan = build_media_video_effect_plan(video, advanced).ok()?;
+    let applied_fields = snapshot
+        .entries
+        .iter()
+        .filter_map(|entry| entry.value.map(|_| entry.field_path.to_owned()))
+        .collect();
+    Some(Gpu83VideoFilterPlan {
+        serial_filter: build_gpu83_static_filter_chain(
+            video,
+            advanced,
+            input_on_vulkan,
+            output_size,
+        ),
+        applied_fields,
+        requires_variable_frame_rate: effect_plan.requires_variable_frame_rate,
+    })
+}
+
+fn build_gpu83_static_filter_chain(
+    video: &VideoEffectParams,
+    advanced: &AdvancedEffectParams,
+    input_on_vulkan: bool,
+    output_size: Option<(u32, u32)>,
+) -> String {
     let shader = gpu83_shader(video, advanced);
     let mut filters = Vec::with_capacity(4);
     if !input_on_vulkan {
@@ -1053,11 +1102,7 @@ pub fn build_gpu83_video_filter(
         encode_binary_option(shader.as_bytes()),
     ));
     filters.extend(["hwdownload".to_owned(), "format=nv12".to_owned()]);
-    Some(Gpu83VideoFilterPlan {
-        serial_filter: filters.join(","),
-        applied_fields,
-        requires_variable_frame_rate: atomic.requires_variable_frame_rate,
-    })
+    filters.join(",")
 }
 
 fn encode_binary_option(bytes: &[u8]) -> String {
@@ -1431,6 +1476,26 @@ mod tests {
         assert!(!snapshot
             .shader_options
             .contains("al_color_space_strength_percent="));
+    }
+
+    #[test]
+    fn static_ffmpeg_filter_accepts_a_valid_snapshot_without_claiming_dynamic_capability() {
+        let plan = build_gpu83_static_video_filter(
+            &VideoEffectParams::default(),
+            &AdvancedEffectParams::default(),
+            false,
+            Some((320, 180)),
+        )
+        .expect("合法快照应可构建一次性 FFmpeg GPU 过滤链");
+        assert!(plan
+            .serial_filter
+            .starts_with("format=nv12,hwupload,libplacebo"));
+        assert!(plan.serial_filter.contains("custom_shader_bin="));
+        assert!(plan.serial_filter.ends_with("hwdownload,format=nv12"));
+        // target/core 频率是合法的可选字段，None 会由静态 shader 使用 0.0；
+        // 因此这里记录 81 个实际提供值，而不是伪造 83 项全部生效。
+        assert_eq!(plan.applied_fields.len(), 81);
+        assert!(!plan.requires_variable_frame_rate);
     }
 
     #[test]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-douyin-live-probe-status"
+description = "Enables the get_douyin_live_probe_status command without any pre-configured scope."
+commands.allow = ["get_douyin_live_probe_status"]
+
+[[permission]]
+identifier = "deny-get-douyin-live-probe-status"
+description = "Denies the get_douyin_live_probe_status command without any pre-configured scope."
+commands.deny = ["get_douyin_live_probe_status"]

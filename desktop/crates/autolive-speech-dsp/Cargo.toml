@@ -1,0 +1,13 @@
+[package]
+name = "autolive-speech-dsp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "本地麦克风插话的 SpeexDSP AEC、降噪、AGC 和 VAD 封装"
+
+[build-dependencies]
+cc = "=1.4.2"
+
+[lints.rust]
+unsafe_code = "allow"

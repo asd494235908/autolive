@@ -12,6 +12,8 @@ Thumbs.db
 # Legacy fixed-phrase artifacts may still exist on developer machines after migration.
 # New builds never read these paths; remove the local copies with an explicit cleanup.
 .venv-voice-clone/
+desktop/tools/.venv/
+desktop/tools/__pycache__/
 build/autolive-voice-clone-worker/
 desktop/src-tauri/voice-models/
 desktop/src-tauri/voice-worker/
@@ -41,6 +43,9 @@ desktop/third_party/ffmpeg/*/ffmpeg.exe
 desktop/third_party/ffmpeg/*/ffprobe.exe
 desktop/third_party/mpv/*/mpv.exe
 desktop/third_party/mpv/*/d3dcompiler_43.dll
+artifacts/
+desktop/third_party/mpv/build-evidence/
+desktop/third_party/mpv/build-inputs/
 desktop/src-tauri/runtime-resources.json
 desktop/src-tauri/embedded-runtime-resources/
 !desktop/src-tauri/embedded-runtime-resources/.gitkeep

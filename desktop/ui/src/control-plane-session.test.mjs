@@ -45,6 +45,14 @@ test('桌面会话只在服务端用户、当前设备与授权有效期均确�
   assert.match(source, /clearActivationRecheck/);
 });
 
+test('桌面登录区分凭据类 4xx 与网络、配置或服务端故障', async () => {
+  const source = await readFile(new URL('./controlPlaneSession.ts', import.meta.url), 'utf8');
+
+  assert.match(source, /function isLoginFormError/);
+  assert.match(source, /status === 400 \|\| status === 401 \|\| status === 429/);
+  assert.match(source, /status: isLoginFormError\(error\) \? 'unauthenticated' : 'error'/);
+});
+
 test('已激活桌面会话按固定周期上报运行信息并限制心跳 outbox', async () => {
   const source = await readFile(new URL('./desktop/control-plane-heartbeat.tsx', import.meta.url), 'utf8');
 

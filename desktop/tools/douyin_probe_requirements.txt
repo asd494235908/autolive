@@ -1,0 +1,11 @@
+# Local development probe runtime. Release uses a signed, locked sidecar.
+beautifulsoup4==4.15.0
+cryptography==50.0.1
+curl_cffi==0.16.2
+ecdsa==0.19.2
+loguru==0.7.3
+pillow==12.3.0
+protobuf==7.36.0
+python-dotenv==1.2.3
+qrcode==8.2
+websocket-client==1.9.1

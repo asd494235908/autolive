@@ -51,6 +51,7 @@
     "resources": [
       "runtime-resources.json",
       "embedded-runtime-resources",
+      "akvirtualcamera",
       "portaudio/portaudio_x64.dll",
       "portaudio/LICENSE.txt",
       "portaudio/README.md",
@@ -58,7 +59,8 @@
       "resources/shaders/gpu83.hook",
       "ambient/LICENSE.txt",
       "signalsmith-stretch/LICENSE.txt",
-      "signalsmith-linear/LICENSE.txt"
+      "signalsmith-linear/LICENSE.txt",
+      "speexdsp/LICENSE.txt"
     ],
     "icon": [
       "icons/32x32.png",

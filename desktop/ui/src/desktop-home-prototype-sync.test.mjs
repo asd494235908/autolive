@@ -80,7 +80,7 @@ test('主页插话声音周期显示已保存的随机插话触发周期', async
 
   assert.match(periodSource, /snapshot\?\.interlude\?\.interval_min_ms \?\? 8_000/);
   assert.match(periodSource, /snapshot\?\.interlude\?\.interval_max_ms \?\? 13_000/);
-  assert.doesNotMatch(periodSource, /audio_variation_period_/);
+  assert.match(periodSource, /const interludePeriodRange[\s\S]*interval_(?:min|max)_ms/);
   assert.match(interludeCard, /range=\{interludePeriodRange\}/);
   assert.match(cycleCard, /formatCycleSeconds\(range\.minMs\)[\s\S]*formatCycleSeconds\(range\.maxMs\)/);
   assert.doesNotMatch(cycleCard, /range\.(?:minMs|maxMs)[^\n]*toFixed\(0\)/);
@@ -109,7 +109,7 @@ test('插话声音预设独立成卡，音视频操作位于标题且声音入�
   const output = home.slice(home.indexOf('<DesktopColumn area="output"'));
 
   assert.match(presetCard, /activeInterludePresets\[0\][\s\S]*desktop-preset-parameter-grid[\s\S]*AUDIO_PRESET_FIELD_DEFINITIONS\.map/);
-  assert.doesNotMatch(audioCard, /AUDIO_PRESET_FIELD_DEFINITIONS\.map|desktop-preset-parameter-grid|>高级设置<|>随机插话</);
+  assert.doesNotMatch(audioCard, /AUDIO_PRESET_FIELD_DEFINITIONS\.map|desktop-preset-parameter-grid|>高级设置<|>插话文件</);
   assert.match(audioCard, /extra=\{[\s\S]*普通声音处理[\s\S]*aria-label="声音处理"/);
   assert.match(videoCard, /extra=\{[\s\S]*视频处理[\s\S]*aria-label="视频处理"[\s\S]*恢复默认/);
   assert.doesNotMatch(videoCard, />应用处理</);
@@ -119,7 +119,7 @@ test('插话声音预设独立成卡，音视频操作位于标题且声音入�
   const speechAt = output.indexOf('title="话术功能"');
   assert.ok(finalAt >= 0 && finalAt < featuresAt && featuresAt < portAudioAt && portAudioAt < speechAt);
   assert.match(output, /setAudioSettingsDrawerOpen\(true\)[\s\S]*>模式修改</);
-  assert.match(output, /setInterludeDrawerOpen\(true\)[\s\S]*>随机插话</);
+  assert.match(output, /setInterludeDrawerOpen\(true\)[\s\S]*>插话文件</);
   assert.doesNotMatch(output, />高级设置</);
 });
 
@@ -141,7 +141,7 @@ test('模式修改和随机插话抽屉同步最新设计稿内容', async () =>
     readSource('./App.tsx'),
     readSource('./desktop-layout.css'),
   ]);
-  const interruption = app.slice(app.indexOf('title="随机插话"'), app.indexOf('title="固定话术"'));
+  const interruption = app.slice(app.indexOf('title="插话文件"'), app.indexOf('title="固定话术"'));
   const advanced = app.slice(app.indexOf('title="高级声音设置"'), app.indexOf('title={`当前插话预设'));
 
   for (const label of [
@@ -174,7 +174,7 @@ test('普通声音默认 3–5 秒且插话周期在界面以秒编辑', async (
     readSource('./runtime-parameter-scheduler.ts'),
     readSource('./App.tsx'),
   ]);
-  const interruptionDrawer = app.slice(app.indexOf('title="随机插话"'), app.indexOf('title="固定话术"'));
+  const interruptionDrawer = app.slice(app.indexOf('title="插话文件"'), app.indexOf('title="固定话术"'));
 
   assert.match(scheduler, /DEFAULT_AUDIO_PERIOD_MIN_MS = 3_000/);
   assert.match(scheduler, /DEFAULT_AUDIO_PERIOD_MAX_MS = 5_000/);

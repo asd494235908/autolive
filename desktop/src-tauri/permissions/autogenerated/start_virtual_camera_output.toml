@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-virtual-camera-output"
+description = "Enables the start_virtual_camera_output command without any pre-configured scope."
+commands.allow = ["start_virtual_camera_output"]
+
+[[permission]]
+identifier = "deny-start-virtual-camera-output"
+description = "Denies the start_virtual_camera_output command without any pre-configured scope."
+commands.deny = ["start_virtual_camera_output"]

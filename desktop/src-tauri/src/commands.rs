@@ -1,6 +1,7 @@
 use crate::audio_cycle_switch::{
     AudioCycleCandidate, AudioMixerSourceIdentity, PendingAudioMixerKind, PendingAudioMixerTask,
 };
+use crate::virtual_camera_output::VirtualCameraOutputTask;
 use autolive_desktop_core::ambient_sound::{
     resolve_ambient_sound, revalidate_ambient_sound, AmbientSoundSource, ResolvedAmbientSound,
 };
@@ -30,7 +31,7 @@ use autolive_desktop_core::media_effect_params::{
     AudioEffectParams, MediaEffectParams, ParameterValidationError,
 };
 use autolive_desktop_core::media_engine::{
-    build_audio_stream_filter_graph_with_ambient, build_media_render_args,
+    build_audio_stream_filter_graph_with_ambient, build_cpu4_video_filter, build_media_render_args,
     configured_media_engine_paths_with_resource_dir,
     configured_media_engine_status_with_resource_dir, render_media_with_progress, target_triple,
     validate_audio_input_decodable, MediaEngineStatus, MediaRenderRequest, MediaRenderTarget,
@@ -43,6 +44,11 @@ use autolive_desktop_core::media_library::{
 use autolive_desktop_core::media_timeline::MediaSegmentIdentity;
 use autolive_desktop_core::media_video_cycle::VideoCycleConfig;
 use autolive_desktop_core::media_video_effects::build_atomic_media_video_effect_plan;
+use autolive_desktop_core::media_video_gpu_effects::build_gpu83_static_video_filter;
+use autolive_desktop_core::microphone_interlude::{
+    list_input_devices, MicrophoneInputDeviceDto, MicrophoneInterludeConfigDto,
+    MicrophoneInterludeController, MicrophoneInterludeError, MicrophoneInterludeStatusDto,
+};
 use autolive_desktop_core::realtime_video_backend::{
     resolve_mpv_executable, resolve_mpv_shader, RealtimeVideoBackendError, VideoBackend,
 };
@@ -50,6 +56,9 @@ use autolive_desktop_core::realtime_video_runtime::{
     AdvanceRealtimeVideoAfterEof, BackendActivation, ConfigureRealtimeVideoCycle,
     MediaVideoBackendRuntimeStatus, PlaybackIntent, PlaybackIntentRequest, PrepareOriginalRenderer,
     RealtimeVideoRuntime, VideoEofFact,
+};
+use autolive_desktop_core::rtmp_output::{
+    RtmpOutputConfig, RtmpOutputError, RtmpOutputManager, RtmpOutputStatus, RtmpSourceIdentity,
 };
 use autolive_desktop_core::runtime_resource_task::{
     RuntimeResourceTask, RuntimeResourceTaskShutdown,
@@ -79,6 +88,13 @@ use autolive_desktop_core::{
     ValidatedAudioStreamConfiguration, MAX_SOURCE_MEDIA_POOL_ITEMS,
 };
 use autolive_native_video_host::{NativeVideoHost, NativeVideoHostError};
+use autolive_virtual_camera_contract::{
+    OutputContext, VirtualCameraError, VirtualCameraOutputManager, VirtualCameraState,
+    VirtualCameraStatus,
+};
+use autolive_virtual_camera_native::{
+    probe as probe_virtual_camera_native, NativeProbeConfig, SidecarArchitecture,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -388,8 +404,10 @@ pub struct AppState {
     audible_audio_clock: Arc<AudibleAudioClock>,
     /// FFmpeg 解码线程 → 音频混音线程；PortAudio 失败时整体停止并回退 WebView。
     audio_mixer: Arc<Mutex<Option<AudioMixerTask>>>,
-    /// 随机插话只生产 PCM；实际叠加和 duck 仍由唯一 audio_cycle_output 完成。
+    /// 插话文件只生产 PCM；实际叠加和 duck 仍由唯一 audio_cycle_output 完成。
     interlude_mixer: Arc<Mutex<Option<ActiveInterludeMixer>>>,
+    /// 麦克风会话的唯一所有者；真实输入与 DSP 失败时保持 fail-open。
+    microphone_interlude: Arc<MicrophoneInterludeController>,
     /// 串行化插话的创建/停止，避免并发 IPC 短暂生成多个 FFmpeg 解码器。
     interlude_prepare_lock: Arc<Mutex<()>>,
     /// 每次准备/切换/停止都会推进；阻塞解码只允许提交最新操作。
@@ -427,6 +445,15 @@ pub struct AppState {
     realtime_video_eof_events: Arc<Mutex<Option<mpsc::Receiver<VideoEofFact>>>>,
     realtime_video_eof_supervisor: Arc<Mutex<Option<RealtimeVideoEofSupervisorTask>>>,
     native_video_host: Arc<Mutex<Option<NativeVideoHost>>>,
+    /// AkVirtualCamera 输出链的唯一状态所有者；平台采集和 GPL sidecar 只能通过此契约提交事实。
+    virtual_camera_output: Arc<Mutex<VirtualCameraOutputManager>>,
+    /// 当前虚拟摄像头捕获泵、Named Pipe 和 sidecar 的唯一运行时所有者。
+    virtual_camera_runtime: Arc<Mutex<Option<VirtualCameraOutputTask>>>,
+    /// 串行化虚拟摄像头启停、窗口重绑和退出清理，避免并发命令交错提交
+    /// `Starting/Recovering` 状态或留下无主 sidecar。
+    virtual_camera_lifecycle_lock: Arc<Mutex<()>>,
+    /// 唯一 RTMP/RTMPS 发布会话；视频直接读取源文件，声音从最终 PCM 总线分流。
+    rtmp_output: RtmpOutputManager,
 }
 
 #[derive(Debug)]
@@ -1041,6 +1068,36 @@ impl CommandErrorDto {
     }
 }
 
+fn rtmp_output_command_error(error: RtmpOutputError, fallback: &str) -> CommandErrorDto {
+    let code = match error {
+        RtmpOutputError::InvalidConfig(_) => "rtmp_output_config_invalid",
+        RtmpOutputError::AlreadyRunning => "rtmp_output_already_running",
+        RtmpOutputError::FfmpegNotFound => "rtmp_output_ffmpeg_unavailable",
+        RtmpOutputError::SourceNotFound => "rtmp_output_source_unavailable",
+        RtmpOutputError::InvalidAudioSampleRate => "rtmp_output_audio_sample_rate_invalid",
+        RtmpOutputError::ThreadStartFailed => "rtmp_output_thread_start_failed",
+        RtmpOutputError::WorkerPanicked => "rtmp_output_worker_failed",
+        RtmpOutputError::Internal => "rtmp_output_internal",
+    };
+    CommandErrorDto::new(code, format!("{fallback}：{error}"))
+}
+
+fn virtual_camera_command_error(error: VirtualCameraError, fallback: &str) -> CommandErrorDto {
+    let code = match error {
+        VirtualCameraError::InvalidConfiguration(_) => "virtual_camera_config_invalid",
+        VirtualCameraError::InvalidTransition { .. } => "virtual_camera_invalid_transition",
+        VirtualCameraError::GpuGateFailed(_) => "virtual_camera_gpu_gate_failed",
+        VirtualCameraError::StaleGeneration { .. } => "virtual_camera_stale_generation",
+        VirtualCameraError::InvalidFrameSize { .. } => "virtual_camera_frame_size_invalid",
+        VirtualCameraError::FrameTooLarge { .. } => "virtual_camera_frame_too_large",
+    };
+    CommandErrorDto::new(code, format!("{fallback}：{error}"))
+}
+
+fn command_error_from_microphone(error: MicrophoneInterludeError) -> CommandErrorDto {
+    CommandErrorDto::new(error.code(), error.message())
+}
+
 fn writable_runtime_resource_layout(app: &AppHandle) -> Result<RuntimeResourceLayout, String> {
     let app_data_dir = app
         .path()
@@ -1439,6 +1496,7 @@ impl Default for AppState {
             audible_audio_clock: Arc::clone(&audible_audio_clock),
             audio_mixer: Arc::new(Mutex::new(None)),
             interlude_mixer: Arc::new(Mutex::new(None)),
+            microphone_interlude: Arc::new(MicrophoneInterludeController::default()),
             interlude_prepare_lock: Arc::new(Mutex::new(())),
             interlude_prepare_token: Arc::new(AtomicU64::new(0)),
             interlude_session_generation: Arc::new(AtomicU64::new(0)),
@@ -1466,6 +1524,10 @@ impl Default for AppState {
             realtime_video_eof_events: Arc::new(Mutex::new(Some(realtime_video_eof_receiver))),
             realtime_video_eof_supervisor: Arc::new(Mutex::new(None)),
             native_video_host: Arc::new(Mutex::new(None)),
+            virtual_camera_output: Arc::new(Mutex::new(VirtualCameraOutputManager::default())),
+            virtual_camera_runtime: Arc::new(Mutex::new(None)),
+            virtual_camera_lifecycle_lock: Arc::new(Mutex::new(())),
+            rtmp_output: RtmpOutputManager::new(),
         }
     }
 }
@@ -1923,8 +1985,17 @@ impl AppState {
                 first_error.get_or_insert(error);
             }
         }
+        if let Err(error) = self.stop_rtmp_output() {
+            first_error.get_or_insert(error.message);
+        }
+        if let Err(error) = self.stop_microphone_interlude() {
+            first_error.get_or_insert(error.message);
+        }
         if let Err(error) = self.stop_audio_for_shutdown() {
             first_error.get_or_insert(error.message);
+        }
+        if let Err(error) = self.stop_virtual_camera_output() {
+            first_error.get_or_insert(error);
         }
         let mut joined_any = false;
         let mut timed_out = false;
@@ -2064,12 +2135,38 @@ impl AppState {
     }
 
     fn stop_audio_cycle_output(&self) -> Result<(), CommandErrorDto> {
-        self.stop_interlude_mixer()?;
-        if let Some(task) = self.take_audio_cycle_output_task()? {
-            task.shutdown()
-                .map_err(|error| CommandErrorDto::new("audio_cycle_output_stop_failed", error))?;
+        // 旧 PortAudio 线程拥有 RTMP 的最终 PCM 分流端；替换或释放它时，
+        // 先停止含声音的 RTMP 会话，避免新线程尚未接管 sink 时继续发布静音。
+        // 麦克风会话持有同一 full-duplex stream 的输入/clean-mic 环缓；必须在
+        // 销毁输出线程前先执行 disable → cancel → Join，否则后续切换可能留下
+        // 仍引用旧 PortAudio stream 的 Worker，使新会话无法安全打开设备。
+        let mut first_error: Option<CommandErrorDto> = None;
+        if self.rtmp_output.status().audio_enabled {
+            if let Err(error) = self.stop_rtmp_output() {
+                first_error = Some(error);
+            }
         }
-        Ok(())
+        if let Err(error) = self.stop_microphone_interlude() {
+            first_error.get_or_insert(error);
+        }
+        if let Err(error) = self.stop_interlude_mixer() {
+            first_error.get_or_insert(error);
+        }
+        match self.take_audio_cycle_output_task() {
+            Ok(Some(task)) => {
+                if let Err(error) = task
+                    .shutdown()
+                    .map_err(|error| CommandErrorDto::new("audio_cycle_output_stop_failed", error))
+                {
+                    first_error.get_or_insert(error);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn stop_audio_for_shutdown(&self) -> Result<(), CommandErrorDto> {
@@ -2082,6 +2179,185 @@ impl AppState {
         })?;
         self.stop_audio_mixer()?;
         self.stop_audio_cycle_output()
+    }
+
+    fn stop_rtmp_output(&self) -> Result<(), CommandErrorDto> {
+        if let Some(control) = self.audio_output_control_if_started()? {
+            let _ = control.set_rtmp_audio_sink(None);
+        }
+        self.rtmp_output
+            .stop()
+            .map_err(|error| rtmp_output_command_error(error, "停止 RTMP 推流失败"))
+    }
+
+    fn stop_virtual_camera_output(&self) -> Result<(), String> {
+        let _lifecycle_guard = self
+            .virtual_camera_lifecycle_lock
+            .lock()
+            .map_err(|_| "虚拟摄像头生命周期锁已损坏".to_owned())?;
+        let mut first_error = None;
+        let task = match self.virtual_camera_runtime.lock() {
+            Ok(mut runtime) => runtime.take(),
+            Err(_) => {
+                first_error = Some("虚拟摄像头运行时状态锁已损坏".to_owned());
+                None
+            }
+        };
+        if let Some(mut task) = task {
+            if let Err(error) = task.stop() {
+                first_error.get_or_insert_with(|| error.to_string());
+            }
+        }
+        match self.virtual_camera_output.lock() {
+            Ok(mut manager) => {
+                if let Err(error) = manager.stop() {
+                    first_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+            Err(_) => {
+                first_error.get_or_insert_with(|| "虚拟摄像头状态锁已损坏".to_owned());
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// 提交新的运行时 task 时也必须覆盖锁损坏路径：不能让已经启动的
+    /// sidecar/捕获线程失去所有者，更不能让 manager 永久停留在 Starting。
+    fn store_virtual_camera_runtime_task(
+        &self,
+        mut task: VirtualCameraOutputTask,
+    ) -> Result<(), String> {
+        let mut runtime = match self.virtual_camera_runtime.lock() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                let stop_error = task.stop().err().map(|error| error.to_string());
+                return Err(match stop_error {
+                    Some(error) => format!("虚拟摄像头运行时锁已损坏，且回收新会话失败：{error}"),
+                    None => "虚拟摄像头运行时锁已损坏".to_owned(),
+                });
+            }
+        };
+        runtime.replace(task);
+        Ok(())
+    }
+
+    /// 最终效果宿主可能在窗口重建时换用新的 HWND。只重建 WGC/D3D11 与
+    /// sidecar 输出会话，不触碰 mpv 或本地播放状态；重绑失败也只让虚拟
+    /// 摄像头进入 Failed，不得反向阻断最终效果窗口。
+    fn rebind_virtual_camera_output_if_window_changed(
+        &self,
+        app: &AppHandle,
+        final_effect_window_id: u64,
+    ) -> Result<(), String> {
+        let _lifecycle_guard = self
+            .virtual_camera_lifecycle_lock
+            .lock()
+            .map_err(|_| "虚拟摄像头生命周期锁已损坏".to_owned())?;
+        let current_window_id = self
+            .virtual_camera_runtime
+            .lock()
+            .map_err(|_| "虚拟摄像头运行时状态锁已损坏".to_owned())?
+            .as_ref()
+            .map(VirtualCameraOutputTask::capture_window_id);
+        if !should_rebind_virtual_camera(current_window_id, final_effect_window_id) {
+            return Ok(());
+        }
+
+        {
+            let mut manager = self
+                .virtual_camera_output
+                .lock()
+                .map_err(|_| "虚拟摄像头状态锁已损坏".to_owned())?;
+            manager
+                .begin_recovery("最终效果窗口 HWND 已变更，正在重建捕获会话")
+                .map_err(|error| error.to_string())?;
+        }
+
+        let previous = self
+            .virtual_camera_runtime
+            .lock()
+            .map_err(|_| "虚拟摄像头运行时状态锁已损坏".to_owned())?
+            .take();
+        if let Some(mut previous) = previous {
+            if let Err(error) = previous.stop() {
+                let reason = format!("回收旧虚拟摄像头会话失败：{error}");
+                if let Ok(mut manager) = self.virtual_camera_output.lock() {
+                    manager.fail(reason.clone());
+                }
+                return Err(reason);
+            }
+        }
+
+        let generation = self
+            .virtual_camera_output
+            .lock()
+            .map_err(|_| "虚拟摄像头状态锁已损坏".to_owned())?
+            .generation();
+        match start_virtual_camera_task_for_window(app, self, final_effect_window_id, generation) {
+            Ok(task) => match self.store_virtual_camera_runtime_task(task) {
+                Ok(()) => Ok(()),
+                Err(reason) => {
+                    if let Ok(mut manager) = self.virtual_camera_output.lock() {
+                        manager.fail(reason.clone());
+                    }
+                    Err(reason)
+                }
+            },
+            Err(error) => {
+                let reason = error.message.clone();
+                if let Ok(mut manager) = self.virtual_camera_output.lock() {
+                    manager.fail(reason);
+                }
+                Err(error.message)
+            }
+        }
+    }
+
+    fn stop_microphone_interlude(&self) -> Result<(), CommandErrorDto> {
+        let had_active_session = self.microphone_interlude.has_active_session();
+        // 先让唯一 PortAudio callback 停止并撤销 full-duplex 桥接，再取消
+        // DSP worker；这样 Worker Join 期间不会继续依赖已关闭的设备。
+        let disable_result = if had_active_session {
+            match self.audio_output_control_if_started() {
+                Ok(Some(control)) => control
+                    .disable_microphone()
+                    .err()
+                    .map(|error| CommandErrorDto::new("microphone_audio_close_failed", error)),
+                // 控制句柄获取失败时仍必须继续执行下方 Stop/Join；否则
+                // Worker 可能继续持有 full-duplex 设备，阻塞后续恢复和退出。
+                Err(error) => Some(error),
+                Ok(None) => None,
+            }
+        } else {
+            None
+        };
+        let stop_result = self
+            .microphone_interlude
+            .stop()
+            .map(|_| ())
+            .map_err(command_error_from_microphone);
+        if let Some(error) = disable_result {
+            // 即使拆流报告错误，也必须继续执行上面的取消/Join；资源释放
+            // 结果不能被一个控制面错误短路。
+            stop_result?;
+            return Err(error);
+        }
+        stop_result?;
+        Ok(())
+    }
+
+    fn pause_microphone_interlude(&self) -> Result<(), CommandErrorDto> {
+        self.microphone_interlude
+            .pause()
+            .map(|_| ())
+            .map_err(command_error_from_microphone)
+    }
+
+    fn resume_microphone_interlude(&self) -> Result<(), CommandErrorDto> {
+        self.microphone_interlude
+            .resume()
+            .map(|_| ())
+            .map_err(command_error_from_microphone)
     }
 
     fn stop_audio_mixer(&self) -> Result<(), CommandErrorDto> {
@@ -2112,6 +2388,7 @@ impl AppState {
     fn pause_audio_output(&self) -> Result<(), CommandErrorDto> {
         self.next_audio_mixer_pending_token();
         self.interlude_prepare_token.fetch_add(1, Ordering::AcqRel);
+        self.pause_microphone_interlude()?;
         let pause_result = self.audio_output_control().and_then(|control| {
             control
                 .pause()
@@ -2133,6 +2410,7 @@ impl AppState {
         self.interlude_prepare_token.fetch_add(1, Ordering::AcqRel);
         self.interlude_session_generation
             .fetch_add(1, Ordering::AcqRel);
+        self.stop_microphone_interlude()?;
         if let Ok(control) = self.audio_output_control() {
             control
                 .clear()
@@ -2145,6 +2423,7 @@ impl AppState {
     }
 
     fn resume_audio_output(&self, app: &AppHandle) -> Result<(), CommandErrorDto> {
+        self.resume_microphone_interlude()?;
         // 首播时最终效果窗口尚未建立真实时钟，先保持 WebView 原声；后续源同步再接管。
         let Some(control) = self.audio_output_control_for_resume()? else {
             return Ok(());
@@ -3240,8 +3519,34 @@ impl AppState {
         self.snapshot_from_core(playback.snapshot())
     }
 
+    /// 将预演中的 PlaybackCore 转成 DTO，但不把尚未提交的状态同步给
+    /// 虚拟摄像头输出。只有权威播放状态提交后，调用方才应使用
+    /// `snapshot_from_core` 更新输出上下文。
+    fn snapshot_preview(&self, playback: &PlaybackCore) -> PlaybackSnapshotDto {
+        PlaybackSnapshotDto::from(playback.snapshot())
+    }
+
     fn snapshot_from_core(&self, snapshot: PlaybackSnapshot) -> PlaybackSnapshotDto {
+        self.sync_virtual_camera_context(&snapshot);
         PlaybackSnapshotDto::from(snapshot)
+    }
+
+    fn sync_virtual_camera_context(&self, snapshot: &PlaybackSnapshot) {
+        let source_is_video = snapshot
+            .source_media
+            .as_ref()
+            .is_some_and(|source| source.media_kind == MediaKind::Video);
+        let context = OutputContext {
+            playback_active: snapshot.playback_state == PlaybackState::Playing,
+            video_source_active: source_is_video,
+            paused: snapshot.playback_state == PlaybackState::Paused,
+            stopped: snapshot.playback_state == PlaybackState::Stopped,
+            locked: false,
+            has_valid_frame: source_is_video && snapshot.source_media.is_some(),
+        };
+        if let Ok(mut manager) = self.virtual_camera_output.lock() {
+            manager.set_output_context(context);
+        }
     }
 }
 
@@ -3469,6 +3774,11 @@ pub struct StartPortAudioInterludeRequestDto {
     pub audio_variants: Vec<AudioEffectParams>,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartMicrophoneInterludeRequestDto {
+    pub config: MicrophoneInterludeConfigDto,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4090,9 +4400,11 @@ impl AppState {
                 .map_err(command_error_from_playback)?;
         }
         action(&mut staged).map_err(command_error_from_playback)?;
-        let snapshot = self.snapshot(&staged);
+        let staged_snapshot = staged.snapshot();
+        let snapshot = self.snapshot_preview(&staged);
         apply_realtime_video_playback_intent(self, snapshot.playback_generation, intent)?;
         *playback = staged;
+        self.sync_virtual_camera_context(&staged_snapshot);
         Ok(snapshot)
     }
 }
@@ -4317,6 +4629,7 @@ fn probe_local_video_pool_blocking(
     state.stop_audio_for_playback()?;
     state.stop_speech_worker()?;
     state.stop_realtime_video_runtime()?;
+    state.stop_rtmp_output()?;
     let sources = results.iter().map(|result| result.source.clone()).collect();
     let snapshot = state.with_playback(&window, |playback| {
         playback
@@ -4372,6 +4685,7 @@ fn commit_playback_pool_edit(
     state.stop_audio_for_playback()?;
     state.stop_speech_worker()?;
     state.stop_realtime_video_runtime()?;
+    state.stop_rtmp_output()?;
     state.with_playback(window, |playback| {
         edit(playback)?;
         Ok(state.snapshot(playback))
@@ -4940,6 +5254,548 @@ pub struct AudioOutputDeviceDto {
     pub host_api: String,
     pub max_output_channels: u16,
     pub default_sample_rate_hz: u32,
+}
+
+fn rtmp_output_ffmpeg_path(app: &AppHandle) -> Result<PathBuf, CommandErrorDto> {
+    let target_root = runtime_resource_target_root(app)
+        .map_err(|error| CommandErrorDto::new("rtmp_output_resource_unavailable", error))?;
+    let (ffmpeg_path, _) =
+        configured_media_engine_paths_with_resource_dir(&target_root).map_err(|error| {
+            CommandErrorDto::new("rtmp_output_resource_unavailable", error.to_string())
+        })?;
+    if !ffmpeg_path.is_file() {
+        return Err(CommandErrorDto::new(
+            "rtmp_output_ffmpeg_unavailable",
+            "FFmpeg 运行资源未安装或不可执行",
+        ));
+    }
+    Ok(ffmpeg_path)
+}
+
+fn current_rtmp_source(
+    state: &AppState,
+) -> Result<(PathBuf, MediaKind, RtmpSourceIdentity), CommandErrorDto> {
+    let snapshot = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot();
+    let source = snapshot.source_media.ok_or_else(|| {
+        CommandErrorDto::new("rtmp_output_source_required", "请先导入并选择一个源媒体")
+    })?;
+    let source_path = PathBuf::from(&source.source_path);
+    if !source_path.is_file() {
+        return Err(CommandErrorDto::new(
+            "rtmp_output_source_unavailable",
+            "当前源媒体文件不可读",
+        ));
+    }
+    Ok((
+        source_path,
+        source.media_kind,
+        RtmpSourceIdentity {
+            playback_generation: snapshot.playback_generation,
+            source_media_index: snapshot.source_media_index,
+            loop_index: snapshot.loop_index,
+            source_duration_ms: source.duration_ms,
+            source_position_ms: snapshot.current_position_ms,
+        },
+    ))
+}
+
+fn rtmp_audio_input_sample_rate_hz(
+    actual_sample_rate_hz: Option<u32>,
+    configured_sample_rate_hz: u32,
+) -> u32 {
+    actual_sample_rate_hz
+        .filter(|sample_rate_hz| *sample_rate_hz > 0)
+        .unwrap_or(configured_sample_rate_hz)
+}
+
+#[tauri::command]
+pub fn validate_rtmp_output_config(
+    window: Window,
+    state: State<'_, AppState>,
+    request: RtmpOutputConfig,
+) -> Result<RtmpOutputStatus, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    state
+        .rtmp_output
+        .validate_config(&request)
+        .map_err(|error| rtmp_output_command_error(error, "RTMP 配置校验失败"))?;
+    Ok(state.rtmp_output.status())
+}
+
+#[tauri::command]
+pub fn get_rtmp_output_status(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<RtmpOutputStatus, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    Ok(state.rtmp_output.status())
+}
+
+#[tauri::command]
+pub fn start_rtmp_output(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: RtmpOutputConfig,
+) -> Result<RtmpOutputStatus, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    // 让源身份快照与 FFmpeg 启动决策和播放转换保持原子性，避免播放池编辑
+    // 或换源与本次快照竞态，最终发布过期的源位置。
+    let _transition_guard = state.playback_transition.lock().map_err(|_| {
+        CommandErrorDto::new("playback_transition_lock_failed", "播放池转换锁已损坏")
+    })?;
+    state.ensure_running()?;
+    state
+        .rtmp_output
+        .validate_config(&request)
+        .map_err(|error| rtmp_output_command_error(error, "RTMP 配置校验失败"))?;
+    let (source_path, source_identity) = if request.video_enabled {
+        let (source_path, source_kind, source_identity) = current_rtmp_source(&state)?;
+        if source_kind != MediaKind::Video {
+            return Err(CommandErrorDto::new(
+                "rtmp_output_video_source_required",
+                "启用画面输出时，当前源必须是视频媒体",
+            ));
+        }
+        (source_path, Some(source_identity))
+    } else {
+        // 纯声音模式只消费最终 PCM 总线，不需要播放池源文件或视频解码器。
+        (PathBuf::new(), None)
+    };
+    let audio_sample_rate_hz = if request.audio_enabled {
+        let control = state.audio_output_control_if_started()?.ok_or_else(|| {
+            CommandErrorDto::new(
+                "rtmp_output_audio_bus_unavailable",
+                "声音输出需要先启用 PortAudio，当前最终 PCM 总线尚未启动",
+            )
+        })?;
+        let output_status = control.status().ok_or_else(|| {
+            CommandErrorDto::new(
+                "rtmp_output_audio_bus_unavailable",
+                "无法读取最终 PCM 总线状态",
+            )
+        })?;
+        rtmp_audio_input_sample_rate_hz(
+            output_status.health.actual_sample_rate_hz,
+            output_status.sample_rate_hz,
+        )
+    } else {
+        48_000
+    };
+    let ffmpeg_path = rtmp_output_ffmpeg_path(&app)?;
+    let video_processing_enabled = state
+        .playback
+        .lock()
+        .map_err(|_| CommandErrorDto::new("playback_lock_failed", "播放状态锁已损坏"))?
+        .snapshot()
+        .video_processing_enabled;
+    let (optional_filter, cpu_fallback_filter) =
+        if request.video_enabled && video_processing_enabled {
+            let video_status = state.realtime_video_runtime.status();
+            video_status
+                .active_cycle_snapshot
+                .map(|snapshot| {
+                    let gpu_filter = (video_status.backend == VideoBackend::RealtimeGpu)
+                        .then(|| {
+                            build_gpu83_static_video_filter(
+                                &snapshot.video,
+                                &snapshot.advanced,
+                                false,
+                                Some((request.width, request.height)),
+                            )
+                            .map(|plan| plan.serial_filter)
+                        })
+                        .flatten();
+                    let cpu_filter = build_cpu4_video_filter(&snapshot.video);
+                    (gpu_filter, cpu_filter)
+                })
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+    state
+        .rtmp_output
+        .start_with_filters_and_audio_sample_rate(
+            request,
+            ffmpeg_path,
+            source_path,
+            optional_filter,
+            cpu_fallback_filter,
+            source_identity,
+            audio_sample_rate_hz,
+        )
+        .map_err(|error| rtmp_output_command_error(error, "启动 RTMP 推流失败"))?;
+    if let Some(control) = state.audio_output_control_if_started()? {
+        if let Err(error) = control.set_rtmp_audio_sink(state.rtmp_output.audio_sink()) {
+            let _ = state.stop_rtmp_output();
+            return Err(CommandErrorDto::new(
+                "rtmp_output_audio_bus_attach_failed",
+                error,
+            ));
+        }
+    }
+    Ok(state.rtmp_output.status())
+}
+
+#[tauri::command]
+pub fn stop_rtmp_output(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<RtmpOutputStatus, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    state.stop_rtmp_output()?;
+    Ok(state.rtmp_output.status())
+}
+
+/// 返回虚拟摄像头的真实状态。状态默认是 Unavailable；在上游组件、签名、WGC/D3D11
+/// 和 GPL sidecar 发布门禁全部完成前，不能把它伪装成已安装或 GPU 运行中。
+#[tauri::command]
+pub fn get_virtual_camera_status(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<VirtualCameraStatus, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    let _ = refresh_virtual_camera_installation_state(&app, &state)?;
+    state
+        .virtual_camera_output
+        .lock()
+        .map(|manager| manager.status())
+        .map_err(|_| {
+            CommandErrorDto::new("virtual_camera_state_lock_failed", "虚拟摄像头状态锁已损坏")
+        })
+}
+
+/// 安装/修复入口只接受产品固定组件。实际注册/修复由 NSIS 完成；运行时只重新
+/// 验证受信任资源根的发布标记和固定文件，缺少完整门禁时必须 fail-closed，不能
+/// 执行任意路径或命令。
+#[tauri::command]
+pub fn install_or_repair_virtual_camera(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<VirtualCameraStatus, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    state.ensure_running()?;
+    if refresh_virtual_camera_installation_state(&app, &state)? {
+        return state
+            .virtual_camera_output
+            .lock()
+            .map(|manager| manager.status())
+            .map_err(|_| {
+                CommandErrorDto::new("virtual_camera_state_lock_failed", "虚拟摄像头状态锁已损坏")
+            });
+    }
+    let mut manager = state.virtual_camera_output.lock().map_err(|_| {
+        CommandErrorDto::new("virtual_camera_state_lock_failed", "虚拟摄像头状态锁已损坏")
+    })?;
+    manager.mark_unavailable(
+        "AkVirtualCamera 安装/修复尚未接入：等待 GPL 对应源码、签名、x86/x64 DirectShow 和安全 IPC 门禁",
+    );
+    Err(CommandErrorDto::new(
+        "virtual_camera_component_unavailable",
+        manager
+            .status()
+            .last_error
+            .unwrap_or_else(|| "AkVirtualCamera 组件尚未通过发布门禁，暂不能安装".to_owned()),
+    ))
+}
+
+/// 启动前必须同时具备最终效果 HWND、WGC/D3D11 非 WARP GPU 和已安装的 GPL sidecar；
+/// 原生捕获/投递或任一门禁失败时明确返回错误，不改变本地播放链。
+#[tauri::command]
+pub fn start_virtual_camera_output(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<VirtualCameraStatus, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    state.ensure_running()?;
+    let _lifecycle_guard = state.virtual_camera_lifecycle_lock.lock().map_err(|_| {
+        CommandErrorDto::new(
+            "virtual_camera_lifecycle_lock_failed",
+            "虚拟摄像头生命周期锁已损坏",
+        )
+    })?;
+    // 安装状态可能在进程存活期间因资源清理、升级或回滚而失效；启动前必须
+    // 再次验证受信任资源根的 release-ready 标记和全部固定组件，不能沿用旧的
+    // Installed 状态启动残留或未签名的 sidecar。
+    if !refresh_virtual_camera_installation_state(&app, &state)? {
+        return Err(CommandErrorDto::new(
+            "virtual_camera_component_unavailable",
+            "虚拟摄像头发布资源未通过门禁；请先完成签名组件安装或修复",
+        ));
+    }
+    let final_effect_window_id = ready_final_effect_video_host_window_id(&state)?;
+    let manager = Arc::clone(&state.virtual_camera_output);
+    let mut manager_guard = manager.lock().map_err(|_| {
+        CommandErrorDto::new("virtual_camera_state_lock_failed", "虚拟摄像头状态锁已损坏")
+    })?;
+    if manager_guard.state() == VirtualCameraState::Unavailable {
+        return Err(CommandErrorDto::new(
+            "virtual_camera_component_unavailable",
+            "虚拟摄像头组件未安装；请先完成 AkVirtualCamera DirectShow x86/x64 安装门禁",
+        ));
+    }
+    if !matches!(
+        manager_guard.state(),
+        VirtualCameraState::Installed | VirtualCameraState::Failed
+    ) {
+        return Err(CommandErrorDto::new(
+            "virtual_camera_start_in_progress",
+            "虚拟摄像头已经处于启动或输出状态",
+        ));
+    }
+    if manager_guard.state() == VirtualCameraState::Failed {
+        manager_guard
+            .mark_installed()
+            .map_err(|error| virtual_camera_command_error(error, "恢复虚拟摄像头失败"))?;
+    }
+    manager_guard
+        .begin_start()
+        .map_err(|error| virtual_camera_command_error(error, "准备启动虚拟摄像头失败"))?;
+    let generation = manager_guard.generation();
+    drop(manager_guard);
+
+    // 启动前先回收旧 task，避免一次用户操作留下第二个 sidecar/捕获线程。
+    let previous = {
+        let mut runtime = state.virtual_camera_runtime.lock().map_err(|_| {
+            CommandErrorDto::new(
+                "virtual_camera_runtime_lock_failed",
+                "虚拟摄像头运行时锁已损坏",
+            )
+        })?;
+        runtime.take()
+    };
+    if let Some(mut previous) = previous {
+        if let Err(error) = previous.stop() {
+            let reason = format!("回收旧虚拟摄像头会话失败：{error}");
+            if let Ok(mut manager) = state.virtual_camera_output.lock() {
+                manager.fail(reason.clone());
+            }
+            return Err(CommandErrorDto::new(
+                "virtual_camera_runtime_stop_failed",
+                reason,
+            ));
+        }
+    }
+
+    let task = match start_virtual_camera_task_for_window(
+        &app,
+        &state,
+        final_effect_window_id,
+        generation,
+    ) {
+        Ok(task) => task,
+        Err(error) => {
+            if let Ok(mut manager) = state.virtual_camera_output.lock() {
+                manager.fail(error.message.clone());
+            }
+            return Err(error);
+        }
+    };
+    if let Err(reason) = state.store_virtual_camera_runtime_task(task) {
+        if let Ok(mut manager) = state.virtual_camera_output.lock() {
+            manager.fail(reason.clone());
+        }
+        return Err(CommandErrorDto::new(
+            "virtual_camera_runtime_lock_failed",
+            reason,
+        ));
+    }
+    state
+        .virtual_camera_output
+        .lock()
+        .map(|manager| manager.status())
+        .map_err(|_| {
+            CommandErrorDto::new("virtual_camera_state_lock_failed", "虚拟摄像头状态锁已损坏")
+        })
+}
+
+fn should_rebind_virtual_camera(current_window_id: Option<u64>, next_window_id: u64) -> bool {
+    next_window_id != 0 && current_window_id.is_some_and(|current| current != next_window_id)
+}
+
+/// 在 manager 已经处于 Starting/Recovering 状态时，创建一个绑定指定最终效果
+/// HWND 的完整 GPU 输出任务。该函数不接管 runtime 槽位，调用方在成功后才提交，
+/// 这样重绑失败时不会短暂留下第二个 sidecar。
+fn start_virtual_camera_task_for_window(
+    app: &AppHandle,
+    state: &AppState,
+    final_effect_window_id: u64,
+    generation: u64,
+) -> Result<VirtualCameraOutputTask, CommandErrorDto> {
+    if !refresh_virtual_camera_installation_state(app, state)? {
+        return Err(CommandErrorDto::new(
+            "virtual_camera_component_unavailable",
+            "虚拟摄像头发布资源未通过门禁；请先完成签名组件安装或修复",
+        ));
+    }
+    let sidecar_path = virtual_camera_sidecar_path(app)?;
+    let native_probe = probe_virtual_camera_native(&NativeProbeConfig {
+        final_effect_window_id: Some(final_effect_window_id),
+        sidecar_path: Some(sidecar_path.clone()),
+        expected_sidecar_architecture: SidecarArchitecture::X64,
+    });
+    if !native_probe.can_start_development_output() {
+        let details = if native_probe.blockers.is_empty() {
+            "原生虚拟摄像头前置条件未满足".to_owned()
+        } else {
+            native_probe.blockers.join("；")
+        };
+        return Err(CommandErrorDto::new(
+            "virtual_camera_prerequisites_failed",
+            format!("虚拟摄像头尚未满足 WGC/D3D11/sidecar 前置条件：{details}"),
+        ));
+    }
+
+    let mut task = VirtualCameraOutputTask::start(
+        Arc::clone(&state.virtual_camera_output),
+        sidecar_path,
+        autolive_virtual_camera_native::CaptureConfig {
+            final_effect_window_id,
+            output_width: autolive_virtual_camera_contract::VIRTUAL_CAMERA_WIDTH,
+            output_height: autolive_virtual_camera_contract::VIRTUAL_CAMERA_HEIGHT,
+            output_fps: autolive_virtual_camera_contract::VIRTUAL_CAMERA_FPS,
+        },
+        generation,
+    )
+    .map_err(|error| {
+        CommandErrorDto::new("virtual_camera_gpu_capture_unavailable", error.to_string())
+    })?;
+    task.wait_until_ready(Duration::from_secs(5))
+        .map_err(|error| {
+            CommandErrorDto::new("virtual_camera_sidecar_start_failed", error.to_string())
+        })?;
+
+    let facts = task.gpu_facts().cloned().ok_or_else(|| {
+        CommandErrorDto::new(
+            "virtual_camera_gpu_capture_unavailable",
+            "GPU 捕获会话未返回实际 adapter 事实",
+        )
+    })?;
+    state
+        .virtual_camera_output
+        .lock()
+        .map_err(|_| {
+            CommandErrorDto::new("virtual_camera_state_lock_failed", "虚拟摄像头状态锁已损坏")
+        })?
+        .mark_ready(facts.into_contract())
+        .map_err(|error| virtual_camera_command_error(error, "确认 GPU 虚拟摄像头事实失败"))?;
+    task.activate().map_err(|error| {
+        CommandErrorDto::new("virtual_camera_sidecar_activate_failed", error.to_string())
+    })?;
+    Ok(task)
+}
+
+const VIRTUAL_CAMERA_RESOURCE_DIRECTORY: &str = "akvirtualcamera";
+const VIRTUAL_CAMERA_SIDECAR_FILE: &str = "akvirtualcamera-sidecar-x64.exe";
+const VIRTUAL_CAMERA_RELEASE_MARKER: &str = "release-ready.json";
+const VIRTUAL_CAMERA_RELEASE_FILES: &[&str] = &[
+    "x64/AkVirtualCamera.dll",
+    "x64/AkVCamAssistant.exe",
+    "x64/AkVCamManager.exe",
+    "x86/AkVirtualCamera.dll",
+    "bin/akvirtualcamera-sidecar-x64.exe",
+    "bin/vcam_capi.dll",
+];
+
+/// 只把已经由发布门禁生成的资源标记视为“已安装”。测试包没有该标记，
+/// 因而不会因为目录或单个未签名文件存在而误报设备可用。
+fn refresh_virtual_camera_installation_state(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<bool, CommandErrorDto> {
+    if !cfg!(windows) {
+        return Ok(false);
+    }
+    let Ok(resource_dir) = app.path().resource_dir() else {
+        // 虚拟摄像头是可选输出；资源目录不可用时保持 Unavailable，不能让
+        // 状态轮询反过来阻断本地播放和主窗口启动。
+        return Ok(false);
+    };
+    let root = resource_dir.join(VIRTUAL_CAMERA_RESOURCE_DIRECTORY);
+    if !virtual_camera_release_resources_are_ready(&root) {
+        if let Ok(mut manager) = state.virtual_camera_output.lock() {
+            if matches!(
+                manager.state(),
+                VirtualCameraState::Installed | VirtualCameraState::Failed
+            ) {
+                manager
+                    .mark_unavailable("虚拟摄像头发布资源缺失或未通过门禁；请重新安装或修复组件");
+            }
+        }
+        return Ok(false);
+    }
+    let mut manager = state.virtual_camera_output.lock().map_err(|_| {
+        CommandErrorDto::new("virtual_camera_state_lock_failed", "虚拟摄像头状态锁已损坏")
+    })?;
+    if matches!(
+        manager.state(),
+        VirtualCameraState::Unavailable | VirtualCameraState::Failed
+    ) {
+        manager
+            .mark_installed()
+            .map_err(|error| virtual_camera_command_error(error, "确认虚拟摄像头安装状态失败"))?;
+    }
+    Ok(true)
+}
+
+fn virtual_camera_release_resources_are_ready(root: &Path) -> bool {
+    let marker = root.join(VIRTUAL_CAMERA_RELEASE_MARKER);
+    let Ok(marker_text) = std::fs::read_to_string(marker) else {
+        return false;
+    };
+    let Ok(marker_json) = serde_json::from_str::<serde_json::Value>(&marker_text) else {
+        return false;
+    };
+    let release_ready = marker_json
+        .get("releaseReady")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    release_ready
+        && VIRTUAL_CAMERA_RELEASE_FILES
+            .iter()
+            .all(|relative| root.join(relative).is_file())
+}
+
+fn virtual_camera_sidecar_path(app: &AppHandle) -> Result<std::path::PathBuf, CommandErrorDto> {
+    let resource_dir = app.path().resource_dir().map_err(|error| {
+        CommandErrorDto::new(
+            "virtual_camera_resource_dir_unavailable",
+            format!("读取虚拟摄像头资源目录失败：{error}"),
+        )
+    })?;
+    Ok(virtual_camera_sidecar_path_from_resource_dir(&resource_dir))
+}
+
+fn virtual_camera_sidecar_path_from_resource_dir(resource_dir: &Path) -> PathBuf {
+    resource_dir
+        .join(VIRTUAL_CAMERA_RESOURCE_DIRECTORY)
+        .join("bin")
+        .join(VIRTUAL_CAMERA_SIDECAR_FILE)
+}
+
+#[tauri::command]
+pub fn stop_virtual_camera_output(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<VirtualCameraStatus, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    state
+        .stop_virtual_camera_output()
+        .map_err(|error| CommandErrorDto::new("virtual_camera_stop_failed", error))?;
+    state
+        .virtual_camera_output
+        .lock()
+        .map(|manager| manager.status())
+        .map_err(|_| {
+            CommandErrorDto::new("virtual_camera_state_lock_failed", "虚拟摄像头状态锁已损坏")
+        })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5617,6 +6473,165 @@ pub fn list_audio_output_devices(
                 .collect()
         })
         .map_err(|message| CommandErrorDto::new("audio_output_devices_failed", message))
+}
+
+#[tauri::command]
+pub fn list_portaudio_input_devices(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<Vec<MicrophoneInputDeviceDto>, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    list_input_devices().map_err(command_error_from_microphone)
+}
+
+#[tauri::command]
+pub fn start_microphone_interlude(
+    window: Window,
+    state: State<'_, AppState>,
+    request: StartMicrophoneInterludeRequestDto,
+) -> Result<MicrophoneInterludeStatusDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    request
+        .config
+        .validate()
+        .map_err(command_error_from_microphone)?;
+    let output = state.audio_output_control_if_started()?.ok_or_else(|| {
+        CommandErrorDto::new("audio_output_missing", "请先启动 PortAudio 声音出口")
+    })?;
+    // full-duplex PortAudio 与现有输出流共用一个硬件采样率；DSP 必须跟随
+    // 实际输出配置，不能把 UI 的偏好值（例如 48 kHz）直接当作输入采样率。
+    let mut config = request.config;
+    config.sample_rate_hz = output
+        .status()
+        .map(|status| status.sample_rate_hz)
+        .filter(|sample_rate_hz| *sample_rate_hz > 0)
+        .unwrap_or(config.sample_rate_hz);
+    config.validate().map_err(command_error_from_microphone)?;
+    if state
+        .microphone_interlude
+        .is_active_for_config(&config)
+        .map_err(command_error_from_microphone)?
+    {
+        return Ok(state.microphone_interlude.status());
+    }
+    // 失败会话也可能仍持有 callback/Worker 资源；必须显式 stop 回收后才
+    // 允许新的设备或配置启动，避免两个输入流并行抢占同一输出总线。
+    if state.microphone_interlude.has_active_session() {
+        return Err(command_error_from_microphone(
+            MicrophoneInterludeError::Busy,
+        ));
+    }
+    let (selected_device_name, selected_host_api, input_device_index) = match config
+        .device_id
+        .as_deref()
+    {
+        Some(device_id) => {
+            let device = list_input_devices()
+                .map_err(command_error_from_microphone)?
+                .into_iter()
+                .find(|device| device.id == device_id)
+                .ok_or_else(|| {
+                    CommandErrorDto::new(
+                        "microphone_device_missing",
+                        "所选麦克风设备不存在或已断开",
+                    )
+                })?;
+            if device.max_input_channels == 0 {
+                return Err(CommandErrorDto::new(
+                    "microphone_device_unavailable",
+                    "所选设备没有可用的麦克风输入通道",
+                ));
+            }
+            let input_device_index =
+                autolive_portaudio_output::input_device_index_for_id(device_id)
+                    .map_err(|error| {
+                        CommandErrorDto::new("microphone_device_lookup_failed", error)
+                    })?
+                    .ok_or_else(|| {
+                        CommandErrorDto::new(
+                            "microphone_device_missing",
+                            "所选麦克风设备已失效，请重新选择输入设备",
+                        )
+                    })?;
+            (
+                Some(device.name),
+                Some(device.host_api),
+                Some(input_device_index),
+            )
+        }
+        None => {
+            let (input_device_index, device) = autolive_portaudio_output::default_input_device()
+                .map_err(|error| CommandErrorDto::new("microphone_device_lookup_failed", error))?
+                .ok_or_else(|| {
+                    CommandErrorDto::new(
+                        "microphone_device_missing",
+                        "当前没有可用的系统默认麦克风输入设备",
+                    )
+                })?;
+            (
+                Some(device.name),
+                Some(host_api_label(device.host_api).to_owned()),
+                Some(input_device_index),
+            )
+        }
+    };
+    state
+        .microphone_interlude
+        .set_device_metadata(selected_device_name, selected_host_api)
+        .map_err(command_error_from_microphone)?;
+    let bridge = output
+        .enable_microphone(autolive_portaudio_output::PortAudioDuplexConfig {
+            input_device_index,
+            input_channels: 1,
+        })
+        .map_err(|error| CommandErrorDto::new("microphone_audio_open_failed", error))?;
+    let priority_state = state.inner().clone();
+    let on_speaking_start = Arc::new(move || {
+        let _ = priority_state.stop_interlude_mixer_current();
+        let _ = priority_state.stop_speech_worker();
+    });
+    match state
+        .microphone_interlude
+        .start_with_bridge(config, bridge, on_speaking_start)
+    {
+        Ok(_) => Ok(state.microphone_interlude.status()),
+        Err(error) => {
+            let _ = output.disable_microphone();
+            Err(command_error_from_microphone(error))
+        }
+    }
+}
+
+#[tauri::command]
+pub fn stop_microphone_interlude(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<MicrophoneInterludeStatusDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    state.stop_microphone_interlude()?;
+    Ok(state.microphone_interlude.status())
+}
+
+#[tauri::command]
+pub fn get_microphone_interlude_status(
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<MicrophoneInterludeStatusDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    Ok(state.microphone_interlude.status())
+}
+
+#[tauri::command]
+pub fn set_microphone_interlude_config(
+    window: Window,
+    state: State<'_, AppState>,
+    config: MicrophoneInterludeConfigDto,
+) -> Result<MicrophoneInterludeStatusDto, CommandErrorDto> {
+    state.ensure_main_window(&window)?;
+    state
+        .microphone_interlude
+        .configure(config)
+        .map_err(command_error_from_microphone)
 }
 
 #[tauri::command]
@@ -7687,9 +8702,16 @@ fn disable_media_processing_on_final_effect_close(app: &AppHandle) {
         return;
     };
     let _ = release_final_effect_video_host(app);
+    let _ = state.stop_virtual_camera_output();
     let _ = state.stop_media_workers();
     let _ = state.stop_speech_worker();
+    let _ = state.stop_microphone_interlude();
     let _ = state.stop_audio_mixer();
+    // 关闭最终效果窗会释放 PortAudio；带声音的 RTMP 会话必须同步停止，
+    // 纯画面会话不依赖该窗口或声音总线，继续由独立源文件发布。
+    if state.rtmp_output.status().audio_enabled {
+        let _ = state.stop_rtmp_output();
+    }
     // 关窗释放 PortAudio，避免设备被占。
     if let Ok(mut preferred) = state.audio_output_preferred.lock() {
         *preferred = false;
@@ -7778,6 +8800,17 @@ pub async fn open_final_effect_window(
             return Err(error);
         }
     };
+    if video_host_ready {
+        if let Ok(final_effect_window_id) = ready_final_effect_video_host_window_id(&state) {
+            if let Err(error) =
+                state.rebind_virtual_camera_output_if_window_changed(&app, final_effect_window_id)
+            {
+                // 虚拟摄像头是可选输出；宿主重绑失败只暴露在状态面，不能
+                // 让最终效果窗口或本地播放失败。
+                eprintln!("failed to rebind virtual camera after host recreation: {error}");
+            }
+        }
+    }
     Ok(FinalEffectWindowDto {
         label: "final-effect".to_owned(),
         created,
@@ -8029,7 +9062,8 @@ pub fn seek_playback(
     }
     let mut staged = playback.clone();
     staged.set_playback_position(request.position_ms);
-    let snapshot = state.snapshot(&staged);
+    let staged_snapshot = staged.snapshot();
+    let snapshot = PlaybackSnapshotDto::from(staged_snapshot.clone());
     apply_realtime_video_playback_intent(
         &state,
         snapshot.playback_generation,
@@ -8038,6 +9072,7 @@ pub fn seek_playback(
         },
     )?;
     *playback = staged;
+    state.sync_virtual_camera_context(&staged_snapshot);
     Ok(snapshot)
 }
 
@@ -8091,6 +9126,7 @@ pub fn stop_playback(
     state.stop_audio_for_playback()?;
     state.stop_speech_worker()?;
     state.stop_realtime_video_runtime()?;
+    state.stop_rtmp_output()?;
     state.with_playback_window(&window, |playback| {
         playback.stop();
         Ok(state.snapshot(playback))
@@ -8620,6 +9656,8 @@ fn complete_playback_item_transaction(
         }
     };
     if source_changed {
+        // 第一阶段采用受控换源：先回收旧 FFmpeg 会话，用户可在新源就绪后重新开始推流。
+        let _ = state.stop_rtmp_output();
         if let Err(error) = state.resume_audio_output(app) {
             let committed_generation = snapshot.playback_generation;
             let committed_source_index = snapshot.source_media_index;
@@ -8826,14 +9864,14 @@ fn validate_interlude_audio_path(
     if snapshot.playback_state != PlaybackState::Playing {
         return Err(CommandErrorDto::new(
             "interlude_playback_not_running",
-            "视频未处于播放状态，不能启动随机插话",
+            "视频未处于播放状态，不能启动插话文件",
         ));
     }
     let interlude = &snapshot.interlude;
     if !interlude.enabled || interlude.audio_files.is_empty() {
         return Err(CommandErrorDto::new(
             "interlude_not_ready",
-            "随机插话尚未启用或目录内没有可用音频",
+            "插话文件尚未启用或目录内没有可用音频",
         ));
     }
     let canonical_path = std::fs::canonicalize(requested_path.trim()).map_err(|error| {
@@ -9156,7 +10194,7 @@ fn start_portaudio_interlude_blocking(
         .ok_or_else(|| {
             CommandErrorDto::new(
                 "interlude_portaudio_inactive",
-                "PortAudio 实际出口未处于活动状态，随机插话保持 WebView 回退",
+                "PortAudio 实际出口未处于活动状态，插话文件保持 WebView 回退",
             )
         })?;
 
@@ -10206,14 +11244,15 @@ mod tests {
         realtime_video_eof_reconciliation_required, realtime_video_eof_rejection,
         record_and_stop_failed_realtime_video_eof, reorder_source_media_pool,
         resolve_audio_candidate_pcm_position_ms, resolve_audio_commit_position_ms,
-        resolve_audio_output_latency_ms, resolve_audio_sync_clock,
+        resolve_audio_output_latency_ms, resolve_audio_sync_clock, rtmp_audio_input_sample_rate_hz,
         scheduled_candidate_commit_tail_ms, should_complete_playback_item,
         should_complete_playback_loop, should_defer_source_sync_for_pending_candidate,
-        should_verify_mpv_video_surface, signed_millis_delta, source_media_index_by_path,
-        stage_playback_item_completion, take_pending_audio_mixer,
+        should_rebind_virtual_camera, should_verify_mpv_video_surface, signed_millis_delta,
+        source_media_index_by_path, stage_playback_item_completion, take_pending_audio_mixer,
         validate_audio_candidate_source_window, validate_audio_sync_clock,
         validate_portaudio_interlude_gain, validate_portaudio_media_gain,
         validate_source_media_paths, validate_source_media_pool_count,
+        virtual_camera_release_resources_are_ready, virtual_camera_sidecar_path_from_resource_dir,
         webview_interlude_original_fallback, AmbientSoundSource, AppState, AudioSyncClock,
         BackgroundWorkerTask, CommandErrorDto, MediaVideoBackendRuntimeStatus, PlaybackSnapshotDto,
         RealtimeVideoBackendError, SetPortAudioMediaVolumeRequestDto,
@@ -10228,6 +11267,7 @@ mod tests {
     use autolive_desktop_core::runtime_resource_task::RuntimeResourceTaskShutdown;
     use autolive_desktop_core::PlaybackCore;
     use std::collections::HashSet;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -10254,6 +11294,24 @@ mod tests {
             mp4_sha256: None,
             mp4_hash_status: "disabled".to_owned(),
         }
+    }
+
+    #[test]
+    fn rtmp_audio_input_rate_prefers_portaudio_actual_rate() {
+        assert_eq!(
+            rtmp_audio_input_sample_rate_hz(Some(44_100), 48_000),
+            44_100
+        );
+        assert_eq!(rtmp_audio_input_sample_rate_hz(Some(0), 48_000), 48_000);
+        assert_eq!(rtmp_audio_input_sample_rate_hz(None, 48_000), 48_000);
+    }
+
+    #[test]
+    fn virtual_camera_rebind_only_happens_for_a_new_nonzero_hwnd() {
+        assert!(!should_rebind_virtual_camera(None, 0));
+        assert!(!should_rebind_virtual_camera(None, 42));
+        assert!(!should_rebind_virtual_camera(Some(42), 42));
+        assert!(should_rebind_virtual_camera(Some(42), 43));
     }
 
     #[test]
@@ -12068,6 +13126,13 @@ mod tests {
             .find("*playback = staged")
             .expect("staged PlaybackCore must commit");
         assert!(intent < commit, "Core must commit only after actor success");
+        let context_sync = action
+            .find("sync_virtual_camera_context(&staged_snapshot)")
+            .expect("committed playback must update virtual camera context");
+        assert!(
+            commit < context_sync,
+            "virtual camera context must not observe an uncommitted playback state"
+        );
 
         let seek = source
             .split("pub fn seek_playback")
@@ -12085,6 +13150,13 @@ mod tests {
         assert!(
             physical_seek < logical_seek,
             "seek must not half-commit Core"
+        );
+        let seek_context_sync = seek
+            .find("sync_virtual_camera_context(&staged_snapshot)")
+            .expect("seek must update virtual camera context after commit");
+        assert!(
+            logical_seek < seek_context_sync,
+            "seek context must not observe an uncommitted PlaybackCore"
         );
     }
 
@@ -12256,5 +13328,31 @@ mod tests {
             take_pending_audio_mixer(&pending).expect("pending lock"),
             None
         );
+    }
+
+    #[test]
+    fn virtual_camera_sidecar_path_is_fixed_under_the_trusted_resource_root() {
+        let root = Path::new(r"C:\Program Files\GpAutoLive\resources");
+        assert_eq!(
+            virtual_camera_sidecar_path_from_resource_dir(root),
+            root.join("akvirtualcamera")
+                .join("bin")
+                .join("akvirtualcamera-sidecar-x64.exe")
+        );
+    }
+
+    #[test]
+    fn virtual_camera_release_resources_require_ready_marker_and_all_components() {
+        let root = Path::new(r"C:\Program Files\GpAutoLive\resources\akvirtualcamera");
+        assert!(!virtual_camera_release_resources_are_ready(root));
+    }
+
+    #[test]
+    fn virtual_camera_release_marker_must_explicitly_declare_release_ready() {
+        let marker = serde_json::json!({ "releaseReady": false });
+        assert!(!marker
+            .get("releaseReady")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false));
     }
 }

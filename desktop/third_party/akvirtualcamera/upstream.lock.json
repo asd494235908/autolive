@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "component": "akvirtualcamera",
+  "repository": "https://github.com/webcamoid/akvirtualcamera",
+  "commit": "9cf77ae6379e5f635255f4b377478d388a46a3b2",
+  "license_expression": "GPL-3.0-only",
+  "source_archive": {
+    "url": "https://github.com/webcamoid/akvirtualcamera/archive/9cf77ae6379e5f635255f4b377478d388a46a3b2.tar.gz",
+    "path": "desktop/third_party/akvirtualcamera/source/akvirtualcamera-9cf77ae6379e5f635255f4b377478d388a46a3b2.tar.gz",
+    "size_bytes": 265293,
+    "sha256": "38adfa9eb271f5e602cc26b495c2c7e761b2e707b2bc9bbb047d57ce9c1e231a"
+  },
+  "build": {
+    "platform": "windows",
+    "minimum_windows_build": 18362,
+    "generator": "cmake",
+    "compiler": "msvc",
+    "network": "none",
+    "directshow": {
+      "enabled": true,
+      "architectures": ["x86", "x64"],
+      "default_endpoint": true
+    },
+    "media_foundation": {
+      "policy": "experimental_not_enabled",
+      "minimum_windows_major": 11
+    }
+  },
+  "runtime": {
+    "device_name": "GpAutoLive Camera",
+    "pixel_format": "YUY2",
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "capture_api": "windows_graphics_capture",
+    "gpu_conversion": true,
+    "cpu_boundary": "single_bounded_staging_readback",
+    "transport": "akvirtualcamera_raw_frame_sidecar",
+    "ipc": "windows_named_pipe",
+    "ipc_scope": "current_user_only",
+    "zero_copy": false
+  },
+  "release_requirements": {
+    "artifacts": [
+      {
+        "role": "directshow-filter",
+        "architecture": "x86",
+        "path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-directshow-x86.dll",
+        "sha256": null,
+        "signature_path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-directshow-x86.dll.authenticode.json",
+        "signature_sha256": null
+      },
+      {
+        "role": "directshow-filter",
+        "architecture": "x64",
+        "path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-directshow-x64.dll",
+        "sha256": null,
+        "signature_path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-directshow-x64.dll.authenticode.json",
+        "signature_sha256": null
+      },
+      {
+        "role": "assistant",
+        "architecture": "x64",
+        "path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-assistant-x64.exe",
+        "sha256": null,
+        "signature_path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-assistant-x64.exe.authenticode.json",
+        "signature_sha256": null
+      },
+      {
+        "role": "manager",
+        "architecture": "x64",
+        "path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-manager-x64.exe",
+        "sha256": null,
+        "signature_path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-manager-x64.exe.authenticode.json",
+        "signature_sha256": null
+      },
+      {
+        "role": "capi",
+        "architecture": "x64",
+        "path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-vcam-capi-x64.dll",
+        "sha256": null,
+        "signature_path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-vcam-capi-x64.dll.authenticode.json",
+        "signature_sha256": null
+      },
+      {
+        "role": "sidecar",
+        "architecture": "x64",
+        "path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-sidecar-x64.exe",
+        "sha256": null,
+        "signature_path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-sidecar-x64.exe.authenticode.json",
+        "signature_sha256": null
+      },
+      {
+        "role": "installer",
+        "architecture": "x64",
+        "path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-installer-x64.exe",
+        "sha256": null,
+        "signature_path": "desktop/third_party/akvirtualcamera/artifacts/akvirtualcamera-installer-x64.exe.authenticode.json",
+        "signature_sha256": null
+      }
+    ],
+    "documents": [
+      {
+        "role": "upstream-license",
+        "path": "desktop/third_party/akvirtualcamera/COPYING",
+        "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+      },
+      {
+        "role": "modifications",
+        "path": "desktop/third_party/akvirtualcamera/MODIFICATIONS.md",
+        "sha256": "33f7adb6eb12e15ce2a55cc9f99ff5b79bf473e17202fb870c46194995cc065a"
+      },
+      {
+        "role": "corresponding-source",
+        "path": "desktop/third_party/akvirtualcamera/corresponding-source-manifest.json",
+        "sha256": "d6cde855f39584e6b0b7ecc4ce85f2812a345f7eb8802b4a202a5367764814f9"
+      },
+      {
+        "role": "cyclonedx-sbom",
+        "path": "desktop/third_party/akvirtualcamera/sbom.cdx.json",
+        "sha256": "5ab429cd26599bd758a1fefbeefb5af1600c49b96773b70a3014fac982272970"
+      },
+      {
+        "role": "legal-review",
+        "path": "desktop/third_party/akvirtualcamera/legal-review.md",
+        "sha256": "d0cd950b76a9bf80bb0db1a9d9b732035692b4c0a12975e4c69fe4c972e6d57b"
+      },
+      {
+        "role": "gpu-benchmark-720p30",
+        "path": "desktop/third_party/akvirtualcamera/gpu-benchmark-720p30.json",
+        "sha256": "8c25409ed01c6416bf05bac182c1852ac4d48a4d25c13d8013bfe8639f477b05"
+      },
+      {
+        "role": "compatibility-matrix",
+        "path": "desktop/third_party/akvirtualcamera/compatibility-matrix.json",
+        "sha256": "1a08b24aefa36c90823deff0deb2479196507fbd77164a6bfafa847e4a799d3f"
+      }
+    ],
+    "required_gates": [
+      "legal_review",
+      "corresponding_source",
+      "sbom",
+      "authenticode",
+      "gpu_benchmark_720p30",
+      "windows_10_11_directshow_matrix"
+    ],
+    "media_foundation": "experimental_not_enabled"
+  }
+}

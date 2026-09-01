@@ -4,6 +4,7 @@
 //! 所有播放、交叉淡化和测试音都通过同一个控制队列进入同一生产线程。
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -35,6 +36,7 @@ const AUDIBLE_CLOCK_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
 pub const AUDIO_CYCLE_CROSSFADE_MS: usize = AUDIO_CROSSFADE_MS;
 
 type ControlResponse = mpsc::Sender<Result<(), String>>;
+type MicrophoneControlResponse = mpsc::Sender<Result<MicrophoneAudioBridge, String>>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AudioOutputConfig {
@@ -119,6 +121,15 @@ enum OutputCommand {
     PauseInterlude(ControlResponse),
     ResumeInterlude(ControlResponse),
     StopInterlude(ControlResponse),
+    SetRtmpAudioSink {
+        sink: Option<crate::rtmp_output::RtmpAudioSink>,
+        response: ControlResponse,
+    },
+    EnableMicrophone {
+        config: autolive_portaudio_output::PortAudioDuplexConfig,
+        response: MicrophoneControlResponse,
+    },
+    DisableMicrophone(ControlResponse),
     Pause(ControlResponse),
     Resume(ControlResponse),
     Clear(ControlResponse),
@@ -156,6 +167,105 @@ struct InterludeMixState {
     release_frames: usize,
     envelope: InterludeEnvelope,
     paused: bool,
+}
+
+/// 将 full-duplex PortAudio 输入环缓交给唯一麦克风 DSP worker。
+///
+/// 输出 callback 只使用 PortAudio 内部的无锁环缓；此桥接对象只在控制/DSP
+/// 线程上加锁，避免 callback 与 Tauri/Worker 共享普通引用。
+#[derive(Clone)]
+pub struct MicrophoneAudioBridge {
+    duplex: Arc<Mutex<autolive_portaudio_output::PortAudioDuplexInput>>,
+    /// 与唯一 PortAudio 输出线程共享的存活标志。输出线程发生硬件/写入
+    /// 故障时必须先撤销该标志，DSP worker 才能在没有阻塞等待的前提下
+    /// 取消并 Join，而不是继续持有一个已失效的 full-duplex 环缓。
+    available: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for MicrophoneAudioBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MicrophoneAudioBridge")
+            .finish_non_exhaustive()
+    }
+}
+
+impl MicrophoneAudioBridge {
+    fn new(duplex: autolive_portaudio_output::PortAudioDuplexInput) -> Self {
+        Self {
+            duplex: Arc::new(Mutex::new(duplex)),
+            available: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// 返回 PortAudio full-duplex 流是否仍由输出线程拥有。
+    pub fn is_available(&self) -> bool {
+        self.available.load(Ordering::Acquire)
+    }
+
+    /// 撤销桥接使用权并立即关闭末端麦克风门控。
+    ///
+    /// 这是输出线程故障和正常拆流共用的 fail-open 边界；它不等待 DSP
+    /// worker，也不释放 full-duplex 对象，后者仍由会话 Join 后按值回收。
+    pub fn mark_unavailable(&self) {
+        self.available.store(false, Ordering::Release);
+        let _ = self.set_gate_enabled(false);
+    }
+
+    pub fn read_input_interleaved(&self, output: &mut [f32]) -> Result<usize, String> {
+        self.duplex
+            .lock()
+            .map_err(|_| "麦克风输入环缓状态锁已损坏".to_owned())
+            .map(|mut duplex| duplex.read_input_interleaved(output))
+    }
+
+    pub fn input_channels(&self) -> Result<u16, String> {
+        self.duplex
+            .lock()
+            .map_err(|_| "麦克风输入环缓状态锁已损坏".to_owned())
+            .map(|duplex| duplex.input_channels())
+    }
+
+    pub fn output_channels(&self) -> Result<u16, String> {
+        self.duplex
+            .lock()
+            .map_err(|_| "麦克风输出环缓状态锁已损坏".to_owned())
+            .map(|duplex| duplex.output_channels())
+    }
+
+    pub fn read_render_reference_interleaved(&self, output: &mut [f32]) -> Result<usize, String> {
+        self.duplex
+            .lock()
+            .map_err(|_| "麦克风参考环缓状态锁已损坏".to_owned())
+            .map(|mut duplex| duplex.read_render_reference_interleaved(output))
+    }
+
+    pub fn write_clean_mic_stereo_interleaved(&self, samples: &[f32]) -> Result<usize, String> {
+        self.duplex
+            .lock()
+            .map_err(|_| "麦克风输出环缓状态锁已损坏".to_owned())
+            .and_then(|mut duplex| duplex.write_clean_mic_stereo_interleaved(samples))
+    }
+
+    pub fn set_gate_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.duplex
+            .lock()
+            .map_err(|_| "麦克风门控状态锁已损坏".to_owned())
+            .map(|duplex| duplex.set_gate_enabled(enabled))
+    }
+
+    pub fn set_gate_speaking(&self, speaking: bool) -> Result<(), String> {
+        self.duplex
+            .lock()
+            .map_err(|_| "麦克风门控状态锁已损坏".to_owned())
+            .map(|duplex| duplex.set_gate_speaking(speaking))
+    }
+
+    pub fn input_health(&self) -> Result<autolive_portaudio_output::PortAudioInputHealth, String> {
+        self.duplex
+            .lock()
+            .map_err(|_| "麦克风输入健康状态锁已损坏".to_owned())
+            .map(|duplex| duplex.input_health())
+    }
 }
 
 #[derive(Debug)]
@@ -787,6 +897,34 @@ impl AudioCycleOutputControl {
         self.request(OutputCommand::StopInterlude)
     }
 
+    /// 设置最终混音 PCM 的 RTMP 分流。
+    ///
+    /// 分流在 PortAudio 输出线程中只做非阻塞尝试；队列已满或发布端停止时，
+    /// 丢弃该块也不会影响本地声音输出。
+    pub fn set_rtmp_audio_sink(
+        &self,
+        sink: Option<crate::rtmp_output::RtmpAudioSink>,
+    ) -> Result<(), String> {
+        self.request(|response| OutputCommand::SetRtmpAudioSink { sink, response })
+    }
+
+    pub fn enable_microphone(
+        &self,
+        config: autolive_portaudio_output::PortAudioDuplexConfig,
+    ) -> Result<MicrophoneAudioBridge, String> {
+        let (response, receiver) = mpsc::channel();
+        self.commands
+            .try_send(OutputCommand::EnableMicrophone { config, response })
+            .map_err(|error| format!("音频输出控制队列不可用：{error}"))?;
+        receiver
+            .recv_timeout(CONTROL_TIMEOUT)
+            .map_err(|_| "音频输出线程未在 1000ms 内确认开启麦克风".to_owned())?
+    }
+
+    pub fn disable_microphone(&self) -> Result<(), String> {
+        self.request(OutputCommand::DisableMicrophone)
+    }
+
     pub fn pause(&self) -> Result<(), String> {
         self.request(OutputCommand::Pause)
     }
@@ -875,6 +1013,8 @@ fn output_loop(
     let mut pending_output = VecDeque::<f32>::new();
     let mut tone_state: Option<ToneState> = None;
     let mut interlude_state: Option<InterludeMixState> = None;
+    let mut microphone_bridge: Option<MicrophoneAudioBridge> = None;
+    let mut rtmp_audio_sink: Option<crate::rtmp_output::RtmpAudioSink> = None;
     let mut timeline = OutputTimeline::default();
     let mut diagnostic_analyzer = LowFrequencyDiagnosticAnalyzer::new(sample_rate_hz);
     let mut paused = output.is_callback_paused();
@@ -928,6 +1068,7 @@ fn output_loop(
                             }
                             match output.prime_stereo_interleaved_available(&samples) {
                                 Ok(written) if written == samples.len() => {
+                                    forward_rtmp_audio(&rtmp_audio_sink, &samples);
                                     diagnostic_analyzer.observe_stereo_pcm(&samples);
                                     current = Some(track);
                                     let health = output.stream_health();
@@ -1070,6 +1211,48 @@ fn output_loop(
                     }
                     let _ = response.send(Ok(()));
                 }
+                OutputCommand::SetRtmpAudioSink { sink, response } => {
+                    rtmp_audio_sink = sink;
+                    let _ = response.send(Ok(()));
+                }
+                OutputCommand::EnableMicrophone { config, response } => {
+                    if microphone_bridge.is_some() {
+                        let _ = response.send(Err("麦克风插话已经启用".to_owned()));
+                        continue;
+                    }
+                    let was_paused = paused;
+                    output.set_callback_paused(true);
+                    output.stop();
+                    match output.start_duplex(config) {
+                        Ok(duplex) => {
+                            output.set_callback_paused(was_paused);
+                            let bridge = MicrophoneAudioBridge::new(duplex);
+                            microphone_bridge = Some(bridge.clone());
+                            let _ = response.send(Ok(bridge));
+                        }
+                        Err(error) => {
+                            // 重新打开 output-only，避免开启麦克风失败后破坏原有播放。
+                            let restore = output.start();
+                            output.set_callback_paused(was_paused);
+                            if let Err(restore_error) = restore {
+                                let _ = response.send(Err(format!(
+                                    "全双工开启失败：{error}；恢复普通音频出口失败：{restore_error}"
+                                )));
+                            } else {
+                                let _ = response.send(Err(error));
+                            }
+                        }
+                    }
+                }
+                OutputCommand::DisableMicrophone(response) => {
+                    fail_microphone_bridge(&mut microphone_bridge);
+                    let was_paused = paused;
+                    output.set_callback_paused(true);
+                    output.stop();
+                    let result = output.start();
+                    output.set_callback_paused(was_paused);
+                    let _ = response.send(result);
+                }
                 OutputCommand::Pause(response) => {
                     fail_pending_switch(&mut pending_crossfade, "音频输出已暂停");
                     paused = true;
@@ -1093,6 +1276,9 @@ fn output_loop(
                 }
                 OutputCommand::Clear(response) => {
                     fail_pending_switch(&mut pending_crossfade, "音频输出已清空");
+                    // 正常命令路径会先由 AppState 停止麦克风；这里仍需
+                    // 防御直接 Clear 的调用，避免 worker 永久等待旧环缓。
+                    fail_microphone_bridge(&mut microphone_bridge);
                     pending_output.clear();
                     current = None;
                     tone_state = None;
@@ -1113,6 +1299,7 @@ fn output_loop(
                     if let Some(interlude) = interlude_state.as_mut() {
                         interlude.cancel_pending_crossfade("音频输出已停止");
                     }
+                    fail_microphone_bridge(&mut microphone_bridge);
                     output.set_callback_paused(true);
                     output.clear_ring();
                     output.stop();
@@ -1123,6 +1310,29 @@ fn output_loop(
                     return;
                 }
             }
+        }
+
+        // DSP/设备故障会撤销桥接存活标志。由唯一输出线程负责把 full-duplex
+        // 流降回 output-only，避免 Worker 需要反向等待控制队列，也保证主轨
+        // 在设备拔出后仍能继续播放（若硬件本身不可用，则沿原有失败路径退出）。
+        if microphone_bridge
+            .as_ref()
+            .is_some_and(|bridge| !bridge.is_available())
+        {
+            fail_microphone_bridge(&mut microphone_bridge);
+            let was_paused = paused;
+            output.set_callback_paused(true);
+            output.stop();
+            if let Err(error) = output.start() {
+                set_failure(
+                    &failure,
+                    format!("麦克风故障后恢复普通音频出口失败：{error}"),
+                );
+                output.stop();
+                update_status(&status, &output, Some(&mut timeline));
+                return;
+            }
+            output.set_callback_paused(was_paused);
         }
 
         if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
@@ -1218,6 +1428,7 @@ fn output_loop(
                         }
                         match output.prime_stereo_interleaved_available(&mixed) {
                             Ok(written) if written == mixed.len() => {
+                                forward_rtmp_audio(&rtmp_audio_sink, &mixed);
                                 diagnostic_analyzer.observe_stereo_pcm(&mixed);
                                 current = Some(switch.next);
                                 let health = output.stream_health();
@@ -1253,6 +1464,7 @@ fn output_loop(
                         ) {
                             let _ = switch.response.send(Err(error.clone()));
                             set_failure(&failure, error);
+                            fail_microphone_bridge(&mut microphone_bridge);
                             output.stop();
                             update_status(&status, &output, Some(&mut timeline));
                             return;
@@ -1264,6 +1476,7 @@ fn output_loop(
                         ) {
                             let _ = switch.response.send(Err(error.clone()));
                             set_failure(&failure, error);
+                            fail_microphone_bridge(&mut microphone_bridge);
                             output.stop();
                             update_status(&status, &output, Some(&mut timeline));
                             return;
@@ -1288,6 +1501,7 @@ fn output_loop(
                     output_chunk_samples,
                 ) {
                     set_failure(&failure, error);
+                    fail_microphone_bridge(&mut microphone_bridge);
                     output.stop();
                     update_status(&status, &output, Some(&mut timeline));
                     return;
@@ -1296,6 +1510,7 @@ fn output_loop(
                     mix_pending_output_once(&mut pending_output, media_gain, &mut interlude_state)
                 {
                     set_failure(&failure, error);
+                    fail_microphone_bridge(&mut microphone_bridge);
                     output.stop();
                     update_status(&status, &output, Some(&mut timeline));
                     return;
@@ -1320,7 +1535,9 @@ fn output_loop(
                     .write_stereo_interleaved_available(write_chunk)
                     .map(|written| {
                         let observed = written.min(write_chunk.len());
-                        diagnostic_analyzer.observe_stereo_pcm(&write_chunk[..observed]);
+                        let observed_chunk = &write_chunk[..observed];
+                        forward_rtmp_audio(&rtmp_audio_sink, observed_chunk);
+                        diagnostic_analyzer.observe_stereo_pcm(observed_chunk);
                         observed
                     }),
             )
@@ -1333,11 +1550,32 @@ fn output_loop(
             Some(Err(error)) => {
                 fail_pending_switch(&mut pending_crossfade, &error);
                 set_failure(&failure, error);
+                fail_microphone_bridge(&mut microphone_bridge);
                 output.stop();
                 update_status(&status, &output, Some(&mut timeline));
                 return;
             }
         }
+    }
+}
+
+/// 撤销输出线程持有的 full-duplex 桥接。
+///
+/// `MicrophoneInterludeController` 仍可能持有同一桥接的 Clone；通过共享
+/// 存活标志通知 DSP worker 尽快退出，再由其拥有者负责取消和 Join。先关
+/// 闭门控可以保证输出故障时主媒体不会被卡在静音态。
+fn fail_microphone_bridge(bridge: &mut Option<MicrophoneAudioBridge>) {
+    if let Some(bridge) = bridge.take() {
+        bridge.mark_unavailable();
+    }
+}
+
+fn forward_rtmp_audio(sink: &Option<crate::rtmp_output::RtmpAudioSink>, samples: &[f32]) {
+    if samples.is_empty() {
+        return;
+    }
+    if let Some(sink) = sink.as_ref() {
+        let _ = sink.try_push(samples);
     }
 }
 

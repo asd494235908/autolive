@@ -326,7 +326,7 @@ test('随机插话抽屉以独立周期范围编辑并继续保存毫秒契约',
     appSource.indexOf('const runtimeRemainingMs'),
   );
   const drawer = appSource.slice(
-    appSource.indexOf('title="随机插话"'),
+    appSource.indexOf('title="插话文件"'),
     appSource.indexOf('title="固定话术"'),
   );
 
@@ -342,20 +342,21 @@ test('随机插话抽屉以独立周期范围编辑并继续保存毫秒契约',
 
 test('随机插话抽屉把全部可编辑输入集中在单一配置区', async () => {
   const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
+  const drawerStart = appSource.lastIndexOf('<FeatureDrawerSection', appSource.indexOf('title="插话配置"'));
   const drawer = appSource.slice(
-    appSource.indexOf('title="随机插话"'),
-    appSource.indexOf('title="固定话术"'),
+    drawerStart,
+    appSource.indexOf('</FeatureDrawer>', drawerStart),
   );
 
   assert.equal(drawer.match(/<FeatureDrawerSection/g)?.length, 1);
   assert.match(drawer, /title="插话配置"/);
-  assert.match(drawer, /title="插话配置"[\s\S]*aria-label="启用随机插话"[\s\S]*label="插话媒体目录"[\s\S]*ariaLabel="插话声音周期最小值（秒）"[\s\S]*aria-label="插话音轨选择方式"[\s\S]*ariaLabel="原声压低"/);
+  assert.match(drawer, /title="插话配置"[\s\S]*aria-label="启用插话文件"[\s\S]*label="插话媒体目录"[\s\S]*ariaLabel="插话声音周期最小值（秒）"[\s\S]*aria-label="插话音轨选择方式"[\s\S]*ariaLabel="原声压低"/);
 });
 
 test('随机插话抽屉列出音视频格式并说明视频仅使用音轨', async () => {
   const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
   const drawer = appSource.slice(
-    appSource.indexOf('title="随机插话"'),
+    appSource.indexOf('title="插话文件"'),
     appSource.indexOf('title="固定话术"'),
   );
 
@@ -370,7 +371,7 @@ test('随机插话抽屉列出音视频格式并说明视频仅使用音轨', as
 test('随机插话前端最多接收 1000 个文件并显示已保存快照数量', async () => {
   const appSource = await readFile(path.join(currentDir, 'App.tsx'), 'utf8');
   const drawer = appSource.slice(
-    appSource.indexOf('title="随机插话"'),
+    appSource.indexOf('title="插话文件"'),
     appSource.indexOf('title="固定话术"'),
   );
 
@@ -436,7 +437,7 @@ test('插话保存独立的 22 项随机预设池、混轨和变化周期契约'
     appSource.indexOf('const runtimeRemainingMs'),
   );
   const drawer = appSource.slice(
-    appSource.indexOf('title="随机插话"'),
+    appSource.indexOf('title="插话文件"'),
     appSource.indexOf('title="固定话术"'),
   );
 
@@ -483,7 +484,7 @@ test('插话支持固定音轨、所选池随机与一键全选，并保存选�
     appSource.indexOf('const runtimeRemainingMs'),
   );
   const drawer = appSource.slice(
-    appSource.indexOf('title="随机插话"'),
+    appSource.indexOf('title="插话文件"'),
     appSource.indexOf('title="固定话术"'),
   );
 

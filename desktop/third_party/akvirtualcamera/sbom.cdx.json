@@ -1,0 +1,63 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:9cf77ae6-379e-5f63-9255-5f4b377478d3",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "group": "gpautolive",
+      "name": "akvirtualcamera-output",
+      "version": "0.1.0"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "group": "webcamoid",
+      "name": "akvirtualcamera",
+      "version": "9cf77ae6379e5f635255f4b377478d388a46a3b2",
+      "purl": "pkg:github/webcamoid/akvirtualcamera@9cf77ae6379e5f635255f4b377478d388a46a3b2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "38adfa9eb271f5e602cc26b495c2c7e761b2e707b2bc9bbb047d57ce9c1e231a"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        }
+      ]
+    },
+    {
+      "type": "application",
+      "group": "gpautolive",
+      "name": "akvirtualcamera-sidecar-overlay",
+      "version": "0.1.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "group": "microsoft",
+      "name": "windows",
+      "version": "0.61.3",
+      "purl": "pkg:cargo/windows@0.61.3",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    }
+  ]
+}

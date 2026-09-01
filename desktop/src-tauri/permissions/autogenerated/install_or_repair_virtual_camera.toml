@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-install-or-repair-virtual-camera"
+description = "Enables the install_or_repair_virtual_camera command without any pre-configured scope."
+commands.allow = ["install_or_repair_virtual_camera"]
+
+[[permission]]
+identifier = "deny-install-or-repair-virtual-camera"
+description = "Denies the install_or_repair_virtual_camera command without any pre-configured scope."
+commands.deny = ["install_or_repair_virtual_camera"]

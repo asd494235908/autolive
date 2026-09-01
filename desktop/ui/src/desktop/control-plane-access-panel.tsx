@@ -136,7 +136,7 @@ export function ControlPlaneAccessPanel({
                 <div className="desktop-access-section-heading">
                   <div>
                     <Typography.Title id="desktop-account-section-title" level={4}>账号密码</Typography.Title>
-                    <Typography.Text type="secondary">使用与管理后台一致的账号和密码。</Typography.Text>
+                    <Typography.Text type="secondary">使用管理端创建的普通用户账号和密码；管理员账号请在管理端登录。</Typography.Text>
                   </div>
                 </div>
                 <Form.Item label="账号" name="username" rules={[

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-stop-rtmp-output"
+description = "Enables the stop_rtmp_output command without any pre-configured scope."
+commands.allow = ["stop_rtmp_output"]
+
+[[permission]]
+identifier = "deny-stop-rtmp-output"
+description = "Denies the stop_rtmp_output command without any pre-configured scope."
+commands.deny = ["stop_rtmp_output"]

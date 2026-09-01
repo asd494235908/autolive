@@ -1,6 +1,6 @@
 # ZLMediaKit RTMP GPU 直推实施方案
 
-> 状态（2026-08-30）：方案已确认，尚未实施代码、IPC、权限、UI 或真实推流验收。本文件是该功能后续开发、审查和验收的唯一实施入口；没有真实运行证据前必须标记为“正式需求·待实施/未接入”，不得描述为已支持推流。
+> 状态（2026-08-31）：初版实施任务已完成，Rust 核心、最终 PCM 非阻塞分流、PCM 过载触发重建、确定性 FFmpeg 错误分类、Tauri IPC/权限、Windows Job Object 兜底、播放源身份快照、Vulkan 设备显式绑定、GPU 静态过滤链到 CPU4 的单向回退和桌面 UI 已接入；本机临时 Windows ZLMediaKit 三轨道、RTMPS TLS、局域网 on_publish 鉴权拒绝、立即取消、AMD AMF + GPU83 静态快照、一次本地断开/恢复、修复进度心跳后的 5 分钟 GPU 长稳及 30 分钟 AV+PCM+GPU83 长稳已通过联调。目标显卡矩阵、远端鉴权/网络故障和跨环境退出残留仍未完成。本文件仍是后续开发、审查和验收的唯一实施入口；在全部真实运行证据完成前，产品必须标记为“正式需求·待实施/未接入”，不得描述为完整支持推流。
 
 > 范围澄清：ZLMediaKit 部署在用户指定的流媒体服务器上，桌面客户端直接向用户输入的 `rtmp://` 或 `rtmps://` 地址发布媒体。Go 后端和 React 管理系统不转发、不代理、不保存媒体正文；本方案不接入 OBS、直播平台账号、多平台分发或平台审核/检测规避能力。
 
@@ -67,6 +67,8 @@
 - `开始推流`、`停止推流`主操作。
 - 真实状态、已发布时间、实际编码器、输出轨道、当前码率、重试次数和脱敏错误。
 
+含声音启动时必须先有可用的 PortAudio 最终 PCM 总线；若声音出口未启用或不可用，客户端拒绝启动并提示先切换到 PortAudio，不改动本地播放状态。
+
 推流过程中锁定地址、轨道组合和编码规格。用户修改草稿不改变实际运行会话；停止并重新开始成功后才提交新配置。
 
 ### 4.2 地址与敏感信息
@@ -84,6 +86,7 @@ Rust 边界必须验证：
 - scheme 只允许 `rtmp`、`rtmps`。
 - 完整地址 UTF-8 长度不超过 `2048` 字节，不含控制字符、CR/LF 或空白前后缀。
 - host 必须存在，显式端口必须在 `1..=65535`，路径必须至少包含发布目标。
+- IPv6 目标必须使用方括号并通过标准 IPv6 解析（例如 `rtmp://[::1]:1935/live/stream`）；查询参数可以存在，但不能替代发布路径。
 - 地址通过参数数组交给 FFmpeg，禁止经过 shell 或拼接命令字符串。
 - 错误、stderr 尾缓冲和结构化日志只显示 `scheme://host:port/<redacted>`，不得显示 userinfo、path 中可能的 stream key 或 query。
 - 默认不持久化完整地址。若后续提供“记住地址”，非敏感 server/app 可进入普通本地配置，用户明确标记的秘密部分必须进入系统凭据库；第一版可直接不提供持久化以缩小风险。
@@ -160,8 +163,8 @@ Rust 边界必须验证：
 
 ### 6.3 第一版编码基线
 
-- 视频：H.264、`yuv420p`、默认 `1920×1080@30fps`、默认 `6000kbps`、GOP `2s`、低延迟参数、B 帧关闭或最小化。
-- 音频：AAC-LC、`48kHz`、双声道、默认 `160kbps`。
+- 视频：H.264、`yuv420p`、默认 `1280×720@30fps`、默认 `2500kbps`、GOP `2s`、低延迟参数、B 帧关闭或最小化；`1920×1080`/更高码率需通过额外 GPU 与网络门禁。
+- 音频：AAC-LC、统一输出 `48kHz` 双声道、默认 `128kbps`；FFmpeg 输入端读取当前 PortAudio 出口的实际采样率（默认 `44.1kHz`），再负责重采样，禁止把 `44.1kHz` PCM 误标成 `48kHz`。
 - 输出：FLV muxer，目标为用户输入的 RTMP/RTMPS 地址。
 - 分辨率、帧率、码率、GOP 和声道布局在一次会话内固定。
 - 编码器专用参数必须由固定枚举生成；UI 不接收自由格式 FFmpeg option。
@@ -180,6 +183,7 @@ Rust 边界必须验证：
 - 分流写入必须非阻塞，不能在 PortAudio callback 或音频生产关键路径等待 FFmpeg。
 - 缓冲以毫秒和字节双上限约束；达到上限时返回结构化落后状态并触发推流重建，禁止静默积压。
 - 暂停或媒体暂无声音时的静音策略必须与 RTMP 连接保活策略一起测试。
+- `RtmpAudioSink` 分片沿用 PortAudio 实际采样率；FFmpeg 将输入重采样为固定 `48kHz` AAC 输出，50ms 静音块按输入采样率计算。
 - 仅声音模式不要求最终效果窗口或 mpv 视频会话存在。
 - 后续麦克风插话完成后，其清理后 PCM 进入同一最终总线即可自然进入推流。
 
@@ -215,6 +219,8 @@ pub enum RtmpOutputState {
 - `video_enabled`、`audio_enabled`；
 - 当前播放身份；
 - 实际编码器、分辨率、帧率、目标码率；
+- FFmpeg 最近一次报告的实际输出码率；
+- 实际视觉过滤链（GPU83/CPU4/Original）；
 - FFmpeg PID；
 - 已发布时间、最近进度时间、输出字节和重试次数；
 - 有界错误码与脱敏摘要。
@@ -287,29 +293,40 @@ audio_bitrate_kbps
 
 ### Phase 1：FFmpeg 直接发布技术门禁
 
-- 在本地开发机使用随包 FFmpeg 向真实 ZLMediaKit 验证三种轨道组合。
-- 分别验证 NVENC、AMF、QSV、Media Foundation 和 OpenH264；没有对应硬件时记录未验证，不伪造通过。
-- 验证用户地址中的 query/token 能发布且日志完全脱敏。
-- 验证 H.264/AAC/FLV 轨道在 ZLMediaKit 与至少一个实际播放器中可读。
+- [x] 在本地开发机使用 FFmpeg 向真实 Windows ZLMediaKit 验证三种轨道组合。
+- [x] 在本机逐一探测 NVENC、AMF、QSV、Media Foundation 和 OpenH264；结果为 `h264_amf`、`libopenh264` 可用，NVENC 因缺少 `nvcuda.dll`、QSV 因 MFX 实现不支持、Media Foundation 因 `AMDh264Encoder` 格式协商失败而不可用，均保留为能力失败而未伪造通过。
+- [x] 验证用户地址中的 query/token 能发布且日志完全脱敏（本机临时 ZLMediaKit 回读 `?token=opaque-query` 成功；Rust 状态只保留脱敏主机和白名单错误码）。
+- [x] 验证 H.264/AAC/FLV 轨道在 ZLMediaKit 与至少一个实际播放器中可读（本机随包 mpv 使用 `--vo=null --ao=null --length=5` 连接临时 ZLMediaKit，实际识别并解码 H.264 `320×180@30fps` 与 AAC `48kHz/2ch`，进程正常退出）。
 
-### Phase 2：Rust 会话和 GPU 视频
+### Phase 2：Rust 会话和 GPU 视频（代码已接入，门禁待完成）
 
-- 建立 `rtmp_output` 状态、配置、进程监督和生命周期。
-- 复用 `build_gpu83_video_filter` 与硬件编码器探测。
-- 按当前 source-local PTS 开始，完成暂停、停止、循环和换源受控重建。
-- 失败保持本地播放，不得让 RTMP 故障改变 mpv/PortAudio 权威状态。
+- [x] 建立 `rtmp_output` 状态、配置、进程监督和生命周期。
+- [x] 复用 `build_gpu83_video_filter` 与硬件编码器探测，并显式绑定 Vulkan 过滤设备。
+- [x] 按当前 source-local PTS 开始，完成停止、循环和换源受控重建；暂停/恢复的长稳行为仍待实机门禁。
+- [x] 纯音频模式强制忽略误传的视频滤镜快照，不初始化 Vulkan、不运行视频滤镜或编码器。
+- [x] 纯声音启动不再强制读取播放池源文件，只依赖已启动的最终 PCM 总线；启用画面时仍要求当前源为可读视频。
+- [x] 推流启动阶段的 H.264 能力探测支持取消；用户停止时会终止正在进行的 FFmpeg 探测子进程，不再被硬件探测超时拖延。
+- [x] GPU 过滤链启动失败时单向回退 CPU4（无可用参数快照时回退中性视频链），保持本地播放不受 RTMP 故障影响。
+- [x] 受限解析 FFmpeg stderr：鉴权/参数/编码器等确定性错误直接失败，连接类错误才进入有界重连；读取器会排空超长行但只保留固定前缀，原始 stderr 不进入状态。
+- [x] 使用随包 FFmpeg 在本机 AMD GPU 上以 `h264_amf + Vulkan/libplacebo GPU83 静态快照` 向真实 ZLMediaKit 发布约 12 秒，状态持续 `Publishing` 且音频无丢弃；NVIDIA、Intel、Media Foundation 和 CPU-only 仍需独立门禁。
+- [x] 进度协议不再受 64KB 错误尾缓冲截断：长期 `-progress pipe:2` 心跳持续解析，64KB 诊断预算只统计非进度行且错误分类仍保持有界；受管 GPU83 会话在本机临时 ZLMediaKit 上连续运行约 5 分钟，`h264_amf`、发布时间和输出字节持续增长且未发生重连。
+- [x] 30 分钟 AV+PCM+GPU83 长稳：本机临时 ZLMediaKit 上持续 `1800s`，状态始终为 `Publishing`，`h264_amf`、GPU83、`retry_count=0`、`dropped_audio_chunks=0`，最终 `published_ms=1693056`、输出 `560318471` 字节；结束后受管 FFmpeg/音频线程均退出且无残留。
+- [x] 管理器句柄释放兜底：`RtmpOutputManager` 使用独立的外部句柄计数，不把工作线程持有的 `inner` 引用误当成管理器所有者；最后一个句柄释放时会请求停止并 Join，避免应用异常退出时遗留 FFmpeg。
 
-### Phase 3：最终声音总线
+### Phase 3：最终声音总线（代码已接入，门禁待完成）
 
-- 增加有界非阻塞 PCM sink，接入 AAC 输入。
-- 覆盖普通声音处理、插话、音量、静音、暂停、无音轨和纯音频项。
+- [x] 增加有界非阻塞 PCM sink，接入 AAC 输入。
+- [x] PCM sink 的关闭与非阻塞发送通过同一发送端锁线性化，关闭后的旧会话不会再接收迟到分片。
+- [x] 队列过载会记录丢弃计数并立即结束当前 FFmpeg 尝试，进入有界重连，避免无界积压。
+- [x] 覆盖普通声音处理、插话、音量、静音、暂停、无音轨和纯音频项的分流入口；音视频模式在无 PCM 时按 PortAudio 实际输入采样率发送 50ms 有界静音块并由 FFmpeg 统一输出 48kHz AAC，真实最终 PCM 到达后立即接管；最终声音连续性仍待实机门禁。
+- [x] PortAudio 出口被替换或释放时先停止含声音的 RTMP 会话，避免旧发布器在新 PCM sink 尚未接管期间继续发布静音；用户需在新声音出口就绪后显式重新开始推流。
 - 固定话术在 PCM 接入前保持明确限制；若用户要求完整进入推流，再实施系统 TTS PCM 子任务。
 
-### Phase 4：桌面 UI
+### Phase 4：桌面 UI（代码已接入，门禁待完成）
 
-- 新增 RTMP 卡片、草稿/运行配置分离、三种轨道选择和真实状态。
-- 覆盖 loading、starting、publishing、reconnecting、failed、stopping 和权限错误。
-- 地址错误只展示脱敏摘要，复制/保存行为不得泄漏秘密。
+- [x] 新增 RTMP 卡片、草稿/运行配置分离、三种轨道选择和真实状态。
+- [x] 覆盖 loading、starting、publishing、reconnecting、failed、stopping 和权限错误的展示路径。
+- [x] 地址错误只展示脱敏摘要；当前不提供复制或持久化完整地址；视觉链状态明确区分 GPU83、CPU4 和原始链，音频-only 不伪造视频链。
 
 ### Phase 5：长稳和发布门禁
 
@@ -362,6 +379,53 @@ pnpm run build
 4. 播放池跨视频、纯音频和无音轨视频，观察第一阶段重新发布时长和可理解状态。
 5. 断开网络、停止 ZLMediaKit、返回鉴权拒绝、恢复网络，核对有界重试和取消。
 6. 运行 30 分钟后核对 CPU/GPU/RSS、句柄、线程、PID 和缓冲无持续增长。
+
+### 13.1 本次实现的本地验证记录（2026-08-31）
+
+- `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check`：通过。
+- `cargo check --manifest-path desktop/src-tauri/Cargo.toml --all-targets`：通过。
+- `cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings`：通过。
+- `cargo build --manifest-path desktop/src-tauri/Cargo.toml --release`：被现有 Windows 发布资源门禁阻断（`runtime-resources.json`/`embedded-runtime-resources` 当前只有开发用 FFmpeg、FFprobe、mpv 和 d3dcompiler，缺少 mpv 运行时 DLL 与法律材料）；这不是 RTMP 源码编译错误，发布资源必须先通过既有 Phase 7B 技术/法律准入，不能用占位文件绕过。
+- `cargo build --manifest-path desktop/src-tauri/Cargo.toml --profile test`：通过，证明不触发发布资源准入时 RTMP 代码可以完成非测试 profile 的本地链接构建。
+- `cargo test --manifest-path desktop/src-tauri/Cargo.toml --all-targets --quiet`：使用独立 `CARGO_TARGET_DIR=E:\\zlm-rtmp-validation\\target-final-check`、`CARGO_BUILD_JOBS=1` 完成全目标复核；共 906 项测试通过（599+109+其余集成/契约目标），0 失败。此前复跑曾受并行编译的 Windows 页面文件压力影响，未影响本次隔离目录结果。
+- `cargo test --manifest-path desktop/src-tauri/Cargo.toml rtmp_output --lib`：RTMP 专项 28 项通过，包含实际输入采样率、48kHz 输出重采样和 FFmpeg 实际码率解析回归。
+- `cargo test --manifest-path desktop/src-tauri/Cargo.toml media_engine::tests::cpu4_filter_keeps_only_the_four_declared_visual_controls --lib`：CPU4 过滤链约束测试通过（1 项）。
+- `pnpm --dir desktop/ui typecheck --pretty false`、`pnpm --dir desktop/ui run build`：通过；Vite 仅提示既有大 chunk 警告。
+- `pnpm --dir desktop/ui test`：预检 22 项通过；主套件 537 项通过、1 项跳过、3 项失败（含新增 RTMP 面板契约测试通过）。失败为既有 Phase 7A/输入锁/CLI 报告契约测试，与本次 RTMP 改动无关；命令因此返回非零。
+- `node --test desktop/tools/lightweight-desktop-build.test.mjs`：15 项通过；归档器同时覆盖旧版 `target/<profile>/bundle/nsis` 和 Tauri CLI 2.11 的 `target/<profile>/nsis/x64` Windows NSIS 输出布局，并只清理当前目标的 NSIS 目录。
+- `pnpm --dir desktop/ui run tauri:build:test`：通过；本地生成测试版 `autolive-desktop-core.exe`、NSIS 安装包和带运行资源的 portable ZIP，归档至 `desktop/package-test/v0.1.0/x86_64-pc-windows-msvc`。测试包使用固定测试控制面和 `--no-sign`，不代表正式发布资源已获 Phase 7B 准入。
+- 本轮收尾复核：`rustfmt --edition 2021 --check desktop/src-tauri/src/rtmp_output/process.rs`、`cargo test --manifest-path desktop/src-tauri/Cargo.toml rtmp_output --lib`（28 项）和 `node --test desktop/ui/src/desktop/rtmp-output-panel.test.mjs` 均通过；`cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib`（599 项）以及 `pnpm --dir desktop/ui typecheck --pretty false` 与生产构建再次通过。
+- 视觉链、生命周期、纯音频滤镜、启动取消、实际采样率及实际码率解析回归收尾复核：Rust RTMP 专项 `28/28`、全目标 `906/906`，面板契约测试和类型检查通过；视频会话发布 `original` 时 UI 显示“原始链”，不再把未知/原始状态映射为 CPU4。
+- stderr 诊断预算修复后的收尾复跑：Rust 管理器音频-only harness 重新运行约 10 秒，状态持续 `Publishing`、`dropped=0`，ZLMediaKit 再次核对 `CodecAAC[48000/2/16]`，结束后无进程残留。
+- 本轮收尾后 `cargo check --manifest-path desktop/src-tauri/Cargo.toml --all-targets` 与 `cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings` 均通过；此前虚拟摄像头代码的编译阻断已由工作区现有改动修复，不属于 RTMP 改动路径。
+- 启动取消边界补充：`h264_encoder_attempt_order_with_cancel` 将停止令牌传入编码器列表/短样本探测；取消后立即终止探测子进程并返回 `Cancelled`，新增单元测试验证已取消请求不会启动探测进程。
+- 纯声音入口补充：`start_rtmp_output` 仅在启用画面时解析和校验当前播放池源；仅声音模式可在无源文件时直接消费 PortAudio 最终 PCM，底层不会创建视频输入或 GPU 过滤器。
+- 本机 FFmpeg RTMP loopback 烟测：发布端和监听端均正常退出，`ffprobe` 核对捕获 FLV 同时包含 H.264 视频（320×180，30 FPS）和 AAC 音频；该结果只证明 FFmpeg/FLV/RTMP 本地链路，不替代 ZLMediaKit 验收。
+- 本机 FFmpeg RTMP loopback 轨道烟测：仅画面捕获 FLV 仅含 H.264，仅声音捕获 FLV 仅含 AAC，发布端和监听端均返回成功；监听端在发布端主动结束时的 I/O 结束提示属于测试连接收尾，不影响 `ffprobe` 轨道结果。
+- 本机 `pipe:0` PCM 烟测：向与 Rust 相同的 `f32le/48kHz/双声道` 输入管道写入 3 秒 PCM，捕获 FLV 同时核对出 H.264 + AAC，发布端返回码为 0。
+- 真实 ZLMediaKit Windows 联调：使用仓库外临时目录中的 Windows x64 `MediaServer.exe`（监听 `1935`，临时配置 `addMuteAudio=0`），分别发布并从 `rtmp://127.0.0.1:1935/live/*` 回读音画、仅画面和仅声音；`ffprobe` 分别核对 H.264 + AAC、仅 H.264、仅 AAC，三项发布端和回读端均返回成功。该包仅用于本机验证，不进入产品发布物。
+- RTMPS Windows 烟测：使用同一临时 ZLMediaKit、`default.pem` 和独立临时配置监听 `1936`，FFmpeg 通过 `rtmps://127.0.0.1:1936/live/rtmps-smoke`（关闭仅用于自签名本机证书校验）发布 3 秒 H.264 + AAC，退出码为 `0`；ZLMediaKit 日志确认 TLS 复杂握手成功并登记 `CodecH264[320/180/0] + CodecAAC[48000/2/16]`，测试服务器和临时配置均已停止/清理。
+- 本机发布鉴权拒绝烟测：临时 ZLMediaKit 的 `on_publish` Hook 返回 `code=-1`，Rust harness 通过局域网地址 `192.168.10.6` 发布时进入 `Failed`，固定 `error_code=rtmp_publish_rejected`、`retry_count=0`，错误只显示“RTMP 服务器拒绝发布，请检查地址或鉴权”，状态目标地址保持脱敏；临时 Hook、配置和服务器均已清理。
+- 本机立即取消烟测：Rust harness 启动 video-only 发布约 `600ms` 后调用 `manager.stop()`，停止前状态为 `Starting`、存在受管 FFmpeg PID，停止后状态为 `Idle`、`process_id=None`、视觉链清空；测试服务器、FFmpeg 和 harness 均无残留。
+- 管理器 Drop 实机烟测：仓库外临时 harness 等待状态进入 `Publishing` 且拿到真实 FFmpeg PID（`pid=23008`）后直接释放最后一个 `RtmpOutputManager` 句柄；进程工作树在退出后无 `MediaServer.exe`、FFmpeg 或 harness 残留，证明工作线程持有内部 `Arc` 时仍能触发句柄释放兜底。
+- 本机换源重发布烟测：同一发布地址先以 `sample.mp4`（`playback_generation=1`、池项 `0`）发布约 2 秒并停止，再以无音轨 `sample-video-only.mp4`（`playback_generation=2`、池项 `1`）重新发布；两次均为 `Publishing`，会话代次从 `1` 递增到 `2`、受管 FFmpeg PID 更换，停止后均回到 `Idle` 且无进程残留，符合第一阶段“换源停止并重新发布”边界。
+- Rust 管理器音频-only 联调：仓库外 `audio_only` harness 关闭视频、仅向 `RtmpAudioSink` 写入 48kHz 双声道 PCM，连续约 10 秒保持 `Publishing`、`video=false`、`audio=true`、`dropped=0`；ZLMediaKit 日志核对为 `CodecAAC[48000/2/16]`，结束后 FFmpeg 和临时 MediaServer 均已清理。
+- 纯声音无源文件联调：仓库外临时 harness 将不存在的源路径传给 `RtmpOutputManager`，关闭视频后仅写入最终格式 PCM；约 15 秒保持 `Publishing`、`video=false`、`audio=true`、`published_ms=14805`、`dropped=0`，ZLMediaKit 日志核对 `CodecAAC[48000/2/16]`，证明仅声音模式不依赖播放池源文件；测试文件、FFmpeg 和 MediaServer 均已清理。
+- 采样率边界回归：`start_rtmp_output` 优先读取 PortAudio 状态中的 `actual_sample_rate_hz`，不可用时回退到配置采样率（默认 `44100Hz`），FFmpeg 以该值解释 `f32le` 输入并统一编码 `48000Hz` AAC；新增命令参数和 50ms 静音块测试覆盖 `44100/48000` 及非法采样率，避免声音变速变调。
+- Rust 管理器无音轨视频联调：使用无音轨 H.264 源媒体和 GPU83 静态快照，连续约 12 秒保持 `Publishing`、`video=true`、`audio=false`、`h264_amf`、`retry=0`；ZLMediaKit 日志核对为 `CodecH264[320/180/30]`，结束后 FFmpeg 和临时 MediaServer 均已清理。
+- RTMP 地址 query 烟测：向 `rtmp://127.0.0.1:1935/live/query-test?token=opaque-query` 发布并成功回读 H.264 + AAC；query/token 未进入状态摘要或日志。
+- 实际播放器联调：本机随包 `mpv` 连接临时 ZLMediaKit 的 `rtmp://127.0.0.1:1935/live/mpv-test2`，5 秒无窗口解码后正常退出；播放器输出确认 H.264 `320×180@30fps/500kbps`、AAC `48kHz/2ch/128kbps`，ZLMediaKit 日志同时记录 RTMP play 会话；测试结束后 publisher、mpv 和临时 MediaServer 均已清理。
+- 本机编码器能力探测：随包 FFmpeg 的 `h264_amf`（AMD）和 `libopenh264` 通过 30 帧 null 输出；`h264_nvenc` 明确报 `Cannot load nvcuda.dll`，`h264_qsv` 报 MFX implementation unsupported，`h264_mf` 报 `AMDh264Encoder` format negotiation failed；因此跨 NVIDIA/Intel/Media Foundation 的发布门禁仍保持未完成。
+- 当前实机环境记录：Windows 11 专业版 x64（Build 26200），显卡为 AMD Radeon RX 6750 GRE 10GB；该记录只证明当前 AMD/Windows 11 环境，不替代 Windows 10、NVIDIA、Intel 或 CPU-only 矩阵。
+- 项目自身 Rust 核心联调：仓库外临时 harness 调用 `RtmpOutputManager`，使用随包 FFmpeg、`sample.mp4` 和 48kHz 双声道 PCM 向同一 ZLMediaKit 发布约 12 秒；状态持续为 `Publishing`，实际编码器为 AMD `h264_amf`，音频丢弃分片为 `0`，ZLMediaKit 日志确认 `CodecH264[320/180/30] + CodecAAC[48000/2/16]`。
+- 项目自身 GPU 核心联调：同一 harness 使用有效参数快照生成约 12.8KB 的静态 GPU83/libplacebo 过滤链，显式 Vulkan 设备绑定成功；ZLMediaKit 日志确认 `CodecH264[320/180/30] + CodecAAC[48000/2/16]`，Rust 状态为 `video_filter_backend=gpu83`、`encoder=h264_amf`、`dropped_audio_chunks=0`。
+- 5 分钟 GPU 长稳联调：修复进度心跳被 64KB stderr 尾缓冲截断后，受管 video-only harness 在 ZLMediaKit 上持续约 299 秒，状态始终为 `Publishing`，`video_filter_backend=gpu83`、`encoder=h264_amf`、`retry_count=0`，`published_ms=299166`、输出约 `102032803` 字节；FFmpeg PID 未在原会话内重启，结束后无残留进程。
+- 30 分钟 AV+PCM+GPU83 长稳联调：同一受管 harness 在临时 Windows ZLMediaKit 上连续运行 `1800s`，全程 `Publishing`，`encoder=h264_amf`、`video_filter_backend=gpu83`、`retry_count=0`、`dropped_audio_chunks=0`；最终 `published_ms=1693056`、输出 `560318471` 字节。FFmpeg 工作集约 `75MB`、句柄约 `1664`，ZLMediaKit 工作集约 `20MB`、句柄约 `207`，观测期间无持续增长、无重启；结束后 harness 与 FFmpeg 均退出，随后手动停止临时 ZLMediaKit，未发现残留进程。
+- 本地故障恢复联调：临时 harness 在推流约 2 秒时停止 ZLMediaKit、约 6 秒时重启；Rust 会话进入 `Reconnecting`，`retry_count=1`，服务器恢复后回到 `Publishing`，最终 `published_ms` 持续增长。故障期间产生的有限音频丢弃被计数并触发受控重建，harness 退出后未残留 `MediaServer.exe` 或 FFmpeg 进程。
+- GPU 回退联调：临时把 GPU 过滤器注入为确定性 `no_such_filter` 错误，Rust 先耗尽 GPU 编码尝试后单向切换 `video_filter_backend=cpu4`，随后以 AMD `h264_amf` 回到 `Publishing` 并持续推进；故障注入结束后无 `MediaServer.exe` 或 FFmpeg 残留。
+- 状态合同补充固定 `error_code`：`rtmp_publish_rejected`、`rtmp_encoder_unavailable`、`rtmp_filter_unavailable`、`rtmp_retries_exhausted` 等，仅返回白名单代码和脱敏摘要。
+- UI 在真实 GPU/网络门禁完成前将 50/60 FPS 选项保持禁用，默认和可选运行档位为 25/30 FPS；Rust 边界仍保留固定白名单校验。
+- 当前开发机已完成一次临时 Windows ZLMediaKit 三轨道联调、`rtmps://` TLS、局域网地址 `on_publish` 鉴权拒绝、立即取消、同地址换源重发布、项目自身 harness 的 AMD `h264_amf + GPU83 静态过滤链` 实际发布、一次本地断开/恢复及 30 分钟 AV+PCM+GPU83 长稳；但仍没有远端鉴权/复杂网络故障、GPU 编码器全矩阵、Windows 10/11 矩阵及跨环境退出残留门禁证据。因此本需求继续标记为“正式需求·待实施/未接入”，不能据此宣称发布版完整支持。
 
 ## 14. 依赖和参考
 

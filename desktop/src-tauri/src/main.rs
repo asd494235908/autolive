@@ -6,6 +6,8 @@
 mod audio_cycle_switch;
 mod commands;
 mod control_plane_auth;
+mod douyin_live;
+mod virtual_camera_output;
 
 use autolive_desktop_core::runtime_resource_task::{
     handle_runtime_resource_exit, RuntimeResourceTaskShutdown,
@@ -18,25 +20,33 @@ use commands::{
     complete_playback_loop, configure_realtime_video_cycle, discard_audio_media_candidate,
     discard_media_processing_candidate, ensure_original_video_renderer, get_audio_cycle_diagnostic,
     get_audio_output_backend_status, get_default_media_effect_params, get_device_runtime_info,
-    get_media_engine_capabilities, get_media_video_backend_status, get_runtime_resource_status,
-    get_snapshot, import_runtime_resource_directory, install_runtime_resources,
-    list_audio_output_devices, open_final_effect_window, pause_playback, pause_portaudio_interlude,
-    play_portaudio_test_tone, prepare_audio_cycle_candidate, prepare_audio_media_candidate,
-    prepare_webview_interlude, probe_local_mp4, probe_local_video, probe_local_videos,
-    purge_media_processing_cache, release_audio_media_candidate, release_media_processing_artifact,
+    get_media_engine_capabilities, get_media_video_backend_status, get_microphone_interlude_status,
+    get_rtmp_output_status, get_runtime_resource_status, get_snapshot, get_virtual_camera_status,
+    import_runtime_resource_directory, install_or_repair_virtual_camera, install_runtime_resources,
+    list_audio_output_devices, list_portaudio_input_devices, open_final_effect_window,
+    pause_playback, pause_portaudio_interlude, play_portaudio_test_tone,
+    prepare_audio_cycle_candidate, prepare_audio_media_candidate, prepare_webview_interlude,
+    probe_local_mp4, probe_local_video, probe_local_videos, purge_media_processing_cache,
+    release_audio_media_candidate, release_media_processing_artifact,
     release_webview_interlude_cache, remove_playback_pool_item, reorder_playback_pool_items,
     replace_playback_pool_item, resize_final_effect_window, restore_original_audio,
     restore_original_video, resume_playback, resume_portaudio_interlude, seek_playback,
     set_audio_output_backend, set_audio_processing_profile, set_interlude_config,
-    set_portaudio_interlude_volume, set_portaudio_media_volume, set_processing_switches,
-    start_media_processing, start_playback, start_portaudio_interlude, stop_playback,
-    stop_portaudio_interlude, stop_realtime_video_renderer, switch_portaudio_interlude_preset,
-    sync_audio_output_source, update_playback_position, validate_media_effect_params, AppState,
+    set_microphone_interlude_config, set_portaudio_interlude_volume, set_portaudio_media_volume,
+    set_processing_switches, start_media_processing, start_microphone_interlude, start_playback,
+    start_portaudio_interlude, start_rtmp_output, start_virtual_camera_output,
+    stop_microphone_interlude, stop_playback, stop_portaudio_interlude,
+    stop_realtime_video_renderer, stop_rtmp_output, stop_virtual_camera_output,
+    switch_portaudio_interlude_preset, sync_audio_output_source, update_playback_position,
+    validate_media_effect_params, validate_rtmp_output_config, AppState,
 };
 use control_plane_auth::{
     clear_legacy_auth_credentials, get_or_create_control_plane_device_id,
     login_control_plane_session, logout_control_plane_session, refresh_control_plane_session,
     restore_control_plane_session, retry_pending_control_plane_logout, ControlPlaneAuthState,
+};
+use douyin_live::{
+    get_douyin_live_probe_status, start_douyin_live_probe, stop_douyin_live_probe, DouyinLiveState,
 };
 use std::process::ExitCode;
 use std::time::Duration;
@@ -67,6 +77,7 @@ fn main() -> ExitCode {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .manage(AppState::default())
+        .manage(DouyinLiveState::default())
         .manage(ControlPlaneAuthState::default())
         .invoke_handler(tauri::generate_handler![
             probe_local_video,
@@ -82,7 +93,16 @@ fn main() -> ExitCode {
             get_media_video_backend_status,
             get_audio_output_backend_status,
             get_audio_cycle_diagnostic,
+            get_rtmp_output_status,
+            validate_rtmp_output_config,
+            start_rtmp_output,
+            stop_rtmp_output,
+            get_virtual_camera_status,
+            install_or_repair_virtual_camera,
+            start_virtual_camera_output,
+            stop_virtual_camera_output,
             list_audio_output_devices,
+            list_portaudio_input_devices,
             set_audio_output_backend,
             sync_audio_output_source,
             prepare_audio_cycle_candidate,
@@ -90,6 +110,7 @@ fn main() -> ExitCode {
             cancel_audio_cycle_candidate,
             play_portaudio_test_tone,
             start_portaudio_interlude,
+            start_microphone_interlude,
             switch_portaudio_interlude_preset,
             set_portaudio_media_volume,
             set_portaudio_interlude_volume,
@@ -98,6 +119,9 @@ fn main() -> ExitCode {
             pause_portaudio_interlude,
             resume_portaudio_interlude,
             stop_portaudio_interlude,
+            stop_microphone_interlude,
+            get_microphone_interlude_status,
+            set_microphone_interlude_config,
             get_runtime_resource_status,
             install_runtime_resources,
             cancel_runtime_resource_install,
@@ -138,6 +162,9 @@ fn main() -> ExitCode {
             logout_control_plane_session,
             retry_pending_control_plane_logout,
             clear_legacy_auth_credentials,
+            start_douyin_live_probe,
+            get_douyin_live_probe_status,
+            stop_douyin_live_probe,
             open_final_effect_window,
             close_final_effect_window,
             resize_final_effect_window,
@@ -165,6 +192,7 @@ fn main() -> ExitCode {
         }
         if let RunEvent::ExitRequested { code, .. } = event {
             let state = app_handle.state::<AppState>();
+            app_handle.state::<DouyinLiveState>().shutdown();
             let shutdown = state.shutdown_all(Duration::from_secs(3));
             match &shutdown {
                 Ok(RuntimeResourceTaskShutdown::TimedOut) => {

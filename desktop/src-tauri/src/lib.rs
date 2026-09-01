@@ -25,15 +25,22 @@ pub mod media_video_cycle;
 pub mod media_video_effects;
 pub mod media_video_frame_scheduler;
 pub mod media_video_gpu_effects;
+pub mod microphone_interlude;
 pub mod realtime_video_backend;
 pub mod realtime_video_capability;
 pub mod realtime_video_runtime;
+pub mod rtmp_output;
 pub mod runtime_resource_task;
 pub mod runtime_resources;
 pub mod speech_to_speech;
 pub mod speech_to_speech_worker;
 pub mod webview_interlude_cache;
 pub mod window_sizing;
+
+/// AkVirtualCamera 的平台无关输出契约；Windows 原生采集和 GPL sidecar 只能通过
+/// 该边界提交经过校验的能力事实与帧，避免把平台句柄或未审核的 C API 带入业务层。
+pub use autolive_virtual_camera_contract as virtual_camera_contract;
+pub use autolive_virtual_camera_native as virtual_camera_native;
 
 use crate::audio_processing::AudioProcessingProfile;
 use crate::errors::PlaybackError;

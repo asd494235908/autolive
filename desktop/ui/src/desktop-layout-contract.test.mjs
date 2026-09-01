@@ -113,7 +113,7 @@ test('主页声音参数保持只读，高级抽屉承载可编辑声音控件',
   const app = await readSource('./App.tsx');
   const home = app.slice(
     app.indexOf('<DesktopShell>'),
-    app.indexOf('title="随机插话"'),
+    app.indexOf('title="插话文件"'),
   );
   const advancedDrawer = app.slice(
     app.indexOf('title="高级声音设置"'),
@@ -267,7 +267,7 @@ test('主窗口只暴露本期视频参数，并保留插话与固定话术抽�
   const app = await readSource('./App.tsx');
   const desktop = app.slice(app.indexOf('function DesktopApp()'));
 
-  assert.match(desktop, /title="随机插话"/);
+  assert.match(desktop, /title="插话文件"/);
   assert.match(desktop, /title="固定话术"/);
   assert.match(desktop, /title="高级声音设置"/);
   assert.doesNotMatch(desktop, /实时话术幻化/);
@@ -286,9 +286,9 @@ test('三个功能抽屉复用响应式高密度结构，PortAudio 设置固定�
   assert.match(drawer, /footer=\{footer \? <div className="feature-drawer-footer">/);
   assert.match(drawer, /aria-live="polite"/);
   assert.match(drawer, /mask: \{ background: 'rgba\(0, 0, 0, 0\.64\)' \}/);
-  assert.equal((app.match(/<FeatureDrawer\b/g) ?? []).length, 3);
+  assert.equal((app.match(/<FeatureDrawer\b/g) ?? []).length, 4);
   assert.match(app, /title="高级声音设置"[\s\S]*width=\{760\}/);
-  assert.match(app, /title="随机插话"[\s\S]*width=\{560\}/);
+  assert.match(app, /title="插话文件"[\s\S]*width=\{560\}/);
   assert.match(app, /递归扫描本地媒体目录及其子目录/);
   assert.match(app, /title="固定话术"[\s\S]*width=\{560\}/);
   for (const label of ['插话媒体目录', '插话声音预设', '预制标题', '朗读正文', '声音参数值预设']) {

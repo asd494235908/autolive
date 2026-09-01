@@ -248,7 +248,11 @@ dependencies = [
  "autolive-native-video-host",
  "autolive-portaudio-output",
  "autolive-signalsmith-stretch",
+ "autolive-speech-dsp",
+ "autolive-virtual-camera-contract",
+ "autolive-virtual-camera-native",
  "cap-std",
+ "getrandom 0.3.4",
  "keyring",
  "mp4",
  "realfft",
@@ -286,6 +290,27 @@ name = "autolive-signalsmith-stretch"
 version = "0.1.0"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "autolive-speech-dsp"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "autolive-virtual-camera-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "autolive-virtual-camera-native"
+version = "0.1.0"
+dependencies = [
+ "windows 0.61.3",
 ]
 
 [[package]]

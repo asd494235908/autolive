@@ -72,6 +72,20 @@ function isInvalidSessionError(error: unknown): boolean {
     || Boolean(error && typeof error === 'object' && 'status' in error && (error as { status?: unknown }).status === 401);
 }
 
+function isLoginFormError(error: unknown): boolean {
+  const isFormStatus = (status: unknown): status is number =>
+    status === 400 || status === 401 || status === 429;
+  if (error instanceof ControlPlaneError) {
+    return isFormStatus(error.status);
+  }
+  return Boolean(
+    error
+      && typeof error === 'object'
+      && 'status' in error
+      && isFormStatus((error as { status?: unknown }).status),
+  );
+}
+
 function isCredentialStorageError(error: unknown): boolean {
   if (!error || typeof error !== 'object' || !('code' in error)) return false;
   const code = (error as { code?: unknown }).code;
@@ -186,7 +200,13 @@ export class ControlPlaneSession {
         response.warning,
       );
     } catch (error) {
-      if (this.isCurrent(generation)) this.publish({ ...this.snapshot, status: 'unauthenticated', error });
+      if (this.isCurrent(generation)) {
+        this.publish({
+          ...this.snapshot,
+          status: isLoginFormError(error) ? 'unauthenticated' : 'error',
+          error,
+        });
+      }
     }
     return this.snapshot;
   }

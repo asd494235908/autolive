@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "status": "not_run",
+  "requiredScope": [
+    "Windows 10 1903+ DirectShow",
+    "Windows 11 DirectShow",
+    "Intel/NVIDIA/AMD",
+    "多显示器",
+    "100%/125%/150% DPI",
+    "Chrome/Edge/Teams/Zoom/Discord/OBS/Windows Camera",
+    "至少一个 32 位 DirectShow 客户端",
+    "退出、崩溃、卸载和客户端占用清理"
+  ],
+  "entries": [
+    { "id": "windows-10-directshow", "status": "not_run" },
+    { "id": "windows-11-directshow", "status": "not_run" },
+    { "id": "intel", "status": "not_run" },
+    { "id": "nvidia", "status": "not_run" },
+    { "id": "amd", "status": "not_run" },
+    { "id": "multi-monitor", "status": "not_run" },
+    { "id": "dpi-100", "status": "not_run" },
+    { "id": "dpi-125", "status": "not_run" },
+    { "id": "dpi-150", "status": "not_run" },
+    { "id": "chrome", "status": "not_run" },
+    { "id": "edge", "status": "not_run" },
+    { "id": "teams", "status": "not_run" },
+    { "id": "zoom", "status": "not_run" },
+    { "id": "discord", "status": "not_run" },
+    { "id": "obs", "status": "not_run" },
+    { "id": "windows-camera", "status": "not_run" },
+    { "id": "directshow-32bit", "status": "not_run" },
+    { "id": "cleanup", "status": "not_run" }
+  ]
+}

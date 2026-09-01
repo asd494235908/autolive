@@ -142,6 +142,12 @@ function archiveWindowsPortable({
         cpSync(portaudioReadme, join(stagingRoot, 'portaudio', 'README.md'));
       }
     }
+    const speexdspLicense = resolveDesktopPath('src-tauri/speexdsp/LICENSE.txt');
+    if (!isFile(speexdspLicense)) {
+      throw new Error(`SpeexDSP 许可证缺失：${speexdspLicense}`);
+    }
+    mkdirSync(join(stagingRoot, 'speexdsp'), { recursive: true });
+    cpSync(speexdspLicense, join(stagingRoot, 'speexdsp', 'LICENSE.txt'));
     rmSync(portableRoot, { force: true, recursive: true });
     renameSync(stagingRoot, portableRoot);
   } catch (error) {
@@ -346,11 +352,26 @@ function findInstallerFiles(bundleSourceDir, targetTriple) {
       ? [{ directory: 'nsis', extension: '.exe' }]
       : [];
   return rules.flatMap(({ directory, extension }) => {
-    const directoryPath = join(bundleSourceDir, directory);
-    if (!isDirectory(directoryPath)) return [];
-    return readdirSync(directoryPath, { withFileTypes: true })
-      .filter((entry) => entry.isFile() && entry.name.endsWith(extension))
-      .map((entry) => ({ directory, source: join(directoryPath, entry.name) }));
+    const directoryPaths = [join(bundleSourceDir, directory)];
+    // Tauri CLI 2.11 writes Windows NSIS output to target/<profile>/nsis/x64,
+    // while older versions used target/<profile>/bundle/nsis. Keep the
+    // configured bundle root stable and accept both layouts.
+    if (targetTriple === 'x86_64-pc-windows-msvc') {
+      directoryPaths.push(
+        join(bundleSourceDir, directory, 'x64'),
+        join(bundleSourceDir, '..', directory),
+        join(bundleSourceDir, '..', directory, 'x64'),
+      );
+    }
+    const seen = new Set();
+    return directoryPaths.flatMap((directoryPath) => {
+      const resolvedDirectoryPath = resolve(directoryPath);
+      if (seen.has(resolvedDirectoryPath) || !isDirectory(resolvedDirectoryPath)) return [];
+      seen.add(resolvedDirectoryPath);
+      return readdirSync(resolvedDirectoryPath, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.endsWith(extension))
+        .map((entry) => ({ directory, source: join(resolvedDirectoryPath, entry.name) }));
+    });
   });
 }
 

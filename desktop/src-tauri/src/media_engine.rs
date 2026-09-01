@@ -23,6 +23,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1190,6 +1191,23 @@ fn cpu_basic_video_request(request: &MediaRenderRequest) -> MediaRenderRequest {
     fallback
 }
 
+/// 为实时 GPU83 失败后的直接推流提供 CPU4 等价视觉链。
+///
+/// 只保留 CPU4 合同中的亮度、对比度、饱和度和色相四项；其余正式参数
+/// 不会偷偷在 CPU 路径生效。输出尺寸由 RTMP 发布器统一追加缩放/留边。
+pub fn build_cpu4_video_filter(video: &VideoEffectParams) -> Option<String> {
+    let fallback = VideoEffectParams {
+        brightness_percent: video.brightness_percent,
+        contrast_percent: video.contrast_percent,
+        saturation_percent: video.saturation_percent,
+        hue_rotation_degrees: video.hue_rotation_degrees,
+        ..VideoEffectParams::default()
+    };
+    video_filter_with_runtime_controls(&fallback, &AdvancedEffectParams::default(), false)
+        .ok()
+        .map(|plan| plan.serial_filter)
+}
+
 fn applied_video_fields(request: &MediaRenderRequest) -> Vec<String> {
     match build_media_video_effect_plan(&request.video, &request.advanced) {
         Ok(plan) => plan
@@ -1717,6 +1735,19 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
+    run_command_with_timeout_cancelable(path, args, timeout_ms, None)
+}
+
+fn run_command_with_timeout_cancelable<I, S>(
+    path: &Path,
+    args: I,
+    timeout_ms: u64,
+    cancellation: Option<&AtomicBool>,
+) -> Result<(ExitStatus, Vec<u8>), MediaEngineError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     let mut child = background_command(path)
         .args(args)
         .stdin(Stdio::null())
@@ -1750,6 +1781,11 @@ where
     let mut captured_stdout = None;
     let started = Instant::now();
     let status = loop {
+        if cancellation.is_some_and(|token| token.load(Ordering::Acquire)) {
+            terminate_child(&mut child);
+            let _ = join_probe_stdout(path, &mut stdout_reader);
+            return Err(MediaEngineError::Cancelled);
+        }
         if stdout_reader
             .as_ref()
             .is_some_and(std::thread::JoinHandle::is_finished)
@@ -1851,6 +1887,21 @@ pub fn h264_encoder_attempt_order(ffmpeg_path: &Path) -> Vec<String> {
     encoder_attempt_order_from_preferred(&preferred)
 }
 
+/// 可取消的编码器候选探测，供长生命周期推流启动路径使用。
+///
+/// 普通媒体渲染仍使用不带取消令牌的兼容入口；推流启动可能在硬件探测期间被用户停止，
+/// 因此这里必须把取消传递到每一个 FFmpeg 探测子进程，并在取消后立即终止它。
+pub fn h264_encoder_attempt_order_with_cancel(
+    ffmpeg_path: &Path,
+    cancellation: &AtomicBool,
+) -> Result<Vec<String>, MediaEngineError> {
+    if cancellation.load(Ordering::Acquire) {
+        return Err(MediaEngineError::Cancelled);
+    }
+    let preferred = select_h264_encoder_with_cancel(ffmpeg_path, cancellation)?;
+    Ok(encoder_attempt_order_from_preferred(&preferred))
+}
+
 fn encoder_attempt_order_from_preferred(preferred: &str) -> Vec<String> {
     let candidates = h264_encoder_candidates();
     let start = candidates
@@ -1879,16 +1930,86 @@ fn detect_h264_encoder(ffmpeg_path: &Path) -> String {
     FALLBACK_H264_ENCODER.to_owned()
 }
 
+fn select_h264_encoder_with_cancel(
+    ffmpeg_path: &Path,
+    cancellation: &AtomicBool,
+) -> Result<String, MediaEngineError> {
+    if cancellation.load(Ordering::Acquire) {
+        return Err(MediaEngineError::Cancelled);
+    }
+    if let Ok(cache) = SELECTED_H264_ENCODER.lock() {
+        if let Some((path, encoder)) = cache.as_ref() {
+            if path == ffmpeg_path {
+                return Ok(encoder.clone());
+            }
+        }
+    }
+    let encoder = detect_h264_encoder_with_cancel(ffmpeg_path, cancellation)?;
+    if let Ok(mut cache) = SELECTED_H264_ENCODER.lock() {
+        *cache = Some((ffmpeg_path.to_path_buf(), encoder.clone()));
+    }
+    Ok(encoder)
+}
+
+fn detect_h264_encoder_with_cancel(
+    ffmpeg_path: &Path,
+    cancellation: &AtomicBool,
+) -> Result<String, MediaEngineError> {
+    let available = list_video_encoders_with_cancel(ffmpeg_path, cancellation)?;
+    for candidate in h264_encoder_candidates() {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(MediaEngineError::Cancelled);
+        }
+        if !available.iter().any(|name| name == candidate) {
+            continue;
+        }
+        if candidate == FALLBACK_H264_ENCODER {
+            return Ok(candidate.to_owned());
+        }
+        match probe_h264_encoder_with_cancel(ffmpeg_path, candidate, cancellation) {
+            Ok(true) => return Ok(candidate.to_owned()),
+            Ok(false) => {}
+            Err(MediaEngineError::Cancelled) => return Err(MediaEngineError::Cancelled),
+            Err(_) => {}
+        }
+    }
+    Ok(FALLBACK_H264_ENCODER.to_owned())
+}
+
 fn list_video_encoders(ffmpeg_path: &Path) -> Vec<String> {
-    let Ok((status, stdout)) =
-        run_command_with_timeout(ffmpeg_path, ["-hide_banner", "-encoders"], 5_000)
-    else {
-        return Vec::new();
+    list_video_encoders_with_cancel_option(ffmpeg_path, None).unwrap_or_default()
+}
+
+fn list_video_encoders_with_cancel(
+    ffmpeg_path: &Path,
+    cancellation: &AtomicBool,
+) -> Result<Vec<String>, MediaEngineError> {
+    list_video_encoders_with_cancel_option(ffmpeg_path, Some(cancellation))
+}
+
+fn list_video_encoders_with_cancel_option(
+    ffmpeg_path: &Path,
+    cancellation: Option<&AtomicBool>,
+) -> Result<Vec<String>, MediaEngineError> {
+    let result = run_command_with_timeout_cancelable(
+        ffmpeg_path,
+        ["-hide_banner", "-encoders"],
+        5_000,
+        cancellation,
+    );
+    let (status, stdout) = match result {
+        Ok(value) => value,
+        Err(MediaEngineError::Cancelled) => return Err(MediaEngineError::Cancelled),
+        Err(_) => return Ok(Vec::new()),
     };
     if !status.success() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    String::from_utf8_lossy(&stdout)
+    Ok(parse_video_encoders(&stdout))
+}
+
+fn parse_video_encoders(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
         .lines()
         .filter_map(|line| {
             let trimmed = line.trim();
@@ -1905,8 +2026,24 @@ fn list_video_encoders(ffmpeg_path: &Path) -> Vec<String> {
 }
 
 fn probe_h264_encoder(ffmpeg_path: &Path, encoder: &str) -> bool {
+    probe_h264_encoder_with_cancel_option(ffmpeg_path, encoder, None).unwrap_or(false)
+}
+
+fn probe_h264_encoder_with_cancel(
+    ffmpeg_path: &Path,
+    encoder: &str,
+    cancellation: &AtomicBool,
+) -> Result<bool, MediaEngineError> {
+    probe_h264_encoder_with_cancel_option(ffmpeg_path, encoder, Some(cancellation))
+}
+
+fn probe_h264_encoder_with_cancel_option(
+    ffmpeg_path: &Path,
+    encoder: &str,
+    cancellation: Option<&AtomicBool>,
+) -> Result<bool, MediaEngineError> {
     let null_output = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    let mut args: Vec<std::ffi::OsString> = vec![
+    let mut args = vec![
         "-hide_banner".into(),
         "-nostdin".into(),
         "-f".into(),
@@ -1919,9 +2056,10 @@ fn probe_h264_encoder(ffmpeg_path: &Path, encoder: &str) -> bool {
     ];
     args.extend(video_encoder_codec_args(encoder));
     args.extend(["-f".into(), "null".into(), null_output.into()]);
-    match run_command_with_timeout(ffmpeg_path, args, 8_000) {
-        Ok((status, _)) => status.success(),
-        Err(_) => false,
+    match run_command_with_timeout_cancelable(ffmpeg_path, args, 8_000, cancellation) {
+        Ok((status, _)) => Ok(status.success()),
+        Err(MediaEngineError::Cancelled) => Err(MediaEngineError::Cancelled),
+        Err(_) => Ok(false),
     }
 }
 
@@ -2604,17 +2742,18 @@ fn join_stderr_capture_reader(
 mod tests {
     use super::{
         audio_mix_filter_complex, build_audio_stream_filter_graph,
-        build_audio_stream_filter_graph_with_ambient, build_media_render_args_for_backend,
-        build_media_render_args_with_video_encoder,
+        build_audio_stream_filter_graph_with_ambient, build_cpu4_video_filter,
+        build_media_render_args_for_backend, build_media_render_args_with_video_encoder,
         configured_media_engine_paths_with_resource_dir, encoder_attempt_order_from_preferred,
         encoder_failure_allows_retry, media_render_deadline, packaged_media_engine_paths,
         parse_max_volume_db, probe_audio_content_with_retry, read_stderr_capture, read_stderr_tail,
-        remaining_deadline_millis, run_command_with_timeout, target_triple, validate_audio_content,
-        validate_audio_input_decodable, validate_audio_probe_output, validate_filter_support,
-        validate_request_shape, video_encoder_codec_args, video_filter,
-        video_render_progress_percent, FfmpegProgressParser, MediaEngineError,
-        MediaOutputProgressWatchdog, MediaRenderRequest, MediaRenderTarget,
-        AUDIO_FINITE_GUARD_FILTER, FALLBACK_H264_ENCODER, MAX_PROBE_STDOUT_BYTES,
+        remaining_deadline_millis, run_command_with_timeout, run_command_with_timeout_cancelable,
+        target_triple, validate_audio_content, validate_audio_input_decodable,
+        validate_audio_probe_output, validate_filter_support, validate_request_shape,
+        video_encoder_codec_args, video_filter, video_render_progress_percent,
+        FfmpegProgressParser, MediaEngineError, MediaOutputProgressWatchdog, MediaRenderRequest,
+        MediaRenderTarget, AUDIO_FINITE_GUARD_FILTER, FALLBACK_H264_ENCODER,
+        MAX_PROBE_STDOUT_BYTES,
     };
     use crate::media_effect_params::{
         AdvancedEffectParams, AudioEffectParams, NaturalVoiceMode, VideoEffectParams,
@@ -2623,11 +2762,31 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     const OVERSIZED_PROBE_FIXTURE_ENV: &str = "AUTOLIVE_OVERSIZED_PROBE_FIXTURE";
+    const BLOCKING_PROBE_FIXTURE_ENV: &str = "AUTOLIVE_BLOCKING_PROBE_FIXTURE";
+
+    #[test]
+    fn cpu4_filter_keeps_only_the_four_declared_visual_controls() {
+        let video = VideoEffectParams {
+            brightness_percent: 12.0,
+            contrast_percent: 88.0,
+            saturation_percent: 110.0,
+            hue_rotation_degrees: 7.0,
+            blur_radius_px: 8.0,
+            sharpen_percent: 100.0,
+            ..Default::default()
+        };
+        let filter = build_cpu4_video_filter(&video).expect("valid CPU4 parameters");
+        assert!(filter.contains("lutyuv="));
+        assert!(filter.contains("hue="));
+        assert!(!filter.contains("gblur"));
+        assert!(!filter.contains("unsharp"));
+    }
 
     #[test]
     fn offline_filter_validation_accepts_a_resolved_ambient_input() {
@@ -2746,6 +2905,16 @@ mod tests {
             encoder_attempt_order_from_preferred(FALLBACK_H264_ENCODER),
             [FALLBACK_H264_ENCODER]
         );
+    }
+
+    #[test]
+    fn cancelled_encoder_attempt_order_does_not_start_a_probe_process() {
+        let cancelled = AtomicBool::new(true);
+        let ffmpeg = PathBuf::from("missing-ffmpeg.exe");
+        let result = super::h264_encoder_attempt_order_with_cancel(&ffmpeg, &cancelled);
+
+        assert!(matches!(result, Err(MediaEngineError::Cancelled)));
+        assert!(cancelled.load(Ordering::Acquire));
     }
 
     #[test]
@@ -3001,6 +3170,40 @@ mod tests {
         std::io::stdout()
             .write_all(&vec![b'x'; MAX_PROBE_STDOUT_BYTES + 1])
             .expect("fixture stdout should be writable");
+    }
+
+    #[test]
+    fn blocking_probe_child_fixture() {
+        if std::env::var_os(BLOCKING_PROBE_FIXTURE_ENV).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    fn active_probe_cancellation_terminates_the_child_process() {
+        let _guard = TEST_ENV_LOCK.lock().expect("test environment lock");
+        let executable = std::env::current_exe().expect("test executable should resolve");
+        std::env::set_var(BLOCKING_PROBE_FIXTURE_ENV, "1");
+        let cancellation = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_cancellation = std::sync::Arc::clone(&cancellation);
+        let worker = std::thread::spawn(move || {
+            run_command_with_timeout_cancelable(
+                &executable,
+                [
+                    "--exact",
+                    "media_engine::tests::blocking_probe_child_fixture",
+                    "--nocapture",
+                ],
+                2_000,
+                Some(&worker_cancellation),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        cancellation.store(true, Ordering::Release);
+        let result = worker.join().expect("probe worker should join");
+        std::env::remove_var(BLOCKING_PROBE_FIXTURE_ENV);
+
+        assert!(matches!(result, Err(MediaEngineError::Cancelled)));
     }
 
     #[test]

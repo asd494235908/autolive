@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "gate": "akvirtualcamera-gpu-benchmark-720p30",
+  "status": "passed",
+  "captureApi": "windows_graphics_capture",
+  "transport": "akvcam_mmap_cpu",
+  "gpuFacts": {
+    "adapterLuid": "00000000:0000ab3a",
+    "adapterName": "AMD Radeon RX 6750 GRE 10GB",
+    "vendorId": 4098,
+    "deviceId": 29695,
+    "featureLevel": "0xb000"
+  },
+  "processResourceUsage": {
+    "sampleCount": 7201,
+    "initialWorkingSetBytes": 47763456,
+    "finalWorkingSetBytes": 33382400,
+    "peakWorkingSetBytes": 59985920,
+    "workingSetDeltaBytes": -14381056,
+    "workingSetPeakGrowthBytes": 12222464,
+    "initialVirtualMemoryBytes": 52617216,
+    "finalVirtualMemoryBytes": 27222016,
+    "peakVirtualMemoryBytes": 53305344,
+    "virtualMemoryDeltaBytes": -25395200,
+    "virtualMemoryPeakGrowthBytes": 688128,
+    "growthWithinBudget": true
+  },
+  "hwnd": 10816512,
+  "width": 1280,
+  "height": 720,
+  "fps": 30,
+  "requestedSeconds": 7200,
+  "minimumFrames": 205200,
+  "elapsedMs": 7200120,
+  "framesDelivered": 210824,
+  "sequenceAdvances": 210824,
+  "firstTimestamp100ns": 2240794999999,
+  "lastTimestamp100ns": 2312794652777,
+  "timestampMonotonic": true,
+  "readback": {
+    "count": 210824,
+    "avgUs": 3236,
+    "p50Us": 3023,
+    "p95Us": 3933,
+    "p99Us": 8104,
+    "maxUs": 116559
+  },
+  "interframe": {
+    "count": 210823,
+    "avgUs": 34151,
+    "p50Us": 34722,
+    "p95Us": 48611,
+    "p99Us": 55555,
+    "maxUs": 750000
+  },
+  "frameCadenceWithinBudget": true,
+  "frameBudgetUs": 33333,
+  "p99ReadbackWithinBudget": true,
+  "gpuScaleAndColorConvert": true,
+  "zeroCopy": false,
+  "releaseReady": false,
+  "errors": [],
+  "notes": [
+    "本报告来自 2026-09-01 本机真实最终效果 HWND 的 7200 秒动态源长测。",
+    "仅覆盖 AMD Radeon RX 6750 GRE 10GB/当前 Windows 主机；Win10/11、多厂商 GPU、下游和签名门禁仍未完成。"
+  ]
+}

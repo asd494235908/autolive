@@ -1,0 +1,33 @@
+diff --git a/VCamUtils/src/messageclient.cpp b/VCamUtils/src/messageclient.cpp
+--- a/VCamUtils/src/messageclient.cpp
++++ b/VCamUtils/src/messageclient.cpp
+@@ -85,7 +85,7 @@ bool AkVCam::MessageClient::isUp(uint16_t port)
+     sockaddr_in serverAddress;
+     serverAddress.sin_family = AF_INET;
+     serverAddress.sin_port = htons(port);
+-    serverAddress.sin_addr.s_addr = INADDR_ANY;
++    serverAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+ 
+     // Connect to the server
+     if (connect(clientSocket,
+@@ -234,7 +234,7 @@ bool AkVCam::MessageClientPrivate::connection(uint16_t port,
+     sockaddr_in serverAddress;
+     serverAddress.sin_family = AF_INET;
+     serverAddress.sin_port = htons(port);
+-    serverAddress.sin_addr.s_addr = INADDR_ANY;
++    serverAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+ 
+     // Connect to the server
+     if (connect(clientSocket,
+diff --git a/VCamUtils/src/messageserver.cpp b/VCamUtils/src/messageserver.cpp
+--- a/VCamUtils/src/messageserver.cpp
++++ b/VCamUtils/src/messageserver.cpp
+@@ -131,7 +131,7 @@ int AkVCam::MessageServer::run()
+     sockaddr_in serverAddress;
+     serverAddress.sin_family = AF_INET;
+     serverAddress.sin_port = htons(this->d->m_port);
+-    serverAddress.sin_addr.s_addr = INADDR_ANY;
++    serverAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+ 
+     // Bind the socket
+     if (bind(serverSocket,

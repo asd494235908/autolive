@@ -124,8 +124,8 @@ export function saveInterludeConfig(
   config: PersistedInterludeConfig,
   storage?: StorageLike | null,
 ): void {
-  if (!isPersistedInterludeConfig(config)) throw new Error('随机插话配置内容无效');
+  if (!isPersistedInterludeConfig(config)) throw new Error('插话文件配置内容无效');
   const target = resolveStorage(storage);
-  if (!target) throw new Error('随机插话配置本地保存不可用');
+  if (!target) throw new Error('插话文件配置本地保存不可用');
   target.setItem(INTERLUDE_CONFIG_STORAGE_KEY, JSON.stringify(config));
 }

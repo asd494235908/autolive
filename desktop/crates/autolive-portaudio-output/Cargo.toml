@@ -9,6 +9,9 @@ description = "PortAudio output backend (Audacity-style I/O). FFI lives here so 
 [dependencies]
 ringbuf = "0.5.1"
 
+[dev-dependencies]
+autolive-speech-dsp = { path = "../autolive-speech-dsp" }
+
 [lints.rust]
 # FFI 仅本 crate；主 crate 仍 forbid
 unsafe_code = "allow"

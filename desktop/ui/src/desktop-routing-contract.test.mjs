@@ -32,6 +32,7 @@ test('桌面端保留兼容路由，但顶部导航只展示主页', async () =>
   assert.doesNotMatch(accessPanel, /DesktopTopbar/);
   assert.match(accessPanel, /src="\/app-icon\.png"/);
   assert.match(accessPanel, /账号登录/);
+  assert.match(accessPanel, /普通用户账号和密码；管理员账号请在管理端登录/);
   assert.doesNotMatch(accessPanel, /激活码|activationCode/);
   assert.match(shell, /aria-label="桌面端页面导航"/);
   assert.match(shell, /const DESKTOP_ROUTE_ITEMS = \[\s*\{ path: '\/', label: '主页' \},\s*\] as const/);

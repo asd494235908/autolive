@@ -1,7 +1,11 @@
 //! PortAudio 输出后端：主总线 f32 → 环缓 → 硬件回调。
+//! 可选的 full-duplex 模式在同一 callback 中捕获输入，并通过有界 input/clean-mic
+//! SPSC 环缓交给 DSP worker；output-only API 保持兼容。
 //! 与 WebView 互斥；探测/启动失败时调用方回退 WebView。
 
 use std::borrow::Cow;
+#[cfg(autolive_has_portaudio)]
+use std::collections::HashMap;
 #[cfg(autolive_has_portaudio)]
 use std::ffi::CStr;
 #[cfg(all(windows, autolive_has_portaudio))]
@@ -60,6 +64,9 @@ pub const MIN_FRAMES_PER_BUFFER: u32 = 128;
 pub const MAX_FRAMES_PER_BUFFER: u32 = 2_048;
 // 硬件回调帧数与应用内存环缓是两个独立参数，不由 UI 的内存缓冲输入控制。
 pub const DEFAULT_FRAMES_PER_BUFFER: u32 = 256;
+pub const DEFAULT_INPUT_CHANNELS: u16 = 1;
+pub const MICROPHONE_MUTE_ATTACK_MS: u32 = 50;
+pub const MICROPHONE_MUTE_RELEASE_MS: u32 = 250;
 // 有效水位覆盖常见 Windows 调度抖动和至少 8 次硬件回调；环缓 KiB 仍只决定容量上限。
 const MIN_PLAYBACK_WATERMARK_MS: u32 = 200;
 const MAX_PLAYBACK_WATERMARK_MS: u32 = 500;
@@ -103,6 +110,110 @@ pub struct OutputDeviceInfo {
     pub host_api: HostApiKind,
     pub max_output_channels: u16,
     pub default_sample_rate_hz: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputDeviceInfo {
+    /// 由 Host API、设备名和能力字段生成的稳定绑定 ID；硬件枚举索引不暴露给 UI。
+    pub id: String,
+    pub name: String,
+    pub host_api: HostApiKind,
+    pub max_input_channels: u16,
+    pub default_sample_rate_hz: u32,
+}
+
+/// 麦克风输入的最小状态。算法层只能更新原子门控，不把 VAD/ASR 实现塞进
+/// PortAudio callback；实际 AEC/NS/AGC/VAD 由上层 DSP worker 负责。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicrophoneGateState {
+    Disabled,
+    Armed,
+    Speaking,
+}
+
+#[derive(Debug, Default)]
+pub struct MicrophoneGate {
+    enabled: AtomicBool,
+    speaking: AtomicBool,
+}
+
+impl MicrophoneGate {
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            self.speaking.store(false, Ordering::Release);
+        }
+    }
+
+    pub fn set_speaking(&self, speaking: bool) {
+        if self.enabled.load(Ordering::Acquire) {
+            self.speaking.store(speaking, Ordering::Release);
+        } else {
+            self.speaking.store(false, Ordering::Release);
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub fn is_speaking(&self) -> bool {
+        self.is_enabled() && self.speaking.load(Ordering::Acquire)
+    }
+
+    pub fn state(&self) -> MicrophoneGateState {
+        if !self.is_enabled() {
+            MicrophoneGateState::Disabled
+        } else if self.is_speaking() {
+            MicrophoneGateState::Speaking
+        } else {
+            MicrophoneGateState::Armed
+        }
+    }
+
+    pub fn main_gain_target(&self) -> f32 {
+        if self.is_speaking() {
+            0.0
+        } else {
+            1.0
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortAudioDuplexConfig {
+    pub input_device_index: Option<i32>,
+    pub input_channels: u16,
+}
+
+impl Default for PortAudioDuplexConfig {
+    fn default() -> Self {
+        Self {
+            input_device_index: None,
+            input_channels: DEFAULT_INPUT_CHANNELS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortAudioInputHealth {
+    pub input_channels: u16,
+    /// callback 心跳；worker 可用它判断输入/输出 callback 是否仍在推进。
+    pub callback_count: u64,
+    /// 最近一次 PortAudio callback 状态标志（例如输入/输出 overflow/underflow）。
+    pub callback_last_status_flags: u64,
+    pub input_frames_captured: u64,
+    pub input_overflow_count: u64,
+    pub clean_mic_frames_rendered: u64,
+    pub clean_mic_drop_count: u64,
+    pub clean_mic_underrun_count: u64,
+    pub render_reference_drop_count: u64,
+    pub input_ring_len_samples: usize,
+    pub input_ring_capacity_samples: usize,
+    pub clean_mic_ring_len_samples: usize,
+    pub clean_mic_ring_capacity_samples: usize,
+    /// PortAudio callback 最近一次提供的 ADC 时间，单位为微秒。
+    pub last_input_adc_time_us: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,9 +389,15 @@ mod ffi {
         pub fn Pa_Terminate() -> PaError;
         pub fn Pa_GetErrorText(error_code: PaError) -> *const c_char;
         pub fn Pa_GetDeviceCount() -> PaDeviceIndex;
+        pub fn Pa_GetDefaultInputDevice() -> PaDeviceIndex;
         pub fn Pa_GetDefaultOutputDevice() -> PaDeviceIndex;
         pub fn Pa_GetDeviceInfo(device: PaDeviceIndex) -> *const PaDeviceInfo;
         pub fn Pa_GetHostApiInfo(host_api: PaHostApiIndex) -> *const PaHostApiInfo;
+        pub fn Pa_IsFormatSupported(
+            input_parameters: *const PaStreamParameters,
+            output_parameters: *const PaStreamParameters,
+            sample_rate: c_double,
+        ) -> PaError;
         pub fn Pa_OpenStream(
             stream: *mut *mut PaStream,
             input_parameters: *const PaStreamParameters,
@@ -562,6 +679,199 @@ pub fn list_output_devices() -> Result<Vec<OutputDeviceInfo>, String> {
     }
 }
 
+pub fn list_input_devices() -> Result<Vec<InputDeviceInfo>, String> {
+    #[cfg(not(autolive_has_portaudio))]
+    {
+        Err("PortAudio 未启用：无输入设备列表".to_owned())
+    }
+    #[cfg(autolive_has_portaudio)]
+    {
+        enumerate_input_devices_with_indices()
+            .map(|devices| devices.into_iter().map(|(_, device)| device).collect())
+    }
+}
+
+/// 返回当前 PortAudio 默认输入设备及其本次枚举索引。
+///
+/// 索引只用于同一次启动请求的 native 打开，不向 UI 或持久化配置暴露；
+/// 调用方仍以稳定 ID 保存用户选择。默认设备不存在时返回 `None`，由上层
+/// 给出可恢复的“无输入设备”错误。
+pub fn default_input_device() -> Result<Option<(i32, InputDeviceInfo)>, String> {
+    #[cfg(not(autolive_has_portaudio))]
+    {
+        Err("PortAudio 未启用：无默认输入设备".to_owned())
+    }
+    #[cfg(autolive_has_portaudio)]
+    {
+        let default_index = {
+            ensure_portaudio_dll_search_path();
+            let _guard = portaudio_lock().lock().unwrap_or_else(|e| e.into_inner());
+            pa_acquire()?;
+            let index = unsafe { ffi::Pa_GetDefaultInputDevice() };
+            pa_release();
+            index
+        };
+        if default_index == ffi::PA_NO_DEVICE {
+            return Ok(None);
+        }
+        Ok(enumerate_input_devices_with_indices()?
+            .into_iter()
+            .find(|(index, _)| *index == default_index))
+    }
+}
+
+/// 将 UI 持久化的稳定设备 ID 解析为当前 PortAudio 设备索引。
+///
+/// PortAudio 的 native API 只接受会随枚举变化的整数索引，因此索引只在
+/// 本次打开前短暂存在；找不到稳定指纹时返回 None，调用方必须报告设备失效。
+pub fn input_device_index_for_id(id: &str) -> Result<Option<i32>, String> {
+    #[cfg(not(autolive_has_portaudio))]
+    {
+        let _ = id;
+        Err("PortAudio 未启用：无输入设备列表".to_owned())
+    }
+    #[cfg(autolive_has_portaudio)]
+    {
+        enumerate_input_devices_with_indices().map(|devices| {
+            devices
+                .into_iter()
+                .find(|(_, device)| device.id == id)
+                .map(|(index, _)| index)
+        })
+    }
+}
+
+#[cfg(autolive_has_portaudio)]
+fn enumerate_input_devices_with_indices() -> Result<Vec<(i32, InputDeviceInfo)>, String> {
+    ensure_portaudio_dll_search_path();
+    let _guard = portaudio_lock().lock().unwrap_or_else(|e| e.into_inner());
+    pa_acquire()?;
+    let count = match checked_device_count(unsafe { ffi::Pa_GetDeviceCount() }) {
+        Ok(count) => count,
+        Err(error) => {
+            pa_release();
+            return Err(error);
+        }
+    };
+    let mut devices = Vec::new();
+    let mut identity_occurrences = HashMap::<String, u32>::new();
+    if count > 0 {
+        for index in 0..count {
+            let info_ptr = unsafe { ffi::Pa_GetDeviceInfo(index) };
+            if info_ptr.is_null() {
+                continue;
+            }
+            let info = unsafe { &*info_ptr };
+            if info.max_input_channels <= 0 {
+                continue;
+            }
+            let name = if info.name.is_null() {
+                format!("device-{index}")
+            } else {
+                unsafe { CStr::from_ptr(info.name).to_string_lossy().into_owned() }
+            };
+            let host_api = unsafe { ffi::Pa_GetHostApiInfo(info.host_api) };
+            let host_kind = if host_api.is_null() {
+                HostApiKind::Other
+            } else {
+                host_api_kind_from_type(unsafe { (*host_api).type_ })
+            };
+            let max_input_channels = info.max_input_channels.max(0) as u16;
+            let default_sample_rate_hz = info.default_sample_rate.round().max(1.0) as u32;
+            let identity = format!(
+                "{}\0{}\0{}\0{}",
+                host_api_key(host_kind),
+                name,
+                max_input_channels,
+                default_sample_rate_hz
+            );
+            let occurrence = identity_occurrences.entry(identity).or_insert(0);
+            let device_id = stable_input_device_id_with_occurrence(
+                host_kind,
+                &name,
+                max_input_channels,
+                default_sample_rate_hz,
+                *occurrence,
+            );
+            *occurrence = occurrence.saturating_add(1);
+            devices.push((
+                index,
+                InputDeviceInfo {
+                    id: device_id,
+                    name,
+                    host_api: host_kind,
+                    max_input_channels,
+                    default_sample_rate_hz,
+                },
+            ));
+        }
+    }
+    pa_release();
+    Ok(devices)
+}
+
+#[cfg(test)]
+fn stable_input_device_id(
+    host_api: HostApiKind,
+    name: &str,
+    max_input_channels: u16,
+    default_sample_rate_hz: u32,
+) -> String {
+    stable_input_device_id_with_occurrence(
+        host_api,
+        name,
+        max_input_channels,
+        default_sample_rate_hz,
+        0,
+    )
+}
+
+#[cfg(any(test, autolive_has_portaudio))]
+fn stable_input_device_id_with_occurrence(
+    host_api: HostApiKind,
+    name: &str,
+    max_input_channels: u16,
+    default_sample_rate_hz: u32,
+    occurrence: u32,
+) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut update = |byte: u8| {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for byte in host_api_key(host_api)
+        .bytes()
+        .chain(std::iter::once(0))
+        .chain(name.bytes())
+        .chain(std::iter::once(0))
+        .chain(max_input_channels.to_le_bytes())
+        .chain(default_sample_rate_hz.to_le_bytes())
+    {
+        update(byte);
+    }
+    // 保留 occurrence=0 的历史 ID，只有确实重复的身份才追加消歧输入，
+    // 避免已有用户配置在升级后无故失效。
+    if occurrence > 0 {
+        for byte in occurrence.to_le_bytes() {
+            update(byte);
+        }
+    }
+    format!("pa-input-{}-{hash:016x}", host_api_key(host_api))
+}
+
+#[cfg(any(test, autolive_has_portaudio))]
+fn host_api_key(host_api: HostApiKind) -> &'static str {
+    match host_api {
+        HostApiKind::Default => "default",
+        HostApiKind::Wasapi => "wasapi",
+        HostApiKind::Asio => "asio",
+        HostApiKind::Mme => "mme",
+        HostApiKind::DirectSound => "dsound",
+        HostApiKind::Wdmks => "wdmks",
+        HostApiKind::Other => "other",
+    }
+}
+
 struct StreamShared {
     xrun_count: AtomicU64,
     callback_underrun_count: AtomicU64,
@@ -577,6 +887,16 @@ struct StreamShared {
     callback_paused: AtomicBool,
     /// 测试音期间暂停跟播 PCM，避免叠音。
     live_pcm_paused: AtomicBool,
+    /// DSP worker 更新、PortAudio callback 读取的无锁麦克风门控。
+    microphone_gate: Arc<MicrophoneGate>,
+    input_channels: AtomicU16,
+    input_frames_captured: AtomicU64,
+    input_overflow_count: AtomicU64,
+    last_input_adc_time_us: AtomicI64,
+    clean_mic_frames_rendered: AtomicU64,
+    clean_mic_drop_count: AtomicU64,
+    clean_mic_underrun_count: AtomicU64,
+    render_reference_drop_count: AtomicU64,
 }
 
 impl std::fmt::Debug for StreamShared {
@@ -614,7 +934,64 @@ impl std::fmt::Debug for StreamShared {
                 &self.callback_pcm_frames_total.load(Ordering::Relaxed),
             )
             .field("channels", &self.channels.load(Ordering::Relaxed))
+            .field(
+                "input_channels",
+                &self.input_channels.load(Ordering::Relaxed),
+            )
+            .field(
+                "input_frames_captured",
+                &self.input_frames_captured.load(Ordering::Relaxed),
+            )
+            .field(
+                "input_overflow_count",
+                &self.input_overflow_count.load(Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
+    }
+}
+
+impl StreamShared {
+    /// 清除一次 full-duplex 会话独有的输入、参考和 clean-mic 统计。
+    ///
+    /// `StreamShared` 与 output-only 流共享生命周期，不能让上一轮麦克风
+    /// 会话的 overflow/drop 计数污染下一轮的故障门禁或 UI 状态。
+    fn reset_microphone_metrics(&self) {
+        self.input_frames_captured.store(0, Ordering::Relaxed);
+        self.input_overflow_count.store(0, Ordering::Relaxed);
+        self.last_input_adc_time_us
+            .store(i64::MIN, Ordering::Relaxed);
+        self.clean_mic_frames_rendered.store(0, Ordering::Relaxed);
+        self.clean_mic_drop_count.store(0, Ordering::Relaxed);
+        self.clean_mic_underrun_count.store(0, Ordering::Relaxed);
+        self.render_reference_drop_count.store(0, Ordering::Relaxed);
+        self.microphone_gate.set_enabled(false);
+    }
+
+    #[cfg(test)]
+    fn for_test(channels: u16) -> Self {
+        Self {
+            xrun_count: AtomicU64::new(0),
+            callback_underrun_count: AtomicU64::new(0),
+            producer_drop_count: AtomicU64::new(0),
+            callback_count: AtomicU64::new(0),
+            callback_last_status_flags: AtomicU64::new(0),
+            callback_status_flags_count: AtomicU64::new(0),
+            callback_output_buffer_dac_time_delta_us: AtomicI64::new(0),
+            callback_pcm_frames_total: AtomicU64::new(0),
+            channels: AtomicU16::new(channels.max(1)),
+            clear_requested: AtomicBool::new(false),
+            callback_paused: AtomicBool::new(false),
+            live_pcm_paused: AtomicBool::new(false),
+            microphone_gate: Arc::new(MicrophoneGate::default()),
+            input_channels: AtomicU16::new(DEFAULT_INPUT_CHANNELS),
+            input_frames_captured: AtomicU64::new(0),
+            input_overflow_count: AtomicU64::new(0),
+            last_input_adc_time_us: AtomicI64::new(i64::MIN),
+            clean_mic_frames_rendered: AtomicU64::new(0),
+            clean_mic_drop_count: AtomicU64::new(0),
+            clean_mic_underrun_count: AtomicU64::new(0),
+            render_reference_drop_count: AtomicU64::new(0),
+        }
     }
 }
 
@@ -622,6 +999,12 @@ impl std::fmt::Debug for StreamShared {
 struct CallbackUserData {
     shared: Arc<StreamShared>,
     consumer: HeapCons<f32>,
+    input_producer: Option<HeapProd<f32>>,
+    clean_mic_consumer: Option<HeapCons<f32>>,
+    render_reference_producer: Option<HeapProd<f32>>,
+    /// callback 线程私有，避免跨线程锁或原子浮点数。
+    microphone_main_gain: f32,
+    sample_rate_hz: u32,
 }
 
 #[cfg(any(test, autolive_has_portaudio))]
@@ -631,6 +1014,93 @@ fn pop_audio_samples(consumer: &mut HeapCons<f32>, output: &mut [f32]) -> usize 
         output[filled..].fill(0.0);
     }
     filled
+}
+
+#[cfg(any(test, autolive_has_portaudio))]
+fn apply_microphone_main_gain(
+    gain: &mut f32,
+    speaking: bool,
+    output: &mut [f32],
+    sample_rate_hz: u32,
+    channels: usize,
+) {
+    let channels = channels.max(1);
+    let sample_rate_hz = sample_rate_hz.max(1) as f32;
+    let attack_step = 1.0 / (sample_rate_hz * MICROPHONE_MUTE_ATTACK_MS as f32 / 1_000.0);
+    let release_step = 1.0 / (sample_rate_hz * MICROPHONE_MUTE_RELEASE_MS as f32 / 1_000.0);
+    for frame in output.chunks_exact_mut(channels) {
+        if speaking {
+            *gain = (*gain - attack_step).max(0.0);
+        } else {
+            *gain = (*gain + release_step).min(1.0);
+        }
+        for sample in frame {
+            *sample *= *gain;
+        }
+    }
+}
+
+#[cfg(any(test, autolive_has_portaudio))]
+fn reset_microphone_gain_if_disabled(gain: &mut f32, gate: &MicrophoneGate) {
+    if !gate.is_enabled() {
+        *gain = 1.0;
+    }
+}
+
+#[cfg(any(test, autolive_has_portaudio))]
+fn mix_clean_mic_samples(
+    consumer: &mut HeapCons<f32>,
+    output: &mut [f32],
+    speaking: bool,
+    shared: &StreamShared,
+    channels: usize,
+) {
+    let mut missing = false;
+    for sample in output.iter_mut() {
+        let mic = consumer.try_pop().unwrap_or_else(|| {
+            missing = true;
+            0.0
+        });
+        if speaking {
+            *sample = (*sample + mic).clamp(-1.0, 1.0);
+        }
+    }
+    if speaking {
+        shared
+            .clean_mic_frames_rendered
+            .fetch_add((output.len() / channels.max(1)) as u64, Ordering::Relaxed);
+        if missing {
+            shared
+                .clean_mic_underrun_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+fn mix_clean_mic_into_output(
+    consumer: &mut HeapCons<f32>,
+    output: &mut [f32],
+    gain: &mut f32,
+    shared: &StreamShared,
+    channels: usize,
+    sample_rate_hz: u32,
+) {
+    let speaking = shared.microphone_gate.is_speaking();
+    apply_microphone_main_gain(gain, speaking, output, sample_rate_hz, channels);
+    mix_clean_mic_samples(consumer, output, speaking, shared, channels);
+}
+
+#[cfg(any(test, autolive_has_portaudio))]
+fn input_adc_time_to_micros(seconds: f64) -> Option<i64> {
+    if !seconds.is_finite() {
+        return None;
+    }
+    let micros = seconds * 1_000_000.0;
+    if !micros.is_finite() {
+        return None;
+    }
+    Some(micros.round().clamp(i64::MIN as f64, i64::MAX as f64) as i64)
 }
 
 fn take_callback_after_confirmed_close<T>(
@@ -733,7 +1203,7 @@ fn record_callback_timing_and_frames(
 
 #[cfg(autolive_has_portaudio)]
 unsafe extern "C" fn output_callback(
-    _input: *const std::os::raw::c_void,
+    input: *const std::os::raw::c_void,
     output: *mut std::os::raw::c_void,
     frame_count: std::os::raw::c_ulong,
     time_info: *const ffi::PaStreamCallbackTimeInfo,
@@ -765,6 +1235,43 @@ unsafe extern "C" fn output_callback(
             time_info.current_time,
         ))
     };
+    // 暂停时不继续填充输入环缓；这样恢复前不会积压旧麦克风帧，也不会把暂停
+    // 期间的采样误判为新的说话事件。
+    if !data.shared.callback_paused.load(Ordering::Acquire) {
+        if let Some(input_producer) = data.input_producer.as_mut() {
+            let input_channels =
+                usize::from(data.shared.input_channels.load(Ordering::Relaxed).max(1));
+            let input_samples = (frame_count as usize).saturating_mul(input_channels);
+            if input.is_null() {
+                data.shared
+                    .input_overflow_count
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                // SAFETY: PortAudio provides `frame_count * input_channels` contiguous f32
+                // samples for a full-duplex callback. The input pointer is valid for this call.
+                let input_slice = std::slice::from_raw_parts(input as *const f32, input_samples);
+                let written = input_producer.push_slice(input_slice);
+                data.shared
+                    .input_frames_captured
+                    .fetch_add((written / input_channels) as u64, Ordering::Relaxed);
+                if written < input_samples {
+                    data.shared
+                        .input_overflow_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if !time_info.is_null() {
+                // SAFETY: The time-info pointer was checked above and is valid for this callback.
+                let time_info = &*time_info;
+                if let Some(adc_time_us) = input_adc_time_to_micros(time_info.input_buffer_adc_time)
+                {
+                    data.shared
+                        .last_input_adc_time_us
+                        .store(adc_time_us, Ordering::Relaxed);
+                }
+            }
+        }
+    }
     if data.shared.callback_paused.load(Ordering::Acquire) {
         out.fill(0.0);
         record_callback_timing_and_frames(&data.shared, dac_time_delta_us, 0, channels);
@@ -772,6 +1279,30 @@ unsafe extern "C" fn output_callback(
     }
     let filled = pop_audio_samples(&mut data.consumer, out);
     record_callback_timing_and_frames(&data.shared, dac_time_delta_us, filled, channels);
+    let speaking = data.shared.microphone_gate.is_speaking();
+    // fail-open 的门控撤销必须绕过正常 release 包络；否则输出线程故障后
+    // 主媒体仍可能在最多 250ms 内保持静音。
+    reset_microphone_gain_if_disabled(&mut data.microphone_main_gain, &data.shared.microphone_gate);
+    apply_microphone_main_gain(
+        &mut data.microphone_main_gain,
+        speaking,
+        out,
+        data.sample_rate_hz,
+        channels,
+    );
+    if let Some(render_reference_producer) = data.render_reference_producer.as_mut() {
+        // AEC 参考使用本 callback 实际送往 DAC 的主轨（不含麦克风回送），
+        // 因而在静音包络完成后、clean mic 叠加前写入。
+        let written = render_reference_producer.push_slice(out);
+        if written < out.len() {
+            data.shared
+                .render_reference_drop_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if let Some(clean_mic_consumer) = data.clean_mic_consumer.as_mut() {
+        mix_clean_mic_samples(clean_mic_consumer, out, speaking, &data.shared, channels);
+    }
     if filled < samples {
         data.shared
             .callback_underrun_count
@@ -801,6 +1332,148 @@ pub struct PortAudioOutput {
     /// 启动回调前允许混音线程先把首段 PCM 写入环缓，避免回调补零。
     prestart_writes_enabled: bool,
     running: AtomicBool,
+}
+
+pub struct PortAudioDuplexInput {
+    shared: Arc<StreamShared>,
+    input_consumer: HeapCons<f32>,
+    clean_mic_producer: HeapProd<f32>,
+    render_reference_consumer: HeapCons<f32>,
+    input_channels: u16,
+    output_channels: u16,
+    #[cfg(test)]
+    input_test_producer: Option<HeapProd<f32>>,
+}
+
+impl std::fmt::Debug for PortAudioDuplexInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortAudioDuplexInput")
+            .field("input_channels", &self.input_channels)
+            .field("output_channels", &self.output_channels)
+            .field("input_ring_len_samples", &self.input_ring_len_samples())
+            .field(
+                "clean_mic_ring_len_samples",
+                &self.clean_mic_ring_len_samples(),
+            )
+            .finish()
+    }
+}
+
+impl PortAudioDuplexInput {
+    pub fn input_channels(&self) -> u16 {
+        self.input_channels
+    }
+
+    pub fn output_channels(&self) -> u16 {
+        self.output_channels
+    }
+
+    /// DSP worker 读取 callback 捕获的原始输入帧；永不等待，空环缓返回 0。
+    pub fn read_input_interleaved(&mut self, output: &mut [f32]) -> usize {
+        self.input_consumer.pop_slice(output)
+    }
+
+    /// DSP worker 读取与输入时间顺序对应的主轨参考；空环缓返回 0。
+    pub fn read_render_reference_interleaved(&mut self, output: &mut [f32]) -> usize {
+        self.render_reference_consumer.pop_slice(output)
+    }
+
+    /// DSP worker 写入已经完成 AEC/降噪/VAD 的双声道 PCM。
+    /// callback 会在说话门控打开时把它叠加到最终输出，并始终执行限幅。
+    pub fn write_clean_mic_stereo_interleaved(&mut self, samples: &[f32]) -> Result<usize, String> {
+        if !samples.len().is_multiple_of(2) {
+            return Err("clean mic 输入未按完整的立体声帧对齐".to_owned());
+        }
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            return Err("clean mic 输入包含 NaN 或 Infinity".to_owned());
+        }
+        let normalized = prepare_mixer_samples(samples, usize::from(self.output_channels))?;
+        let written = self
+            .clean_mic_producer
+            .push_iter(normalized.iter().copied());
+        if written < normalized.len() {
+            self.shared
+                .clean_mic_drop_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let stereo_written =
+            stereo_samples_for_output_samples(written, usize::from(self.output_channels))
+                .ok_or_else(|| "clean mic 写入结果未按完整硬件帧对齐".to_owned())?;
+        Ok(stereo_written)
+    }
+
+    pub fn input_ring_len_samples(&self) -> usize {
+        self.input_consumer.occupied_len()
+    }
+
+    pub fn input_capacity_samples(&self) -> usize {
+        self.input_consumer.capacity().get()
+    }
+
+    pub fn clean_mic_ring_len_samples(&self) -> usize {
+        self.clean_mic_producer.occupied_len()
+    }
+
+    pub fn clean_mic_capacity_samples(&self) -> usize {
+        self.clean_mic_producer.capacity().get()
+    }
+
+    pub fn input_health(&self) -> PortAudioInputHealth {
+        let last_input_adc_time_us =
+            match self.shared.last_input_adc_time_us.load(Ordering::Relaxed) {
+                i64::MIN => None,
+                value => Some(value),
+            };
+        PortAudioInputHealth {
+            input_channels: self.input_channels,
+            callback_count: self.shared.callback_count.load(Ordering::Relaxed),
+            callback_last_status_flags: self
+                .shared
+                .callback_last_status_flags
+                .load(Ordering::Relaxed),
+            input_frames_captured: self.shared.input_frames_captured.load(Ordering::Relaxed),
+            input_overflow_count: self.shared.input_overflow_count.load(Ordering::Relaxed),
+            clean_mic_frames_rendered: self
+                .shared
+                .clean_mic_frames_rendered
+                .load(Ordering::Relaxed),
+            clean_mic_drop_count: self.shared.clean_mic_drop_count.load(Ordering::Relaxed),
+            clean_mic_underrun_count: self.shared.clean_mic_underrun_count.load(Ordering::Relaxed),
+            render_reference_drop_count: self
+                .shared
+                .render_reference_drop_count
+                .load(Ordering::Relaxed),
+            input_ring_len_samples: self.input_ring_len_samples(),
+            input_ring_capacity_samples: self.input_capacity_samples(),
+            clean_mic_ring_len_samples: self.clean_mic_ring_len_samples(),
+            clean_mic_ring_capacity_samples: self.clean_mic_capacity_samples(),
+            last_input_adc_time_us,
+        }
+    }
+
+    pub fn microphone_gate(&self) -> Arc<MicrophoneGate> {
+        Arc::clone(&self.shared.microphone_gate)
+    }
+
+    pub fn set_gate_enabled(&self, enabled: bool) {
+        self.shared.microphone_gate.set_enabled(enabled);
+    }
+
+    pub fn set_gate_speaking(&self, speaking: bool) {
+        self.shared.microphone_gate.set_speaking(speaking);
+    }
+
+    pub fn gate_state(&self) -> MicrophoneGateState {
+        self.shared.microphone_gate.state()
+    }
+
+    #[cfg(test)]
+    fn push_input_for_test(&mut self, samples: &[f32]) -> usize {
+        self.input_test_producer
+            .as_mut()
+            .map(|producer| producer.push_slice(samples))
+            .unwrap_or(0)
+    }
 }
 
 impl std::fmt::Debug for PortAudioOutput {
@@ -839,6 +1512,15 @@ impl PortAudioOutput {
                 clear_requested: AtomicBool::new(false),
                 callback_paused: AtomicBool::new(false),
                 live_pcm_paused: AtomicBool::new(false),
+                microphone_gate: Arc::new(MicrophoneGate::default()),
+                input_channels: AtomicU16::new(DEFAULT_INPUT_CHANNELS),
+                input_frames_captured: AtomicU64::new(0),
+                input_overflow_count: AtomicU64::new(0),
+                last_input_adc_time_us: AtomicI64::new(i64::MIN),
+                clean_mic_frames_rendered: AtomicU64::new(0),
+                clean_mic_drop_count: AtomicU64::new(0),
+                clean_mic_underrun_count: AtomicU64::new(0),
+                render_reference_drop_count: AtomicU64::new(0),
             }),
             producer,
             consumer: Some(consumer),
@@ -908,6 +1590,12 @@ impl PortAudioOutput {
 
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
+    }
+
+    /// 返回与硬件 callback 共享的无锁麦克风门控。output-only 流也提供该对象，
+    /// 但只有 full-duplex callback 会消费 clean mic ring。
+    pub fn microphone_gate(&self) -> Arc<MicrophoneGate> {
+        Arc::clone(&self.shared.microphone_gate)
     }
 
     /// 返回应用运行标志、真实 PortAudio 流状态、callback 观测值和环缓水位。
@@ -1022,6 +1710,11 @@ impl PortAudioOutput {
             let user_data = Box::new(CallbackUserData {
                 shared: Arc::clone(&self.shared),
                 consumer,
+                input_producer: None,
+                clean_mic_consumer: None,
+                render_reference_producer: None,
+                microphone_main_gain: 1.0,
+                sample_rate_hz: self.sample_rate_hz,
             });
             let user_ptr = Box::into_raw(user_data);
             let mut stream: *mut ffi::PaStream = std::ptr::null_mut();
@@ -1072,9 +1765,232 @@ impl PortAudioOutput {
         }
     }
 
+    /// 在同一 PortAudio stream 中打开输入和输出。普通 `start()` 仍保持 output-only
+    /// 行为；只有麦克风会话显式调用本方法时才创建输入环缓和 full-duplex callback。
+    pub fn start_duplex(
+        &mut self,
+        config: PortAudioDuplexConfig,
+    ) -> Result<PortAudioDuplexInput, String> {
+        if config.input_channels == 0 {
+            return Err("PortAudio 输入声道数必须大于 0".to_owned());
+        }
+        #[cfg(not(autolive_has_portaudio))]
+        {
+            let _ = config;
+            Err("PortAudio 未启用：无法打开全双工输入".to_owned())
+        }
+        #[cfg(autolive_has_portaudio)]
+        {
+            if self.running.load(Ordering::SeqCst) {
+                return Err("PortAudio 输出已经启动，不能重复打开全双工流".to_owned());
+            }
+            if !self.stream.is_null() || self.user_data.is_some() || self.close_quarantined {
+                return Err("此前 PortAudio 流关闭失败，不能重复创建硬件流".to_owned());
+            }
+            ensure_portaudio_dll_search_path();
+            let _guard = portaudio_lock().lock().unwrap_or_else(|e| e.into_inner());
+            pa_acquire()?;
+            self.initialized = true;
+
+            let output_device = self
+                .device_index
+                .unwrap_or_else(|| unsafe { ffi::Pa_GetDefaultOutputDevice() });
+            let input_device = config
+                .input_device_index
+                .unwrap_or_else(|| unsafe { ffi::Pa_GetDefaultInputDevice() });
+            if output_device == ffi::PA_NO_DEVICE {
+                self.shutdown_pa_unlocked();
+                return Err("无默认输出设备".to_owned());
+            }
+            if input_device == ffi::PA_NO_DEVICE {
+                self.shutdown_pa_unlocked();
+                return Err("无默认输入设备".to_owned());
+            }
+            let output_info_ptr = unsafe { ffi::Pa_GetDeviceInfo(output_device) };
+            let input_info_ptr = unsafe { ffi::Pa_GetDeviceInfo(input_device) };
+            if output_info_ptr.is_null() {
+                self.shutdown_pa_unlocked();
+                return Err("无法读取输出设备".to_owned());
+            }
+            if input_info_ptr.is_null() {
+                self.shutdown_pa_unlocked();
+                return Err("无法读取输入设备".to_owned());
+            }
+            let output_info = unsafe { &*output_info_ptr };
+            let input_info = unsafe { &*input_info_ptr };
+            let output_channels = i32::from(self.shared.channels.load(Ordering::Relaxed))
+                .min(output_info.max_output_channels);
+            if output_channels <= 0 {
+                self.shutdown_pa_unlocked();
+                return Err("输出设备无可用输出声道".to_owned());
+            }
+            if i32::from(config.input_channels) > input_info.max_input_channels {
+                self.shutdown_pa_unlocked();
+                return Err(format!(
+                    "输入设备最多支持 {} 个声道，不能打开 {} 个声道",
+                    input_info.max_input_channels, config.input_channels
+                ));
+            }
+            self.shared
+                .channels
+                .store(output_channels as u16, Ordering::Relaxed);
+            self.shared
+                .input_channels
+                .store(config.input_channels, Ordering::Relaxed);
+            let input_params = ffi::PaStreamParameters {
+                device: input_device,
+                channel_count: i32::from(config.input_channels),
+                sample_format: ffi::PA_FLOAT32,
+                suggested_latency: input_info.default_low_input_latency,
+                host_api_specific_stream_info: std::ptr::null_mut(),
+            };
+            let output_params = ffi::PaStreamParameters {
+                device: output_device,
+                channel_count: output_channels,
+                sample_format: ffi::PA_FLOAT32,
+                suggested_latency: output_info.default_low_output_latency,
+                host_api_specific_stream_info: std::ptr::null_mut(),
+            };
+            let format_err = unsafe {
+                ffi::Pa_IsFormatSupported(
+                    &input_params,
+                    &output_params,
+                    f64::from(self.sample_rate_hz),
+                )
+            };
+            if format_err != ffi::PA_NO_ERROR {
+                self.shutdown_pa_unlocked();
+                return Err(format!(
+                    "PortAudio 全双工格式不支持：{}",
+                    pa_error_text(format_err)
+                ));
+            }
+
+            self.shared.reset_microphone_metrics();
+
+            let (input_producer, input_consumer) = HeapRb::<f32>::new(
+                ring_capacity_samples(self.ring_capacity_kib, config.input_channels).max(1),
+            )
+            .split();
+            let (clean_mic_producer, clean_mic_consumer) = HeapRb::<f32>::new(
+                ring_capacity_samples(self.ring_capacity_kib, output_channels as u16).max(1),
+            )
+            .split();
+            let (render_reference_producer, render_reference_consumer) = HeapRb::<f32>::new(
+                ring_capacity_samples(self.ring_capacity_kib, output_channels as u16).max(1),
+            )
+            .split();
+            let Some(consumer) = self.consumer.take() else {
+                self.shutdown_pa_unlocked();
+                return Err("PortAudio 消费端未就绪".to_owned());
+            };
+            let user_data = Box::new(CallbackUserData {
+                shared: Arc::clone(&self.shared),
+                consumer,
+                input_producer: Some(input_producer),
+                clean_mic_consumer: Some(clean_mic_consumer),
+                render_reference_producer: Some(render_reference_producer),
+                microphone_main_gain: 1.0,
+                sample_rate_hz: self.sample_rate_hz,
+            });
+            let user_ptr = Box::into_raw(user_data);
+            let mut stream: *mut ffi::PaStream = std::ptr::null_mut();
+            let open_err = unsafe {
+                ffi::Pa_OpenStream(
+                    &mut stream,
+                    &input_params,
+                    &output_params,
+                    f64::from(self.sample_rate_hz),
+                    std::os::raw::c_ulong::from(self.frames_per_buffer),
+                    ffi::PA_CLIP_OFF,
+                    Some(output_callback),
+                    user_ptr as *mut _,
+                )
+            };
+            if open_err != ffi::PA_NO_ERROR {
+                // SAFETY: Open 失败时仅本函数持有 callback box。
+                let callback_data = unsafe { Box::from_raw(user_ptr) };
+                self.consumer = Some(callback_data.consumer);
+                self.shutdown_pa_unlocked();
+                return Err(format!(
+                    "Pa_OpenStream 全双工失败：{}",
+                    pa_error_text(open_err)
+                ));
+            }
+            let start_err = unsafe { ffi::Pa_StartStream(stream) };
+            if start_err != ffi::PA_NO_ERROR {
+                let close_err = unsafe { ffi::Pa_CloseStream(stream) };
+                // SAFETY: user_ptr 仍只由本函数持有；关闭失败时必须隔离 callback box。
+                let callback_data = unsafe { Box::from_raw(user_ptr) };
+                if close_err == ffi::PA_NO_ERROR {
+                    self.consumer = Some(callback_data.consumer);
+                    self.shutdown_pa_unlocked();
+                    return Err(format!(
+                        "Pa_StartStream 全双工失败：{}",
+                        pa_error_text(start_err)
+                    ));
+                }
+                self.stream = stream;
+                self.user_data = Some(callback_data);
+                self.close_quarantined = true;
+                return Err(format!(
+                    "Pa_StartStream 全双工失败：{}；Pa_CloseStream 同时失败：{}",
+                    pa_error_text(start_err),
+                    pa_error_text(close_err)
+                ));
+            }
+            self.stream = stream;
+            // SAFETY: 所有权转回 Box，随 self 生命周期。
+            self.user_data = Some(unsafe { Box::from_raw(user_ptr) });
+            self.running.store(true, Ordering::SeqCst);
+            Ok(PortAudioDuplexInput {
+                shared: Arc::clone(&self.shared),
+                input_consumer,
+                clean_mic_producer,
+                render_reference_consumer,
+                input_channels: config.input_channels,
+                output_channels: output_channels as u16,
+                #[cfg(test)]
+                input_test_producer: None,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    fn start_duplex_for_test(
+        &mut self,
+        input_channels: u16,
+        output_channels: u16,
+    ) -> Result<PortAudioDuplexInput, String> {
+        if input_channels == 0 || output_channels == 0 {
+            return Err("测试全双工环缓声道数必须大于 0".to_owned());
+        }
+        self.shared.reset_microphone_metrics();
+        let (input_test_producer, input_consumer) = HeapRb::<f32>::new(256).split();
+        let (clean_mic_producer, _clean_callback_consumer) = HeapRb::<f32>::new(256).split();
+        let (_render_reference_producer, render_reference_consumer) =
+            HeapRb::<f32>::new(256).split();
+        self.shared
+            .input_channels
+            .store(input_channels, Ordering::Relaxed);
+        self.shared
+            .channels
+            .store(output_channels, Ordering::Relaxed);
+        Ok(PortAudioDuplexInput {
+            shared: Arc::clone(&self.shared),
+            input_consumer,
+            clean_mic_producer,
+            render_reference_consumer,
+            input_channels,
+            output_channels,
+            input_test_producer: Some(input_test_producer),
+        })
+    }
+
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         self.prestart_writes_enabled = false;
+        self.shared.microphone_gate.set_enabled(false);
         self.shared.callback_paused.store(false, Ordering::Release);
         self.shared.live_pcm_paused.store(false, Ordering::SeqCst);
         #[cfg(autolive_has_portaudio)]
@@ -1510,6 +2426,15 @@ mod tests {
             clear_requested: AtomicBool::new(false),
             callback_paused: AtomicBool::new(false),
             live_pcm_paused: AtomicBool::new(false),
+            microphone_gate: Arc::new(MicrophoneGate::default()),
+            input_channels: AtomicU16::new(DEFAULT_INPUT_CHANNELS),
+            input_frames_captured: AtomicU64::new(0),
+            input_overflow_count: AtomicU64::new(0),
+            last_input_adc_time_us: AtomicI64::new(i64::MIN),
+            clean_mic_frames_rendered: AtomicU64::new(0),
+            clean_mic_drop_count: AtomicU64::new(0),
+            clean_mic_underrun_count: AtomicU64::new(0),
+            render_reference_drop_count: AtomicU64::new(0),
         };
 
         record_callback_status(&shared, 0);
@@ -1675,6 +2600,162 @@ mod tests {
         assert!(status.selected_backend == "portaudio" || status.selected_backend == "webview");
     }
 
+    #[test]
+    fn microphone_gate_is_atomic_and_fail_open_when_disabled() {
+        let gate = MicrophoneGate::default();
+
+        assert_eq!(gate.state(), MicrophoneGateState::Disabled);
+        assert_eq!(gate.main_gain_target(), 1.0);
+
+        gate.set_enabled(true);
+        assert_eq!(gate.state(), MicrophoneGateState::Armed);
+        gate.set_speaking(true);
+        assert_eq!(gate.state(), MicrophoneGateState::Speaking);
+        assert_eq!(gate.main_gain_target(), 0.0);
+
+        gate.set_enabled(false);
+        assert_eq!(gate.state(), MicrophoneGateState::Disabled);
+        assert_eq!(gate.main_gain_target(), 1.0);
+    }
+
+    #[test]
+    fn disabling_microphone_resets_callback_gain_without_release_delay() {
+        let gate = MicrophoneGate::default();
+        gate.set_enabled(true);
+        gate.set_speaking(true);
+        let mut gain = 0.0;
+
+        gate.set_enabled(false);
+        reset_microphone_gain_if_disabled(&mut gain, &gate);
+
+        assert_eq!(gain, 1.0);
+    }
+
+    #[test]
+    fn input_adc_timestamp_rejects_invalid_values_and_preserves_microseconds() {
+        assert_eq!(input_adc_time_to_micros(1.234_567), Some(1_234_567));
+        assert_eq!(input_adc_time_to_micros(f64::NAN), None);
+        assert_eq!(input_adc_time_to_micros(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn input_health_exposes_callback_heartbeat_and_status_flags() {
+        let mut output = PortAudioOutput::new(48_000, 128, 2);
+        let input = output
+            .start_duplex_for_test(1, 2)
+            .expect("test duplex rings should be available");
+        input.shared.callback_count.store(12, Ordering::Relaxed);
+        input
+            .shared
+            .callback_last_status_flags
+            .store(0x05, Ordering::Relaxed);
+
+        let health = input.input_health();
+        assert_eq!(health.callback_count, 12);
+        assert_eq!(health.callback_last_status_flags, 0x05);
+        output.stop();
+    }
+
+    #[test]
+    fn starting_a_new_duplex_session_resets_previous_microphone_metrics() {
+        let mut output = PortAudioOutput::new(48_000, 128, 2);
+        let input = output
+            .start_duplex_for_test(1, 2)
+            .expect("test duplex rings should be available");
+        input
+            .shared
+            .input_overflow_count
+            .store(7, Ordering::Relaxed);
+        input
+            .shared
+            .render_reference_drop_count
+            .store(3, Ordering::Relaxed);
+        input
+            .shared
+            .clean_mic_drop_count
+            .store(2, Ordering::Relaxed);
+        drop(input);
+
+        let next = output
+            .start_duplex_for_test(1, 2)
+            .expect("a new test duplex session should be available");
+        let health = next.input_health();
+        assert_eq!(health.input_overflow_count, 0);
+        assert_eq!(health.render_reference_drop_count, 0);
+        assert_eq!(health.clean_mic_drop_count, 0);
+        assert_eq!(health.last_input_adc_time_us, None);
+    }
+
+    #[test]
+    fn microphone_mute_envelope_reaches_exact_silence_and_recovers() {
+        let mut gain = 1.0;
+        let mut output = vec![1.0; 480];
+        apply_microphone_main_gain(&mut gain, true, &mut output, 48_000, 2);
+        assert!(gain < 1.0);
+        assert!(gain > 0.0);
+
+        for _ in 0..10 {
+            apply_microphone_main_gain(&mut gain, true, &mut output, 48_000, 2);
+        }
+        assert_eq!(gain, 0.0);
+        assert!(output.iter().all(|sample| *sample == 0.0));
+
+        apply_microphone_main_gain(&mut gain, false, &mut output, 48_000, 2);
+        assert!(gain > 0.0);
+        assert!(gain < 1.0);
+    }
+
+    #[test]
+    fn duplex_input_and_clean_mic_rings_are_bounded_and_round_trip() {
+        let mut output = PortAudioOutput::new(48_000, 128, 2);
+        let mut input = output
+            .start_duplex_for_test(1, 2)
+            .expect("test duplex rings should be available");
+
+        let capacity = input.input_capacity_samples();
+        assert!(capacity > 0);
+        let oversized = vec![0.25; capacity + 2];
+        let written = input.push_input_for_test(&oversized);
+        assert_eq!(written, capacity);
+        assert_eq!(input.input_ring_len_samples(), capacity);
+
+        let mut captured = vec![0.0; capacity];
+        assert_eq!(input.read_input_interleaved(&mut captured), capacity);
+        assert!(captured.iter().all(|sample| *sample == 0.25));
+
+        input.set_gate_enabled(true);
+        input.set_gate_speaking(true);
+        assert_eq!(
+            input
+                .write_clean_mic_stereo_interleaved(&[0.1, 0.2, 0.3, 0.4])
+                .unwrap(),
+            4
+        );
+        assert_eq!(input.clean_mic_ring_len_samples(), 4);
+        output.stop();
+    }
+
+    #[test]
+    fn clean_mic_is_mixed_only_while_speaking_and_main_track_is_gated() {
+        let shared = Arc::new(StreamShared::for_test(2));
+        let gate = Arc::clone(&shared.microphone_gate);
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(8).split();
+        producer.push_slice(&[0.25, -0.25, 0.5, -0.5]);
+        gate.set_enabled(true);
+        gate.set_speaking(true);
+        let mut output = vec![0.75, 0.75, 0.75, 0.75];
+        let mut gain = 0.0;
+        mix_clean_mic_into_output(&mut consumer, &mut output, &mut gain, &shared, 2, 48_000);
+        assert_eq!(output, vec![0.25, -0.25, 0.5, -0.5]);
+
+        gate.set_speaking(false);
+        producer.push_slice(&[0.1, 0.1, 0.1, 0.1]);
+        output.fill(0.75);
+        gain = 1.0;
+        mix_clean_mic_into_output(&mut consumer, &mut output, &mut gain, &shared, 2, 48_000);
+        assert!(output.iter().all(|sample| *sample == 0.75));
+    }
+
     #[cfg(autolive_has_portaudio)]
     #[test]
     fn negative_device_count_is_reported_as_portaudio_error() {
@@ -1693,6 +2774,55 @@ mod tests {
             assert!(device.max_output_channels > 0);
             assert!(!device.id.is_empty());
         }
+    }
+
+    #[cfg(autolive_has_portaudio)]
+    #[test]
+    fn default_input_device_metadata_is_safe_when_available() {
+        let device = default_input_device().expect("default input probe should not fail");
+        if let Some((index, device)) = device {
+            assert!(index >= 0);
+            assert!(device.id.starts_with("pa-input-"));
+            assert!(!device.name.contains('\n'));
+            assert!(device.max_input_channels > 0);
+        }
+    }
+
+    #[test]
+    fn microphone_device_id_is_stable_for_same_identity() {
+        let first = stable_input_device_id(HostApiKind::Mme, "Mic", 1, 44_100);
+        let second = stable_input_device_id(HostApiKind::Mme, "Mic", 1, 44_100);
+        let changed_name = stable_input_device_id(HostApiKind::Mme, "Other Mic", 1, 44_100);
+        let duplicate =
+            stable_input_device_id_with_occurrence(HostApiKind::Mme, "Mic", 1, 44_100, 1);
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            stable_input_device_id_with_occurrence(HostApiKind::Mme, "Mic", 1, 44_100, 0)
+        );
+        assert_ne!(first, changed_name);
+        assert_ne!(first, duplicate);
+        assert!(first.starts_with("pa-input-mme-"));
+    }
+
+    #[cfg(autolive_has_portaudio)]
+    #[test]
+    fn enumerated_microphone_ids_resolve_without_exposing_indices() {
+        let devices = list_input_devices().expect("should list input devices");
+        for device in devices {
+            assert!(
+                input_device_index_for_id(&device.id)
+                    .expect("stable input device lookup should succeed")
+                    .is_some(),
+                "enumerated input device must resolve: {}",
+                device.id
+            );
+        }
+        assert_eq!(
+            input_device_index_for_id("pa-input-mme-deadbeefdeadbeef")
+                .expect("unknown ID lookup should succeed"),
+            None
+        );
     }
 
     #[cfg(autolive_has_portaudio)]

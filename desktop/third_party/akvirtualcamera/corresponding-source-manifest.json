@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "component": "akvirtualcamera",
+  "upstream_repository": "https://github.com/webcamoid/akvirtualcamera",
+  "upstream_commit": "9cf77ae6379e5f635255f4b377478d388a46a3b2",
+  "upstream_archive": {
+    "path": "desktop/third_party/akvirtualcamera/source/akvirtualcamera-9cf77ae6379e5f635255f4b377478d388a46a3b2.tar.gz",
+    "sha256": "38adfa9eb271f5e602cc26b495c2c7e761b2e707b2bc9bbb047d57ce9c1e231a"
+  },
+  "overlay": [
+    {
+      "path": "desktop/third_party/akvirtualcamera/sidecar/src/main.cpp",
+      "sha256": "35eeae7a6836cdd5ae5f546aceef48ef49df816f6d55b214089e9a478b34ca52"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/sidecar/CMakeLists.txt",
+      "sha256": "ac84c3d8a441dfb3746cda793521ab896da00cd5253fa3138a36c852a2197095"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/cmake/enable-gpautolive-sidecar.cmake",
+      "sha256": "52527a2070b49d1d6b2873092d59e40e136bae5b27f896a965b199bb828de5b8"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/build-sidecar.ps1",
+      "sha256": "04a214d836d644c67eae12ddefa7bf316c6c37a02235c080aebc43f59ab759b1"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/build-directshow.ps1",
+      "sha256": "120b4e9255b7246a064dd0d58ca547dc4291cddbe7ddd3723cacdc46cf71de2b"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/patches/0001-add-gpautolive-sidecar.cmake.patch",
+      "sha256": "c48eb153f4e8126bfa802c8b2ccc8d03b2d264ebd8e6a73e47cb4cc99ef0c7e8"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/patches/0002-loopback-service-socket.patch",
+      "sha256": "68504db97734230fc2fc07a090cf8e2a3682e656c9fdf1fa9c4e5235d487970e"
+    }
+  ],
+  "license": "GPL-3.0-only",
+  "build": {
+    "network": "none",
+    "compiler": "msvc",
+    "sidecar_architecture": "x64",
+    "directshow_architectures": ["x86", "x64"]
+  },
+  "status": "source-and-overlay-declared; build-and-release-evidence-pending"
+}
