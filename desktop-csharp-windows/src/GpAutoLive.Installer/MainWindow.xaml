@@ -1,0 +1,172 @@
+<Window x:Class="GpAutoLive.Installer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="GpAutoLive 安装维护助手"
+        Width="720"
+        Height="720"
+        MinWidth="640"
+        MinHeight="620"
+        Background="{StaticResource WindowBrush}"
+        Foreground="{StaticResource TextBrush}"
+        WindowStartupLocation="CenterScreen"
+        Closing="OnWindowClosing">
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0">
+            <TextBlock FontSize="24" FontWeight="SemiBold" Text="安装维护助手" />
+            <TextBlock Margin="0,7,0,0"
+                       Foreground="{StaticResource MutedTextBrush}"
+                       TextWrapping="Wrap"
+                       Text="只编排已审核的安装、校验、回滚、旧版本删除和 Runtime 探测脚本。真实变更会先自动安全预演。" />
+        </StackPanel>
+
+        <Border Grid.Row="1"
+                Margin="0,18,0,14"
+                Padding="12"
+                Background="#2A2318"
+                BorderBrush="#6B5427"
+                BorderThickness="1"
+                CornerRadius="6">
+            <TextBlock Foreground="#F4C96B"
+                       TextWrapping="Wrap"
+                       Text="当前是 Runtime 已就绪后的维护壳：需要 .NET 10 Desktop Runtime 和 PowerShell 7。删除仅限非活动版本，不会删除用户配置，也不代表完整卸载。" />
+        </Border>
+
+        <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="140" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0" VerticalAlignment="Center" Text="操作" />
+            <ComboBox x:Name="OperationBox"
+                      Grid.Row="0"
+                      Grid.Column="1"
+                      Grid.ColumnSpan="2"
+                      Margin="0,0,0,10"
+                      DisplayMemberPath="Label"
+                      SelectionChanged="OnOperationChanged"
+                      AutomationProperties.Name="安装维护操作" />
+
+            <TextBlock Grid.Row="1" VerticalAlignment="Center" Text="安装目录" />
+            <TextBox x:Name="InstallRootBox"
+                     Grid.Row="1"
+                     Grid.Column="1"
+                     Margin="0,0,8,10"
+                     AutomationProperties.Name="安装目录" />
+            <Button x:Name="BrowseInstallRootButton"
+                    Grid.Row="1"
+                    Grid.Column="2"
+                    Margin="0,0,0,10"
+                    Click="OnBrowseFolder"
+                    Tag="Install"
+                    AutomationProperties.Name="选择安装目录"
+                    Content="选择…" />
+
+            <TextBlock Grid.Row="2" VerticalAlignment="Center" Text="发布包目录" />
+            <TextBox x:Name="PackageRootBox"
+                     Grid.Row="2"
+                     Grid.Column="1"
+                     Margin="0,0,8,10"
+                     AutomationProperties.Name="发布包目录" />
+            <Button x:Name="BrowsePackageRootButton"
+                    Grid.Row="2"
+                    Grid.Column="2"
+                    Margin="0,0,0,10"
+                    Click="OnBrowseFolder"
+                    Tag="Package"
+                    AutomationProperties.Name="选择发布包目录"
+                    Content="选择…" />
+
+            <TextBlock Grid.Row="3" VerticalAlignment="Center" Text="版本" />
+            <TextBox x:Name="VersionBox"
+                     Grid.Row="3"
+                     Grid.Column="1"
+                     Grid.ColumnSpan="2"
+                     AutomationProperties.HelpText="安装和删除时必填；回滚留空使用 previous_version"
+                     AutomationProperties.Name="版本号" />
+        </Grid>
+
+        <StackPanel Grid.Row="3" Margin="140,16,0,14">
+            <CheckBox x:Name="RequireSignedBox"
+                      IsChecked="True"
+                      Content="要求发布包和回滚目标通过签名门禁"
+                      AutomationProperties.Name="要求签名" />
+            <CheckBox x:Name="WhatIfBox"
+                      Margin="0,8,0,0"
+                      IsChecked="True"
+                      Content="仅安全预演（WhatIf），不写入或删除"
+                      AutomationProperties.Name="安全预演" />
+            <TextBlock x:Name="OperationHelpText"
+                       Margin="0,10,0,0"
+                       Foreground="{StaticResource MutedTextBrush}"
+                       TextWrapping="Wrap" />
+        </StackPanel>
+
+        <Border Grid.Row="4"
+                Padding="12"
+                Background="{StaticResource SurfaceBrush}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="1"
+                CornerRadius="6">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <TextBlock FontWeight="SemiBold" Text="结果" />
+                <TextBox x:Name="ResultBox"
+                         Grid.Row="1"
+                         Margin="0,10,0,0"
+                         IsReadOnly="True"
+                         TextWrapping="Wrap"
+                         VerticalScrollBarVisibility="Auto"
+                         AutomationProperties.Name="安装维护结果" />
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="5" Margin="0,16,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <ProgressBar x:Name="BusyIndicator"
+                         Height="4"
+                         Margin="0,0,16,0"
+                         VerticalAlignment="Center"
+                         IsIndeterminate="True"
+                         Visibility="Collapsed" />
+            <Button x:Name="CancelButton"
+                    Grid.Column="1"
+                    Margin="0,0,10,0"
+                    Click="OnCancel"
+                    IsEnabled="False"
+                    AutomationProperties.Name="取消当前操作"
+                    Content="取消" />
+            <Button x:Name="RunButton"
+                    Grid.Column="2"
+                    Click="OnRun"
+                    Background="{StaticResource AccentBrush}"
+                    Foreground="#0B1715"
+                    FontWeight="SemiBold"
+                    AutomationProperties.Name="执行所选操作"
+                    Content="执行所选操作" />
+        </Grid>
+    </Grid>
+</Window>

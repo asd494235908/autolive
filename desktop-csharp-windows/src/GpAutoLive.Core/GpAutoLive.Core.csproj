@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>GpAutoLive.Core</AssemblyName>
+    <RootNamespace>GpAutoLive.Core</RootNamespace>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\GpAutoLive.Contracts\GpAutoLive.Contracts.csproj" />
+  </ItemGroup>
+</Project>

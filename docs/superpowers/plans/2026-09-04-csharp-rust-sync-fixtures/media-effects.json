@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "contract": "media-effects",
+  "case": "gpu83-request-with-cpu4-fallback",
+  "input": {
+    "video_processing": "gpu83",
+    "brightness_percent": 0,
+    "contrast_percent": 100,
+    "saturation_percent": 100,
+    "hue_degrees": 0
+  },
+  "expected": {
+    "accepted": true,
+    "fallback_order": ["gpu83", "cpu4", "original"],
+    "effective_mode_when_gpu_available": "gpu83",
+    "effective_mode_when_gpu_unavailable": "cpu4",
+    "error_code": null
+  }
+}

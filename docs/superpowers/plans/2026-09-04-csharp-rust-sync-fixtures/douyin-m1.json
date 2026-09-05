@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "contract": "douyin-m1",
+  "case": "chat-message-selects-local-reply",
+  "input": {
+    "event_type": "WebcastChatMessage",
+    "message_id": "fixture-message-1",
+    "room_id": "123456789",
+    "reply_pool_size": 2,
+    "queue_capacity": 500,
+    "task_age_seconds": 30,
+    "auto_reply_enabled": true
+  },
+  "expected": {
+    "accepted": true,
+    "reply_source": "local_pool",
+    "send_mode": "serial_bounded_queue",
+    "expired": false,
+    "model_calls": 0,
+    "go_calls": 0,
+    "credential_persisted": false,
+    "error_code": null
+  }
+}

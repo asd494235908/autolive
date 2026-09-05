@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-09-05",
+  "source_plan": "2026-09-04-CSharp与Rust桌面端功能同步长任务实施方案.md",
+  "status_labels": {
+    "正式需求·待实现/未接入": "只有需求、模型、默认值或校验，尚未进入真实输出。",
+    "代码已接入·待验收": "代码路径存在，但缺真实设备、外部服务、长稳或发布门禁。",
+    "自动化已通过": "指定自动化测试通过，不代表真实业务完成。",
+    "真实环境已通过": "真实设备、服务和发布门禁证据均已通过。",
+    "非当前范围": "当前版本明确不实施。"
+  },
+  "capabilities": [
+    {
+      "id": "auth-device-activation",
+      "name": "登录、设备、激活、心跳",
+      "priority": "P0",
+      "rust": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop/src-tauri/src/control_plane_auth.rs", "desktop/src-tauri/src/commands.rs"]
+      },
+      "csharp": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.App/", "desktop-csharp-windows/docs/CSharp-Windows当前状态.md"]
+      },
+      "next_gate": "统一刷新、离线恢复、错误语义和服务端/设备授权矩阵"
+    },
+    {
+      "id": "local-media-pool",
+      "name": "本地媒体池",
+      "priority": "P0",
+      "rust": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop/src-tauri/src/media_library/mod.rs", "desktop/src-tauri/src/lib.rs"]
+      },
+      "csharp": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Core/MediaPoolService.cs", "desktop-csharp-windows/src/GpAutoLive.Media/MediaImportCoordinator.cs", "desktop-csharp-windows/src/GpAutoLive.App/MainWindow.MediaPool.cs", "desktop-csharp-windows/src/GpAutoLive.App/MainWindow.xaml"]
+      },
+    "next_gate": "人工导入/播放页面、100 项上限、取消/重复路径/失败保留旧池；真实主窗口导入与 EOF 自动换源夹具已通过"
+    },
+    {
+      "id": "single-window-playback",
+      "name": "单窗口播放、EOF、换源和循环",
+      "priority": "P0",
+      "rust": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop/src-tauri/src/realtime_video_runtime.rs", "desktop/src-tauri/src/media_av_sync.rs"]
+      },
+      "csharp": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Windows/WindowsMpvPlaybackController.cs", "desktop-csharp-windows/src/GpAutoLive.App/MainWindow.Playback.cs"]
+      },
+    "next_gate": "暂停/恢复、连续 EOF、多次换源和退出资源回收；真实首帧与单次 EOF 换源夹具已通过"
+    },
+    {
+      "id": "video-effects",
+      "name": "视频效果 GPU83、CPU4、Original",
+      "priority": "P0",
+      "rust": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop/src-tauri/src/realtime_video_runtime.rs", "desktop/src-tauri/src/media_effect_params.rs"]
+      },
+      "csharp": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Media/MpvPlaybackSession.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsMpvPlaybackController.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsGraphicsCaptureGpuYuy2Converter.cs", "desktop-csharp-windows/src/GpAutoLive.App/MainWindow.Effects.cs", "desktop-csharp-windows/tests/GpAutoLive.App.Tests/VideoEffectPixelFixtureTests.cs", "desktop-csharp-windows/tests/GpAutoLive.Windows.Tests/WindowsMpvRealFixtureTests.cs"]
+      },
+      "next_gate": "目标显卡矩阵和人工页面验收；原生 Win32 GPU83 与实际 WPF FinalEffectWindow 最终 YUY2/视频表面像素哈希、播放态参数回读后的 estimated-frame-number 下一帧观察已通过显式夹具"
+    },
+    {
+      "id": "ordinary-audio",
+      "name": "普通声音候选、PortAudio、最终 PCM 和可听时钟",
+      "priority": "P0",
+      "rust": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop/src-tauri/src/audio_pcm_effects.rs", "desktop/src-tauri/src/audible_audio_clock.rs", "desktop/src-tauri/src/media_av_sync.rs"]
+      },
+      "csharp": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Media/FinalPcmBus.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsAudioPlaybackController.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsRtmpAudioSession.cs"]
+      },
+      "next_gate": "真实 N/N+1 预载/切换、可听 PTS、过载重建、设备拔插和故障恢复；首批 PCM 启动门槛与 RTMP 分支非阻塞已通过显式夹具"
+    },
+    {
+      "id": "interlude-and-sapi",
+      "name": "插话文件与固定 SAPI 话术",
+      "priority": "P0",
+      "rust": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop/src-tauri/src/interlude_player.rs"]
+      },
+      "csharp": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.App/MainWindow.AudioInterlude.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsSystemSpeechAdapter.cs"]
+      },
+      "next_gate": "统一优先级、静音、抢占、取消、恢复和真实 SAPI 设备输出"
+    },
+    {
+      "id": "microphone-interlude",
+      "name": "麦克风插话",
+      "priority": "P1",
+      "rust": {
+        "status": "正式需求·待实现/未接入",
+        "evidence": ["desktop/src-tauri/src/microphone_interlude.rs", "AGENTS.md"]
+      },
+      "csharp": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Windows/WindowsMicrophoneInterludeController.cs"]
+      },
+      "next_gate": "真实 AEC/降噪/AGC/VAD 声学门禁；VAD 只作说话活动门控"
+    },
+    {
+      "id": "rtmp-output",
+      "name": "RTMP/RTMPS 直推",
+      "priority": "P0",
+      "rust": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop/src-tauri/src/rtmp_output/mod.rs", "desktop/src-tauri/src/commands.rs"]
+      },
+      "csharp": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Windows/WindowsRtmpOutputManager.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsRtmpAudioSession.cs", "desktop-csharp-windows/src/GpAutoLive.App/MainWindow.Rtmp.cs"]
+      },
+      "next_gate": "ZLMediaKit/RTMPS 远端握手、三轨道、断线恢复、取消和 30 分钟长稳；本机进程终态、启动期 Pump/Producer 失败和停止超时资源保留已有显式测试"
+    },
+    {
+      "id": "akvirtualcamera",
+      "name": "AkVirtualCamera 虚拟摄像头",
+      "priority": "P1",
+      "rust": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop/src-tauri/crates/autolive-virtual-camera-contract", "desktop/src-tauri/src/virtual_camera_output.rs"]
+      },
+      "csharp": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Core/VirtualCameraOutputManager.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsGraphicsCaptureCapabilityProbe.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsGraphicsCaptureWindowSession.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsGraphicsCaptureGpuYuy2Converter.cs"]
+      },
+      "next_gate": "实际 WPF FinalEffectWindow 可见帧、固定 YUY2 720p30 下游、sidecar、DirectShow、签名和卸载；原生 Win32 GPU83 WGC→D3D11→YUY2 已通过显式帧哈希夹具"
+    },
+    {
+      "id": "douyin-m1",
+      "name": "抖音直播弹幕随机自动回应 M1",
+      "priority": "P1",
+      "rust": {
+        "status": "正式需求·待实现/未接入",
+        "evidence": ["desktop/src-tauri/src/douyin_live.rs", "docs/superpowers/plans/2026-08-31-抖音直播弹幕逐条自动回应实施方案.md"]
+      },
+      "csharp": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Core/DouyinLiveManager.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsDouyinProbeHost.cs"]
+      },
+      "next_gate": "真实 WebcastChatMessage 事件桥、扫码、单房间发送、自回显、风险停止和许可审计"
+    },
+    {
+      "id": "runtime-resources",
+      "name": "本地运行时资源",
+      "priority": "P1",
+      "rust": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop/src-tauri/src/runtime_resources.rs"]
+      },
+      "csharp": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.App/Features/Runtime/", "desktop-csharp-windows/src/GpAutoLive.Installer/"]
+      },
+      "next_gate": "manifest、SHA-256、路径白名单、许可证、签名、安装/卸载和回滚"
+    },
+    {
+      "id": "shared-output-ownership",
+      "name": "单实例与媒体输出所有权",
+      "priority": "P0",
+      "rust": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop/src-tauri/crates/autolive-media-output-ownership/src/lib.rs", "desktop/src-tauri/src/main.rs"]
+      },
+      "csharp": {
+        "status": "代码已接入·待验收",
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Windows/WindowsMediaOutputOwnership.cs", "desktop-csharp-windows/docs/C7-媒体输出所有权与单实例审查记录.md"]
+      },
+      "next_gate": "跨进程争用、启动竞态、输出资源矩阵、崩溃恢复和无孤儿进程"
+    },
+    {
+      "id": "realtime-speech-morphing",
+      "name": "实时话术幻化、speech-to-speech、ASR/LLM/TTS",
+      "priority": "N/A",
+      "rust": {
+        "status": "非当前范围",
+        "evidence": ["AGENTS.md", "产品需求文档.md"]
+      },
+      "csharp": {
+        "status": "非当前范围",
+        "evidence": ["desktop-csharp-windows/docs/CSharp-Windows当前状态.md"]
+      },
+      "next_gate": "不实施；如范围变更，先更新产品架构与本方案"
+    }
+  ]
+}

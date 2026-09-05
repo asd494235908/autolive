@@ -1,0 +1,119 @@
+<Window x:Class="GpAutoLive.App.Features.Settings.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="设置"
+        Icon="/GpAutoLive;component/Assets/app-icon.ico"
+        Width="560"
+        Height="480"
+        MinWidth="560"
+        MinHeight="480"
+        MaxWidth="560"
+        MaxHeight="480"
+        Background="{StaticResource WindowBrush}"
+        Foreground="{StaticResource TextBrush}"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        WindowStartupLocation="CenterOwner"
+        PreviewKeyDown="Window_PreviewKeyDown">
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="12" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="16" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0">
+            <TextBlock FontSize="21" FontWeight="SemiBold" Text="设置" />
+            <TextBlock Margin="0,6,0,0"
+                       Foreground="{StaticResource MutedTextBrush}"
+                       FontSize="11"
+                       Text="偏好只写入本机用户配置，不包含媒体文件、地址或凭据。"
+                       TextWrapping="Wrap" />
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="2"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled">
+            <StackPanel>
+                <Border Style="{StaticResource CardStyle}">
+                    <StackPanel>
+                        <TextBlock FontSize="14" FontWeight="SemiBold" Text="性能与布局" />
+                        <CheckBox x:Name="PerformanceSamplingCheckBox"
+                                  Margin="0,14,0,4"
+                                  AutomationProperties.Name="启用性能采样"
+                                  Content="性能采样（每秒更新标题栏）"
+                                  ToolTip="关闭后停止本进程的周期性能采样。"
+                                  IsTabStop="True" />
+                        <CheckBox x:Name="EffectsPanelExpandedCheckBox"
+                                  AutomationProperties.Name="展开快速参数"
+                                  Content="启动时展开快速参数卡"
+                                  ToolTip="关闭后隐藏主窗口的快速参数卡，可随时重新打开。"
+                                  IsTabStop="True" />
+                    </StackPanel>
+                </Border>
+
+                <Border Margin="0,12,0,0" Style="{StaticResource CardStyle}">
+                    <StackPanel>
+                        <TextBlock FontSize="14" FontWeight="SemiBold" Text="输出偏好" />
+                        <TextBlock Margin="0,6,0,0"
+                                   Foreground="{StaticResource MutedTextBrush}"
+                                   FontSize="11"
+                                   Text="只记住下次进入输出面板时的选择，不会自动启动推流或虚拟摄像头。"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Margin="0,14,0,5"
+                                   Style="{StaticResource SectionLabelStyle}"
+                                   Text="下次输出入口" />
+                        <ComboBox x:Name="LastOutputModeComboBox"
+                                  AutomationProperties.Name="下次输出入口"
+                                  Background="{StaticResource SurfaceRaisedBrush}"
+                                  BorderBrush="{StaticResource BorderBrush}"
+                                  Foreground="{StaticResource TextBrush}"
+                                  Padding="8,5">
+                            <ComboBoxItem Tag="preview" Content="本地预览" />
+                            <ComboBoxItem Tag="rtmp" Content="RTMP / RTMPS" />
+                            <ComboBoxItem Tag="virtual_camera" Content="虚拟摄像头" />
+                        </ComboBox>
+                    </StackPanel>
+                </Border>
+
+                <Border Margin="0,12,0,0" Style="{StaticResource CardStyle}">
+                    <StackPanel>
+                        <TextBlock FontSize="14" FontWeight="SemiBold" Text="兼容性" />
+                        <TextBlock Margin="0,6,0,0"
+                                   Foreground="{StaticResource MutedTextBrush}"
+                                   FontSize="11"
+                                   Text="当前版本固定使用深色主题与简体中文；字段已保留用于后续兼容升级。"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+
+        <Grid Grid.Row="4">
+            <TextBlock x:Name="StatusText"
+                       VerticalAlignment="Center"
+                       Foreground="{StaticResource MutedTextBrush}"
+                       FontSize="11"
+                       Text="Enter 保存 · Esc 取消" />
+            <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+                <Button Width="76"
+                        Margin="0,0,8,0"
+                        AutomationProperties.Name="取消设置"
+                        Content="取消"
+                        Click="CancelButton_Click"
+                        IsCancel="True"
+                        Style="{StaticResource ButtonStyle}" />
+                <Button Width="76"
+                        AutomationProperties.Name="保存设置"
+                        Content="保存"
+                        Click="SaveButton_Click"
+                        IsDefault="True"
+                        Style="{StaticResource AccentButtonStyle}" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

@@ -1,0 +1,1770 @@
+<Window x:Class="GpAutoLive.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        xmlns:auth="clr-namespace:GpAutoLive.App.Features.Auth"
+        Title="GpAutoLive"
+        Icon="/GpAutoLive;component/Assets/app-icon.ico"
+        Width="1586"
+        Height="992"
+        MinWidth="1280"
+        MinHeight="800"
+        Background="{StaticResource WindowBrush}"
+        Foreground="{StaticResource TextBrush}"
+        WindowStyle="None"
+        ResizeMode="CanResize"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        Loaded="Window_Loaded"
+        PreviewKeyDown="Window_PreviewKeyDown">
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="36"
+                            ResizeBorderThickness="6"
+                            GlassFrameThickness="0"
+                            UseAeroCaptionButtons="False" />
+    </shell:WindowChrome.WindowChrome>
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="45" />
+            <RowDefinition Height="53" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="74" />
+            <RowDefinition Height="44" />
+        </Grid.RowDefinitions>
+
+        <!-- 45px custom title bar. It is the only drag surface in this shell. -->
+        <Border Grid.Row="0"
+                Background="#080F15"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,0,0,1"
+                MouseLeftButtonDown="TitleBar_MouseLeftButtonDown">
+            <Grid Margin="16,0,4,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="26" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <Border Grid.Column="0"
+                        Width="26"
+                        Height="26"
+                        HorizontalAlignment="Left"
+                        VerticalAlignment="Center"
+                        Background="#101827"
+                        CornerRadius="6">
+                    <Image Width="26"
+                           Height="26"
+                           Source="/GpAutoLive;component/Assets/app-icon.png"
+                           Stretch="Uniform"
+                           SnapsToDevicePixels="True"
+                           RenderOptions.BitmapScalingMode="HighQuality" />
+                </Border>
+                <TextBlock Grid.Column="1"
+                           Margin="5,0,0,0"
+                           VerticalAlignment="Center"
+                           FontSize="16"
+                           FontWeight="SemiBold"
+                           Text="GpAutoLive" />
+                <Border Grid.Column="2"
+                        Margin="63,0,60,0"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Padding="0">
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <Grid Width="14"
+                              Height="16"
+                              Margin="0,0,8,0">
+                            <Path Fill="{Binding Foreground, ElementName=DeviceStatusText}"
+                                  Data="M7,0 L13,2.6 V7.1 C13,11 10.5,14 7,16 C3.5,14 1,11 1,7.1 V2.6 Z" />
+                            <Path Stroke="{StaticResource WindowBrush}"
+                                  StrokeThickness="1.2"
+                                  StrokeStartLineCap="Round"
+                                  StrokeEndLineCap="Round"
+                                  Data="M4,8 L6.2,10.2 L10.4,5.8" />
+                        </Grid>
+                        <TextBlock x:Name="DeviceStatusText"
+                                   Foreground="{StaticResource WarningBrush}"
+                                   FontSize="11"
+                                   Text="设备未授权" />
+                    </StackPanel>
+                </Border>
+                <TextBlock x:Name="AccountStatusText"
+                           Grid.Column="3"
+                           Margin="0,0,16,0"
+                           VerticalAlignment="Center"
+                           Foreground="{StaticResource MutedTextBrush}"
+                           FontSize="11"
+                           Text="账户：—" />
+                <TextBlock x:Name="ActivationExpiryText"
+                           Grid.Column="4"
+                           Margin="0,0,16,0"
+                           VerticalAlignment="Center"
+                           Foreground="{StaticResource MutedTextBrush}"
+                           FontSize="11"
+                           Text="授权到期：—" />
+                <TextBlock x:Name="PerformanceText"
+                           Grid.Column="6"
+                           Margin="0,0,12,0"
+                           VerticalAlignment="Center"
+                           Foreground="{StaticResource MutedTextBrush}"
+                           FontSize="11"
+                           Text="CPU / GPU / RAM · 待采样" />
+                <StackPanel Grid.Column="7" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock x:Name="AuthStatusText"
+                               VerticalAlignment="Center"
+                               Foreground="{StaticResource MutedTextBrush}"
+                               FontSize="11"
+                               Text="未登录"
+                               Visibility="Collapsed" />
+                </StackPanel>
+                <StackPanel Grid.Column="8" Orientation="Horizontal">
+                    <Button x:Name="SettingsButton"
+                            Width="64"
+                            shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                            AutomationProperties.Name="打开设置"
+                            Click="SettingsButton_Click"
+                            Style="{StaticResource IconButtonStyle}"
+                            ToolTip="设置 (Ctrl+,)">
+                        <StackPanel Orientation="Horizontal">
+                            <Path Width="14"
+                                  Height="14"
+                                  Margin="0,0,5,0"
+                                  VerticalAlignment="Center"
+                                  Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                                  StrokeThickness="1.15"
+                                  StrokeLineJoin="Round"
+                                  StrokeStartLineCap="Round"
+                                  StrokeEndLineCap="Round"
+                                  Data="{StaticResource SettingsGearIconGeometry}" />
+                            <TextBlock VerticalAlignment="Center" Text="设置" />
+                        </StackPanel>
+                    </Button>
+                    <Button Margin="4,0,0,0"
+                            shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                            AutomationProperties.Name="最小化"
+                            Content="—"
+                            Click="MinimizeButton_Click"
+                            Style="{StaticResource IconButtonStyle}"
+                            ToolTip="最小化" />
+                    <Button Margin="4,0,0,0"
+                            shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                            AutomationProperties.Name="最大化或还原"
+                            Content="□"
+                            Click="MaximizeButton_Click"
+                            Style="{StaticResource IconButtonStyle}"
+                            ToolTip="最大化/还原" />
+                    <Button Margin="4,0,0,0"
+                            shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                            AutomationProperties.Name="关闭"
+                            Content="×"
+                            Click="CloseButton_Click"
+                            Style="{StaticResource IconButtonStyle}"
+                            ToolTip="关闭" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- 53px navigation and operation bar matching the reference workbench. -->
+        <Border x:Name="OperationBar"
+                Grid.Row="1"
+                Background="#101720"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,0,0,1">
+            <Grid Margin="16,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="272" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button Width="70" Height="36" Content="主页" Style="{StaticResource AccentTabButtonStyle}" />
+                    <Button Width="68" Height="36" Margin="6,0,0,0" Content="工作区" Background="{StaticResource SurfaceRaisedBrush}" BorderBrush="{StaticResource BorderBrush}" Foreground="{StaticResource TextBrush}" Style="{StaticResource TabButtonStyle}" />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button x:Name="TopImportButton"
+                            Width="110"
+                            Height="36"
+                            AutomationProperties.Name="添加媒体"
+                            AutomationProperties.AutomationId="TopImportButton"
+                            Click="ImportButton_Click"
+                            HorizontalContentAlignment="Center"
+                            Style="{StaticResource ButtonStyle}">
+                        <StackPanel Orientation="Horizontal">
+                            <Path Width="12" Height="12" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.3" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Data="M6,1 V11 M1,6 H11" />
+                            <TextBlock Margin="8,0,0,0" VerticalAlignment="Center" Text="添加媒体" />
+                        </StackPanel>
+                    </Button>
+                    <Button Width="102" Height="36" Margin="10,0,0,0" HorizontalContentAlignment="Center" IsEnabled="False" Style="{StaticResource ButtonStyle}" ToolTip="整理媒体尚未接入；请使用媒体池下方的排序按钮">
+                        <StackPanel Orientation="Horizontal">
+                            <Path Width="13" Height="13" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.1" Data="M1,1 H5 V5 H1 Z M8,1 H12 V5 H8 Z M1,8 H5 V12 H1 Z M8,8 H12 V12 H8 Z" />
+                            <TextBlock Margin="8,0,0,0" VerticalAlignment="Center" Text="整理媒体" />
+                        </StackPanel>
+                    </Button>
+                    <Button x:Name="TopImportPlaylistButton"
+                            Width="100"
+                            Height="36"
+                            Margin="10,0,0,0"
+                            AutomationProperties.Name="导入媒体列表"
+                            AutomationProperties.AutomationId="TopImportPlaylistButton"
+                            Click="ImportPlaylistButton_Click"
+                            HorizontalContentAlignment="Center"
+                            IsEnabled="False"
+                            Style="{StaticResource ButtonStyle}"
+                            ToolTip="导入版本化 JSON 媒体列表；成功后按列表顺序替换当前播放池">
+                        <StackPanel Orientation="Horizontal">
+                            <Path Width="13" Height="13" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.1" StrokeLineJoin="Round" Data="M2,1 H11 V12 H2 Z M4,4 H9 M4,7 H9 M4,10 H7" />
+                            <TextBlock Margin="8,0,0,0" VerticalAlignment="Center" Text="导入列表" />
+                        </StackPanel>
+                    </Button>
+                    <Button Width="98" Height="36" Margin="10,0,0,0" HorizontalContentAlignment="Center" IsEnabled="False" Style="{StaticResource ButtonStyle}" ToolTip="保存配置尚未接入；媒体池仅存在当前进程">
+                        <StackPanel Orientation="Horizontal">
+                            <Path Width="13" Height="13" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.1" StrokeLineJoin="Round" Data="M2,1 H10 L12,3 V12 H2 Z M4,1 V5 H9 V1 M4,8 H10 V12 H4 Z" />
+                            <TextBlock Margin="8,0,0,0" VerticalAlignment="Center" Text="保存配置" />
+                        </StackPanel>
+                    </Button>
+                    <Button Width="100" Height="36" Margin="10,0,0,0" HorizontalContentAlignment="Center" IsEnabled="False" Style="{StaticResource ButtonStyle}" ToolTip="加载配置尚未接入；请使用添加媒体导入视频/音频文件">
+                        <StackPanel Orientation="Horizontal">
+                            <Path Width="13" Height="13" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.1" StrokeLineJoin="Round" Data="M2,1 H10 L12,3 V12 H2 Z M4,9 H10 M7,11 V5 M5,7 L7,5 L9,7" />
+                            <TextBlock Margin="8,0,0,0" VerticalAlignment="Center" Text="加载配置" />
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button Width="118"
+                            Height="36"
+                            AutomationProperties.Name="开始 RTMP 画面推流"
+                            Click="StartRtmpButton_Click"
+                            HorizontalContentAlignment="Center"
+                            Style="{StaticResource AccentButtonStyle}">
+                        <StackPanel Orientation="Horizontal">
+                            <Path Width="13" Height="12" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.1" StrokeLineJoin="Round" Data="M1,2 H8 V10 H1 Z M8,4 L12,2 V10 L8,8 Z" />
+                            <TextBlock Margin="8,0,0,0" VerticalAlignment="Center" Text="开始推流" />
+                        </StackPanel>
+                    </Button>
+                    <Button Width="146"
+                            Height="36"
+                            Margin="10,0,0,0"
+                            AutomationProperties.Name="打开最终效果窗口"
+                            Click="OpenFinalEffectButton_Click"
+                            HorizontalContentAlignment="Center"
+                            Style="{StaticResource ButtonStyle}">
+                        <StackPanel Orientation="Horizontal">
+                            <Path Width="13" Height="13" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.1" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Data="M6.5,1 A5.5,5.5 0 1 1 6.49,1 M6.5,3.5 V6.5 L9,8" />
+                            <TextBlock Margin="8,0,0,0" VerticalAlignment="Center" Text="打开效果窗口" />
+                        </StackPanel>
+                    </Button>
+                    <Button x:Name="MainMenuButton"
+                            Height="36"
+                            Margin="51,0,0,0"
+                            AutomationProperties.Name="打开主菜单"
+                            Content="☰"
+                            Style="{StaticResource IconButtonStyle}">
+                        <Button.ContextMenu>
+                            <ContextMenu>
+                                <MenuItem x:Name="LogoutMenuItem"
+                                          Header="退出登录"
+                                          Click="LogoutButton_Click"
+                                          IsEnabled="False"
+                                          ToolTip="退出当前登录或离线会话" />
+                            </ContextMenu>
+                        </Button.ContextMenu>
+                    </Button>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid x:Name="WorkbenchSurface" Grid.Row="2" Margin="10,9,10,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="23.2*" />
+                <ColumnDefinition Width="10" />
+                <ColumnDefinition Width="50.3*" />
+                <ColumnDefinition Width="10" />
+                <ColumnDefinition Width="26.5*" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Media pool and playback settings -->
+            <Grid Grid.Column="0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="224" />
+                </Grid.RowDefinitions>
+            <Border Grid.Row="0"
+                    Style="{StaticResource CardStyle}"
+                    Padding="0"
+                    AllowDrop="True"
+                    DragOver="MediaPool_DragOver"
+                    Drop="MediaPool_Drop">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="70" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid Margin="14,0">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="38" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="10" />
+                            <ColumnDefinition Width="102" />
+                            <ColumnDefinition Width="10" />
+                            <ColumnDefinition Width="164" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock VerticalAlignment="Center" FontSize="15" FontWeight="SemiBold" Text="媒体池" />
+                        <ComboBox Grid.Row="0" Grid.Column="2" Width="102" Height="30" VerticalAlignment="Center" SelectedIndex="0">
+                            <ComboBoxItem Content="全部" />
+                            <ComboBoxItem Content="视频" />
+                            <ComboBoxItem Content="音频" />
+                        </ComboBox>
+                        <TextBox Grid.Row="0"
+                                 Grid.Column="4"
+                                 Width="164"
+                                 Height="30"
+                                 VerticalAlignment="Center"
+                                 AutomationProperties.Name="搜索媒体"
+                                 IsReadOnly="True"
+                                 ToolTip="媒体搜索尚未接入；当前显示完整播放池"
+                                 Text="⌕  搜索媒体" />
+                        <TextBlock x:Name="MediaCountText"
+                                   Grid.Row="1"
+                                   Grid.ColumnSpan="7"
+                                   Margin="0,0,0,2"
+                                   VerticalAlignment="Center"
+                                   Foreground="{StaticResource MutedTextBrush}"
+                                   FontSize="10"
+                                   Text="共 0 个媒体" />
+                    </Grid>
+                    <Grid Grid.Row="1" Margin="10,8">
+                        <StackPanel x:Name="EmptyMediaPanel" VerticalAlignment="Center">
+                            <TextBlock HorizontalAlignment="Center"
+                                       Foreground="{StaticResource MutedTextBrush}"
+                                       FontSize="26"
+                                       Text="＋" />
+                            <TextBlock Margin="0,8,0,0"
+                                       HorizontalAlignment="Center"
+                                       Foreground="{StaticResource MutedTextBrush}"
+                                       Text="尚未添加媒体" />
+                            <TextBlock Margin="0,4,0,0"
+                                       HorizontalAlignment="Center"
+                                       Foreground="#697186"
+                                       FontSize="11"
+                                       Text="拖放文件，或使用 Ctrl+O 导入" />
+                        </StackPanel>
+                        <ListBox x:Name="MediaListBox"
+                                 AutomationProperties.Name="有序媒体播放池"
+                                 ItemsSource="{Binding MediaItems}"
+                                 SelectionChanged="MediaListBox_SelectionChanged"
+                                 Visibility="Collapsed"
+                                 Background="Transparent"
+                                 BorderThickness="0"
+                                 ScrollViewer.CanContentScroll="True"
+                                 ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                 ScrollViewer.VerticalScrollBarVisibility="Hidden"
+                                 Padding="0"
+                                 VirtualizingPanel.IsVirtualizing="True"
+                                 VirtualizingPanel.VirtualizationMode="Recycling">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <Border Padding="4" Margin="-2,0,2,9" Background="#171B25" CornerRadius="5">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="104" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <Border Width="96"
+                                                    Height="54"
+                                                    Background="#202A39"
+                                                    BorderBrush="#2B3342"
+                                                    BorderThickness="1"
+                                                    CornerRadius="4"
+                                                    ToolTip="{Binding MediaKindLabel}">
+                                                <Grid>
+                                                    <Image Source="{Binding Thumbnail}" Stretch="UniformToFill" />
+                                                    <TextBlock HorizontalAlignment="Center"
+                                                               VerticalAlignment="Center"
+                                                               FontSize="22"
+                                                               Foreground="{StaticResource AccentBrush}"
+                                                               Text="▶">
+                                                       <TextBlock.Style>
+                                                            <Style TargetType="TextBlock">
+                                                                <Setter Property="Text" Value="▶" />
+                                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                                     <Style.Triggers>
+                                                                     <DataTrigger Binding="{Binding MediaKind}" Value="Video">
+                                                                         <Setter Property="Visibility" Value="Visible" />
+                                                                     </DataTrigger>
+                                                                     <DataTrigger Binding="{Binding MediaKind}" Value="Audio">
+                                                                         <Setter Property="Text" Value="♫" />
+                                                                     </DataTrigger>
+                                                                    <DataTrigger Binding="{Binding Thumbnail}" Value="{x:Null}">
+                                                                        <Setter Property="Visibility" Value="Visible" />
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </TextBlock.Style>
+                                                    </TextBlock>
+                                                </Grid>
+                                            </Border>
+                                            <StackPanel Grid.Column="1" Margin="7,0,6,0">
+                                                <TextBlock Foreground="{StaticResource TextBrush}" Text="{Binding FileName, Mode=OneWay}" TextTrimming="CharacterEllipsis" />
+                                                <TextBlock Margin="0,4,0,0" Foreground="{StaticResource MutedTextBrush}" FontSize="10">
+                                                    <Run Text="{Binding DurationLabel, Mode=OneWay}" />
+                                                </TextBlock>
+                                                <TextBlock Margin="0,3,0,0" Foreground="{StaticResource MutedTextBrush}" FontSize="10">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock">
+                                                            <Setter Property="Visibility" Value="Visible" />
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding MediaKind}" Value="Audio">
+                                                                    <Setter Property="Visibility" Value="Collapsed" />
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                    <Run Text="{Binding VideoFormatLabel, Mode=OneWay}" />
+                                                </TextBlock>
+                                                <TextBlock Margin="0,3,0,0" Foreground="{StaticResource MutedTextBrush}" FontSize="10">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock">
+                                                            <Setter Property="Visibility" Value="Collapsed" />
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding MediaKind}" Value="Audio">
+                                                                    <Setter Property="Visibility" Value="Visible" />
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                    <Run Text="{Binding AudioFormatLabel, Mode=OneWay}" />
+                                                </TextBlock>
+                                            </StackPanel>
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </Grid>
+                    <Grid Grid.Row="2" Margin="14,0">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="32" />
+                        </Grid.RowDefinitions>
+                        <Button x:Name="ImportButton"
+                                AutomationProperties.Name="导入媒体"
+                                Content="导入媒体  Ctrl+O"
+                                Click="ImportButton_Click"
+                                Style="{StaticResource AccentButtonStyle}" />
+                        <StackPanel Grid.Row="1" HorizontalAlignment="Right" Orientation="Horizontal">
+                            <Button x:Name="MoveUpButton"
+                                    Width="52"
+                                    AutomationProperties.Name="上移媒体"
+                                    Content="↑"
+                                    Click="MoveUpButton_Click"
+                                    IsEnabled="False"
+                                    Style="{StaticResource IconButtonStyle}"
+                                    ToolTip="上移选中媒体" />
+                            <Button x:Name="MoveDownButton"
+                                    Width="52"
+                                    Margin="6,0,0,0"
+                                    AutomationProperties.Name="下移媒体"
+                                    Content="↓"
+                                    Click="MoveDownButton_Click"
+                                    IsEnabled="False"
+                                    Style="{StaticResource IconButtonStyle}"
+                                    ToolTip="下移选中媒体" />
+                            <Button x:Name="RemoveMediaButton"
+                                    Width="52"
+                                    Margin="6,0,0,0"
+                                    AutomationProperties.Name="移除媒体"
+                                    Content="移除"
+                                    Click="RemoveMediaButton_Click"
+                                    IsEnabled="False"
+                                    Style="{StaticResource ButtonStyle}"
+                                    ToolTip="移除选中媒体" />
+                            <Button x:Name="ClearMediaButton"
+                                    Width="52"
+                                    Margin="6,0,0,0"
+                                    AutomationProperties.Name="清空媒体池"
+                                    Content="清空"
+                                    Click="ClearMediaButton_Click"
+                                    IsEnabled="False"
+                                    Style="{StaticResource ButtonStyle}"
+                                    ToolTip="清空媒体池" />
+                        </StackPanel>
+                    </Grid>
+                </Grid>
+            </Border>
+
+            <Border Grid.Row="1" Margin="0,10,0,0" Style="{StaticResource CardStyle}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <Grid>
+                        <TextBlock FontSize="14" FontWeight="SemiBold" Text="播放设置（本地有序循环）" />
+                        <Border HorizontalAlignment="Right" Style="{StaticResource PillStyle}">
+                            <TextBlock Foreground="{StaticResource AccentBrush}" FontSize="10" Text="已就绪" />
+                        </Border>
+                    </Grid>
+                    <TextBlock Grid.Row="1" Margin="0,14,0,0" Style="{StaticResource SectionLabelStyle}" Text="触发方式" />
+                    <ComboBox Grid.Row="2" Height="34" Margin="0,6,0,0" SelectedIndex="0">
+                        <ComboBoxItem Content="本地有序循环" />
+                        <ComboBoxItem Content="手动播放当前项" />
+                    </ComboBox>
+                    <TextBlock Grid.Row="3" Margin="0,10,0,0" Style="{StaticResource SectionLabelStyle}" Text="播放完成后" />
+                    <Grid Grid.Row="4" Margin="0,6,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <ComboBox Height="34" SelectedIndex="0">
+                            <ComboBoxItem Content="保持最后一帧" />
+                            <ComboBoxItem Content="回到首项" />
+                        </ComboBox>
+                        <CheckBox Grid.Column="1" Margin="12,4,0,0" Content="循环播放" IsChecked="True" />
+                    </Grid>
+                    <Button Grid.Row="5"
+                            Width="100"
+                            HorizontalAlignment="Right"
+                            VerticalAlignment="Bottom"
+                            Margin="0,8,0,0"
+                            Content="应用到全部"
+                            IsEnabled="False"
+                            Style="{StaticResource ButtonStyle}"
+                            ToolTip="批量播放设置尚未接入正式配置" />
+                </Grid>
+            </Border>
+            </Grid>
+
+            <!-- Preview and parameter workbench -->
+            <Grid Grid.Column="2">
+                <Grid.RowDefinitions>
+                    <RowDefinition x:Name="PreviewRow" Height="0.965*" />
+                    <RowDefinition x:Name="PreviewGapRow" Height="10" />
+                <RowDefinition x:Name="QuickParamsRow" Height="1.035*" />
+                </Grid.RowDefinitions>
+                <Border x:Name="PreviewCard"
+                        Grid.Row="0"
+                         Background="#10161D"
+                        BorderBrush="{StaticResource BorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="8">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition x:Name="ParameterTabRow" Height="43" />
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="38" />
+                        </Grid.RowDefinitions>
+                        <Grid Margin="14,0">
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                <TextBlock FontSize="15" FontWeight="SemiBold" Text="实时预览" />
+                                <Border Margin="10,0,0,0" Style="{StaticResource PillStyle}">
+                                    <TextBlock Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="单一视频表面" />
+                                </Border>
+                            </StackPanel>
+                            <StackPanel Width="333" HorizontalAlignment="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                                <Button Width="96" HorizontalContentAlignment="Center" Style="{StaticResource TabButtonStyle}">
+                                    <StackPanel Orientation="Horizontal">
+                                        <Path Width="14" Height="14" Margin="0,1,0,0" Data="M1,5 V1 H5 M11,1 H15 V5 M15,11 V15 H11 M5,15 H1 V11" Stroke="{StaticResource MutedTextBrush}" StrokeThickness="1.1" StrokeStartLineCap="Round" StrokeEndLineCap="Round" />
+                                        <TextBlock Margin="6,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" Text="适配窗口" />
+                                    </StackPanel>
+                                </Button>
+                                <StackPanel Width="48" Margin="16,0,0,0" Orientation="Horizontal" VerticalAlignment="Center">
+                                    <Path Width="12" Height="10" Margin="0,0,5,0" Data="M1,1 H11 V9 H1 Z" Stroke="{StaticResource MutedTextBrush}" StrokeThickness="1.1" />
+                                    <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="16:9" />
+                                </StackPanel>
+                                <StackPanel Width="82" Margin="16,0,0,0" Orientation="Horizontal" VerticalAlignment="Center">
+                                    <Path Width="13" Height="13" Margin="0,0,5,0" Data="M1,5 H4 L8,2 V11 L4,8 H1 Z M10,5 L13,8 M13,5 L10,8" Stroke="{StaticResource MutedTextBrush}" StrokeThickness="1.1" StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round" />
+                                    <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="静音预览" />
+                                </StackPanel>
+                                <StackPanel Width="48" Margin="16,0,0,0" Orientation="Horizontal" VerticalAlignment="Center">
+                                    <Path Width="14" Height="14" Margin="0,0,5,0" Data="M1,5 V1 H5 M10,1 H14 V5 M14,10 V14 H10 M5,14 H1 V10" Stroke="{StaticResource MutedTextBrush}" StrokeThickness="1.1" StrokeStartLineCap="Round" StrokeEndLineCap="Round" />
+                                    <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="全屏" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Grid>
+                        <Grid Grid.Row="1" Background="#080A0F">
+                            <Image x:Name="PreviewThumbnailImage"
+                                   Stretch="UniformToFill"
+                                   Opacity="0.76"
+                                   Visibility="Collapsed" />
+                            <StackPanel x:Name="PreviewPlaceholderPanel" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                <TextBlock HorizontalAlignment="Center" Foreground="#697186" FontSize="36" Text="▶" />
+                                <TextBlock Margin="0,12,0,0" HorizontalAlignment="Center" Foreground="{StaticResource TextBrush}" FontSize="15" FontWeight="SemiBold" Text="唯一视频表面" />
+                                <TextBlock x:Name="PreviewSurfaceStatusText"
+                                           Margin="0,5,0,0"
+                                           HorizontalAlignment="Center"
+                                           Foreground="{StaticResource MutedTextBrush}"
+                                           FontSize="11"
+                                           Text="等待媒体 · 不启动 mpv / FFmpeg" />
+                            </StackPanel>
+                            <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="12" Style="{StaticResource PillStyle}">
+                                <TextBlock Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="原始画面" />
+                            </Border>
+                        </Grid>
+                        <Grid Grid.Row="2" Margin="14,0">
+                             <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                 <TextBlock Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="当前媒体：" />
+                                 <TextBlock x:Name="PreviewCurrentMediaText" Foreground="{StaticResource TextBrush}" FontSize="10" Text="无活动源" TextTrimming="CharacterEllipsis" />
+                             </StackPanel>
+                             <StackPanel HorizontalAlignment="Center" Orientation="Horizontal" VerticalAlignment="Center">
+                                 <TextBlock x:Name="PreviewTimeText" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="00:00:00 / —" />
+                                 <TextBlock x:Name="PreviewPlaybackStateText" Margin="12,0,0,0" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="就绪" />
+                             </StackPanel>
+                             <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                                 <TextBlock x:Name="PreviewVideoInfoText" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="视频：—" />
+                                 <TextBlock x:Name="PreviewAudioInfoText" Margin="14,0,0,0" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="音频：—" />
+                            </StackPanel>
+                        </Grid>
+                    </Grid>
+                </Border>
+                <Border x:Name="QuickParamsCard" Grid.Row="2" Padding="8" Style="{StaticResource CardStyle}">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="42" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+                        <Grid x:Name="ParameterTabBar" Grid.Row="0">
+                            <StackPanel x:Name="ParameterTabButtons" Margin="3,1,0,0" VerticalAlignment="Top" Orientation="Horizontal">
+                                <Button Width="62" Height="30" Content="参数" Style="{StaticResource AccentTabButtonStyle}" />
+                                <Button Height="30" Padding="24,7" Content="播放队列" Style="{StaticResource TabButtonStyle}" />
+                                <Button Height="30" Padding="24,7" Content="快捷键" Style="{StaticResource TabButtonStyle}" />
+                                <Button Height="30" Padding="24,7" Content="日志" Style="{StaticResource TabButtonStyle}" />
+                            </StackPanel>
+                            <TextBlock x:Name="ParameterScrollHintText"
+                                       HorizontalAlignment="Right"
+                                       VerticalAlignment="Center"
+                                       Margin="0,0,8,0"
+                                       Foreground="{StaticResource MutedTextBrush}"
+                                       FontSize="10"
+                                       Text="←    向下滚动 · 参数与状态    →"
+                                       Visibility="Collapsed" />
+                        </Grid>
+                        <Grid x:Name="ParameterContentGrid" Grid.Row="1" Margin="0,8,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition x:Name="ParameterCategoryColumn" Width="76" />
+                                <ColumnDefinition x:Name="ParameterCategoryGapColumn" Width="16" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel x:Name="ParameterCategoryNavigation"
+                                        Grid.Column="0"
+                                        Panel.ZIndex="2"
+                                        Width="85"
+                                        VerticalAlignment="Top">
+                                <Button Tag="video" Width="78" Height="30" Margin="7,0,0,0" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" SnapsToDevicePixels="True" Content="视频处理" Click="ParameterCategoryButton_Click" Style="{StaticResource AccentButtonStyle}">
+                                    <Button.RenderTransform>
+                                        <TranslateTransform Y="-3" />
+                                    </Button.RenderTransform>
+                                </Button>
+                                <Button Tag="audio" Width="78" Height="30" Margin="7,5,0,0" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" SnapsToDevicePixels="True" Content="声音处理" Click="ParameterCategoryButton_Click" Visibility="Collapsed" Style="{StaticResource ButtonStyle}" />
+                                <Button Tag="advanced" Width="78" Height="30" Margin="7,5,0,0" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" SnapsToDevicePixels="True" Content="场景与合成" Click="ParameterCategoryButton_Click" Visibility="Collapsed" Style="{StaticResource ButtonStyle}" />
+                                <Button Width="78" Height="30" Margin="7,5,0,0" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" SnapsToDevicePixels="True" Content="字幕与水印" IsEnabled="False" Visibility="Collapsed" Style="{StaticResource ButtonStyle}" />
+                                <Button Width="78" Height="30" Margin="7,5,0,0" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" SnapsToDevicePixels="True" Content="系统设置" IsEnabled="False" Visibility="Collapsed" Style="{StaticResource ButtonStyle}" />
+                            </StackPanel>
+                            <ScrollViewer x:Name="ParameterScrollViewer"
+                                          Grid.Column="0"
+                                          Grid.ColumnSpan="3"
+                                          Margin="0,0,-8,0"
+                                          Padding="0,0,4,0"
+                                          ScrollChanged="ParameterScrollViewer_ScrollChanged"
+                                          VerticalScrollBarVisibility="Auto"
+                                          HorizontalScrollBarVisibility="Disabled">
+                                <ScrollViewer.Resources>
+                                    <Style TargetType="ScrollBar" BasedOn="{StaticResource {x:Type ScrollBar}}">
+                                        <Setter Property="Width" Value="12" />
+                                    </Style>
+                                </ScrollViewer.Resources>
+                                <StackPanel Margin="0,0,8,0">
+                                    <Border x:Name="VideoSnapshotSection" Padding="3" Style="{StaticResource SnapshotSectionCardStyle}">
+                                        <Grid>
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                            </Grid.RowDefinitions>
+                                            <Grid Grid.Row="0" Margin="96,0,0,0">
+                                                <StackPanel>
+                                                    <TextBlock FontSize="13" FontWeight="SemiBold" Text="当前视频周期参数" />
+                                                    <TextBlock Margin="0,3,0,0" Style="{StaticResource SnapshotLabelStyle}" Text="系统自动生成的结果快照 · 不允许直接修改" />
+                                                </StackPanel>
+                                                <StackPanel Margin="0,0,20,0" HorizontalAlignment="Right" Orientation="Horizontal">
+                                                    <Border Width="78" Style="{StaticResource SnapshotAccentPillStyle}"><TextBlock Style="{StaticResource SnapshotPillTextStyle}" Foreground="{StaticResource AccentBrush}" Text="自动生成" /></Border>
+                                                    <Border Width="78" Margin="6,0,0,0" Style="{StaticResource SnapshotAccentPillStyle}"><TextBlock Style="{StaticResource SnapshotPillTextStyle}" Foreground="{StaticResource AccentBrush}" Text="只读快照" /></Border>
+                                                    <Border Width="78" Margin="6,0,0,0" Style="{StaticResource SnapshotWarningPillStyle}"><TextBlock Style="{StaticResource SnapshotPillTextStyle}" Foreground="{StaticResource WarningBrush}" Text="待接入" /></Border>
+                                                </StackPanel>
+                                            </Grid>
+                                            <Grid Grid.Row="1" Margin="0,2,0,0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="140" />
+                                                    <ColumnDefinition Width="140" />
+                                                    <ColumnDefinition Width="110" />
+                                                    <ColumnDefinition Width="*" />
+                                                </Grid.ColumnDefinitions>
+                                                <Border Grid.Column="0" Height="38" Style="{StaticResource SnapshotValueCardStyle}"><Grid><TextBlock VerticalAlignment="Center" Style="{StaticResource SnapshotLabelStyle}" Text="周期" /><TextBlock HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="{StaticResource TextBrush}" FontSize="12" FontWeight="SemiBold" Text="5–8 秒" /></Grid></Border>
+                                                <Border Grid.Column="1" Height="38" Style="{StaticResource SnapshotValueCardStyle}"><Grid><TextBlock VerticalAlignment="Center" Style="{StaticResource SnapshotLabelStyle}" Text="当前轮次" /><TextBlock HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="{StaticResource TextBrush}" FontSize="12" FontWeight="SemiBold" Text="{Binding VideoParameterSnapshot.Generation, Mode=OneWay, StringFormat={}{0:00}}" /></Grid></Border>
+                                                <Border Grid.Column="2" Height="38" Style="{StaticResource SnapshotValueCardStyle}"><Grid><TextBlock VerticalAlignment="Center" Style="{StaticResource SnapshotLabelStyle}" Text="视频路径" /><TextBlock HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="{StaticResource TextBrush}" FontSize="12" FontWeight="SemiBold" Text="按资源选择" ToolTip="视频处理开启时使用已验证 GPU83；不满足完整 shader 能力时单向回退 CPU4；关闭时为 Original" /></Grid></Border>
+                                                <Border Grid.Column="3" Height="38" Style="{StaticResource SnapshotValueCardStyle}"><Grid><TextBlock VerticalAlignment="Center" Style="{StaticResource SnapshotLabelStyle}" Text="源素材" /><TextBlock HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="{StaticResource TextBrush}" FontSize="12" FontWeight="SemiBold" Text="{Binding Text, ElementName=PreviewCurrentMediaText, Mode=OneWay}" TextTrimming="CharacterEllipsis" /></Grid></Border>
+                                            </Grid>
+                                            <UniformGrid Grid.Row="2" Margin="0,6,13,0" Columns="8">
+                                                <Border Height="62" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="亮度" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding VideoParameterSnapshot.BrightnessPercent, Mode=OneWay, StringFormat={}{0:+0;-0;0}%}" /></StackPanel></Border>
+                                                <Border Height="62" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="对比度" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding VideoParameterSnapshot.ContrastPercent, Mode=OneWay, StringFormat={}{0:0}%}" /></StackPanel></Border>
+                                                <Border Height="62" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="饱和度" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding VideoParameterSnapshot.SaturationPercent, Mode=OneWay, StringFormat={}{0:0}%}" /></StackPanel></Border>
+                                                <Border Height="62" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="色相旋转" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding VideoParameterSnapshot.HueRotationDegrees, Mode=OneWay, StringFormat={}{0:0}°}" /></StackPanel></Border>
+                                                <Border Height="62" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="锐度" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding VideoParameterSnapshot.SharpnessPercent, Mode=OneWay, StringFormat={}{0:0}%}" /></StackPanel></Border>
+                                                <Border Height="62" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="伽马" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding VideoParameterSnapshot.Gamma, Mode=OneWay, StringFormat={}{0:0.00}}" /></StackPanel></Border>
+                                                <Border Height="62" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="曝光" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding VideoParameterSnapshot.ExposurePercent, Mode=OneWay, StringFormat={}{0:+0;-0;0}%}" /></StackPanel></Border>
+                                                <Border Height="62" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="降噪" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding VideoParameterSnapshot.NoiseReduction, Mode=OneWay}" /></StackPanel></Border>
+                                            </UniformGrid>
+                                            <Grid Grid.Row="3" Margin="0,9,0,0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="166" />
+                                                    <ColumnDefinition Width="100" />
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock VerticalAlignment="Center" Style="{StaticResource SnapshotLabelStyle}" Text="参数由系统按周期自动生成，用户不可直接修改" />
+                                                <Button Grid.Column="1" Width="166" HorizontalAlignment="Right" Content="重新生成本周期参数" Click="RegenerateEffectParametersButton_Click" Style="{StaticResource ButtonStyle}" ToolTip="由系统按当前规则生成新快照；不会写入任意手工效果值" />
+                                                <TextBlock Grid.Column="2" Margin="12,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource AccentBrush}" FontSize="11" Text="查看生成规则  ›" />
+                                            </Grid>
+                                        </Grid>
+                                    </Border>
+
+                                    <Border x:Name="AudioSnapshotSection" Padding="1,7,1,8" Margin="0,0,0,5" Style="{StaticResource SnapshotSectionCardStyle}">
+                                        <Grid>
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                            </Grid.RowDefinitions>
+                                            <Grid Grid.Row="0">
+                                                <StackPanel>
+                                                    <TextBlock FontSize="13" FontWeight="SemiBold" Text="①  声音处理   ·   普通声音周期参数" />
+                                                    <TextBlock Margin="0,3,0,0" Style="{StaticResource SnapshotLabelStyle}" Text="普通声音效果与视频结果独立生成，结果只读" />
+                                                </StackPanel>
+                                                <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+                                                    <Border Width="70" Style="{StaticResource SnapshotAccentPillStyle}"><TextBlock Style="{StaticResource SnapshotPillTextStyle}" Foreground="{StaticResource AccentBrush}" Text="自动生成" /></Border>
+                                                    <Border Width="70" Margin="6,0,0,0" Style="{StaticResource SnapshotAccentPillStyle}"><TextBlock Style="{StaticResource SnapshotPillTextStyle}" Foreground="{StaticResource AccentBrush}" Text="只读快照" /></Border>
+                                                    <Border Width="70" Margin="6,0,0,0" Style="{StaticResource SnapshotWarningPillStyle}"><TextBlock Style="{StaticResource SnapshotPillTextStyle}" Foreground="{StaticResource WarningBrush}" Text="待接入" /></Border>
+                                                </StackPanel>
+                                            </Grid>
+                                            <UniformGrid Grid.Row="1" Margin="0,15,0,0" Columns="9">
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="音量增益" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding AudioParameterSnapshot.GainDb, Mode=OneWay, StringFormat={}{0:+0.0;-0.0;0.0} dB}" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="动态范围" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding AudioParameterSnapshot.DynamicRangeDb, Mode=OneWay, StringFormat={}{0:+0.0;-0.0;0.0} dB}" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="低频" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding AudioParameterSnapshot.LowEqDb, Mode=OneWay, StringFormat={}{0:+0.0;-0.0;0.0} dB}" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="中频" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding AudioParameterSnapshot.MidEqDb, Mode=OneWay, StringFormat={}{0:+0.0;-0.0;0.0} dB}" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="高频" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding AudioParameterSnapshot.HighEqDb, Mode=OneWay, StringFormat={}{0:+0.0;-0.0;0.0} dB}" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="混响" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding AudioParameterSnapshot.Reverb, Mode=OneWay}" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="压缩" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding AudioParameterSnapshot.Compression, Mode=OneWay}" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="降噪" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding AudioParameterSnapshot.NoiseReduction, Mode=OneWay}" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="音色" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding AudioParameterSnapshot.Tone, Mode=OneWay}" /></StackPanel></Border>
+                                            </UniformGrid>
+                                            <UniformGrid Grid.Row="2" Margin="0,2,0,0" Columns="4">
+                                                <Border Height="56" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="周期" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="3–5 秒" /></StackPanel></Border>
+                                                <Border Height="56" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="当前轮次" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding AudioParameterSnapshot.Generation, Mode=OneWay, StringFormat={}{0:00}}" /></StackPanel></Border>
+                                                <Border Height="56" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="预设池" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="p01–p20" /></StackPanel></Border>
+                                                <Border Height="56" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="本周期预设" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding AudioParameterSnapshot.PresetId, Mode=OneWay}" /></StackPanel></Border>
+                                            </UniformGrid>
+                                            <Grid Grid.Row="3" Margin="0,7,0,0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="70" />
+                                                    <ColumnDefinition Width="164" />
+                                                    <ColumnDefinition Width="91" />
+                                                    <ColumnDefinition Width="164" />
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock VerticalAlignment="Center" Style="{StaticResource SnapshotLabelStyle}" Text="预设池" />
+                                                <ComboBox Grid.Column="1" Margin="8,0,0,0" Height="34" IsEnabled="False" SelectedIndex="0" ToolTip="规则编辑待普通声音生成器接入"><ComboBoxItem Content="p01–p20" /></ComboBox>
+                                                <TextBlock Grid.Column="2" Margin="14,0,0,0" VerticalAlignment="Center" Style="{StaticResource SnapshotLabelStyle}" Text="周期范围" />
+                                                <ComboBox Grid.Column="3" Margin="8,0,0,0" Height="34" IsEnabled="False" SelectedIndex="0" ToolTip="规则编辑待普通声音生成器接入"><ComboBoxItem Content="3–5 秒" /></ComboBox>
+                                                <Button Grid.Column="5" Width="212" Height="36" Margin="12,0,0,0" HorizontalAlignment="Right" Content="重新生成本周期参数" Click="RegenerateEffectParametersButton_Click" Style="{StaticResource ButtonStyle}" ToolTip="由系统按当前规则生成新快照；不会写入任意手工效果值" />
+                                            </Grid>
+                                        </Grid>
+                                    </Border>
+
+                                    <Border x:Name="AdvancedVisualSection" Padding="1" Margin="0,0,0,5" Style="{StaticResource SnapshotSectionCardStyle}">
+                                        <Grid>
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                            </Grid.RowDefinitions>
+                                            <Grid Grid.Row="0">
+                                                <StackPanel>
+                                                    <TextBlock FontSize="13" FontWeight="SemiBold" Text="②  高级视觉   ·   高级视觉参数（只读快照）" />
+                                                    <TextBlock Margin="0,3,0,0" Style="{StaticResource SnapshotLabelStyle}" Text="只展示当前运行时能力和正式需求状态" />
+                                                </StackPanel>
+                                                <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+                                                    <Border Width="70" Style="{StaticResource SnapshotAccentPillStyle}"><TextBlock Style="{StaticResource SnapshotPillTextStyle}" Foreground="{StaticResource AccentBrush}" Text="只读快照" /></Border>
+                                                    <Border Width="70" Margin="6,0,0,0" Style="{StaticResource SnapshotWarningPillStyle}"><TextBlock Style="{StaticResource SnapshotPillTextStyle}" Foreground="{StaticResource WarningBrush}" Text="待接入" /></Border>
+                                                </StackPanel>
+                                            </Grid>
+                                            <UniformGrid Grid.Row="1" Margin="0,10,0,0" Columns="5">
+                                                <Border Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="视觉频段" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="65Hz–20000Hz" /></StackPanel></Border>
+                                                <Border Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="微扰状态" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="关闭" /></StackPanel></Border>
+                                                <Border Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="GPU路径" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="GPU83" /></StackPanel></Border>
+                                                <Border Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="失败回退" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="CPU4" /></StackPanel></Border>
+                                                <Border Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="当前源素材" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding Text, ElementName=PreviewCurrentMediaText, Mode=OneWay}" TextTrimming="CharacterEllipsis" /></StackPanel></Border>
+                                            </UniformGrid>
+                                            <Border Grid.Row="2" Margin="3,9,3,0" Height="100" Padding="10" Background="#10151C" BorderBrush="#2B3944" BorderThickness="1" CornerRadius="5">
+                                                <Grid>
+                                                    <TextBlock VerticalAlignment="Top" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="频谱预览（实时）" />
+                                                    <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                                                        <TextBlock HorizontalAlignment="Center" Foreground="{StaticResource WarningBrush}" FontSize="11" Text="待接入真实音频数据" />
+                                                        <TextBlock Margin="0,6,0,0" HorizontalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="不生成伪造波形" />
+                                                    </StackPanel>
+                                                </Grid>
+                                            </Border>
+                                        </Grid>
+                                    </Border>
+
+                                    <Border x:Name="PlaybackStateSection" Padding="1" Margin="0,0,0,4" Style="{StaticResource SnapshotSectionCardStyle}">
+                                        <Grid>
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                            </Grid.RowDefinitions>
+                                            <Grid Grid.Row="0">
+                                                <TextBlock FontSize="13" FontWeight="SemiBold" Text="播放与设备状态" />
+                                                <Border HorizontalAlignment="Right" Style="{StaticResource SnapshotAccentPillStyle}"><TextBlock Style="{StaticResource SnapshotPillTextStyle}" Foreground="{StaticResource AccentBrush}" Text="单窗口会话" /></Border>
+                                            </Grid>
+                                            <UniformGrid Grid.Row="1" Margin="0,10,0,0" Columns="6">
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="当前媒体" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding Text, ElementName=PreviewCurrentMediaText, Mode=OneWay}" TextTrimming="CharacterEllipsis" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="视频处理" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding VideoProcessingLabel, Mode=OneWay}" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="声音处理" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="{Binding AudioProcessingLabel, Mode=OneWay}" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="mpv" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="单窗口" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="PortAudio" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="声音总线" /></StackPanel></Border>
+                                                <Border Height="58" Style="{StaticResource SnapshotValueCardStyle}"><StackPanel><TextBlock Style="{StaticResource SnapshotLabelStyle}" Text="RTMP" /><TextBlock Style="{StaticResource SnapshotValueStyle}" Text="直推" /></StackPanel></Border>
+                                            </UniformGrid>
+                                        </Grid>
+                                    </Border>
+
+                                    <Border x:Name="EventLogSection" Padding="1" Style="{StaticResource SnapshotSectionCardStyle}">
+                                        <Grid>
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                            </Grid.RowDefinitions>
+                                            <Grid Grid.Row="0">
+                                                <StackPanel>
+                                                    <TextBlock FontSize="13" FontWeight="SemiBold" Text="运行日志" />
+                                                </StackPanel>
+                                                <Border HorizontalAlignment="Right" Style="{StaticResource SnapshotWarningPillStyle}"><TextBlock Style="{StaticResource SnapshotPillTextStyle}" Foreground="{StaticResource WarningBrush}" Text="无新事件" /></Border>
+                                            </Grid>
+                                            <StackPanel Grid.Row="1" Margin="0,0,0,0">
+                                                <Grid Height="22"><Ellipse Width="8" Height="8" Fill="{StaticResource AccentBrush}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Margin="18,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="{Binding StatusMessage, Mode=OneWay}" TextTrimming="CharacterEllipsis" /></Grid>
+                                                <Grid Height="22"><Ellipse Width="8" Height="8" Fill="{StaticResource AccentBrush}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Margin="18,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="声音预设保持 p01–p20 有界池" /></Grid>
+                                                <Grid Height="22"><Ellipse Width="8" Height="8" Fill="{StaticResource AccentBrush}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Margin="18,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="视频与声音处理开关保持独立" /></Grid>
+                                                <Grid Height="22"><Ellipse Width="8" Height="8" Fill="{StaticResource AccentBrush}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Margin="18,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="播放保持单窗口媒体会话" /></Grid>
+                                                <Grid Height="22"><Ellipse Width="8" Height="8" Fill="{StaticResource AccentBrush}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Margin="18,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="输出运行时等待真实设备确认" /></Grid>
+                                            </StackPanel>
+                                            <Border Grid.Row="2" Margin="0,0,0,0" Padding="10,3" Background="#10151C" BorderBrush="#2B3944" BorderThickness="1" CornerRadius="5">
+                                                <TextBlock Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="参数值由系统自动生成；用户可调整规则，但不能直接改写本周期结果。" TextWrapping="Wrap" />
+                                            </Border>
+                                        </Grid>
+                                    </Border>
+                                </StackPanel>
+                            </ScrollViewer>
+                        </Grid>
+                    </Grid>
+                </Border>
+            </Grid>
+
+            <!-- Output/status cards -->
+            <ScrollViewer Grid.Column="4" VerticalScrollBarVisibility="Hidden" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel>
+                     <Grid Margin="14,8,14,8">
+                        <TextBlock FontSize="15" FontWeight="SemiBold" Text="输出" />
+                        <TextBlock x:Name="LastOutputModeText"
+                                   HorizontalAlignment="Right"
+                                   VerticalAlignment="Center"
+                                   Foreground="{StaticResource MutedTextBrush}"
+                                   FontSize="10"
+                                   Text="下次入口：本地预览"
+                                   Visibility="Collapsed" />
+                    </Grid>
+                     <Border Style="{StaticResource CardStyle}" Padding="14,8,14,12" Margin="0,0,0,8">
+                        <StackPanel>
+                            <Grid>
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Width="13"
+                                          Height="13"
+                                          Margin="0,0,7,0"
+                                          VerticalAlignment="Center"
+                                          Stroke="{StaticResource TextBrush}"
+                                          StrokeThickness="1.1"
+                                          StrokeLineJoin="Round"
+                                          Data="M1.5,4.5 L4.5,1.5 H9 L12.5,5 L7,11.5 L1.5,6.5 Z M4.3,4.2 A1,1 0 1 0 4.31,4.2" />
+                                    <TextBlock FontWeight="SemiBold" Text="RTMP 推流" />
+                                </StackPanel>
+                                <Border HorizontalAlignment="Right" Style="{StaticResource OutputStatePillStyle}">
+                                    <TextBlock x:Name="RtmpStatePillText" HorizontalAlignment="Center" Foreground="{StaticResource WarningBrush}" FontSize="10" Text="待机" />
+                                </Border>
+                            </Grid>
+                            <Grid Margin="0,7,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="90" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="推流地址" />
+                                <TextBox x:Name="RtmpTargetUrlTextBox"
+                                         Grid.Column="1"
+                                          Height="28"
+                                         AutomationProperties.Name="RTMP 或 RTMPS 推流地址"
+                                         MaxLength="2048"
+                                         ToolTip="完整地址只保存在当前进程内存，不写入普通配置"
+                                         TextWrapping="NoWrap" />
+                                <Button Grid.Column="2"
+                                        Width="48"
+                                        Height="28"
+                                        Margin="6,0,0,0"
+                                        AutomationProperties.Name="复制 RTMP 推流地址"
+                                        Content="复制"
+                                        Click="CopyRtmpTargetUrlButton_Click"
+                                        Style="{StaticResource ButtonStyle}" />
+                            </Grid>
+                            <Grid Margin="0,6,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="90" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="流密钥" />
+                                <Grid Grid.Column="1" Height="28">
+                                    <PasswordBox x:Name="RtmpStreamKeyPasswordBox"
+                                                 MaxLength="512"
+                                                 AutomationProperties.Name="RTMP 流密钥" />
+                                    <TextBox x:Name="RtmpStreamKeyTextBox"
+                                             MaxLength="512"
+                                             AutomationProperties.Name="RTMP 流密钥（明文显示）"
+                                             Visibility="Collapsed" />
+                                </Grid>
+                                <Button x:Name="RtmpStreamKeyVisibilityButton"
+                                        Grid.Column="2"
+                                        Width="48"
+                                        Height="28"
+                                        Margin="6,0,0,0"
+                                        AutomationProperties.Name="显示或隐藏 RTMP 流密钥"
+                                        Content="显示"
+                                        Click="ToggleRtmpStreamKeyButton_Click"
+                                        Style="{StaticResource ButtonStyle}" />
+                            </Grid>
+                            <Grid Margin="0,4,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="12" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Grid>
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="42" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="分辨率" />
+                                    <ComboBox Grid.Column="1" Height="26" Margin="5,0,0,0" SelectedIndex="0"><ComboBoxItem Content="1280×720" /><ComboBoxItem Content="1920×1080" /></ComboBox>
+                                </Grid>
+                                <Grid Grid.Column="2">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="32" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="帧率" />
+                                    <ComboBox Grid.Column="1" Height="26" Margin="5,0,0,0" SelectedIndex="0"><ComboBoxItem Content="30 FPS" /><ComboBoxItem Content="60 FPS" /></ComboBox>
+                                </Grid>
+                            </Grid>
+                            <Grid Margin="0,4,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="12" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Grid>
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="52" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="视频码率" />
+                                    <ComboBox Grid.Column="1" Height="26" Margin="5,0,0,0" SelectedIndex="0"><ComboBoxItem Content="2500 kbps" /><ComboBoxItem Content="4000 kbps" /></ComboBox>
+                                </Grid>
+                                <Grid Grid.Column="2">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="52" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="音频码率" />
+                                    <ComboBox Grid.Column="1" Height="26" Margin="5,0,0,0" SelectedIndex="0"><ComboBoxItem Content="128 kbps" /><ComboBoxItem Content="192 kbps" /></ComboBox>
+                                </Grid>
+                            </Grid>
+                            <Grid Margin="0,5,0,0">
+                                <StackPanel Orientation="Horizontal">
+                                    <Button x:Name="StartRtmpButton"
+                                            Width="96"
+                                            AutomationProperties.Name="开始 RTMP 画面推流"
+                                            Content="开始推流"
+                                            Click="StartRtmpButton_Click"
+                                            Style="{StaticResource ButtonStyle}" />
+                                    <Button x:Name="StopRtmpButton"
+                                            Width="80"
+                                            Height="28"
+                                            Margin="6,0,0,0"
+                                            AutomationProperties.Name="停止 RTMP 推流"
+                                            Content="停止推流"
+                                            Click="StopRtmpButton_Click"
+                                            IsEnabled="False"
+                                            Style="{StaticResource ButtonStyle}" />
+                                    <Button x:Name="ReconnectRtmpButton"
+                                            Width="80"
+                                            Height="28"
+                                            Margin="6,0,0,0"
+                                            AutomationProperties.Name="重新连接 RTMP 推流"
+                                            Content="重新连接"
+                                            Click="ReconnectRtmpButton_Click"
+                                            IsEnabled="False"
+                                            Style="{StaticResource ButtonStyle}"
+                                            ToolTip="仅在 RTMP 会话明确失败后可用" />
+                                </StackPanel>
+                                <TextBlock x:Name="RtmpStatusText"
+                                           Width="188"
+                                           HorizontalAlignment="Right"
+                                           VerticalAlignment="Center"
+                                           Foreground="{StaticResource MutedTextBrush}"
+                                           FontSize="10"
+                                           MaxHeight="18"
+                                           Text="尚未校验；画面/声音会话已接入，真实网络待验收"
+                                           TextAlignment="Right"
+                                           TextTrimming="CharacterEllipsis"
+                                           ToolTip="尚未校验；画面/声音会话已接入，真实网络待验收" />
+                            </Grid>
+                            <StackPanel Margin="0,5,0,0" Orientation="Horizontal" Visibility="Collapsed">
+                                <Button x:Name="OpenFinalEffectButton"
+                                        Width="112"
+                                        AutomationProperties.Name="打开最终效果窗口"
+                                        Content="打开最终效果"
+                                        Click="OpenFinalEffectButton_Click"
+                                        Visibility="Collapsed"
+                                        Style="{StaticResource ButtonStyle}" />
+                                <Button x:Name="CloseFinalEffectButton"
+                                        Width="80"
+                                        Margin="8,0,0,0"
+                                        AutomationProperties.Name="关闭最终效果窗口"
+                                        Content="关闭窗口"
+                                        Click="CloseFinalEffectButton_Click"
+                                        IsEnabled="False"
+                                        Style="{StaticResource ButtonStyle}" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+                     <Border MinHeight="107" Style="{StaticResource CardStyle}" Padding="14,8,14,12" Margin="0,0,0,8">
+                         <StackPanel>
+                             <Grid>
+                                 <StackPanel Orientation="Horizontal">
+                                     <Path Width="14"
+                                           Height="12"
+                                           Margin="0,0,6,0"
+                                           VerticalAlignment="Center"
+                                           Stroke="{StaticResource TextBrush}"
+                                           StrokeThickness="1.1"
+                                           StrokeLineJoin="Round"
+                                           Data="M1,2 H9 V10 H1 Z M9,4 L13,2 V10 L9,8 Z" />
+                                     <TextBlock FontWeight="SemiBold" Text="虚拟摄像头" />
+                                 </StackPanel>
+                                <Border HorizontalAlignment="Right" Style="{StaticResource OutputStatePillStyle}">
+                                    <TextBlock x:Name="VirtualCameraStatePillText" HorizontalAlignment="Center" Foreground="{StaticResource WarningBrush}" FontSize="10" Text="待机" />
+                                </Border>
+                            </Grid>
+                            <Grid Margin="0,5,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="90" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="设备名称" />
+                                <ComboBox Grid.Column="1"
+                                          Height="26"
+                                          IsEnabled="False"
+                                          AutomationProperties.Name="虚拟摄像头设备名称"
+                                          SelectedIndex="0">
+                                    <ComboBoxItem Content="GpAutoLive Camera" />
+                                </ComboBox>
+                            </Grid>
+                            <TextBlock x:Name="VirtualCameraStatusText"
+                                       Margin="0,5,0,0"
+                                       Foreground="{StaticResource MutedTextBrush}"
+                                        FontSize="10"
+                                        MaxHeight="18"
+                                        Text="契约/GPU→YUY2 已接入 · sidecar 签名/DirectShow 待验收"
+                                       Visibility="Collapsed"
+                                       TextTrimming="CharacterEllipsis" />
+                             <Grid Margin="0,8,0,0">
+                                 <Grid.ColumnDefinitions>
+                                     <ColumnDefinition Width="90" />
+                                     <ColumnDefinition Width="*" />
+                                     <ColumnDefinition Width="82" />
+                                 </Grid.ColumnDefinitions>
+                                 <TextBlock VerticalAlignment="Center"
+                                            Foreground="{StaticResource MutedTextBrush}"
+                                            FontSize="10"
+                                            Text="输出规格" />
+                                 <TextBlock Grid.Column="1"
+                                            VerticalAlignment="Center"
+                                            Foreground="{StaticResource MutedTextBrush}"
+                                            FontSize="10"
+                                            Text="1280×720 · 30fps" />
+                                 <Button x:Name="StopVirtualCameraButton"
+                                         Grid.Column="2"
+                                         Width="82"
+                                         Height="28"
+                                         AutomationProperties.Name="停止虚拟摄像头输出"
+                                         Content="停用设备"
+                                         Click="StopVirtualCameraButton_Click"
+                                         IsEnabled="False"
+                                         Style="{StaticResource ButtonStyle}" />
+                             </Grid>
+                         </StackPanel>
+                    </Border>
+                    <Border BorderThickness="0" Background="Transparent" Padding="0" Margin="0,0,0,6">
+                        <StackPanel>
+                              <Border MinHeight="146" Style="{StaticResource CardStyle}" Padding="14,8,14,10" Margin="0,0,0,6">
+                                <StackPanel>
+                            <Grid Margin="0,0,0,0">
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Width="13"
+                                          Height="13"
+                                          Margin="0,0,7,0"
+                                          VerticalAlignment="Center"
+                                          Stroke="{StaticResource TextBrush}"
+                                          StrokeThickness="1.1"
+                                          StrokeLineJoin="Round"
+                                          Data="M4,2 V7 A3,3 0 0 0 10,7 V2 M2,7 A5,5 0 0 0 12,7 M7,12 V10 M4,12 H10" />
+                                    <TextBlock FontWeight="SemiBold" Text="麦克风插话" ToolTip="只做本地能量门控，不识别、不上传" />
+                                </StackPanel>
+                                        <Border HorizontalAlignment="Right" Style="{StaticResource OutputStatePillStyle}">
+                                            <TextBlock x:Name="MicrophoneStatePillText" HorizontalAlignment="Center" Foreground="{StaticResource WarningBrush}" FontSize="10" Text="待机" />
+                                </Border>
+                            </Grid>
+                            <TextBlock Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="本地能量门控 · 不识别、不上传" />
+                            <Grid Margin="0,3,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="90" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="输入设备" />
+                                <ComboBox x:Name="AudioInputDeviceComboBox"
+                                          Grid.Column="1"
+                                          Height="26"
+                                          AutomationProperties.Name="PortAudio 麦克风输入设备"
+                                          DisplayMemberPath="Name"
+                                          SelectedValuePath="Index"
+                                          IsEnabled="False" />
+                            </Grid>
+                            <Grid Margin="0,4,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="90" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="插话阈值" />
+                                <Slider Grid.Column="1" IsEnabled="False" Maximum="100" Value="32" ToolTip="阈值配置待接入" />
+                                <TextBlock Grid.Column="2" Margin="8,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="32%" />
+                            </Grid>
+                            <Grid Margin="0,5,0,0">
+                                <Button Width="64"
+                                        HorizontalAlignment="Left"
+                                        AutomationProperties.Name="测试麦克风插话"
+                                        Content="测试"
+                                        IsEnabled="False"
+                                        Style="{StaticResource ButtonStyle}"
+                                        ToolTip="麦克风测试入口待接入" />
+                                <Button Width="34"
+                                        Height="30"
+                                        HorizontalAlignment="Right"
+                                        AutomationProperties.Name="打开麦克风设置"
+                                        IsEnabled="False"
+                                        Style="{StaticResource ButtonStyle}"
+                                        ToolTip="麦克风设置入口待接入">
+                                    <Path Width="14"
+                                          Height="14"
+                                          Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                                          StrokeThickness="1.2"
+                                          StrokeLineJoin="Round"
+                                          StrokeStartLineCap="Round"
+                                          StrokeEndLineCap="Round"
+                                          Data="{StaticResource SettingsGearIconGeometry}" />
+                                </Button>
+                            </Grid>
+                                </StackPanel>
+                            </Border>
+                              <Border MinHeight="95" Style="{StaticResource CardStyle}" Padding="14,8,14,4" Margin="0,0,0,3">
+                                 <StackPanel>
+                                     <Grid>
+                                         <StackPanel Orientation="Horizontal">
+                                             <Path Width="12"
+                                                   Height="12"
+                                                   Margin="0,0,7,0"
+                                                   VerticalAlignment="Center"
+                                                   Stroke="{StaticResource TextBrush}"
+                                                   StrokeThickness="1.2"
+                                                   StrokeStartLineCap="Round"
+                                                   StrokeEndLineCap="Round"
+                                                   Data="M1.5,3.5 L6,8.5 L10.5,3.5" />
+                                             <TextBlock FontWeight="SemiBold" Text="固定话术" />
+                                         </StackPanel>
+                                        <Border HorizontalAlignment="Right" Style="{StaticResource OutputStatePillStyle}">
+                                            <TextBlock x:Name="FixedSpeechStatePillText" HorizontalAlignment="Center" Foreground="{StaticResource WarningBrush}" FontSize="10" Text="待机" />
+                                        </Border>
+                                    </Grid>
+                                    <TextBlock Margin="0,6,0,0" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="固定话术 · Windows 本地 SAPI" Visibility="Collapsed" TextWrapping="Wrap" />
+                                    <Grid Margin="0,4,0,0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="90" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="52" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock VerticalAlignment="Center"
+                                                   Foreground="{StaticResource MutedTextBrush}"
+                                                   FontSize="10"
+                                                   Text="当前话术" />
+                                        <TextBox x:Name="FixedSpeechTextBox"
+                                                 Grid.Column="1"
+                                                 Height="28"
+                                                 MinHeight="0"
+                                                 AcceptsReturn="True"
+                                                 AutomationProperties.Name="固定话术文本"
+                                                 MaxLength="500"
+                                                 Text="默认固定话术"
+                                                 TextWrapping="Wrap"
+                                                 VerticalScrollBarVisibility="Auto" />
+                                        <Button Grid.Column="2"
+                                                Height="30"
+                                                Margin="6,0,0,0"
+                                                AutomationProperties.Name="管理固定话术"
+                                                Content="管理"
+                                                IsEnabled="False"
+                                                Style="{StaticResource ButtonStyle}"
+                                                ToolTip="固定话术管理入口待接入" />
+                                    </Grid>
+                                    <Grid Margin="0,4,0,0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="90" />
+                                            <ColumnDefinition Width="116" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock VerticalAlignment="Center"
+                                                   Foreground="{StaticResource MutedTextBrush}"
+                                                   FontSize="10"
+                                                   Text="插播延迟" />
+                                        <ComboBox Grid.Column="1"
+                                                  Height="26"
+                                                  IsEnabled="False"
+                                                  SelectedIndex="0"
+                                                  ToolTip="插播延迟配置待接入">
+                                            <ComboBoxItem Content="0.5 秒" />
+                                            <ComboBoxItem Content="1.0 秒" />
+                                        </ComboBox>
+                                        <CheckBox Grid.Column="2"
+                                                  Margin="12,5,0,0"
+                                                  AutomationProperties.Name="固定话术自动循环"
+                                                  Content="自动循环"
+                                                  IsEnabled="False"
+                                                  ToolTip="固定话术自动循环配置待接入" />
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+                            <Border MinHeight="136" Style="{StaticResource CardStyle}" Padding="14,8,14,10">
+                                 <StackPanel>
+                                     <Grid Margin="0,0,0,2">
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Width="12"
+                                          Height="12"
+                                          Margin="0,0,7,0"
+                                          VerticalAlignment="Center"
+                                          Stroke="{StaticResource TextBrush}"
+                                          StrokeThickness="1.2"
+                                          StrokeStartLineCap="Round"
+                                          StrokeEndLineCap="Round"
+                                          Data="M1.5,3.5 L6,8.5 L10.5,3.5" />
+                                    <TextBlock FontWeight="SemiBold" Text="抖音弹幕" />
+                                </StackPanel>
+                                <Border HorizontalAlignment="Right" Style="{StaticResource OutputStatePillStyle}">
+                                    <TextBlock x:Name="DouyinStatePillText" HorizontalAlignment="Center" Foreground="{StaticResource WarningBrush}" FontSize="10" Text="待连接" />
+                                </Border>
+                            </Grid>
+                            <TextBlock Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="M1 本地回复合同 · 单直播间" Visibility="Collapsed" />
+                             <Grid Margin="0,3,0,0">
+                                 <Grid.ColumnDefinitions>
+                                     <ColumnDefinition Width="90" />
+                                     <ColumnDefinition Width="*" />
+                                 </Grid.ColumnDefinitions>
+                                 <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="弹幕服务器" />
+                                 <TextBox Grid.Column="1"
+                                          Height="28"
+                                          IsReadOnly="True"
+                                          Text="wss://live.douyin.com/webcast"
+                                          ToolTip="M1 sidecar 使用的抖音弹幕服务器地址" />
+                             </Grid>
+                             <Grid Margin="0,5,0,0">
+                                 <Grid.ColumnDefinitions>
+                                     <ColumnDefinition Width="90" />
+                                     <ColumnDefinition Width="*" />
+                                     <ColumnDefinition Width="82" />
+                                 </Grid.ColumnDefinitions>
+                                 <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="房间 ID" />
+                                 <TextBox x:Name="DouyinRoomTextBox"
+                                          Grid.Column="1"
+                                         Height="28"
+                                         AutomationProperties.Name="抖音直播间号"
+                                         MaxLength="256"
+                                          ToolTip="填写 1～20 位数字或标准 live.douyin.com 地址"
+                                          Text="" />
+                                 <Button x:Name="StopDouyinButton"
+                                         Grid.Column="2"
+                                         Width="82"
+                                         Height="28"
+                                         Margin="6,0,0,0"
+                                         AutomationProperties.Name="断开抖音 M1 本地状态"
+                                         Content="断开连接"
+                                         Click="StopDouyinButton_Click"
+                                         IsEnabled="False"
+                                         Style="{StaticResource ButtonStyle}" />
+                             </Grid>
+                             <CheckBox Margin="0,5,0,0"
+                                       AutomationProperties.Name="抖音弹幕显示在预览"
+                                       Content="显示在预览"
+                                       IsChecked="False"
+                                       IsEnabled="False"
+                                       ToolTip="预览投影待接入" />
+                                 </StackPanel>
+                             </Border>
+                            <Expander Margin="0,0,0,8"
+                                      Padding="10"
+                                      Background="{StaticResource SurfaceBrush}"
+                                      BorderBrush="{StaticResource BorderBrush}"
+                                      BorderThickness="1"
+                                      Header="高级控制（输出 / 麦克风 / 话术 / M1）"
+                                      IsExpanded="False">
+                                <StackPanel>
+                                    <TextBlock Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="虚拟摄像头" />
+                                    <StackPanel Margin="0,5,0,0" Orientation="Horizontal">
+                                        <Button x:Name="StartVirtualCameraButton"
+                                                Width="82"
+                                                AutomationProperties.Name="启动虚拟摄像头输出"
+                                                Content="启动输出"
+                                                Click="StartVirtualCameraButton_Click"
+                                                IsEnabled="False"
+                                                Style="{StaticResource ButtonStyle}" />
+                                        <Button x:Name="RefreshVirtualCameraButton"
+                                                Width="76"
+                                                Margin="6,0,0,0"
+                                                AutomationProperties.Name="刷新虚拟摄像头安装与 GPU 探测"
+                                                Content="刷新探测"
+                                                Click="RefreshVirtualCameraButton_Click"
+                                                Style="{StaticResource ButtonStyle}" />
+                                    </StackPanel>
+                                    <TextBlock x:Name="VirtualCameraActionStatusText"
+                                               Margin="0,5,0,0"
+                                               Foreground="{StaticResource MutedTextBrush}"
+                                               FontSize="10"
+                                               MaxHeight="18"
+                                               Text="仅检查安装与 GPU 前置，不自动注册设备"
+                                               TextTrimming="CharacterEllipsis" />
+
+                                    <TextBlock Margin="0,12,0,0" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="麦克风插话" />
+                                    <StackPanel Margin="0,5,0,0" Orientation="Horizontal">
+                                        <Button x:Name="StartMicrophoneButton"
+                                                Width="92"
+                                                AutomationProperties.Name="启用麦克风本地门控"
+                                                Content="启用门控"
+                                                Click="StartMicrophoneButton_Click"
+                                                IsEnabled="False"
+                                                Style="{StaticResource ButtonStyle}" />
+                                        <Button x:Name="StopMicrophoneButton"
+                                                Width="64"
+                                                Margin="6,0,0,0"
+                                                AutomationProperties.Name="停止麦克风本地门控"
+                                                Content="停止"
+                                                Click="StopMicrophoneButton_Click"
+                                                IsEnabled="False"
+                                                Style="{StaticResource ButtonStyle}" />
+                                    </StackPanel>
+                                    <TextBlock x:Name="MicrophoneStatusText"
+                                               Margin="0,5,0,0"
+                                               Foreground="{StaticResource MutedTextBrush}"
+                                               FontSize="10"
+                                               MaxHeight="18"
+                                               Text="未启用；仅本地能量门控，AEC/降噪/AGC 待验收"
+                                               TextTrimming="CharacterEllipsis" />
+
+                                    <TextBlock Margin="0,12,0,0" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="固定话术" />
+                                    <StackPanel Margin="0,5,0,0" Orientation="Horizontal">
+                                        <Button x:Name="SpeakFixedSpeechButton"
+                                                Width="92"
+                                                AutomationProperties.Name="朗读固定话术"
+                                                Content="朗读话术"
+                                                Click="SpeakFixedSpeechButton_Click"
+                                                Style="{StaticResource ButtonStyle}" />
+                                        <Button x:Name="CancelFixedSpeechButton"
+                                                Width="64"
+                                                Margin="6,0,0,0"
+                                                AutomationProperties.Name="取消固定话术"
+                                                Content="取消"
+                                                Click="CancelFixedSpeechButton_Click"
+                                                IsEnabled="False"
+                                                Style="{StaticResource ButtonStyle}" />
+                                    </StackPanel>
+                                    <TextBlock x:Name="FixedSpeechStatusText"
+                                               Margin="0,5,0,0"
+                                               Foreground="{StaticResource MutedTextBrush}"
+                                               FontSize="10"
+                                               MaxHeight="18"
+                                               Text="本地 SAPI 待机；不调用模型"
+                                               TextTrimming="CharacterEllipsis" />
+
+                                    <TextBlock Margin="0,12,0,0" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="抖音 M1" />
+                                    <CheckBox x:Name="DouyinEnabledCheckBox"
+                                              Margin="0,5,0,0"
+                                              AutomationProperties.Name="启用抖音 M1 自动回应"
+                                              Content="启用本地自动回应（默认关闭）" />
+                                    <StackPanel Margin="0,5,0,0" Orientation="Horizontal">
+                                        <Button x:Name="StartDouyinButton"
+                                                Width="92"
+                                                AutomationProperties.Name="启动抖音 M1 本地状态"
+                                                Content="启动 M1"
+                                                Click="StartDouyinButton_Click"
+                                                Style="{StaticResource AccentButtonStyle}"
+                                                ToolTip="只启动本地状态合同，不登录或连接抖音" />
+                                        <Button x:Name="PauseDouyinButton"
+                                                Width="64"
+                                                Margin="6,0,0,0"
+                                                AutomationProperties.Name="暂停抖音 M1 队列"
+                                                Content="暂停"
+                                                Click="PauseDouyinButton_Click"
+                                                IsEnabled="False"
+                                                Style="{StaticResource ButtonStyle}" />
+                                        <Button x:Name="ResumeDouyinButton"
+                                                Width="64"
+                                                Margin="6,0,0,0"
+                                                AutomationProperties.Name="恢复抖音 M1 队列"
+                                                Content="恢复"
+                                                Click="ResumeDouyinButton_Click"
+                                                IsEnabled="False"
+                                                Style="{StaticResource ButtonStyle}" />
+                                    </StackPanel>
+                                    <TextBlock x:Name="DouyinStatusText"
+                                               Margin="0,5,0,0"
+                                               Foreground="#697186"
+                                               FontSize="10"
+                                               MaxHeight="18"
+                                               Text="M1 本地合同已接入 · 未启动；扫码/sidecar 待验收"
+                                               TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                            </Expander>
+                            <Expander Margin="0,0,0,8"
+                                      Padding="10"
+                                      Background="{StaticResource SurfaceBrush}"
+                                      BorderBrush="{StaticResource BorderBrush}"
+                                      BorderThickness="1"
+                                      Header="插话文件池（高级）"
+                                      IsExpanded="False">
+                                <StackPanel>
+                                    <TextBlock Margin="0,12,0,0"
+                                               Foreground="{StaticResource MutedTextBrush}"
+                                               FontSize="11"
+                                               Text="插话文件池（递归扫描）"
+                                               Visibility="Collapsed" />
+                                    <TextBox x:Name="InterludeDirectoryTextBox"
+                                             Margin="0,6,0,0"
+                                             AutomationProperties.Name="插话文件目录"
+                                             IsReadOnly="True"
+                                             MaxLength="4096"
+                                             ToolTip="仅显示当前进程内存中的规范化目录，不写入普通配置"
+                                             TextWrapping="NoWrap" />
+                                    <StackPanel Margin="0,7,0,0" Orientation="Horizontal">
+                                        <Button x:Name="SelectInterludeDirectoryButton"
+                                                Width="92"
+                                                AutomationProperties.Name="选择插话文件目录"
+                                                Content="选择目录"
+                                                Click="SelectInterludeDirectoryButton_Click"
+                                                Style="{StaticResource ButtonStyle}" />
+                                        <Button x:Name="ClearInterludePoolButton"
+                                                Width="64"
+                                                Margin="8,0,0,0"
+                                                AutomationProperties.Name="清空插话文件池"
+                                                Content="清空"
+                                                Click="ClearInterludePoolButton_Click"
+                                                Style="{StaticResource ButtonStyle}" />
+                                    </StackPanel>
+                                    <StackPanel Margin="0,6,0,0" Orientation="Horizontal">
+                                        <Button x:Name="PlayInterludeButton"
+                                                Width="88"
+                                                AutomationProperties.Name="播放插话文件"
+                                                Content="插话试播"
+                                                Click="PlayInterludeButton_Click"
+                                                IsEnabled="False"
+                                                Style="{StaticResource AccentButtonStyle}" />
+                                        <Button x:Name="StopInterludeButton"
+                                                Width="64"
+                                                Margin="8,0,0,0"
+                                                AutomationProperties.Name="停止插话文件"
+                                                Content="停插话"
+                                                Click="StopInterludeButton_Click"
+                                                IsEnabled="False"
+                                                Style="{StaticResource ButtonStyle}" />
+                                    </StackPanel>
+                                    <TextBlock x:Name="InterludePoolStatusText"
+                                               Margin="0,6,0,0"
+                                               Foreground="{StaticResource MutedTextBrush}"
+                                               FontSize="10"
+                                               Text="未配置；不会启动解码或音频流"
+                                               TextWrapping="Wrap" />
+                                    <TextBlock x:Name="InterludeAudioConfigStatusText"
+                                               Margin="0,4,0,0"
+                                               Foreground="#697186"
+                                               FontSize="10"
+                                               Text="预设：随机 p01–p20 · 多轨关闭 · duck -60 dB"
+                                               TextWrapping="Wrap" />
+                                    <TextBlock Margin="0,10,0,0"
+                                               Foreground="{StaticResource MutedTextBrush}"
+                                               FontSize="11"
+                                               Text="PortAudio 输出设备" />
+                                    <ComboBox x:Name="AudioOutputDeviceComboBox"
+                                              Margin="0,6,0,0"
+                                              AutomationProperties.Name="PortAudio 输出设备"
+                                              DisplayMemberPath="Name"
+                                              SelectedValuePath="Index"
+                                              IsEnabled="False" />
+                                    <Button x:Name="RefreshAudioDevicesButton"
+                                            Margin="0,6,0,0"
+                                            AutomationProperties.Name="刷新本机音频设备"
+                                            Content="刷新本机设备"
+                                            Click="RefreshAudioDevicesButton_Click"
+                                            Style="{StaticResource ButtonStyle}" />
+                                    <TextBlock x:Name="AudioDeviceStatusText"
+                                               Margin="0,6,0,0"
+                                               Foreground="{StaticResource MutedTextBrush}"
+                                               FontSize="10"
+                                               Text="尚未枚举；不启动播放流"
+                                               TextWrapping="Wrap" />
+                                </StackPanel>
+                            </Expander>
+                             </StackPanel>
+                    </Border>
+                    <Border Style="{StaticResource CardStyle}">
+                        <StackPanel>
+                            <TextBlock FontWeight="SemiBold" Text="运行资源" />
+                            <TextBlock Margin="0,8,0,0" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="外置 DLL / sidecar" />
+                            <TextBlock x:Name="MediaResourceText" Margin="0,4,0,0" Foreground="#697186" FontSize="10" TextWrapping="Wrap" />
+                            <TextBlock x:Name="WindowsStatusText" Margin="0,8,0,0" Foreground="{StaticResource WarningBrush}" FontSize="10" TextWrapping="Wrap" />
+                            <TextBlock x:Name="MediaStatusText" Margin="0,4,0,0" Foreground="{StaticResource WarningBrush}" FontSize="10" TextWrapping="Wrap" />
+                        </StackPanel>
+                    </Border>
+                    <Expander Margin="0,0,0,8"
+                              Padding="10"
+                              Background="{StaticResource SurfaceBrush}"
+                              BorderBrush="{StaticResource BorderBrush}"
+                              BorderThickness="1"
+                              Header="RTMP 输出选项（高级）"
+                              IsExpanded="False">
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <CheckBox x:Name="RtmpVideoCheckBox"
+                                          AutomationProperties.Name="RTMP 画面轨道"
+                                          Content="画面"
+                                          IsChecked="True" />
+                                <CheckBox x:Name="RtmpAudioCheckBox"
+                                          Margin="14,0,0,0"
+                                          AutomationProperties.Name="RTMP 声音轨道"
+                                          Content="声音"
+                                          IsChecked="True" />
+                            </StackPanel>
+                            <Button Margin="0,5,0,0"
+                                    AutomationProperties.Name="校验 RTMP 输出配置"
+                                    Content="校验输出配置"
+                                    Click="OutputButton_Click"
+                                    Style="{StaticResource ButtonStyle}" />
+                        </StackPanel>
+                    </Expander>
+                    <Expander Margin="0,0,0,8"
+                              Padding="10"
+                              Background="{StaticResource SurfaceBrush}"
+                              BorderBrush="{StaticResource BorderBrush}"
+                              BorderThickness="1"
+                              Header="抖音本地回复池（高级）"
+                              IsExpanded="False">
+                        <StackPanel>
+                            <TextBox x:Name="DouyinRepliesTextBox"
+                                     Margin="0,6,0,0"
+                                     MinHeight="46"
+                                     AcceptsReturn="True"
+                                     AutomationProperties.Name="抖音本地回复池"
+                                     MaxLength="4096"
+                                     Text="GpAutoLive探针✅"
+                                     ToolTip="每行一条；最多 100 条，正文只保留在本地进程"
+                                     TextWrapping="Wrap"
+                                     VerticalScrollBarVisibility="Auto" />
+                            <Grid Margin="0,6,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBox x:Name="DouyinQueueCapacityTextBox"
+                                         AutomationProperties.Name="抖音回复队列容量"
+                                         MaxLength="4"
+                                         Text="500"
+                                         ToolTip="10～5000；监听中需先暂停才能修改" />
+                                <TextBlock Grid.Column="1"
+                                           Margin="8,0,0,0"
+                                           VerticalAlignment="Center"
+                                           Foreground="{StaticResource MutedTextBrush}"
+                                           FontSize="10"
+                                           Text="队列容量" />
+                            </Grid>
+                        </StackPanel>
+                    </Expander>
+                </StackPanel>
+            </ScrollViewer>
+        </Grid>
+
+        <!-- Playback bar -->
+        <Border x:Name="PlaybackBar"
+                Grid.Row="3"
+                Margin="10,0"
+                 Background="#131B24"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="1"
+                CornerRadius="6"
+                Padding="10,0">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="16" />
+                    <ColumnDefinition Width="136" />
+                    <ColumnDefinition Width="126" />
+                    <ColumnDefinition Width="308" />
+                </Grid.ColumnDefinitions>
+                <Button Grid.Column="0" Width="82" Height="48" AutomationProperties.Name="播放或暂停" Click="PlayPauseButton_Click" HorizontalContentAlignment="Center" Style="{StaticResource AccentButtonStyle}" ToolTip="播放/暂停 (Space)"><StackPanel Orientation="Horizontal"><Path Width="12" Height="14" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" Data="M1,1 L12,7 L1,13 Z" /><TextBlock Margin="7,0,0,0" VerticalAlignment="Center" Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" FontSize="12" Text="播放" /></StackPanel></Button>
+                <Button Grid.Column="1" Width="82" Height="48" Margin="8,0,0,0" AutomationProperties.Name="暂停播放" Background="#101820" Click="PlayPauseButton_Click" HorizontalContentAlignment="Center" Style="{StaticResource ButtonStyle}" ToolTip="播放/暂停 (Space)"><StackPanel Orientation="Horizontal"><Path Width="10" Height="14" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.5" StrokeStartLineCap="Round" Data="M2,1 V13 M8,1 V13" /><TextBlock Margin="7,0,0,0" VerticalAlignment="Center" Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" FontSize="12" Text="暂停" /></StackPanel></Button>
+                <Button Grid.Column="2" Width="82" Height="48" Margin="8,0,0,0" AutomationProperties.Name="停止播放" Background="#101820" Click="StopButton_Click" HorizontalContentAlignment="Center" Style="{StaticResource IconButtonStyle}" ToolTip="停止 (Ctrl+Shift+S)"><StackPanel Orientation="Horizontal"><Path Width="12" Height="12" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" Data="M1,1 H11 V11 H1 Z" /><TextBlock Margin="7,0,0,0" VerticalAlignment="Center" Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" FontSize="12" Text="停止" /></StackPanel></Button>
+                <Button Grid.Column="3" Width="88" Height="48" Margin="8,0,0,0" AutomationProperties.Name="上一项" Background="#101820" Click="PreviousButton_Click" HorizontalContentAlignment="Center" Style="{StaticResource ButtonStyle}" ToolTip="上一项"><StackPanel Orientation="Horizontal"><Path Width="13" Height="14" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.1" StrokeLineJoin="Round" Data="M3,1 V13 M12,1 L5,7 L12,13" /><TextBlock Margin="7,0,0,0" VerticalAlignment="Center" Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" FontSize="12" Text="上一条" /></StackPanel></Button>
+                <Button Grid.Column="4" Width="88" Height="48" Margin="10,0,0,0" AutomationProperties.Name="下一项" Background="#101820" Click="NextButton_Click" HorizontalContentAlignment="Center" Style="{StaticResource ButtonStyle}" ToolTip="下一项"><StackPanel Orientation="Horizontal"><Path Width="13" Height="14" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.1" StrokeLineJoin="Round" Data="M10,1 V13 M1,1 L8,7 L1,13" /><TextBlock Margin="7,0,0,0" VerticalAlignment="Center" Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" FontSize="12" Text="下一条" /></StackPanel></Button>
+                <Grid Grid.Column="5" Margin="18,0,12,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="35" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <TextBlock x:Name="CurrentMediaBarText"
+                               Margin="4,0,0,9"
+                               Foreground="{StaticResource TextBrush}"
+                               FontSize="10"
+                               VerticalAlignment="Bottom"
+                               Text="当前媒体：无活动源"
+                               TextTrimming="CharacterEllipsis" />
+                    <Grid Grid.Row="1">
+                        <Slider x:Name="PlaybackSlider"
+                                Width="320"
+                                Height="20"
+                                Margin="3,3,0,0"
+                                HorizontalAlignment="Left"
+                                VerticalAlignment="Top"
+                                Maximum="1"
+                                Value="{Binding PlaybackProgress, Mode=TwoWay}"
+                                AutomationProperties.Name="播放进度"
+                                PreviewMouseLeftButtonUp="PlaybackSlider_PreviewMouseLeftButtonUp"
+                                KeyUp="PlaybackSlider_KeyUp" />
+                        <StackPanel Margin="345,4,0,0"
+                                    HorizontalAlignment="Left"
+                                    VerticalAlignment="Top"
+                                    Orientation="Horizontal">
+                            <TextBlock x:Name="PlaybackPositionText"
+                                       Foreground="{StaticResource MutedTextBrush}"
+                                       FontSize="10"
+                                       Text="00:00" />
+                            <TextBlock Foreground="{StaticResource MutedTextBrush}"
+                                       FontSize="10"
+                                       Text=" / " />
+                            <TextBlock x:Name="PlaybackDurationText"
+                                       Foreground="{StaticResource MutedTextBrush}"
+                                       FontSize="10"
+                                       Text="00:00" />
+                        </StackPanel>
+                    </Grid>
+                </Grid>
+                <Border Grid.Column="6" Width="1" Height="48" HorizontalAlignment="Left" VerticalAlignment="Center" Background="{StaticResource BorderBrush}" />
+                <CheckBox Grid.Column="7" Width="118" Margin="6,0,0,0" VerticalAlignment="Center" AutomationProperties.Name="播放时启用视频处理" AutomationProperties.AutomationId="VideoProcessingCheckBox" IsChecked="{Binding VideoProcessing, Mode=TwoWay}" Style="{StaticResource SwitchCheckBoxStyle}" ToolTip="视频处理">
+                    <StackPanel Width="60">
+                        <TextBlock Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="视频处理" />
+                        <TextBlock Foreground="{StaticResource AccentBrush}" FontSize="10" Text="{Binding VideoProcessingLabel, Mode=OneWay}" />
+                    </StackPanel>
+                </CheckBox>
+                    <CheckBox Grid.Column="8" Width="118" Margin="8,0,0,0" VerticalAlignment="Center" AutomationProperties.Name="播放时启用声音处理" AutomationProperties.AutomationId="AudioProcessingCheckBox" IsChecked="{Binding AudioProcessing, Mode=TwoWay}" Style="{StaticResource SwitchCheckBoxStyle}" ToolTip="声音处理">
+                    <StackPanel Width="60">
+                        <TextBlock Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="声音处理" />
+                        <TextBlock Foreground="{StaticResource AccentBrush}" FontSize="10" Text="{Binding AudioProcessingLabel, Mode=OneWay}" />
+                    </StackPanel>
+                </CheckBox>
+                <StackPanel Grid.Column="9" Margin="16,0,0,0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="音量" />
+                    <Slider Width="120" Maximum="100" Value="80" AutomationProperties.Name="输出音量" />
+                    <TextBlock Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource TextBrush}" FontSize="10" Text="80%" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- LoginView is a gate only; it does not start media or own credentials. -->
+        <auth:LoginView x:Name="LoginGate"
+                        Grid.Row="2"
+                        Grid.RowSpan="2"
+                        Panel.ZIndex="100"
+                        Visibility="Visible" />
+
+        <Border Grid.Row="4"
+                Background="#101720"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,1,0,0"
+                Padding="12,0"
+                IsHitTestVisible="False">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="90" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="120" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0"
+                           VerticalAlignment="Center"
+                           Foreground="{StaticResource MutedTextBrush}"
+                           FontSize="10"
+                           Text="{Binding StatusMessage, Mode=OneWay}"
+                           TextTrimming="CharacterEllipsis" />
+                <StackPanel Grid.Column="1" HorizontalAlignment="Center" Orientation="Horizontal">
+                    <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="丢帧 — (—)" />
+                    <TextBlock Margin="16,0" VerticalAlignment="Center" Foreground="{StaticResource BorderBrush}" FontSize="10" Text="|" />
+                    <TextBlock x:Name="FooterPerformanceText"
+                               VerticalAlignment="Center"
+                               Foreground="{StaticResource MutedTextBrush}"
+                               FontSize="10"
+                               Text="CPU / GPU / RAM · 待采样"
+                               TextTrimming="CharacterEllipsis" />
+                    <TextBlock Margin="16,0" VerticalAlignment="Center" Foreground="{StaticResource BorderBrush}" FontSize="10" Text="|" />
+                    <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Text="上行 —" />
+                </StackPanel>
+                <TextBlock Grid.Column="2"
+                           HorizontalAlignment="Right"
+                           VerticalAlignment="Center"
+                           Foreground="{StaticResource AccentBrush}"
+                           FontSize="10"
+                           Text="网络状态 · 待检查" />
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

@@ -245,6 +245,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "autolive-desktop-core"
 version = "0.1.0"
 dependencies = [
+ "autolive-media-output-ownership",
  "autolive-native-video-host",
  "autolive-portaudio-output",
  "autolive-signalsmith-stretch",
@@ -269,6 +270,13 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-runtime",
  "win32job",
+]
+
+[[package]]
+name = "autolive-media-output-ownership"
+version = "0.1.0"
+dependencies = [
+ "windows 0.61.3",
 ]
 
 [[package]]

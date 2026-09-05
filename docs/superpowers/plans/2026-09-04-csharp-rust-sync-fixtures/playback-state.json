@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "contract": "playback-state",
+  "case": "eof_moves_to_next_item-in-one-window",
+  "input": {
+    "window_id": "fixture-window",
+    "pool": ["media-a", "media-b"],
+    "active_index": 0,
+    "event": "eof"
+  },
+  "expected": {
+    "next_active_index": 1,
+    "window_reused": true,
+    "pool_order_changed": false,
+    "generated_version_file": false,
+    "error_code": null
+  }
+}

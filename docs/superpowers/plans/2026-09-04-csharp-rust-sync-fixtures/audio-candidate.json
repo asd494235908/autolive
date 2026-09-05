@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "contract": "audio-candidate",
+  "case": "n-plus-1-switch-keeps-final-pcm-fanout",
+  "input": {
+    "current_candidate": "N",
+    "next_candidate": "N+1",
+    "event": "current_source_eof",
+    "final_pcm_consumers": ["portaudio", "rtmp"],
+    "rtmp_consumer_owns_bus": false
+  },
+  "expected": {
+    "selected_candidate": "N+1",
+    "portaudio_consumer_preserved": true,
+    "rtmp_consumer_preserved": true,
+    "duplicate_source_decode": false,
+    "error_code": null
+  }
+}

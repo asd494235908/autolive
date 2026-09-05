@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "captured_at_utc": "2026-09-03T00:00:00.0000000+00:00",
+  "platform": "windows",
+  "executable": "GpAutoLive.exe",
+  "duration_seconds": 30,
+  "interval_milliseconds": 500,
+  "warmup_milliseconds": 2000,
+  "logical_processor_count": 16,
+  "status": "completed",
+  "summary": {
+    "sample_count": 0,
+    "private_working_set_min_bytes": null,
+    "private_working_set_max_bytes": null,
+    "working_set_min_bytes": null,
+    "working_set_max_bytes": null,
+    "gdi_object_count_min": null,
+    "gdi_object_count_max": null,
+    "user_object_count_min": null,
+    "user_object_count_max": null,
+    "cpu_percent_max": null
+  },
+  "samples": [],
+  "unexpected": true
+}

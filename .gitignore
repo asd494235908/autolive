@@ -65,6 +65,7 @@ desktop/package-smoke/
 desktop/package-test/
 desktop/.codex-worker-smoke/
 desktop/src-tauri/target-test-package/
+desktop/src-tauri/target-*/
 desktop/src-tauri/bundle/
 desktop/src-tauri/*.dmg
 desktop/src-tauri/*.msi

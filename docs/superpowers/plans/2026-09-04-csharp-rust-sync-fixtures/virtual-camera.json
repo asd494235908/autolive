@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "contract": "virtual-camera",
+  "case": "fixed-yuy2-output-contract",
+  "input": {
+    "device_name": "GpAutoLive Camera",
+    "pixel_format": "YUY2",
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "capture_scope": "final_effect_hwnd",
+    "zero_copy": false
+  },
+  "expected": {
+    "accepted": true,
+    "cpu_full_frame_conversion": false,
+    "warp_adapter_allowed": false,
+    "sidecar_required": true,
+    "error_code": null
+  }
+}

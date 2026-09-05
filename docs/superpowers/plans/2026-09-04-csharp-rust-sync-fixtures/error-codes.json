@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "contract": "cross-client-error-categories",
+  "codes": [
+    { "code": "invalid_input", "retryable": false, "ui_state": "error" },
+    { "code": "not_ready", "retryable": false, "ui_state": "pending" },
+    { "code": "resource_unavailable", "retryable": true, "ui_state": "degraded" },
+    { "code": "external_process_failed", "retryable": true, "ui_state": "error" },
+    { "code": "external_service_rejected", "retryable": false, "ui_state": "error" },
+    { "code": "cancelled", "retryable": false, "ui_state": "cancelled" },
+    { "code": "stale_generation", "retryable": false, "ui_state": "ignored" },
+    { "code": "ownership_conflict", "retryable": false, "ui_state": "blocked" }
+  ]
+}

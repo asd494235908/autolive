@@ -1,0 +1,10 @@
+.tools/
+.publish-*/
+.tmp/
+artifacts/
+bin/
+obj/
+TestResults/
+*.user
+*.suo
+*.pdb

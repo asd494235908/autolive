@@ -1,0 +1,24 @@
+{
+  "profiles": {
+    "GpAutoLive - 远程测试控制面": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "AUTOLIVE_CONTROL_PLANE_ENV": "test",
+        "AUTOLIVE_CONTROL_PLANE_BASE_URI": "http://101.96.208.132:9090"
+      }
+    },
+    "GpAutoLive - 本地开发控制面": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "AUTOLIVE_CONTROL_PLANE_ENV": "development",
+        "AUTOLIVE_CONTROL_PLANE_BASE_URI": "http://101.96.208.132:9090"
+      }
+    },
+    "GpAutoLive - 本地离线壳": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "AUTOLIVE_CONTROL_PLANE_ENV": "offline"
+      }
+    }
+  }
+}

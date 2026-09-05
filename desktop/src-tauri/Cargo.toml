@@ -18,6 +18,7 @@ tauri-build = { version = "2.0.0", features = [] }
 
 [dependencies]
 autolive-native-video-host = { path = "crates/autolive-native-video-host" }
+autolive-media-output-ownership = { path = "crates/autolive-media-output-ownership" }
 autolive-virtual-camera-contract = { path = "crates/autolive-virtual-camera-contract" }
 autolive-virtual-camera-native = { path = "crates/autolive-virtual-camera-native" }
 autolive-portaudio-output = { path = "../crates/autolive-portaudio-output" }

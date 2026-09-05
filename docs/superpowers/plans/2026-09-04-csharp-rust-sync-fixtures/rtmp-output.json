@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "contract": "rtmp-output",
+  "case": "video-and-audio-direct-publish",
+  "input": {
+    "target_scheme": "rtmp",
+    "tracks": ["video", "audio"],
+    "source_is_direct_media": true,
+    "audio_source": "final_pcm_bus",
+    "encoder_candidates": ["h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "libopenh264"]
+  },
+  "expected": {
+    "accepted": true,
+    "video_capture": false,
+    "audio_decode_duplicate": false,
+    "retry_seconds": [1, 2, 4, 8, 15],
+    "error_code": null
+  }
+}

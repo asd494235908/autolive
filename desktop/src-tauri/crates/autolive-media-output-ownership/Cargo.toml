@@ -1,0 +1,19 @@
+[package]
+name = "autolive-media-output-ownership"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Safe boundary for the shared Windows media/output ownership mutex."
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.61.3", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Threading",
+] }
+
+[lints.rust]
+# Win32 mutex FFI 仅允许存在于此最小平台封装 crate；桌面主 crate 继续 forbid。
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"

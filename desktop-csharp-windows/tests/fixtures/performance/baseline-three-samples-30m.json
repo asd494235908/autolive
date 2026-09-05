@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "captured_at_utc": "2026-09-03T00:00:00.0000000+00:00",
+  "platform": "windows",
+  "executable": "GpAutoLive.exe",
+  "duration_seconds": 1802,
+  "interval_milliseconds": 60000,
+  "warmup_milliseconds": 2000,
+  "logical_processor_count": 16,
+  "status": "completed",
+  "summary": {
+    "sample_count": 3,
+    "private_working_set_min_bytes": 104857600,
+    "private_working_set_max_bytes": 120586240,
+    "working_set_min_bytes": 157286400,
+    "working_set_max_bytes": 167772160,
+    "gdi_object_count_min": 17,
+    "gdi_object_count_max": 18,
+    "user_object_count_min": 40,
+    "user_object_count_max": 41,
+    "cpu_percent_max": 0.4
+  },
+  "samples": [
+    {
+      "captured_at_utc": "2026-09-03T00:00:02.0000000+00:00",
+      "elapsed_ms": 2000,
+      "private_working_set_bytes": 104857600,
+      "working_set_bytes": 157286400,
+      "thread_count": 20,
+      "handle_count": 1000,
+      "gdi_object_count": 17,
+      "user_object_count": 40,
+      "cpu_percent": null
+    },
+    {
+      "captured_at_utc": "2026-09-03T00:15:02.0000000+00:00",
+      "elapsed_ms": 902000,
+      "private_working_set_bytes": 115343360,
+      "working_set_bytes": 162529280,
+      "thread_count": 22,
+      "handle_count": 1010,
+      "gdi_object_count": 18,
+      "user_object_count": 41,
+      "cpu_percent": 0.4
+    },
+    {
+      "captured_at_utc": "2026-09-03T00:30:02.0000000+00:00",
+      "elapsed_ms": 1802000,
+      "private_working_set_bytes": 120586240,
+      "working_set_bytes": 167772160,
+      "thread_count": 24,
+      "handle_count": 1020,
+      "gdi_object_count": 17,
+      "user_object_count": 40,
+      "cpu_percent": 0.2
+    }
+  ]
+}

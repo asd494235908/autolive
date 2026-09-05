@@ -1,0 +1,263 @@
+.login-page {
+  position: relative;
+  display: grid;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  place-items: center;
+  overflow: hidden;
+  background: #edf6ff;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei",
+    sans-serif;
+}
+
+.login-page__backdrop {
+  position: fixed;
+  inset: -4%;
+  width: 108%;
+  height: 108%;
+  object-fit: cover;
+  opacity: 0.58;
+  filter: blur(18px);
+  pointer-events: none;
+  user-select: none;
+}
+
+.login-stage {
+  position: relative;
+  width: min(100vw, 177.6833156vh);
+  height: min(100vh, 56.2799043vw);
+  height: min(100dvh, 56.2799043vw);
+  overflow: hidden;
+  container-type: inline-size;
+}
+
+.login-stage__visual {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  user-select: none;
+}
+
+.login-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.login-feedback {
+  position: absolute;
+  z-index: 4;
+  top: 2.5%;
+  left: 50%;
+  width: min(520px, 72%);
+  transform: translateX(-50%);
+}
+
+.login-hotspot {
+  position: absolute;
+  z-index: 2;
+  min-width: 0;
+  height: auto;
+  padding: 0;
+  overflow: hidden;
+  color: transparent;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.login-page .login-stage .login-hotspot:not(:disabled):hover,
+.login-page .login-stage .login-hotspot:not(:disabled):active {
+  color: transparent;
+  background: transparent;
+}
+
+.login-page .login-stage .login-hotspot--submit:not(:disabled):hover {
+  background: rgb(255 255 255 / 10%);
+}
+
+.login-page .login-stage .login-hotspot--submit:not(:disabled):active {
+  background: rgb(40 70 255 / 12%);
+  transform: translateY(0.06cqw);
+}
+
+.login-hotspot:focus-visible,
+.login-field:focus-within,
+.login-check-control:focus-within {
+  outline: max(2px, 0.18cqw) solid #1677ff;
+  outline-offset: max(1px, 0.12cqw);
+}
+
+.login-hotspot--account-tab,
+.login-hotspot--phone-tab {
+  top: 30.924548%;
+  width: 7.655502%;
+  height: 5.100956%;
+}
+
+.login-hotspot--account-tab {
+  left: 72.069378%;
+}
+
+.login-hotspot--phone-tab {
+  left: 82.655502%;
+}
+
+.login-field {
+  position: absolute;
+  z-index: 2;
+  left: 69.138756%;
+  width: 23.26555%;
+  height: 7.120085%;
+  border-radius: 0.84cqw;
+}
+
+.login-field--username {
+  top: 40.063762%;
+}
+
+.login-field--password {
+  top: 50.478215%;
+}
+
+.login-field__input {
+  width: 100%;
+  height: 100%;
+  padding: 0 1.435cqw 0 3.35cqw;
+  color: transparent;
+  caret-color: #2a69ee;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  font-size: 1.077cqw;
+}
+
+.login-field__input::placeholder {
+  color: transparent;
+}
+
+.login-field__input:hover,
+.login-field__input:focus {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.login-mirror {
+  position: absolute;
+  z-index: 3;
+  left: 72.248804%;
+  width: 17.942584%;
+  height: 3.613177%;
+  padding-block: 0.239cqw;
+  overflow: hidden;
+  color: #75809d;
+  font-size: 1.017cqw;
+  line-height: 1.555cqw;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  background: rgb(250 252 255 / 94%);
+  border-radius: 0.239cqw;
+}
+
+.login-mirror--username {
+  top: 41.870351%;
+}
+
+.login-mirror--password {
+  top: 52.284803%;
+}
+
+.login-hotspot--eye {
+  top: 51.965994%;
+  left: 89.114833%;
+  width: 2.870813%;
+  height: 4.463337%;
+}
+
+.login-check-control {
+  position: absolute;
+  z-index: 2;
+  top: 60.892667%;
+  left: 68.779904%;
+  width: 7.894737%;
+  height: 4.038257%;
+}
+
+.login-check-control > label {
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+}
+
+.login-unchecked {
+  position: absolute;
+  z-index: 3;
+  top: 61.636557%;
+  left: 69.198565%;
+  width: 1.315789%;
+  aspect-ratio: 1;
+  pointer-events: none;
+  background: #fff;
+  border: 0.12cqw solid #9fb1d5;
+  border-radius: 0.3cqw;
+}
+
+.login-hotspot--forgot {
+  top: 60.892667%;
+  left: 86.483254%;
+  width: 6.339713%;
+  height: 4.038257%;
+}
+
+.login-hotspot--submit {
+  top: 68.437832%;
+  left: 69.138756%;
+  width: 23.26555%;
+  height: 7.863974%;
+  border-radius: 0.84cqw;
+}
+
+.login-submit-status {
+  position: absolute;
+  z-index: 3;
+  top: 68.437832%;
+  left: 69.138756%;
+  display: grid;
+  width: 23.26555%;
+  height: 7.863974%;
+  place-items: center;
+  color: #fff;
+  font-size: 1.4cqw;
+  pointer-events: none;
+  background: linear-gradient(135deg, rgb(22 140 247 / 96%), rgb(169 76 255 / 96%));
+  border-radius: 0.84cqw;
+}
+
+.login-hotspot--register {
+  top: 80.021254%;
+  left: 80.921053%;
+  width: 5.741627%;
+  height: 4.038257%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-page *,
+  .login-page *::before,
+  .login-page *::after {
+    scroll-behavior: auto;
+    transition-duration: 0.01ms;
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+  }
+}

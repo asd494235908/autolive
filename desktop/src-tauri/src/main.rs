@@ -12,6 +12,8 @@ mod virtual_camera_output;
 use autolive_desktop_core::runtime_resource_task::{
     handle_runtime_resource_exit, RuntimeResourceTaskShutdown,
 };
+#[cfg(windows)]
+use autolive_media_output_ownership::MediaOutputOwnershipLease;
 use commands::{
     append_local_videos, cancel_audio_cycle_candidate, cancel_runtime_resource_install,
     cleanup_local_caches_command, cleanup_stale_generated_caches, clear_playback_pool,
@@ -66,6 +68,15 @@ fn retain_unregistered_realtime_speech_commands() {
 }
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    let _media_output_ownership = match MediaOutputOwnershipLease::try_acquire() {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("无法启动桌面端：{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {

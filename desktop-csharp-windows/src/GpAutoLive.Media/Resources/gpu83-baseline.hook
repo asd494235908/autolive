@@ -1,0 +1,56 @@
+//!PARAM al_brightness_percent
+//!TYPE float
+//!MINIMUM -100.0
+//!MAXIMUM 100.0
+0.0
+
+//!PARAM al_contrast_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 200.0
+100.0
+
+//!PARAM al_saturation_percent
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 200.0
+100.0
+
+//!PARAM al_hue_degrees
+//!TYPE float
+//!MINIMUM -180.0
+//!MAXIMUM 180.0
+0.0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC AutoLive CSharp GPU83 baseline color effects
+//!WIDTH HOOKED.w
+//!HEIGHT HOOKED.h
+//!WHEN 1
+
+vec3 autolive_hue_rotate(vec3 color, float angle) {
+    float y = dot(color, vec3(0.299, 0.587, 0.114));
+    float i = dot(color, vec3(0.596, -0.275, -0.321));
+    float q = dot(color, vec3(0.212, -0.523, 0.311));
+    float cosine_value = cos(angle);
+    float sine_value = sin(angle);
+    float rotated_i = cosine_value * i - sine_value * q;
+    float rotated_q = sine_value * i + cosine_value * q;
+    return vec3(
+        y + 0.956 * rotated_i + 0.621 * rotated_q,
+        y - 0.272 * rotated_i - 0.647 * rotated_q,
+        y - 1.106 * rotated_i + 1.703 * rotated_q
+    );
+}
+
+vec4 hook() {
+    vec4 source_color = HOOKED_tex(HOOKED_pos);
+    vec3 color = source_color.rgb;
+    color += vec3(al_brightness_percent / 100.0);
+    color = (color - vec3(0.5)) * (al_contrast_percent / 100.0) + vec3(0.5);
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    color = mix(vec3(luma), color, al_saturation_percent / 100.0);
+    color = autolive_hue_rotate(color, radians(al_hue_degrees));
+    return vec4(clamp(color, 0.0, 1.0), source_color.a);
+}

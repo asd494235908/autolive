@@ -1,3 +1,71 @@
+# 映声工坊管理端登录页 Design QA
+
+- source visual truth path: `C:\Users\asd49\xwechat_files\wxid_rud357apqrci12_129a\msg\file\2026-09\映声工坊登录页.html` 内嵌的首个 PNG（提取检查路径：`C:\Users\asd49\AppData\Local\Temp\yingsheng-login-reference.png`）
+- repository visual asset: `E:\aotlve\admin-web\src\features\auth\assets\yingsheng-login.png`
+- reported mismatch paths: `C:\Users\asd49\AppData\Local\Temp\codex-clipboard-a02dbfa4-33e2-4e82-b1d2-0e6623b4d397.png`、`C:\Users\asd49\AppData\Local\Temp\codex-clipboard-c98d838b-eae3-4bb9-a934-5de9ac7a3ab5.png`
+- implementation screenshot path: Codex 内置浏览器截图仅以内存证据返回，未暴露文件系统路径；被测 Docker 页面为 `http://127.0.0.1:18092/login`
+- viewport: `1280 × 720` CSS px，`deviceScaleFactor=1`；`.login-stage` 为 `1279.3125 × 720`
+- source pixels: 原始视觉 `1672 × 941`；问题局部截图分别为 `251 × 103` 与 `368 × 119`
+- implementation pixels: 浏览器截图按 `1280 × 720` CSS px、`deviceScaleFactor=1` 检查
+- density normalization: 整页按原始 `1672:941` 比例等比缩放；局部 hover 比较以浏览器计算样式和同状态截图复核
+- state: 账号页签 hover、登录按钮 hover；另保留初始态与既有表单交互检查
+
+**Findings**
+
+- 修复后无 P0/P1/P2 视觉差异。问题根因是 Ant Design 的 hover 选择器覆盖了透明热点：账号页签重复显示 DOM 文案，登录按钮则显示组件库默认蓝色。修复后浏览器实测账号页签 hover 的 `color` 与 `background` 均为透明；登录按钮 hover 为 `rgba(255, 255, 255, 0.1)`，文字保持透明。
+- 字体与排版：品牌字、标题、说明、表单文案和功能卡文案均来自参考原图，字形、字号、字重、行高、换行与抗锯齿保持一致。
+- 间距与布局节奏：使用参考 HTML 的原始热区坐标换算为百分比，卡片、字段、按钮、标签和底部能力卡的位置与原图一致。
+- 颜色与视觉令牌：首屏颜色、渐变、透明度、光晕、阴影、圆角均来自原始 PNG，没有用 CSS 近似重绘可见资产。
+- 图像质量与资产一致性：仓库 PNG 与 HTML 内嵌 PNG 的 SHA-256 为 `191696D898B1C6CA5CFC592A414D763D61B2D26139925A2F2760878D17F6CF3B`；未使用占位图、CSS 图形、手绘 SVG 或替代 Logo。
+- 文案：参考页文案完整保留，透明热点不会再把底图已有的“账号登录”或“登录”重复绘制。手机登录、忘记密码和注册没有对应后端能力，点击时明确提示暂未开放，不伪造可用流程。
+
+**Full-view comparison evidence**
+
+- 原始 PNG 与 Docker `/login` 实现继续使用相同 `1672:941` 宽高比；`1280 × 720` 下截图未发现布局、裁切、字体、色彩、图片或文案新增差异。
+- 修复只调整自有热点状态选择器，没有改动视觉底板、热区坐标、表单或响应式计算。
+
+**Focused region comparison evidence**
+
+- 对照用户提供的两个局部截图复现并检查同一状态：账号页签 hover 后 `:hover=true`、`color=rgba(0,0,0,0)`、`background=rgba(0,0,0,0)`，没有第二份文字；登录按钮 hover 动画完成后 `:hover=true`、`color=rgba(0,0,0,0)`、`background=rgba(255,255,255,0.1)`。
+- 键盘 `:focus-visible` 轮廓仍独立保留；本次没有用 hover 替代焦点反馈。
+
+**Comparison history**
+
+1. 用户局部截图发现 P2：透明热点在 hover 时被 Ant Design 高优先级状态样式覆盖，出现重复文案和默认蓝色按钮。
+2. 将自有 hover/active 选择器提高到页面作用域内的明确优先级；普通热点恢复透明，仅提交热点按原始 HTML 应用 `10%` 白色 hover 蒙层与 `12%` 蓝色 active 蒙层。
+3. Docker 镜像重建后在同一页面复验，两处计算样式均符合参考，console warning/error 为 `0`；最终结果通过。
+
+**Primary interactions tested**
+
+- 账号输入：通过。
+- 密码输入与掩码：通过。
+- 密码显示/隐藏：通过。
+- 记住我切换：通过。
+- 手机登录暂未开放反馈：通过。
+- 账号页签 hover 不重复显示文字：通过。
+- 登录按钮 hover 不再显示 Ant Design 默认蓝色：通过。
+- 浏览器 console warning/error：0 条。
+
+**Implementation Checklist**
+
+- [x] 原始视觉资产按 1:1 尺寸接入。
+- [x] Ant Design 真实表单控件覆盖在对应热区。
+- [x] 既有 `/api/v1/auth/login` 与 `product=autolive` 契约保持不变。
+- [x] 键盘语义、可访问名称和焦点反馈可用。
+- [x] hover/active 状态不会覆盖底图已有文案或颜色。
+- [x] 类型检查、测试和本地生产构建通过。
+
+**Follow-up Polish**
+
+- 无阻塞项。窄屏继续忠实采用参考 HTML 的整页缩放，因此控件视觉尺寸较小；若后续需要移动端重排，应作为独立设计需求处理，而不是本次 1:1 复刻的一部分。
+
+final result: passed
+
+
+---
+
+## 既有桌面端参数预览 QA（原文保留）
+
 # 桌面端参数预览设计 QA
 
 > 2026-08-24 当前最新满宽、自动网格、卡片内容、逐卡颜色与高亮动效决策：参数内容区填满桌面中栏实际可用宽度，不设置约 `880px`、`860–900px` 或其他固定最大宽度，宽中栏两侧不得因参数容器上限留下大面积空白。外层保持双主栏，左栏为普通视频与高级视觉、右栏为普通声音；每个主栏内部卡网格根据实际可用宽度自动决定列数并自然换行，不限制每排卡片数量，也不设置固定列数或卡宽。极窄时外层双主栏按 DOM 顺序降为单列，全程不横向裁剪。普通参数卡固定为统一 `80px` 高度，只显示参数名、当前值/进度和“已接入 / 正式需求待实现 / 待确认”三态标签，不显示底部范围、单位、接入情况或待实现原因说明句。固定视觉频段权重固定为独立 `196px` 高度、跨满所属栏，完整显示三列且不得裁剪。范围、默认值和能力状态事实仍保留在正式契约、校验及媒体边界中。每张参数卡或独立参数模块分别从《媒体参数范围与默认值》的参考图五色色板分配自己的颜色，不再按普通视频、高级视觉、普通声音大分类固定一种颜色；五色可以循环复用，分配顺序应尽量避免视觉上相邻的卡片同色，且单次挂载期内每卡颜色保持稳定。挂载后显示 `value` 实际变化时按该卡自己的颜色执行一次约 `900ms` 高亮：先短暂增强，再平滑淡出；初始挂载、相同值、仅重排和普通重渲染不触发，`prefers-reduced-motion: reduce` 下禁用。算法状态仍只由三态文字表达，颜色不表达算法状态，三态不等于编辑权限。
@@ -85,3 +153,5 @@
 - P3：尚未在 Windows 125%/150% 系统缩放下保存独立截图；当前逻辑尺寸、文本换行和进度总宽已有静态约束，风险较低。
 
 historical result: passed; current contract: pending revalidation
+
+final result: passed

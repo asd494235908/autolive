@@ -1,0 +1,34 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/GpAutoLive.App/GpAutoLive.App.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/GpAutoLive.Installer/GpAutoLive.Installer.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/GpAutoLive.Contracts/GpAutoLive.Contracts.csproj" />
+    <Project Path="src/GpAutoLive.Core/GpAutoLive.Core.csproj" />
+    <Project Path="src/GpAutoLive.Media/GpAutoLive.Media.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/GpAutoLive.Windows/GpAutoLive.Windows.csproj">
+      <Platform Project="x64" />
+    </Project>
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GpAutoLive.App.Tests/GpAutoLive.App.Tests.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="tests/GpAutoLive.Installer.Tests/GpAutoLive.Installer.Tests.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="tests/GpAutoLive.Contracts.Tests/GpAutoLive.Contracts.Tests.csproj" />
+    <Project Path="tests/GpAutoLive.Core.Tests/GpAutoLive.Core.Tests.csproj" />
+    <Project Path="tests/GpAutoLive.Media.Tests/GpAutoLive.Media.Tests.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="tests/GpAutoLive.Windows.Tests/GpAutoLive.Windows.Tests.csproj">
+      <Platform Project="x64" />
+    </Project>
+  </Folder>
+</Solution>

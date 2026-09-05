@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0-windows10.0.19041": {
+      "gpautolive.contracts": {
+        "type": "Project"
+      },
+      "gpautolive.core": {
+        "type": "Project",
+        "dependencies": {
+          "GpAutoLive.Contracts": "[1.0.0, )"
+        }
+      }
+    },
+    "net10.0-windows10.0.19041/win-x64": {}
+  }
+}
