@@ -100,7 +100,7 @@ public partial class MainWindow
                         switched.Error?.Message ?? "视频切换失败，已停止媒体运行时");
                     if (stoppedAfterSwitchFailure.IsSuccess)
                     {
-                        MediaListBox.SelectedIndex = stoppedAfterSwitchFailure.Snapshot.SourceMediaIndex;
+                        SelectMediaPoolIndex(stoppedAfterSwitchFailure.Snapshot.SourceMediaIndex);
                     }
 
                     return;
@@ -171,7 +171,7 @@ public partial class MainWindow
             $"已切换到第 {result.Snapshot.SourceMediaIndex + 1} 项");
         if (result.IsSuccess)
         {
-            MediaListBox.SelectedIndex = result.Snapshot.SourceMediaIndex;
+            SelectMediaPoolIndex(result.Snapshot.SourceMediaIndex);
         }
     }
 
@@ -216,7 +216,7 @@ public partial class MainWindow
             return;
         }
 
-        if (e.Key == Key.Delete && Keyboard.Modifiers == ModifierKeys.None && MediaListBox.SelectedIndex >= 0)
+        if (e.Key == Key.Delete && Keyboard.Modifiers == ModifierKeys.None && GetSelectedMediaPoolIndex() >= 0)
         {
             _ = RemoveSelectedMediaAsync();
             e.Handled = true;
@@ -1123,7 +1123,7 @@ public partial class MainWindow
 
             StartVideoStateWatcher(_mediaPool.CurrentIdentity);
             ApplyMediaOperation(completed, $"已自动切换到第 {completed.Snapshot.SourceMediaIndex + 1} 项");
-            MediaListBox.SelectedIndex = completed.Snapshot.SourceMediaIndex;
+            SelectMediaPoolIndex(completed.Snapshot.SourceMediaIndex);
             return;
         }
 
@@ -1142,7 +1142,7 @@ public partial class MainWindow
         StartAudioCompletionWatcher(_mediaPool.CurrentIdentity);
         await PrepareNextAudioCandidateAsync(_mediaPool.CurrentIdentity).ConfigureAwait(true);
         ApplyMediaOperation(completed, $"已自动切换到第 {completed.Snapshot.SourceMediaIndex + 1} 项");
-        MediaListBox.SelectedIndex = completed.Snapshot.SourceMediaIndex;
+        SelectMediaPoolIndex(completed.Snapshot.SourceMediaIndex);
     }
 
     private async Task ObserveAudioCompletionAsync(
@@ -1365,7 +1365,7 @@ public partial class MainWindow
 
             // 音频→视频必须重新建立 mpv 视频表面；TogglePlaybackCoreAsync 会复用
             // 已保持 Playing 的播放池状态，并统一启动视频与其声音会话。
-            MediaListBox.SelectedIndex = completed.Snapshot.SourceMediaIndex;
+            SelectMediaPoolIndex(completed.Snapshot.SourceMediaIndex);
             await TogglePlaybackCoreAsync().ConfigureAwait(true);
             return;
         }
@@ -1380,7 +1380,7 @@ public partial class MainWindow
                 var nextIdentity = _mediaPool.CurrentIdentity;
                 StartAudioCompletionWatcher(nextIdentity);
                 ApplyMediaOperation(completed, $"已自动切换到第 {completed.Snapshot.SourceMediaIndex + 1} 项");
-                MediaListBox.SelectedIndex = completed.Snapshot.SourceMediaIndex;
+                SelectMediaPoolIndex(completed.Snapshot.SourceMediaIndex);
                 await PrepareNextAudioCandidateAsync(nextIdentity).ConfigureAwait(true);
                 return;
             }
@@ -1421,7 +1421,7 @@ public partial class MainWindow
         StartAudioCompletionWatcher(_mediaPool.CurrentIdentity);
         await PrepareNextAudioCandidateAsync(_mediaPool.CurrentIdentity).ConfigureAwait(true);
         ApplyMediaOperation(completed, $"已自动切换到第 {completed.Snapshot.SourceMediaIndex + 1} 项");
-        MediaListBox.SelectedIndex = completed.Snapshot.SourceMediaIndex;
+        SelectMediaPoolIndex(completed.Snapshot.SourceMediaIndex);
     }
 
     private Task RunPlaybackCommandAsync(Func<Task> command) =>
@@ -1514,15 +1514,20 @@ public partial class MainWindow
         PlaybackDurationText.Text = isVideo
             ? PlaybackTimeFormatter.Format(currentSource?.DurationMs)
             : "—";
-        EmptyMediaPanel.Visibility = hasMedia ? Visibility.Collapsed : Visibility.Visible;
-        MediaListBox.Visibility = hasMedia ? Visibility.Visible : Visibility.Collapsed;
+        var hasVisibleMedia = _state.VisibleMediaItems.Count > 0;
+        EmptyMediaPanel.Visibility = hasVisibleMedia ? Visibility.Collapsed : Visibility.Visible;
+        MediaListBox.Visibility = hasVisibleMedia ? Visibility.Visible : Visibility.Collapsed;
+        EmptyMediaTitleText.Text = hasMedia ? "没有匹配的媒体" : "尚未添加媒体";
+        EmptyMediaHintText.Text = hasMedia ? "请调整搜索关键词" : "拖放文件，或使用 Ctrl+O 导入";
         PlaybackSlider.IsEnabled = hasMedia
             && isVideo
             && snapshot.PlaybackState is PlaybackState.Playing or PlaybackState.Paused;
         MediaCountText.Text = hasMedia
-            ? $"共 {_state.MediaItems.Count} 个媒体（拖拽排序）"
+            ? string.IsNullOrWhiteSpace(_state.MediaSearchText)
+                ? $"共 {_state.MediaItems.Count} 个媒体（拖拽排序）"
+                : $"显示 {_state.VisibleMediaItems.Count} / {_state.MediaItems.Count} 个媒体"
             : "共 0 个媒体";
-        var selectedIndex = MediaListBox.SelectedIndex;
+        var selectedIndex = GetSelectedMediaPoolIndex();
         MoveUpButton.IsEnabled = hasMedia && selectedIndex > 0;
         MoveDownButton.IsEnabled = hasMedia && selectedIndex >= 0 && selectedIndex < _state.MediaItems.Count - 1;
         RemoveMediaButton.IsEnabled = hasMedia && selectedIndex >= 0;

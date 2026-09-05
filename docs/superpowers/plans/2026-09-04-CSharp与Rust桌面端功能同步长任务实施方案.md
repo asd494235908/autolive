@@ -1,6 +1,6 @@
 # GpAutoLive C# 与 Rust 桌面端功能同步长任务实施方案
 
-- 版本：v1.79
+- 版本：v1.80
 - 日期：2026-09-05
 - 状态：Phase 2 C# 黄金路径修复已接入；导入/媒体池选择、媒体池编辑控件、拖放候选白名单、mpv CPU4 视频效果及四值运行时回读、基于真实播放 PTS 的 5–8s 视频周期触发、FFmpeg 实时声音子集（含已知时长淡出、自然动态模式和确定性本地音色预设）、按可听位置预载并按 PortAudio 输出帧目标提交的声音周期候选、视频音轨→PortAudio、系统生成 EQ dB 单位、GPU83 完整 83 项 C# 映射与完整 shader 资源包、启动/更新固定白名单回读、完整 shader 哈希门控下的 WPF GPU83/旧包 CPU4 选择、音频 N/N+1 单一输出切换、基于 PortAudio `timeInfo` 的可听时钟投影和正常容量范围内的 PCM 背压、播放态视频效果更新后的 mpv 下一帧号观察、视频启动后的 mpv 首帧帧号门禁、视频启动 `GPU83 → CPU4 → Original` 单向降级、WGC `FrameArrived` 事件唤醒取帧、同一捕获线程的有界轮询、WGC 绑定顶层最终效果窗口 HWND、普通 WPF 与实际 `FinalEffectWindow` 的 WGC 帧池启动/停止隔离门禁、WGC D3D11 设备的 `BGRA_SUPPORT|VIDEO_SUPPORT` 创建标志、真实硬件 adapter 选择和 WGC surface→DXGI texture 解包已接入；视频播放中切换声音开关会停止并从 mpv 当前位置重建 FFmpeg 声音会话；视频画面启动不再因独立 PortAudio 设备失败而回滚；音频计划与输出采样率不一致时在启动前 fail-closed；RTMP 无音频停止路径已修正为只释放实际取得的音频串行锁；App 测试程序集已固化串行执行，消除共享 WPF Dispatcher/真实 mpv 资源的并行竞态。GPU83 原生 Win32 窗口和实际 `FinalEffectWindow` 最终像素均已通过显式夹具；本轮又将 C# 最终效果窗对齐 Rust `final-effect` 的黑色视频纯画布样式，删除 Footer、浮层、等待文字和重复播放控制，保留同一视频子 HWND、WGC 顶层 HWND、单实例及主窗口控制边界。目标显卡矩阵、真实声卡稳定性、过载重建、远端输出与人工页面验收仍待验收
 - 本轮并行增量：`MediaPoolOwner.ReplaceAll` 已修复为仅按替换后池长度校验，`Append` 继续按旧池加新候选限制 100 项；C# 通用 D3D11 硬件工厂已使用 `BgraSupport | VideoSupport`，与 Rust WGC 视频处理能力声明对齐；WGC surface→DXGI texture 解包和实际 WPF GPU83 最终像素闭环已通过显式夹具；声音启动现在必须在有界预算内产生首批 PCM，最终 PCM 总线的 RTMP 分支不再反向阻塞本机声音；主窗口真实导入、运行包失败保留旧池、未授权导入和真实 EOF 自动换源已补齐边界证据；mpv IPC 断开时控制器不再误报播放中，停止失败会向上返回；RTMP 启动失败、Pump/Producer 失败和停止超时均保留真实失败状态与可重试资源；底部主导入按钮恢复可见，mpv `glsl-shader-opts` 字符串回读按固定键集合兼容；复审并撤回未形成闭环的 RTMP stdout 进度草稿，修正无音频停止时的 `_audioSerial` 释放条件；生成音频快照的正式频域字段已进入 FFmpeg `-af`，CPU4 动态更新已与启动滤镜使用固定标签，视频声音会话在首次输出失败后可随暂停/恢复从 mpv 位置有界重试；App 测试程序集已加入串行门禁，保护共享 WPF Dispatcher、环境变量和真实 mpv 窗口资源；`导入列表` 已接入版本化 JSON 本地路径列表，成功后复用既有 FFprobe 与 `ReplaceAll` 原子提交；导入探测与原子提交现在持有共享播放命令串行门，关闭最终效果窗口复用统一输出停止路径，RTMP 共享最终 PCM 总线按实际声道数构造解码、混音和分流链；C# 启动入口新增用户本地文件句柄单实例门禁，实测第二次启动立即退出且进程数保持为 1。以上只修改 C# 代码、测试和专项文档，未改变登录门禁、媒体原子提交、WARP 禁止或目标 GPU/下游发布门禁边界。
@@ -642,3 +642,10 @@ Rust/Tauri App
 - C# 窗口标题改为 `GpAutoLive 最终效果`，默认客户区 `1280×720`、最小 `320×180`，保留原生标题栏、可调整大小、居中、单实例和主窗口播放控制。
 - 删除只服务于 Footer 的 `FinalEffectPlaybackCommand`、`CommandRequested` 和进度/身份投影，保留 `ReservedVideoSurface` 子 HWND 与 WGC 顶层 HWND 的双句柄边界；只修改 C# 代码、测试和文档，不修改 Rust/Tauri。
 - WPF 回归测试覆盖纯画布无控件、Rust 对齐尺寸/标题及 F11 往返；真实 WGC 可见帧、人工页面、真实声卡、远端输出和长稳仍按总计划单独验收。
+
+### v1.80 C# 媒体池搜索与导入按钮样式修复（2026-09-05）
+
+- 媒体池搜索框从只读占位文本接入真实输入链：`ShellState.MediaSearchText` 驱动 `VisibleMediaItems` 显示投影，按文件名或媒体类型不区分大小写匹配，空白查询恢复完整媒体池，零结果显示明确空态；真实 `MediaPoolService` 池和导入/播放契约不因搜索改变。
+- 过滤后的选中项不再把显示序号当作源池序号；选择、排序、移除、键盘删除、自动换源和播放切换通过 `MediaListItemViewModel` 身份映射回完整源池索引，保留当前源和原子媒体池编辑边界。
+- 底部主导入按钮继续复用既有 `ImportButton_Click → RunImportAsync`，只补齐 `32px` 高度、居中布局和顶栏同源加号/`Ctrl+O` 文案，修复内容自然尺寸导致的又宽又矮样式；不新增组件或依赖。
+- 本轮目标测试 `2/2`、既有媒体池忙碌态回归 `1/1`、格式检查和 Release x64 构建 `0` 警告/`0` 错误。CUA 未返回 C# 原生窗口，人工页面点击和像素级视觉验收未计入通过；Rust/Tauri 保持只读。

@@ -318,4 +318,59 @@ public sealed class ShellStateTests
         Assert.IsFalse(state.IsPlaying);
         Assert.AreEqual(0d, state.PlaybackProgress);
     }
+
+    [TestMethod]
+    public void Media_search_filters_only_the_display_projection_and_whitespace_restores_all()
+    {
+        var state = new ShellState();
+        var video = new SourceMediaDto(
+            @"C:\media\alpha.mp4",
+            @"C:\media\alpha.mp4",
+            MediaKind.Video,
+            MediaCompatibilityMode.Direct,
+            "alpha.mp4",
+            1,
+            1_000,
+            null,
+            null,
+            1280,
+            720,
+            30,
+            null,
+            null,
+            "h264",
+            null,
+            null,
+            "disabled");
+        var audio = new SourceMediaDto(
+            @"C:\media\music.wav",
+            @"C:\media\music.wav",
+            MediaKind.Audio,
+            MediaCompatibilityMode.Direct,
+            "music.wav",
+            1,
+            1_000,
+            null,
+            null,
+            null,
+            null,
+            null,
+            48_000,
+            2,
+            null,
+            null,
+            null,
+            "disabled");
+
+        state.ApplyMediaSnapshot(new AppState { SourceMediaPool = [video, audio] });
+        state.MediaSearchText = "music";
+
+        Assert.AreEqual(2, state.MediaItems.Count);
+        Assert.AreEqual(1, state.VisibleMediaItems.Count);
+        Assert.AreEqual("music.wav", state.VisibleMediaItems[0].FileName);
+
+        state.MediaSearchText = "  ";
+
+        Assert.AreEqual(2, state.VisibleMediaItems.Count);
+    }
 }

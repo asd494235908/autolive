@@ -270,6 +270,13 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (e.PropertyName is nameof(ShellState.MediaSearchText)
+            or nameof(ShellState.VisibleMediaItems))
+        {
+            UpdateMediaProjection();
+            return;
+        }
+
         if (e.PropertyName == nameof(ShellState.VideoProcessing))
         {
             await RunPlaybackCommandAsync(

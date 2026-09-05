@@ -2,6 +2,8 @@ using System.IO;
 using Microsoft.Win32;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Threading;
+using GpAutoLive.App.Features.Media;
 using GpAutoLive.Contracts;
 using GpAutoLive.Core;
 using GpAutoLive.Core.Configuration;
@@ -12,11 +14,21 @@ namespace GpAutoLive.App;
 
 public partial class MainWindow
 {
+    private MediaListItemViewModel? _pendingMediaSelection;
+
     private async void ImportButton_Click(object sender, RoutedEventArgs e) =>
         await ImportMediaAsync().ConfigureAwait(true);
 
     private async void ImportPlaylistButton_Click(object sender, RoutedEventArgs e) =>
         await ImportPlaylistAsync().ConfigureAwait(true);
+
+    private void MediaSearchTextBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (!_isClosing && sender is TextBox searchBox)
+        {
+            _state.MediaSearchText = searchBox.Text;
+        }
+    }
 
     private void MediaPool_DragOver(object sender, DragEventArgs e)
     {
@@ -58,6 +70,13 @@ public partial class MainWindow
 
     private void MediaListBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (e.AddedItems.Count > 0
+            && MediaListBox.SelectedItem is MediaListItemViewModel selected
+            && !ReferenceEquals(selected, _pendingMediaSelection))
+        {
+            _pendingMediaSelection = null;
+        }
+
         if (!_login.CanEnterWorkbench || _importBusy || _isClosing)
         {
             SetMediaMutationButtonsEnabled(false);
@@ -65,13 +84,12 @@ public partial class MainWindow
         }
 
         UpdateMediaProjection();
-        if (e.AddedItems.Count == 0
-            || MediaListBox.SelectedIndex < 0)
+        var selectedIndex = GetSelectedMediaPoolIndex();
+        if (e.AddedItems.Count == 0 || selectedIndex < 0)
         {
             return;
         }
 
-        var selectedIndex = MediaListBox.SelectedIndex;
         var snapshot = _mediaPool.Snapshot;
         if (selectedIndex == snapshot.SourceMediaIndex)
         {
@@ -80,7 +98,7 @@ public partial class MainWindow
 
         if (snapshot.PlaybackState is PlaybackState.Playing or PlaybackState.Paused)
         {
-            MediaListBox.SelectedIndex = snapshot.SourceMediaIndex;
+            SelectMediaPoolIndex(snapshot.SourceMediaIndex);
             _state.SetStatus("播放中请使用上一项/下一项切换，避免列表选择与输出会话脱节");
             return;
         }
@@ -98,7 +116,7 @@ public partial class MainWindow
             return;
         }
 
-        var selectedIndex = MediaListBox.SelectedIndex;
+        var selectedIndex = GetSelectedMediaPoolIndex();
         if (selectedIndex <= 0)
         {
             return;
@@ -113,7 +131,7 @@ public partial class MainWindow
         ApplyMediaOperation(result, result.IsSuccess ? "媒体已上移" : result.Error?.Message ?? "媒体上移失败");
         if (result.IsSuccess)
         {
-            MediaListBox.SelectedIndex = selectedIndex - 1;
+            SelectMediaPoolIndex(selectedIndex - 1);
         }
     }
 
@@ -124,7 +142,7 @@ public partial class MainWindow
             return;
         }
 
-        var selectedIndex = MediaListBox.SelectedIndex;
+        var selectedIndex = GetSelectedMediaPoolIndex();
         if (selectedIndex < 0 || selectedIndex >= _state.MediaItems.Count - 1)
         {
             return;
@@ -139,7 +157,7 @@ public partial class MainWindow
         ApplyMediaOperation(result, result.IsSuccess ? "媒体已下移" : result.Error?.Message ?? "媒体下移失败");
         if (result.IsSuccess)
         {
-            MediaListBox.SelectedIndex = selectedIndex + 1;
+            SelectMediaPoolIndex(selectedIndex + 1);
         }
     }
 
@@ -159,7 +177,7 @@ public partial class MainWindow
             return;
         }
 
-        var selectedIndex = MediaListBox.SelectedIndex;
+        var selectedIndex = GetSelectedMediaPoolIndex();
         if (selectedIndex < 0)
         {
             return;
@@ -182,7 +200,7 @@ public partial class MainWindow
         ApplyMediaOperation(result, result.IsSuccess ? "媒体已移除" : result.Error?.Message ?? "移除媒体失败");
         if (result.IsSuccess && result.Snapshot.SourceMediaPool.Length > 0)
         {
-            MediaListBox.SelectedIndex = Math.Min(selectedIndex, result.Snapshot.SourceMediaPool.Length - 1);
+            SelectMediaPoolIndex(Math.Min(selectedIndex, result.Snapshot.SourceMediaPool.Length - 1));
         }
     }
 
@@ -289,9 +307,7 @@ public partial class MainWindow
     {
         _state.ApplyMediaSnapshot(snapshot);
         SyncVirtualCameraOutputContext(snapshot);
-        MediaListBox.SelectedIndex = snapshot.SourceMediaPool.IsEmpty
-            ? -1
-            : snapshot.SourceMediaIndex;
+        SelectMediaPoolIndex(snapshot.SourceMediaPool.IsEmpty ? -1 : snapshot.SourceMediaIndex);
         UpdateMediaProjection();
         StartMediaThumbnailLoad();
         _state.SetStatus(status);
@@ -429,14 +445,16 @@ public partial class MainWindow
 
     private void SetMediaMutationButtonsEnabled(bool enabled)
     {
-        var selectedIndex = MediaListBox.SelectedIndex;
-        if (selectedIndex < 0 && _state.MediaItems.Count > 0)
+        var selectedIndex = GetSelectedMediaPoolIndex();
+        if (selectedIndex < 0 && _state.MediaItems.Count > 0 && MediaListBox.Items.Count == 0)
         {
             // WPF applies a changed ItemsSource on the next binding pass. During that
             // short window the pool snapshot still has a valid current item even though
             // the ListBox has not received its items yet.
             var snapshotIndex = _mediaPool.Snapshot.SourceMediaIndex;
-            if (snapshotIndex < _state.MediaItems.Count)
+            if (snapshotIndex < _state.MediaItems.Count
+                && (string.IsNullOrWhiteSpace(_state.MediaSearchText)
+                    || _state.VisibleMediaItems.Contains(_state.MediaItems[snapshotIndex])))
             {
                 selectedIndex = snapshotIndex;
             }
@@ -448,6 +466,75 @@ public partial class MainWindow
             && selectedIndex < _state.MediaItems.Count - 1;
         RemoveMediaButton.IsEnabled = enabled && selectedIndex >= 0;
         ClearMediaButton.IsEnabled = enabled && _state.HasMedia;
+    }
+
+    private int GetSelectedMediaPoolIndex() =>
+        MediaListBox.SelectedItem is MediaListItemViewModel selected
+            && MediaListBox.Items.Contains(selected)
+            ? FindMediaPoolIndex(selected)
+            : -1;
+
+    private int FindMediaPoolIndex(MediaListItemViewModel item)
+    {
+        for (var index = 0; index < _state.MediaItems.Count; index++)
+        {
+            if (ReferenceEquals(_state.MediaItems[index], item))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    private void SelectMediaPoolIndex(int index)
+    {
+        if (index < 0 || index >= _state.MediaItems.Count)
+        {
+            _pendingMediaSelection = null;
+            MediaListBox.SelectedItem = null;
+            return;
+        }
+
+        var item = _state.MediaItems[index];
+        if (!_state.VisibleMediaItems.Contains(item))
+        {
+            _pendingMediaSelection = null;
+            MediaListBox.SelectedItem = null;
+            return;
+        }
+
+        _pendingMediaSelection = item;
+        ApplyPendingMediaSelection();
+        if (_pendingMediaSelection is not null)
+        {
+            Dispatcher.BeginInvoke(
+                DispatcherPriority.Background,
+                new Action(ApplyPendingMediaSelection));
+        }
+    }
+
+    private void ApplyPendingMediaSelection()
+    {
+        var item = _pendingMediaSelection;
+        if (item is null)
+        {
+            return;
+        }
+
+        if (_isClosing || !_state.MediaItems.Contains(item))
+        {
+            _pendingMediaSelection = null;
+            return;
+        }
+
+        if (!MediaListBox.Items.Contains(item))
+        {
+            return;
+        }
+
+        _pendingMediaSelection = null;
+        MediaListBox.SelectedItem = item;
     }
 
     private async Task<bool> PrepareMediaPoolCommitAsync(CancellationToken cancellationToken)

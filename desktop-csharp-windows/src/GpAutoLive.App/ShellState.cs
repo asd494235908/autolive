@@ -13,6 +13,8 @@ public sealed class ShellState : INotifyPropertyChanged
     private PlaybackState _playbackState = PlaybackState.Stopped;
     private bool _hasMedia;
     private IReadOnlyList<MediaListItemViewModel> _mediaItems = EmptyMediaItems;
+    private IReadOnlyList<MediaListItemViewModel> _visibleMediaItems = EmptyMediaItems;
+    private string _mediaSearchText = string.Empty;
     private bool _videoProcessing = true;
     private bool _audioProcessing = true;
     private long _audioProcessingRevision;
@@ -94,8 +96,29 @@ public sealed class ShellState : INotifyPropertyChanged
             _mediaItems = value;
             OnPropertyChanged();
             OnPropertyChanged(nameof(MediaCountLabel));
+            RefreshVisibleMediaItems();
         }
     }
+
+    /// <summary>媒体池搜索文本；只影响界面投影，不改变媒体所有者的播放池。</summary>
+    public string MediaSearchText
+    {
+        get => _mediaSearchText;
+        set
+        {
+            var next = value ?? string.Empty;
+            if (string.Equals(_mediaSearchText, next, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _mediaSearchText = next;
+            OnPropertyChanged();
+            RefreshVisibleMediaItems();
+        }
+    }
+
+    public IReadOnlyList<MediaListItemViewModel> VisibleMediaItems => _visibleMediaItems;
 
     public string MediaCountLabel => $"{MediaItems.Count} / {MediaPoolRules.MaxItems}";
 
@@ -244,4 +267,22 @@ public sealed class ShellState : INotifyPropertyChanged
 
     private void OnPropertyChanged([CallerMemberName] string? propertyName = null) =>
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+
+    private void RefreshVisibleMediaItems()
+    {
+        var query = MediaSearchText.Trim();
+        var visible = string.IsNullOrEmpty(query)
+            ? MediaItems
+            : MediaItems
+                .Where(item => item.FileName.Contains(query, StringComparison.OrdinalIgnoreCase)
+                    || item.MediaKindLabel.Contains(query, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+        if (ReferenceEquals(_visibleMediaItems, visible))
+        {
+            return;
+        }
+
+        _visibleMediaItems = visible;
+        OnPropertyChanged(nameof(VisibleMediaItems));
+    }
 }
