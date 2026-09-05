@@ -1,8 +1,8 @@
 # GpAutoLive C# 与 Rust 桌面端功能同步长任务实施方案
 
-- 版本：v1.78
+- 版本：v1.79
 - 日期：2026-09-05
-- 状态：Phase 2 C# 黄金路径修复已接入；导入/媒体池选择、媒体池编辑控件、拖放候选白名单、mpv CPU4 视频效果及四值运行时回读、基于真实播放 PTS 的 5–8s 视频周期触发、FFmpeg 实时声音子集（含已知时长淡出、自然动态模式和确定性本地音色预设）、按可听位置预载并按 PortAudio 输出帧目标提交的声音周期候选、视频音轨→PortAudio、系统生成 EQ dB 单位、GPU83 完整 83 项 C# 映射与完整 shader 资源包、启动/更新固定白名单回读、完整 shader 哈希门控下的 WPF GPU83/旧包 CPU4 选择、音频 N/N+1 单一输出切换、基于 PortAudio `timeInfo` 的可听时钟投影和正常容量范围内的 PCM 背压、播放态视频效果更新后的 mpv 下一帧号观察、视频启动后的 mpv 首帧帧号门禁、视频启动 `GPU83 → CPU4 → Original` 单向降级、WGC `FrameArrived` 事件唤醒取帧、同一捕获线程的有界轮询、WGC 绑定顶层最终效果窗口 HWND、普通 WPF 与实际 `FinalEffectWindow` 的 WGC 帧池启动/停止隔离门禁、WGC D3D11 设备的 `BGRA_SUPPORT|VIDEO_SUPPORT` 创建标志、真实硬件 adapter 选择和 WGC surface→DXGI texture 解包已接入；视频播放中切换声音开关会停止并从 mpv 当前位置重建 FFmpeg 声音会话；视频画面启动不再因独立 PortAudio 设备失败而回滚；音频计划与输出采样率不一致时在启动前 fail-closed；RTMP 无音频停止路径已修正为只释放实际取得的音频串行锁；App 测试程序集已固化串行执行，消除共享 WPF Dispatcher/真实 mpv 资源的并行竞态。GPU83 原生 Win32 窗口和实际 WPF `FinalEffectWindow` 最终像素均已通过显式夹具，目标显卡矩阵、真实声卡稳定性、过载重建、远端输出与人工页面验收仍待验收
+- 状态：Phase 2 C# 黄金路径修复已接入；导入/媒体池选择、媒体池编辑控件、拖放候选白名单、mpv CPU4 视频效果及四值运行时回读、基于真实播放 PTS 的 5–8s 视频周期触发、FFmpeg 实时声音子集（含已知时长淡出、自然动态模式和确定性本地音色预设）、按可听位置预载并按 PortAudio 输出帧目标提交的声音周期候选、视频音轨→PortAudio、系统生成 EQ dB 单位、GPU83 完整 83 项 C# 映射与完整 shader 资源包、启动/更新固定白名单回读、完整 shader 哈希门控下的 WPF GPU83/旧包 CPU4 选择、音频 N/N+1 单一输出切换、基于 PortAudio `timeInfo` 的可听时钟投影和正常容量范围内的 PCM 背压、播放态视频效果更新后的 mpv 下一帧号观察、视频启动后的 mpv 首帧帧号门禁、视频启动 `GPU83 → CPU4 → Original` 单向降级、WGC `FrameArrived` 事件唤醒取帧、同一捕获线程的有界轮询、WGC 绑定顶层最终效果窗口 HWND、普通 WPF 与实际 `FinalEffectWindow` 的 WGC 帧池启动/停止隔离门禁、WGC D3D11 设备的 `BGRA_SUPPORT|VIDEO_SUPPORT` 创建标志、真实硬件 adapter 选择和 WGC surface→DXGI texture 解包已接入；视频播放中切换声音开关会停止并从 mpv 当前位置重建 FFmpeg 声音会话；视频画面启动不再因独立 PortAudio 设备失败而回滚；音频计划与输出采样率不一致时在启动前 fail-closed；RTMP 无音频停止路径已修正为只释放实际取得的音频串行锁；App 测试程序集已固化串行执行，消除共享 WPF Dispatcher/真实 mpv 资源的并行竞态。GPU83 原生 Win32 窗口和实际 `FinalEffectWindow` 最终像素均已通过显式夹具；本轮又将 C# 最终效果窗对齐 Rust `final-effect` 的黑色视频纯画布样式，删除 Footer、浮层、等待文字和重复播放控制，保留同一视频子 HWND、WGC 顶层 HWND、单实例及主窗口控制边界。目标显卡矩阵、真实声卡稳定性、过载重建、远端输出与人工页面验收仍待验收
 - 本轮并行增量：`MediaPoolOwner.ReplaceAll` 已修复为仅按替换后池长度校验，`Append` 继续按旧池加新候选限制 100 项；C# 通用 D3D11 硬件工厂已使用 `BgraSupport | VideoSupport`，与 Rust WGC 视频处理能力声明对齐；WGC surface→DXGI texture 解包和实际 WPF GPU83 最终像素闭环已通过显式夹具；声音启动现在必须在有界预算内产生首批 PCM，最终 PCM 总线的 RTMP 分支不再反向阻塞本机声音；主窗口真实导入、运行包失败保留旧池、未授权导入和真实 EOF 自动换源已补齐边界证据；mpv IPC 断开时控制器不再误报播放中，停止失败会向上返回；RTMP 启动失败、Pump/Producer 失败和停止超时均保留真实失败状态与可重试资源；底部主导入按钮恢复可见，mpv `glsl-shader-opts` 字符串回读按固定键集合兼容；复审并撤回未形成闭环的 RTMP stdout 进度草稿，修正无音频停止时的 `_audioSerial` 释放条件；生成音频快照的正式频域字段已进入 FFmpeg `-af`，CPU4 动态更新已与启动滤镜使用固定标签，视频声音会话在首次输出失败后可随暂停/恢复从 mpv 位置有界重试；App 测试程序集已加入串行门禁，保护共享 WPF Dispatcher、环境变量和真实 mpv 窗口资源；`导入列表` 已接入版本化 JSON 本地路径列表，成功后复用既有 FFprobe 与 `ReplaceAll` 原子提交；导入探测与原子提交现在持有共享播放命令串行门，关闭最终效果窗口复用统一输出停止路径，RTMP 共享最终 PCM 总线按实际声道数构造解码、混音和分流链；C# 启动入口新增用户本地文件句柄单实例门禁，实测第二次启动立即退出且进程数保持为 1。以上只修改 C# 代码、测试和专项文档，未改变登录门禁、媒体原子提交、WARP 禁止或目标 GPU/下游发布门禁边界。
 - 实施端：`desktop-csharp-windows`（C# / WPF / Windows）
 - 只读参考端：`desktop`（Rust / Tauri）；本长任务禁止修改 Rust/Tauri 源码、依赖、锁文件、生成物和测试产物
@@ -635,3 +635,10 @@ Rust/Tauri App
 - `MainWindow.MediaPool.SetMediaMutationButtonsEnabled` 在 WPF `ItemsSource` 尚未完成绑定的短暂窗口内，使用已验证范围内的 `MediaPoolService` 当前源索引作为按钮投影回退；对快照索引做池长度边界检查，避免陈旧索引越界。列表绑定完成后仍以用户实际选择为准，不改变播放池、排序或播放状态。
 - `WindowsRtmpAudioSession.StartAsync` 不再把“分流泵任务已创建”当作声音启动成功；启动后在 3 秒有界预算内等待 `ForwardedFrames > 0`，泵错误、无 PCM 或取消都会返回稳定失败并执行有界停止，避免 UI 误报 RTMP 声音已消费。
 - 新增/强化媒体池忙碌态与首帧门禁回归证据；Windows 全量 `226/226`、受影响目标测试 `28/28`、`dotnet format --verify-no-changes --no-restore` 和本机 Release x64 构建 `0` 警告/`0` 错误通过。未修改 Rust、未新增依赖或播放器；真实声卡、远端 ZLMediaKit/RTMPS、人工页面、AkVirtualCamera 下游、目标 GPU 矩阵和长稳仍待验收。
+
+### v1.79 C# 最终效果窗口对齐 Rust 视频纯画布（2026-09-05）
+
+- 对照 Rust `desktop/ui/src/App.tsx` 的 `FinalEffectWindow`，删除 C# `FinalEffectWindow` 的底部 Footer、左上角表面标签、等待播放文字及弹窗内播放/停止/进度/身份/关闭控件；最终效果窗客户区只保留黑色画布和视频/纯音频表面。
+- C# 窗口标题改为 `GpAutoLive 最终效果`，默认客户区 `1280×720`、最小 `320×180`，保留原生标题栏、可调整大小、居中、单实例和主窗口播放控制。
+- 删除只服务于 Footer 的 `FinalEffectPlaybackCommand`、`CommandRequested` 和进度/身份投影，保留 `ReservedVideoSurface` 子 HWND 与 WGC 顶层 HWND 的双句柄边界；只修改 C# 代码、测试和文档，不修改 Rust/Tauri。
+- WPF 回归测试覆盖纯画布无控件、Rust 对齐尺寸/标题及 F11 往返；真实 WGC 可见帧、人工页面、真实声卡、远端输出和长稳仍按总计划单独验收。

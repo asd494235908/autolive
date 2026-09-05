@@ -114,7 +114,6 @@ public partial class MainWindow : Window
         _douyinProbeHost.SnapshotChanged += DouyinProbeHost_SnapshotChanged;
         _rtmpOutputManager.SnapshotChanged += RtmpOutputManager_SnapshotChanged;
         _finalEffectController.StateChanged += FinalEffectController_StateChanged;
-        _finalEffectController.CommandRequested += FinalEffectController_CommandRequested;
         _state.ApplyMediaSnapshot(_mediaPool.Snapshot);
         // Keep the media assembly cold on the login shell. Resource probing is deferred until
         // the authorized workbench is actually entered, matching the startup memory budget.
@@ -179,7 +178,6 @@ public partial class MainWindow : Window
         _login.PropertyChanged -= Login_PropertyChanged;
         _state.PropertyChanged -= ShellState_PropertyChanged;
         _finalEffectController.StateChanged -= FinalEffectController_StateChanged;
-        _finalEffectController.CommandRequested -= FinalEffectController_CommandRequested;
         _finalEffectWindow?.Close();
         _finalEffectWindow = null;
         _settingsWindow?.Close();
@@ -465,18 +463,6 @@ public partial class MainWindow : Window
             _ = StopMicrophoneAsync();
             _ = RunPlaybackCommandAsync(StopVirtualCameraCoreAsync);
             StopDouyinSession();
-        }
-    }
-
-    private void FinalEffectController_CommandRequested(object? sender, FinalEffectCommandRequestedEventArgs e)
-    {
-        if (e.Command is FinalEffectPlaybackCommand.TogglePlayPause)
-        {
-            _ = TogglePlaybackAsync();
-        }
-        else
-        {
-            _ = StopPlaybackAsync();
         }
     }
 

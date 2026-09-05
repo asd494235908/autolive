@@ -1760,3 +1760,10 @@ v8 启动冒烟在设置 `DOTNET_ROOT`/`DOTNET_ROOT_X64` 指向本地 .NET 10 �
 - `MediaPoolOwner.ResumePlayback` 与 Rust `PlaybackCore::resume` 对齐，只允许 `Ready/Paused → Playing`；`Stopped` 保留为停止终态，重新播放必须调用 `StartPlayback`，并且失败的恢复操作保持原快照不变。
 - `MainWindow` 只有在 Core 状态为 `Playing/Paused`、当前媒体身份一致且 mpv 运行态有效时才复用 `TogglePauseAsync`；`Ready/Stopped` 不再根据进程存活猜测恢复，而是沿用登录、运行包、FFprobe、首帧和单一 mpv 会话门禁进入启动路径。
 - 本轮不新增播放器、抽象或依赖，不修改 Rust；Core 状态测试 `16/16` 通过。App/WPF 人工导入、暂停/恢复/停止和 EOF 换源、真实声卡及长稳仍需独立验收。
+
+## 172. C# 最终效果窗口对齐 Rust 视频纯画布（2026-09-05）
+
+- 对照 Rust `desktop/ui/src/App.tsx` 的 `FinalEffectWindow`，删除 C# `FinalEffectWindow` 的底部 Footer、状态浮层、等待播放文字及弹窗内播放/停止/进度/身份/关闭控件；最终效果窗客户区只保留黑色画布和视频/纯音频表面。
+- C# 窗口标题改为 `GpAutoLive 最终效果`，默认客户区 `1280×720`、最小 `320×180`，保留原生标题栏、可调整大小、居中、单实例和主窗口播放控制。
+- 删除只服务于 Footer 的 `FinalEffectPlaybackCommand`、`CommandRequested` 和进度/身份投影，保留 `ReservedVideoSurface` 子 HWND 与 WGC 顶层 HWND 的双句柄边界；不修改 Rust/Tauri。
+- 新增/调整 WPF 回归测试覆盖纯画布无控件、Rust 对齐尺寸/标题及 F11 往返；自动化构建、真实 WGC 可见帧、人工页面和长稳按总计划单独验收。

@@ -77,35 +77,19 @@ public partial class FinalEffectWindow : Window
 
     private void ApplySnapshot(FinalEffectSnapshot snapshot)
     {
-        Footer.Visibility = Visibility.Visible;
         VideoSurface.Visibility = snapshot.SurfaceKind is FinalEffectSurfaceKind.VideoHwndReserved
             ? Visibility.Visible
             : Visibility.Collapsed;
-        AudioSurface.Visibility = snapshot.IsPureAudio ? Visibility.Visible : Visibility.Collapsed;
-        EmptySurface.Visibility = snapshot.HasMedia ? Visibility.Collapsed : Visibility.Visible;
-        SurfaceModeText.Text = snapshot.SurfaceLabel;
-        PlaybackStateText.Text = snapshot.PlaybackLabel;
-        PlaybackProgress.Value = snapshot.Progress;
-        IdentityText.Text = $"会话 {snapshot.PlaybackGeneration} · 源 {snapshot.SourceRevision} · 循环 {snapshot.LoopIndex}";
-        PlayPauseButton.IsEnabled = snapshot.HasMedia;
-        StopButton.IsEnabled = snapshot.HasMedia;
+        AudioSurface.Visibility = snapshot.SurfaceKind is FinalEffectSurfaceKind.AudioBlack
+            ? Visibility.Visible
+            : Visibility.Collapsed;
     }
 
     private void RefreshPresentationLayout()
     {
-        Footer.Visibility = Visibility.Visible;
-        Footer.IsHitTestVisible = true;
         UpdateLayout();
         VideoSurface.UpdateLayout();
     }
-
-    private void PlayPauseButton_Click(object sender, RoutedEventArgs e) =>
-        _controller.RequestCommand(FinalEffectPlaybackCommand.TogglePlayPause);
-
-    private void StopButton_Click(object sender, RoutedEventArgs e) =>
-        _controller.RequestCommand(FinalEffectPlaybackCommand.Stop);
-
-    private void CloseButton_Click(object sender, RoutedEventArgs e) => Close();
 
     private void Window_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {

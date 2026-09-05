@@ -18,18 +18,19 @@
 
 ## 最终效果弹窗呈现契约（2026-09-05）
 
-本弹窗是同一 C# 进程内的唯一最终效果窗口，不是第二个桌面端实例，也不创建第二个视频渲染表面。默认非全屏和 F11 全屏都保留底部信息栏：
+本弹窗对齐 Rust/Tauri `final-effect` 页面：它是同一 C# 进程内的唯一最终效果窗口，不是第二个桌面端实例，也不创建第二个视频渲染表面。客户区只保留黑色画布和媒体表面：
 
-- 视频/纯音频/空池表面位于上方内容行；底部信息栏独立占用固定高度，显示播放/暂停、停止、关闭、播放状态、进度和脱敏的“会话/源/循环”信息。
-- 全屏只切换同一窗口的 `WindowStyle`、`ResizeMode` 和 `WindowState`；进入、退出全屏后都会重新布局信息栏和视频预留表面，因此信息不因样式切换消失。
+- 视频使用 `ReservedVideoSurface`，纯音频使用黑色表面，空池保持纯黑；不显示等待文字、表面状态浮层或任何底部信息栏。
+- 删除 Footer 的播放/暂停、停止、进度、会话/源/循环信息和关闭按钮；播放控制仍由主窗口负责，窗口关闭使用原生标题栏关闭按钮。
+- 标题为 `GpAutoLive 最终效果`，默认客户区为 `1280×720`，最小尺寸为 `320×180`，可调整大小并居中，和 Rust 运行时创建窗口一致。
+- 全屏只切换同一窗口的 `WindowStyle`、`ResizeMode` 和 `WindowState`；`Loaded`、F11 往返和顶层 HWND 查询仍刷新视频预留表面布局。
 - `ReservedVideoSurface` 继续承载 mpv 子 HWND；Windows Graphics Capture 继续绑定最终效果窗口的顶层 HWND。两者不互换、不创建覆盖层窗口。
-- 弹窗按钮只向 `FinalEffectWindowController` 发出 `TogglePlayPause`/`Stop`，再由既有 `MainWindow` `CommandRequested` 编排转发到播放命令串行闸门；弹窗不直接启动或停止媒体进程。
 
 ### 生命周期审计结论
 
-原 XAML 虽有 footer 行，但没有明确的 footer 名称和呈现生命周期重申点；`HwndHost` 的原生子窗口还受 WPF airspace 规则约束，视频内容行内的 WPF 覆盖文字不能作为稳定信息层。现实现通过 `Loaded`、全屏往返和顶层 HWND 查询统一执行布局刷新，并显式保持独立 footer 可见、可交互；信息层不覆盖 mpv 子 HWND。
+本轮移除了只服务于 Footer 的按钮事件、播放命令事件和进度/身份投影字段，`FinalEffectWindowController` 仅保留窗口开关与表面类型投影。WPF airspace 下的原生视频宿主仍由独立 `ReservedVideoSurface` 承载，C# 不能因删除可见控件而删除 HWND 宿主或顶层窗口绑定。
 
-自动化覆盖：离屏 WPF 布局验证默认/全屏往返的 footer、按钮、状态、进度和脱敏会话投影；真实 Button.Click 验证命令转发；既有 WGC 测试继续负责实机顶层 HWND 绑定门禁。
+自动化覆盖：WPF 回归测试验证 Rust 对齐的标题/尺寸、视频纯画布无 Footer/覆盖文字、F11 往返和子 HWND/顶层 HWND 合同；既有 WGC 测试继续负责真实顶层 HWND 绑定门禁。
 
 ## 方法清单
 
@@ -63,4 +64,4 @@
 git diff --check
 ```
 
-结果：App Release x64 独立构建 **0 警告/0 错误**；App 测试 **36/36 通过**；`dotnet format --verify-no-changes` 和 `git diff --check` 通过。当前 `GpAutoLive` PID 19612 未停止。
+本轮样式收口后，FinalEffectWindowController 目标测试 **3/3 通过**；视频纯画布/标题尺寸与 F11 往返测试分别 **1/1、1/1 通过**；关窗后句柄拒绝测试 **1/1**。独立 WGC 启停测试在当前 WPF 测试宿主中未取得最终效果窗顶层 HWND（`0x0`），因而未计为通过；该测试仍使用无 Owner 的非生产构造路径，生产路径的 `Owner=MainWindow` 和真实页面需单独验收。App Release x64 构建 **0 警告/0 错误**，`dotnet format --verify-no-changes` 和 `git diff --check` 通过。自动化环境未进行人工页面点击，不能以这些结果替代真实视频播放、声卡、WGC 下游和多屏/DPI 验收。

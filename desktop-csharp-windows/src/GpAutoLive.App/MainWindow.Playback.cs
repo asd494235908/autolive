@@ -1542,29 +1542,7 @@ public partial class MainWindow
         var surfaceKind = source.MediaKind is MediaKind.Video
             ? FinalEffectSurfaceKind.VideoHwndReserved
             : FinalEffectSurfaceKind.AudioBlack;
-        var duration = TimeSpan.Zero;
-        if (source.DurationMs is ulong durationMs)
-        {
-            var maxMilliseconds = (ulong)(TimeSpan.MaxValue.Ticks / TimeSpan.TicksPerMillisecond);
-            var boundedMilliseconds = Math.Min(durationMs, maxMilliseconds);
-            duration = TimeSpan.FromTicks((long)(boundedMilliseconds * (ulong)TimeSpan.TicksPerMillisecond));
-        }
-        var positionMs = _projectedPositionIdentity == _mediaPool.CurrentIdentity
-            ? _projectedPositionMs
-            : null;
-        var position = positionMs is ulong boundedPositionMs
-            ? TimeSpan.FromMilliseconds(Math.Min(
-                boundedPositionMs,
-                (ulong)(TimeSpan.MaxValue.Ticks / TimeSpan.TicksPerMillisecond)))
-            : TimeSpan.Zero;
-        return FinalEffectSnapshot.Create(
-            snapshot.PlaybackState,
-            surfaceKind,
-            position,
-            duration,
-            snapshot.PlaybackGeneration,
-            snapshot.SourceRevision,
-            snapshot.LoopIndex);
+        return FinalEffectSnapshot.Create(surfaceKind);
     }
 
     private void ProjectVideoPlaybackPosition(
