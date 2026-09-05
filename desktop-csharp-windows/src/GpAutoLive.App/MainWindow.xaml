@@ -1715,8 +1715,14 @@
                 </CheckBox>
                 <StackPanel Grid.Column="9" Margin="16,0,0,0" Orientation="Horizontal" VerticalAlignment="Center">
                     <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Text="音量" />
-                    <Slider Width="120" Maximum="100" Value="80" AutomationProperties.Name="输出音量" />
-                    <TextBlock Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource TextBrush}" FontSize="10" Text="80%" />
+                    <Slider x:Name="OutputVolumeSlider"
+                            Width="120"
+                            Maximum="100"
+                            Value="80"
+                            AutomationProperties.Name="输出音量"
+                            ToolTip="实时作用于本机 PortAudio 和 RTMP PCM 总线"
+                            ValueChanged="OutputVolumeSlider_ValueChanged" />
+                    <TextBlock x:Name="OutputVolumeText" Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource TextBrush}" FontSize="10" Text="80%" />
                 </StackPanel>
             </Grid>
         </Border>

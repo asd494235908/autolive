@@ -16,6 +16,21 @@
 - 视频 `time-pos` 仍只投影到当前匹配身份；seek 仍调用 `WindowsMpvPlaybackController.SeekAsync`，不在 UI 拼接 IPC 或命令行。
 - 纯音频的 FFmpeg→PortAudio 会话、插话混音、RTMP/虚拟摄像头/抖音和窗口生命周期仍保持各自 partial/主窗口边界，不引入第二份控制器或配置状态。
 
+## 最终效果弹窗呈现契约（2026-09-05）
+
+本弹窗是同一 C# 进程内的唯一最终效果窗口，不是第二个桌面端实例，也不创建第二个视频渲染表面。默认非全屏和 F11 全屏都保留底部信息栏：
+
+- 视频/纯音频/空池表面位于上方内容行；底部信息栏独立占用固定高度，显示播放/暂停、停止、关闭、播放状态、进度和脱敏的“会话/源/循环”信息。
+- 全屏只切换同一窗口的 `WindowStyle`、`ResizeMode` 和 `WindowState`；进入、退出全屏后都会重新布局信息栏和视频预留表面，因此信息不因样式切换消失。
+- `ReservedVideoSurface` 继续承载 mpv 子 HWND；Windows Graphics Capture 继续绑定最终效果窗口的顶层 HWND。两者不互换、不创建覆盖层窗口。
+- 弹窗按钮只向 `FinalEffectWindowController` 发出 `TogglePlayPause`/`Stop`，再由既有 `MainWindow` `CommandRequested` 编排转发到播放命令串行闸门；弹窗不直接启动或停止媒体进程。
+
+### 生命周期审计结论
+
+原 XAML 虽有 footer 行，但没有明确的 footer 名称和呈现生命周期重申点；`HwndHost` 的原生子窗口还受 WPF airspace 规则约束，视频内容行内的 WPF 覆盖文字不能作为稳定信息层。现实现通过 `Loaded`、全屏往返和顶层 HWND 查询统一执行布局刷新，并显式保持独立 footer 可见、可交互；信息层不覆盖 mpv 子 HWND。
+
+自动化覆盖：离屏 WPF 布局验证默认/全屏往返的 footer、按钮、状态、进度和脱敏会话投影；真实 Button.Click 验证命令转发；既有 WGC 测试继续负责实机顶层 HWND 绑定门禁。
+
 ## 方法清单
 
 `MainWindow.Playback.cs` 当前承载：

@@ -35,7 +35,7 @@ public partial class FinalEffectWindow : Window
     /// </summary>
     public bool TryGetCaptureWindowHandle(out uint handle)
     {
-        UpdateLayout();
+        RefreshPresentationLayout();
         return TryGetReadyHandle(new WindowInteropHelper(this).Handle, out handle);
     }
 
@@ -51,6 +51,7 @@ public partial class FinalEffectWindow : Window
             ResizeMode = ResizeMode.NoResize;
             WindowState = WindowState.Maximized;
             IsFullscreen = true;
+            RefreshPresentationLayout();
             return;
         }
 
@@ -58,7 +59,10 @@ public partial class FinalEffectWindow : Window
         ResizeMode = _fullscreenPreviousResizeMode;
         WindowStyle = _fullscreenPreviousStyle;
         IsFullscreen = false;
+        RefreshPresentationLayout();
     }
+
+    private void Window_Loaded(object sender, RoutedEventArgs e) => RefreshPresentationLayout();
 
     private void Controller_StateChanged(object? sender, EventArgs e)
     {
@@ -73,6 +77,7 @@ public partial class FinalEffectWindow : Window
 
     private void ApplySnapshot(FinalEffectSnapshot snapshot)
     {
+        Footer.Visibility = Visibility.Visible;
         VideoSurface.Visibility = snapshot.SurfaceKind is FinalEffectSurfaceKind.VideoHwndReserved
             ? Visibility.Visible
             : Visibility.Collapsed;
@@ -84,6 +89,14 @@ public partial class FinalEffectWindow : Window
         IdentityText.Text = $"会话 {snapshot.PlaybackGeneration} · 源 {snapshot.SourceRevision} · 循环 {snapshot.LoopIndex}";
         PlayPauseButton.IsEnabled = snapshot.HasMedia;
         StopButton.IsEnabled = snapshot.HasMedia;
+    }
+
+    private void RefreshPresentationLayout()
+    {
+        Footer.Visibility = Visibility.Visible;
+        Footer.IsHitTestVisible = true;
+        UpdateLayout();
+        VideoSurface.UpdateLayout();
     }
 
     private void PlayPauseButton_Click(object sender, RoutedEventArgs e) =>

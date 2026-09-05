@@ -15,6 +15,7 @@ public sealed class ShellState : INotifyPropertyChanged
     private IReadOnlyList<MediaListItemViewModel> _mediaItems = EmptyMediaItems;
     private bool _videoProcessing = true;
     private bool _audioProcessing = true;
+    private long _audioProcessingRevision;
     private double _playbackProgress;
     private string _statusMessage = "就绪 · C# Windows 壳";
     private GeneratedVideoEffectSnapshot _videoParameterSnapshot = GeneratedVideoEffectSnapshot.Create();
@@ -148,11 +149,15 @@ public sealed class ShellState : INotifyPropertyChanged
             }
 
             _audioProcessing = value;
+            _audioProcessingRevision++;
             OnPropertyChanged();
             OnPropertyChanged(nameof(AudioProcessingLabel));
             StatusMessage = value ? "声音处理已开启（壳状态）" : "声音处理已关闭（壳状态）";
         }
     }
+
+    /// <summary>声音处理开关每次实际变化的单调版本，供异步重配置拒绝过期请求。</summary>
+    public long AudioProcessingRevision => _audioProcessingRevision;
 
     public double PlaybackProgress
     {

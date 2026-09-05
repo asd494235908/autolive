@@ -2,6 +2,8 @@
 
 更新时间：2026-09-05
 
+> 2026-09-05 声音与最终效果窗口修复：底部输出音量滑块已从静态占位接入现有最终 PCM 混音策略，0～100% 映射为有限 dB 增益，实时作用于本机 PortAudio 与 RTMP 分支；声音处理开关新增单调版本号，异步重建期间再次切换会拒绝过期请求，避免旧声音会话覆盖新状态。最终效果窗口底栏固定在独立布局行，默认/全屏往返都会刷新布局并保持播放/暂停、停止、关闭、状态、进度和脱敏会话信息可见；mpv 仍绑定视频子 HWND，WGC 仍绑定窗口顶层 HWND。Media 音频混音测试 `134/134`、FinalEffect/声音状态目标测试 `10/10`、Release x64 构建 `0` 警告/`0` 错误、格式检查通过；真实声卡和人工页面点击仍待验收，真实 FFmpeg/PortAudio 声音切换夹具因当前环境缺少对应变量而跳过。
+
 ## 当前结论
 
 工程仍处于“实施中”，不是正式发布完成。C0/C1/C2 已完成；C3～C7 的核心代码边界、WPF 工作台和发布骨架已接入，有限音频项的 N/N+1 预载、单一 PortAudio 输出切换、声音周期候选和基于 PortAudio callback `timeInfo` 的可听时钟投影已有代码/夹具证据，WPF 也已在完整 shader 哈希匹配时选择 GPU83、旧资源包保持 CPU4；FFprobe 对封面图视频流和无效平均帧率的导入边界已与 Rust 对齐，媒体池的真实编辑控件与底部主导入入口已恢复可见，顶栏与底部导入入口已接入同一忙碌态投影。但真实设备、网络、签名、安装和长稳门禁尚未全部通过。2026-09-03 已确认两张 v2 设计稿为授权态主工作台的正式 UI 实施基准；首屏与下滑态的静态网格、视频/声音只读快照和连续滚动结构已接入，下滑续页的数据所有者和真实运行时生效回显仍未完成。
@@ -263,6 +265,8 @@
 > v1.71（2026-09-05）C# Rust 对齐的自动视频周期参数接线：`GeneratedVideoEffectSnapshot` 保留旧 UI 投影和未接入字段语义，同时生成正式 `VideoEffectParams` 与 `AdvancedEffectParams`；生成规则对齐 Rust `sample_automatic_video_parameters` 的已验证范围。`MainWindow.Effects` 的完整 GPU83 路径传入当前周期高级参数，不再固定传 `AdvancedEffectParams.Default`；CPU4 仍只消费亮度、对比度、饱和度和色相四项。新增映射测试；App 全量串行测试 `74/74`、本机 Release x64 构建和格式检查通过。目标显卡矩阵、真实声卡、远端输出、下游虚拟摄像头和人工页面仍未验收；Rust 只读。
 
 > v1.72（2026-09-05）C# 媒体拖放与音频启动计划边界收口：`MediaDropPayload.HasCandidateFiles` 复用现有媒体扩展名白名单，预览阶段拒绝空路径、目录形态、不支持扩展名和超限候选，不触碰文件 I/O；真实 FFprobe 探测、原子入池和旧池保护仍由 `MediaImportCoordinator` 负责。`WindowsAudioPlaybackController.StartAsync` 在创建输出前校验计划声道与输出采样率，不一致返回 `invalid_plan`，避免声音开关状态与实际输出链路分叉。Windows 全量 `223/223`、Media 全量 `131/131`、App 全量串行 `79/79`，拖放边界 `7/7`、音频控制器边界 `14/14`，格式检查、本机 x64 Release 构建和显式 WPF GPU83 最终表面像素夹具均通过；真实声卡、远端输出、下游虚拟摄像头、人工页面和长稳仍待验收，Rust 只读。
+
+> 2026-09-05 声音开关异步竞态修复：`ShellState.AudioProcessing` 增加仅用于异步重配置判定的单调版本；`MainWindow.Effects` 在读取视频位置、停止旧会话、启动新 FFmpeg/PortAudio 会话、暂停同步和候选准备的边界拒绝过期请求。连续切换时旧请求不会用最新值误启动错误滤镜，已启动的过期会话会沿现有停止/Join 路径收尾，队列中的最新开关继续完成重配置；纯音频与视频音频仍共用一个 `WindowsAudioPlaybackController` 和一个 PortAudio 输出链。失败先行的版本测试、纯音频切换和视频切换测试 `3/3` 通过；Windows 音频专项筛选 `58/58` 通过。真实声卡听感、设备拔插/睡眠恢复、RTMP 远端和 30 分钟长稳仍未验收，未修改 Rust 或弹窗 Features/Playback 文件。
 > 2026-09-05 RTMP 最终 PCM 首帧门禁：`WindowsRtmpAudioSession.StartAsync` 现在必须在有界 3 秒预算内观察到分流泵已向 FFmpeg 转发至少一帧最终 PCM，才返回成功；泵失败或无首帧会停止会话并返回 `PumpFailed`，避免 UI 将“泵已启动”误报为“声音已消费”。共享总线无生产者的测试夹具已改为显式提供单声道 PCM；真实 ZLMediaKit、声卡和网络稳定性仍待验收。
 
 > 2026-09-05 C# 音频字段消费边界复核：`FfmpegAudioFilterBuilder` 已将音高微移调整到播放速度之前，与 Rust 音频链保持一致；高频扰动的开关、间隔、强度和目标电平继续经 `AudioEffectParams` 进入同一受管 FFmpeg `-af`。`DynamicRangeDb`、`Compression`、`Tone` 没有正式 C# 参数与算法对应，继续只读展示/未接入，不使用近似压缩或 EQ 冒充生效。失败先行顺序测试修复后通过；本轮不修改 App 快照、Rust、播放器、线程或队列。

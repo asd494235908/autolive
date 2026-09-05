@@ -564,6 +564,7 @@ public partial class MainWindow : Window
     {
         var priority = _audioPriority.Snapshot;
         return new(
+            BaseGainDb: GetOutputVolumeGainDb(),
             BaseDuckingDb: priority.MediaDucked ? _interludeConfig.DuckingDepthDb : 0,
             MuteBase: priority.MediaMuted,
             OverlayGainDb: priority.InterludeMuted ? -120 : _interludeConfig.VolumeDb);

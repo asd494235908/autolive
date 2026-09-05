@@ -73,7 +73,11 @@ public partial class MainWindow
             .ConfigureAwait(true);
         var audioReconfigured = !string.IsNullOrWhiteSpace(source.AudioCodecName)
             && result.IsSuccess
-            && await ReconfigureVideoAudioAsync(source, identity).ConfigureAwait(true);
+            && await ReconfigureVideoAudioAsync(
+                    source,
+                    identity,
+                    _state.AudioProcessingRevision)
+                .ConfigureAwait(true);
         _finalEffectController.Update(CreateFinalEffectSnapshot());
         if (!result.IsSuccess || (!string.IsNullOrWhiteSpace(source.AudioCodecName) && !audioReconfigured))
         {
@@ -96,6 +100,7 @@ public partial class MainWindow
 
     private async Task ApplyAudioProcessingAsync()
     {
+        var audioProcessingRevision = _state.AudioProcessingRevision;
         var snapshot = _mediaPool.Snapshot;
         if (snapshot.SourceMediaPool.IsEmpty)
         {
@@ -112,7 +117,11 @@ public partial class MainWindow
         var source = snapshot.SourceMediaPool[snapshot.SourceMediaIndex];
         if (source.MediaKind is MediaKind.Video)
         {
-            await ReconfigureVideoAudioAsync(source, _mediaPool.CurrentIdentity).ConfigureAwait(true);
+            await ReconfigureVideoAudioAsync(
+                    source,
+                    _mediaPool.CurrentIdentity,
+                    audioProcessingRevision)
+                .ConfigureAwait(true);
             return;
         }
 
@@ -122,8 +131,20 @@ public partial class MainWindow
         {
             sourceStartMs = Math.Min(sourceStartMs, durationMs - 1);
         }
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            ReportStaleAudioProcessingRequest();
+            return;
+        }
+
         if (!await StopVideoAudioForTransitionAsync().ConfigureAwait(true))
         {
+            return;
+        }
+
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            ReportStaleAudioProcessingRequest();
             return;
         }
 
@@ -132,6 +153,16 @@ public partial class MainWindow
         {
             var stopped = _mediaPool.StopPlayback();
             ApplyMediaOperation(stopped, started.Error?.Message ?? "声音处理重启失败");
+            return;
+        }
+
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            if (await StopStaleAudioProcessingSessionAsync().ConfigureAwait(true))
+            {
+                ReportStaleAudioProcessingRequest();
+            }
+
             return;
         }
 
@@ -152,8 +183,28 @@ public partial class MainWindow
             }
         }
 
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            if (await StopStaleAudioProcessingSessionAsync().ConfigureAwait(true))
+            {
+                ReportStaleAudioProcessingRequest();
+            }
+
+            return;
+        }
+
         StartAudioCompletionWatcher(identity);
         await PrepareNextAudioCandidateAsync(identity).ConfigureAwait(true);
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            if (await StopVideoAudioForTransitionAsync().ConfigureAwait(true))
+            {
+                ReportStaleAudioProcessingRequest();
+            }
+
+            return;
+        }
+
         AudioDeviceStatusText.Text = _state.AudioProcessing
             ? "声音处理已应用 · FFmpeg 音频滤镜"
             : "声音处理已关闭 · 已恢复原始 PCM";
@@ -162,7 +213,8 @@ public partial class MainWindow
 
     private async Task<bool> ReconfigureVideoAudioAsync(
         SourceMediaDto source,
-        MediaPlaybackIdentity? identity)
+        MediaPlaybackIdentity? identity,
+        long audioProcessingRevision)
     {
         if (identity is null)
         {
@@ -178,9 +230,21 @@ public partial class MainWindow
             return false;
         }
 
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            ReportStaleAudioProcessingRequest();
+            return false;
+        }
+
         var wasPaused = _mediaPool.Snapshot.PlaybackState is PlaybackState.Paused;
         if (!await StopVideoAudioForTransitionAsync().ConfigureAwait(true))
         {
+            return false;
+        }
+
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            ReportStaleAudioProcessingRequest();
             return false;
         }
 
@@ -190,6 +254,16 @@ public partial class MainWindow
         {
             AudioDeviceStatusText.Text = "视频画面继续运行 · 新声音会话未启动";
             _state.SetStatus(started.Error?.Message ?? "视频声音处理重启失败；视频画面仍在播放");
+            return false;
+        }
+
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            if (await StopStaleAudioProcessingSessionAsync().ConfigureAwait(true))
+            {
+                ReportStaleAudioProcessingRequest();
+            }
+
             return false;
         }
 
@@ -205,11 +279,40 @@ public partial class MainWindow
             }
         }
 
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            if (await StopStaleAudioProcessingSessionAsync().ConfigureAwait(true))
+            {
+                ReportStaleAudioProcessingRequest();
+            }
+
+            return false;
+        }
+
         StartAudioCompletionWatcher(identity);
         AudioDeviceStatusText.Text = _state.AudioProcessing
             ? "视频声音处理已应用 · 从当前时间点恢复"
             : "视频声音处理已关闭 · 从当前时间点恢复原始 PCM";
         _state.SetStatus(AudioDeviceStatusText.Text);
+        return true;
+    }
+
+    private bool IsAudioProcessingRequestCurrent(long revision) =>
+        !_isClosing && _state.AudioProcessingRevision == revision;
+
+    private void ReportStaleAudioProcessingRequest() =>
+        _state.SetStatus("声音处理开关已再次变化，已跳过过期声音重建");
+
+    private async Task<bool> StopStaleAudioProcessingSessionAsync()
+    {
+        await StopAudioCompletionWatcherAsync().ConfigureAwait(true);
+        var stopped = await _audioPlaybackController.StopAsync().ConfigureAwait(true);
+        if (!stopped.IsSuccess)
+        {
+            _state.SetStatus(stopped.Error?.Message ?? "过期声音会话停止失败");
+            return false;
+        }
+
         return true;
     }
 
