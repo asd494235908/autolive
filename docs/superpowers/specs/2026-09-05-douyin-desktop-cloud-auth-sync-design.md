@@ -111,6 +111,21 @@ Renderer 永远不直接持有 autoLive Token，也不放宽 Tauri CSP。远程�
 - 同步读取只返回当前用户产品空间；管理员列表和其他产品不能旁路读取正文。
 - 不新增 WebSocket；启动、手动同步和 sidecar 有界周期同步足够满足本期目标。
 
+### 6.4 固定 payload 契约
+
+服务端按 kind 校验以下精确字段；除 `metadata`、`locator` 和人设/策略的 `content` 外不接受额外字段。所有 ID 均是 1～128 字符的安全标识，时间使用 UTC RFC3339，哈希为 64 位小写十六进制：
+
+- `persona_version`：`version`、`content`、`created_at`。
+- `policy_version`：`version`、`score_threshold`、`minimum_confidence`、`daily_send_quota`、`automation_level`、`auto_send_enabled`、`content`、`created_at`。
+- `model_config`：`retrieval_mode`、`chat_base_url`、`chat_model`、`embedding_base_url`、`embedding_model`、`embedding_dimensions`、`config_version`、`updated_at`；明确禁止两个 `*_api_key_ref` 字段。
+- `knowledge_source`：`source_type`、`title`、`original_name`、`source_key`、`content_hash`、`status`、`created_at`、`updated_at`；不含本机 `stored_path`。
+- `knowledge_document`：`source_id`、`version`、`content_hash`、`parser_version`、`chunker_version`、`status`、`metadata`、`created_at`；不含本机 `stored_path`、embedding 和索引运行态。
+- `knowledge_chunk`：`document_id`、`ordinal`、`text`、`locator`、`chunker_version`、`enabled`、`created_at`。
+- `knowledge_rule`：`document_id`、`condition_kind`、`condition_text`、`reply_guidance`、`literal_terms`、`record_ids`、`rule_fingerprint`、`status`、`created_at`、`updated_at`。
+- `memory`：`reusable_situation`、`response_pattern`、`tags`、`exclusions`、`confidence`、`revision`、`expires_at`、`lifecycle_state`、`created_at`、`updated_at`、`cloud_source_ref`；不含本地账号 ID、反馈/回复/评论/任务 ID、命中统计和向量状态。
+
+单项序列化后最多 256 KiB；`knowledge_chunk.text` 最多 64 KiB，其余字符串沿用本地领域上限且不得超过 4 KiB。`metadata`、`locator`、`content` 深度最多 8 层、总键数最多 200。服务端拒绝大小写及连接符归一化后包含 `cookie`、`password`、`private`、`api_key`、`token`、`ticket`、`credential_ref` 的任意嵌套键。
+
 ## 7. 本地同步算法
 
 本地新增同步状态表，只记录 `(kind,item_id)` 的云 revision、上次同步内容哈希和结果；不复制 Token。
