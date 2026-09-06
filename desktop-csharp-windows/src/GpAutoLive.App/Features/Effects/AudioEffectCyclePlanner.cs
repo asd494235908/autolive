@@ -1,4 +1,5 @@
 using GpAutoLive.Core;
+using GpAutoLive.Core.Configuration;
 
 namespace GpAutoLive.App.Features.Effects;
 
@@ -14,12 +15,44 @@ public enum AudioEffectCycleAction
 /// </summary>
 public sealed class AudioEffectCyclePlanner
 {
-    public const ulong CyclePeriodMs = 4_000;
     public const ulong PrepareLeadMs = 1_000;
 
+    private readonly Random _random;
+    private ulong _periodMinMs = EffectCycleSettings.Default.AudioPeriodMinMs;
+    private ulong _periodMaxMs = EffectCycleSettings.Default.AudioPeriodMaxMs;
     private MediaPlaybackIdentity? _identity;
+    private ulong? _cycleStartMs;
     private ulong? _targetPositionMs;
+    private ulong? _currentPeriodMs;
     private bool _prepareRequested;
+
+    public AudioEffectCyclePlanner(Random? random = null) => _random = random ?? Random.Shared;
+
+    public ulong? CurrentCycleStartMs => _cycleStartMs;
+
+    public ulong? CurrentCycleTargetMs => _targetPositionMs;
+
+    public ulong? CurrentPeriodMs => _currentPeriodMs;
+
+    public void Configure(ulong periodMinMs, ulong periodMaxMs)
+    {
+        var normalized = EffectCycleSettings.NormalizeRange(
+            periodMinMs,
+            periodMaxMs,
+            EffectCycleSettings.Default.AudioPeriodMinMs,
+            EffectCycleSettings.Default.AudioPeriodMaxMs);
+        if (_periodMinMs == normalized.Minimum && _periodMaxMs == normalized.Maximum)
+        {
+            return;
+        }
+
+        _periodMinMs = normalized.Minimum;
+        _periodMaxMs = normalized.Maximum;
+        _cycleStartMs = null;
+        _targetPositionMs = null;
+        _currentPeriodMs = null;
+        _prepareRequested = false;
+    }
 
     public AudioEffectCycleAction GetAction(
         MediaPlaybackIdentity? identity,
@@ -40,19 +73,25 @@ public sealed class AudioEffectCyclePlanner
         if (_identity != identity)
         {
             _identity = identity;
+            _cycleStartMs = null;
             _targetPositionMs = null;
+            _currentPeriodMs = null;
             _prepareRequested = false;
         }
 
         if (_targetPositionMs is null)
         {
-            if (ulong.MaxValue - position < CyclePeriodMs
-                || position + CyclePeriodMs >= duration)
+            _currentPeriodMs = NextPeriod();
+            if (ulong.MaxValue - position < _currentPeriodMs.Value
+                || position + _currentPeriodMs.Value >= duration)
             {
+                _cycleStartMs = null;
+                _currentPeriodMs = null;
                 return AudioEffectCycleAction.None;
             }
 
-            _targetPositionMs = position + CyclePeriodMs;
+            _cycleStartMs = position;
+            _targetPositionMs = position + _currentPeriodMs.Value;
         }
 
         targetPositionMs = _targetPositionMs.Value;
@@ -86,15 +125,21 @@ public sealed class AudioEffectCyclePlanner
         }
 
         _prepareRequested = false;
-        _targetPositionMs = ulong.MaxValue - targetPositionMs < CyclePeriodMs
-            ? null
-            : targetPositionMs + CyclePeriodMs;
+        _cycleStartMs = null;
+        _targetPositionMs = null;
+        _currentPeriodMs = null;
     }
 
     public void Reset()
     {
         _identity = null;
+        _cycleStartMs = null;
         _targetPositionMs = null;
+        _currentPeriodMs = null;
         _prepareRequested = false;
     }
+
+    private ulong NextPeriod() => _periodMinMs == _periodMaxMs
+        ? _periodMinMs
+        : (ulong)_random.NextInt64((long)_periodMinMs, checked((long)_periodMaxMs + 1));
 }

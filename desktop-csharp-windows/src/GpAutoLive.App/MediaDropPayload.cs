@@ -48,7 +48,8 @@ public static class MediaDropPayload
 
         for (var index = 0; index < rawPaths.Length; index++)
         {
-            if (string.IsNullOrWhiteSpace(rawPaths[index]))
+            if (string.IsNullOrWhiteSpace(rawPaths[index])
+                || !MediaFormatCatalog.IsSupportedExtension(rawPaths[index]))
             {
                 return false;
             }

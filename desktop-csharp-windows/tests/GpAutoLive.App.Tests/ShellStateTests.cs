@@ -10,6 +10,15 @@ namespace GpAutoLive.App.Tests;
 public sealed class ShellStateTests
 {
     [TestMethod]
+    public void Heartbeat_playback_state_maps_to_server_contract()
+    {
+        Assert.AreEqual("idle", MainWindow.MapHeartbeatPlaybackState(PlaybackState.Ready));
+        Assert.AreEqual("idle", MainWindow.MapHeartbeatPlaybackState(PlaybackState.Stopped));
+        Assert.AreEqual("playing", MainWindow.MapHeartbeatPlaybackState(PlaybackState.Playing));
+        Assert.AreEqual("paused", MainWindow.MapHeartbeatPlaybackState(PlaybackState.Paused));
+    }
+
+    [TestMethod]
     public void Empty_pool_does_not_enter_playing_state()
     {
         var state = new ShellState();
@@ -106,6 +115,21 @@ public sealed class ShellStateTests
         Assert.IsTrue(audio.HighFrequencyPerturbationIntervalMs is >= 8_000 and <= 12_000);
         Assert.IsTrue(audio.HighFrequencyPerturbationStrengthPercent is >= 1 and <= 4);
         Assert.AreEqual(-32d, audio.HighFrequencyPerturbationLevelDb);
+    }
+
+    [TestMethod]
+    public void Generated_video_color_parameters_stay_within_the_automatic_low_perception_range()
+    {
+        for (var seed = 0; seed < 256; seed++)
+        {
+            var video = GeneratedVideoEffectSnapshot.Create(new Random(seed));
+
+            Assert.IsTrue(Math.Round(Math.Abs(video.BrightnessPercent), 3) is >= 0.1 and <= 0.35);
+            Assert.IsTrue(Math.Round(Math.Abs(video.ContrastPercent - 100), 3) is >= 0.1 and <= 0.3);
+            Assert.IsTrue(Math.Round(Math.Abs(video.SaturationPercent - 100), 3) is >= 0.1 and <= 0.3);
+            Assert.IsTrue(Math.Round(Math.Abs(video.HueRotationDegrees), 3) is >= 0.05 and <= 0.2);
+            Assert.IsTrue(video.SharpnessPercent is >= 0.1 and <= 0.4);
+        }
     }
 
     [TestMethod]
@@ -260,6 +284,35 @@ public sealed class ShellStateTests
     }
 
     [TestMethod]
+    [DataRow(null, "等待视频")]
+    [DataRow(GpAutoLive.Media.MpvVideoProcessingMode.Original, "未处理·Original")]
+    [DataRow(GpAutoLive.Media.MpvVideoProcessingMode.Cpu4, "CPU·CPU4")]
+    [DataRow(GpAutoLive.Media.MpvVideoProcessingMode.Gpu83, "GPU·GPU83")]
+    public void Active_video_processing_backend_uses_the_confirmed_runtime_mode(
+        GpAutoLive.Media.MpvVideoProcessingMode? mode,
+        string expected)
+    {
+        Assert.AreEqual(expected, VideoPlaybackModeSelector.DescribeActive(mode));
+    }
+
+    [TestMethod]
+    public void Changing_video_processing_backend_requires_a_new_mpv_session()
+    {
+        Assert.IsFalse(VideoPlaybackModeSelector.RequiresSessionRestart(
+            GpAutoLive.Media.MpvVideoProcessingMode.Cpu4,
+            GpAutoLive.Media.MpvVideoProcessingMode.Cpu4));
+        Assert.IsTrue(VideoPlaybackModeSelector.RequiresSessionRestart(
+            GpAutoLive.Media.MpvVideoProcessingMode.Cpu4,
+            GpAutoLive.Media.MpvVideoProcessingMode.Gpu83));
+        Assert.IsTrue(VideoPlaybackModeSelector.RequiresSessionRestart(
+            GpAutoLive.Media.MpvVideoProcessingMode.Gpu83,
+            GpAutoLive.Media.MpvVideoProcessingMode.Original));
+        Assert.IsTrue(VideoPlaybackModeSelector.RequiresSessionRestart(
+            null,
+            GpAutoLive.Media.MpvVideoProcessingMode.Original));
+    }
+
+    [TestMethod]
     public void Regenerating_parameter_snapshots_only_advances_the_system_generation()
     {
         var state = new ShellState();
@@ -370,6 +423,65 @@ public sealed class ShellStateTests
         Assert.AreEqual("music.wav", state.VisibleMediaItems[0].FileName);
 
         state.MediaSearchText = "  ";
+
+        Assert.AreEqual(2, state.VisibleMediaItems.Count);
+    }
+
+    [TestMethod]
+    public void Media_kind_filter_composes_with_text_search_without_mutating_source_pool()
+    {
+        var state = new ShellState();
+        var video = new SourceMediaDto(
+            @"C:\media\clip.mp4",
+            @"C:\media\clip.mp4",
+            MediaKind.Video,
+            MediaCompatibilityMode.Direct,
+            "clip.mp4",
+            1,
+            1_000,
+            null,
+            null,
+            1280,
+            720,
+            30,
+            null,
+            null,
+            "h264",
+            null,
+            null,
+            "disabled");
+        var audio = new SourceMediaDto(
+            @"C:\media\clip.wav",
+            @"C:\media\clip.wav",
+            MediaKind.Audio,
+            MediaCompatibilityMode.Direct,
+            "clip.wav",
+            1,
+            1_000,
+            null,
+            null,
+            null,
+            null,
+            null,
+            48_000,
+            2,
+            null,
+            null,
+            null,
+            "disabled");
+
+        state.ApplyMediaSnapshot(new AppState { SourceMediaPool = [video, audio] });
+        state.MediaKindFilter = MediaKindFilter.Audio;
+
+        Assert.AreEqual(1, state.VisibleMediaItems.Count);
+        Assert.AreEqual(MediaKind.Audio, state.VisibleMediaItems[0].MediaKind);
+
+        state.MediaSearchText = "clip";
+
+        Assert.AreEqual(1, state.VisibleMediaItems.Count);
+        Assert.AreEqual(2, state.MediaItems.Count);
+
+        state.MediaKindFilter = MediaKindFilter.All;
 
         Assert.AreEqual(2, state.VisibleMediaItems.Count);
     }

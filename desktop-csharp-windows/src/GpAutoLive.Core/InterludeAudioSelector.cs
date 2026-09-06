@@ -7,7 +7,41 @@ namespace GpAutoLive.Core;
 public sealed record InterludeAudioSelection(
     ImmutableArray<string> PresetIds,
     ulong NextIntervalMs,
-    DateTimeOffset? PresetValidUntil);
+    DateTimeOffset? PresetValidUntil)
+{
+    /// <summary>
+    /// 将单轨选择投影到 C# 已有的受管 FFmpeg 参数边界。
+    /// 这里只传递预设 ID 作为本地确定性音色库键，不冒充 Rust UI 的 35 字段完整映射。
+    /// </summary>
+    public bool TryCreateBoundedAudioEffectParams(
+        out AudioEffectParams? parameters,
+        out string? error)
+    {
+        parameters = null;
+        error = null;
+        if (PresetIds.IsDefaultOrEmpty)
+        {
+            error = "插话预设选择为空。";
+            return false;
+        }
+
+        if (PresetIds.Length != 1)
+        {
+            error = "插话多轨预设尚未接入 C# 单输入 FFmpeg 消费链。";
+            return false;
+        }
+
+        var presetId = PresetIds[0];
+        if (!InterludeAudioRules.IsAllowedPresetId(presetId))
+        {
+            error = "插话预设 ID 不受支持。";
+            return false;
+        }
+
+        parameters = new AudioEffectParams { VoiceLibraryId = presetId };
+        return true;
+    }
+}
 
 /// <summary>
 /// 插话预设/多轨/周期选择器。它只运行在控制线程，不触碰音频回调、文件或网络；

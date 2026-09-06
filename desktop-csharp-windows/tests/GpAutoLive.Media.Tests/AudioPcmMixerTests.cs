@@ -209,6 +209,29 @@ public sealed class AudioPcmMixerTests
     }
 
     [TestMethod]
+    public void Mixing_output_source_applies_overlay_volume_without_changing_base_duck()
+    {
+        var baseBuffer = new AudioPcmRingBuffer(capacityFrames: 4, channels: 1);
+        var overlayBuffer = new AudioPcmRingBuffer(capacityFrames: 4, channels: 1);
+        Assert.IsTrue(baseBuffer.TryWrite([1F], out _, out _));
+        Assert.IsTrue(overlayBuffer.TryWrite([1F], out _, out _));
+        var source = new AudioPcmMixingOutputSource(
+            baseBuffer,
+            overlayBuffer,
+            channels: 1,
+            maxFramesPerRead: 1,
+            policyProvider: static () => new AudioPcmMixPolicy(
+                BaseDuckingDb: -6,
+                OverlayGainDb: -12));
+        var output = new float[1];
+
+        Assert.IsTrue(source.TryRead(output, out var frames, out var error), error?.Message);
+
+        Assert.AreEqual(1, frames);
+        Assert.AreEqual(0.752F, output[0], 0.002F);
+    }
+
+    [TestMethod]
     public void Mixing_output_source_does_not_require_overlay_frames()
     {
         var baseBuffer = new AudioPcmRingBuffer(capacityFrames: 4, channels: 1);

@@ -33,6 +33,7 @@ public sealed class ControlPlaneHeartbeatScheduler : IAsyncDisposable, IDisposab
     private readonly HeartbeatOutboxStore _outbox;
     private readonly IControlPlaneClock _clock;
     private readonly ControlPlaneHeartbeatSchedulerOptions _options;
+    private readonly Action<AuthTransition>? _transitionObserver;
     private readonly object _gate = new();
     private readonly SemaphoreSlim _sendSerial = new(1, 1);
     private Task? _runTask;
@@ -46,13 +47,15 @@ public sealed class ControlPlaneHeartbeatScheduler : IAsyncDisposable, IDisposab
         HeartbeatStatusProvider statusProvider,
         HeartbeatOutboxStore outbox,
         IControlPlaneClock? clock = null,
-        ControlPlaneHeartbeatSchedulerOptions? options = null)
+        ControlPlaneHeartbeatSchedulerOptions? options = null,
+        Action<AuthTransition>? transitionObserver = null)
     {
         _auth = auth ?? throw new ArgumentNullException(nameof(auth));
         _statusProvider = statusProvider ?? throw new ArgumentNullException(nameof(statusProvider));
         _outbox = outbox ?? throw new ArgumentNullException(nameof(outbox));
         _clock = clock ?? SystemControlPlaneClock.Instance;
         _options = options ?? new ControlPlaneHeartbeatSchedulerOptions();
+        _transitionObserver = transitionObserver;
         _options.Validate();
     }
 
@@ -197,7 +200,36 @@ public sealed class ControlPlaneHeartbeatScheduler : IAsyncDisposable, IDisposab
         await _sendSerial.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            var expiryTransition = await _auth
+                .ExpireActivationIfNeededAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (expiryTransition is not null)
+            {
+                Observe(expiryTransition);
+                return;
+            }
+
             var snapshot = _auth.Snapshot;
+            if (!IsHeartbeatEligible(snapshot)
+                || string.IsNullOrWhiteSpace(snapshot.UserId)
+                || string.IsNullOrWhiteSpace(snapshot.DeviceId))
+            {
+                return;
+            }
+
+            if (snapshot.AccessExpiresAt is { } accessExpiresAt
+                && accessExpiresAt <= _clock.UtcNow + _options.Interval)
+            {
+                var refresh = await _auth.RefreshAsync(cancellationToken).ConfigureAwait(false);
+                Observe(refresh);
+                if (!refresh.IsSuccess || !refresh.Snapshot.CanEnterWorkbench)
+                {
+                    return;
+                }
+
+                snapshot = _auth.Snapshot;
+            }
+
             if (!IsHeartbeatEligible(snapshot)
                 || string.IsNullOrWhiteSpace(snapshot.UserId)
                 || string.IsNullOrWhiteSpace(snapshot.DeviceId))
@@ -215,6 +247,7 @@ public sealed class ControlPlaneHeartbeatScheduler : IAsyncDisposable, IDisposab
                     queued.Request,
                     cancellationToken,
                     queued.IdempotencyKey).ConfigureAwait(false);
+                Observe(queuedTransition);
                 if (queuedTransition.IsSuccess)
                 {
                     await _outbox.ClearAsync(
@@ -236,6 +269,7 @@ public sealed class ControlPlaneHeartbeatScheduler : IAsyncDisposable, IDisposab
                         queued.IdempotencyKey,
                         cancellationToken,
                         now).ConfigureAwait(false);
+                    return;
                 }
             }
 
@@ -256,6 +290,7 @@ public sealed class ControlPlaneHeartbeatScheduler : IAsyncDisposable, IDisposab
                 _clock.UtcNow,
                 status);
             var transition = await _auth.HeartbeatAsync(request, cancellationToken).ConfigureAwait(false);
+            Observe(transition);
             if (transition.IsSuccess)
             {
                 return;
@@ -326,4 +361,16 @@ public sealed class ControlPlaneHeartbeatScheduler : IAsyncDisposable, IDisposab
 
     private static bool ShouldKeepForRetry(AuthTransition transition) =>
         transition.ShouldRetry || transition.Error?.IsTransient == true;
+
+    private void Observe(AuthTransition transition)
+    {
+        try
+        {
+            _transitionObserver?.Invoke(transition);
+        }
+        catch (Exception)
+        {
+            // UI 投影失败不能终止唯一心跳所有者；核心状态仍保持 fail-closed。
+        }
+    }
 }

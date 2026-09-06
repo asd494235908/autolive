@@ -40,6 +40,34 @@ public sealed class WindowsVirtualCameraSidecarLocatorTests
     }
 
     [TestMethod]
+    public void Legacy_virtual_camera_path_remains_compatible()
+    {
+        using var fixture = InstallFixture.Create();
+        Directory.CreateDirectory(fixture.LegacyBinDirectory);
+        File.WriteAllBytes(fixture.LegacyExecutablePath, CreateMinimalPe(machine: 0x8664, optionalHeaderMagic: 0x20b));
+
+        var result = WindowsVirtualCameraSidecarLocator.Probe(fixture.Root);
+
+        Assert.AreEqual(WindowsVirtualCameraSidecarProbeCode.Available, result.Code);
+        Assert.AreEqual(Path.GetFullPath(fixture.LegacyExecutablePath), result.ExecutablePath);
+    }
+
+    [TestMethod]
+    public void Invalid_formal_path_does_not_fallback_to_legacy_path()
+    {
+        using var fixture = InstallFixture.Create();
+        Directory.CreateDirectory(fixture.BinDirectory);
+        Directory.CreateDirectory(fixture.LegacyBinDirectory);
+        File.WriteAllBytes(fixture.ExecutablePath, CreateMinimalPe(machine: 0x14c, optionalHeaderMagic: 0x10b));
+        File.WriteAllBytes(fixture.LegacyExecutablePath, CreateMinimalPe(machine: 0x8664, optionalHeaderMagic: 0x20b));
+
+        var result = WindowsVirtualCameraSidecarLocator.Probe(fixture.Root);
+
+        Assert.AreEqual(WindowsVirtualCameraSidecarProbeCode.InvalidSidecar, result.Code);
+        Assert.IsNull(result.ExecutablePath);
+    }
+
+    [TestMethod]
     public void Wrong_architecture_is_invalid_sidecar()
     {
         using var fixture = InstallFixture.Create();
@@ -87,13 +115,17 @@ public sealed class WindowsVirtualCameraSidecarLocatorTests
         private InstallFixture(string root)
         {
             Root = root;
-            BinDirectory = Path.Combine(root, "virtual-camera", "bin");
+            BinDirectory = Path.Combine(root, "akvirtualcamera", "bin");
             ExecutablePath = Path.Combine(BinDirectory, WindowsVirtualCameraSidecarLaunchPlanBuilder.SidecarFileName);
+            LegacyBinDirectory = Path.Combine(root, "virtual-camera", "bin");
+            LegacyExecutablePath = Path.Combine(LegacyBinDirectory, WindowsVirtualCameraSidecarLaunchPlanBuilder.SidecarFileName);
         }
 
         public string Root { get; }
         public string BinDirectory { get; }
         public string ExecutablePath { get; }
+        public string LegacyBinDirectory { get; }
+        public string LegacyExecutablePath { get; }
 
         public static InstallFixture Create()
         {

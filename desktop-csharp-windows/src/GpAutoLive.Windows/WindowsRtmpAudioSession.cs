@@ -650,6 +650,7 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
         }
         finally
         {
+            bus.DiscardOverlayPending();
             await decoder.DisposeAsync().ConfigureAwait(false);
             lock (_gate)
             {

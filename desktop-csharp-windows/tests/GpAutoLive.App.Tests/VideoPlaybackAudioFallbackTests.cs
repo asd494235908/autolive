@@ -321,7 +321,7 @@ public sealed class VideoPlaybackAudioFallbackTests
 
                     var mediaPool = GetPrivateField<MediaPoolService>(window, "_mediaPool");
                     var state = GetPrivateField<ShellState>(window, "_state");
-                    var source = CreateSyntheticVideoSource(fixture);
+                    var source = CreateSyntheticVideoSource(fixture) with { DurationMs = 10_000 };
                     var committed = mediaPool.ReplaceAll([source]);
                     Assert.IsTrue(committed.IsSuccess, committed.Error?.Message);
                     state.ApplyMediaSnapshot(committed.Snapshot);
@@ -338,6 +338,11 @@ public sealed class VideoPlaybackAudioFallbackTests
                     var initialDecoderPid = audio.Snapshot.Decoder?.ProcessId;
                     Assert.IsNotNull(initialIdentity, "视频会话没有建立活动身份。");
                     Assert.IsNotNull(initialDecoderPid, "视频声音会话没有建立 FFmpeg 解码器。");
+                    Assert.IsTrue(
+                        PumpUntil(
+                            () => state.AudioEffectCycleProgress > 0,
+                            TimeSpan.FromSeconds(2)),
+                        "带音轨视频已经建立最终 PCM，但声音周期观察器没有推进变换进度。");
 
                     state.AudioProcessing = false;
                     if (!PumpUntil(
@@ -493,6 +498,7 @@ public sealed class VideoPlaybackAudioFallbackTests
                 {
                     window = new MainWindow();
                     window.Show();
+                    PumpDispatcherUntilLoaded();
                     GetPrivateField<LoginViewModel>(window, "_login")
                         .ApplyActivated("fixture-account");
 
@@ -511,8 +517,11 @@ public sealed class VideoPlaybackAudioFallbackTests
                     if (mediaPool.Snapshot.SourceMediaPool.Length != 1
                         || mediaPool.Snapshot.PlaybackState is not PlaybackState.Ready)
                     {
+                        var actualShellState = GetPrivateField<ShellState>(window, "_state");
+                        var mediaStatus = GetPrivateField<TextBlock>(window, "MediaStatusText");
                         throw new InvalidOperationException(
-                            $"主窗口导入后播放池状态不正确：{mediaPool.Snapshot.SourceMediaPool.Length} 项，状态 {mediaPool.Snapshot.PlaybackState}。");
+                            $"主窗口导入后播放池状态不正确：{mediaPool.Snapshot.SourceMediaPool.Length} 项，状态 {mediaPool.Snapshot.PlaybackState}，"
+                            + $"主状态={actualShellState.StatusMessage}，运行时={mediaStatus.Text}。");
                     }
 
                     var mediaList = GetPrivateField<ListBox>(window, "MediaListBox");
@@ -611,6 +620,10 @@ public sealed class VideoPlaybackAudioFallbackTests
                             $"主窗口导入后播放池状态不正确：{mediaPool.Snapshot.SourceMediaPool.Length} 项，状态 {mediaPool.Snapshot.PlaybackState}。");
                     }
 
+                    var firstDurationMs = mediaPool.Snapshot.SourceMediaPool[0].DurationMs ?? 20_000;
+                    var eofTimeout = TimeSpan.FromMilliseconds(
+                        Math.Clamp((double)firstDurationMs + 10_000, 20_000, 120_000));
+
                     var startTask = InvokePrivate(window, "TogglePlaybackCoreAsync") as Task
                         ?? throw new InvalidOperationException("主窗口播放入口未返回异步任务。");
                     PumpUntilCompleted(startTask);
@@ -626,10 +639,11 @@ public sealed class VideoPlaybackAudioFallbackTests
                                     && poolSnapshot.PlaybackState is PlaybackState.Playing
                                     && state.StatusMessage.Contains("已自动切换到第 2 项", StringComparison.Ordinal);
                             },
-                            TimeSpan.FromSeconds(20)))
+                            eofTimeout))
                     {
                         throw new InvalidOperationException(
                             $"第一项 EOF 后未完成真实换源，当前索引 {mediaPool.Snapshot.SourceMediaIndex}，"
+                            + $"首项时长={firstDurationMs}ms，等待预算={eofTimeout.TotalSeconds:0.#}s，"
                             + $"池状态 {mediaPool.Snapshot.PlaybackState}，主窗口状态 {state.StatusMessage}，"
                             + $"mpv={mpv.Snapshot.State}/{mpv.Snapshot.Runtime.State}/{mpv.Snapshot.Runtime.IpcState}，"
                             + $"身份={mpv.Snapshot.ActiveIdentity}，声音={GetPrivateField<TextBlock>(window, "AudioDeviceStatusText").Text}。");

@@ -80,6 +80,7 @@ public sealed class LoginViewModel : INotifyPropertyChanged
             OnPropertyChanged(nameof(CanLogout));
             OnPropertyChanged(nameof(CanEnterWorkbench));
             OnPropertyChanged(nameof(IsGateVisible));
+            OnPropertyChanged(nameof(IsCredentialEntryVisible));
         }
     }
 
@@ -119,6 +120,12 @@ public sealed class LoginViewModel : INotifyPropertyChanged
     public bool CanEnterWorkbench => Status is LoginStatus.Activated or LoginStatus.Offline;
 
     public bool IsGateVisible => !CanEnterWorkbench;
+
+    /// <summary>账号会话仍有效但设备不可用时，不再展示密码表单误导用户重复登录。</summary>
+    public bool IsCredentialEntryVisible => Status is not (
+        LoginStatus.Authenticated or
+        LoginStatus.ActivationRequired or
+        LoginStatus.Disabled);
 
     public string StatusLabel => Status switch
     {
@@ -337,7 +344,20 @@ public sealed class LoginViewModel : INotifyPropertyChanged
         ApplySnapshot(transition.Snapshot);
         if (transition.Error is not null)
         {
-            Message = transition.Error.Message;
+            Message = FormatTransitionError(transition);
+        }
+        else if (!string.IsNullOrWhiteSpace(transition.Warning))
+        {
+            Message = transition.Warning.Trim();
+        }
+    }
+
+    /// <summary>显示不改变当前授权状态的控制面警告。</summary>
+    public void ApplyWarning(string warning)
+    {
+        if (!string.IsNullOrWhiteSpace(warning))
+        {
+            Message = warning.Trim();
         }
     }
 
@@ -378,6 +398,36 @@ public sealed class LoginViewModel : INotifyPropertyChanged
             LoginStatus.Disabled => "账号或设备已被禁用，请联系管理员。",
             _ => "控制面会话尚未建立。",
         };
+    }
+
+    private static string FormatTransitionError(AuthTransition transition)
+    {
+        var error = transition.Error!;
+        var message = string.IsNullOrWhiteSpace(error.Message) ? "控制面请求失败" : error.Message.Trim();
+        var requestId = string.IsNullOrWhiteSpace(error.RequestId)
+            ? string.Empty
+            : $"；请求编号：{error.RequestId.Trim()}";
+        var diagnostics = $"（错误码：{error.Code}{requestId}）";
+
+        if (transition.Operation == AuthOperationKind.Activation)
+        {
+            if (error.Status == 401
+                || string.Equals(error.Code, AuthErrorCodes.Unauthenticated, StringComparison.Ordinal))
+            {
+                return $"登录会话已失效：{message}{diagnostics} 请重新登录。";
+            }
+
+            if (string.Equals(error.Code, AuthErrorCodes.DeviceLimitExceeded, StringComparison.Ordinal))
+            {
+                return $"账号登录成功，但可登录设备数量已达到授权上限。{diagnostics} 请联系管理员释放设备名额后，再点击“重试设备授权”。";
+            }
+
+            return $"账号登录成功，但设备授权失败：{message}{diagnostics} 请点击“重试设备授权”。";
+        }
+
+        return transition.Operation == AuthOperationKind.Login
+            ? $"账号登录失败：{message}{diagnostics}"
+            : message;
     }
 
     private bool ValidateCredentials()

@@ -64,7 +64,9 @@ public sealed class DouyinLiveManager
     private bool _chatReceived;
     private bool _replyAttempted;
     private bool _selfEchoFiltered;
+    private bool _replySendingBlocked;
     private int? _lastReplyIndex;
+    private string? _lastGapReason;
 
     /// <summary>使用可注入随机源创建管理器；随机源只在控制线程使用。</summary>
     public DouyinLiveManager(Random? random = null)
@@ -113,6 +115,8 @@ public sealed class DouyinLiveManager
             _chatReceived = false;
             _replyAttempted = false;
             _selfEchoFiltered = false;
+            _replySendingBlocked = false;
+            _lastGapReason = null;
             _error = null;
             InvalidateGeneration();
             _state = DouyinLiveState.WaitingQr;
@@ -218,6 +222,8 @@ public sealed class DouyinLiveManager
             _chatReceived = false;
             _replyAttempted = false;
             _selfEchoFiltered = false;
+            _replySendingBlocked = false;
+            _lastGapReason = null;
             _error = null;
             RecordEvent("probe_stopped");
             return Success();
@@ -255,6 +261,53 @@ public sealed class DouyinLiveManager
         "self_echo_filtered",
         static state => state is DouyinLiveState.Listening or DouyinLiveState.Paused,
         static manager => manager._selfEchoFiltered = true);
+
+    /// <summary>停止当前会话的新回复发送；读取侧仍可继续观察和按容量丢弃任务。</summary>
+    public DouyinLiveOperationResult BlockReplySending(string reason)
+    {
+        lock (_gate)
+        {
+            if (_state is not (DouyinLiveState.Listening or DouyinLiveState.Paused))
+            {
+                return Failure(InvalidTransition("block_reply_sending"));
+            }
+
+            if (_replySendingBlocked)
+            {
+                return Success();
+            }
+
+            _replySendingBlocked = true;
+            _error = NormalizeReason(reason, "回复发送已暂停");
+            RecordEvent("reply_sending_blocked");
+            return Success();
+        }
+    }
+
+    /// <summary>记录 sidecar 报告的有限数据缺口；不恢复缺失弹幕，也不触发自动重试。</summary>
+    public DouyinLiveOperationResult RecordLiveGap(string? reason, ulong droppedCount)
+    {
+        lock (_gate)
+        {
+            if (_state is not (DouyinLiveState.RoomResolved or DouyinLiveState.Listening or DouyinLiveState.Paused)
+                || !IsValidGapReason(reason)
+                || droppedCount == 0)
+            {
+                return Failure(new DouyinLiveOperationError(
+                    "douyin_gap_invalid",
+                    "sidecar 数据缺口的原因或丢弃数量无效"));
+            }
+
+            _lastGapReason = reason;
+            _metrics = _metrics with
+            {
+                GapEvents = SaturatingIncrement(_metrics.GapEvents),
+                GapDroppedCount = SaturatingAdd(_metrics.GapDroppedCount, droppedCount)
+            };
+            RecordEvent("live_gap");
+            return Success();
+        }
+    }
 
     /// <summary>记录 sidecar 已完成最小正向兼容验证。</summary>
     public DouyinLiveOperationResult MarkPassed()
@@ -321,61 +374,125 @@ public sealed class DouyinLiveManager
                     "弹幕消息 ID 无效"));
             }
 
-            var messageId = message.MessageId.Trim();
-            if (message.IsSelf)
-            {
-                _selfEchoFiltered = true;
-                _metrics = _metrics with { IgnoredSelf = SaturatingIncrement(_metrics.IgnoredSelf) };
-                RecordEvent("self_echo_filtered");
-                return Ignored(DouyinEnqueueDecision.IgnoredSelf);
-            }
-
-            if (message.IsReplay)
-            {
-                _metrics = _metrics with { IgnoredReplay = SaturatingIncrement(_metrics.IgnoredReplay) };
-                RecordEvent("replay_filtered");
-                return Ignored(DouyinEnqueueDecision.IgnoredReplay);
-            }
-
-            if (!_seenMessageIds.Add(messageId))
-            {
-                _metrics = _metrics with { IgnoredDuplicate = SaturatingIncrement(_metrics.IgnoredDuplicate) };
-                RecordEvent("duplicate_filtered");
-                return Ignored(DouyinEnqueueDecision.IgnoredDuplicate);
-            }
-
-            _seenMessageOrder.Enqueue(messageId);
-            if (_seenMessageOrder.Count > DouyinLiveRules.SeenMessageCapacity)
-            {
-                _seenMessageIds.Remove(_seenMessageOrder.Dequeue());
-            }
-
-            var replyIndex = SelectReplyIndex();
-            var task = new DouyinReplyTask(_generation, messageId, _config.Replies[replyIndex], now);
-            if (_queue.Count >= _config.QueueCapacity)
-            {
-                _queue.Dequeue();
-                _metrics = _metrics with { DroppedOldest = SaturatingIncrement(_metrics.DroppedOldest) };
-            }
-
-            _queue.Enqueue(task);
-            _chatReceived = true;
-            _metrics = _metrics with { Enqueued = SaturatingIncrement(_metrics.Enqueued) };
-            RecordEvent("reply_selected");
-            return new(true, DouyinEnqueueDecision.Enqueued, CreateStatus(), task);
+            return ObserveChatLocked(message.MessageId, message.IsSelf, message.IsReplay, now);
         }
     }
 
     /// <summary>
+    /// 接收 sidecar 的脱敏弹幕元数据。正文不进入 C#，但仍校验单房间、发送者和正文长度边界。
+    /// </summary>
+    public DouyinEnqueueResult ObserveChatMetadata(DouyinChatMessageMetadata? metadata, DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            if (_state != DouyinLiveState.Listening)
+            {
+                return EnqueueFailure(new DouyinLiveOperationError(
+                    "douyin_invalid_transition",
+                    "当前未处于抖音公屏监听状态"));
+            }
+
+            if (!_config.Enabled)
+            {
+                return EnqueueFailure(new DouyinLiveOperationError(
+                    "douyin_auto_reply_disabled",
+                    "抖音自动回应未启用"));
+            }
+
+            if (!IsValidChatMetadata(metadata))
+            {
+                return EnqueueFailure(new DouyinLiveOperationError(
+                    "douyin_message_invalid",
+                    "弹幕元数据无效"));
+            }
+
+            return ObserveChatLocked(metadata!.MessageId, metadata.IsSelf, metadata.IsReplay, now);
+        }
+    }
+
+    private DouyinEnqueueResult ObserveChatLocked(
+        string messageIdValue,
+        bool isSelf,
+        bool isReplay,
+        DateTimeOffset now)
+    {
+        var messageId = messageIdValue.Trim();
+        if (isSelf)
+        {
+            _selfEchoFiltered = true;
+            _metrics = _metrics with { IgnoredSelf = SaturatingIncrement(_metrics.IgnoredSelf) };
+            RecordEvent("self_echo_filtered");
+            return Ignored(DouyinEnqueueDecision.IgnoredSelf);
+        }
+
+        if (isReplay)
+        {
+            _metrics = _metrics with { IgnoredReplay = SaturatingIncrement(_metrics.IgnoredReplay) };
+            RecordEvent("replay_filtered");
+            return Ignored(DouyinEnqueueDecision.IgnoredReplay);
+        }
+
+        if (!_seenMessageIds.Add(messageId))
+        {
+            _metrics = _metrics with { IgnoredDuplicate = SaturatingIncrement(_metrics.IgnoredDuplicate) };
+            RecordEvent("duplicate_filtered");
+            return Ignored(DouyinEnqueueDecision.IgnoredDuplicate);
+        }
+
+        _seenMessageOrder.Enqueue(messageId);
+        if (_seenMessageOrder.Count > DouyinLiveRules.SeenMessageCapacity)
+        {
+            _seenMessageIds.Remove(_seenMessageOrder.Dequeue());
+        }
+
+        var replyIndex = SelectReplyIndex();
+        var task = new DouyinReplyTask(
+            _generation,
+            messageId,
+            _config.Replies[replyIndex],
+            now,
+            $"chat-{Guid.NewGuid():N}");
+        if (_queue.Count >= _config.QueueCapacity)
+        {
+            _queue.Dequeue();
+            _metrics = _metrics with { DroppedOldest = SaturatingIncrement(_metrics.DroppedOldest) };
+        }
+
+        _queue.Enqueue(task);
+        _chatReceived = true;
+        _metrics = _metrics with { Enqueued = SaturatingIncrement(_metrics.Enqueued) };
+        RecordEvent("reply_selected");
+        return new(true, DouyinEnqueueDecision.Enqueued, CreateStatus(), task);
+    }
+
+    private bool IsValidChatMetadata(DouyinChatMessageMetadata? metadata) =>
+        metadata is not null
+        && DouyinLiveRules.TryNormalizeRoomId(metadata.RoomId, out var roomId)
+        && string.Equals(roomId, _config.RoomId, StringComparison.Ordinal)
+        && DouyinLiveRules.IsValidMessageId(metadata.MessageId)
+        && !string.IsNullOrWhiteSpace(metadata.SenderId)
+        && System.Text.Encoding.UTF8.GetByteCount(metadata.SenderId.Trim()) <= DouyinLiveRules.MaxMessageIdBytes
+        && metadata.TextLength is >= 0 and <= DouyinLiveRules.MaxChatTextLength;
+
+    /// <summary>
     /// 取出最早未过期任务。等待超过 60 秒的任务丢弃；不负责向平台发送或自动重试。
     /// </summary>
-    public bool TryDequeue(DateTimeOffset now, out DouyinReplyTask? task)
+    public bool TryDequeue(
+        DateTimeOffset now,
+        out DouyinReplyTask? task,
+        ulong? expectedGeneration = null)
     {
         lock (_gate)
         {
             while (_queue.Count > 0)
             {
                 var candidate = _queue.Dequeue();
+                if (expectedGeneration is { } generation
+                    && candidate.Generation != generation)
+                {
+                    continue;
+                }
+
                 if (now >= candidate.EnqueuedAtUtc
                     && now - candidate.EnqueuedAtUtc > DouyinLiveRules.TaskMaxAge)
                 {
@@ -513,7 +630,9 @@ public sealed class DouyinLiveManager
         _queue.Count,
         _config.QueueCapacity,
         _metrics,
-        _error);
+        _error,
+        _replySendingBlocked,
+        _lastGapReason);
 
     private bool IsRunning() => _state is not (
         DouyinLiveState.Idle
@@ -558,6 +677,14 @@ public sealed class DouyinLiveManager
     }
 
     private static ulong SaturatingIncrement(ulong value) => value == ulong.MaxValue ? value : value + 1;
+
+    private static ulong SaturatingAdd(ulong value, ulong increment) =>
+        ulong.MaxValue - value < increment ? ulong.MaxValue : value + increment;
+
+    private static bool IsValidGapReason(string? reason) => reason is
+        "sidecar_backpressure"
+        or "reconnect"
+        or "no_replay";
 
     private static string NormalizeReason(string? reason, string fallback)
     {

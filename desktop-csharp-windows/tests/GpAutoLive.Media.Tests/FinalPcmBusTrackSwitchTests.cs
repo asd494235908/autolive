@@ -61,4 +61,30 @@ public sealed class FinalPcmBusTrackSwitchTests
         Assert.AreSame(current, retired);
         Assert.AreSame(next, trackSwitch.ActiveBus);
     }
+
+    [TestMethod]
+    public void Scheduled_commit_promotes_overlay_branch_with_rtmp_consumer()
+    {
+        using var current = new FinalPcmBus(capacityFrames: 8, channels: 1);
+        using var next = new FinalPcmBus(capacityFrames: 8, channels: 1);
+        Assert.IsTrue(current.TryPublish([0.1F], out _, out _));
+        Assert.IsTrue(current.TryPublishOverlay([0.3F], out _, out _));
+        Assert.IsTrue(next.TryPublish([0.9F], out _, out _));
+
+        using var trackSwitch = new FinalPcmBusTrackSwitch(1, current);
+        trackSwitch.SetRtmpConsumerAttached(true);
+        Assert.IsTrue(trackSwitch.TryPrepareNext(2, next, out _));
+        Assert.IsTrue(trackSwitch.TryCommitNextAtFrames(2, 0, out _));
+
+        Span<float> local = stackalloc float[1];
+        Span<float> rtmp = stackalloc float[1];
+        Assert.IsTrue(trackSwitch.OutputSource.TryRead(local, out _, out _));
+        Assert.IsTrue(trackSwitch.RtmpSource.TryRead(rtmp, out _, out _));
+
+        Assert.IsTrue(
+            trackSwitch.TryAcknowledgePromotion(2, out var retired, out var error),
+            error?.Message ?? "RTMP 插话分支不得阻塞已完成的主轨周期切换。");
+        Assert.AreSame(current, retired);
+        Assert.AreSame(next, trackSwitch.ActiveBus);
+    }
 }

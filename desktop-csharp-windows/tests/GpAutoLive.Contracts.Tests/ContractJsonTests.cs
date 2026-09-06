@@ -87,4 +87,35 @@ public sealed class ContractJsonTests
         Assert.IsFalse(AuthContractValidation.TryValidateHeartbeat(request, out var error));
         Assert.AreEqual(AuthErrorCodes.InvalidRequest, error!.Code);
     }
+
+    [TestMethod]
+    public void Heartbeat_playback_state_only_accepts_server_contract_values()
+    {
+        foreach (var playbackState in new string?[] { null, string.Empty, "idle", "playing", "paused", "error" })
+        {
+            var request = new HeartbeatRequestDto(
+                ControlPlaneContractValues.Product,
+                "device01",
+                DateTimeOffset.UtcNow,
+                new HeartbeatStatusDto(0, PlaybackState: playbackState));
+
+            Assert.IsTrue(
+                AuthContractValidation.TryValidateHeartbeat(request, out var error),
+                $"服务端允许的心跳播放状态被拒绝：{playbackState ?? "<null>"}，{error?.Message}");
+        }
+
+        foreach (var playbackState in new[] { "ready", "stopped", "buffering" })
+        {
+            var request = new HeartbeatRequestDto(
+                ControlPlaneContractValues.Product,
+                "device01",
+                DateTimeOffset.UtcNow,
+                new HeartbeatStatusDto(0, PlaybackState: playbackState));
+
+            Assert.IsFalse(
+                AuthContractValidation.TryValidateHeartbeat(request, out var error),
+                $"非服务端契约的心跳播放状态未被拒绝：{playbackState}");
+            Assert.AreEqual(AuthErrorCodes.InvalidRequest, error!.Code);
+        }
+    }
 }

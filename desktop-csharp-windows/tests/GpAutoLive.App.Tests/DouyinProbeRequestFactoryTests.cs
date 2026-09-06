@@ -1,5 +1,6 @@
 using GpAutoLive.App.Features.Douyin;
 using GpAutoLive.Contracts;
+using GpAutoLive.Windows;
 
 namespace GpAutoLive.App.Tests;
 
@@ -49,7 +50,8 @@ public sealed class DouyinProbeRequestFactoryTests
             ["AUTOLIVE_DOUYIN_PROBE"] = "C:\\probe.py",
             ["CONDA_EXE"] = "C:\\Miniconda3\\Scripts\\conda.exe",
             ["AUTOLIVE_CONDA_ENV"] = "gpautolive-douyin-test",
-            ["AUTOLIVE_DOUYIN_TIMEOUT_SEC"] = "120"
+            ["AUTOLIVE_DOUYIN_TIMEOUT_SEC"] = "120",
+            ["AUTOLIVE_DOUYIN_PROTOCOL"] = "canonical"
         };
 
         Assert.IsTrue(
@@ -65,6 +67,7 @@ public sealed class DouyinProbeRequestFactoryTests
         Assert.IsTrue(configured);
         Assert.AreEqual("gpautolive-douyin-test", request!.CondaEnvironment);
         Assert.AreEqual(TimeSpan.FromSeconds(120), request.Timeout);
+        Assert.AreEqual(WindowsDouyinProbeProtocol.CanonicalNdjson, request.Protocol);
         StringAssert.StartsWith(request.QrOutputPath, "C:\\Temp\\gpautolive-douyin-");
         StringAssert.EndsWith(request.QrOutputPath, ".png");
     }

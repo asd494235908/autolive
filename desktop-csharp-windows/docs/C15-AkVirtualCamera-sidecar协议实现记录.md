@@ -2,6 +2,18 @@
 
 日期：2026-09-03
 
+## v1.103 增量：正式安装组件清单门禁
+
+- `WindowsVirtualCameraInstallationProbe` 现在按 Rust/NSIS 已有正式安装契约检查七项固定文件：`release-ready.json`、x64/x86 `AkVirtualCamera.dll`、x64 `AkVCamAssistant.exe`、x64 `AkVCamManager.exe`、`bin/akvirtualcamera-sidecar-x64.exe` 和 `bin/vcam_capi.dll`。
+- 缺少任一项时保持 `ComponentMissing`，不把已有注册表所有者或 PnP 设备单独提升为 `Installed`；探测仍是只读，不执行安装、`regsvr32`、设备变更或签名操作。
+- 新增缺少发布 marker 与完整清单的回归；真实签名安装、DirectShow、sidecar、下游兼容、WGC 可见帧和长稳仍待实机验收。
+
+## v1.102 增量：下游连接状态快照投影
+
+- `WindowsVirtualCameraOutputCoordinator` 现在消费 sidecar 的下游客户端数量事件后，在 Core 成功切换 `Ready`/`Streaming` 时发布 `SnapshotChanged`，WPF 能及时刷新“等待下游客户端”和“下游客户端 N 个”状态。
+- 该修复只补齐状态通知，不改变固定帧协议、latest-wins、sidecar/DirectShow 安装门禁、签名门禁、资源所有权或恢复策略；Rust 保持只读。
+- 新增 `Ready→Streaming→Ready` 回归测试；真实 sidecar、DirectShow、WGC 可见帧、签名安装、下游兼容和长稳仍待实机验收。
+
 ## 本轮落地
 
 - `GpAutoLive.Windows/WindowsVirtualCameraSidecarProtocol.cs` 对齐 Rust/Tauri `sidecar_protocol.rs`：协议版本 1、`GPAKVC01` magic、52 字节固定帧头、YUY2 `1280×720×2` 固定 payload。
@@ -65,12 +77,41 @@
 
 本轮仍未接入 WGC/D3D11 捕获、Named Pipe ACL 创建、AkVirtualCamera DirectShow 端点、GPL sidecar 启停或安装器注册。令牌不得进入命令行/普通配置；真实 sidecar 必须在独立进程、当前用户 ACL、Job Object、签名、许可证与下游兼容门禁全部完成后接入。
 
+## v1.81 增量：sidecar 首帧写入启动门禁
+
+- `WindowsVirtualCameraSidecarOutputWriter.StartAsync` 不再把“输出 worker 已创建”当作启动成功；现在必须在 2 秒有界预算内完成第一帧固定协议写入，才进入 `Running` 并返回成功。
+- 首帧写入失败、取消或超时会回收 worker，并返回脱敏稳定错误；不会让上层仅凭 sidecar 进程/Named Pipe 已连接把没有实际帧交付的输出标记为已启动。
+- 新增断开管道后的失败先行回归测试；未改变固定 `1280×720 YUY2`、30fps、latest-wins、一次有界回读、Job Object 或 sidecar ACL 边界。
+- 使用项目锁定 SDK 执行 Windows 目标测试 `227/227` 通过，`dotnet format --verify-no-changes --no-restore` 通过，`git diff --check` 通过。真实 sidecar、DirectShow、下游兼容、目标 GPU、签名/许可证和长稳仍待验收。
+
 ## v71 增量：资源包固定路径探测与宿主取消竞态加固
 
-- 新增 `WindowsVirtualCameraSidecarLocator`，只读探测 `virtual-camera/bin/akvirtualcamera-sidecar-x64.exe`；默认使用应用目录，也可通过 `AUTOLIVE_AKVIRTUALCAMERA_ROOT` 指定安装根目录。探测结果区分 Windows 不适用、根目录无效、文件不存在和 sidecar 无效，不把“文件存在”当作可执行授权。
+- 新增 `WindowsVirtualCameraSidecarLocator`，只读探测资源包内的 `akvirtualcamera/bin/akvirtualcamera-sidecar-x64.exe`；同时兼容 v1 旧包的 `virtual-camera/bin/akvirtualcamera-sidecar-x64.exe`。默认使用应用目录，也可通过 `AUTOLIVE_AKVIRTUALCAMERA_ROOT` 指定安装根目录。探测结果区分 Windows 不适用、根目录无效、文件不存在和 sidecar 无效，不把“文件存在”当作可执行授权。
 - 定位过程复用固定文件名、普通文件、非 Reparse 目录和 PE32+ AMD64 校验；宿主启动前仍二次校验，防止探测与执行之间的文件替换绕过边界。
 - `WindowsVirtualCameraSidecarHost` 的输出读取回调改为安全取消，Stop/Dispose 与后台 drain 并发时不会因已释放 CTS 冒出未观察 `ObjectDisposedException`。
 - 新增 5 项定位测试；全量自动化测试为 **369 项通过**（Contracts 25、Core 75、Media 91、Windows 145、App 33）。
+
+## v1.98 增量：对齐正式 AkVirtualCamera staging 目录
+
+- C# locator 将 Rust staging 的 `akvirtualcamera/bin` 作为首选资源目录；旧 `virtual-camera/bin` 只作为兼容路径，避免历史包升级后不可用。
+- 当正式目录存在但无效时不会静默使用旧目录；只有正式目录不存在时才尝试旧目录，仍保留 x64 PE、普通文件、非 Reparse 和 Authenticode 探测。
+- 新增正式目录、旧目录兼容和正式目录无效时拒绝旧目录回退的回归覆盖；locator 定向测试 `7/7` 通过。真实 sidecar/DirectShow、设备、签名和下游门禁未因此标记为完成。
+
+## v1.99 增量：运行时故障统一上报与可清理停止入口
+
+- `WindowsVirtualCameraOutputCoordinator` 增加 250ms 有界健康监视，运行中统一观察 WGC、sidecar host、Named Pipe client 和 writer；任一组件进入确定性失败/退出终态时，Core 进入 `Failed`，并通过脱敏 `SnapshotChanged` 通知 WPF 更新状态。
+- 故障态不再被当作正常运行，也不丢失停止按钮：`HasActiveResources` 覆盖故障组件和 Core `Failed`，媒体池变更、最终效果窗口关闭与主窗口停止都会继续进入统一清理；停止/关闭先取消并等待健康任务，再复用既有 writer→GPU→client→sidecar 有界逆序回收。
+- 新增运行时 host 故障上报→Core `Failed`→Stop 回到 `Installed` 的回归测试；受影响 Windows 测试 `8/8` 通过。未新增依赖、播放器、捕获路径、自动重启或 Rust 改动，真实 sidecar/DirectShow、WGC 可见帧、签名/许可证、目标 GPU、下游兼容和长稳仍待实机验收。
+
+## v1.100 增量：writer 未分类异常 fail-closed
+
+- 受管 30fps writer 对未分类运行时异常统一投影为脱敏 `Failed/WriteFailed`，避免后台 worker fault 后快照继续停在 `Running`，让 coordinator 的健康监视能够继续把 Core 收敛到 `Failed`。
+- 未新增重试、线程、缓存或依赖；现有 writer/coordinator 测试 `8/8` 通过，真实 sidecar、DirectShow、WGC 可见帧、签名/许可证、目标 GPU、下游兼容和长稳仍待实机验收。
+
+## v1.101 增量：host 启动前 Authenticode 二次门禁
+
+- `WindowsVirtualCameraSidecarHost.TryValidatePlan` 在进程创建前再次执行 `WindowsAuthenticodeProbe`；即使调用方直接构造或绕过 WPF 的 sidecar 探测，未签名、签名无效或签名 API 不可用的文件也返回 `InvalidPlan`，不会创建进程。
+- 新增未签名 sidecar 计划拒绝测试，host 定向测试 `4/4` 通过。结构校验、x64 PE、Job Object、stdin 令牌、Named Pipe 和真实签名/许可证/DirectShow/下游兼容边界保持不变，未修改 Rust。
 
 ## v71 发布复验
 
@@ -182,3 +223,20 @@
 - v79 候选 `artifacts/csharp-windows-controller-20260903-v79` 根目录 8 个文件、`1,428,208` bytes，EXE `162,816` bytes；GPU DLL 7 个 `1,208,320` bytes，WinRT DLL 2 个 `27,848,816` bytes；symbols 7 个 `473,235` bytes；媒体运行时 13 个硬链接文件、逻辑大小 `352,365,694` bytes，manifest 大小/SHA-256 全部匹配。
 - 全量自动化测试 **394 项通过**；Release 构建 0 警告/0 错误，格式和 `desktop/` 作用域检查通过。发布包锁定 `.tools/dotnet` 启动关闭冒烟通过（`WaitForInputIdle=True`、`CloseMainWindow=True`、退出码 0、无残留）；4 秒空闲基线 6 个样本，私有工作集 `85,475,328～86,773,760` bytes、工作集 `142,733,312～147,476,480` bytes、CPU 峰值 `2.74%`。
 - 真实 sidecar ACL、GPU→sidecar 连续帧、WGC 可见帧、DirectShow 安装/卸载、签名/许可证、多 GPU、下游兼容和 30 分钟长稳仍待目标设备验收；本轮仅完成 WPF 编排与生命周期门禁接线。
+
+## v1.84（2026-09-06）活动写入取消的管道收口
+
+- 修正 `WindowsVirtualCameraSidecarClient.WriteFrameAsync` 的活动写入取消分支：取消发生在固定帧已开始写入后，会立即关闭当前 Named Pipe、归还池化帧缓冲，并进入 `Failed` + `Cancelled` 的可重试失败态。
+- 该边界避免部分固定帧残留在已连接流中并与下一帧拼接；不会把取消结果、管道存活或进程存活当作像素交付，也不会自动重连或伪造首帧。
+- 新增失败先行回归测试 `Cancellation_during_write_closes_pipe_and_enters_retryable_failure_state`，使用本机管道背压验证取消后的脱敏状态和错误码；目标测试 `1/1` 通过。
+- 真实 sidecar、当前用户 ACL、DirectShow 下游、GPU→sidecar 连续帧、签名/许可证、目标 GPU/Win10/11、下游兼容和 30 分钟长稳仍待实机验收。
+
+## v1.85（2026-09-06）组合协调器清理结果收口
+
+- `WindowsVirtualCameraOutputCoordinator` 的启动失败、取消和异常路径现在统一按已尝试的资源边界执行有界逆序清理；writer、GPU、Named Pipe client 和 sidecar host 的返回结果或异常不再被静默丢弃，后续清理仍会继续执行。
+- `StopCoreAsync` 只有在全部清理调用没有失败时才返回 `Stopped`；任一清理失败投影为脱敏 `CleanupFailed`，停止期间发生取消也不会伪造成功。已取消的单项清理会再用不可取消令牌执行一次有界补偿清理，避免 caller cancellation 留下进程、管道或后台 worker。
+- writer 的已关闭快照由 coordinator 保留用于状态投影；重复 `StopAsync` 不会再次把已关闭 writer 当作活动资源，仍保持幂等 `Stopped`。`DisposeAsync` 继续尝试全部组件并在清理失败后抛出稳定摘要，避免关闭成功假象。
+- 新增失败先行回归测试，覆盖 writer 停止取消、GPU/client/sidecar 继续清理、`CleanupFailed` 投影和重复 Stop；目标 Windows 测试通过。未新增依赖，未改变固定 `YUY2 1280×720@30fps`、WGC/D3D11、sidecar ACL、Job Object、签名/许可证或 DirectShow 边界。
+- 本轮仍只证明 C# 编排器与本机受控替身的生命周期语义；真实 sidecar、当前用户 Named Pipe ACL、WGC/D3D11 可见帧、DirectShow 注册/卸载、签名/许可证、Win10/11 多 GPU、下游兼容和 30 分钟长稳仍待目标设备验收。
+
+- 代码总监复核补充：当停止清理仍有终态失败时，coordinator 会保留 `CleanupFailed` 熔断，拒绝新的启动请求；只有重复 `StopAsync` 完成全部组件回收后才允许解除，避免下游资源未释放时产生第二套输出链。

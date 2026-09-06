@@ -128,6 +128,75 @@ public sealed class DouyinLiveManagerTests
     }
 
     [TestMethod]
+    public void Redacted_chat_metadata_uses_the_real_queue_rules_and_room_gate()
+    {
+        var manager = ListeningManager();
+
+        var accepted = manager.ObserveChatMetadata(new DouyinChatMessageMetadata(
+            "12345",
+            "m-meta",
+            "sender",
+            12,
+            false,
+            false),
+            DateTimeOffset.UnixEpoch);
+
+        Assert.IsTrue(accepted.IsAccepted, accepted.Error?.Message);
+        Assert.AreEqual(1UL, manager.Snapshot.Metrics.Enqueued);
+        Assert.IsFalse(string.IsNullOrWhiteSpace(accepted.Task!.ClientActionId));
+        Assert.IsTrue(manager.TryDequeue(DateTimeOffset.UnixEpoch, out var task));
+        Assert.AreEqual("m-meta", task!.MessageId);
+        Assert.AreEqual(accepted.Task.ClientActionId, task.ClientActionId);
+        Assert.IsFalse(manager.ObserveChatMetadata(new DouyinChatMessageMetadata(
+            "99999",
+            "m-other-room",
+            "sender",
+            0,
+            false,
+            false),
+            DateTimeOffset.UnixEpoch).IsAccepted);
+    }
+
+    [TestMethod]
+    public void Live_gap_is_visible_without_replaying_or_requeueing_messages()
+    {
+        var manager = ListeningManager();
+
+        var result = manager.RecordLiveGap("reconnect", 3);
+
+        Assert.IsTrue(result.IsSuccess, result.Error?.Message);
+        Assert.AreEqual("live_gap", result.Snapshot.LastEvent);
+        Assert.AreEqual("reconnect", result.Snapshot.LastGapReason);
+        Assert.AreEqual(1UL, result.Snapshot.Metrics.GapEvents);
+        Assert.AreEqual(3UL, result.Snapshot.Metrics.GapDroppedCount);
+        Assert.AreEqual(0, result.Snapshot.QueueCount);
+    }
+
+    [TestMethod]
+    public void Live_gap_rejects_invalid_reason_or_zero_count()
+    {
+        var manager = ListeningManager();
+
+        Assert.IsFalse(manager.RecordLiveGap("unknown", 1).IsSuccess);
+        Assert.IsFalse(manager.RecordLiveGap("no_replay", 0).IsSuccess);
+        Assert.AreEqual(0UL, manager.Snapshot.Metrics.GapEvents);
+    }
+
+    [TestMethod]
+    public void Dequeue_with_expected_generation_discards_stale_task()
+    {
+        var manager = ListeningManager();
+        var now = DateTimeOffset.UnixEpoch;
+        Assert.IsTrue(manager.ObserveChatMessage(Message("m-stale"), now).IsAccepted);
+
+        Assert.IsFalse(manager.TryDequeue(
+            now,
+            out _,
+            expectedGeneration: manager.Snapshot.Generation + 1));
+        Assert.AreEqual(0, manager.Snapshot.QueueCount);
+    }
+
+    [TestMethod]
     public void Sidecar_inconclusive_is_terminal_and_not_success()
     {
         var manager = ListeningManager();

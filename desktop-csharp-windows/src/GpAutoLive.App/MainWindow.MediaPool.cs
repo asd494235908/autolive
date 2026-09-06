@@ -253,6 +253,10 @@ public partial class MainWindow
         await StopVideoStateWatcherAsync().ConfigureAwait(true);
         await StopAudioCompletionWatcherAsync().ConfigureAwait(true);
         await StopInterludeForPriorityAsync().ConfigureAwait(true);
+        if (!await StopMicrophoneAsync().ConfigureAwait(true))
+        {
+            return false;
+        }
         var audioState = _audioPlaybackController.Snapshot.State;
         if (audioState is WindowsAudioPlaybackState.Starting
             or WindowsAudioPlaybackState.Playing
@@ -329,9 +333,12 @@ public partial class MainWindow
             Title = "选择要加入播放池的媒体",
         };
         return Task.FromResult<MediaImportRequest?>(dialog.ShowDialog(this) == true
-            ? new MediaImportRequest(MediaImportOperation.ReplaceAll, dialog.FileNames)
+            ? CreateFileImportRequest(dialog.FileNames)
             : null);
     }
+
+    internal static MediaImportRequest CreateFileImportRequest(IReadOnlyList<string?> paths) =>
+        new(MediaImportOperation.Append, paths);
 
     private async Task<MediaImportRequest?> CreateOpenPlaylistImportRequestAsync()
     {
@@ -453,8 +460,7 @@ public partial class MainWindow
             // the ListBox has not received its items yet.
             var snapshotIndex = _mediaPool.Snapshot.SourceMediaIndex;
             if (snapshotIndex < _state.MediaItems.Count
-                && (string.IsNullOrWhiteSpace(_state.MediaSearchText)
-                    || _state.VisibleMediaItems.Contains(_state.MediaItems[snapshotIndex])))
+                && _state.VisibleMediaItems.Contains(_state.MediaItems[snapshotIndex]))
             {
                 selectedIndex = snapshotIndex;
             }
@@ -540,7 +546,16 @@ public partial class MainWindow
     private async Task<bool> PrepareMediaPoolCommitAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return await StopMediaForMutationAsync().ConfigureAwait(true);
+        if (Dispatcher.CheckAccess())
+        {
+            return await StopMediaForMutationAsync().ConfigureAwait(true);
+        }
+
+        var operation = Dispatcher.InvokeAsync(
+            StopMediaForMutationAsync,
+            DispatcherPriority.Send,
+            cancellationToken);
+        return await operation.Task.Unwrap().ConfigureAwait(false);
     }
 
     private bool ConfirmMediaMutation(string title, string message) =>

@@ -1,16 +1,12 @@
-using System.Diagnostics;
-using System.ComponentModel;
 using System.Collections.Concurrent;
 
 namespace GpAutoLive.Windows;
 
-/// <summary>媒体和输出资源跨客户端所有权门禁结果。</summary>
+/// <summary>C# 客户端媒体和输出资源所有权门禁结果。</summary>
 public enum WindowsMediaOutputOwnershipCode
 {
     Acquired,
     AlreadyOwned,
-    ReferenceClientRunning,
-    ReferenceClientProbeFailed,
     NotWindows,
     InvalidMutexName,
     ApiUnavailable,
@@ -25,19 +21,16 @@ public sealed record WindowsMediaOutputOwnershipResult(
 }
 
 /// <summary>
-/// C# 客户端持有的全局媒体/输出资源租约。
+/// C# 客户端持有的媒体/输出资源租约。
 /// <para>
-/// 互斥名称是 C# 与 Rust/Tauri 共同遵守的跨客户端协议；进程探测仅用于
-/// 提供更明确的启动提示，命名 Mutex 才是实际的双边资源所有权门禁。
+/// 该互斥只保护 C# 客户端自己的进程内外输出生命周期；Rust/Tauri 是隔离的
+/// 参考客户端，不在 C# 运行时启动、探测或参与此租约。
 /// </para>
 /// </summary>
 public sealed class WindowsMediaOutputOwnershipLease : IDisposable
 {
-    /// <summary>预留给所有桌面客户端的同一用户会话资源锁名称。</summary>
-    public const string SharedMutexName = "Local\\GpAutoLive.MediaOutput.Owner.v1";
-
-    /// <summary>现有 Rust/Tauri 正式桌面进程的文件名（不含 .exe）。</summary>
-    public const string ReferenceClientProcessName = "autolive-desktop-core";
+    /// <summary>C# 客户端当前用户会话的媒体/输出资源锁名称。</summary>
+    public const string CSharpMutexName = "Local\\GpAutoLive.CSharp.MediaOutput.Owner.v1";
 
     private static readonly ConcurrentDictionary<string, byte> ProcessOwnedNames = new(StringComparer.OrdinalIgnoreCase);
 
@@ -53,35 +46,18 @@ public sealed class WindowsMediaOutputOwnershipLease : IDisposable
     /// <summary>实际持有的受限互斥名称，供诊断和测试核对。</summary>
     public string MutexName { get; }
 
-    /// <summary>
-    /// 尝试立即取得资源锁。不会等待其他客户端，不会启动或终止任何进程。
-    /// <paramref name="referenceClientProbe"/> 仅用于测试或宿主注入；生产默认探测 Rust 进程，
-    /// 但最终仍以共享命名 Mutex 的立即获取结果为准。
-    /// </summary>
-    public static WindowsMediaOutputOwnershipResult TryAcquire(
-        string? mutexName = null,
-        Func<bool>? referenceClientProbe = null)
+    /// <summary>尝试立即取得 C# 自己的资源锁；不会等待、启动或探测其他客户端。</summary>
+    public static WindowsMediaOutputOwnershipResult TryAcquire(string? mutexName = null)
     {
         if (!OperatingSystem.IsWindows())
         {
             return new(WindowsMediaOutputOwnershipCode.NotWindows);
         }
 
-        mutexName ??= SharedMutexName;
+        mutexName ??= CSharpMutexName;
         if (!IsValidMutexName(mutexName))
         {
             return new(WindowsMediaOutputOwnershipCode.InvalidMutexName);
-        }
-
-        var initialReferenceProbe = TryProbeReferenceClient(referenceClientProbe);
-        if (initialReferenceProbe is null)
-        {
-            return new(WindowsMediaOutputOwnershipCode.ReferenceClientProbeFailed);
-        }
-
-        if (initialReferenceProbe.Value)
-        {
-            return new(WindowsMediaOutputOwnershipCode.ReferenceClientRunning);
         }
 
         if (!ProcessOwnedNames.TryAdd(mutexName, 0))
@@ -112,21 +88,6 @@ public sealed class WindowsMediaOutputOwnershipLease : IDisposable
             }
 
             mutexOwned = true;
-
-            // The first process probe and mutex acquisition are separate kernel operations.
-            // Re-check while holding the mutex so a reference client that starts in that
-            // window cannot be accepted by this client. The Rust/Tauri client now consumes
-            // this same named mutex; the process probe remains only a diagnostic fast path.
-            var finalReferenceProbe = TryProbeReferenceClient(referenceClientProbe);
-            if (finalReferenceProbe is null)
-            {
-                return new(WindowsMediaOutputOwnershipCode.ReferenceClientProbeFailed);
-            }
-
-            if (finalReferenceProbe.Value)
-            {
-                return new(WindowsMediaOutputOwnershipCode.ReferenceClientRunning);
-            }
 
             var lease = new WindowsMediaOutputOwnershipLease(mutex, mutexName);
             mutex = null;
@@ -198,23 +159,6 @@ public sealed class WindowsMediaOutputOwnershipLease : IDisposable
         }
     }
 
-    private static bool? TryProbeReferenceClient(Func<bool>? referenceClientProbe)
-    {
-        if (referenceClientProbe is null)
-        {
-            return TryDetectReferenceClient();
-        }
-
-        try
-        {
-            return referenceClientProbe();
-        }
-        catch (Exception exception) when (IsProbeFailure(exception))
-        {
-            return null;
-        }
-    }
-
     private static void TryReleaseMutex(Mutex mutex)
     {
         try
@@ -236,41 +180,4 @@ public sealed class WindowsMediaOutputOwnershipLease : IDisposable
             || name.StartsWith("Global\\", StringComparison.Ordinal))
         && name.All(static character => !char.IsControl(character));
 
-    private static bool? TryDetectReferenceClient()
-    {
-        try
-        {
-            foreach (var process in Process.GetProcessesByName(ReferenceClientProcessName))
-            {
-                try
-                {
-                    if (!process.HasExited)
-                    {
-                        return true;
-                    }
-                }
-                catch (InvalidOperationException)
-                {
-                    // 进程在枚举期间退出；继续检查其他实例。
-                }
-                finally
-                {
-                    process.Dispose();
-                }
-            }
-
-            return false;
-        }
-        catch (Exception exception) when (IsProbeFailure(exception))
-        {
-            return null;
-        }
-    }
-
-    private static bool IsProbeFailure(Exception exception) =>
-        exception is InvalidOperationException
-            or UnauthorizedAccessException
-            or NotSupportedException
-            or PlatformNotSupportedException
-            or Win32Exception;
 }

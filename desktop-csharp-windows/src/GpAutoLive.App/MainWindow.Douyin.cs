@@ -10,6 +10,8 @@ namespace GpAutoLive.App;
 
 public partial class MainWindow
 {
+    private string? _douyinQrImagePath;
+
     private async void StartDouyinButton_Click(object sender, RoutedEventArgs e)
     {
         if (!_login.CanEnterWorkbench)
@@ -151,6 +153,7 @@ public partial class MainWindow
         }
 
         var status = _douyinLive.Snapshot;
+        UpdateDouyinQrProjection(_douyinProbeHost.Snapshot);
         var authorized = _login.CanEnterWorkbench;
         var douyinActive = status.State is DouyinLiveState.WaitingQr
             or DouyinLiveState.LoggedIn
@@ -160,6 +163,7 @@ public partial class MainWindow
             or DouyinLiveState.Stopping;
         var douyinPill = status.State switch
         {
+            DouyinLiveState.Listening when status.ReplySendingBlocked => "发送已暂停",
             DouyinLiveState.Listening => "已连接",
             DouyinLiveState.Paused => "已暂停",
             DouyinLiveState.WaitingQr or DouyinLiveState.LoggedIn or DouyinLiveState.RoomResolved => "连接中",
@@ -167,6 +171,9 @@ public partial class MainWindow
             DouyinLiveState.Passed => "已通过",
             _ => "待连接",
         };
+        var gapSuffix = status.Metrics.GapDroppedCount > 0
+            ? $" · 数据缺口 {status.Metrics.GapDroppedCount} 条"
+            : string.Empty;
         SetStatusPill(DouyinStatePillText, douyinPill, douyinActive);
         var canEditConfig = status.State is DouyinLiveState.Idle
             or DouyinLiveState.Failed
@@ -187,14 +194,50 @@ public partial class MainWindow
             DouyinLiveState.WaitingQr => "等待扫码 · 凭据仅存当前进程内存",
             DouyinLiveState.LoggedIn => "扫码已确认 · 直播间解析待验收",
             DouyinLiveState.RoomResolved => "直播间已解析 · 公屏监听待验收",
-            DouyinLiveState.Listening => $"公屏监听中 · 队列 {status.QueueCount}/{status.QueueCapacity} · sidecar 待验收",
-            DouyinLiveState.Paused => $"已暂停 · 队列 {status.QueueCount}/{status.QueueCapacity}",
+            DouyinLiveState.Listening when status.ReplySendingBlocked => $"公屏仍在监听 · 回复已因风控/限流暂停 · 队列 {status.QueueCount}/{status.QueueCapacity}{gapSuffix}",
+            DouyinLiveState.Listening => $"公屏监听中 · 队列 {status.QueueCount}/{status.QueueCapacity} · sidecar 待验收{gapSuffix}",
+            DouyinLiveState.Paused => $"已暂停 · 队列 {status.QueueCount}/{status.QueueCapacity}{gapSuffix}",
             DouyinLiveState.Stopping => "抖音 M1 正在停止",
             DouyinLiveState.Failed => $"M1 失败 · {status.Error ?? "请检查兼容探针"}",
             DouyinLiveState.Inconclusive => $"证据不足 · {status.Error ?? "本轮未观察到完整回显"}",
             DouyinLiveState.Passed => "兼容探针已通过 · 正式发布门禁仍待验收",
             _ => "抖音 M1 状态未知"
         };
+    }
+
+    private void UpdateDouyinQrProjection(WindowsDouyinProbeHostSnapshot hostSnapshot)
+    {
+        var qrPath = hostSnapshot.QrPath;
+        if (string.IsNullOrWhiteSpace(qrPath))
+        {
+            _douyinQrImagePath = null;
+            DouyinQrImage.Source = null;
+            DouyinQrPanel.Visibility = Visibility.Collapsed;
+            DouyinQrStatusText.Text = hostSnapshot.State == WindowsDouyinProbeHostState.Running
+                ? "等待 sidecar 发放二维码"
+                : "未生成二维码";
+            return;
+        }
+
+        if (!string.Equals(_douyinQrImagePath, qrPath, StringComparison.OrdinalIgnoreCase))
+        {
+            if (DouyinQrImageLoader.TryLoad(qrPath, out var image, out var error))
+            {
+                DouyinQrImage.Source = image;
+                _douyinQrImagePath = qrPath;
+                DouyinQrStatusText.Text = "请使用抖音扫码；凭据不会写入配置文件";
+            }
+            else
+            {
+                _douyinQrImagePath = null;
+                DouyinQrImage.Source = null;
+                DouyinQrStatusText.Text = error ?? "二维码文件不可用";
+            }
+        }
+
+        DouyinQrPanel.Visibility = DouyinQrImage.Source is null
+            ? Visibility.Collapsed
+            : Visibility.Visible;
     }
 
     private async Task LoadDouyinConfigAsync()

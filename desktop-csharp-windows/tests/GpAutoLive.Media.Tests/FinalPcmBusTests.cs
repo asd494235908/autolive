@@ -85,4 +85,38 @@ public sealed class FinalPcmBusTests
         Assert.AreEqual(2, bus.Snapshot.OutputAvailableFrames);
         Assert.IsTrue(bus.Snapshot.IsClosed);
     }
+
+    [TestMethod]
+    public void Discard_overlay_pending_clears_local_and_rtmp_tails_without_closing_bus()
+    {
+        using var bus = new FinalPcmBus(capacityFrames: 8, channels: 1);
+        bus.SetRtmpConsumerAttached(true);
+
+        Assert.IsTrue(bus.TryPublishOverlay([1, 2], out _, out var error), error?.Message);
+        Assert.AreEqual(2, bus.OutputOverlayBuffer.Snapshot.AvailableFrames);
+        Assert.AreEqual(2, bus.RtmpOverlayBuffer.Snapshot.AvailableFrames);
+
+        bus.DiscardOverlayPending();
+
+        Assert.AreEqual(0, bus.OutputOverlayBuffer.Snapshot.AvailableFrames);
+        Assert.AreEqual(0, bus.RtmpOverlayBuffer.Snapshot.AvailableFrames);
+        Assert.IsFalse(bus.Snapshot.IsClosed);
+    }
+
+    [TestMethod]
+    public void Spectrum_diagnostics_follow_base_and_overlay_pcm_without_consuming_output()
+    {
+        using var bus = new FinalPcmBus(capacityFrames: 8_192, channels: 1);
+        var samples = Enumerable.Range(0, 4_096)
+            .Select(index => (float)Math.Sin(index * Math.PI / 8))
+            .ToArray();
+
+        Assert.IsTrue(bus.TryPublish(samples, out _, out var error), error?.Message);
+        Assert.IsTrue(bus.TryPublishOverlay(samples, out _, out error), error?.Message);
+
+        Assert.IsTrue(bus.OutputSpectrum.HasSignal);
+        Assert.IsTrue(bus.OverlaySpectrum.HasSignal);
+        Assert.AreEqual(4_096, bus.OutputBuffer.Snapshot.AvailableFrames);
+        Assert.AreEqual(4_096, bus.OutputOverlayBuffer.Snapshot.AvailableFrames);
+    }
 }

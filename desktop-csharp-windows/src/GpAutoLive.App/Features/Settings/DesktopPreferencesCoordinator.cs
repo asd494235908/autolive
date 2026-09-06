@@ -96,6 +96,27 @@ public sealed class DesktopPreferencesCoordinator
         return await SaveCoreAsync(next, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>保存主窗口周期规则；规则属于低敏感本地偏好，不触碰播放会话。</summary>
+    public async Task<string?> SaveEffectCycleSettingsAsync(
+        EffectCycleSettings settings,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        if (!_loaded)
+        {
+            _loaded = true;
+        }
+
+        try
+        {
+            return await SaveCoreAsync(settings.ApplyTo(_current), cancellationToken).ConfigureAwait(false);
+        }
+        catch (ConfigurationValidationException)
+        {
+            return "效果周期超出允许范围，本次修改未保存";
+        }
+    }
+
     /// <summary>
     /// 保存设置窗口提交的非敏感偏好与主窗口几何；白名单和规范化由 Core 完成，
     /// 写入仍使用同一原子 INI 边界。

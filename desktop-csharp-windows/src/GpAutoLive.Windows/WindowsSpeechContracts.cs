@@ -25,6 +25,7 @@ public enum WindowsSpeechFailureCode
     VoiceUnavailable,
     SapiUnavailable,
     BridgeUnavailable,
+    FinalPcmBusUnavailable,
     SpeechFailed,
     Closed
 }
@@ -104,10 +105,16 @@ public interface IWindowsSpeechBridge : IAsyncDisposable
     /// <summary>读取已脱敏的本地 voice 目录。</summary>
     WindowsSpeechVoiceCatalogResult GetVoices();
 
-    /// <summary>创建单个本地朗读操作；实际启动由操作的 Started 任务确认。</summary>
+    /// <summary>
+    /// 创建单个本地朗读操作；实际启动由操作的 Started 任务确认。
+    /// pcmSink 接收 48kHz、16-bit little-endian PCM；返回 false 表示最终 PCM 总线已关闭，
+    /// 桥接器必须停止 SAPI，不得回退到系统默认音频设备。
+    /// </summary>
     Task<IWindowsSpeechOperation> StartAsync(
         string text,
         string? voiceKey,
+        int pcmChannels,
+        Func<ReadOnlyMemory<byte>, bool>? pcmSink,
         CancellationToken cancellationToken = default);
 }
 

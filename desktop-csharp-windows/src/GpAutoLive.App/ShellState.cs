@@ -7,6 +7,13 @@ using GpAutoLive.Core;
 
 namespace GpAutoLive.App;
 
+public enum MediaKindFilter
+{
+    All,
+    Video,
+    Audio,
+}
+
 public sealed class ShellState : INotifyPropertyChanged
 {
     private static readonly IReadOnlyList<MediaListItemViewModel> EmptyMediaItems = Array.Empty<MediaListItemViewModel>();
@@ -15,10 +22,14 @@ public sealed class ShellState : INotifyPropertyChanged
     private IReadOnlyList<MediaListItemViewModel> _mediaItems = EmptyMediaItems;
     private IReadOnlyList<MediaListItemViewModel> _visibleMediaItems = EmptyMediaItems;
     private string _mediaSearchText = string.Empty;
+    private MediaKindFilter _mediaKindFilter = MediaKindFilter.All;
     private bool _videoProcessing = true;
     private bool _audioProcessing = true;
     private long _audioProcessingRevision;
     private double _playbackProgress;
+    private double _videoEffectCycleProgress;
+    private double _audioEffectCycleProgress;
+    private double _interludeEffectCycleProgress;
     private string _statusMessage = "就绪 · C# Windows 壳";
     private GeneratedVideoEffectSnapshot _videoParameterSnapshot = GeneratedVideoEffectSnapshot.Create();
     private GeneratedAudioEffectSnapshot _audioParameterSnapshot = GeneratedAudioEffectSnapshot.Create();
@@ -118,6 +129,22 @@ public sealed class ShellState : INotifyPropertyChanged
         }
     }
 
+    public MediaKindFilter MediaKindFilter
+    {
+        get => _mediaKindFilter;
+        set
+        {
+            if (_mediaKindFilter == value)
+            {
+                return;
+            }
+
+            _mediaKindFilter = value;
+            OnPropertyChanged();
+            RefreshVisibleMediaItems();
+        }
+    }
+
     public IReadOnlyList<MediaListItemViewModel> VisibleMediaItems => _visibleMediaItems;
 
     public string MediaCountLabel => $"{MediaItems.Count} / {MediaPoolRules.MaxItems}";
@@ -156,7 +183,10 @@ public sealed class ShellState : INotifyPropertyChanged
 
             _videoProcessing = value;
             OnPropertyChanged();
-            OnPropertyChanged(nameof(VideoProcessingLabel));
+            if (!value)
+            {
+                SetVideoEffectCycleProgress(0);
+            }
             StatusMessage = value ? "视频处理已开启（壳状态）" : "视频处理已关闭（壳状态）";
         }
     }
@@ -175,6 +205,10 @@ public sealed class ShellState : INotifyPropertyChanged
             _audioProcessingRevision++;
             OnPropertyChanged();
             OnPropertyChanged(nameof(AudioProcessingLabel));
+            if (!value)
+            {
+                SetAudioEffectCycleProgress(0);
+            }
             StatusMessage = value ? "声音处理已开启（壳状态）" : "声音处理已关闭（壳状态）";
         }
     }
@@ -197,9 +231,34 @@ public sealed class ShellState : INotifyPropertyChanged
         }
     }
 
-    public string PlaybackGlyph => IsPlaying ? "Ⅱ" : "▶";
+    /// <summary>基于 mpv/最终 PCM 真实播放时钟的当前视频变换周期进度（0–100）。</summary>
+    public double VideoEffectCycleProgress => _videoEffectCycleProgress;
 
-    public string VideoProcessingLabel => VideoProcessing ? "已启用" : "已关闭";
+    /// <summary>基于最终 PCM 可听时钟的当前声音变换周期进度（0–100）。</summary>
+    public double AudioEffectCycleProgress => _audioEffectCycleProgress;
+
+    /// <summary>基于插话调度器当前等待窗口的自动变换进度（0–100）。</summary>
+    public double InterludeEffectCycleProgress => _interludeEffectCycleProgress;
+
+    public void SetVideoEffectCycleProgress(double progress) =>
+        SetEffectCycleProgress(
+            ref _videoEffectCycleProgress,
+            progress,
+            nameof(VideoEffectCycleProgress));
+
+    public void SetAudioEffectCycleProgress(double progress) =>
+        SetEffectCycleProgress(
+            ref _audioEffectCycleProgress,
+            progress,
+            nameof(AudioEffectCycleProgress));
+
+    public void SetInterludeEffectCycleProgress(double progress) =>
+        SetEffectCycleProgress(
+            ref _interludeEffectCycleProgress,
+            progress,
+            nameof(InterludeEffectCycleProgress));
+
+    public string PlaybackGlyph => IsPlaying ? "Ⅱ" : "▶";
 
     public string AudioProcessingLabel => AudioProcessing ? "已启用" : "已关闭";
 
@@ -242,6 +301,7 @@ public sealed class ShellState : INotifyPropertyChanged
     {
         PlaybackState = PlaybackState.Stopped;
         PlaybackProgress = 0;
+        ResetEffectCycleProgress();
         StatusMessage = "播放已停止（壳状态）";
     }
 
@@ -259,10 +319,36 @@ public sealed class ShellState : INotifyPropertyChanged
             .ToArray();
         HasMedia = MediaItems.Count > 0;
         PlaybackState = snapshot.PlaybackState;
-        if (!HasMedia || snapshot.PlaybackState is PlaybackState.Stopped)
+        if (!HasMedia
+            || snapshot.PlaybackState is not (PlaybackState.Playing or PlaybackState.Paused))
         {
             PlaybackProgress = 0;
+            ResetEffectCycleProgress();
         }
+    }
+
+    private void ResetEffectCycleProgress()
+    {
+        SetVideoEffectCycleProgress(0);
+        SetAudioEffectCycleProgress(0);
+        SetInterludeEffectCycleProgress(0);
+    }
+
+    private void SetEffectCycleProgress(
+        ref double field,
+        double progress,
+        string propertyName)
+    {
+        var normalized = double.IsFinite(progress)
+            ? Math.Clamp(progress, 0, 100)
+            : 0;
+        if (Math.Abs(field - normalized) < 0.01)
+        {
+            return;
+        }
+
+        field = normalized;
+        OnPropertyChanged(propertyName);
     }
 
     private void OnPropertyChanged([CallerMemberName] string? propertyName = null) =>
@@ -273,9 +359,12 @@ public sealed class ShellState : INotifyPropertyChanged
         var query = MediaSearchText.Trim();
         var visible = string.IsNullOrEmpty(query)
             ? MediaItems
+                .Where(HasSelectedMediaKind)
+                .ToArray()
             : MediaItems
-                .Where(item => item.FileName.Contains(query, StringComparison.OrdinalIgnoreCase)
-                    || item.MediaKindLabel.Contains(query, StringComparison.OrdinalIgnoreCase))
+                .Where(item => HasSelectedMediaKind(item)
+                    && (item.FileName.Contains(query, StringComparison.OrdinalIgnoreCase)
+                        || item.MediaKindLabel.Contains(query, StringComparison.OrdinalIgnoreCase)))
                 .ToArray();
         if (ReferenceEquals(_visibleMediaItems, visible))
         {
@@ -285,4 +374,13 @@ public sealed class ShellState : INotifyPropertyChanged
         _visibleMediaItems = visible;
         OnPropertyChanged(nameof(VisibleMediaItems));
     }
+
+    private bool HasSelectedMediaKind(MediaListItemViewModel item) =>
+        MediaKindFilter switch
+        {
+            MediaKindFilter.All => true,
+            MediaKindFilter.Video => item.MediaKind is MediaKind.Video,
+            MediaKindFilter.Audio => item.MediaKind is MediaKind.Audio,
+            _ => false,
+        };
 }

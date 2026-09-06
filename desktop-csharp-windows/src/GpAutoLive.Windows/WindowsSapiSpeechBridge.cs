@@ -63,11 +63,26 @@ public sealed class WindowsSapiSpeechBridge : IWindowsSpeechBridge
     public Task<IWindowsSpeechOperation> StartAsync(
         string text,
         string? voiceKey,
+        int pcmChannels,
+        Func<ReadOnlyMemory<byte>, bool>? pcmSink,
         CancellationToken cancellationToken = default)
     {
         if (cancellationToken.IsCancellationRequested)
         {
             return Task.FromCanceled<IWindowsSpeechOperation>(cancellationToken);
+        }
+
+        if (pcmSink is null || pcmChannels is < 1 or > 2)
+        {
+            return Task.FromResult<IWindowsSpeechOperation>(
+                SapiSpeechOperation.Failed(
+                    text,
+                    voiceKey,
+                    new(
+                        WindowsSpeechFailureCode.FinalPcmBusUnavailable,
+                        "固定话术必须接入最终 PCM 总线。"),
+                    pcmChannels,
+                    pcmSink));
         }
 
         SapiSpeechOperation operation;
@@ -83,11 +98,18 @@ public sealed class WindowsSapiSpeechBridge : IWindowsSpeechBridge
                 operation = SapiSpeechOperation.Failed(
                     text,
                     voiceKey,
-                    new(WindowsSpeechFailureCode.AlreadyActive, "Windows 本地语音已有活动操作。"));
+                    new(WindowsSpeechFailureCode.AlreadyActive, "Windows 本地语音已有活动操作。"),
+                    pcmChannels,
+                    pcmSink);
             }
             else
             {
-                operation = new SapiSpeechOperation(text, voiceKey, OnOperationCompleted);
+                operation = new SapiSpeechOperation(
+                    text,
+                    voiceKey,
+                    pcmChannels,
+                    pcmSink,
+                    OnOperationCompleted);
                 _active = operation;
             }
         }
@@ -262,9 +284,16 @@ public sealed class WindowsSapiSpeechBridge : IWindowsSpeechBridge
         private const int SvsfPurgeBeforeSpeak = 2;
         // SpeechRunState.SRSInactive = 0; 1/2 mean queued/speaking in SAPI Automation.
         private const int SpeechStateInactive = 0;
+        private const int SapiFormat48kHz16BitMono = 38;
+        private const int SapiFormat48kHz16BitStereo = 39;
+        private const int MaxFramesPerPcmChunk = 4_096;
+        private const int MaxCapturedPcmBytes = 24 * 1024 * 1024;
+        private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(50);
         private static readonly TimeSpan JoinTimeout = TimeSpan.FromSeconds(2);
         private readonly string _text;
         private readonly string? _voiceKey;
+        private readonly int _pcmChannels;
+        private readonly Func<ReadOnlyMemory<byte>, bool>? _pcmSink;
         private readonly Action<SapiSpeechOperation> _completed;
         private readonly CancellationTokenSource _cancel = new();
         private readonly TaskCompletionSource<WindowsSpeechBridgeStartResult> _started =
@@ -280,10 +309,14 @@ public sealed class WindowsSapiSpeechBridge : IWindowsSpeechBridge
         public SapiSpeechOperation(
             string text,
             string? voiceKey,
+            int pcmChannels,
+            Func<ReadOnlyMemory<byte>, bool>? pcmSink,
             Action<SapiSpeechOperation> completed)
         {
             _text = text;
             _voiceKey = voiceKey;
+            _pcmChannels = pcmChannels;
+            _pcmSink = pcmSink;
             _completed = completed;
         }
 
@@ -294,9 +327,16 @@ public sealed class WindowsSapiSpeechBridge : IWindowsSpeechBridge
         public static SapiSpeechOperation Failed(
             string text,
             string? voiceKey,
-            WindowsSpeechError error)
+            WindowsSpeechError error,
+            int pcmChannels,
+            Func<ReadOnlyMemory<byte>, bool>? pcmSink)
         {
-            var operation = new SapiSpeechOperation(text, voiceKey, static _ => { });
+            var operation = new SapiSpeechOperation(
+                text,
+                voiceKey,
+                pcmChannels,
+                pcmSink,
+                static _ => { });
             operation._started.TrySetResult(new(false, error));
             operation._completion.TrySetResult(new(WindowsSpeechBridgeCompletionKind.Failed, error));
             return operation;
@@ -381,6 +421,8 @@ public sealed class WindowsSapiSpeechBridge : IWindowsSpeechBridge
         {
             object? voice = null;
             object? selectedToken = null;
+            object? audioStream = null;
+            object? audioFormat = null;
             try
             {
                 if (_cancel.IsCancellationRequested)
@@ -416,10 +458,41 @@ public sealed class WindowsSapiSpeechBridge : IWindowsSpeechBridge
                     dynamicVoice.Voice = selectedToken;
                 }
 
+                var streamProgId = Type.GetTypeFromProgID("SAPI.SpMemoryStream", throwOnError: false);
+                var formatProgId = Type.GetTypeFromProgID("SAPI.SpAudioFormat", throwOnError: false);
+                if (streamProgId is null || formatProgId is null)
+                {
+                    CompleteFailed(new(
+                        WindowsSpeechFailureCode.SapiUnavailable,
+                        "Windows SAPI PCM 输出当前不可用。",
+                        Retryable: true));
+                    return;
+                }
+
+                audioStream = Activator.CreateInstance(streamProgId);
+                audioFormat = Activator.CreateInstance(formatProgId);
+                if (audioStream is null || audioFormat is null)
+                {
+                    CompleteFailed(new(
+                        WindowsSpeechFailureCode.SapiUnavailable,
+                        "Windows SAPI PCM 输出当前不可用。",
+                        Retryable: true));
+                    return;
+                }
+
+                dynamic dynamicFormat = audioFormat;
+                dynamicFormat.Type = _pcmChannels == 1
+                    ? SapiFormat48kHz16BitMono
+                    : SapiFormat48kHz16BitStereo;
+                dynamic dynamicStream = audioStream;
+                dynamicStream.Format = audioFormat;
+                dynamicVoice.AudioOutputStream = audioStream;
                 dynamicVoice.Speak(_text, SvsFlagsAsync);
                 _started.TrySetResult(new(true));
 
                 var observedSpeaking = false;
+                var publishedBytes = 0;
+                var publishedAnyPcm = false;
                 while (true)
                 {
                     if (_cancel.IsCancellationRequested)
@@ -429,14 +502,42 @@ public sealed class WindowsSapiSpeechBridge : IWindowsSpeechBridge
                         return;
                     }
 
-                    if (IsDone(dynamicVoice, ref observedSpeaking))
+                    var publishedFrames = 0;
+                    var pcmState = PublishNextPcmChunk(
+                        audioStream!,
+                        ref publishedBytes,
+                        out publishedFrames);
+                    if (pcmState is PcmPublishState.Failed)
                     {
+                        Purge(dynamicVoice);
+                        CompleteFailed(new(
+                            WindowsSpeechFailureCode.FinalPcmBusUnavailable,
+                            "固定话术 PCM 无法写入最终总线。",
+                            Retryable: true));
+                        return;
+                    }
+
+                    publishedAnyPcm |= publishedFrames > 0;
+                    var speechDone = IsDone(dynamicVoice, ref observedSpeaking);
+                    if (speechDone && pcmState is PcmPublishState.Drained)
+                    {
+                        if (!publishedAnyPcm)
+                        {
+                            CompleteFailed(new(
+                                WindowsSpeechFailureCode.SpeechFailed,
+                                "Windows SAPI 未生成可播放 PCM。"));
+                            return;
+                        }
+
                         _completion.TrySetResult(new(WindowsSpeechBridgeCompletionKind.Completed));
                         _completed(this);
                         return;
                     }
 
-                    _cancel.Token.WaitHandle.WaitOne(50);
+                    if (publishedFrames == 0)
+                    {
+                        _cancel.Token.WaitHandle.WaitOne(PollInterval);
+                    }
                 }
             }
             catch (Exception)
@@ -445,6 +546,8 @@ public sealed class WindowsSapiSpeechBridge : IWindowsSpeechBridge
             }
             finally
             {
+                ReleaseCom(audioFormat);
+                ReleaseCom(audioStream);
                 ReleaseCom(selectedToken);
                 ReleaseCom(voice);
                 _threadExited.TrySetResult(null);
@@ -479,6 +582,70 @@ public sealed class WindowsSapiSpeechBridge : IWindowsSpeechBridge
             {
                 ReleaseCom(status);
             }
+        }
+
+        private PcmPublishState PublishNextPcmChunk(
+            object stream,
+            ref int publishedBytes,
+            out int publishedFrames)
+        {
+            publishedFrames = 0;
+            object? data = null;
+            try
+            {
+                dynamic dynamicStream = stream;
+                data = dynamicStream.GetData();
+                if (data is not byte[] pcm)
+                {
+                    return PcmPublishState.Failed;
+                }
+
+                if (pcm.Length < publishedBytes || pcm.Length > MaxCapturedPcmBytes)
+                {
+                    return PcmPublishState.Failed;
+                }
+
+                var bytesPerFrame = checked(_pcmChannels * sizeof(short));
+                var availableBytes = pcm.Length - publishedBytes;
+                var completeBytes = availableBytes - availableBytes % bytesPerFrame;
+                if (completeBytes == 0)
+                {
+                    return availableBytes == 0
+                        ? PcmPublishState.Waiting
+                        : PcmPublishState.Failed;
+                }
+
+                var frames = Math.Min(completeBytes / bytesPerFrame, MaxFramesPerPcmChunk);
+                var chunkBytes = checked(frames * bytesPerFrame);
+                if (_pcmSink is null || !_pcmSink(pcm.AsMemory(publishedBytes, chunkBytes)))
+                {
+                    return PcmPublishState.Failed;
+                }
+
+                publishedBytes += chunkBytes;
+                publishedFrames = frames;
+                var cadenceMs = Math.Max(1, (int)Math.Round(frames * 1_000D / 48_000D));
+                _cancel.Token.WaitHandle.WaitOne(cadenceMs);
+                return publishedBytes == pcm.Length
+                    ? PcmPublishState.Drained
+                    : PcmPublishState.Published;
+            }
+            catch (Exception)
+            {
+                return PcmPublishState.Failed;
+            }
+            finally
+            {
+                ReleaseCom(data);
+            }
+        }
+
+        private enum PcmPublishState
+        {
+            Waiting,
+            Published,
+            Drained,
+            Failed
         }
 
         private static void Purge(dynamic voice)

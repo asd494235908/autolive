@@ -45,6 +45,7 @@ public sealed class MediaDropPayloadTests
             new[] { @"C:\media\notes.txt" });
 
         Assert.IsFalse(MediaDropPayload.HasCandidateFiles(data));
+        Assert.IsFalse(MediaDropPayload.TryReadPaths(data, out _));
     }
 
     [TestMethod]

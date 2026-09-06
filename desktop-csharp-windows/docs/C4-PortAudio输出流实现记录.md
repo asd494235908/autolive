@@ -15,7 +15,7 @@
 - `WindowsPortAudioInputStream` 提供显式启用的本地输入流，使用预分配回调缓冲写入固定容量环缓；它不执行识别、模型调用或网络上传。
 - `MicrophoneInterludeGate` 只提供本地 RMS 电平、迟滞和 hangover 状态，作为后续 VAD 接入的窄边界；不会把能量门控宣传为 AEC/降噪/AGC。
 - `WindowsPortAudioNative` 对 `Pa_IsStreamActive`/`Pa_IsStreamStopped` 使用可选导出；缺失导出返回 `Unknown`，不把旧版 DLL 误判为故障。输出快照额外记录硬件状态、回调次数和最后一次原生状态旗标。
-- `WindowsPortAudioOutputRecovery` 只在会话未暂停且状态为 `Stopped`、`Inactive` 或 `QueryError` 时工作，按最多 3 次、250/500/1000 ms 退避重新打开同一设备配置；第一次重开失败关闭原生句柄后，后续尝试仍保留恢复资格，不会被误判成“尚未启动”的初始调用。恢复失败立即取消会话并 fail-closed，不清空 PCM 环缓、不无限重试。
+- `WindowsPortAudioOutputRecovery` 只在会话未暂停且状态为 `Stopped`、`Inactive` 或 `QueryError` 时工作，按最多 3 次、250/500/1000 ms 退避重新打开同一设备配置；第一次重开失败关闭原生句柄后，后续尝试仍保留恢复资格，不会被误判成“尚未启动”的初始调用。恢复委托发生可预期的原生/对象生命周期异常时统一投影为脱敏 `RestartFailed`，仍走相同有界重试；恢复失败立即取消会话并 fail-closed，不清空 PCM 环缓、不无限重试。
 - `WindowsPortAudioInputStream` 同样投影 `Pa_IsStreamActive`/`Pa_IsStreamStopped` 的健康状态、回调次数和最后一次状态旗标；缺少可选导出时返回 `Unknown`，不把兼容性差异误报为设备故障。麦克风门控观察器发现 `Stopped`、`Inactive` 或 `QueryError` 后停止输入并进入 `Failed`，不自动无限重开，用户可在修复设备后重新启用。
 
 ## 明确未接入
@@ -28,7 +28,7 @@
 
 ## 验证
 
-- `WindowsPortAudioOutputStreamTests` 覆盖无效路径、缺失资源、无效配置、取消、停止幂等、关闭后拒绝启动、未创建健康状态、有界退避策略、三次恢复尝试上限，以及首次重开失败后下一次仍按恢复路径执行；启用显式 PortAudio 夹具时还验证真实句柄关闭后的第二次重开分类。
+- `WindowsPortAudioOutputStreamTests` 覆盖无效路径、缺失资源、无效配置、取消、停止幂等、关闭后拒绝启动、未创建健康状态、有界退避策略、三次恢复尝试上限、恢复委托原生异常的脱敏分类，以及首次重开失败后下一次仍按恢复路径执行；启用显式 PortAudio 夹具时还验证真实句柄关闭后的第二次重开分类。
 - `WindowsPortAudioInputStreamTests` 覆盖未创建输入流的 `NotCreated` 健康回退、回调计数/状态旗标初值、资源/配置/取消和关闭边界；`WindowsMicrophoneInterludeController` 的异步健康观察保持 50 ms 轮询、有界停止和取消 Join。
 - `FinalPcmBusTests` 覆盖双路顺序、满载丢旧、形状/容量和关闭排空；`WindowsRtmpFinalPcmPumpTests` 覆盖缺宿主、宿主未运行和关闭来源排空。
 - 本机真实 DLL 冒烟使用 48 kHz、双声道、256 帧输出流启动约 500 ms 后停止成功；环缓为空时仅输出静音，未写入媒体或网络。

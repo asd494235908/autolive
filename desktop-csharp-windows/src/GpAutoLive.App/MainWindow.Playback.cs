@@ -24,8 +24,11 @@ public partial class MainWindow
     private async void NextButton_Click(object sender, RoutedEventArgs e) =>
         await NavigateMediaAsync(next: true).ConfigureAwait(true);
 
-    private Task NavigateMediaAsync(bool next) =>
-        RunPlaybackCommandAsync(() => NavigateMediaCoreAsync(next));
+    private Task NavigateMediaAsync(bool next)
+    {
+        CancelRtmpReconnect();
+        return RunPlaybackCommandAsync(() => NavigateMediaCoreAsync(next));
+    }
 
     private async Task NavigateMediaCoreAsync(bool next)
     {
@@ -50,6 +53,10 @@ public partial class MainWindow
 
         await StopVideoStateWatcherAsync().ConfigureAwait(true);
         await StopInterludeForPriorityAsync().ConfigureAwait(true);
+        if (!await StopMicrophoneAsync().ConfigureAwait(true))
+        {
+            return;
+        }
 
         var audioControllerState = _audioPlaybackController.Snapshot.State;
         var audioSessionWasActive = audioControllerState is WindowsAudioPlaybackState.Starting
@@ -147,6 +154,7 @@ public partial class MainWindow
                     return;
                 }
 
+                StartAudioCompletionWatcher(_mediaPool.CurrentIdentity);
                 AudioDeviceStatusText.Text = "视频已切换 · 新声音已连接";
             }
         }
@@ -377,6 +385,7 @@ public partial class MainWindow
             && controllerSnapshot.Runtime.State is WindowsMpvPlaybackRuntimeState.Running;
         var audioUnavailable = false;
         var audioRecovered = false;
+        var audioSessionStarted = false;
         WindowsMpvPlaybackControllerResult controllerResult;
         var launchMode = MpvLaunchMode.Original;
         var startedMode = MpvLaunchMode.Original;
@@ -433,6 +442,7 @@ public partial class MainWindow
                             if (restartedAudio.IsSuccess)
                             {
                                 audioRecovered = true;
+                                audioSessionStarted = true;
                                 AudioDeviceStatusText.Text = "视频声音已恢复 · 从当前时间点重新连接";
                             }
                             else
@@ -532,6 +542,7 @@ public partial class MainWindow
             }
             else
             {
+                audioSessionStarted = true;
                 AudioDeviceStatusText.Text = "视频声音已连接 · FFmpeg PCM / PortAudio";
             }
         }
@@ -563,6 +574,11 @@ public partial class MainWindow
         {
             StartVideoStateWatcher(identity);
         }
+        if (result.IsSuccess
+            && ShouldStartAudioCompletionWatcher(result.Snapshot.PlaybackState, audioSessionStarted))
+        {
+            StartAudioCompletionWatcher(identity);
+        }
 
         ApplyMediaOperation(result, result.IsSuccess
             ? result.Snapshot.PlaybackState is PlaybackState.Playing
@@ -592,6 +608,11 @@ public partial class MainWindow
             or WindowsAudioPlaybackState.Failed
             or WindowsAudioPlaybackState.Completed);
 
+    internal static bool ShouldStartAudioCompletionWatcher(
+        PlaybackState playbackState,
+        bool audioSessionStarted) =>
+        playbackState is PlaybackState.Playing && audioSessionStarted;
+
     private async Task<WindowsAudioPlaybackResult> PauseVideoAudioAsync()
     {
         var cancelledCandidate = await _audioPlaybackController.CancelPreparedNextAsync()
@@ -601,7 +622,11 @@ public partial class MainWindow
             : await _audioPlaybackController.PauseAsync().ConfigureAwait(true);
     }
 
-    private Task StopPlaybackAsync() => RunPlaybackCommandAsync(StopPlaybackCoreAsync);
+    private Task StopPlaybackAsync()
+    {
+        CancelRtmpReconnect();
+        return RunPlaybackCommandAsync(StopPlaybackCoreAsync);
+    }
 
     private async Task StopPlaybackAfterFinalEffectWindowClosedAsync()
     {
@@ -624,6 +649,10 @@ public partial class MainWindow
 
         await StopVideoStateWatcherAsync().ConfigureAwait(true);
         await StopInterludeForPriorityAsync().ConfigureAwait(true);
+        if (!await StopMicrophoneAsync().ConfigureAwait(true))
+        {
+            return;
+        }
         var audioState = _audioPlaybackController.Snapshot.State;
         if (audioState is WindowsAudioPlaybackState.Starting
             or WindowsAudioPlaybackState.Playing
@@ -659,7 +688,8 @@ public partial class MainWindow
     private async Task<WindowsAudioPlaybackResult> StartAudioPlaybackAsync(
         SourceMediaDto source,
         MediaPlaybackIdentity identity,
-        ulong sourceStartMs = 0)
+        ulong sourceStartMs = 0,
+        ulong? audioEffectPeriodMs = null)
     {
         if (_audioPlaybackController.Snapshot.State is WindowsAudioPlaybackState.Playing
             or WindowsAudioPlaybackState.Paused
@@ -671,7 +701,12 @@ public partial class MainWindow
                 new WindowsAudioPlaybackError("already_running", "纯音频播放已经在运行。"));
         }
 
-        var preparation = await TryPrepareAudioPlaybackAsync(source, identity, sourceStartMs).ConfigureAwait(true);
+        var preparation = await TryPrepareAudioPlaybackAsync(
+                source,
+                identity,
+                sourceStartMs,
+                audioEffectPeriodMs)
+            .ConfigureAwait(true);
         if (preparation.Preparation is null)
         {
             return new(
@@ -719,7 +754,8 @@ public partial class MainWindow
         WindowsAudioPlaybackError? Error)> TryPrepareAudioPlaybackAsync(
         SourceMediaDto source,
         MediaPlaybackIdentity identity,
-        ulong sourceStartMs = 0)
+        ulong sourceStartMs = 0,
+        ulong? audioEffectPeriodMs = null)
     {
         var runtime = await EnsureVerifiedMediaRuntimeAsync().ConfigureAwait(true);
         if (runtime is null)
@@ -761,7 +797,7 @@ public partial class MainWindow
                 channels,
                 out var plan,
                 out var planError,
-                _state.AudioProcessing ? CreateCurrentAudioEffectParameters() : null,
+                _state.AudioProcessing ? CreateCurrentAudioEffectParameters(audioEffectPeriodMs) : null,
                 sourceStartMs)
             || plan is null)
         {
@@ -843,9 +879,10 @@ public partial class MainWindow
         return true;
     }
 
-    private AudioEffectParams CreateCurrentAudioEffectParameters()
+    private AudioEffectParams CreateCurrentAudioEffectParameters(ulong? periodMs = null)
     {
-        return _state.AudioParameterSnapshot.ToAudioEffectParams();
+        return _state.AudioParameterSnapshot.ToAudioEffectParams(
+            periodMs ?? _effectCycleSettings.AudioPeriodMinMs);
     }
 
     private void StartAudioCompletionWatcher(MediaPlaybackIdentity identity)
@@ -1002,12 +1039,20 @@ public partial class MainWindow
                 var currentSource = currentPoolSnapshot.SourceMediaPool.IsEmpty
                     ? null
                     : currentPoolSnapshot.SourceMediaPool[currentPoolSnapshot.SourceMediaIndex];
-                if (videoCyclePlanner.ShouldRegenerate(
+                videoCyclePlanner.Configure(
+                    _effectCycleSettings.VideoPeriodMinMs,
+                    _effectCycleSettings.VideoPeriodMaxMs);
+                var shouldRegenerateVideoEffects = videoCyclePlanner.ShouldRegenerate(
                         identity,
                         playbackTimeMs,
                         currentSource?.DurationMs,
                         _state.VideoProcessing
-                        && currentPoolSnapshot.PlaybackState is PlaybackState.Playing))
+                        && currentPoolSnapshot.PlaybackState is PlaybackState.Playing);
+                _state.SetVideoEffectCycleProgress(EffectCycleProgressProjection.Calculate(
+                    playbackTimeMs,
+                    videoCyclePlanner.CurrentCycleStartMs,
+                    videoCyclePlanner.CurrentCycleTargetMs));
+                if (shouldRegenerateVideoEffects)
                 {
                     await RunPlaybackCommandAsync(
                             () => ApplyAutomaticVideoEffectCycleAsync(identity),
@@ -1031,6 +1076,11 @@ public partial class MainWindow
         }
         finally
         {
+            if (_mediaPool.CurrentIdentity == identity)
+            {
+                _state.SetVideoEffectCycleProgress(0);
+            }
+
             if (ReferenceEquals(_videoStateCancellation, ownerCancellation))
             {
                 _videoStateCancellation = null;
@@ -1119,6 +1169,8 @@ public partial class MainWindow
                     ApplyMediaOperation(stopped, startedAudio.Error?.Message ?? "下一项视频声音启动失败");
                     return;
                 }
+
+                StartAudioCompletionWatcher(_mediaPool.CurrentIdentity);
             }
 
             StartVideoStateWatcher(_mediaPool.CurrentIdentity);
@@ -1172,6 +1224,9 @@ public partial class MainWindow
                         ? null
                         : poolSnapshot.SourceMediaPool[poolSnapshot.SourceMediaIndex];
                     var cycleAudioSnapshot = _audioPlaybackController.Snapshot;
+                    audioCyclePlanner.Configure(
+                        _effectCycleSettings.AudioPeriodMinMs,
+                        _effectCycleSettings.AudioPeriodMaxMs);
                     var action = audioCyclePlanner.GetAction(
                         identity,
                         cycleAudioSnapshot.AudibleClock?.PlaybackTimeMs,
@@ -1181,6 +1236,10 @@ public partial class MainWindow
                         && _mediaPool.CurrentIdentity == identity,
                         _audioPlaybackController.HasPreparedNext,
                         out var targetPositionMs);
+                    _state.SetAudioEffectCycleProgress(EffectCycleProgressProjection.Calculate(
+                        cycleAudioSnapshot.AudibleClock?.PlaybackTimeMs,
+                        audioCyclePlanner.CurrentCycleStartMs,
+                        audioCyclePlanner.CurrentCycleTargetMs));
 
                     if (action is AudioEffectCycleAction.Prepare
                         && source is not null)
@@ -1189,11 +1248,13 @@ public partial class MainWindow
                         var preparation = await TryPrepareAudioPlaybackAsync(
                                 source,
                                 identity,
-                                targetPositionMs)
+                                targetPositionMs,
+                                audioCyclePlanner.CurrentPeriodMs)
                             .ConfigureAwait(true);
                         if (preparation.Preparation is null)
                         {
                             audioCyclePlanner.Reset();
+                            _state.SetAudioEffectCycleProgress(0);
                             continue;
                         }
 
@@ -1204,6 +1265,7 @@ public partial class MainWindow
                         if (!prepared.IsSuccess)
                         {
                             audioCyclePlanner.Reset();
+                            _state.SetAudioEffectCycleProgress(0);
                         }
                     }
                     else if (action is AudioEffectCycleAction.Commit)
@@ -1214,6 +1276,7 @@ public partial class MainWindow
                             .ConfigureAwait(true);
                         if (committed.IsSuccess)
                         {
+                            _state.SetAudioEffectCycleProgress(100);
                             audioCyclePlanner.MarkCommitted(identity, targetPositionMs);
                             candidateCompletion = _audioPlaybackController.CandidateCompletion
                                 ?? candidateCompletion;
@@ -1221,6 +1284,7 @@ public partial class MainWindow
                         else if (!_audioPlaybackController.HasPreparedNext)
                         {
                             audioCyclePlanner.Reset();
+                            _state.SetAudioEffectCycleProgress(0);
                         }
                     }
                 }
@@ -1237,6 +1301,11 @@ public partial class MainWindow
         }
         finally
         {
+            if (_mediaPool.CurrentIdentity == identity)
+            {
+                _state.SetAudioEffectCycleProgress(0);
+            }
+
             if (ReferenceEquals(_audioCompletionCancellation, ownerCancellation))
             {
                 _audioCompletionCancellation = null;
@@ -1274,6 +1343,7 @@ public partial class MainWindow
                 if (stoppedRtmp.IsSuccess)
                 {
                     _audioPlaybackController.SetRtmpConsumerAttached(false);
+                    _lastRtmpConfig = null;
                 }
                 if (!stoppedRtmp.IsSuccess)
                 {
@@ -1356,6 +1426,7 @@ public partial class MainWindow
                 if (stoppedRtmp.IsSuccess)
                 {
                     _audioPlaybackController.SetRtmpConsumerAttached(false);
+                    _lastRtmpConfig = null;
                 }
                 if (!stoppedRtmp.IsSuccess)
                 {
@@ -1392,6 +1463,7 @@ public partial class MainWindow
             if (stoppedRtmp.IsSuccess)
             {
                 _audioPlaybackController.SetRtmpConsumerAttached(false);
+                _lastRtmpConfig = null;
             }
             if (!stoppedRtmp.IsSuccess)
             {
@@ -1457,52 +1529,22 @@ public partial class MainWindow
         var currentSource = snapshot.SourceMediaPool.IsEmpty
             ? null
             : snapshot.SourceMediaPool[snapshot.SourceMediaIndex];
-        var currentItem = snapshot.SourceMediaPool.IsEmpty
-            || snapshot.SourceMediaIndex < 0
-            || snapshot.SourceMediaIndex >= _state.MediaItems.Count
-            ? null
-            : _state.MediaItems[snapshot.SourceMediaIndex];
         var currentIdentity = _mediaPool.CurrentIdentity;
         var isVideo = currentSource?.MediaKind is MediaKind.Video;
-        var hasPreviewThumbnail = isVideo && currentItem?.Thumbnail is not null;
-        PreviewThumbnailImage.Source = currentItem?.Thumbnail;
-        PreviewThumbnailImage.Visibility = hasPreviewThumbnail ? Visibility.Visible : Visibility.Collapsed;
-        PreviewPlaceholderPanel.Visibility = hasPreviewThumbnail ? Visibility.Collapsed : Visibility.Visible;
-        PreviewCurrentMediaText.Text = currentSource?.FileName ?? "无活动源";
+        var videoProcessingBackend = VideoPlaybackModeSelector.DescribeActive(
+            _mpvController.Snapshot.ActiveVideoProcessingMode);
+        CurrentMediaText.Text = currentSource?.FileName ?? "无活动源";
         CurrentMediaBarText.Text = currentSource is null
             ? "当前媒体：无活动源"
             : $"当前媒体：{currentSource.FileName}";
-        PreviewSurfaceStatusText.Text = currentSource is null
-            ? "等待媒体 · 不启动 mpv / FFmpeg"
-            : currentSource.MediaKind is MediaKind.Audio
-                ? "纯音频媒体 · 预览窗口保持黑色"
-                : snapshot.PlaybackState switch
-                {
-                    PlaybackState.Playing => "正在播放 · 单一视频表面由最终效果窗口承载",
-                    PlaybackState.Paused => "已暂停 · 单一视频表面保留当前帧",
-                    _ => "已就绪 · 点击播放启动单一视频表面",
-                };
-        PreviewTimeText.Text = currentSource is null
-            ? "00:00:00 / —"
-            : $"{PlaybackTimeFormatter.Format(
-                isVideo && _projectedPositionIdentity == currentIdentity
-                    ? _projectedPositionMs
-                    : 0)} / {PlaybackTimeFormatter.Format(currentSource.DurationMs)}";
-        PreviewPlaybackStateText.Text = snapshot.PlaybackState switch
+        VideoProcessingPathText.Text = videoProcessingBackend;
+        VideoProcessingBackendText.Text = videoProcessingBackend;
+        AudioDiagnosticsStatusText.Text = snapshot.PlaybackState switch
         {
-            PlaybackState.Playing => "正在播放",
-            PlaybackState.Paused => "已暂停",
-            _ => currentSource is null ? "就绪" : "已就绪",
+            PlaybackState.Playing => "正在播放 · 音谱来自最终 PCM",
+            PlaybackState.Paused => "已暂停 · 保留最近 PCM 音谱",
+            _ => currentSource is null ? "未启动音频会话" : "已就绪 · 点击播放启动音频总线",
         };
-        PreviewPlaybackStateText.Foreground = snapshot.PlaybackState is PlaybackState.Playing
-            ? (System.Windows.Media.Brush)FindResource("AccentBrush")
-            : (System.Windows.Media.Brush)FindResource("MutedTextBrush");
-        PreviewVideoInfoText.Text = isVideo
-            ? $"视频：{currentSource?.Width ?? 0}×{currentSource?.Height ?? 0} {currentSource?.FrameRateFps ?? 0:0.#}fps"
-            : "视频：—";
-        PreviewAudioInfoText.Text = currentSource?.AudioSampleRateHz is uint sampleRate
-            ? $"音频：{sampleRate / 1000.0:0.#}kHz {currentSource.AudioChannelCount ?? 0}ch"
-            : "音频：—";
         if (!isVideo || _projectedPositionIdentity != currentIdentity)
         {
             _projectedPositionIdentity = null;
@@ -1533,6 +1575,7 @@ public partial class MainWindow
         RemoveMediaButton.IsEnabled = hasMedia && selectedIndex >= 0;
         ClearMediaButton.IsEnabled = hasMedia;
         UpdateInterludeProjection();
+        UpdateMicrophoneProjection();
     }
 
     private FinalEffectSnapshot CreateFinalEffectSnapshot()
@@ -1547,7 +1590,10 @@ public partial class MainWindow
         var surfaceKind = source.MediaKind is MediaKind.Video
             ? FinalEffectSurfaceKind.VideoHwndReserved
             : FinalEffectSurfaceKind.AudioBlack;
-        return FinalEffectSnapshot.Create(surfaceKind);
+        return FinalEffectSnapshot.Create(
+            surfaceKind,
+            surfaceKind is FinalEffectSurfaceKind.VideoHwndReserved ? source.Width : null,
+            surfaceKind is FinalEffectSurfaceKind.VideoHwndReserved ? source.Height : null);
     }
 
     private void ProjectVideoPlaybackPosition(
@@ -1586,11 +1632,6 @@ public partial class MainWindow
         _projectedPositionMs = resolvedPositionMs;
         PlaybackPositionText.Text = PlaybackTimeFormatter.Format(resolvedPositionMs);
         PlaybackDurationText.Text = PlaybackTimeFormatter.Format(durationMs);
-        PreviewTimeText.Text = $"{PlaybackTimeFormatter.Format(resolvedPositionMs)} / {PlaybackTimeFormatter.Format(durationMs)}";
-        PreviewPlaybackStateText.Text = snapshot.PlaybackState is PlaybackState.Playing ? "正在播放" : "已暂停";
-        PreviewPlaybackStateText.Foreground = snapshot.PlaybackState is PlaybackState.Playing
-            ? (System.Windows.Media.Brush)FindResource("AccentBrush")
-            : (System.Windows.Media.Brush)FindResource("MutedTextBrush");
         _finalEffectController.Update(CreateFinalEffectSnapshot());
     }
 

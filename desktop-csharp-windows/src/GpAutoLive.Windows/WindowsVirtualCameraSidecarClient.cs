@@ -252,6 +252,8 @@ public sealed class WindowsVirtualCameraSidecarClient : IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
+                DisposePipeNoLock();
+                SetStateNoLock(WindowsVirtualCameraSidecarClientState.Failed, WindowsVirtualCameraSidecarClientErrorCode.Cancelled);
                 return FailureNoLock(WindowsVirtualCameraSidecarClientErrorCode.Cancelled, "sidecar 帧写入已取消", true);
             }
             catch (IOException)

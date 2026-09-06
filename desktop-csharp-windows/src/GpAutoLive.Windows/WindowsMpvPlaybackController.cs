@@ -45,7 +45,8 @@ public sealed record WindowsMpvPlaybackControllerError(
 public sealed record WindowsMpvPlaybackControllerSnapshot(
     WindowsMpvPlaybackControllerState State,
     MediaPlaybackIdentity? ActiveIdentity,
-    WindowsMpvPlaybackRuntimeSnapshot Runtime);
+    WindowsMpvPlaybackRuntimeSnapshot Runtime,
+    MpvVideoProcessingMode? ActiveVideoProcessingMode = null);
 
 /// <summary>播放控制器操作结果。</summary>
 public sealed record WindowsMpvPlaybackControllerResult(
@@ -102,7 +103,10 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
                 return new(
                     state,
                     _activeIdentity,
-                    runtime);
+                    runtime,
+                    state is WindowsMpvPlaybackControllerState.Playing or WindowsMpvPlaybackControllerState.Paused
+                        ? _session?.Snapshot.EffectSnapshot.Mode
+                        : null);
             }
         }
     }
@@ -116,7 +120,8 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
         MpvLaunchMode mode = MpvLaunchMode.Gpu83,
         CancellationToken cancellationToken = default,
         MpvVideoEffectSnapshot? initialEffectSnapshot = null,
-        bool waitForFirstFrame = false)
+        bool waitForFirstFrame = false,
+        ulong sourceStartMs = 0)
     {
         lock (_gate)
         {
@@ -192,7 +197,7 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
                     hostWindowId,
                     endpoint,
                     mode,
-                    sourceStartMs: 0,
+                    sourceStartMs,
                     source.DurationMs,
                     out var plan,
                     out var planError)
@@ -379,6 +384,7 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
     {
         var observeNextFrame = waitForNextFrame && IsPlaying(expectedIdentity);
         ulong? previousFrameNumber = null;
+        double? previousPlaybackTime = null;
         if (observeNextFrame)
         {
             var previousFrame = await ReadPropertyAsync(
@@ -386,10 +392,18 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
                     MpvIpcProperty.EstimatedFrameNumber,
                     cancellationToken)
                 .ConfigureAwait(false);
-            if (!TryReadEstimatedFrameNumber(previousFrame, out previousFrameNumber))
+            if (!TryReadEstimatedFrameNumber(previousFrame, out previousFrameNumber)
+                && previousFrame.IpcError?.Code is not MpvIpcFailureCode.PropertyUnavailable)
             {
                 return CreateEffectiveFrameObservationFailure(previousFrame);
             }
+
+            var playbackTime = await ReadPropertyAsync(
+                    expectedIdentity,
+                    MpvIpcProperty.PlaybackTime,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            HasPlaybackTimeAdvanced(playbackTime, ref previousPlaybackTime);
         }
 
         var updated = await RunSessionOperationAsync(
@@ -404,11 +418,12 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
 
         if (next.Mode is MpvVideoProcessingMode.Original)
         {
-            return !observeNextFrame || previousFrameNumber is not ulong originalFrameNumber
+            return !observeNextFrame
                 ? updated
                 : await WaitForNextFrameAsync(
                         expectedIdentity,
-                        originalFrameNumber,
+                        previousFrameNumber,
+                        previousPlaybackTime,
                         cancellationToken)
                     .ConfigureAwait(false);
         }
@@ -423,14 +438,15 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
         var readbackResult = next.Mode is MpvVideoProcessingMode.Cpu4
             ? CreateCpu4ReadbackFailure(readback, next) ?? updated
             : CreateGpu83ReadbackFailure(readback, next.ShaderOptions) ?? updated;
-        if (!readbackResult.IsSuccess || !observeNextFrame || previousFrameNumber is not ulong frameNumber)
+        if (!readbackResult.IsSuccess || !observeNextFrame)
         {
             return readbackResult;
         }
 
         return await WaitForNextFrameAsync(
                 expectedIdentity,
-                frameNumber,
+                previousFrameNumber,
+                previousPlaybackTime,
                 cancellationToken)
             .ConfigureAwait(false);
     }
@@ -673,6 +689,7 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var deadline = DateTime.UtcNow + SourceReadyObservationTimeout;
+        double? previousPlaybackTime = null;
         while (DateTime.UtcNow < deadline)
         {
             var path = await runtime.DispatchAsync(
@@ -712,6 +729,19 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
                         && frameNumber is > 0)
                     {
                         return Success();
+                    }
+
+                    if (frameNumber is not > 0)
+                    {
+                        var playbackTime = await runtime.DispatchAsync(
+                                MpvIpcCommand.GetProperty(MpvIpcProperty.PlaybackTime),
+                                identity,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        if (HasPlaybackTimeAdvanced(playbackTime, ref previousPlaybackTime))
+                        {
+                            return Success();
+                        }
                     }
                 }
             }
@@ -878,7 +908,8 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
 
     private async Task<WindowsMpvPlaybackControllerResult> WaitForNextFrameAsync(
         MediaPlaybackIdentity? expectedIdentity,
-        ulong previousFrameNumber,
+        ulong? previousFrameNumber,
+        double? previousPlaybackTime,
         CancellationToken cancellationToken)
     {
         var deadline = DateTime.UtcNow + NextFrameObservationTimeout;
@@ -889,12 +920,30 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
                     MpvIpcProperty.EstimatedFrameNumber,
                     cancellationToken)
                 .ConfigureAwait(false);
-            if (!TryReadEstimatedFrameNumber(currentFrame, out var currentFrameNumber))
+            var hasFrameNumber = TryReadEstimatedFrameNumber(currentFrame, out var currentFrameNumber);
+            if (!hasFrameNumber
+                && currentFrame.IpcError?.Code is not MpvIpcFailureCode.PropertyUnavailable)
             {
                 return CreateEffectiveFrameObservationFailure(currentFrame);
             }
 
-            if (currentFrameNumber > previousFrameNumber)
+            if (hasFrameNumber && currentFrameNumber is ulong frameNumber)
+            {
+                if (previousFrameNumber is ulong previous
+                    && frameNumber > previous)
+                {
+                    return Success();
+                }
+
+                previousFrameNumber ??= frameNumber;
+            }
+
+            var playbackTime = await ReadPropertyAsync(
+                    expectedIdentity,
+                    MpvIpcProperty.PlaybackTime,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (HasPlaybackTimeAdvanced(playbackTime, ref previousPlaybackTime))
             {
                 return Success();
             }
@@ -924,6 +973,7 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var deadline = DateTime.UtcNow + NextFrameObservationTimeout;
+        double? previousPlaybackTime = null;
         while (DateTime.UtcNow < deadline)
         {
             var currentFrame = await runtime.DispatchAsync(
@@ -931,7 +981,9 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
                     expectedIdentity,
                     cancellationToken)
                 .ConfigureAwait(false);
-            if (!TryReadEstimatedFrameNumber(currentFrame, out var currentFrameNumber))
+            var hasFrameNumber = TryReadEstimatedFrameNumber(currentFrame, out var currentFrameNumber);
+            if (!hasFrameNumber
+                && currentFrame.IpcError?.Code is not MpvIpcFailureCode.PropertyUnavailable)
             {
                 var message = currentFrame.IsSuccess
                     ? "mpv 未返回有效的首视频帧编号。"
@@ -944,7 +996,17 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
                     retryable: true);
             }
 
-            if (currentFrameNumber is > 0)
+            if (hasFrameNumber && currentFrameNumber is > 0)
+            {
+                return Success();
+            }
+
+            var playbackTime = await runtime.DispatchAsync(
+                    MpvIpcCommand.GetProperty(MpvIpcProperty.PlaybackTime),
+                    expectedIdentity,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (HasPlaybackTimeAdvanced(playbackTime, ref previousPlaybackTime))
             {
                 return Success();
             }
@@ -966,6 +1028,25 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
             WindowsMpvPlaybackControllerFailureCode.FirstFrameNotObserved,
             "mpv 已启动，但在限定时间内未观察到首视频帧。",
             retryable: true);
+    }
+
+    private static bool HasPlaybackTimeAdvanced(
+        MpvIpcDispatchResult result,
+        ref double? previousPlaybackTime)
+    {
+        if (!result.IsSuccess
+            || result.Frame is null
+            || !MpvIpcValueReader.TryReadFiniteDouble(result.Frame, out var value, out _)
+            || value is not double currentPlaybackTime
+            || currentPlaybackTime < 0)
+        {
+            return false;
+        }
+
+        var advanced = previousPlaybackTime is double previous
+            && currentPlaybackTime > previous;
+        previousPlaybackTime = currentPlaybackTime;
+        return advanced;
     }
 
     private static bool TryReadEstimatedFrameNumber(

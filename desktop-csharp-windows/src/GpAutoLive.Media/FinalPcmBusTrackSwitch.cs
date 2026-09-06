@@ -329,12 +329,12 @@ public sealed class FinalPcmBusTrackSwitch : IDisposable
             if (!_rtmpConsumerAttached)
             {
                 _ = _rtmpSource.TryForcePromoteCommittedWithoutRead(candidateId, out _);
-                _ = _rtmpOverlaySource.TryForcePromoteCommittedWithoutRead(candidateId, out _);
             }
 
             // 插话分支没有独立的候选消费者；其边界跟随主轨提交，避免未启用插话时
             // 因为没有回调读取 overlay source 而永远阻塞候选回收。
             _ = _outputOverlaySource.TryForcePromoteCommittedWithoutRead(candidateId, out _);
+            _ = _rtmpOverlaySource.TryForcePromoteCommittedWithoutRead(candidateId, out _);
 
             if (_rtmpSource.ActiveCandidateId != candidateId
                 || _rtmpOverlaySource.ActiveCandidateId != candidateId

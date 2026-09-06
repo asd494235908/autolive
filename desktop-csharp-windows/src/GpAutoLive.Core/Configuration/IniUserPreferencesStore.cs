@@ -15,7 +15,8 @@ public sealed class IniUserPreferencesStore
     {
         "meta",
         "window",
-        "ui"
+        "ui",
+        "effects"
     };
 
     private static readonly IReadOnlyDictionary<string, IReadOnlySet<string>> AllowedKeys =
@@ -30,6 +31,13 @@ public sealed class IniUserPreferencesStore
                 "effects_panel_expanded",
                 "performance_sampling_enabled",
                 "last_output_mode"
+            },
+            ["effects"] = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "video_cycle_period_min_ms",
+                "video_cycle_period_max_ms",
+                "audio_cycle_period_min_ms",
+                "audio_cycle_period_max_ms"
             }
         };
 
@@ -164,6 +172,12 @@ public sealed class IniUserPreferencesStore
         builder.Append("effects_panel_expanded=").AppendLine(preferences.EffectsPanelExpanded.ToString().ToLowerInvariant());
         builder.Append("performance_sampling_enabled=").AppendLine(preferences.PerformanceSamplingEnabled.ToString().ToLowerInvariant());
         builder.Append("last_output_mode=").AppendLine(preferences.LastOutputMode);
+        builder.AppendLine();
+        builder.AppendLine("[effects]");
+        builder.Append("video_cycle_period_min_ms=").AppendLine(preferences.VideoCyclePeriodMinMs.ToString(CultureInfo.InvariantCulture));
+        builder.Append("video_cycle_period_max_ms=").AppendLine(preferences.VideoCyclePeriodMaxMs.ToString(CultureInfo.InvariantCulture));
+        builder.Append("audio_cycle_period_min_ms=").AppendLine(preferences.AudioCyclePeriodMinMs.ToString(CultureInfo.InvariantCulture));
+        builder.Append("audio_cycle_period_max_ms=").AppendLine(preferences.AudioCyclePeriodMaxMs.ToString(CultureInfo.InvariantCulture));
         return builder.ToString();
     }
 
@@ -179,6 +193,10 @@ public sealed class IniUserPreferencesStore
         var effectsExpanded = ParseBool(values, "ui.effects_panel_expanded", required: true);
         var performanceSampling = ParseBool(values, "ui.performance_sampling_enabled", required: true);
         var outputMode = ParseString(values, "ui.last_output_mode", required: true);
+        var videoCycleMin = ParseULong(values, "effects.video_cycle_period_min_ms", UserPreferences.DefaultVideoCyclePeriodMinMs);
+        var videoCycleMax = ParseULong(values, "effects.video_cycle_period_max_ms", UserPreferences.DefaultVideoCyclePeriodMaxMs);
+        var audioCycleMin = ParseULong(values, "effects.audio_cycle_period_min_ms", UserPreferences.DefaultAudioCyclePeriodMinMs);
+        var audioCycleMax = ParseULong(values, "effects.audio_cycle_period_max_ms", UserPreferences.DefaultAudioCyclePeriodMaxMs);
 
         if (schemaVersion != UserPreferences.CurrentSchemaVersion)
         {
@@ -211,7 +229,11 @@ public sealed class IniUserPreferencesStore
             Language = UserPreferences.NormalizeLanguage(language),
             EffectsPanelExpanded = effectsExpanded,
             PerformanceSamplingEnabled = performanceSampling,
-            LastOutputMode = UserPreferences.NormalizeOutputMode(outputMode)
+            LastOutputMode = UserPreferences.NormalizeOutputMode(outputMode),
+            VideoCyclePeriodMinMs = videoCycleMin,
+            VideoCyclePeriodMaxMs = videoCycleMax,
+            AudioCyclePeriodMinMs = audioCycleMin,
+            AudioCyclePeriodMaxMs = audioCycleMax,
         };
         preferences.Validate();
         return preferences;
@@ -226,6 +248,16 @@ public sealed class IniUserPreferencesStore
         }
 
         return parsed;
+    }
+
+    private static ulong ParseULong(IReadOnlyDictionary<string, string> values, string key, ulong fallback)
+    {
+        var value = ParseString(values, key, required: false);
+        return value.Length == 0
+            ? fallback
+            : ulong.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
+                ? parsed
+                : throw new ConfigurationValidationException($"配置值格式无效：{key}。");
     }
 
     private static double? ParseCoordinate(IReadOnlyDictionary<string, string> values, string key)

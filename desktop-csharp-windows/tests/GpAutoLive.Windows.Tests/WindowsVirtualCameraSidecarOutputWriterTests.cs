@@ -26,11 +26,11 @@ public sealed class WindowsVirtualCameraSidecarOutputWriterTests
             manager,
             client,
             TimeSpan.FromTicks(TimeSpan.TicksPerSecond / VirtualCameraRules.Fps));
+        var encoded = new byte[WindowsVirtualCameraSidecarProtocol.EncodedFrameBytes];
+        var readFrame = server.ReadExactlyAsync(encoded, timeout.Token);
         var started = await writer.StartAsync(timeout.Token);
         Assert.IsTrue(started.IsSuccess, started.Error?.Message);
-
-        var encoded = new byte[WindowsVirtualCameraSidecarProtocol.EncodedFrameBytes];
-        await server.ReadExactlyAsync(encoded, timeout.Token);
+        await readFrame;
         Assert.IsTrue(
             WindowsVirtualCameraSidecarProtocol.TryDecode(encoded, out var decoded, out _, out var error),
             error?.Message);
@@ -72,11 +72,11 @@ public sealed class WindowsVirtualCameraSidecarOutputWriterTests
             manager,
             client,
             TimeSpan.FromTicks(TimeSpan.TicksPerSecond / VirtualCameraRules.Fps));
+        var encoded = new byte[WindowsVirtualCameraSidecarProtocol.EncodedFrameBytes];
+        var readFrame = server.ReadExactlyAsync(encoded, timeout.Token);
         var started = await writer.StartAsync(timeout.Token);
         Assert.IsTrue(started.IsSuccess, started.Error?.Message);
-
-        var encoded = new byte[WindowsVirtualCameraSidecarProtocol.EncodedFrameBytes];
-        await server.ReadExactlyAsync(encoded, timeout.Token);
+        await readFrame;
         Assert.IsTrue(
             WindowsVirtualCameraSidecarProtocol.TryDecode(encoded, out var decoded, out _, out var error),
             error?.Message);
@@ -110,6 +110,75 @@ public sealed class WindowsVirtualCameraSidecarOutputWriterTests
     }
 
     [TestMethod]
+    public async Task Writer_start_does_not_succeed_when_first_frame_write_fails()
+    {
+        var pipeName = CreatePipeName();
+        await using var server = CreateServer(pipeName);
+        await using var client = new WindowsVirtualCameraSidecarClient();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var waitForConnection = server.WaitForConnectionAsync(timeout.Token);
+        var connected = await client.ConnectAsync(pipeName, TimeSpan.FromSeconds(2), timeout.Token);
+        Assert.IsTrue(connected.IsSuccess, connected.Error?.Message);
+        await waitForConnection;
+        await server.DisposeAsync();
+
+        await using var writer = new WindowsVirtualCameraSidecarOutputWriter(ReadyManager(), client);
+        var started = await writer.StartAsync(timeout.Token);
+
+        Assert.IsFalse(started.IsSuccess);
+        Assert.AreEqual(WindowsVirtualCameraSidecarOutputWriterErrorCode.WriteFailed, started.Error!.Code);
+        Assert.AreEqual(WindowsVirtualCameraSidecarOutputWriterState.Failed, started.Snapshot.State);
+    }
+
+    [TestMethod]
+    public async Task Coordinator_stop_does_not_report_success_when_writer_stop_is_cancelled()
+    {
+        var manager = ReadyManager();
+        await using var client = new WindowsVirtualCameraSidecarClient();
+        await using var writer = new WindowsVirtualCameraSidecarOutputWriter(manager, client);
+        using var stopCancellation = new CancellationTokenSource();
+        using var workerCancellation = new CancellationTokenSource();
+        var workerCompleted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cancellationRegistration = workerCancellation.Token.Register(() =>
+        {
+            stopCancellation.Cancel();
+            workerCompleted.TrySetResult(true);
+        });
+        var writerType = typeof(WindowsVirtualCameraSidecarOutputWriter);
+        writerType.GetField("_worker", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(writer, workerCompleted.Task);
+        writerType.GetField("_cancellation", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(writer, workerCancellation);
+        writerType.GetField("_state", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(writer, WindowsVirtualCameraSidecarOutputWriterState.Running);
+
+        await using var coordinator = new WindowsVirtualCameraOutputCoordinator(
+            manager,
+            new WindowsVirtualCameraSurfaceBinding());
+        typeof(WindowsVirtualCameraOutputCoordinator)
+            .GetField("_writer", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, writer);
+
+        var stopTask = coordinator.StopAsync(stopCancellation.Token);
+        var stopped = await stopTask;
+
+        Assert.IsFalse(stopped.IsSuccess);
+        Assert.AreEqual(WindowsVirtualCameraOutputCoordinatorCode.CleanupFailed, stopped.Code);
+        Assert.AreEqual(VirtualCameraState.Installed, stopped.Snapshot.Output.State);
+        Assert.AreEqual(WindowsVirtualCameraSidecarOutputWriterState.Closed, stopped.Snapshot.Writer.State);
+        Assert.AreEqual(WindowsVirtualCameraSidecarClientState.Stopped, stopped.Snapshot.Client.State);
+        Assert.AreEqual(WindowsVirtualCameraSidecarHostState.Stopped, stopped.Snapshot.Sidecar.State);
+
+        var blockedStart = await coordinator.StartAsync(null);
+        Assert.IsFalse(blockedStart.IsSuccess);
+        Assert.AreEqual(WindowsVirtualCameraOutputCoordinatorCode.CleanupFailed, blockedStart.Code);
+
+        var repeatedStop = await coordinator.StopAsync();
+        Assert.IsTrue(repeatedStop.IsSuccess);
+        Assert.AreEqual(WindowsVirtualCameraOutputCoordinatorCode.Stopped, repeatedStop.Code);
+    }
+
+    [TestMethod]
     public async Task Coordinator_requires_install_gate_before_sidecar_plan()
     {
         await using var coordinator = new WindowsVirtualCameraOutputCoordinator(
@@ -135,6 +204,69 @@ public sealed class WindowsVirtualCameraSidecarOutputWriterTests
 
         Assert.IsFalse(result.IsSuccess);
         Assert.AreEqual(WindowsVirtualCameraOutputCoordinatorCode.InvalidPlan, result.Code);
+    }
+
+    [TestMethod]
+    public async Task Coordinator_reports_runtime_component_failure_and_keeps_stop_cleanup_available()
+    {
+        var manager = new VirtualCameraOutputManager();
+        Assert.IsTrue(manager.MarkInstalled().IsSuccess);
+        await using var coordinator = new WindowsVirtualCameraOutputCoordinator(
+            manager,
+            new WindowsVirtualCameraSurfaceBinding());
+
+        var host = typeof(WindowsVirtualCameraOutputCoordinator)
+            .GetField("_sidecarHost", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(coordinator)!;
+        host.GetType()
+            .GetField("_state", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(host, WindowsVirtualCameraSidecarHostState.Failed);
+        typeof(WindowsVirtualCameraOutputCoordinator)
+            .GetField("_started", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, true);
+
+        WindowsVirtualCameraOutputCoordinatorSnapshot? changed = null;
+        coordinator.SnapshotChanged += (_, snapshot) => changed = snapshot;
+
+        coordinator.RefreshHealth();
+
+        Assert.AreEqual(VirtualCameraState.Failed, manager.Snapshot.State);
+        Assert.IsTrue(coordinator.HasActiveResources);
+        Assert.AreEqual(VirtualCameraState.Failed, changed?.Output.State);
+
+        var stopped = await coordinator.StopAsync();
+
+        Assert.IsTrue(stopped.IsSuccess, stopped.ErrorMessage);
+        Assert.AreEqual(WindowsVirtualCameraOutputCoordinatorCode.Stopped, stopped.Code);
+        Assert.AreEqual(VirtualCameraState.Installed, stopped.Snapshot.Output.State);
+    }
+
+    [TestMethod]
+    public async Task Coordinator_publishes_ready_streaming_projection_when_downstream_count_changes()
+    {
+        var manager = ReadyManager();
+        await using var coordinator = new WindowsVirtualCameraOutputCoordinator(
+            manager,
+            new WindowsVirtualCameraSurfaceBinding());
+
+        var host = typeof(WindowsVirtualCameraOutputCoordinator)
+            .GetField("_sidecarHost", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(coordinator)!;
+        var publishCount = host.GetType()
+            .GetMethod("PublishDownstreamClientCount", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+
+        var snapshots = new List<WindowsVirtualCameraOutputCoordinatorSnapshot>();
+        coordinator.SnapshotChanged += (_, snapshot) => snapshots.Add(snapshot);
+
+        publishCount.Invoke(host, [2u]);
+        publishCount.Invoke(host, [0u]);
+
+        Assert.AreEqual(VirtualCameraState.Ready, manager.Snapshot.State);
+        Assert.AreEqual(2, snapshots.Count);
+        Assert.AreEqual(VirtualCameraState.Streaming, snapshots[0].Output.State);
+        Assert.AreEqual((uint)2, snapshots[0].Output.DownstreamClientCount);
+        Assert.AreEqual(VirtualCameraState.Ready, snapshots[1].Output.State);
+        Assert.AreEqual((uint)0, snapshots[1].Output.DownstreamClientCount);
     }
 
     private static NamedPipeServerStream CreateServer(string pipeName) => new(

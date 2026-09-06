@@ -5,18 +5,29 @@ namespace GpAutoLive.Windows;
 /// <summary>RTMP 重连策略的固定预算；不访问网络，也不创建后台任务。</summary>
 public sealed class WindowsRtmpReconnectPolicy
 {
+    private static readonly TimeSpan[] DefaultBackoff =
+    [
+        TimeSpan.FromSeconds(1),
+        TimeSpan.FromSeconds(2),
+        TimeSpan.FromSeconds(4),
+        TimeSpan.FromSeconds(8),
+        TimeSpan.FromSeconds(15),
+    ];
+    private readonly bool _usesDefaultBackoff;
+
     public WindowsRtmpReconnectPolicy(
-        int maxAttempts = 3,
+        int maxAttempts = 6,
         TimeSpan? initialDelay = null,
         TimeSpan? maxDelay = null)
     {
-        if (maxAttempts is < 1 or > 3)
+        if (maxAttempts is < 1 or > 6)
         {
-            throw new ArgumentOutOfRangeException(nameof(maxAttempts), "RTMP 重连尝试次数必须在 1 到 3 次之间。");
+            throw new ArgumentOutOfRangeException(nameof(maxAttempts), "RTMP 重连尝试次数必须在 1 到 6 次之间。");
         }
 
-        InitialDelay = initialDelay ?? TimeSpan.FromMilliseconds(250);
-        MaxDelay = maxDelay ?? TimeSpan.FromSeconds(1);
+        _usesDefaultBackoff = initialDelay is null && maxDelay is null;
+        InitialDelay = initialDelay ?? DefaultBackoff[0];
+        MaxDelay = maxDelay ?? DefaultBackoff[^1];
         if (InitialDelay <= TimeSpan.Zero || MaxDelay < InitialDelay)
         {
             throw new ArgumentOutOfRangeException(nameof(initialDelay), "RTMP 重连延迟必须为正数且不超过最大延迟。");
@@ -31,15 +42,20 @@ public sealed class WindowsRtmpReconnectPolicy
     /// <summary>第一次重试前的退避时长。</summary>
     public TimeSpan InitialDelay { get; }
 
-    /// <summary>指数退避的上限。</summary>
+    /// <summary>自定义退避的上限；默认策略使用固定的 Rust 对齐序列。</summary>
     public TimeSpan MaxDelay { get; }
 
-    /// <summary>按 0 基重试序号计算有界指数退避，不加入随机抖动。</summary>
+    /// <summary>按 0 基重试序号计算有界退避，不加入随机抖动。</summary>
     public TimeSpan GetDelay(int retryOrdinal)
     {
         if (retryOrdinal < 0)
         {
             throw new ArgumentOutOfRangeException(nameof(retryOrdinal));
+        }
+
+        if (_usesDefaultBackoff && retryOrdinal < DefaultBackoff.Length)
+        {
+            return DefaultBackoff[retryOrdinal];
         }
 
         var multiplier = Math.Pow(2, Math.Min(retryOrdinal, 10));

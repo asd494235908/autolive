@@ -1,6 +1,9 @@
+using System.Diagnostics;
 using System.Windows;
+using System.Windows.Threading;
 using System.Runtime.InteropServices;
 using GpAutoLive.Contracts;
+using GpAutoLive.Core;
 using GpAutoLive.Media;
 using GpAutoLive.Windows;
 
@@ -8,6 +11,29 @@ namespace GpAutoLive.App;
 
 public partial class MainWindow
 {
+    private static readonly TimeSpan RtmpPublishingWaitTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan RtmpPublishingPollInterval = TimeSpan.FromMilliseconds(100);
+
+    internal static Task<T> RunOnDispatcherAsync<T>(
+        Dispatcher dispatcher,
+        Func<Task<T>> operation,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(dispatcher);
+        ArgumentNullException.ThrowIfNull(operation);
+        if (dispatcher.CheckAccess())
+        {
+            return operation();
+        }
+
+        return dispatcher.InvokeAsync(
+                operation,
+                DispatcherPriority.Send,
+                cancellationToken)
+            .Task
+            .Unwrap();
+    }
+
     private void CopyRtmpTargetUrlButton_Click(object sender, RoutedEventArgs e)
     {
         if (string.IsNullOrWhiteSpace(RtmpTargetUrlTextBox.Text))
@@ -72,11 +98,26 @@ public partial class MainWindow
         UpdateRtmpProjection();
     }
 
+    private void CancelRtmpReconnect()
+    {
+        try
+        {
+            _rtmpReconnectCancellation?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // 重连任务已经完成并释放令牌；停止操作本身仍需继续。
+        }
+    }
+
     private async void StartRtmpButton_Click(object sender, RoutedEventArgs e) =>
         await RunPlaybackCommandAsync(() => StartRtmpCoreAsync()).ConfigureAwait(true);
 
-    private async void StopRtmpButton_Click(object sender, RoutedEventArgs e) =>
-        await RunPlaybackCommandAsync(StopRtmpCoreAsync).ConfigureAwait(true);
+    private async void StopRtmpButton_Click(object sender, RoutedEventArgs e)
+    {
+        CancelRtmpReconnect();
+        await RunPlaybackCommandAsync(() => StopRtmpCoreAsync()).ConfigureAwait(true);
+    }
 
     private async Task StartRtmpCoreAsync(RtmpOutputConfig? requestedConfig = null)
     {
@@ -257,10 +298,14 @@ public partial class MainWindow
             _audioPlaybackController.SetRtmpConsumerAttached(true);
         }
 
+        _lastRtmpConfig = config;
+
         RtmpStatusText.Text = config.AudioEnabled
-            ? $"{(config.VideoEnabled ? "音画" : "声音")}推流中 · {redactedTargetUrl}"
-            : $"画面推流中 · {redactedTargetUrl ?? "rtmp://…"}";
-        _state.SetStatus(config.AudioEnabled ? "RTMP 最终 PCM 声音推流已启动" : "RTMP 画面直推已启动");
+            ? $"{(config.VideoEnabled ? "音画" : "声音")}连接启动中 · {redactedTargetUrl}"
+            : $"画面连接启动中 · {redactedTargetUrl ?? "rtmp://…"}";
+        _state.SetStatus(config.AudioEnabled
+            ? "RTMP 最终 PCM 声音已启动，等待远端进度"
+            : "RTMP 画面已启动，等待远端进度");
         UpdateRtmpProjection();
     }
 
@@ -274,6 +319,12 @@ public partial class MainWindow
 
         var managerSnapshot = _rtmpOutputManager.Snapshot;
         var audioSnapshot = _rtmpAudioSession.Snapshot;
+        if (_rtmpReconnectCoordinator.Snapshot.State == RtmpOutputState.Reconnecting)
+        {
+            _state.SetStatus("RTMP 已在重连中");
+            return;
+        }
+
         var failed = managerSnapshot.State == RtmpOutputState.Failed
             || audioSnapshot.ErrorCode is not null;
         if (!failed)
@@ -283,7 +334,7 @@ public partial class MainWindow
             return;
         }
 
-        var config = CreateRtmpOutputConfig();
+        var config = SelectRtmpReconnectConfig(_lastRtmpConfig, CreateRtmpOutputConfig());
         if (!RtmpOutputRules.TryValidate(config, out var validationError))
         {
             RtmpStatusText.Text = validationError?.Message ?? "RTMP 配置无效";
@@ -293,49 +344,119 @@ public partial class MainWindow
         }
 
         RtmpStatusText.Text = "RTMP 已断开，正在执行有限重连";
-        _state.SetStatus("RTMP 正在有限重连；最多尝试 3 次");
+        _state.SetStatus("RTMP 正在有限重连；最多尝试 6 次");
         UpdateRtmpProjection();
-        var reconnect = await _rtmpReconnectCoordinator
-            .ReconnectAsync(
-                async (_, cancellationToken) =>
-                {
-                    await StopRtmpCoreAsync().ConfigureAwait(true);
-                    if (_rtmpAudioSession.Snapshot.IsRunning
-                        || _rtmpOutputManager.Snapshot.State is RtmpOutputState.Starting or RtmpOutputState.Publishing)
-                    {
-                        return WindowsRtmpReconnectAttempt.Failed(
-                            WindowsRtmpFailureCode.StopTimedOut,
-                            retryable: true);
-                    }
-
-                    await StartRtmpCoreAsync(config).ConfigureAwait(true);
-                    var audioRunning = _rtmpAudioSession.Snapshot.IsRunning;
-                    var videoRunning = _rtmpOutputManager.Snapshot.State is RtmpOutputState.Starting or RtmpOutputState.Publishing;
-                    return audioRunning || videoRunning
-                        ? WindowsRtmpReconnectAttempt.Succeeded()
-                        : WindowsRtmpReconnectAttempt.Failed(
-                            WindowsRtmpFailureCode.StartFailed,
-                            retryable: true);
-                },
-                _windowCancellation.Token)
-            .ConfigureAwait(true);
-
-        if (reconnect.IsSuccess)
+        var expectedIdentity = _mediaPool.CurrentIdentity;
+        using var reconnectCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            _windowCancellation.Token);
+        _rtmpReconnectCancellation = reconnectCancellation;
+        try
         {
-            RtmpStatusText.Text = "RTMP 有限重连成功";
-            _state.SetStatus("RTMP 推流已恢复");
+            var reconnect = await _rtmpReconnectCoordinator
+                .ReconnectAsync(
+                    (_, cancellationToken) => RunRtmpReconnectAttemptAsync(
+                        config,
+                        expectedIdentity,
+                        cancellationToken),
+                    reconnectCancellation.Token)
+                .ConfigureAwait(true);
+
+            if (reconnect.IsSuccess)
+            {
+                RtmpStatusText.Text = "RTMP 有限重连成功";
+                _state.SetStatus("RTMP 推流已恢复");
+            }
+            else if (reconnect.Error?.Code == WindowsRtmpFailureCode.Cancelled)
+            {
+                RtmpStatusText.Text = "RTMP 重连已取消";
+                _state.SetStatus("RTMP 重连已取消");
+            }
+            else
+            {
+                RtmpStatusText.Text = reconnect.Error?.Message ?? "RTMP 重连失败";
+                _state.SetStatus("RTMP 推流未恢复，可重新开始或检查地址");
+            }
+            UpdateRtmpProjection();
         }
-        else
+        finally
         {
-            RtmpStatusText.Text = reconnect.Error?.Message ?? "RTMP 重连失败";
-            _state.SetStatus("RTMP 推流未恢复，可重新开始或检查地址");
+            if (ReferenceEquals(_rtmpReconnectCancellation, reconnectCancellation))
+            {
+                _rtmpReconnectCancellation = null;
+            }
         }
-        UpdateRtmpProjection();
     }
 
-    private async Task StopRtmpCoreAsync()
+    private Task<WindowsRtmpReconnectAttempt> RunRtmpReconnectAttemptAsync(
+        RtmpOutputConfig config,
+        MediaPlaybackIdentity expectedIdentity,
+        CancellationToken cancellationToken)
+        => RunOnDispatcherAsync(
+            Dispatcher,
+            () => RunRtmpReconnectAttemptOnDispatcherAsync(
+                config,
+                expectedIdentity,
+                cancellationToken),
+            cancellationToken);
+
+    private async Task<WindowsRtmpReconnectAttempt> RunRtmpReconnectAttemptOnDispatcherAsync(
+        RtmpOutputConfig config,
+        MediaPlaybackIdentity expectedIdentity,
+        CancellationToken cancellationToken)
     {
+        if (_mediaPool.CurrentIdentity != expectedIdentity)
+        {
+            return WindowsRtmpReconnectAttempt.Failed(
+                WindowsRtmpFailureCode.StartFailed,
+                retryable: false);
+        }
+
+        await StopRtmpCoreAsync(cancelReconnect: false, clearLastConfig: false).ConfigureAwait(true);
+        if (_rtmpAudioSession.Snapshot.IsRunning
+            || _rtmpOutputManager.Snapshot.State is RtmpOutputState.Starting or RtmpOutputState.Publishing)
+        {
+            return WindowsRtmpReconnectAttempt.Failed(
+                WindowsRtmpFailureCode.StopTimedOut,
+                retryable: true);
+        }
+
+        if (_mediaPool.CurrentIdentity != expectedIdentity)
+        {
+            return WindowsRtmpReconnectAttempt.Failed(
+                WindowsRtmpFailureCode.StartFailed,
+                retryable: false);
+        }
+
+        await StartRtmpCoreAsync(config).ConfigureAwait(true);
+        var ready = await WaitForRtmpTracksReadyAsync(config, expectedIdentity, cancellationToken)
+            .ConfigureAwait(true);
+        if (_mediaPool.CurrentIdentity != expectedIdentity)
+        {
+            await StopRtmpCoreAsync(cancelReconnect: false, clearLastConfig: false).ConfigureAwait(true);
+            return WindowsRtmpReconnectAttempt.Failed(
+                WindowsRtmpFailureCode.StartFailed,
+                retryable: false);
+        }
+
+        return ready
+            ? WindowsRtmpReconnectAttempt.Succeeded()
+            : WindowsRtmpReconnectAttempt.Failed(
+                _rtmpOutputManager.Snapshot.State == RtmpOutputState.Failed
+                    ? WindowsRtmpFailureCode.ProcessExited
+                    : WindowsRtmpFailureCode.StartFailed,
+                retryable: true);
+    }
+
+    private async Task StopRtmpCoreAsync(
+        bool cancelReconnect = true,
+        bool clearLastConfig = true)
+    {
+        if (cancelReconnect)
+        {
+            CancelRtmpReconnect();
+        }
         await StopInterludeForPriorityAsync().ConfigureAwait(true);
+        bool stopSucceeded;
         if (_rtmpAudioSession.Snapshot.IsRunning)
         {
             var audioResult = await _rtmpAudioSession.StopAsync(_windowCancellation.Token).ConfigureAwait(true);
@@ -346,6 +467,7 @@ public partial class MainWindow
             RtmpStatusText.Text = audioResult.IsSuccess
                 ? "RTMP 推流已停止"
                 : audioResult.Error?.Message ?? "RTMP 推流停止失败";
+            stopSucceeded = audioResult.IsSuccess;
         }
         else
         {
@@ -353,6 +475,12 @@ public partial class MainWindow
             RtmpStatusText.Text = result.IsSuccess
                 ? "RTMP 推流已停止"
                 : result.Error?.Message ?? "RTMP 推流停止失败";
+            stopSucceeded = result.IsSuccess;
+        }
+
+        if (stopSucceeded && clearLastConfig)
+        {
+            _lastRtmpConfig = null;
         }
         _state.SetStatus(RtmpStatusText.Text);
         UpdateRtmpProjection();
@@ -365,6 +493,75 @@ public partial class MainWindow
         AudioEnabled = RtmpAudioCheckBox.IsChecked == true,
     };
 
+    internal static bool AreSelectedRtmpTracksReady(
+        RtmpOutputConfig config,
+        RtmpOutputState outputState,
+        WindowsRtmpAudioSessionSnapshot audioSnapshot)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        ArgumentNullException.ThrowIfNull(audioSnapshot);
+        return (config.VideoEnabled || config.AudioEnabled)
+            && outputState == RtmpOutputState.Publishing
+            && (!config.AudioEnabled
+                || audioSnapshot.IsRunning && audioSnapshot.ErrorCode is null);
+    }
+
+    internal static bool CanStopRtmpSession(
+        RtmpOutputState managerState,
+        RtmpOutputState reconnectState,
+        WindowsRtmpAudioSessionSnapshot audioSnapshot,
+        bool managerNeedsCleanup = false)
+    {
+        ArgumentNullException.ThrowIfNull(audioSnapshot);
+        var reconnecting = reconnectState == RtmpOutputState.Reconnecting;
+        var hasActiveSession = reconnecting
+            || managerState is RtmpOutputState.Starting or RtmpOutputState.Publishing
+            || audioSnapshot.IsRunning
+            || managerNeedsCleanup;
+        var failed = !reconnecting && !managerNeedsCleanup
+            && (managerState == RtmpOutputState.Failed || audioSnapshot.ErrorCode is not null);
+        return hasActiveSession && !failed && managerState != RtmpOutputState.Stopping;
+    }
+
+    internal static RtmpOutputConfig SelectRtmpReconnectConfig(
+        RtmpOutputConfig? lastStartedConfig,
+        RtmpOutputConfig currentEditorConfig)
+    {
+        ArgumentNullException.ThrowIfNull(currentEditorConfig);
+        return lastStartedConfig ?? currentEditorConfig;
+    }
+
+    private async Task<bool> WaitForRtmpTracksReadyAsync(
+        RtmpOutputConfig config,
+        MediaPlaybackIdentity expectedIdentity,
+        CancellationToken cancellationToken)
+    {
+        var startTimestamp = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            if (_mediaPool.CurrentIdentity != expectedIdentity)
+            {
+                return false;
+            }
+
+            var managerSnapshot = _rtmpOutputManager.Snapshot;
+            var audioSnapshot = _rtmpAudioSession.Snapshot;
+            if (AreSelectedRtmpTracksReady(config, managerSnapshot.State, audioSnapshot))
+            {
+                return true;
+            }
+
+            if (managerSnapshot.State == RtmpOutputState.Failed
+                || audioSnapshot.ErrorCode is not null
+                || Stopwatch.GetElapsedTime(startTimestamp) >= RtmpPublishingWaitTimeout)
+            {
+                return false;
+            }
+
+            await Task.Delay(RtmpPublishingPollInterval, cancellationToken).ConfigureAwait(true);
+        }
+    }
+
     private void UpdateRtmpProjection()
     {
         if (!IsInitialized)
@@ -374,19 +571,49 @@ public partial class MainWindow
 
         var managerSnapshot = _rtmpOutputManager.Snapshot;
         var audioSnapshot = _rtmpAudioSession.Snapshot;
-        var managerPublishing = managerSnapshot.State is RtmpOutputState.Starting or RtmpOutputState.Publishing;
-        var publishing = managerPublishing
-            || (audioSnapshot.IsRunning && managerSnapshot.State != RtmpOutputState.Failed);
-        var failed = managerSnapshot.State == RtmpOutputState.Failed
-            || audioSnapshot.ErrorCode is not null;
-        SetStatusPill(RtmpStatePillText, publishing ? "推流中" : "待机", publishing);
-        StartRtmpButton.IsEnabled = _login.CanEnterWorkbench && !publishing;
-        StopRtmpButton.IsEnabled = _login.CanEnterWorkbench && publishing;
-        ReconnectRtmpButton.IsEnabled = _login.CanEnterWorkbench && failed && !publishing;
+        var reconnectSnapshot = _rtmpReconnectCoordinator.Snapshot;
+        var managerPublishing = managerSnapshot.State == RtmpOutputState.Publishing;
+        var managerStarting = managerSnapshot.State == RtmpOutputState.Starting;
+        var reconnecting = reconnectSnapshot.State == RtmpOutputState.Reconnecting;
+        var managerNeedsCleanup = managerSnapshot.ProcessId is not null
+            || managerSnapshot.FinalPcmInputOpen;
+        var lifecycleBusy = managerSnapshot.State is
+            RtmpOutputState.Starting or RtmpOutputState.Reconnecting or RtmpOutputState.Stopping
+            || reconnecting;
+        var hasActiveSession = managerPublishing
+            || managerStarting
+            || reconnecting
+            || audioSnapshot.IsRunning
+            || managerNeedsCleanup;
+        var failed = !reconnecting && (managerSnapshot.State == RtmpOutputState.Failed
+            || audioSnapshot.ErrorCode is not null);
+        var stateLabel = reconnecting || managerSnapshot.State == RtmpOutputState.Reconnecting
+            ? "重连中"
+            : managerPublishing
+                ? "推流中"
+                : managerStarting
+                    ? "启动中"
+                    : managerSnapshot.State == RtmpOutputState.Stopping
+                        ? "停止中"
+                        : failed
+                            ? "失败"
+                            : "待机";
+        SetStatusPill(RtmpStatePillText, stateLabel, managerPublishing && !reconnecting);
+        StartRtmpButton.IsEnabled = _login.CanEnterWorkbench && !hasActiveSession && !lifecycleBusy;
+        StopRtmpButton.IsEnabled = _login.CanEnterWorkbench
+            && CanStopRtmpSession(
+                managerSnapshot.State,
+                reconnectSnapshot.State,
+                audioSnapshot,
+                managerNeedsCleanup);
+        ReconnectRtmpButton.IsEnabled = _login.CanEnterWorkbench
+            && failed
+            && !hasActiveSession
+            && !lifecycleBusy;
         ReconnectRtmpButton.ToolTip = ReconnectRtmpButton.IsEnabled
-            ? "重新启动当前 RTMP 配置，最多尝试 3 次"
+            ? "重新启动当前 RTMP 配置，最多尝试 6 次"
             : "仅在 RTMP 会话明确失败后可用";
-        if (failed && !publishing && string.IsNullOrWhiteSpace(RtmpStatusText.Text))
+        if (failed && !managerPublishing && string.IsNullOrWhiteSpace(RtmpStatusText.Text))
         {
             RtmpStatusText.Text = managerSnapshot.Error
                 ?? audioSnapshot.Error
@@ -409,11 +636,18 @@ public partial class MainWindow
                     return;
                 }
 
-                if (snapshot.State == RtmpOutputState.Failed
-                    || _rtmpAudioSession.Snapshot.ErrorCode is not null)
+                var reconnecting = _rtmpReconnectCoordinator.Snapshot.State == RtmpOutputState.Reconnecting;
+                if (!reconnecting
+                    && (snapshot.State == RtmpOutputState.Failed
+                        || _rtmpAudioSession.Snapshot.ErrorCode is not null))
                 {
                     RtmpStatusText.Text = snapshot.Error ?? "RTMP 推流已断开，可重新连接";
                     _state.SetStatus("RTMP 推流已断开，可重新连接");
+                }
+                else if (snapshot.State == RtmpOutputState.Publishing)
+                {
+                    RtmpStatusText.Text = $"RTMP 推流中 · {snapshot.TargetUrl ?? "rtmp://…"}";
+                    _state.SetStatus("RTMP 推流已建立");
                 }
                 UpdateRtmpProjection();
             },
@@ -422,11 +656,19 @@ public partial class MainWindow
 
     private async Task<bool> StopRtmpForMediaMutationAsync()
     {
-        var state = _rtmpOutputManager.Snapshot.State;
+        CancelRtmpReconnect();
+        var managerSnapshot = _rtmpOutputManager.Snapshot;
+        var state = managerSnapshot.State;
+        var reconnecting = _rtmpReconnectCoordinator.Snapshot.State == RtmpOutputState.Reconnecting;
+        var managerNeedsCleanup = managerSnapshot.ProcessId is not null
+            || managerSnapshot.FinalPcmInputOpen;
         if (!_rtmpAudioSession.Snapshot.IsRunning
-            && state is not (RtmpOutputState.Starting or RtmpOutputState.Publishing))
+            && state is not (RtmpOutputState.Starting or RtmpOutputState.Publishing)
+            && !reconnecting
+            && !managerNeedsCleanup)
         {
             _audioPlaybackController.SetRtmpConsumerAttached(false);
+            _lastRtmpConfig = null;
             return true;
         }
 
@@ -460,6 +702,7 @@ public partial class MainWindow
         }
 
         RtmpStatusText.Text = "媒体源即将变化，RTMP 推流已停止";
+        _lastRtmpConfig = null;
         UpdateRtmpProjection();
         return true;
     }

@@ -32,10 +32,11 @@ public partial class MainWindow
     {
         var status = _virtualCameraOutput.Snapshot;
         if (_virtualCameraOutputCoordinator is null
-            || status.State is not (VirtualCameraState.Starting
-                or VirtualCameraState.Ready
-                or VirtualCameraState.Streaming
-                or VirtualCameraState.Recovering))
+            || (!_virtualCameraOutputCoordinator.HasActiveResources
+                && status.State is not (VirtualCameraState.Starting
+                    or VirtualCameraState.Ready
+                    or VirtualCameraState.Streaming
+                    or VirtualCameraState.Recovering)))
         {
             return true;
         }
@@ -81,6 +82,7 @@ public partial class MainWindow
             or VirtualCameraState.Ready
             or VirtualCameraState.Streaming
             or VirtualCameraState.Recovering;
+        var canStop = outputRunning || (_virtualCameraOutputCoordinator?.HasActiveResources ?? false);
         var cameraPill = status.State switch
         {
             VirtualCameraState.Starting or VirtualCameraState.Recovering => "启动中",
@@ -103,7 +105,7 @@ public partial class MainWindow
         StopVirtualCameraButton.IsEnabled = _login.CanEnterWorkbench
             && !_virtualCameraProbeBusy
             && !_virtualCameraOutputCommandBusy
-            && outputRunning;
+            && canStop;
     }
 
     private string FormatVirtualCameraUnavailableStatus()
@@ -262,9 +264,15 @@ public partial class MainWindow
                 return;
             }
 
-            var coordinator = _virtualCameraOutputCoordinator ??= new(
-                _virtualCameraOutput,
-                _virtualCameraSurfaceBinding);
+            var coordinator = _virtualCameraOutputCoordinator;
+            if (coordinator is null)
+            {
+                coordinator = new(
+                    _virtualCameraOutput,
+                    _virtualCameraSurfaceBinding);
+                coordinator.SnapshotChanged += VirtualCameraOutputCoordinator_SnapshotChanged;
+                _virtualCameraOutputCoordinator = coordinator;
+            }
             var result = await coordinator.StartAsync(
                     plan,
                     cancellationToken: _windowCancellation.Token)
@@ -286,6 +294,32 @@ public partial class MainWindow
                 UpdateVirtualCameraProjection();
             }
         }
+    }
+
+    private void VirtualCameraOutputCoordinator_SnapshotChanged(
+        object? sender,
+        WindowsVirtualCameraOutputCoordinatorSnapshot snapshot)
+    {
+        if (_isClosing)
+        {
+            return;
+        }
+
+        _ = Dispatcher.InvokeAsync(() =>
+        {
+            if (_isClosing)
+            {
+                return;
+            }
+
+            if (snapshot.Output.State == VirtualCameraState.Failed)
+            {
+                VirtualCameraActionStatusText.Text = "虚拟摄像头输出已失败；请点击停止完成资源清理";
+                _state.SetStatus("虚拟摄像头输出已失败，可停止清理后重新启动");
+            }
+
+            UpdateVirtualCameraProjection();
+        }, System.Windows.Threading.DispatcherPriority.Background);
     }
 
     private async Task StopVirtualCameraCoreAsync()

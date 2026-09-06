@@ -46,11 +46,11 @@ public sealed record GeneratedVideoEffectSnapshot(
         random ??= Random.Shared;
         var snapshot = new GeneratedVideoEffectSnapshot(
             Generation: generation,
-            BrightnessPercent: random.Next(-6, 7),
-            ContrastPercent: random.Next(96, 105),
-            SaturationPercent: random.Next(96, 107),
-            HueRotationDegrees: random.Next(-4, 5),
-            SharpnessPercent: random.Next(0, 7),
+            BrightnessPercent: Rounded(Signed(random, 0.1, 0.35), 3),
+            ContrastPercent: Rounded(100.0 + Signed(random, 0.1, 0.3), 3),
+            SaturationPercent: Rounded(100.0 + Signed(random, 0.1, 0.3), 3),
+            HueRotationDegrees: Rounded(Signed(random, 0.05, 0.2), 3),
+            SharpnessPercent: Rounded(InRange(random, 0.1, 0.4), 3),
             Gamma: Math.Round(0.96 + random.NextDouble() * 0.08, 2),
             ExposurePercent: random.Next(-2, 4),
             NoiseReduction: "关闭");
@@ -183,13 +183,13 @@ public sealed record GeneratedAudioEffectSnapshot(
     /// 将当前快照中已建模且已接入 C# 实时滤镜链的字段映射为正式声音参数。
     /// 动态范围、压缩和音色仍只用于只读展示，避免伪造未建模参数。
     /// </summary>
-    public AudioEffectParams ToAudioEffectParams() =>
+    public AudioEffectParams ToAudioEffectParams(ulong randomChangePeriodMs = 4_000) =>
         new()
         {
             NaturalVoiceMode = string.Equals(ProcessingMode, "随机预设", StringComparison.Ordinal)
                 ? NaturalVoiceMode.NaturalDynamic
                 : NaturalVoiceMode.Original,
-            RandomChangePeriodMs = 4_000,
+            RandomChangePeriodMs = randomChangePeriodMs,
             VoiceLibraryId = PresetId,
             LoudnessAdjustmentDb = GainDb,
             LowEqDb = LowEqDb,

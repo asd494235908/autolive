@@ -230,6 +230,28 @@ public sealed class WindowsPortAudioOutputStreamTests
     }
 
     [TestMethod]
+    public async Task Recovery_translates_native_restart_exception_to_bounded_failure()
+    {
+        var buffer = new AudioPcmRingBuffer(256, 1);
+        using var output = new WindowsPortAudioOutputStream(buffer);
+        var snapshot = output.Snapshot;
+        var recovery = new WindowsPortAudioOutputRecovery(
+            new WindowsPortAudioRecoveryPolicy(
+                maxAttempts: 1,
+                initialDelay: TimeSpan.FromMilliseconds(1),
+                maxDelay: TimeSpan.FromMilliseconds(1)));
+
+        var result = await recovery.RecoverWithAsync(
+            _ => throw new InvalidOperationException("native restart failed"),
+            () => snapshot);
+
+        Assert.IsFalse(result.IsSuccess);
+        Assert.AreEqual(WindowsPortAudioStreamFailureCode.RestartFailed, result.Error?.Code);
+        Assert.IsTrue(result.Error?.Retryable);
+        Assert.AreEqual("PortAudio 输出流恢复发生原生错误。", result.Error?.Message);
+    }
+
+    [TestMethod]
     public async Task Restart_failure_keeps_next_bounded_attempt_from_being_misclassified_as_initial_start()
     {
         var dllPath = Environment.GetEnvironmentVariable("AUTOLIVE_TEST_PORTAUDIO_DLL");

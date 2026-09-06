@@ -5,12 +5,25 @@
 
 ## 审计结论
 
-当前不把 `WindowsRtmpReconnectCoordinator` 自动接入
-`WindowsRtmpOutputManager`、`WindowsRtmpAudioSession` 或 WPF。现有边界是安全且
-最小的：协调器只有在上层已经确认“传输确实断开”后，才接受一个不携带地址、路径、
-stream key 或 FFmpeg 原文的尝试回调；它只负责顺序、退避、取消、并发拒绝和有限终态。
+当前生产入口已由 WPF `MainWindow.ReconnectRtmpCoreAsync` 显式调用
+`WindowsRtmpReconnectCoordinator`，并由同一上层拥有 `WindowsRtmpOutputManager`、
+`WindowsRtmpAudioSession` 和活动源身份。协调器仍不会自行监听远端或在后台自动重连；
+它只负责顺序、退避、取消、并发拒绝和有限终态，尝试回调不携带地址、路径、stream key
+或 FFmpeg 原文。
 
-本轮未新增网络探测、RTMP/RTMPS 握手猜测或隐式后台重连。
+本轮未新增网络探测、RTMP/RTMPS 握手猜测或隐式后台重连；WPF 的“Publishing”门禁仍
+只表示受管 FFmpeg 有正向进度，不能替代远端握手、首包或回读证据。
+
+## 2026-09-06 当前远端复核
+
+- `192.168.10.22:1935` 一次 TCP 探测在约 3 秒后不可达，因此没有执行真实推流、回读或停止烟测，也没有反复等待。
+- 当前代码路径的状态、取消、无音频轨拒绝、有限重连、源身份失效和资源收敛测试均通过；远端网络门禁保持“待验收”。
+
+## 2026-09-06 默认预算更新
+
+协调器默认预算已与 Rust 对齐为初次启动后最多 5 次重试（共 6 次尝试），退避为
+`1/2/4/8/15s`；这不改变本审计的核心结论：只有上层确认断开、校验同一活动源身份，
+并成组停止/重建画面与最终 PCM 会话后，才允许调用协调器。
 
 ## 证据与缺口
 
@@ -21,7 +34,8 @@ stream key 或 FFmpeg 原文的尝试回调；它只负责顺序、退避、取�
 - 对外 `WindowsRtmpSnapshot.TargetUrl` 来自 `RtmpOutputRules.RedactTargetUrl`；
   完整目标地址只在启动计划和进程参数的短生命周期内使用，不进入重连协调器状态。
 - `StartAsync` 本身不做自动重试；它只启动当前一次画面/声音 FFmpeg 会话，启动后
-  即投影为本机 `Publishing`，这不等于远端发布成功。
+  先投影为 `Starting`，只有受管 stderr 的正向 FFmpeg 输出进度才进入本机 `Publishing`，
+  这仍不等于远端发布成功。
 
 ### `WindowsRtmpAudioSession`
 
@@ -59,7 +73,7 @@ var result = await reconnect.ReconnectAsync(async (attempt, cancellationToken) =
 
 协调器本身满足以下约束：
 
-- 最多 3 次尝试，退避 250ms、500ms、1s；不创建无界队列或无人管理任务；
+- 默认最多 6 次尝试，退避 1s、2s、4s、8s、15s；不创建无界队列或无人管理任务；
 - 同一协调器并发调用被拒绝；退避与回调均受取消令牌控制；
 - 回调异常、空结果和未知失败均映射为固定错误分类，不传播敏感异常正文；
 - 首次调用前已取消时不会调用传输回调；取消终态回到 `Idle`，重试耗尽进入

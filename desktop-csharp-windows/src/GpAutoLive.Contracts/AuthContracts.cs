@@ -299,7 +299,8 @@ public static class AuthContractValidation
             || !OptionalLengthWithin(request.Status.OsVersion, AuthInputLimits.OsVersionMaxLength)
             || !OptionalLengthWithin(request.Status.KernelVersion, AuthInputLimits.OsVersionMaxLength)
             || !OptionalLengthWithin(request.Status.CurrentMediaName, AuthInputLimits.HeartbeatMediaNameMaxLength)
-            || !OptionalLengthWithin(request.Status.PlaybackState, AuthInputLimits.HeartbeatPlaybackStateMaxLength))
+            || !OptionalLengthWithin(request.Status.PlaybackState, AuthInputLimits.HeartbeatPlaybackStateMaxLength)
+            || request.Status.PlaybackState is not (null or "" or "idle" or "playing" or "paused" or "error"))
         {
             error = Invalid("心跳请求格式无效");
             return false;

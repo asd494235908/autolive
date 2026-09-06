@@ -13,6 +13,7 @@
         ShowInTaskbar="False"
         ShowActivated="True"
         WindowStartupLocation="CenterScreen"
+        SourceInitialized="Window_SourceInitialized"
         Loaded="Window_Loaded"
         PreviewKeyDown="Window_PreviewKeyDown"
         Closed="Window_Closed">

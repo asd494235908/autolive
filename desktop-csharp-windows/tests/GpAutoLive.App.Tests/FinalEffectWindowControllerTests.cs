@@ -45,4 +45,16 @@ public sealed class FinalEffectWindowControllerTests
         Assert.IsFalse(typeof(FinalEffectSnapshot).GetProperties()
             .Any(property => property.Name.Contains("Path", StringComparison.OrdinalIgnoreCase)));
     }
+
+    [TestMethod]
+    public void Video_projection_retains_source_dimensions_for_window_sizing()
+    {
+        var snapshot = FinalEffectSnapshot.Create(
+            FinalEffectSurfaceKind.VideoHwndReserved,
+            videoWidth: 1920,
+            videoHeight: 1080);
+
+        Assert.AreEqual(1920u, snapshot.VideoWidth);
+        Assert.AreEqual(1080u, snapshot.VideoHeight);
+    }
 }

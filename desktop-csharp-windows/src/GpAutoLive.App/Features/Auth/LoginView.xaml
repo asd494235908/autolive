@@ -4,6 +4,9 @@
              Background="#E8101217"
              Loaded="LoginView_Loaded"
              KeyboardNavigation.TabNavigation="Local">
+    <UserControl.Resources>
+        <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+    </UserControl.Resources>
     <Grid>
         <Border Width="430"
                 Padding="28"
@@ -35,28 +38,30 @@
                            Text="Windows 本地工作台 · 登录门禁"
                            TextWrapping="Wrap" />
 
-                <TextBlock Grid.Row="2" Style="{StaticResource SectionLabelStyle}" Text="账号" />
-                <TextBox x:Name="AccountBox"
-                         Grid.Row="3"
-                         Height="36"
-                         Margin="0,6,0,14"
-                         MaxLength="128"
-                         MinHeight="36"
-                         TabIndex="1"
-                         Text="{Binding Account, UpdateSourceTrigger=PropertyChanged}"
-                         AutomationProperties.Name="账号" />
-
-                <TextBlock Grid.Row="4" Style="{StaticResource SectionLabelStyle}" Text="密码" />
-                <PasswordBox x:Name="PasswordBox"
-                             Grid.Row="5"
+                <StackPanel Grid.Row="2"
+                            Grid.RowSpan="4"
+                            Visibility="{Binding IsCredentialEntryVisible, Converter={StaticResource BooleanToVisibilityConverter}}">
+                    <TextBlock Style="{StaticResource SectionLabelStyle}" Text="账号" />
+                    <TextBox x:Name="AccountBox"
                              Height="36"
-                             Margin="0,6,0,10"
-                             MaxLength="256"
+                             Margin="0,6,0,14"
+                             MaxLength="128"
                              MinHeight="36"
-                             PasswordChanged="PasswordBox_PasswordChanged"
-                             TabIndex="2"
-                             AutomationProperties.Name="密码"
-                             AutomationProperties.HelpText="密码只在当前进程内暂存，不写入配置文件。" />
+                             TabIndex="1"
+                             Text="{Binding Account, UpdateSourceTrigger=PropertyChanged}"
+                             AutomationProperties.Name="账号" />
+
+                    <TextBlock Style="{StaticResource SectionLabelStyle}" Text="密码" />
+                    <PasswordBox x:Name="PasswordBox"
+                                 Height="36"
+                                 Margin="0,6,0,10"
+                                 MaxLength="256"
+                                 MinHeight="36"
+                                 PasswordChanged="PasswordBox_PasswordChanged"
+                                 TabIndex="2"
+                                 AutomationProperties.Name="密码"
+                                 AutomationProperties.HelpText="密码只在当前进程内暂存，不写入配置文件。" />
+                </StackPanel>
 
                 <Grid Grid.Row="6">
                     <Grid.RowDefinitions>
@@ -80,6 +85,7 @@
                             Margin="0,0,0,8"
                             IsDefault="True"
                             IsEnabled="{Binding CanSubmit}"
+                            Visibility="{Binding IsCredentialEntryVisible, Converter={StaticResource BooleanToVisibilityConverter}}"
                             TabIndex="3"
                             Content="登录"
                             Click="LoginButton_Click"
@@ -94,12 +100,12 @@
                                 Margin="0,0,8,0"
                                 IsEnabled="{Binding CanRefresh}"
                                 TabIndex="4"
-                                Content="刷新会话"
+                                Content="重试设备授权"
                                 Click="RefreshButton_Click"
                                 HorizontalContentAlignment="Center"
                                 VerticalContentAlignment="Center"
                                 Style="{StaticResource ButtonStyle}"
-                                AutomationProperties.Name="刷新会话" />
+                                AutomationProperties.Name="重试设备授权" />
                         <Button Height="30"
                                 MinHeight="30"
                                 IsEnabled="{Binding CanUseOffline}"

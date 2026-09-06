@@ -7,6 +7,38 @@ namespace GpAutoLive.Windows.Tests;
 public sealed class WindowsRtmpReconnectCoordinatorTests
 {
     [TestMethod]
+    public async Task Default_policy_matches_rust_bounded_retry_budget()
+    {
+        var delays = new List<TimeSpan>();
+        var coordinator = new WindowsRtmpReconnectCoordinator(
+            new WindowsRtmpReconnectPolicy(),
+            (delay, _) =>
+            {
+                delays.Add(delay);
+                return Task.CompletedTask;
+            });
+
+        var result = await coordinator.ReconnectAsync((_, _) =>
+            Task.FromResult(
+                WindowsRtmpReconnectAttempt.Failed(
+                    WindowsRtmpFailureCode.ProcessExited,
+                    retryable: true)));
+
+        Assert.IsFalse(result.IsSuccess);
+        Assert.AreEqual(6, result.Snapshot.RetryCount);
+        CollectionAssert.AreEqual(
+            new[]
+            {
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(2),
+                TimeSpan.FromSeconds(4),
+                TimeSpan.FromSeconds(8),
+                TimeSpan.FromSeconds(15),
+            },
+            delays);
+    }
+
+    [TestMethod]
     public async Task Successful_attempt_enters_publishing_and_keeps_bounded_count()
     {
         var observedStates = new List<WindowsRtmpReconnectSnapshot>();
@@ -74,7 +106,7 @@ public sealed class WindowsRtmpReconnectCoordinatorTests
         Assert.IsFalse(result.IsSuccess);
         Assert.AreEqual(3, attempts);
         CollectionAssert.AreEqual(
-            new[] { TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(500) },
+            new[] { TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2) },
             delays);
         Assert.AreEqual(RtmpOutputState.Failed, result.Snapshot.State);
         Assert.AreEqual(WindowsRtmpFailureCode.ReconnectExhausted.ToString(), result.Snapshot.ErrorCode);

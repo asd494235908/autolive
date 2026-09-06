@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using GpAutoLive.Contracts;
 using GpAutoLive.Media;
@@ -65,7 +66,7 @@ public sealed record WindowsRtmpResult(
 /// </summary>
 public sealed class WindowsRtmpOutputManager : IAsyncDisposable
 {
-    private const int MaxStderrCharacters = 64 * 1024;
+    private const int MaxProgressLineCharacters = 8 * 1024;
     private const int MaxPcmFloatsPerWrite = 48_000 * 2;
     private static readonly TimeSpan CleanupTimeout = TimeSpan.FromSeconds(2);
     private readonly object _gate = new();
@@ -583,8 +584,9 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
 
     private async Task DrainStderrAsync(StreamReader reader, CancellationToken cancellationToken)
     {
-        var characters = 0;
         var buffer = new char[4_096];
+        var line = new System.Text.StringBuilder(MaxProgressLineCharacters);
+        var lineTruncated = false;
         try
         {
             while (true)
@@ -592,12 +594,42 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
                 var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
                 if (read == 0)
                 {
+                    if (line.Length > 0 && !lineTruncated)
+                    {
+                        ObserveProgressLine(line.ToString());
+                    }
+
                     return;
                 }
 
-                if (characters < MaxStderrCharacters)
+                for (var index = 0; index < read; index++)
                 {
-                    characters = Math.Min(MaxStderrCharacters, checked(characters + read));
+                    var character = buffer[index];
+                    if (character == '\n')
+                    {
+                        if (!lineTruncated)
+                        {
+                            ObserveProgressLine(line.ToString());
+                        }
+
+                        line.Clear();
+                        lineTruncated = false;
+                        continue;
+                    }
+
+                    if (character == '\r')
+                    {
+                        continue;
+                    }
+
+                    if (line.Length < MaxProgressLineCharacters)
+                    {
+                        line.Append(character);
+                    }
+                    else
+                    {
+                        lineTruncated = true;
+                    }
                 }
             }
         }
@@ -617,6 +649,51 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
         }
         catch (ObjectDisposedException)
         {
+        }
+    }
+
+    internal static bool IsProgressOutputAdvanced(string line)
+    {
+        var separator = line.IndexOf('=');
+        if (separator <= 0 || separator == line.Length - 1)
+        {
+            return false;
+        }
+
+        var key = line[..separator].Trim();
+        if (key is not ("out_time_ms" or "out_time_us" or "total_size"))
+        {
+            return false;
+        }
+
+        return ulong.TryParse(
+                   line[(separator + 1)..].Trim(),
+                   NumberStyles.None,
+                   CultureInfo.InvariantCulture,
+                   out var value)
+            && value > 0;
+    }
+
+    private void ObserveProgressLine(string line)
+    {
+        if (!IsProgressOutputAdvanced(line))
+        {
+            return;
+        }
+
+        var stateChanged = false;
+        lock (_gate)
+        {
+            if (_process is not null && _state == RtmpOutputState.Starting)
+            {
+                _state = RtmpOutputState.Publishing;
+                stateChanged = true;
+            }
+        }
+
+        if (stateChanged)
+        {
+            PublishSnapshot();
         }
     }
 

@@ -1,5 +1,8 @@
+using System.Buffers;
+using System.Buffers.Binary;
 using GpAutoLive.Contracts;
 using GpAutoLive.Core;
+using GpAutoLive.Media;
 
 namespace GpAutoLive.Windows;
 
@@ -17,6 +20,7 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
     private readonly IWindowsSpeechBridge _bridge;
     private readonly FixedSpeechStateMachine _stateMachine = new();
     private readonly AudioPriorityCoordinator _audioPriority;
+    private readonly Func<FinalPcmBus?>? _finalPcmBusProvider;
     private readonly TimeSpan _startupTimeout;
     private ActiveSpeech? _active;
     private bool _disposed;
@@ -26,10 +30,12 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
     public WindowsSystemSpeechAdapter(
         IWindowsSpeechBridge bridge,
         TimeSpan? startupTimeout = null,
-        AudioPriorityCoordinator? audioPriority = null)
+        AudioPriorityCoordinator? audioPriority = null,
+        Func<FinalPcmBus?>? finalPcmBusProvider = null)
     {
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
         _audioPriority = audioPriority ?? new AudioPriorityCoordinator();
+        _finalPcmBusProvider = finalPcmBusProvider;
         _startupTimeout = startupTimeout ?? DefaultStartupTimeout;
         if (_startupTimeout <= TimeSpan.Zero || _startupTimeout > TimeSpan.FromSeconds(30))
         {
@@ -123,6 +129,26 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
                 Error(WindowsSpeechFailureCode.InvalidCommand, "Windows 本地 voice 标识无效。"));
         }
 
+        FinalPcmBus? finalPcmBus;
+        try
+        {
+            finalPcmBus = _finalPcmBusProvider?.Invoke();
+        }
+        catch (Exception)
+        {
+            return Rejected(
+                command.OperationId,
+                Error(WindowsSpeechFailureCode.FinalPcmBusUnavailable, "最终 PCM 总线当前不可用。", retryable: true));
+        }
+
+        if (_finalPcmBusProvider is not null
+            && (finalPcmBus is null || finalPcmBus.Snapshot.IsClosed))
+        {
+            return Rejected(
+                command.OperationId,
+                Error(WindowsSpeechFailureCode.FinalPcmBusUnavailable, "请先启动本地声音播放，再使用固定话术。", retryable: true));
+        }
+
         ActiveSpeech? superseded;
         ActiveSpeech activeSpeech;
         FixedSpeechTransition transition;
@@ -161,9 +187,12 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
             activeSpeech = new ActiveSpeech(
                 command.OperationId,
                 voiceKey,
+                finalPcmBus,
                 new(TaskCreationOptions.RunContinuationsAsynchronously));
             _active = activeSpeech;
         }
+
+        finalPcmBus?.DiscardOverlayPending();
 
         if (superseded is not null)
         {
@@ -174,7 +203,16 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
         IWindowsSpeechOperation? operation = null;
         try
         {
-            operation = await _bridge.StartAsync(text, voiceKey, cancellationToken).ConfigureAwait(false);
+            var pcmSink = finalPcmBus is null
+                ? null
+                : new Func<ReadOnlyMemory<byte>, bool>(pcm => TryPublishPcm16(finalPcmBus, pcm));
+            operation = await _bridge.StartAsync(
+                    text,
+                    voiceKey,
+                    finalPcmBus?.Channels ?? 0,
+                    pcmSink,
+                    cancellationToken)
+                .ConfigureAwait(false);
             if (operation is null)
             {
                 return await FailCurrentAsync(
@@ -382,6 +420,7 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
         if (active is not null)
         {
             await CancelAndDisposeAsync(active).ConfigureAwait(false);
+            active.DiscardPendingOverlay();
             active.Completion.TrySetResult(new(
                 false,
                 active.OperationId,
@@ -470,6 +509,7 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
 
                 _active = null;
                 _audioPriority.End(AudioPriorityLayer.FixedSpeech);
+                active.DiscardPendingOverlay();
                 var snapshot = CreateSnapshotUnsafe();
                 active.Completion.TrySetResult(new(
                     terminalState is WindowsSpeechAdapterState.Completed,
@@ -497,6 +537,7 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
                 _stateMachine.Fail(operationId, error.Message);
                 _active = null;
                 _audioPriority.End(AudioPriorityLayer.FixedSpeech);
+                active.DiscardPendingOverlay();
                 active.Completion.TrySetResult(new(false, operationId, CreateSnapshotUnsafe(), error));
             }
 
@@ -515,6 +556,7 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
                 _stateMachine.Cancel(FixedSpeechCommandDto.Cancel(operationId));
                 _active = null;
                 _audioPriority.End(AudioPriorityLayer.FixedSpeech);
+                active.DiscardPendingOverlay();
                 active.Completion.TrySetResult(new(
                     false,
                     operationId,
@@ -540,6 +582,7 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
 
             _active = null;
             _audioPriority.End(AudioPriorityLayer.FixedSpeech);
+            active.DiscardPendingOverlay();
             active.Completion.TrySetResult(new(
                 false,
                 active.OperationId,
@@ -548,12 +591,15 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
         }
     }
 
-    private void CompleteSuperseded(ActiveSpeech active) =>
+    private void CompleteSuperseded(ActiveSpeech active)
+    {
+        active.DiscardPendingOverlay();
         active.Completion.TrySetResult(new(
             false,
             active.OperationId,
             new(WindowsSpeechAdapterState.Cancelled, active.OperationId, active.VoiceKey, null),
             Error(WindowsSpeechFailureCode.Cancelled, "固定话术被新的操作抢占。", retryable: true)));
+    }
 
     private Task CancelAndDisposeAsync(ActiveSpeech active) =>
         CancelAndDisposeAsync(active, active.Operation);
@@ -606,6 +652,61 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
         catch (Exception)
         {
             // 适配器不能把 COM 异常或超时传播到 UI；生产桥接器必须自行满足有界释放契约。
+        }
+    }
+
+    private static bool TryPublishPcm16(FinalPcmBus finalPcmBus, ReadOnlyMemory<byte> pcm)
+    {
+        if (finalPcmBus.Channels is < 1 or > 2)
+        {
+            return false;
+        }
+
+        var bytes = pcm.Span;
+        var bytesPerFrame = checked(finalPcmBus.Channels * sizeof(short));
+        if (bytes.Length == 0)
+        {
+            return true;
+        }
+
+        if (bytes.Length % bytesPerFrame != 0)
+        {
+            return false;
+        }
+
+        var samples = ArrayPool<float>.Shared.Rent(MaxFramesPerPcmChunk * finalPcmBus.Channels);
+        try
+        {
+            var framesRemaining = bytes.Length / bytesPerFrame;
+            var sourceOffset = 0;
+            while (framesRemaining > 0)
+            {
+                var frames = Math.Min(framesRemaining, MaxFramesPerPcmChunk);
+                var sampleCount = checked(frames * finalPcmBus.Channels);
+                for (var sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++)
+                {
+                    var sample = BinaryPrimitives.ReadInt16LittleEndian(
+                        bytes.Slice(sourceOffset + sampleIndex * sizeof(short), sizeof(short)));
+                    samples[sampleIndex] = sample / 32_768F;
+                }
+
+                if (!finalPcmBus.TryPublishOverlay(
+                        samples.AsSpan(0, sampleCount),
+                        out _,
+                        out _))
+                {
+                    return false;
+                }
+
+                sourceOffset += checked(sampleCount * sizeof(short));
+                framesRemaining -= frames;
+            }
+
+            return true;
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(samples, clearArray: false);
         }
     }
 
@@ -675,6 +776,7 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
             WindowsSpeechFailureCode.InvalidCommand => "Windows 本地语音命令无效。",
             WindowsSpeechFailureCode.StartupTimeout => "Windows 本地语音启动确认超时。",
             WindowsSpeechFailureCode.MicrophonePriority => "麦克风正在插话，固定话术未启动。",
+            WindowsSpeechFailureCode.FinalPcmBusUnavailable => "最终 PCM 总线当前不可用。",
             WindowsSpeechFailureCode.SpeechFailed => "Windows 本地语音播放失败。",
             _ => fallbackMessage
         };
@@ -684,10 +786,12 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
     private sealed class ActiveSpeech(
         string operationId,
         string? voiceKey,
+        FinalPcmBus? finalPcmBus,
         TaskCompletionSource<WindowsSpeechTerminalResult> completion)
     {
         public string OperationId { get; } = operationId;
         public string? VoiceKey { get; } = voiceKey;
+        public FinalPcmBus? FinalPcmBus { get; } = finalPcmBus;
         public TaskCompletionSource<WindowsSpeechTerminalResult> Completion { get; } = completion;
         public IWindowsSpeechOperation? Operation { get; set; }
         public Task? MonitorTask { get; set; }
@@ -696,5 +800,9 @@ public sealed class WindowsSystemSpeechAdapter : IAsyncDisposable
 
         public bool TryClaimOperationDispose() =>
             Interlocked.Exchange(ref _operationDisposeClaimed, 1) == 0;
+
+        public void DiscardPendingOverlay() => FinalPcmBus?.DiscardOverlayPending();
     }
+
+    private const int MaxFramesPerPcmChunk = 4_096;
 }

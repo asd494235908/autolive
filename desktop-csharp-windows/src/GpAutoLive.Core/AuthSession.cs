@@ -129,6 +129,7 @@ public sealed record AuthTransition(
 {
     public bool IsSuccess => Error is null && Kind is AuthTransitionKind.Accepted or AuthTransitionKind.Completed or AuthTransitionKind.Duplicate;
     public bool ShouldRetry => Kind == AuthTransitionKind.RetryScheduled;
+    public string? Warning { get; init; }
     public bool RemoteLogoutConfirmed { get; init; }
     public bool RequiresRemoteLogoutRetry =>
         Operation == AuthOperationKind.Logout
@@ -416,7 +417,7 @@ public sealed class AuthSessionMachine
         if (device is null)
         {
             var error = Error(AuthErrorCodes.ResponseInvalid, 502, "控制面返回了无效的设备摘要");
-            _snapshot = _snapshot with { State = AuthSessionState.Unauthenticated, LastError = error };
+            _snapshot = _snapshot with { State = AuthSessionState.Authenticated, LastError = error };
             return CompleteFailure(AuthOperationKind.Activation, operationKey, error);
         }
 
@@ -427,7 +428,7 @@ public sealed class AuthSessionMachine
                 && !string.Equals(device.UserId, _snapshot.UserId, StringComparison.Ordinal)))
         {
             var error = Error(AuthErrorCodes.DeviceBindingConflict, 409, "设备绑定身份与当前会话不一致");
-            _snapshot = _snapshot with { State = AuthSessionState.Unauthenticated, LastError = error };
+            _snapshot = _snapshot with { State = AuthSessionState.Authenticated, LastError = error };
             return CompleteFailure(AuthOperationKind.Activation, operationKey, error);
         }
 
@@ -445,24 +446,30 @@ public sealed class AuthSessionMachine
                 disabled ? "设备已被禁用" : "当前设备尚未完成激活");
             _snapshot = _snapshot with
             {
-                State = disabled ? AuthSessionState.Disabled : AuthSessionState.Unauthenticated,
+                State = AuthSessionState.Authenticated,
                 LastError = error,
                 NextRetryAt = null
             };
             return CompleteFailure(AuthOperationKind.Activation, operationKey, error);
         }
 
-        DateTimeOffset? activationExpiresAt = null;
-        if (device.ActivationExpiresAt is not null)
+        if (string.IsNullOrWhiteSpace(device.ActivationExpiresAt)
+            || !DateTimeOffset.TryParse(
+                device.ActivationExpiresAt,
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.RoundtripKind,
+                out var activationExpiresAt))
         {
-            if (!DateTimeOffset.TryParse(device.ActivationExpiresAt, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out var parsed) || parsed <= now)
-            {
-                var error = Error(AuthErrorCodes.AccountActivationExpired, 403, "设备激活已过期");
-                _snapshot = _snapshot with { State = AuthSessionState.Unauthenticated, LastError = error };
-                return CompleteFailure(AuthOperationKind.Activation, operationKey, error);
-            }
+            var error = Error(AuthErrorCodes.ResponseInvalid, 502, "控制面未返回有效的设备授权到期时间");
+            _snapshot = _snapshot with { State = AuthSessionState.Authenticated, LastError = error };
+            return CompleteFailure(AuthOperationKind.Activation, operationKey, error);
+        }
 
-            activationExpiresAt = parsed;
+        if (activationExpiresAt <= now)
+        {
+            var error = Error(AuthErrorCodes.AccountActivationExpired, 403, "设备激活已过期");
+            _snapshot = _snapshot with { State = AuthSessionState.Authenticated, LastError = error };
+            return CompleteFailure(AuthOperationKind.Activation, operationKey, error);
         }
 
         _snapshot = _snapshot with
@@ -477,6 +484,33 @@ public sealed class AuthSessionMachine
             LastError = null
         };
         return CompleteSuccess(AuthOperationKind.Activation, operationKey);
+    }
+
+    /// <summary>在后台心跳边界按本地时钟收回已到期授权；不会等待服务端再返回一次状态。</summary>
+    public AuthTransition? ExpireActivationIfNeeded(string operationKey, DateTimeOffset now)
+    {
+        if (_snapshot.State is not (AuthSessionState.Activated or AuthSessionState.Offline)
+            || _snapshot.ActivationExpiresAt is not { } expiresAt
+            || expiresAt > now)
+        {
+            return null;
+        }
+
+        var error = Error(AuthErrorCodes.AccountActivationExpired, 403, "设备授权已过期，请重试设备授权");
+        _pending = null;
+        _snapshot = _snapshot with
+        {
+            State = AuthSessionState.Authenticated,
+            ActivationExpiresAt = null,
+            LastError = error,
+            NextRetryAt = null
+        };
+        return new AuthTransition(
+            AuthTransitionKind.Rejected,
+            AuthOperationKind.Activation,
+            operationKey,
+            _snapshot,
+            error);
     }
 
     public AuthTransition FailActivation(string operationKey, ControlPlaneErrorDto error, DateTimeOffset now) =>
@@ -691,10 +725,66 @@ public sealed class AuthSessionMachine
             return new AuthTransition(AuthTransitionKind.RetryScheduled, operation, operationKey, _snapshot, error);
         }
 
-        var nextState = error.Code is AuthErrorCodes.DeviceDisabled or AuthErrorCodes.DeviceRevoked
-            ? AuthSessionState.Disabled
-            : AuthSessionState.Unauthenticated;
-        _snapshot = _snapshot with { State = nextState, LastError = error, NextRetryAt = null };
+        if (operation == AuthOperationKind.Heartbeat)
+        {
+            var heartbeatNextState = error.Code is AuthErrorCodes.DeviceDisabled or AuthErrorCodes.DeviceRevoked
+                ? AuthSessionState.Disabled
+                : error.Status == 401 || error.Code == AuthErrorCodes.Unauthenticated
+                    ? AuthSessionState.Offline
+                    : error.Status == 403
+                        || error.Code is AuthErrorCodes.AccountActivationRequired
+                        or AuthErrorCodes.AccountActivationExpired
+                        or AuthErrorCodes.DeviceNotFound
+                        or AuthErrorCodes.DeviceBindingRequired
+                        or AuthErrorCodes.DeviceBindingConflict
+                        or AuthErrorCodes.DeviceLimitExceeded
+                            ? AuthSessionState.Authenticated
+                            : _snapshot.State;
+            _snapshot = heartbeatNextState switch
+            {
+                AuthSessionState.Disabled => _snapshot with
+                {
+                    State = heartbeatNextState,
+                    AccessToken = null,
+                    AccessExpiresAt = null,
+                    ActivationExpiresAt = null,
+                    LastError = error,
+                    NextRetryAt = null
+                },
+                AuthSessionState.Authenticated => _snapshot with
+                {
+                    State = heartbeatNextState,
+                    ActivationExpiresAt = null,
+                    LastError = error,
+                    NextRetryAt = null
+                },
+                _ => _snapshot with { State = heartbeatNextState, LastError = error, NextRetryAt = null }
+            };
+            return CompleteFailure(operation, operationKey, error);
+        }
+
+        var activationSessionStillValid = operation == AuthOperationKind.Activation
+            && error.Status != 401
+            && error.Code != AuthErrorCodes.Unauthenticated;
+        var nextState = activationSessionStillValid
+            ? AuthSessionState.Authenticated
+            : error.Code is AuthErrorCodes.DeviceDisabled or AuthErrorCodes.DeviceRevoked
+                ? AuthSessionState.Disabled
+                : AuthSessionState.Unauthenticated;
+        _snapshot = nextState switch
+        {
+            AuthSessionState.Unauthenticated => AuthSessionSnapshot.Initial with { LastError = error },
+            AuthSessionState.Disabled => _snapshot with
+            {
+                State = nextState,
+                AccessToken = null,
+                AccessExpiresAt = null,
+                ActivationExpiresAt = null,
+                LastError = error,
+                NextRetryAt = null
+            },
+            _ => _snapshot with { State = nextState, LastError = error, NextRetryAt = null }
+        };
         return CompleteFailure(operation, operationKey, error, nextState == AuthSessionState.Unauthenticated
             ? new CredentialAction(CredentialActionKind.DeleteRefreshToken)
             : null);

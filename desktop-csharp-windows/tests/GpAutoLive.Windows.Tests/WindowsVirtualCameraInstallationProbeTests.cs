@@ -38,4 +38,46 @@ public sealed class WindowsVirtualCameraInstallationProbeTests
             Assert.AreNotEqual(WindowsVirtualCameraInstallationProbeCode.Available, result.Code);
         }
     }
+
+    [TestMethod]
+    public void Formal_release_component_set_requires_marker_and_all_fixed_architecture_files()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "gpautolive-vc-install-components", Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "x64"));
+            Directory.CreateDirectory(Path.Combine(root, "x86"));
+            Directory.CreateDirectory(Path.Combine(root, "bin"));
+
+            var required = new[]
+            {
+                Path.Combine(root, "release-ready.json"),
+                Path.Combine(root, "x64", "AkVirtualCamera.dll"),
+                Path.Combine(root, "x64", "AkVCamAssistant.exe"),
+                Path.Combine(root, "x64", "AkVCamManager.exe"),
+                Path.Combine(root, "x86", "AkVirtualCamera.dll"),
+                Path.Combine(root, "bin", "akvirtualcamera-sidecar-x64.exe"),
+                Path.Combine(root, "bin", "vcam_capi.dll"),
+            };
+            foreach (var path in required.Skip(1))
+            {
+                File.WriteAllBytes(path, [0x01]);
+            }
+
+            var checker = typeof(WindowsVirtualCameraInstallationProbe)
+                .GetMethod("HasFixedComponents", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+            Assert.IsFalse((bool)checker.Invoke(null, [root])!);
+
+            File.WriteAllText(required[0], "{}");
+
+            Assert.IsTrue((bool)checker.Invoke(null, [root])!);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
 }

@@ -1,7 +1,51 @@
 # GpAutoLive C# 与 Rust 桌面端功能同步长任务实施方案
 
-- 版本：v1.80
-- 日期：2026-09-05
+- 版本：v1.123
+- 日期：2026-09-07
+- 本轮 C# 媒体池筛选与视频处理模式切换收口：媒体类型下拉筛选与文件名搜索组合生效，清空搜索会恢复当前源选中；拖放落地校验与候选扩展名校验一致。视频处理模式在 Original/CPU4/GPU83 间变化时不再只回读参数冒充 shader 生效，而是从当前 mpv 位置有界重启对应会话并恢复声音/暂停状态；同模式参数仍走既有 IPC 更新。新增 WPF/模式选择回归；不启动、不修改 Rust。
+- 本轮 C# WPF 音频诊断和周期编辑：取消原“实时预览”占位模块，上方改为固定布局的最终 PCM 音谱卡片，分别投影视频/主音频与插话音频的真实 16 段频谱；参数内部滚动只作用于 `ParameterScrollViewer`，不再通过滚动事件隐藏或重排上方卡片。视频处理周期、普通声音处理周期、插话触发间隔改为秒输入，分别经过 `1–60s`、`1–60s`、`0.5–60s` 合同校验并持久化为毫秒，调度器下一周期按新范围生效。新增 `EffectCycleSettings`、`PcmSpectrumAnalyzer`、WPF 滚动/输入回归与最终 PCM 双音谱验证；不启动、不修改 Rust。
+- 本轮根据 WPF 实际截图压缩音频诊断卡：`PreviewRow` 固定 `216px`，诊断标题/底部状态行及两个音谱面板采用紧凑间距，消除按剩余空间拉伸造成的大块空白；新增固定高度回归断言，不改 PCM、播放或周期调度边界。
+- 本轮 C# WPF 高级控制区视觉状态修正：四个高级 `Expander` 统一使用深色主题标题模板和 `TextBrush`，修复默认 WPF 模板将标题显示为黑色/系统灰的问题；插话池和 M1 状态文案统一使用 `MutedTextBrush`。不改变实时状态机、按钮启停、媒体输出或 Rust 隔离边界；新增 WPF 样式回归测试。
+- 本轮 C# canonical `live.chat/live.state` 字段边界收口：解析器现在对事件包络和 payload 都执行固定字段白名单，未知字段直接 fail-closed；新增 4 个未知字段回归用例，Rust 仍只作协议阅读参考，不启动、不联调。
+- 本轮边界修正：Rust 与 C# 是两个隔离的桌面客户端。Rust 只作为代码阅读参考，C# 不启动、探测或调用 Rust，也不与 Rust 共用媒体/输出锁；“C#↔Rust 交叉启动”和跨客户端资源争用不再是 C# 的实施或验收条件。C# 仅维护自己的单实例、媒体输出租约、安装签名与回滚边界。
+- 本轮 C# RTMP 启动失败资源回收边界收口：当 `WindowsRtmpOutputManager` 处于 `Failed` 但仍保留 PID 或最终 PCM stdin 时，WPF 将其视为可回收活动，停止按钮保持可用，媒体变更不会提前返回；成功停止/媒体变更/纯音频自然结束清除旧配置快照，重连内部拆旧会话保留快照。新增失败资源停止投影回归，Rust 保持只读。
+- 本轮 C# RTMP 重连配置快照收口：主窗口在画面/声音宿主启动成功后捕获当前 `RtmpOutputConfig`，显式重连优先复用产生失败会话的地址/轨道/编码配置，不因用户在失败后修改 TextBox 而漂移；无历史启动快照才读取当前编辑器值。快照仅存当前进程内，不写日志或持久化完整地址；新增配置选择纯逻辑回归，Rust 保持只读。
+- 本轮 C# RTMP 用户停止取消边界收口：`MainWindow.ReconnectRtmpCoreAsync` 使用独立的链接取消令牌，停止按钮在进入播放命令串行队列前先取消重连，媒体源变更前也先取消；状态投影观察协调器 `Reconnecting`，退避期间仍显示“重连中”并允许停止。重连尝试内部清理显式不取消自身令牌，避免用户停止修复引入自取消竞态；新增 `CanStopRtmpSession` 纯逻辑回归。当前只证明本地取消/状态边界，真实远端握手、断线确认、三轨道恢复和长稳仍待验收，Rust 保持只读。
+- 本轮 C# canonical M1 认证/开房/单条回复/停止生命周期接线：在显式 `AUTOLIVE_DOUYIN_PROTOCOL=canonical` 下，宿主通过受管 stdin/stdout 发送 `auth.qr.start`，等待脱敏 `auth.state=confirmed`，再发送 `live.open` 并绑定 `session_id/generation`；成功响应先推进 Core 到 `RoomResolved`，再消费 `live.state=connected` 进入监听，随后本地 fake 已打通 `live.chat → chat.send → accepted`，发送统计会发布到 WPF 快照；canonical 停止会话时，已确认登录按 `live.close → auth.logout → shutdown` 收口，超时仍强制回收，避免响应与事件异步竞态。legacy 模式保持兼容。该证据不等于真实 Conda sidecar、抖音扫码、WebSocket、平台发送或自回显通过，Rust 保持只读。
+- 本轮 C# canonical `live.gap` 缺口事件接线：parser 严格校验 `session_id/generation`、原因白名单 `sidecar_backpressure/reconnect/no_replay`、正数 `dropped_count` 和固定 payload；Core 累计缺口事件/丢弃数量并保留最近原因，bridge/WPF 将缺口作为可见的非终态状态，不重放缺失弹幕、不自动重试。fake sidecar 已覆盖宿主消费；Rust 当前旧一次性探针尚未输出 canonical `live.gap`，真实背压/重连/不可重放证据仍待验收。
+- 本轮 C# canonical 停止生命周期补齐 `auth.logout`：已确认登录的 canonical 会话按 `live.close → auth.logout → shutdown` 有界发送，扫码未确认会话按 `auth.cancel → shutdown` 收口；每条命令最多等待 750ms，超时继续走既有 stdin/Job Object 强制回收，legacy 路径不变。新增序列化与 fake sidecar marker 验证；不把 logout response 或进程退出当成真实平台登出验收。
+- 本轮 C# canonical `auth.qr` 事件消费接线：解析 `v=1/type=event/event=auth.qr/payload`，严格限制未知字段、Base64 字符、PNG 签名、256 KiB 解码上限和 Unix 过期时间；宿主只把未过期合法 PNG 写入本轮随机临时路径，复用现有 WPF `OnLoad + Freeze` 展示，旧 CLI `qr_issued` 文件路径保持兼容。新增 parser 定向回归；该增量不等于扫码确认，不实现认证凭据、真实 sidecar 或平台登录，Rust 保持只读。
+- 本轮 C# `live.open` 协议边界补齐：新增 Rust 冻结 NDJSON v1 请求/响应 codec，严格校验 `request_id` 绑定、`web_rid/generation`、脱敏 `session_id/title/live_status`、64 KiB 行上限、稳定失败码和未知字段；失败响应不保留错误正文或 canonical room_id。该增量只完成合同级编解码和 7 项定向测试，尚未让宿主实际发起/绑定 `live.open`，不替代扫码、真实 sidecar、WebSocket 或平台连接验收，Rust 保持只读。
+- 本轮 C# M1 二维码展示接线：WPF 从 `WindowsDouyinProbeHostSnapshot.QrPath` 读取宿主已验证的临时 PNG，使用 `OnLoad + Freeze` 后展示扫码面板；空路径、目录、非 PNG、重解析点、超大文件和读取失败均隐藏图片并显示脱敏状态，停止/新会话清空投影。新增二维码加载器及 7 项定向测试（其中符号链接受环境限制时跳过）。该增量只补本地展示，不把二维码文件存在误报为扫码确认，不实现 `auth.qr` base64 协议、真实 sidecar 或平台登录，Rust 保持只读。
+- 本轮 C# M1 发送安全边界复核收口：回复任务在入队时生成并缓存 `client_action_id`，Core 暴露发送阻断状态；宿主在出队和写入前复核任务/会话代际，stdin 写入使用可取消 API，合法迟到或未知请求 response 丢弃而不累计坏事件；response 嵌套字段采用固定白名单，`auth_expired/rate_limited/risk_controlled` 立即停止本轮新发送并记录至少 60 秒冷却，不自动恢复。该增量修复本地生命周期和状态门禁，不替代 `live.open`、真实 sidecar 或平台回显验收，Rust 保持只读。
+- 本轮 C# canonical `chat.send` 边界接线：新增与 Rust 冻结合同一致的 NDJSON v1 请求/响应编解码，严格校验 64 KiB 单行、会话代际、正文字符/字节和稳定错误码；`WindowsDouyinProbeHost` 通过受管 stdin/stdout 单请求关联接入本地回复队列，固定至少 3 秒一条、每分钟最多 5 条，派发后超时/断连归为 `unknown` 且不自动重试，停止/释放先关闭 stdin 并取消在途响应。该增量只打通 C# 发送协议与宿主边界，不把序列化、进程存活或本地入队计为平台发送成功；`live.open` 响应绑定、真实 sidecar、扫码、WebSocket、自回显和远端权限仍待验收，Rust 保持只读。
+- 本轮 C# canonical 事件代际门禁：`WindowsDouyinProbeHost` 在首条 `live.chat/live.state` 建立 `(session_id,generation)` 身份，后续 canonical 事件必须匹配；parser 支持传入预期身份并拒绝迟到/跨代事件，宿主停止、释放和新会话启动时清空身份。该增量只收紧事件消费，不实现 `chat.send`、真实 sidecar、扫码或 WebSocket，Rust 保持只读。
+- 本轮 Rust `live.state` 合同消费对齐：C# parser 新增对 `v=1/type=event/event=live.state/session_id/generation/payload.state` 的严格解析，限制 `connecting/connected/reconnecting/room_ended/auth_expired/risk_controlled/closed/failed` 状态；bridge 只将 `connected` 和终态投影到现有 Core，重连/关闭不会被误报为发送成功，缺会话代际 fail-closed。该增量仍不实现 `chat.send`、真实扫码或 WebSocket，Rust 保持只读。
+- 本轮 C# 抖音事件解析与 Rust 冻结 NDJSON 对齐：`WindowsDouyinProbeEventParser` 新增 `live.chat` v1 包络校验，读取 `session_id/generation/payload.msg_id/author_id/nickname/content/received_at_unix_ms`，只把正文长度转成脱敏元数据；宿主将当前配置房间注入单房间校验，正文、顶层泄露字段、坏包络和过期时间均拒绝。该增量仍不实现平台发送、不持有凭据、不修改 Rust。
+- 本轮抖音 M1 事件桥接接通真实本地消费边界：C# sidecar parser 对 `chat_received` 只接受 `WebcastChatMessage`、房间号、消息 ID、发送者 ID、文本长度和自回显/重放标志；明确拒绝 `text/content/body` 正文，队列 TTL 使用 C# 收到事件的本地时间。`WindowsDouyinProbeEventBridge` 现在调用 `DouyinLiveManager.ObserveChatMetadata`，实际进入既有去重、随机回复、有界队列和 60 秒过期路径；房间不匹配或缺元数据 fail-closed。该增量不猜测平台发送协议、不新增网络或凭据路径，真实扫码、WebSocket、发送、自回显仍待 sidecar/远端门禁。
+- 本轮虚拟摄像头安装探测与 Rust/NSIS 正式清单对齐：C# `HasFixedComponents` 现在要求 `release-ready.json`、x86/x64 DirectShow、x64 Assistant/Manager、`bin/akvirtualcamera-sidecar-x64.exe` 和 `bin/vcam_capi.dll` 七项固定文件全部存在，避免仅有注册表、三项旧文件和 PnP 设备时误报 `Installed`；新增“缺 marker/完整清单”回归。该探测仍只读，不执行安装、注册、签名或设备修改，Rust 保持只读。
+- 本轮虚拟摄像头状态投影修复：sidecar 报告下游客户端数量变化时，C# `WindowsVirtualCameraOutputCoordinator` 现在在 `Ready`/`Streaming` 转换成功后发布脱敏 `SnapshotChanged`，WPF 可及时刷新“等待下游客户端/下游客户端 N 个”状态，不改变帧写入、安装、签名或恢复边界；新增 `Ready→Streaming→Ready` 回归，目标 Windows 测试通过。Rust 保持只读。
+- 本轮 sidecar host 安全门禁收口：`WindowsVirtualCameraSidecarHost.TryValidatePlan` 在启动前再次执行 Authenticode 校验，直接构造或绕过 WPF 探测器的未签名/无效 sidecar 均在进程创建前返回 `InvalidPlan`；新增未签名计划拒绝测试，host 定向测试 `4/4` 通过。启动计划的结构校验、x64 PE、Job Object、令牌 stdin、ACL 和真实 sidecar 兼容边界保持不变。
+- 本轮虚拟摄像头 writer 异常收口：受管 30fps writer 对未分类运行时异常也转换为脱敏 `Failed/WriteFailed`，避免后台任务 fault 后快照继续停在 `Running`，使 coordinator 的健康监视能够统一收敛 Core 状态；未新增重试、线程或依赖，writer 相关 Windows 测试仍为 `8/8` 通过。
+- 本轮虚拟摄像头运行时故障收口：C# `WindowsVirtualCameraOutputCoordinator` 增加 250ms 有界健康监视，统一观察 WGC、sidecar host、Named Pipe client 和 writer 的终态；运行中组件进入失败/退出状态时，Core 会落到 `Failed`，并通过脱敏快照通知主窗口。故障态仍保留停止按钮和媒体变更前清理入口，`StopAsync` 会先取消并 Join 健康任务，再按 writer→GPU→client→sidecar 顺序回收；新增运行时失败上报→停止清理回归，受影响 Windows 测试 `8/8` 通过。该实现不自动重启、不改变 Rust 所有权，不把故障态误报为“已启用”，真实 sidecar/DirectShow/WGC 下游仍待验收。
+- 本轮 AkVirtualCamera 资源路径修复：C# sidecar locator 现在优先查找 Rust staging 的正式目录 `akvirtualcamera/bin/akvirtualcamera-sidecar-x64.exe`，同时兼容 v1 旧包的 `virtual-camera/bin` 目录；两条路径均继续经过固定文件名、普通文件、非 Reparse、x64 PE 和签名探测，不把路径命中当作真实设备/下游通过。locator 定向测试 `7/7` 通过，Rust 保持只读。
+- 本轮验证结果：使用 `D:\xz\8d020eb133350a74bbc4daec1f33bbc1.mp4`（FFprobe 实际 72.3 秒、720×1280、AAC 单声道）运行 `VideoPlaybackAudioFallbackTests` 完整 `8/8`；主窗口真实导入→首项播放、按真实时长等待后的 EOF→第二项自动换源通过。RTMP `MainWindowRtmpReadinessTests` `3/3` 通过，包含后台重连尝试回 Dispatcher 的回归；`dotnet format --verify-no-changes`、fixture `7` 文件校验、作用域门禁和 `git diff --check` 通过，无 mpv/FFmpeg/FFprobe 残留。真实 ZLMediaKit 远端、人工页面点击、目标 GPU/声卡、sidecar/DirectShow、签名安装和长稳仍未验收，Rust 保持只读。
+- 本轮真实 EOF 门禁适配用户测试媒体：用户授权视频 `D:\xz\8d020eb133350a74bbc4daec1f33bbc1.mp4` 的实际时长约 72.3 秒，原主窗口连续 EOF 夹具固定等待 20 秒会产生错误失败；测试现在根据 FFprobe 导入后的首项 `DurationMs` 使用 `时长 + 10 秒`、20～120 秒的有界等待，并在失败信息中输出脱敏时长/预算。产品播放与换源代码未因测试适配而放宽身份、取消或资源边界，Rust 保持只读。
+- 本轮 RTMP 重连线程边界修复：`WindowsRtmpReconnectCoordinator` 的第 2 次及以后尝试会在后台线程继续执行，但 `MainWindow.ReconnectRtmpCoreAsync` 现在通过窗口 `Dispatcher` 统一承载每次停止、启动和发布就绪等待，避免后台 continuation 直接访问 WPF 控件；新增跨线程调度回归测试。该修复不扩大重连预算、不改变媒体身份保护或远端握手门禁，Rust 保持只读。
+- 本轮主窗口导入黄金路径修复：`MediaImportCoordinator` 的探测/提交 continuation 运行在后台线程时，C# `PrepareMediaPoolCommitAsync` 现在把 WPF 输出停止和状态投影切回所属 `Dispatcher`，并保留取消门禁；修复了“独立 FFprobe 导入通过、主窗口导入在提交前失败”的跨线程缺口。使用用户授权测试媒体 `D:\xz\8d020eb133350a74bbc4daec1f33bbc1.mp4` 和已校验 C# 运行包，真实导入→首项播放夹具通过。Rust 保持只读。
+- 本轮并行生命周期收口：C# `WindowsVirtualCameraOutputCoordinator` 统一收集 writer/GPU/Named Pipe client/sidecar host 的停止结果，任一清理失败都继续后续回收并返回脱敏 `CleanupFailed`；取消后执行一次有界补偿清理，清理未完成期间熔断再次启动，重复停止成功后才解除。C# 媒体输出 Mutex 现在先于单实例文件锁获取，退出按输出锁→单实例锁顺序释放，新增真实内核 Mutex 争用、abandoned 接管和生命周期顺序测试。Rust 只读，真实 sidecar/DirectShow/跨进程设备资源仍待验收。
+- 本轮 RTMP 重连发布门禁收口：`MainWindow.ReconnectRtmpCoreAsync` 在用户触发的有限重连中固定当前 `MediaPlaybackIdentity`，停止前后和启动前后均拒绝跨源重连；启动后最多等待 10 秒，只有受管 FFmpeg `-progress` 已将所选画面轨提升为 `Publishing` 且所选声音会话仍运行、无错误时才报告重连成功。源身份变化进入不可重试失败，启动超时/进程失败继续交给既有有限重试；新增 `MainWindowRtmpReadinessTests`。不把本机进程存活或当前远端不可达解释为远端握手通过。
+- 本轮 C# RTMP P0 远端复核：对 `192.168.10.22:1935` 只做一次 3 秒 TCP 探测，结果不可达，因此未执行真实推流/回读/停止烟测；授权媒体文件存在但不作为网络通过证据。当前 RTMP 代码未发现需追加的明确修复缺口，远端 ZLMediaKit/RTMPS、鉴权、断线恢复和长稳继续保持待验收。
+- 本轮麦克风基础可听链路收口：C# WindowsMicrophonePcmBridge 将受管 PortAudio 输入环缓中的说话/挂起帧按活动最终 PCM 总线声道映射到 overlay；静音期间丢弃积压，总线关闭或发布失败进入可重试失败态并释放输入流。主窗口只在有活动最终 PCM 总线时允许启用麦克风，切换媒体、媒体池编辑和停止播放前先停止麦克风；同时修正固定话术/麦克风 overlay 被优先级策略误静音的问题。AEC、降噪、AGC、完整 VAD、真实麦克风/声卡和长稳仍待验收。
+- 本轮退出顺序修复：主窗口关闭时先停止并释放麦克风输入及门控观察器，再释放 mpv、PortAudio 和 RTMP 最终 PCM 总线，避免输入观察器在输出总线已关闭后才进入失败路径；不改变取消、单实例和资源释放边界。
+- 本轮 UI 对齐：Rust `final-effect` 与 C# `FinalEffectWindow` 均保持黑色纯画布和独立视频/音频表面；截图中的处理开关属于 C# 主窗口播放栏。C# 继续使用可访问的 `CheckBox` 作为状态所有者，仅把自定义开关几何收敛到 Rust Ant Design `Switch size="small"` 的 28×16 轨道、12×12 滑块，并用伸展列避免轨道越界；不改变视频/声音处理绑定、状态提交或最终效果窗口生命周期。新增 WPF 几何回归测试，Rust 只读。
+- 本轮窗口尺寸对齐：Rust `window_sizing` 的视频宽高→工作区等比缩放语义已接入 C#；`FinalEffectSnapshot` 传递当前视频宽高，C# 首次打开按当前显示器工作区和非客户区缩放，Windows `WM_SIZING` 锁定普通窗口拖拽的客户区宽高比，全屏期间保留系统最大化行为，退出全屏后按当前视频重新校准。新增纯尺寸计算、投影和窗口回归测试，不改变 mpv 视频子 HWND、WGC 顶层 HWND、窗口单实例或音频表面边界；Rust 只读。
+- 本轮 RTMP/sidecar 生命周期收口：C# RTMP 命令现在通过受管 stderr 输出有界 `-progress pipe:2`，只有 `out_time_ms/out_time_us/total_size` 出现正值后才从 `Starting` 进入 `Publishing`；主窗口同步区分“启动中/重连中/停止中/推流中/失败”，重连也只有画面/声音所选轨道都达到已发布状态才报告成功，不再把进程已启动误报为已发布；重连默认预算对齐 Rust 的初次尝试后 5 次重试与 `1/2/4/8/15s` 固定退避，仍保持取消、脱敏和有界回收。AkVirtualCamera sidecar 活动帧写入取消时会关闭当前 Named Pipe、归还池化缓冲并进入可重试失败态。以上只修改 C# 及专项文档，不把服务器当前不可达或本机进程存活计为远端/真实像素验收；Rust 只读。
+- 本轮固定话术收口：C# `WindowsSapiSpeechBridge` 通过 `SpMemoryStream` 捕获 48kHz/16-bit PCM，经既有 `FinalPcmBus` overlay 分支同时供 PortAudio 与已挂接 RTMP 消费者；无活动总线、PCM 写入失败、取消、抢占和关闭均 fail-closed 并清理 overlay 尾部，不回退 SAPI 默认设备。固定话术的真实 voice、声卡、RTMP-only 和长稳仍待实机验收。
+- 本轮插话文件生命周期收口：C# 本机 PortAudio 与 RTMP 音频会话在插话 EOF、取消、停止和 decoder 释放前清理 `FinalPcmBus` 的本地/RTMP overlay 尾部，不关闭仍由基础轨使用的总线；保留插话优先级、共享最终 PCM 和有界停止边界。当前接入的是基本 PCM overlay 链，Rust 的 22 套预设 DSP、多轨候选和真实设备曲线仍待验收。
+- 本轮 PortAudio 恢复错误收口：C# `WindowsPortAudioOutputRecovery` 将取消、普通恢复失败与原生/对象生命周期异常分别映射到稳定结果；原生异常归类为可重试 `RestartFailed`，仍受最多 3 次有界恢复预算约束，不让健康观察任务因本机 native/object 异常无人管理地 fault。
+- 本轮自动插话调度接线：C# `InterludeSchedulePlanner` 复用 Rust 的首次立即、插话结束后再开始有界随机间隔、源代次切换立即重置、暂停/固定话术/麦克风门控保留到期点和相邻文件不重复语义；WPF 使用现有 `DispatcherTimer` 与播放命令串行门触发，不创建第二播放器、第二输出流或后台无主任务。手动试播会从本次播放结束后重新建立下一次等待，自动选择的文件索引会校验当前插话池快照；真实声卡、RTMP-only、预设听感和长稳仍待验收。
+- 本轮 Phase 0 fixture 门禁补齐 C# 侧：`SyncFixtureContractTests` 读取同一目录下的 7 份 JSON，逐项校验媒体效果降级顺序、单窗口 EOF、N/N+1 最终 PCM 双消费者、RTMP 有限退避、虚拟摄像头固定规格、抖音 M1 的本地队列边界和 8 类稳定错误映射；不把 fixture 静态存在误报为 Rust/C# 真实环境通过。Rust 侧 fixture 行为测试、真实设备/远端服务和发布门禁仍待验收。
 - 状态：Phase 2 C# 黄金路径修复已接入；导入/媒体池选择、媒体池编辑控件、拖放候选白名单、mpv CPU4 视频效果及四值运行时回读、基于真实播放 PTS 的 5–8s 视频周期触发、FFmpeg 实时声音子集（含已知时长淡出、自然动态模式和确定性本地音色预设）、按可听位置预载并按 PortAudio 输出帧目标提交的声音周期候选、视频音轨→PortAudio、系统生成 EQ dB 单位、GPU83 完整 83 项 C# 映射与完整 shader 资源包、启动/更新固定白名单回读、完整 shader 哈希门控下的 WPF GPU83/旧包 CPU4 选择、音频 N/N+1 单一输出切换、基于 PortAudio `timeInfo` 的可听时钟投影和正常容量范围内的 PCM 背压、播放态视频效果更新后的 mpv 下一帧号观察、视频启动后的 mpv 首帧帧号门禁、视频启动 `GPU83 → CPU4 → Original` 单向降级、WGC `FrameArrived` 事件唤醒取帧、同一捕获线程的有界轮询、WGC 绑定顶层最终效果窗口 HWND、普通 WPF 与实际 `FinalEffectWindow` 的 WGC 帧池启动/停止隔离门禁、WGC D3D11 设备的 `BGRA_SUPPORT|VIDEO_SUPPORT` 创建标志、真实硬件 adapter 选择和 WGC surface→DXGI texture 解包已接入；视频播放中切换声音开关会停止并从 mpv 当前位置重建 FFmpeg 声音会话；视频画面启动不再因独立 PortAudio 设备失败而回滚；音频计划与输出采样率不一致时在启动前 fail-closed；RTMP 无音频停止路径已修正为只释放实际取得的音频串行锁；App 测试程序集已固化串行执行，消除共享 WPF Dispatcher/真实 mpv 资源的并行竞态。GPU83 原生 Win32 窗口和实际 `FinalEffectWindow` 最终像素均已通过显式夹具；本轮又将 C# 最终效果窗对齐 Rust `final-effect` 的黑色视频纯画布样式，删除 Footer、浮层、等待文字和重复播放控制，保留同一视频子 HWND、WGC 顶层 HWND、单实例及主窗口控制边界。目标显卡矩阵、真实声卡稳定性、过载重建、远端输出与人工页面验收仍待验收
 - 本轮并行增量：`MediaPoolOwner.ReplaceAll` 已修复为仅按替换后池长度校验，`Append` 继续按旧池加新候选限制 100 项；C# 通用 D3D11 硬件工厂已使用 `BgraSupport | VideoSupport`，与 Rust WGC 视频处理能力声明对齐；WGC surface→DXGI texture 解包和实际 WPF GPU83 最终像素闭环已通过显式夹具；声音启动现在必须在有界预算内产生首批 PCM，最终 PCM 总线的 RTMP 分支不再反向阻塞本机声音；主窗口真实导入、运行包失败保留旧池、未授权导入和真实 EOF 自动换源已补齐边界证据；mpv IPC 断开时控制器不再误报播放中，停止失败会向上返回；RTMP 启动失败、Pump/Producer 失败和停止超时均保留真实失败状态与可重试资源；底部主导入按钮恢复可见，mpv `glsl-shader-opts` 字符串回读按固定键集合兼容；复审并撤回未形成闭环的 RTMP stdout 进度草稿，修正无音频停止时的 `_audioSerial` 释放条件；生成音频快照的正式频域字段已进入 FFmpeg `-af`，CPU4 动态更新已与启动滤镜使用固定标签，视频声音会话在首次输出失败后可随暂停/恢复从 mpv 位置有界重试；App 测试程序集已加入串行门禁，保护共享 WPF Dispatcher、环境变量和真实 mpv 窗口资源；`导入列表` 已接入版本化 JSON 本地路径列表，成功后复用既有 FFprobe 与 `ReplaceAll` 原子提交；导入探测与原子提交现在持有共享播放命令串行门，关闭最终效果窗口复用统一输出停止路径，RTMP 共享最终 PCM 总线按实际声道数构造解码、混音和分流链；C# 启动入口新增用户本地文件句柄单实例门禁，实测第二次启动立即退出且进程数保持为 1。以上只修改 C# 代码、测试和专项文档，未改变登录门禁、媒体原子提交、WARP 禁止或目标 GPU/下游发布门禁边界。
 - 实施端：`desktop-csharp-windows`（C# / WPF / Windows）
@@ -56,22 +100,22 @@ Rust 的当前产品入口以 [`desktop/src-tauri/src/main.rs`](../../../desktop
 | 单窗口播放 | 单一 mpv 会话、活动源、暂停/恢复/换源 | 已有播放控制器和单窗口约束 | 补齐 EOF、停止、换源和退出时资源回收的共同验收 | P0 |
 | 视频效果 | `gpu-next/libplacebo` GPU83，失败单向降级 CPU4，再到 Original；部分参数已有真实运行链 | C# 已以真实可验收的 mpv CPU4 `vf set` 链承载四项参数，并已接入 83 项契约映射、完整受限 shader 资源、调度输入和 manifest/SHA-256 校验；WPF 在完整 shader 哈希匹配时使用 GPU83，旧包保持 CPU4；启动和播放态更新都已接入有界 `estimated-frame-number` 首帧/下一帧观察；原生 Win32 与实际 WPF `FinalEffectWindow` 的 GPU83/CPU4 最终像素均已通过显式夹具 | 保持目标显卡矩阵、完整算法能力、单向降级和人工页面证据；不可把 IPC 回读或帧号前进单独当作视觉效果验收 | P0 |
 | 普通声音 | 独立声音候选、PortAudio、N/N+1 和可听时钟边界 | C# 视频/音频播放均接入 FFmpeg PCM→PortAudio；处理开关把增益/EQ/倍速/内置滤镜音高微移/淡入/自然动态响度包络/确定性本地音色 EQ/混响/降噪/相位/颤音写入 `-af`，低/中/高 EQ 中心频率与 Rust realtime 链统一为 `200/1000/8000 Hz`，最终 PCM 可分流给 RTMP，有限音频项已接入一个预载候选和单输出边界切换，PortAudio `timeInfo` 已形成可听帧/延迟快照并用于同身份视频进度投影；动态范围、压缩没有 C# 正式对应参数，继续标记为未接入 | 补齐真实声卡时钟稳定性、过载重建、设备故障回退和 RTMP/声卡联合门禁 | P0 |
-| 插话文件/固定话术 | 按当前范围执行，实时话术除外 | C# 有插话/`SAPI.SpVoice` 边界，但 SAPI 尚未进入最终 PCM 总线 | 对齐优先级、抢占、静音、取消、恢复；固定话术保持无模型 | P0 |
+| 插话文件/固定话术 | 按当前范围执行，实时话术除外 | C# 插话文件与 `SAPI.SpVoice` 均已接入最终 PCM overlay、本机/RTMP 分流及有界取消/EOF 清理；当前仍是基本 PCM 链 | 对齐优先级、抢占、静音、取消、恢复；补齐真实 voice/设备门禁和 Rust 22 套预设 DSP、多轨候选差异；固定话术保持无模型 | P0 |
 | 麦克风插话 | 已有正式需求和 Rust 侧边界，真实声学门禁未完成 | Windows 音频接入和状态边界可由 C# 管理，真实 AEC/降噪/AGC/VAD 待门禁 | 两端均标记待验收；VAD 仅作说话活动门控，不扩展为识别或变声 | P1 |
 | RTMP/RTMPS 直推 | 受管 FFmpeg、GPU 编码探测、最终 PCM 分流、有限重试已有运行基础；UI 状态仍有旧标签 | 有 FFmpeg 主机、状态和重连协调器，但启动/断开/远端握手/联合轨道证据不完整 | 统一 3 轨道、重试、取消、脱敏、断开和恢复语义；不捕获桌面、不经过 Go | P0 |
 | AkVirtualCamera | WGC/D3D11、固定 YUY2 720p30、独立 GPL sidecar 边界已有部分接入 | 有 WGC/D3D11/Vortice 和安装脚本基础，真实设备/sidecar/签名门禁未完成 | 可以由 C# 直接管理 Windows 采集与安装外壳，但必须保持固定协议和一次有界回读 | P1 |
-| 抖音 M1 | 当前 Rust 只有扫码/探针入口，尚未形成完整 manager + 真实 sidecar 发送链 | C# Core 已有二维码状态、去重、随机回复、有界队列和 60 秒过期逻辑，但事件桥未接入真实消息字段 | C# Core 可作为队列语义实现候选；协议、许可、扫码、发送、自回显和风险停止必须按专项方案实测 | P1 |
+| 抖音 M1 | 当前 Rust 只有旧一次性探针入口，尚未形成完整 manager + canonical sidecar 发送链 | C# Core 已有二维码状态、去重、随机回复、有界队列和 60 秒过期逻辑；事件桥已消费脱敏 `chat_received/live.chat` 与 `live.state`，并有本流身份锁定；C# 宿主已接入 canonical `auth.qr.start/auth.state/live.open/chat.send` 编解码、stdin/stdout 单请求响应关联、任务 action ID、代际复核、严格字段白名单和风险后发送阻断；本地 fake sidecar 已打通登录确认到监听态及单条 `live.chat→chat.send→accepted` 统计投影 | 正式 canonical sidecar、真实扫码、WebSocket、`WebcastChatMessage`、平台发送、自回显和真实风险/限流恢复必须按专项方案实测；本地 fake 管道和协议测试不等于平台接受 | P1 |
 | 本地运行时资源 | Rust 有受限资源状态/安装/导入/清理命令 | C# 有 WPF 安装、回滚、卸载、签名探针 | 保持平台差异；统一 manifest、版本、路径白名单、失败关闭和退出回收 | P1 |
 | 缩略图、偏好设置、Windows 诊断 | Rust UI 没有同等 WPF 缩略图缓存；偏好和诊断模型不同 | C# 有有界 FFmpeg 缩略图缓存、INI 偏好、GDI/User/GC 采样 | 不作为强制功能镜像；只有产品行为需要时才补 Rust 对应能力 | P2 |
-| 单实例/媒体输出所有权 | Rust 保留 Tauri 单实例，并在 Builder 前获取共享媒体 Mutex | C# 使用同名媒体 Mutex，进程探测仅作诊断 | 共享锁代码已接入；真实跨进程争用和资源矩阵待验收 | P0 |
+| 单实例/媒体输出所有权 | Rust 保留自己的 Tauri 单实例与 Rust 侧资源所有权实现，仅供代码参考 | C# 使用专属单实例文件锁和 `Local\\GpAutoLive.CSharp.MediaOutput.Owner.v1` 媒体输出 Mutex | 两个客户端隔离；只验收 C# 自身重复启动、崩溃恢复、安装中断回滚、权限级别和无孤儿进程，不启动或探测 Rust | P0 |
 
 ### 2.1 已确认的关键差距
 
 1. C# 的旧 `VideoEffectEditorState` 仍只映射有限字段；当前 WPF v2 系统生成快照已先转换为正式 `VideoEffectParams`，在完整 shader 哈希匹配时进入 GPU83、旧包进入 CPU4，启动已形成“首帧号有效”门禁，播放态更新已形成“参数回读 → 下一帧号前进”的运行时门禁，实际 WPF `FinalEffectWindow` GPU83/CPU4 最终像素回显也已通过显式夹具；剩余是目标显卡矩阵、完整算法能力和发布门禁。
 2. C# 已将本地音频生产的 `FinalPcmBus` 共享给 RTMP 声音出口；有限音频项已连接一个 N+1 预载解码器、四分支总线切换器和单一 PortAudio/RTMP 输出边界，PortAudio `timeInfo` 已接入可听帧/延迟快照和同身份视频进度投影，主轨和候选在正常容量范围内按消费者水位背压，并以 `E:\下载\csharp-golden-av.mp4` 完成一次真实夹具切换测试。真实设备时钟稳定性、过载重建、设备故障回退和真实 RTMP 仍需单独门禁，不能把该测试等同于完整声音同步。
 3. C# RTMP 有重连协调器，但底层进程退出、无进展、远端失败、联合音画轨道和最终 PCM 的真实连接仍需按 Rust 语义补齐；Rust UI 中“待实施/未接入”标签需要按真实代码和门禁重新整理。
-4. 两端此前的媒体所有权协议不是同一个协议；本轮已新增 Rust 共享 Mutex 封装并在 Builder 前获取，当前剩余问题是真实跨进程争用和资源矩阵证据。
-5. C# 的抖音队列核心比 Rust 探针更接近 M1 目标，但当前 sidecar 事件桥只映射粗粒度状态，没有把真实 `WebcastChatMessage` 载荷送入 `ObserveChatMessage`，所以不能宣称 C# 已完成抖音链路。
+4. Rust 与 C# 是隔离客户端，不共享媒体输出 Mutex，也不互相启动、探测或联调；本轮已删除 C# 对 Rust 进程和共享锁的运行时依赖。当前只剩 C# 自身跨重复启动、崩溃恢复、权限级别和输出资源回收证据。
+5. C# 的抖音队列核心比 Rust 旧探针更接近 M1 目标；本轮已把脱敏 `WebcastChatMessage`/Rust `live.chat` 元数据送入 `ObserveChatMetadata`，并消费 `live.state`、锁定本流 `(session_id,generation)`，补齐单房间、去重、自回显/重放过滤、随机回复、有界队列、入队 action ID、发送前代际复核、严格 response 白名单、风险/限流后的发送阻断以及 canonical `auth.qr.start → auth.state → live.open` 的宿主生命周期。本地 fake sidecar 已验证到监听态；正式 sidecar、扫码、WebSocket、平台发送、自回显确认、真实人工恢复和远端权限仍未完成，不能宣称 C# 已完成抖音链路。
 
 ### 2.2 2026-09-04 历史实施增量
 
@@ -219,7 +263,7 @@ Rust/Tauri App
 
 目标是先让两端对“同一个功能是否完成”有相同定义。
 
-当前进度：已建立 13 项能力同步矩阵、7 个跨语言 JSON fixture/错误类别样例及 PowerShell 5.1/7 无依赖校验入口；两端读取相同 fixture 并产出相同状态/错误类别的行为测试仍待补齐。
+当前进度：已建立 13 项能力同步矩阵、7 个跨语言 JSON fixture/错误类别样例及 PowerShell 5.1/7 无依赖校验入口；C# Media 测试已读取 7 份 fixture 并校验关键状态、降级、背压/所有权和错误分类，Rust 侧 fixture 行为测试仍待补齐。
 
 - 建立一份机器可读的同步矩阵：能力、端、状态标签、依赖、验收证据、负责人和更新时间；当前文件为 [`2026-09-04-CSharp与Rust桌面端功能同步同步矩阵.json`](./2026-09-04-CSharp与Rust桌面端功能同步同步矩阵.json)。
 - 为媒体参数、播放状态、音频候选、RTMP、虚拟摄像头和抖音 M1 建立最小 JSON fixture/错误码样例，集中放在 [`2026-09-04-csharp-rust-sync-fixtures`](./2026-09-04-csharp-rust-sync-fixtures/)；使用 [`tools/verify-csharp-rust-sync-fixtures.ps1`](../../../tools/verify-csharp-rust-sync-fixtures.ps1) 做无依赖静态校验。
@@ -230,12 +274,12 @@ Rust/Tauri App
 
 ### Phase 1：安全边界、所有权与生命周期（P0）
 
-当前进度：Rust 已通过最小 `autolive-media-output-ownership` 封装消费与 C# 相同的 `Local\\GpAutoLive.MediaOutput.Owner.v1`；跨进程启动竞态、实际输出资源争用和发布环境矩阵仍待验收。
+当前进度：C# 已接入自己的媒体/输出租约与单实例生命周期；Rust 仅作为只读实现参考，不参与 C# 启动、探测、调用或资源争用验收。C# 自身安装签名、升级中断恢复、回滚和 Windows 发布环境矩阵仍待验收。
 
-- 统一媒体输出所有权名称、互斥策略和启动顺序；启动 mpv、PortAudio、RTMP、虚拟摄像头前都必须通过同一仲裁。
+- 统一 C# 自身媒体输出所有权名称、互斥策略和启动顺序；启动 mpv、PortAudio、RTMP、虚拟摄像头前都必须通过 C# 自己的仲裁。
 - 补齐 C# 与 Rust 的取消、超时、Job Object、线程 Join、管道关闭和窗口关闭回收。
 - 统一敏感数据脱敏：RTMP URL、Token、Cookie、二维码凭据、sidecar 原文和用户回复正文不得进入普通日志或 Renderer。
-- 统一单实例、换源、停止、崩溃恢复和重复启动的错误语义。
+- 统一 C# 单实例、换源、停止、崩溃恢复和重复启动的错误语义；不要求与 Rust 互相启动或互相抢占资源。
 
 退出条件：故障注入和第二实例测试均 fail-closed；没有孤儿进程、无人管理线程或可绕过的任意 IPC 命令。
 
@@ -349,10 +393,10 @@ Rust/Tauri App
 
 ## 10. 本阶段交付物
 
-本阶段已完成方案文档、Phase 1 共享媒体输出所有权锁，以及 Phase 2 C# mpv 初始/开关效果 IPC 和本地音频→RTMP 共享最终 PCM 的第一段接入。后续实施仍按阶段产出：
+本阶段已完成方案文档、Phase 1 C# 自身媒体输出所有权锁，以及 Phase 2 C# mpv 初始/开关效果 IPC 和本地音频→RTMP 共享最终 PCM 的第一段接入。Rust 仅作为只读实现参考，后续实施仍按阶段产出：
 
 - 本文持续维护的方案、决策记录，以及 [`2026-09-04-CSharp与Rust桌面端功能同步同步矩阵.json`](./2026-09-04-CSharp与Rust桌面端功能同步同步矩阵.json)。
-- Phase 1 跨客户端媒体/输出所有权锁：Rust 与 C# 已消费同一命名 Mutex；真实进程争用仍待验收。
+- Phase 1 C# 自身媒体/输出所有权锁：C# 使用专属命名 Mutex 与单实例文件锁；真实 C# 重复启动、崩溃恢复、权限级别和输出回收仍待验收，Rust 不参与。
 - Phase 2 C# 媒体接入第一段：视频处理开关可向活动 mpv 会话提交受限快照，CPU4 夹具可回读活动 `vf` 链，GPU83 基线夹具可回读四项 `glsl-shader-opts`；本地音频会话可作为最终 PCM 生产者供 RTMP 非拥有消费，有限音频项已完成真实 N/N+1 预载和单一 PortAudio 输出切换，可听时钟已接入实际输出帧/延迟并用于同身份视频进度投影；完整 shader 效果回显、真实时钟稳定性、设备恢复、过载重建和远端输出仍待验收。
 - 两端可复用的契约 fixture、错误码和状态标签测试；当前 fixture 校验入口为 `powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify-csharp-rust-sync-fixtures.ps1`。
 - C# 媒体运行时闭环、音频总线、RTMP、虚拟摄像头和抖音 M1 的实现与分层验收记录。
@@ -626,7 +670,7 @@ Rust/Tauri App
 ### v1.75 C# 单实例进程门禁修复（2026-09-05）
 
 - 真实冷启动复现确认旧 C# 命名 Mutex 门禁未阻止第二个 `GpAutoLive.exe`；新增 `WindowsSingleInstanceLease`，在 `%LocalAppData%\GpAutoLive\locks\csharp-instance.lock` 上持有 `FileShare.None` 文件句柄，进程退出或异常终止时由 Windows 自动释放句柄。
-- `App.OnStartup` 先取得单实例租约，再取得跨客户端媒体/输出资源租约；第二次启动只返回并退出，不创建主窗口，也不影响已运行实例。锁文件不删除，避免清理与新启动之间的竞态。
+- `App.OnStartup` 先取得 C# 单实例租约，再取得 C# 专属媒体/输出资源租约；第二次启动只返回并退出，不创建主窗口，也不影响已运行实例。锁文件不删除，避免清理与新启动之间的竞态。Rust 不参与。
 - 新增同一路径二次获取拒绝、释放后重新获取回归测试；锁定 SDK 下测试 `1/1`，新版 Release x64 构建 `0` 警告/`0` 错误，冷启动 A/B 验证为 A 保持运行、B 已退出、进程数保持 `1`。
 - 本轮未修改 Rust/Tauri、未新增第三方依赖、未删除生产代码；主控制窗口与最终效果窗口仍属于同一个 C# 进程，最终效果窗口继续作为单一 mpv/WGC 承载窗口。真实声卡、远端 ZLMediaKit/RTMPS、AkVirtualCamera 下游、人工页面和长稳仍按总计划验收。
 
@@ -649,3 +693,48 @@ Rust/Tauri App
 - 过滤后的选中项不再把显示序号当作源池序号；选择、排序、移除、键盘删除、自动换源和播放切换通过 `MediaListItemViewModel` 身份映射回完整源池索引，保留当前源和原子媒体池编辑边界。
 - 底部主导入按钮继续复用既有 `ImportButton_Click → RunImportAsync`，只补齐 `32px` 高度、居中布局和顶栏同源加号/`Ctrl+O` 文案，修复内容自然尺寸导致的又宽又矮样式；不新增组件或依赖。
 - 本轮目标测试 `2/2`、既有媒体池忙碌态回归 `1/1`、格式检查和 Release x64 构建 `0` 警告/`0` 错误。CUA 未返回 C# 原生窗口，人工页面点击和像素级视觉验收未计入通过；Rust/Tauri 保持只读。
+
+### v1.81 C# AkVirtualCamera sidecar 首帧写入启动门禁（2026-09-05）
+
+- `WindowsVirtualCameraSidecarOutputWriter` 启动时等待第一帧固定协议写入成功，2 秒超时、取消和断管道均回收 worker 并返回稳定失败；只有真实完成首帧写入后才投影 `Running`。
+- 新增断开 Named Pipe 后首帧写入失败回归测试，保持固定 `1280×720 YUY2@30fps`、latest-wins、单一 WGC/D3D11 捕获链和有界生命周期；不把进程存活或 IPC 连接冒充像素交付。
+- 使用项目锁定 SDK 执行 Windows 目标测试 `227/227` 通过，格式检查和 Release 构建通过，`git diff --check` 已通过。真实 sidecar/DirectShow、下游兼容、目标 GPU、签名/许可证和长稳仍待验收，Rust 只读。
+
+### v1.82 C# 处理开关展示对齐 Rust（2026-09-06）
+
+- 对照 Rust `final-effect` 运行时和主窗口 `Switch size="small"`：最终效果窗口继续保持黑色纯画布；截图中的“视频处理/声音处理”属于主窗口播放栏，不属于最终效果弹窗。
+- C# `SwitchCheckBoxStyle` 保留可访问 `CheckBox`、现有状态绑定和启用/关闭文案，仅修正为伸展内容列、36px 开关列、28×16 轨道和 12×12 滑块，避免自定义轨道超出模板列宽造成显示偏移。
+- 新增 WPF 几何回归测试；媒体样式 `2/2`、最终效果纯画布 `2/2`、格式检查和 App Release x64 构建 `0` 警告/`0` 错误。人工页面点击和真实窗口像素仍待可用桌面控制环境，Rust 只读。
+
+### v1.83 C# 最终效果窗口按视频宽高等比调整（2026-09-06）
+
+- `FinalEffectSnapshot` 携带当前视频宽高；首次显示按 Rust `window_sizing` 语义在当前显示器工作区内计算客户区尺寸，较大视频等比缩小，较小视频保留最小尺寸。
+- `FinalEffectWindow` 通过 `WM_SIZING` 修改普通窗口拖拽矩形，分别处理边缘和四角，按视频客户区宽高比回写尺寸；全屏不拦截，退出全屏后重新按当前视频校准。
+- 新增 `FinalEffectWindowSizingTests`、主窗口宽高投影测试和最终效果窗口回归；相关最终效果测试 `8/8` 通过。人工拖拽、多屏切换、DPI、真实视频像素、WGC 下游和长稳仍待验收，Rust 只读。
+
+### v1.90 C# 插话尾部与 PortAudio 恢复边界收口（2026-09-06）
+
+- `WindowsAudioPlaybackController.RunInterludeAsync` 和 `WindowsRtmpAudioSession.RunInterludeAsync` 在插话 EOF、取消、停止及 decoder 释放前清理 `FinalPcmBus` 的本地/RTMP overlay 尾部；清理只丢弃未消费的插话数据，不关闭仍由基础轨使用的共享总线。
+- 新增 `FinalPcmBusTests.Discard_overlay_pending_clears_local_and_rtmp_tails_without_closing_bus`，并复验插话链 `11/11`、音频控制器 `14/14`、Media `FinalPcmBus` `6/6`；未新增播放器、线程、队列或第三方依赖。
+- `WindowsPortAudioOutputRecovery` 将取消、普通恢复失败和原生/对象生命周期异常映射为稳定的 `Cancelled`/`RestartFailed` 结果；原生异常保持可重试，但仍受最多 3 次有界恢复预算限制。新增原生重启异常回归测试，PortAudio 输出专项 `13/13` 通过。
+- 主线程定向复验 Windows/Media/App 分别为 `28/28`、`29/29`、`7/7`，格式检查通过。真实 SAPI voice、声卡、RTMP-only、Rust 22 套预设 DSP/多轨候选、设备拔插和长稳仍待验收；本轮不修改 Rust。
+
+### v1.91 C# 插话预设单轨消费边界收口（2026-09-06）
+
+- 修复 WPF 插话启动链只显示 `presetSummary`、未把选择结果传入 `FfmpegPcmDecodePlanBuilder` 的真实缺口。
+- `InterludeAudioSelection.TryCreateBoundedAudioEffectParams` 只允许一个经 p01～p22 白名单校验的 ID，映射为现有 `AudioEffectParams.VoiceLibraryId`；固定模式和随机单轨都进入受管单输入 `-af`，多轨、空选择和非法 ID fail-closed。
+- 该边界复用现有 C# 本地确定性 EQ 消费，不臆造 Rust `audio-value-presets.ts` 的 35 字段/22 套完整滤镜；Rust、麦克风 overlay、PortAudio/RTMP 混音所有权不变。Core 10/10、Media 17/17、Contracts 3/3 定向测试通过；真实声卡、预设听感、完整字段映射、多轨、远端 RTMP 和长稳仍 deferred。
+- 同时修复已有插话调度器在触发后丢失下一次到期时间的回归，保持换源立即触发和有界间隔；该修复不新增播放器、线程或队列。
+
+### v1.92 C# 自动插话调度接入（2026-09-06）
+
+- `InterludeSchedulePlanner` 已成为 C# 插话自动触发的唯一纯逻辑边界：首次播放立即触发，当前插话结束后再建立下一次 500～60000ms 有界等待；暂停、固定 SAPI、麦克风优先级或当前插话活动时只保留到期点，不在门控期间启动新任务。
+- WPF 主窗口的 250ms `DispatcherTimer` 只在媒体状态为 `Playing`、本机/RTMP 音频宿主可用、插话池为 `Ready` 且配置启用时观察调度；实际启动仍经过既有 `RunPlaybackCommandAsync` 串行门和 `StartInterludeFileAsync` 的媒体身份/索引/插话池路径/取消校验。
+- 手动“插话试播”与自动触发共享同一单轨预设投影、最终 PCM overlay 和停止/EOF 清理路径；手动启动会重置下一次自动等待，避免立即重复触发。新增规划器回归覆盖首次触发、暂停/换源和手动启动后的等待。
+- 定向 Core 插话测试 `14/14`、App Release x64 构建 `0` 警告/`0` 错误、解决方案格式检查通过；未执行真实 WPF 页面点击，真实声卡、RTMP 远端、自动插话听感和长稳仍待验收。
+
+### v1.93 C# 共享 fixture 合同门禁补齐（2026-09-06）
+
+- 扩展 `SyncFixtureContractTests`，读取同一份跨语言 fixture 目录并校验 7 份 JSON 的 schema/contract、GPU83→CPU4→Original 降级、单窗口 EOF、N/N+1 最终 PCM 双消费者、RTMP 直接媒体与 `1/2/4/8/15s` 退避、固定 YUY2 720p30 虚拟摄像头、抖音 M1 本地有界串行队列，以及 8 类稳定错误的 retryable/UI 状态。
+- 该增量只补 C# 侧 Phase 0 可重复合同门禁，不新增运行时抽象、依赖、媒体处理或网络路径；fixture 校验通过不替代 Rust 侧行为测试、真实设备/远端服务和发布门禁。
+- `SyncFixtureContractTests` 定向测试 `1/1` 通过；Rust 端保持只读。
