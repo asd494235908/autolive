@@ -1,6 +1,113 @@
 # C# Windows 桌面端当前状态
 
-更新时间：2026-09-05
+> 2026-09-07 真实黄金路径复验：使用 `D:\xz\8d020eb133350a74bbc4daec1f33bbc1.mp4`（FFprobe 约 72.3 秒）与已校验 `csharp-gpu83-real-v2` 运行包，主窗口真实导入→首项视频播放→EOF 自动切换 `2/2` 通过；视频声音处理开关重建 FFmpeg/PortAudio 会话 `2/2` 通过；GPU83 最终窗口像素变化 `1/1` 通过；独立声音滤镜输出与原始 PCM 的长度和 SHA-256 均不同。该证据只覆盖当前机器和显式运行包，不等于人工 UI、目标 GPU 矩阵、设备拔插、RTMP 远端或长稳验收；Rust 保持只读。
+
+> 2026-09-07 媒体池筛选与视频模式切换收口：媒体池新增真正生效的“全部/视频/音频”筛选，并与文件名搜索组合；清空搜索或切换筛选会恢复当前源的可见选中项，拖放候选的扩展名校验与文件导入保持一致，避免“看得到但不能操作”或不支持文件进入候选池。视频处理模式在 `Original/CPU4/GPU83` 之间变化时不再只通过 IPC 回读参数冒充 shader 已生效，而是从当前 mpv 位置有界重启单一会话，并恢复声音、暂停状态及 GPU83→CPU4→Original 的既有单向回退；同模式参数仍使用原子 IPC 更新。相关 App/Windows 定向测试、格式检查和本地 x64 Release 构建通过；真实目标 GPU、PortAudio、RTMP 和人工连续页面验收仍待完成。
+
+> 2026-09-07 媒体添加语义修复：顶栏、媒体池按钮和 `Ctrl+O` 选择的文件现在统一按所选顺序追加到当前播放池，不再错误提交“替换全部”而使已有条目从列表消失；系统文件拖放继续使用同一追加语义。按钮统一显示“添加媒体”，并明确提示不会删除已有条目或本地源文件。版本化 JSON 媒体列表仍保留整池替换语义。生产文件删除调用审计确认导入、移除和清空仅修改进程内播放池引用，用户源文件不进入删除路径；仅应用生成的临时缩略图、原子配置临时文件等受管临时产物允许清理。App 入口/UI 定向测试 `2/2`、Core 媒体池测试 `17/17` 通过；本地 x64 Release 构建 `0` 警告、`0` 错误并已重启开发端。未执行全量测试与人工文件选择点击。
+
+> 2026-09-07 插话音量与主音频恢复修复：插话高级区新增 `0%–100%` 音量滑块，对应既有合同的 `-60–0 dB`，拖动实时进入 overlay 混音策略，鼠标释放或键盘调整后复用既有原子配置存储；主媒体音量与 duck 深度保持独立。真实复测证明上轮仅把 duck 释放移出 UI continuation 仍不足，进一步定位到 RTMP 已接入时普通声音定时 N→N+1 切换的互等：本机/RTMP 主轨已晋级，但 RTMP overlay 等待旧总线关闭，旧总线又等待 overlay 晋级，5 秒后 `candidate_activation_timeout` 会终止整个主音频会话。当前两个 overlay 分支都跟随已确认主轨晋级，有真实消费者的 RTMP 主轨仍保留自然确认。主线程集成定向测试 App `13/13`、Core `15/15`、Media `19/19`、Windows 音频/RTMP `23/23` 及格式检查通过；x64 Release 本地构建 `0` 警告、`0` 错误并已重新启动开发端。真实 RTMP + PortAudio + 插话 + 声音周期联合听感、人工页面、重启持久化和长稳仍待验收。
+
+> 2026-09-07 当前画面处理路径显示：主窗口视频参数区、播放状态区和底部视频处理开关现在统一显示当前受管 mpv 会话效果快照中的真实模式：`GPU·GPU83`、`CPU·CPU4`、`未处理·Original`；没有活动视频会话时显示“等待视频”。显示不再根据视频处理开关或资源能力预判，因此 GPU83 启动失败并单向回退 CPU4/Original 后会呈现实际会话模式。未新增硬件探测、线程、缓存或第二状态源。主线程集成复核中 App 状态/UI 定向测试 `29/29`、Windows 控制器测试 `6/6`、格式检查通过，x64 Release 本地构建 `0` 警告、`0` 错误并已重新启动桌面端；真实 GPU83/CPU4 启动后的人工页面观察和目标显卡矩阵仍待验收。
+
+> 2026-09-07 插话收尾与下一轮进度第一层收口：插话 duck 优先级曾由 WPF UI completion continuation 释放，UI 投影延迟时 `MediaDucked` 会继续保持；当前释放已直接绑定底层解码 completion，并由后台 `finally` 覆盖成功、失败和取消，UI 只显示终态，不拥有主音频恢复时机。该接线通过自动化但没有单独解决真实主音频终止，最终根因和修复见本文顶部的 RTMP overlay 切换互等记录。下一轮进度不再把音频宿主短暂不可用误判为配置失效：有效播放、插话配置和候选池仍存在时继续投影真实调度窗口，到 100% 后等待宿主恢复再触发；真正停止、关闭/清空配置或候选失效才清零。集成聚焦筛选 App `24/24`、Core `21/21` 通过，x64 Release 本地构建为 `0` 警告、`0` 错误并已启动新进程；未执行全量测试，真实 PortAudio/RTMP 听感、人工页面连续进度、设备异常和 30 分钟长稳仍待验收。
+
+> 2026-09-07 自动视频周期低感知范围修复：`VideoEffectCyclePlanner` 的职责仍只限于按真实播放位置决定下一次切换时机；持续明显偏色的根因是 `GeneratedVideoEffectSnapshot` 曾把亮度 `-6～+6%`、对比度 `96～104%`、饱和度 `96～106%`、色相 `-4～+4°` 和锐化 `0～6%` 直接用于生产自动周期，偏离《媒体参数范围与默认值》的低感知档。当前生产生成范围已收窄为亮度 `±0.1～0.35%`、对比度/饱和度相对 `100%` 偏移 `±0.1～0.3%`、色相 `±0.05～0.2°`、锐化 `0.1～0.4%`，GPU83 与 CPU4 均消费同一收窄快照；“明显可见”范围只保留给固定测试素材验证映射链真实改变画面，不进入生产随机周期。失败先行测试修复前 `1/1` 失败，修复后相关测试 `3/3`、`ShellStateTests` `18/18` 及格式检查通过；真实视频主观低感知观察、目标 GPU 和长稳仍待验收。
+
+> 2026-09-07 插话候选启动恢复：桌面端加载到 `Enabled=true` 且目录非空的已保存插话配置后，复用现有 `InterludeFilePoolService.ScanDirectory` 在后台执行一次有界、可取消的安全扫描，只恢复候选快照而不自动播放。目录不存在、无权限或超过目录上限时保持持久化配置及已有候选快照不变，并在插话区域及全局状态显示明确错误；关闭或未配置状态不触发扫描。App 定向测试 `3/3` 通过；真实受限目录、人工重启页面观察和真实插话播放仍待验收。
+
+> 2026-09-07 声音周期进度停滞修复：声音变换进度必须在活动音频会话期间持续读取最终 PCM 的真实可听位置，并相对 `AudioEffectCyclePlanner` 当前周期窗口投影；带音轨视频在初播、声音恢复、手动切换和自然续播成功建立最终 PCM 后，均启动同一个声音完成观察器。不能只在参数重新生成时更新，也不能由 UI 动画或独立计时器猜测。暂停、停止、换源、关闭声音处理或会话失效时清零。使用用户当前视频与真实 FFmpeg/PortAudio 的 WPF 定向夹具已确认进度从 0 开始推进；人工页面连续观察、主观听感和长稳仍待验收。
+
+> 2026-09-07 插话频谱显示修复：插话文件实际播放期间，视频/主音频频谱只在诊断 UI 中归零并隐藏，插话频谱继续显示实际 overlay PCM；插话结束、停止或失败收尾后恢复主频谱显示。该显示门控不写入 `FinalPcmBus`、不消费或改写 PCM，也不改变既有基础轨 duck/静音优先级和插话混音策略。当前未完成真实声卡听感、人工页面切换和长稳验收，不把自动化投影检查记作实机通过。
+
+> 2026-09-07 视频/声音/插话变换进度投影：WPF `ShellState` 新增三条 `0–100` 周期进度绑定属性。视频进度只使用现有 mpv/最终 PCM 播放观察时钟与 `VideoEffectCyclePlanner` 真实周期窗口；声音进度只使用最终 PCM 可听时钟与 `AudioEffectCyclePlanner` 候选切换窗口；插话进度直接消费 `InterludeSchedulePlanner.ProgressPercent`。未新增定时器、动画或调度事实源；停止、失效、关闭处理或换代时清零，不保留旧周期假进度。App 聚焦测试 `25/25` 通过；未执行人工页面点击或真实媒体进度观察。
+
+> 2026-09-06 桌面认证接管：C# 已成为后续版本唯一桌面认证事实源。C# 自有设备 ID 不被 Rust 覆盖；仅在 C# ID 缺失时读取固定旧目标 `device-id.autolive.desktop`，按 Windows keyring 的 UTF-16LE 密码编码解码，合法则复制、损坏则停止自动迁移以避免创建第二设备。密码、Rust Refresh Token 和 Rust pending logout 均不迁移。C# 远端 Logout 失败会把最多 8 条待撤销 Token 隔离保存并在启动恢复前重试；激活成功必须包含未来到期时间，心跳周期会本地收回到期授权，并把设备禁用/撤销结果投影到 WPF 门禁且清理当前会话凭据。认证定向 Release 自动化 `47/47`、格式检查和 App Release x64 构建通过；真实 Credential Manager 迁移、控制面 TLS、管理员禁用和跨到期时间实机仍待验收。
+
+更新时间：2026-09-07
+
+> 2026-09-06 WPF 音频诊断与周期输入接入：取消原“实时预览”占位模块，上方区域改为固定布局的最终 PCM 音谱卡片，分别显示主音频与插话的 16 段实时频谱；参数区内部 `ScrollViewer` 滚动不再改变上方卡片的可见性或行高。视频处理周期、普通声音处理周期和插话触发间隔均支持用户输入秒数并做 `1–60s`（插话沿用 `0.5–60s`）范围校验，配置以毫秒写入本地低敏偏好，调度器下一周期按新范围生效。新增周期配置、PCM 双音谱和滚动布局回归测试；C# Release 构建、相关测试和格式检查通过，未执行人工页面点击，Rust 仅作只读参考且未启动。
+
+> 2026-09-06 WPF 音谱卡紧凑化：根据实际页面截图将上方音频诊断区域固定为 `216px`，标题/底部状态行收窄，两个音谱面板和柱状图高度同步压缩，避免诊断卡占用过多工作区；参数区仍独立滚动，音谱数据与周期输入逻辑不变。新增固定高度回归断言，Rust 保持只读且未启动。
+
+> 2026-09-06 WPF 高级控制区样式修正：高级控制、插话文件池、RTMP、抖音回复池四个 `Expander` 已统一绑定 `DarkExpanderStyle`、深色标题模板和 `TextBrush`，修复截图中标题落为黑色导致的低对比度；插话池/M1 状态文案改用 `MutedTextBrush`。实时按钮启停和状态投影逻辑未改；新增 `Advanced_expander_headers_use_the_dark_theme_text_and_header_template` 回归测试并通过。该次只验证 WPF 控件属性与本地构建，未执行人工页面点击，Rust 保持只读且未启动。
+
+> 2026-09-06 客户端隔离边界修正：Rust 与 C# 是两个独立客户端，Rust 仅用于阅读实现方式。C# 不启动、不探测、不调用 Rust，也不使用与 Rust 共享的媒体/输出锁；本端只验证 C# 自身的单实例、媒体输出资源、安装签名和回滚。历史记录中“C#↔Rust 交叉启动/跨客户端争用”不再属于当前 C# 验收条件。
+
+> 2026-09-06 canonical `live.chat/live.state` 未知字段门禁：C# parser 对事件包络和 payload 统一执行固定字段白名单，未知字段直接拒绝，避免 sidecar 夹带未审计正文或状态扩展；Windows parser 定向测试 `17/17` 通过。该修改只收紧 C# 输入边界，不启动或修改 Rust。
+
+> 2026-09-06 canonical M1 认证/开房/单条回复/停止生命周期接线：在显式 `AUTOLIVE_DOUYIN_PROTOCOL=canonical` 下，C# 宿主通过受管 stdin/stdout 依次发送 `auth.qr.start`、等待 `auth.state=confirmed`、发送 `live.open` 并绑定脱敏 `session_id/generation`，成功响应先推进 `RoomResolved`，再消费 `live.state=connected` 进入监听；监听后 fake `live.chat → chat.send → accepted` 已验证队列、动作 ID 和统计 `SnapshotChanged` 投影，停止时已确认会话优先发送 `live.close → auth.logout → shutdown`，扫码未确认会话发送 `auth.cancel → shutdown`，消除响应与事件异步竞态。Windows 抖音相关测试和停止协议定向测试已通过。legacy 模式保持兼容；真实 Conda sidecar、抖音扫码、WebSocket、平台发送、自回显和风险恢复仍待验收，Rust 保持只读。
+
+> 2026-09-06 canonical `live.gap` 接线：C# parser/bridge/Core 已校验并记录 `sidecar_backpressure/reconnect/no_replay` 缺口及正数 `dropped_count`，状态快照保留最近原因和累计丢弃数，WPF 监听状态会显示缺口计数；缺口不伪造补发、不自动重试。Rust 当前旧探针尚未输出该事件，真实 sidecar 的背压/重连/不可重放证据仍待验收。
+
+> 2026-09-06 RTMP 自动重连线程边界修复：`MainWindow.ReconnectRtmpCoreAsync` 的每次停止、启动和发布就绪等待现在统一经窗口 `Dispatcher` 执行；后台退避 continuation 不再直接触碰 WPF 控件或 UI 状态。新增后台入口回归测试，App 定向 `MainWindowRtmpReadinessTests` `3/3` 通过；该修复不等于远端 ZLMediaKit/RTMPS 握手、断线信号或长稳已验收，Rust 保持只读。
+
+> 2026-09-06 canonical `auth.qr` 事件消费：C# parser 现在解码 `v=1/type=event/event=auth.qr` 的 `png_base64`，限制 Base64 字符、PNG 签名、256 KiB 解码上限、过期时间和未知字段；宿主只把未过期合法图片写入本轮随机临时文件，复用 WPF 二维码面板，旧 CLI 文件路径不受影响。该路径不返回或持久化凭据，不把二维码文件存在当作扫码成功；parser 定向测试 `11/11` 通过，真实 sidecar/登录仍待验收，Rust 保持只读。
+
+> 2026-09-06 `live.open` 合同与宿主生命周期接入：C# 新增 Rust 冻结 NDJSON v1 的请求/响应编解码，并由 canonical 宿主实际发送/绑定；按 `request_id` 校验响应，限制 `web_rid/generation/session_id/title/live_status`、64 KiB 行上限、稳定错误码和未知字段，失败正文与 canonical room_id 不进入模型。真实扫码、正式 sidecar、WebSocket 和平台连接仍待验收，Rust 保持只读；Windows 协议与宿主定向测试已通过。
+
+> 2026-09-06 M1 二维码展示接线：WPF 读取宿主已验证的临时 PNG 路径，`DouyinQrImageLoader` 在 16 MiB、PNG 扩展名、普通文件和非 Reparse 门禁后以 `OnLoad + Freeze` 解码，扫码面板只在加载成功时显示，停止/新会话清空图片；canonical `auth.qr` base64 已由 parser/host 转为本地临时 PNG，二维码文件存在仍不等于扫码确认，真实 sidecar、平台登录和 WebSocket 仍待验收，Rust 保持只读。二维码定向测试通过 `6/6`，符号链接用例因当前环境权限跳过。
+
+> 2026-09-06 Rust NDJSON `live.chat` 对齐：C# parser 已支持 `v=1/type=event/session_id/generation/payload` 包络，并将 `msg_id/author_id/nickname/content` 收敛为脱敏元数据；宿主注入当前配置房间，非法包络、顶层正文和超界字段 fail-closed。平台真实 sidecar、`chat.send`、扫码和 WebSocket 仍待验收，Rust 保持只读。
+
+> 2026-09-06 M1 发送门禁复核收口：回复任务在 Core 入队时生成 `client_action_id`；宿主在发送前复核任务/会话代际，stdin 写入/刷新可取消，合法迟到 response 不累计坏事件，response 根/result/error 均拒绝未知字段；`auth_expired/rate_limited/risk_controlled` 会阻断本轮新发送并保留至少 60 秒冷却，不自动恢复。canonical `live.open` 宿主绑定已通过本地管道测试，但正式 sidecar、平台发送和自回显仍待验收，Rust 保持只读。
+
+> 2026-09-06 canonical `chat.send` 宿主边界：C# 新增 Rust 冻结 NDJSON v1 请求/响应编解码，校验 64 KiB 单行、代际、正文 100 Unicode/400 UTF-8 字节和稳定错误码；`WindowsDouyinProbeHost` 通过受管 stdin/stdout 做单请求在途关联，固定至少 3 秒一条、每分钟最多 5 条，派发后超时/断连记录 `unknown` 且不自动重试，停止/释放先关闭 stdin。该代码不把序列化成功、队列出队、本地 fake response 或本机进程存活计为平台接受；正式 sidecar、扫码、WebSocket、自回显和远端权限仍待验收，Rust 保持只读。
+
+> 2026-09-06 Rust NDJSON `live.state` 对齐：C# parser 已校验会话 ID、正数 generation、payload 状态白名单，并由 bridge 处理 `connected`、房间结束、鉴权失效、风控和失败；`connecting/reconnecting/closed` 不会被误报为已发送成功，缺会话代际直接 fail-closed。`chat.send`、真实扫码、WebSocket 和跨代迟到事件丢弃仍待实现/验收，Rust 保持只读。
+
+> 2026-09-06 canonical 事件代际门禁：`WindowsDouyinProbeHost` 现在以首条 `live.chat/live.state` 的 `(session_id,generation)` 建立本轮身份，后续不匹配事件被拒绝，停止/释放/新会话会清空身份。该门禁已接入 C# 消费边界，但 `live.open` 响应绑定、真实 `chat.send`、扫码和 WebSocket 仍待实现/验收，Rust 保持只读。
+
+> 2026-09-06 抖音 M1 脱敏事件消费接线：`chat_received` 事件现在只接受 `WebcastChatMessage`、房间/消息/发送者标识、正文长度和自回显/重放标志，拒绝 `text/content/body`；桥接进入 `DouyinLiveManager.ObserveChatMetadata`，真实执行单房间校验、去重、随机回复、有界队列和本地 60 秒 TTL。平台真实 sidecar、扫码、WebSocket、发送和自回显仍未验收，Rust 保持只读。
+
+> 2026-09-06 AkVirtualCamera 安装清单对齐：C# 安装探测现在要求 Rust/NSIS 正式包的 `release-ready.json`、x86/x64 DirectShow、x64 Assistant/Manager、`bin/akvirtualcamera-sidecar-x64.exe` 和 `bin/vcam_capi.dll` 七项固定文件全部存在，避免不完整包配合旧 PnP 设备误报 `Installed`；新增清单回归。探测保持只读，不执行安装/注册/签名/设备修改，真实签名发布和设备验收仍待完成，Rust 保持只读。
+
+> 2026-09-06 AkVirtualCamera 状态投影修复：sidecar 下游客户端数量从 0/正数变化时，`WindowsVirtualCameraOutputCoordinator` 现在在 Core 成功切换 `Ready`/`Streaming` 后发布脱敏 `SnapshotChanged`，WPF 不再保留旧的下游连接状态；新增 `Ready→Streaming→Ready` 回归。该修复不启动真实 sidecar、不改变安装/签名/DirectShow 门禁，Rust 保持只读。
+
+> 2026-09-06 AkVirtualCamera 资源路径修复：C# sidecar locator 现在优先查找正式 staging 目录 `akvirtualcamera/bin/akvirtualcamera-sidecar-x64.exe`，兼容旧版 `virtual-camera/bin` 目录；两条路径继续经过固定文件名、普通文件、非 Reparse、x64 PE 和签名探测。locator 定向测试 `7/7` 通过；真实 sidecar、DirectShow、下游兼容、签名安装和长稳仍待验收，Rust 保持只读。
+
+> 2026-09-06 AkVirtualCamera host 安全门禁收口：`WindowsVirtualCameraSidecarHost` 启动前再次执行 Authenticode 校验，未签名/无效 sidecar 在进程创建前返回 `InvalidPlan`，不依赖 WPF 入口是否已经做过探测。新增拒绝未签名计划测试，host 定向测试 `4/4` 通过；真实签名安装、sidecar、DirectShow、下游兼容和长稳仍待验收，Rust 保持只读。
+
+> 2026-09-06 AkVirtualCamera writer 异常收口：受管 30fps writer 对未分类运行时异常也转换为脱敏 `Failed/WriteFailed`，避免后台任务 fault 后快照继续停在 `Running`，使 coordinator 健康监视可以统一收敛 Core 状态；未新增重试、线程或依赖，writer 相关 Windows 测试 `8/8` 通过，Rust 保持只读。
+
+> 2026-09-06 AkVirtualCamera 运行时故障收口：`WindowsVirtualCameraOutputCoordinator` 增加 250ms 有界健康监视，统一把 WGC、sidecar host、Named Pipe client 和 writer 的失败/退出终态投影到 Core `Failed`；主窗口在故障态仍保留停止入口，停止前先取消并等待健康任务，再按 writer→GPU→client→sidecar 回收资源。新增运行时故障上报与停止清理回归，Windows 受影响测试 `8/8` 通过；不自动重启、不绕过签名/安装/下游门禁，真实 sidecar、DirectShow、WGC 可见帧和长稳仍待验收，Rust 保持只读。
+
+> 2026-09-06 主窗口导入黄金路径修复：媒体探测在后台 continuation 完成后，提交前的 WPF 输出停止/状态投影现通过所属 `Dispatcher` 执行，避免跨线程访问导致新媒体池在提交前被拒绝。使用 `D:\xz\8d020eb133350a74bbc4daec1f33bbc1.mp4` 与已校验 C# 媒体运行包的真实导入→首项播放夹具通过；不改变媒体原子提交、输出停止或取消边界，Rust 保持只读。
+
+> 2026-09-06 本轮真实黄金路径复验：使用 `D:\xz\8d020eb133350a74bbc4daec1f33bbc1.mp4`（FFprobe 72.3 秒、720×1280、AAC 单声道），`VideoPlaybackAudioFallbackTests` 完整 `8/8` 通过，含主窗口导入、视频/声音启动、PortAudio 失败降级、声音处理切换、暂停/恢复和真实 EOF→第二项换源；`MainWindowRtmpReadinessTests` `3/3` 通过，包含后台重连回 Dispatcher。该结果仍不替代 RTMP 远端、人工页面、目标设备和长稳验收。
+
+> 2026-09-06 用户测试媒体 EOF 门禁适配：`D:\xz\8d020eb133350a74bbc4daec1f33bbc1.mp4` 实际时长约 72.3 秒，连续换源夹具不再固定等待 20 秒，而是依据导入后首项时长采用 20～120 秒的有界 `时长+10 秒`预算，避免把长视频错误判定为 EOF 失败；播放逻辑、身份校验、取消和资源释放未放宽，Rust 保持只读。
+
+> 2026-09-06 RTMP 重连跨线程边界修复：有限重连第 2 次及以后尝试会在 `WindowsRtmpReconnectCoordinator` 的后台 continuation 中执行，C# `MainWindow` 现在将每次停止、启动和发布就绪等待统一切回窗口 `Dispatcher`，避免后台线程直接访问 WPF 控件；新增 `RunOnDispatcherAsync` 回归测试。该修复不改变媒体身份保护、有限重试预算、取消和远端握手门禁，Rust 保持只读。
+
+> 2026-09-06 C# 插话预设真实消费边界：修复 `MainWindow.AudioInterlude` 只显示 `presetSummary`、未把选择结果送入 FFmpeg 计划的缺口。固定模式和随机单轨通过 `InterludeAudioSelection.TryCreateBoundedAudioEffectParams` 将唯一 p01～p22 ID 作为现有本地确定性 `VoiceLibraryId`，进入 `FfmpegPcmDecodePlanBuilder` 的受管单输入 `-af` 链；空选择、非法 ID 和多轨选择 fail-closed。该实现是可验证的 ID-only 最小边界，不伪造 Rust `audio-value-presets.ts` 的 35 字段一一映射，也不把多轨/完整 22 套 DSP 标为已生效。Core 10/10、Media 17/17、Contracts 3/3 通过；真实听感、声卡、RTMP 和长稳仍待验收，Rust 保持只读。
+
+> 2026-09-06 C# 自动插话调度接入：WPF 通过现有 250ms `DispatcherTimer` 观察 `InterludeSchedulePlanner`，对齐 Rust 的首次立即、插话结束后再开始有界随机间隔、源代次重置、暂停/固定话术/麦克风门控和相邻文件不重复；手动试播结束后也会重置下一次等待。调度实际启动仍经过既有播放串行门、媒体身份校验、单轨预设投影和最终 PCM overlay 清理。Core 插话规划器定向 `14/14`，App Release x64 构建 0 警告/0 错误；真实 WPF 页面点击、声卡/RTMP-only、自动插话听感和长稳仍待验收。
+
+> 2026-09-06 C# Phase 0 fixture 门禁：`SyncFixtureContractTests` 读取共享目录中的 7 份 JSON，校验 GPU83→CPU4→Original、单窗口 EOF、N/N+1 PCM 双消费者、RTMP 有限退避、虚拟摄像头固定规格、抖音 M1 本地有界串行队列和 8 类稳定错误；定向测试 `1/1` 通过。该证据只代表 C# 合同门禁，不替代 Rust 侧行为测试或真实设备/远端/发布验收。
+
+> 2026-09-06 插话与 PortAudio 生命周期收口：插话文件在本机 PortAudio 与 RTMP 音频会话的 EOF、取消、停止和 decoder 释放前，都会清理 `FinalPcmBus` 本地/RTMP overlay 尾部，不关闭仍由基础轨使用的总线；PortAudio 恢复路径将取消、普通失败和原生/对象生命周期异常映射为稳定结果，原生异常归类为可重试 `RestartFailed`，保留最多 3 次有界重试。相关 Media `FinalPcmBus` 测试 `6/6`、Windows 插话/音频控制器测试 `11/11` 与 `14/14`、PortAudio 恢复专项 `13/13`，本轮 Windows/Media/App 定向回归分别 `28/28`、`29/29`、`7/7` 通过；Rust 的 22 套预设 DSP、多轨候选、真实声卡/voice、远端 RTMP 和长稳仍待验收。
+
+> 2026-09-06 麦克风基础可听桥接：WindowsMicrophonePcmBridge 将受管 PortAudio 输入环缓中的说话/挂起帧按活动最终 PCM 总线映射到 overlay，静音期间丢弃积压；主窗口只在存在活动最终 PCM 总线时开放启用入口，媒体切换、媒体池编辑和停止播放前先停止麦克风。固定话术/麦克风共享 overlay 时只静音/duck 基础轨，不再误静音 overlay。新增桥接、无总线 fail-closed、媒体停止边界和混音策略测试；定向测试 8/8 通过。AEC、降噪、AGC、完整 VAD、真实麦克风/声卡、页面点击和长稳仍待验收，Rust 保持只读。
+> 2026-09-06 并行生命周期复核：虚拟摄像头 coordinator 现在逐项收集 writer/GPU/Named Pipe client/sidecar host 清理结果，清理失败不伪造 `Stopped`，取消后执行一次有界补偿清理，并在未完成清理前拒绝再次启动；虚拟摄像头受影响测试 38/38 通过。媒体输出所有权改为先获取 C# 专属 Mutex、再获取 C# 单实例锁，退出逆序释放；新增 C# 内核争用、abandoned 接管和生命周期顺序测试。真实 sidecar/DirectShow/WGC 可见帧、C# 输出资源仍待验收，Rust 保持只读。
+> 2026-09-06 RTMP 重连发布门禁：`MainWindow` 现在在有限重连中锁定当前媒体身份，停止前后拒绝跨源重连；启动后最多等待 10 秒，只有所选轨道达到 `Publishing`/声音运行且无错误才返回成功，超时或进程失败继续按既有有限预算重试。新增 `MainWindowRtmpReadinessTests` 2/2；远端 `192.168.10.22:1935` 当前不可达，真实握手、断线恢复和长稳仍待服务器恢复后复验，Rust 保持只读。
+> 2026-09-06 本批复验：Windows 测试项目全量 236/236、App 关键回归 6/6、`dotnet format --verify-no-changes --no-restore` 通过，C# App Release x64 构建 0 警告/0 错误；同步矩阵 JSON 解析通过，`git diff --check` 无错误。远端 `192.168.10.22:1935` 本次复探不可达，不能把历史 RTMP 烟测或本机进程启动当作当前远端/人工验收，Rust 保持只读。
+
+> 2026-09-06 固定话术/SAPI → 最终 PCM P0 接线：`MainWindow` 现在把 `WindowsAudioPlaybackController.ActiveFinalPcmBus` 提供给 `WindowsSystemSpeechAdapter`；`WindowsSapiSpeechBridge` 将 SAPI 输出捕获为 48kHz/16-bit PCM，经既有 overlay 分支送入 PortAudio 及已挂接的 RTMP 消费者。无活动总线时拒绝启动，不回退默认音频设备；取消、抢占、关闭和终态会清理未消费 overlay，保留“麦克风 > 固定话术 > 插话 > 原媒体”优先级。新增总线缺失/PCM 接入/取消清理测试；使用仓库锁定 SDK 定向测试 `11/11` 通过，真实 SAPI voice、声卡、RTMP-only、人工页面点击和长稳仍待验收，Rust 保持只读。
+
+> 2026-09-06 最终效果窗口按视频尺寸等比调整：C# `FinalEffectSnapshot` 现在携带当前视频的宽高；首次显示按当前显示器工作区和窗口非客户区等比缩放，视频较大时先缩放到工作区内，视频较小时保留最小尺寸。最终效果窗通过 Windows `WM_SIZING` 在普通窗口拖拽边缘/角点时锁定当前视频宽高比，全屏期间不拦截系统尺寸，退出全屏后按当前视频重新校准。新增等比尺寸计算、主窗口宽高投影和最终效果窗口回归测试；人工拖拽、多屏切换、DPI 和真实视频窗口像素验收仍待可用桌面环境，Rust 保持只读。
+
+> 2026-09-06 Rust/C# 展示一致性修复：确认两端最终效果窗口都保持黑色纯画布，视频使用独立视频表面，声音使用黑底，不在弹窗内重复放置播放控制或处理开关；本次截图中的控件实际属于 C# 主窗口底部播放栏。C# 底部视频/声音处理开关继续保留可访问的 `CheckBox` 语义和“已启用/已关闭”状态文案，但自定义开关已对齐 Rust `Switch size="small"` 的 28×16 轨道、12×12 滑块，并修正模板列宽与内容伸展布局，避免轨道超出列宽造成显示偏移。新增 WPF 几何回归测试；人工页面点击与真实窗口像素验收仍待可用桌面控制环境，Rust 保持只读。
+
+> 2026-09-06 RTMP 状态门禁与重连预算：受管 FFmpeg 通过 stderr 上的 `-progress pipe:2` 输出建立正向进度证据，只有 `out_time_ms/out_time_us/total_size` 为正值后才投影“推流中”；主窗口将启动、重连、停止和失败与已发布状态分开显示，重连也只有所选画面/声音轨道都达到已发布状态才报告成功，避免把进程存活当作远端握手成功。默认重连为初次启动后最多 5 次重试，退避 `1/2/4/8/15s`；目标 `192.168.10.22:1935` 当前复探测不可达，因此远端握手、三轨道、恢复和长稳仍待服务器恢复后复验，Rust 保持只读。
+
+> 2026-09-05 sidecar 首帧启动门禁：`WindowsVirtualCameraSidecarOutputWriter` 现在必须在 2 秒有界预算内完成第一帧固定 `1280×720 YUY2@30fps` 写入，才返回启动成功并进入 `Running`；断管道、取消和超时会回收 worker 并返回脱敏失败，不再把 worker/IPC 连接存在冒充实际帧交付。新增断开管道首帧失败回归测试；使用项目锁定 SDK 的 Windows 目标测试 `227/227` 通过，格式检查和 Release 构建通过，`git diff --check` 通过。真实 sidecar、DirectShow、下游兼容、目标 GPU、签名/许可证和长稳仍待验收，Rust 保持只读。
+
+> 2026-09-05 声音与最终效果窗口修复：底部输出音量滑块已从静态占位接入现有最终 PCM 混音策略，0～100% 映射为有限 dB 增益，实时作用于本机 PortAudio 与 RTMP 分支；声音处理开关新增单调版本号，异步重建期间再次切换会拒绝过期请求，避免旧声音会话覆盖最新状态。最终效果窗口已对齐 Rust 的视频纯画布样式，删除 Footer、状态/等待文字及弹窗内播放控制，默认/全屏往返仍保持 mpv 视频子 HWND 与 WGC 顶层 HWND。声音专项此前 `135/135`、FinalEffect/声音状态目标此前 `10/10`、Release x64 构建此前 `0` 警告/`0` 错误；本轮样式回归与构建结果以本次交付记录为准，真实声卡和人工页面点击仍待验收。
+
+> 2026-09-05 最终效果窗口样式对齐 Rust：删除 C# FinalEffectWindow 底部 Footer、左上角表面标签、等待播放文字和弹窗内播放/停止/进度/关闭控件；客户区改为黑色视频画布，标题、默认尺寸 `1280×720`、最小尺寸 `320×180` 与 Rust `final-effect` 运行时窗口一致。播放控制回到主窗口，原生标题栏仍可关闭；mpv 视频子 HWND、WGC 顶层 HWND、单实例和输出生命周期不变。新增/调整 WPF 回归契约覆盖无控件纯画布与全屏往返；人工页面点击、真实声卡、WGC 下游和长稳仍待验收。
+
+> 2026-09-05 C# 媒体池搜索与导入按钮样式修复：搜索框从只读占位文本改为真实输入框，按文件名或媒体类型过滤 `VisibleMediaItems`，空白搜索恢复完整池，空结果显示明确空态；完整 `MediaItems` 和 `MediaPoolService` 播放池不被搜索改写，过滤后的选中项操作按 ViewModel 身份映射回源池索引。底部主导入按钮继续复用既有 `ImportButton_Click → RunImportAsync` 链，仅补齐 32px 高度、居中对齐和与顶栏一致的加号/快捷键布局。新增搜索投影、源池不变、过滤选中索引和按钮样式回归；目标测试 `2/2`、既有媒体池忙碌态测试 `1/1`、格式检查通过，Release x64 构建 `0` 警告/`0` 错误。CUA 未返回 C# 原生窗口，本轮不宣称人工页面点击或视觉像素验收；Rust 端保持只读。
 
 ## 当前结论
 
@@ -56,7 +163,7 @@
 - 2026-09-05 GPU83 最终表面复验：独立真实 mpv GPU83 完整 shader 夹具 `1/1` 通过；实际 WPF `FinalEffectWindow` GPU83 WGC 像素夹具 `1/1` 通过，确认处理参数更新后最终视频表面像素发生变化。目标显卡矩阵、真实下游和长稳仍待验收。
 - 2026-09-05 GPU83 原生窗口像素夹具收敛：显式 Win32 窗口重绘夹具已复用受管 mpv GPU83、WGC/D3D11→YUY2 和前后帧哈希链，最终 YUY2 像素 `1/1` 通过；Windows 受影响测试 `217/217`、格式检查通过。该证据不替代目标 GPU 矩阵、AkVirtualCamera 下游和发布门禁。
 - C# 桌面端产品图标已从 Rust/Tauri `desktop/src-tauri/icons/` 复制为本地 `src/GpAutoLive.App/Assets/app-icon.png` 与 `app-icon.ico`；主标题栏、EXE、设置窗口和最终效果窗口共用该产品图标资源。
-- mpv JSON IPC、HWND 播放、受身份保护 seek/EOF、FFmpeg PCM、固定容量 PCM 总线、PortAudio 输入/输出和本地麦克风能量门控。
+- mpv JSON IPC、HWND 播放、受身份保护 seek/EOF、FFmpeg PCM、固定容量 PCM 总线、PortAudio 输入/输出和本地麦克风能量门控；固定话术已接入同一最终 PCM overlay，SAPI/声卡仍待真实验收。
 - 2026-09-04 媒体闭环增量：C# mpv 启动后的 Original/GPU83/CPU4 初始模式统一经 `MpvPlaybackSession.UpdateEffects` 固定 IPC 命令应用；CPU4 不再同时出现在静态启动参数和动态滤镜链中；`WindowsMpvPlaybackController.UpdateEffectsAsync` 与换源后的效果重应用入口已接入。GPU83 使用经 manifest/SHA-256 校验的完整 shader 运行包；启动和更新都会对 GPU83 固定白名单、CPU4 固定滤镜值做运行时回读，并由 `estimated-frame-number` 观察下一帧。WPF GPU83/CPU4 最终表面像素已有显式夹具证据，但不标记为所有参数均完成真实环境验收。
 - 2026-09-04 视频处理开关增量：WPF“视频处理”开关在已有视频会话处于播放/暂停时，按当前系统生成快照和资源能力门禁调用 `WindowsMpvPlaybackController.UpdateEffectsAsync`；无活动 mpv 会话时只更新待播放配置，不宣称运行时已生效。播放态下一帧有效回显已由后续 `estimated-frame-number` 观察接入，WPF GPU83/CPU4 最终表面像素也已有显式夹具证据；目标显卡矩阵和发布门禁仍未完成。
 - 2026-09-04 开关接线修复：视频处理改由 `ShellState.VideoProcessing` 属性变化统一提交，声音处理保留单一 WPF `Click` 入口，避免绑定状态变化后只停留在“壳状态”。视频播放中切换声音开关现在读取当前 mpv `time-pos`，只停止并重建 FFmpeg/PortAudio 声音会话，按该位置恢复且不重启视频；位置不可读时 fail-closed，保留视频并提示重新播放。已用 `E:\下载\csharp-golden-av.mp4` 完成真实声音偏移解码和最终 PCM 输出验证；这仍不等同于 GPU83 完整渲染或真实声音频谱验收。
@@ -75,7 +182,7 @@
 - AkVirtualCamera 契约、GPU/WGC/sidecar 探测和输出门禁；抖音 M1 本地合同、配置 JSON、队列和受管 sidecar 启动边界。
 - 外置 GPU/WinRT/媒体运行库、Manifest、安装/回滚/卸载骨架、Runtime 探测、签名流水线和 WPF 安装维护壳。
 - C7 安装、回滚、卸载脚本共用跨维护壳事务锁 `Local\\GpAutoLive.CSharp.Windows.InstallTransaction.v1`；占用时立即 fail-closed，避免并发覆盖 `current.json` 回滚链。详见 [`C7 安装事务锁审查记录`](./C7-安装事务锁审查记录.md)。
-- C7 媒体/输出租约使用 `Local\\GpAutoLive.MediaOutput.Owner.v1`；Rust/Tauri 已在 Tauri Builder 前消费同一命名 Mutex，C# 进程探测只作为诊断快速路径。详见 [`C7 媒体输出所有权与单实例审查记录`](./C7-媒体输出所有权与单实例审查记录.md)。真实跨进程争用仍待验收。
+- C7 媒体/输出租约使用 C# 专属的 `Local\\GpAutoLive.CSharp.MediaOutput.Owner.v1`；Rust/Tauri 不参与 C# 运行时，C# 不探测 Rust。详见 [`C7 媒体输出所有权与单实例审查记录`](./C7-媒体输出所有权与单实例审查记录.md)。当前只验收 C# 自身进程内外的资源生命周期。
 - C7 安装事务读取已有 `current.json` 时校验 schema、活动版本、相对路径和上一版本；指针激活失败/取消时清理本次新版本目录并保留旧指针。`test-c7-install-boundaries.ps1` 已覆盖损坏指针、WhatIf 不落盘和激活失败清理。
 - WPF 主窗口已按职责拆分为 RTMP、性能、虚拟摄像头、抖音 M1、音频/插话/麦克风、播放、媒体池 partial；共享生命周期和媒体池编辑状态仍由 `MainWindow.xaml.cs` 唯一持有。C6 已为麦克风与抖音后台快照接入有界 latest-wins UI 更新队列；媒体列表保持 Recycling 虚拟化，缩略图通过有界异步 FFmpeg 首帧链加载并在失败时回退类型图标，不保留无界日志历史列表。
 - GUI 结构对齐已进入 v2 双页实施轮：根窗口以 `1586×992` 为基准，工作区约按 `23.2:50.3:26.5` 三栏与 `10px` 间距布局；左栏保留媒体池/播放设置，中栏预览下方使用四个 Tab、分类导航和中央独立滚动区；首屏视频结果改为两行八项系统随机只读快照，下滑态隐藏分类/Tab 并按声音 8 项、场景 5 项、设备 6 项单行卡片显示，右栏仍按 RTMP→虚拟摄像头→麦克风→固定话术→抖音弹幕排列。右栏主卡只保留设计稿配置/状态，已有高级操作进入折叠区并继续复用原事件处理。夹具已验证首屏和下滑静态网格，但没有真实媒体首帧、真实周期刷新、原生运行窗口或目标 DPI/像素级截图，仍不判定为 1:1。详见 [`GUI视觉对照审计-20260903`](./GUI视觉对照审计-20260903.md)。
@@ -136,7 +243,7 @@
 - 抖音真实 Conda/Python sidecar、扫码、协议兼容、发送、自回显和退出恢复。
 - 代码签名证书/时间戳、干净机安装升级卸载、Windows 10/11 矩阵，以及 NoPlayback30m/JointPlayback30m 长稳证据。
 - C6 真实性能门禁：100 项媒体池 60Hz 滚动、30 分钟内存/GC 趋势及与 Rust/Tauri 同机原始对照报告。
-- C7 跨客户端媒体/输出所有权：Rust/Tauri 已消费 C# 同名 Mutex，代码门禁已接入；真实跨客户端争用和资源矩阵仍待实施/验收。
+- C7 C# 自身媒体/输出所有权：C# 使用专属 Mutex 和单实例文件锁，Rust/Tauri 不参与 C# 运行时；当前只剩 C# 自身重复启动、崩溃恢复、权限级别和输出资源回收的实机证据。
 - v2 UI 设计验收：中央只读快照、声音/高级视觉下滑续页、规则与结果边界、`已生效` 真实回显、滚动/键盘/DPI/像素级截图仍待实施和验收。
 
 ## 时间估算
@@ -220,7 +327,7 @@
 
 > 2026-09-05 声音周期真实夹具：在显式环境门控下使用 C# 已校验运行包的真实 FFmpeg/PortAudio 和 8 秒正弦音频，新增周期候选夹具 `1/1` 通过；同一 PortAudio 输出流在约 4 秒目标切换到同源新参数候选，初始/周期最终 PCM 总线均发布帧且会话正常完成。该结果不替代真实声卡长期稳定、RTMP/ZLMediaKit、用户主观听感和长稳门禁，Rust 端保持只读。
 
-> 2026-09-05 RTMP 状态与视频效果桥接：C# RTMP 声音会话现在拥有并观察 FFmpeg PCM 分流泵/解码生产任务；异常会固定投影 `PumpFailed`/`DecodeFailed`、取消会话并有界停止宿主，正常停止取消不产生假失败。受管 RTMP 进程终态通过脱敏事件刷新 WPF，失败状态启用最多 3 次的重新连接入口。RTMP 画面发布在视频处理开启时接收已校验 CPU4 四项快照并生成固定 `eq + hue` `-vf`，关闭处理不生成 `-vf`；不把 mpv 标签、任意滤镜或 GPU83 参数当作 FFmpeg 直推实现。RTMP 命令计划测试 `5/5`、Windows RTMP 测试 `13/13`、Release x64 构建 `0` 警告/`0` 错误通过；真实 ZLMediaKit/RTMPS、远端握手、重连结果和长稳仍待验收，Rust 端本轮保持只读。
+> 2026-09-05 RTMP 状态与视频效果桥接：C# RTMP 声音会话现在拥有并观察 FFmpeg PCM 分流泵/解码生产任务；异常会固定投影 `PumpFailed`/`DecodeFailed`、取消会话并有界停止宿主，正常停止取消不产生假失败。受管 RTMP 进程终态通过脱敏事件刷新 WPF，失败状态启用有限重连入口；当前默认预算已与 Rust 对齐为初次启动后最多 5 次重试、退避 `1/2/4/8/15s`。RTMP 画面发布在视频处理开启时接收已校验 CPU4 四项快照并生成固定 `eq + hue` `-vf`，关闭处理不生成 `-vf`；不把 mpv 标签、任意滤镜或 GPU83 参数当作 FFmpeg 直推实现。RTMP 命令计划测试 `7/7`、Windows 受影响测试和 Release x64 构建以本轮记录为准；真实 ZLMediaKit/RTMPS、远端握手、重连结果和长稳仍待验收，Rust 端本轮保持只读。
 
 > 2026-09-05 WGC 句柄就绪与虚拟摄像头前置门禁：最终效果窗口的 mpv 视频子 HWND 与 WGC 顶层 HWND 现在统一校验窗口有效、可见且客户区非零，窗口显示后先完成布局再刷新输出绑定；虚拟摄像头只有在当前源为视频、播放状态为播放/暂停、mpv 活动身份一致且运行时已进入 `Running` 时才允许启动。新增关闭最终效果窗口后拒绝捕获句柄的 WPF 回归测试，WPF/WGC 隔离测试 `3/3` 通过。该门禁不把 WGC `Running` 冒充有效像素，真实可见帧、sidecar/DirectShow、GPU83 最终像素、目标 GPU 矩阵和发布门禁仍待验收；Rust 端保持只读。
 
@@ -240,7 +347,7 @@
 
 > 2026-09-05 媒体导入/输出生命周期收口：`RunImportAsync` 在请求工厂完成后取得共享 `_playbackCommandSerial`，覆盖运行包、FFprobe、停止旧输出和媒体池原子提交，避免探测期间播放/停止/换源交错；导入取消、运行包失败或任一探测失败继续保留旧池。用户关闭 `FinalEffectWindow` 时复用 `StopMediaForMutationAsync`，成功路径统一停止 RTMP、虚拟摄像头、观察者、插话、PortAudio、mpv 和媒体池，并同步实际池快照；主窗口关闭仍走既有最终 Dispose 路径。`WindowsRtmpAudioSession` 的共享 PCM 链改用 `FinalPcmBus.Channels` 构造解码计划、混音器和分流泵，单声道共享总线不再被固定双声道拒绝。Windows 全量 `224/224`；新增关闭窗口、导入闸门和单声道 RTMP 回归测试均通过。App 全量串行尝试 `80/81`，唯一失败是顺序运行下真实 WPF/mpv 夹具的 90 秒宿主超时；两个真实 mpv 夹具隔离均 `1/1`，因此 App 全量不标记为通过。未修改 Rust、未新增第三方依赖。
 
-> 2026-09-05 C# 单实例进程门禁修复：冷启动实测发现旧命名 Mutex 仍允许第二个 `GpAutoLive.exe` 进入可见窗口；新增 `WindowsSingleInstanceLease`，使用 `%LocalAppData%\GpAutoLive\locks\csharp-instance.lock` 的 `FileShare.None` 独占句柄作为 C# 进程边界。`App.OnStartup` 先取单实例租约，再取跨客户端媒体/输出租约；第二次启动直接退出。锁定 SDK 下单实例回归 `1/1`、Release x64 构建 `0` 警告/`0` 错误；冷启动 A/B 为 A 保持运行、B 已退出、进程数 `1`。主控窗口与 `FinalEffectWindow` 仍是同一进程的两个窗口，未新增播放器，Rust 端未修改。真实声卡、远端 ZLMediaKit/RTMPS、AkVirtualCamera 下游、人工页面和长稳仍待验收。
+> 2026-09-05 C# 单实例进程门禁修复：冷启动实测发现旧命名 Mutex 仍允许第二个 `GpAutoLive.exe` 进入可见窗口；新增 `WindowsSingleInstanceLease`，使用 `%LocalAppData%\GpAutoLive\locks\csharp-instance.lock` 的 `FileShare.None` 独占句柄作为 C# 进程边界。`App.OnStartup` 先取 C# 单实例租约，再取 C# 专属媒体/输出租约；第二次启动直接退出。锁定 SDK 下单实例回归 `1/1`、Release x64 构建 `0` 警告/`0` 错误；冷启动 A/B 为 A 保持运行、B 已退出、进程数 `1`。主控窗口与 `FinalEffectWindow` 仍是同一进程的两个窗口，未新增播放器，Rust 端未修改。真实声卡、远端 ZLMediaKit/RTMPS、AkVirtualCamera 下游、人工页面和长稳仍待验收。
 
 > 2026-09-05 声音启动与总线背压修复：音频控制器不再把“已创建 PortAudio/FFmpeg 会话”直接当作启动成功，而是在 3 秒有界预算内确认首批 PCM 已写入目标；取消、无 PCM、解码提前结束均返回稳定错误并执行有界收尾。最终 PCM 总线的 RTMP 环缓继续按自身固定容量丢弃最旧帧，不再因 RTMP 泵暂时未读而反向阻塞本机声音；显式真实夹具验证循环/暂停/恢复/有限总线及带音轨视频效果消费 `2/2`，Windows 全量 `217/217`。
 
@@ -263,6 +370,12 @@
 > v1.71（2026-09-05）C# Rust 对齐的自动视频周期参数接线：`GeneratedVideoEffectSnapshot` 保留旧 UI 投影和未接入字段语义，同时生成正式 `VideoEffectParams` 与 `AdvancedEffectParams`；生成规则对齐 Rust `sample_automatic_video_parameters` 的已验证范围。`MainWindow.Effects` 的完整 GPU83 路径传入当前周期高级参数，不再固定传 `AdvancedEffectParams.Default`；CPU4 仍只消费亮度、对比度、饱和度和色相四项。新增映射测试；App 全量串行测试 `74/74`、本机 Release x64 构建和格式检查通过。目标显卡矩阵、真实声卡、远端输出、下游虚拟摄像头和人工页面仍未验收；Rust 只读。
 
 > v1.72（2026-09-05）C# 媒体拖放与音频启动计划边界收口：`MediaDropPayload.HasCandidateFiles` 复用现有媒体扩展名白名单，预览阶段拒绝空路径、目录形态、不支持扩展名和超限候选，不触碰文件 I/O；真实 FFprobe 探测、原子入池和旧池保护仍由 `MediaImportCoordinator` 负责。`WindowsAudioPlaybackController.StartAsync` 在创建输出前校验计划声道与输出采样率，不一致返回 `invalid_plan`，避免声音开关状态与实际输出链路分叉。Windows 全量 `223/223`、Media 全量 `131/131`、App 全量串行 `79/79`，拖放边界 `7/7`、音频控制器边界 `14/14`，格式检查、本机 x64 Release 构建和显式 WPF GPU83 最终表面像素夹具均通过；真实声卡、远端输出、下游虚拟摄像头、人工页面和长稳仍待验收，Rust 只读。
+
+> 2026-09-05 声音开关异步竞态修复：`ShellState.AudioProcessing` 增加仅用于异步重配置判定的单调版本；`MainWindow.Effects` 在读取视频位置、停止旧会话、启动新 FFmpeg/PortAudio 会话、暂停同步和候选准备的边界拒绝过期请求。连续切换时旧请求不会用最新值误启动错误滤镜，已启动的过期会话会沿现有停止/Join 路径收尾，队列中的最新开关继续完成重配置；纯音频与视频音频仍共用一个 `WindowsAudioPlaybackController` 和一个 PortAudio 输出链。失败先行的版本测试、纯音频切换和视频切换测试 `3/3` 通过；Windows 音频专项筛选 `58/58` 通过。真实声卡听感、设备拔插/睡眠恢复、RTMP 远端和 30 分钟长稳仍未验收，未修改 Rust 或弹窗 Features/Playback 文件。
 > 2026-09-05 RTMP 最终 PCM 首帧门禁：`WindowsRtmpAudioSession.StartAsync` 现在必须在有界 3 秒预算内观察到分流泵已向 FFmpeg 转发至少一帧最终 PCM，才返回成功；泵失败或无首帧会停止会话并返回 `PumpFailed`，避免 UI 将“泵已启动”误报为“声音已消费”。共享总线无生产者的测试夹具已改为显式提供单声道 PCM；真实 ZLMediaKit、声卡和网络稳定性仍待验收。
 
 > 2026-09-05 C# 音频字段消费边界复核：`FfmpegAudioFilterBuilder` 已将音高微移调整到播放速度之前，与 Rust 音频链保持一致；高频扰动的开关、间隔、强度和目标电平继续经 `AudioEffectParams` 进入同一受管 FFmpeg `-af`。`DynamicRangeDb`、`Compression`、`Tone` 没有正式 C# 参数与算法对应，继续只读展示/未接入，不使用近似压缩或 EQ 冒充生效。失败先行顺序测试修复后通过；本轮不修改 App 快照、Rust、播放器、线程或队列。
+
+> 2026-09-06 真实局域网 RTMP 传输烟测（状态进度门禁接入前的历史记录）：使用用户提供的 `D:\xz\8d020eb133350a74bbc4daec1f33bbc1.mp4`，沿用已校验 C# 外置媒体运行包 v90 的 FFmpeg，以 `192.168.10.22:1935`、临时 `live` 应用/流发布 60 秒；远端回读确认 H.264 `1280×720@30fps` 和 AAC `48000Hz/2ch`，发布自然退出码 `0`，停止后流不可回读，且无本次测试进程残留。随后直接调用当时版本的 C# `WindowsRtmpOutputManager.StartAsync` 进行画面-only 真实发布，返回成功并选择 `h264_amf`，远端回读确认 H.264，`StopAsync` 成功收敛到 `Idle`。该证据覆盖真实服务器、标准端口、C# 画面发布管理器和 H.264/AAC/FLV 传输，但不覆盖 WPF 页面点击、C# 最终 PCM 分流、远端握手状态投影、断线恢复或长稳；当时管理器仍显示 `Starting`，不伪装成已确认 `Publishing`。当前实现已新增正向进度门禁；桌面控制 RPC 未配置，真实 C# WPF 全轨推流门禁继续保持待验收，Rust 端保持只读。
+
+> 2026-09-06 AkVirtualCamera sidecar 活动写入取消收口：修正 `WindowsVirtualCameraSidecarClient.WriteFrameAsync` 在固定帧活动写入期间收到取消时仍保留已连接 Named Pipe 的缺口；现在会关闭当前管道、归还池化帧缓冲，并返回 `Cancelled`、`Retryable=true`、状态 `Failed`。失败先行回归 `Cancellation_during_write_closes_pipe_and_enters_retryable_failure_state` `1/1` 通过；该修复只收紧管道和资源生命周期，不新增重连、进程存活或像素交付假设。真实 sidecar/DirectShow、当前用户 ACL、GPU→sidecar 连续帧、签名/许可证、目标 GPU、下游兼容、人工页面和 30 分钟长稳仍待验收，Rust 端保持只读。

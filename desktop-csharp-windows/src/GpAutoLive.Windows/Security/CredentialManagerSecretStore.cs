@@ -15,7 +15,30 @@ public sealed class CredentialManagerSecretStore : ISecretStore
     private const uint ErrorNotFound = 1168;
     private const int MaxTargetNameLength = 256;
     private const int MaxSecretBytes = 64 * 1024;
-    private const string TargetPrefix = "GpAutoLive.CSharp.Windows/";
+    private const string DefaultTargetPrefix = "GpAutoLive.CSharp.Windows/";
+    private const string LegacyRustDeviceIdTarget = "device-id.autolive.desktop";
+    private readonly string _targetPrefix;
+
+    public CredentialManagerSecretStore()
+        : this(DefaultTargetPrefix)
+    {
+    }
+
+    private CredentialManagerSecretStore(string targetPrefix)
+    {
+        ArgumentNullException.ThrowIfNull(targetPrefix);
+        if (targetPrefix.Any(char.IsControl) || targetPrefix.Length >= MaxTargetNameLength)
+        {
+            throw new ArgumentException("凭据目标前缀格式无效。", nameof(targetPrefix));
+        }
+
+        _targetPrefix = targetPrefix;
+    }
+
+    internal static ISecretStore CreateLegacyRustDeviceIdentityReader() =>
+        new ReadOnlyExactTargetStore(
+            new CredentialManagerSecretStore(string.Empty),
+            LegacyRustDeviceIdTarget);
 
     public void Set(string name, ReadOnlySpan<byte> secret)
     {
@@ -111,10 +134,10 @@ public sealed class CredentialManagerSecretStore : ISecretStore
         throw CreateWin32Exception("删除 Windows Credential Manager 凭据失败。", error);
     }
 
-    private static string BuildTargetName(string name)
+    private string BuildTargetName(string name)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
-        var targetName = TargetPrefix + name;
+        var targetName = _targetPrefix + name;
         if (targetName.Length > MaxTargetNameLength
             || name.Any(character => char.IsControl(character) || character is '/' or '\\'))
         {
@@ -136,6 +159,25 @@ public sealed class CredentialManagerSecretStore : ISecretStore
         {
             Marshal.FreeCoTaskMem(pointer);
         }
+    }
+
+    private sealed class ReadOnlyExactTargetStore(ISecretStore inner, string allowedName) : ISecretStore
+    {
+        public void Set(string name, ReadOnlySpan<byte> secret) =>
+            throw new NotSupportedException("旧 Rust 设备凭据只允许读取。");
+
+        public bool TryGet(string name, out SecretBuffer secret)
+        {
+            if (!string.Equals(name, allowedName, StringComparison.Ordinal))
+            {
+                throw new ArgumentException("只允许读取固定的旧 Rust 设备凭据。", nameof(name));
+            }
+
+            return inner.TryGet(name, out secret);
+        }
+
+        public bool Delete(string name) =>
+            throw new NotSupportedException("旧 Rust 设备凭据不允许删除。");
     }
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]

@@ -17,6 +17,7 @@
 - `MpvLaunchPlan` 把已验证的 `mpv.exe`、视频路径、宿主 HWND、命名管道和 `Gpu83/Cpu4/Original` 模式收敛成不可变的 Windows 参数数组；固定关闭 Shell/默认配置，限制命令长度，并拒绝无效句柄、路径、起始位置或未校验运行时。它只生成计划，不自行启动进程。
 - `WindowsMpvProcessHost` 消费上述启动计划，以 `ProcessStartInfo.ArgumentList`、隐藏窗口和 Job Object 优先策略启动/回收 Windows 进程；进程启动失败、立即退出、取消和停止超时均映射为稳定状态。
 - `WindowsMpvPlaybackRuntime` 是 Windows 组合入口：先启动宿主，再用计划中的同一管道创建客户端并连接，随后才允许通过 `MpvPlaybackSession` 身份分发固定命令；停止时在 2 秒清理预算内尽力发送 `quit`，再释放管道和进程树。
+- `.ts`、`.m2ts` 已属于媒体白名单；真实 MPEG-TS 样本可通过 FFprobe 探测，并可由 FFmpeg 与 mpv 正常解码。首帧、切源和效果更新后的就绪判断不能只依赖 mpv 的 `estimated-frame-number`：部分 MPEG-TS 在播放时间持续推进时仍长期返回 `0`，旧逻辑会在超时后误判播放失败。当前判断复用已有播放时间作为容器无关的进展证据，同时继续校验会话身份、媒体路径、暂停状态和 EOF，并保留调用方取消与有界超时。
 - 事件帧可在等待请求响应时跳过；响应必须携带当前 `request_id`。响应错配、未知字段、畸形帧会 fail-closed 并使连接进入 `Faulted`，防止把迟到响应应用到错误请求。
 - 响应超时、调用方取消和管道断开均关闭当前连接；下次使用必须显式重新连接，不能复用不确定的流状态。
 - 关闭操作取消生命周期令牌、释放命名管道，活动请求在异常/取消路径中回收其有界互斥；错误正文不回显管道路径、媒体路径、原始 mpv 错误或原始帧。
@@ -35,6 +36,8 @@ DisposeAsync()
 真实播放组合使用 `WindowsMpvPlaybackRuntime.StartAsync(plan, session, options, cancellationToken)`，不允许页面自行创建 `Process` 或自行拼接 IPC 字符串。
 
 调用方负责生成不可预测的临时管道名称，并将同一 `PipePath` 传给受管 mpv 的 `--input-ipc-server`。本边界不接受任意命令字符串，也不允许用用户输入直接拼接进程参数。
+
+MPEG-TS 兼容修复只调整现有 mpv 会话的播放进展判定，不预转码、不生成临时 MP4、不增加播放器或第三方依赖。
 
 ## 错误分类
 

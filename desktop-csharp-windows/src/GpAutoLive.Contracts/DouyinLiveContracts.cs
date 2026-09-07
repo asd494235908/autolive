@@ -102,6 +102,8 @@ public static class DouyinLiveRules
     public static readonly TimeSpan TaskMaxAge = TimeSpan.FromSeconds(60);
     /// <summary>消息 ID 最大字节数。</summary>
     public const int MaxMessageIdBytes = 256;
+    /// <summary>sidecar 允许报告的弹幕正文长度上限；只传长度，不传正文。</summary>
+    public const int MaxChatTextLength = 16 * 1024;
     /// <summary>消息去重集合容量。</summary>
     public const int SeenMessageCapacity = 4_096;
 
@@ -202,12 +204,22 @@ public sealed record DouyinChatMessage(
     bool IsReplay,
     DateTimeOffset ReceivedAtUtc);
 
+/// <summary>sidecar 转发给桌面端的最小弹幕元数据；不携带弹幕正文。</summary>
+public sealed record DouyinChatMessageMetadata(
+    string RoomId,
+    string MessageId,
+    string SenderId,
+    int TextLength,
+    bool IsSelf,
+    bool IsReplay);
+
 /// <summary>已选定回复的有界发送任务。</summary>
 public sealed record DouyinReplyTask(
     ulong Generation,
     string MessageId,
     string ReplyText,
-    DateTimeOffset EnqueuedAtUtc);
+    DateTimeOffset EnqueuedAtUtc,
+    string ClientActionId);
 
 /// <summary>本地队列统计，不包含弹幕正文或凭据。</summary>
 public sealed record DouyinQueueMetrics(
@@ -221,7 +233,9 @@ public sealed record DouyinQueueMetrics(
     ulong Accepted = 0,
     ulong NotSent = 0,
     ulong Rejected = 0,
-    ulong OutcomeUnknown = 0);
+    ulong OutcomeUnknown = 0,
+    ulong GapEvents = 0,
+    ulong GapDroppedCount = 0);
 
 /// <summary>抖音 M1 脱敏状态快照。</summary>
 public sealed record DouyinLiveStatus(
@@ -237,4 +251,6 @@ public sealed record DouyinLiveStatus(
     int QueueCount,
     int QueueCapacity,
     DouyinQueueMetrics Metrics,
-    string? Error);
+    string? Error,
+    bool ReplySendingBlocked = false,
+    string? LastGapReason = null);

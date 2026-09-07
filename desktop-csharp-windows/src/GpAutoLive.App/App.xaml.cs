@@ -15,6 +15,20 @@ public partial class App : Application
         ExternalWinRtRuntimeResolver.Configure();
         _ = WindowsAppIdentity.TryConfigure();
 
+        var ownership = WindowsMediaOutputOwnershipLease.TryAcquire();
+        if (!ownership.IsSuccess || ownership.Lease is null)
+        {
+            MessageBox.Show(
+                FormatOwnershipFailure(ownership.Code),
+                "GpAutoLive",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            Shutdown();
+            return;
+        }
+
+        _mediaOutputOwnership = ownership.Lease;
+
         var singleInstance = WindowsSingleInstanceLease.TryAcquire();
         if (!singleInstance.IsSuccess || singleInstance.Lease is null)
         {
@@ -27,27 +41,13 @@ public partial class App : Application
                     MessageBoxImage.Warning);
             }
 
+            _mediaOutputOwnership.Dispose();
+            _mediaOutputOwnership = null;
             Shutdown();
             return;
         }
 
         _singleInstance = singleInstance.Lease;
-
-        var ownership = WindowsMediaOutputOwnershipLease.TryAcquire();
-        if (!ownership.IsSuccess || ownership.Lease is null)
-        {
-            MessageBox.Show(
-                FormatOwnershipFailure(ownership.Code),
-                "GpAutoLive",
-                MessageBoxButton.OK,
-                MessageBoxImage.Warning);
-            _singleInstance.Dispose();
-            _singleInstance = null;
-            Shutdown();
-            return;
-        }
-
-        _mediaOutputOwnership = ownership.Lease;
 
         DispatcherUnhandledException += OnDispatcherUnhandledException;
         TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
@@ -62,6 +62,9 @@ public partial class App : Application
         DispatcherUnhandledException -= OnDispatcherUnhandledException;
         TaskScheduler.UnobservedTaskException -= OnUnobservedTaskException;
 
+        _mediaOutputOwnership?.Dispose();
+        _mediaOutputOwnership = null;
+
         if (_singleInstance is not null)
         {
             try
@@ -74,20 +77,13 @@ public partial class App : Application
             }
         }
 
-        _mediaOutputOwnership?.Dispose();
-        _mediaOutputOwnership = null;
-
         base.OnExit(e);
     }
 
     private static string FormatOwnershipFailure(WindowsMediaOutputOwnershipCode code) => code switch
     {
-        WindowsMediaOutputOwnershipCode.ReferenceClientRunning =>
-            "检测到现有 Rust/Tauri 桌面端正在运行；为避免媒体或输出资源争抢，C# 客户端未启动。",
-        WindowsMediaOutputOwnershipCode.ReferenceClientProbeFailed =>
-            "无法确认现有桌面端资源状态；为安全起见，C# 客户端未启动。",
         WindowsMediaOutputOwnershipCode.AlreadyOwned =>
-            "媒体或输出资源已被另一桌面客户端占用；请先关闭它再启动 C# 客户端。",
+            "C# 媒体或输出资源已被当前用户的另一个 C# 实例占用；请先关闭它再启动。",
         WindowsMediaOutputOwnershipCode.NotWindows =>
             "当前平台不是 Windows；此客户端只支持 Windows 10/11 x64。",
         _ => "无法建立媒体/输出资源所有权门禁；应用将退出。"

@@ -230,6 +230,25 @@ public sealed class MediaPoolServiceTests
     }
 
     [TestMethod]
+    public void Pool_edits_only_remove_references_and_never_delete_user_source_files()
+    {
+        var owner = new MediaPoolOwner();
+        var first = CreateMedia("preserve-first.mp4");
+        var second = CreateMedia("preserve-second.mp4");
+        var replacement = CreateMedia("preserve-replacement.mp4");
+
+        Assert.IsTrue(owner.ReplaceAll([first, second]).IsSuccess);
+        Assert.IsTrue(owner.RemoveAt(0).IsSuccess);
+        Assert.IsTrue(owner.Clear().IsSuccess);
+        Assert.IsTrue(owner.ReplaceAll([first, second]).IsSuccess);
+        Assert.IsTrue(owner.ReplaceAll([replacement]).IsSuccess);
+
+        Assert.IsTrue(File.Exists(first.SourcePath));
+        Assert.IsTrue(File.Exists(second.SourcePath));
+        Assert.IsTrue(File.Exists(replacement.SourcePath));
+    }
+
+    [TestMethod]
     public void Playback_state_machine_preserves_ready_playing_paused_stopped_invariants()
     {
         var owner = new MediaPoolOwner();

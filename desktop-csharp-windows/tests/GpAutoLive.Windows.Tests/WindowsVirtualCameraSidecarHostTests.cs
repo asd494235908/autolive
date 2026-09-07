@@ -56,9 +56,31 @@ public sealed class WindowsVirtualCameraSidecarHostTests
 
         Assert.IsFalse(result.IsSuccess);
         Assert.IsTrue(
-            result.Error!.Code is WindowsVirtualCameraSidecarHostErrorCode.StartFailed
+            result.Error!.Code is WindowsVirtualCameraSidecarHostErrorCode.InvalidPlan
+                or WindowsVirtualCameraSidecarHostErrorCode.StartFailed
                 or WindowsVirtualCameraSidecarHostErrorCode.JobObjectUnavailable);
         Assert.IsFalse(result.Snapshot.State is WindowsVirtualCameraSidecarHostState.Running or WindowsVirtualCameraSidecarHostState.Stopping);
+    }
+
+    [TestMethod]
+    public async Task Unsigned_sidecar_plan_is_rejected_before_process_creation()
+    {
+        using var fixture = SidecarFixture.Create();
+        var request = new WindowsVirtualCameraSidecarLaunchRequest(
+            fixture.Path,
+            WindowsVirtualCameraSidecarLaunchPlanBuilder.CreateSessionToken(),
+            VirtualCameraConfig.Default,
+            TimeSpan.FromSeconds(5));
+        Assert.IsTrue(
+            WindowsVirtualCameraSidecarLaunchPlanBuilder.TryCreate(request, out var plan, out var planError),
+            planError);
+
+        await using var host = new WindowsVirtualCameraSidecarHost();
+        var result = await host.StartAsync(plan);
+
+        Assert.IsFalse(result.IsSuccess);
+        Assert.AreEqual(WindowsVirtualCameraSidecarHostErrorCode.InvalidPlan, result.Error!.Code);
+        Assert.AreEqual(WindowsVirtualCameraSidecarHostState.Ready, result.Snapshot.State);
     }
 
     private sealed class SidecarFixture : IDisposable

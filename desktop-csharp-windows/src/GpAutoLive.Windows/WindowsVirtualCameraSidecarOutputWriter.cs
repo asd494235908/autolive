@@ -56,6 +56,7 @@ public sealed record WindowsVirtualCameraSidecarOutputWriterResult(
 public sealed class WindowsVirtualCameraSidecarOutputWriter : IAsyncDisposable
 {
     private static readonly TimeSpan DefaultFramePeriod = TimeSpan.FromTicks(TimeSpan.TicksPerSecond / VirtualCameraRules.Fps);
+    private static readonly TimeSpan FirstFrameTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(2);
 
     private readonly object _gate = new();
@@ -65,6 +66,7 @@ public sealed class WindowsVirtualCameraSidecarOutputWriter : IAsyncDisposable
     private readonly byte[] _blackPayload;
     private CancellationTokenSource? _cancellation;
     private Task? _worker;
+    private TaskCompletionSource<bool>? _firstFrameReady;
     private VirtualCameraFrame? _latestFrame;
     private ulong _sequence;
     private ulong _framesAttempted;
@@ -125,64 +127,133 @@ public sealed class WindowsVirtualCameraSidecarOutputWriter : IAsyncDisposable
         }
     }
 
-    /// <summary>以固定周期启动输出泵；首帧立即发送。</summary>
-    public Task<WindowsVirtualCameraSidecarOutputWriterResult> StartAsync(
+    /// <summary>以固定周期启动输出泵；首帧写入成功后才报告启动成功。</summary>
+    public async Task<WindowsVirtualCameraSidecarOutputWriterResult> StartAsync(
         CancellationToken cancellationToken = default)
     {
         if (!OperatingSystem.IsWindows())
         {
-            return Task.FromResult(Failure(
+            return Failure(
                 WindowsVirtualCameraSidecarOutputWriterErrorCode.NotWindows,
-                "虚拟摄像头 sidecar 仅支持 Windows"));
+                "虚拟摄像头 sidecar 仅支持 Windows");
         }
 
         var config = _output.Snapshot.Config;
         if (config.Fps != VirtualCameraRules.Fps
             || _framePeriod != DefaultFramePeriod)
         {
-            return Task.FromResult(Failure(
+            return Failure(
                 WindowsVirtualCameraSidecarOutputWriterErrorCode.InvalidFrameRate,
-                "虚拟摄像头输出泵必须使用固定 30fps"));
+                "虚拟摄像头输出泵必须使用固定 30fps");
         }
 
         if (cancellationToken.IsCancellationRequested)
         {
-            return Task.FromResult(Failure(
+            return Failure(
                 WindowsVirtualCameraSidecarOutputWriterErrorCode.Cancelled,
                 "虚拟摄像头输出泵启动已取消",
-                retryable: true));
+                retryable: true);
         }
 
         if (_client.Snapshot.State is not WindowsVirtualCameraSidecarClientState.Connected)
         {
-            return Task.FromResult(Failure(
+            return Failure(
                 WindowsVirtualCameraSidecarOutputWriterErrorCode.NotConnected,
                 "sidecar 管道尚未连接",
-                retryable: true));
+                retryable: true);
         }
 
+        TaskCompletionSource<bool> firstFrameReady;
+        TaskCompletionSource<bool> startGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenSource cancellation;
+        Task worker;
         lock (_gate)
         {
             if (_disposed)
             {
-                return Task.FromResult(FailureNoLock(
+                return FailureNoLock(
                     WindowsVirtualCameraSidecarOutputWriterErrorCode.Closed,
-                    "虚拟摄像头输出泵已关闭"));
+                    "虚拟摄像头输出泵已关闭");
             }
 
             if (_worker is not null)
             {
-                return Task.FromResult(FailureNoLock(
+                return FailureNoLock(
                     WindowsVirtualCameraSidecarOutputWriterErrorCode.AlreadyRunning,
-                    "虚拟摄像头输出泵已经在运行"));
+                    "虚拟摄像头输出泵已经在运行");
             }
 
-            _cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _cancellation = cancellation;
+            firstFrameReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _firstFrameReady = firstFrameReady;
             _state = WindowsVirtualCameraSidecarOutputWriterState.Starting;
             _lastErrorCode = null;
-            _worker = RunAsync(_cancellation);
+            worker = RunAsync(cancellation, firstFrameReady, startGate.Task);
+            _worker = worker;
+        }
+
+        // RunAsync 必须在释放 _gate 后才执行首帧；否则同步失败路径可能回调本类型并重入同一把锁。
+        startGate.TrySetResult(true);
+
+        bool firstFrameWritten;
+        try
+        {
+            firstFrameWritten = await firstFrameReady.Task
+                .WaitAsync(FirstFrameTimeout, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            await StopAsync(CancellationToken.None).ConfigureAwait(false);
+            return Failure(
+                WindowsVirtualCameraSidecarOutputWriterErrorCode.Cancelled,
+                "虚拟摄像头输出泵启动已取消",
+                retryable: true);
+        }
+        catch (TimeoutException)
+        {
+            await StopAsync(CancellationToken.None).ConfigureAwait(false);
+            lock (_gate)
+            {
+                _state = WindowsVirtualCameraSidecarOutputWriterState.Failed;
+                _lastErrorCode = WindowsVirtualCameraSidecarOutputWriterErrorCode.WriteFailed;
+            }
+
+            return Failure(
+                WindowsVirtualCameraSidecarOutputWriterErrorCode.WriteFailed,
+                "虚拟摄像头输出泵首帧写入超时",
+                retryable: true);
+        }
+
+        if (!firstFrameWritten)
+        {
+            var errorCode = Snapshot.LastErrorCode ?? WindowsVirtualCameraSidecarOutputWriterErrorCode.WriteFailed;
+            await StopAsync(CancellationToken.None).ConfigureAwait(false);
+            lock (_gate)
+            {
+                _state = WindowsVirtualCameraSidecarOutputWriterState.Failed;
+                _lastErrorCode = errorCode;
+            }
+
+            return Failure(errorCode, "虚拟摄像头输出泵首帧写入失败", retryable: true);
+        }
+
+        lock (_gate)
+        {
+            if (!ReferenceEquals(_firstFrameReady, firstFrameReady)
+                || !ReferenceEquals(_worker, worker)
+                || _disposed)
+            {
+                return FailureNoLock(
+                    WindowsVirtualCameraSidecarOutputWriterErrorCode.Cancelled,
+                    "虚拟摄像头输出泵启动状态已失效",
+                    retryable: true);
+            }
+
             _state = WindowsVirtualCameraSidecarOutputWriterState.Running;
-            return Task.FromResult(SucceededNoLock());
+            _firstFrameReady = null;
+            return SucceededNoLock();
         }
     }
 
@@ -205,10 +276,14 @@ public sealed class WindowsVirtualCameraSidecarOutputWriter : IAsyncDisposable
             cancellation = _cancellation;
             if (worker is null)
             {
+                _firstFrameReady?.TrySetResult(false);
+                _firstFrameReady = null;
                 _state = WindowsVirtualCameraSidecarOutputWriterState.Stopped;
                 return SucceededNoLock();
             }
 
+            _firstFrameReady?.TrySetResult(false);
+            _firstFrameReady = null;
             _state = WindowsVirtualCameraSidecarOutputWriterState.Stopping;
         }
 
@@ -267,6 +342,8 @@ public sealed class WindowsVirtualCameraSidecarOutputWriter : IAsyncDisposable
             _disposed = true;
             worker = _worker;
             cancellation = _cancellation;
+            _firstFrameReady?.TrySetResult(false);
+            _firstFrameReady = null;
             _state = WindowsVirtualCameraSidecarOutputWriterState.Stopping;
         }
 
@@ -296,12 +373,17 @@ public sealed class WindowsVirtualCameraSidecarOutputWriter : IAsyncDisposable
         }
     }
 
-    private async Task RunAsync(CancellationTokenSource cancellation)
+    private async Task RunAsync(
+        CancellationTokenSource cancellation,
+        TaskCompletionSource<bool> firstFrameReady,
+        Task startGate)
     {
         var token = cancellation.Token;
         try
         {
+            await startGate.ConfigureAwait(false);
             await WriteOneAsync(token).ConfigureAwait(false);
+            firstFrameReady.TrySetResult(true);
             using var timer = new PeriodicTimer(_framePeriod);
             while (await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
             {
@@ -310,11 +392,13 @@ public sealed class WindowsVirtualCameraSidecarOutputWriter : IAsyncDisposable
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
+            firstFrameReady.TrySetResult(false);
         }
         catch (SidecarOutputWriteException)
         {
             // WriteOneAsync 已把稳定错误码写入快照；worker 以失败终态结束，
             // 由上层决定是否先停止客户端再重新建立输出链。
+            firstFrameReady.TrySetResult(false);
         }
         catch (Exception exception) when (exception is IOException or InvalidOperationException or ObjectDisposedException)
         {
@@ -323,6 +407,18 @@ public sealed class WindowsVirtualCameraSidecarOutputWriter : IAsyncDisposable
                 _state = WindowsVirtualCameraSidecarOutputWriterState.Failed;
                 _lastErrorCode = WindowsVirtualCameraSidecarOutputWriterErrorCode.WriteFailed;
             }
+
+            firstFrameReady.TrySetResult(false);
+        }
+        catch (Exception)
+        {
+            lock (_gate)
+            {
+                _state = WindowsVirtualCameraSidecarOutputWriterState.Failed;
+                _lastErrorCode = WindowsVirtualCameraSidecarOutputWriterErrorCode.WriteFailed;
+            }
+
+            firstFrameReady.TrySetResult(false);
         }
     }
 

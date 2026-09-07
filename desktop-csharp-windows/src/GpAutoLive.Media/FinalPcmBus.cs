@@ -59,6 +59,8 @@ public sealed class FinalPcmBus : IDisposable
         RtmpBuffer = new AudioPcmRingBuffer(capacityFrames, channels);
         OutputOverlayBuffer = new AudioPcmRingBuffer(capacityFrames, channels);
         RtmpOverlayBuffer = new AudioPcmRingBuffer(capacityFrames, channels);
+        OutputSpectrum = new();
+        OverlaySpectrum = new();
     }
 
     public int Channels { get; }
@@ -76,6 +78,12 @@ public sealed class FinalPcmBus : IDisposable
 
     /// <summary>RTMP PCM pump 消费的插话环缓；由混音输出源与基础轨同步读取。</summary>
     public AudioPcmRingBuffer RtmpOverlayBuffer { get; }
+
+    /// <summary>视频/主音频 PCM 的最新频谱；只读诊断结果，不消费输出缓冲。</summary>
+    public PcmSpectrumAnalyzer OutputSpectrum { get; }
+
+    /// <summary>插话 PCM 的最新频谱；只读诊断结果，不消费插话缓冲。</summary>
+    public PcmSpectrumAnalyzer OverlaySpectrum { get; }
 
     public FinalPcmBusSnapshot Snapshot
     {
@@ -170,6 +178,7 @@ public sealed class FinalPcmBus : IDisposable
             _publishedFrames = ulong.MaxValue - (ulong)framesPublished < _publishedFrames
                 ? ulong.MaxValue
                 : _publishedFrames + (ulong)framesPublished;
+            OutputSpectrum.Update(interleavedPcm, Channels);
             return true;
         }
     }
@@ -224,7 +233,18 @@ public sealed class FinalPcmBus : IDisposable
             framesPublished = _rtmpConsumerAttached
                 ? Math.Min(outputFrames, rtmpFrames)
                 : outputFrames;
+            OverlaySpectrum.Update(interleavedPcm, Channels);
             return true;
+        }
+    }
+
+    /// <summary>丢弃插话/固定话术未消费尾部，避免优先级结束后旧语音泄漏到原媒体。</summary>
+    public void DiscardOverlayPending()
+    {
+        lock (_gate)
+        {
+            OutputOverlayBuffer.DiscardPending();
+            RtmpOverlayBuffer.DiscardPending();
         }
     }
 

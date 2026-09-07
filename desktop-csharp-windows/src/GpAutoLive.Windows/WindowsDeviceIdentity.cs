@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using GpAutoLive.Contracts;
 using GpAutoLive.Core.Security;
+using GpAutoLive.Windows.Security;
 
 namespace GpAutoLive.Windows;
 
@@ -12,46 +13,96 @@ namespace GpAutoLive.Windows;
 public static class WindowsDeviceIdentity
 {
     public const string CredentialName = "control-plane-device-id";
+    internal const string LegacyRustCredentialName = "device-id.autolive.desktop";
 
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+    private static readonly UnicodeEncoding StrictUtf16LittleEndian = new(false, false, true);
 
     public static string GetOrCreate(ISecretStore secretStore)
     {
         ArgumentNullException.ThrowIfNull(secretStore);
+        return GetOrCreate(secretStore, CredentialManagerSecretStore.CreateLegacyRustDeviceIdentityReader());
+    }
+
+    internal static string GetOrCreate(ISecretStore secretStore, ISecretStore legacyRustSecretStore)
+    {
+        ArgumentNullException.ThrowIfNull(secretStore);
+        ArgumentNullException.ThrowIfNull(legacyRustSecretStore);
 
         if (secretStore.TryGet(CredentialName, out var stored))
         {
             using (stored)
             {
-                var bytes = new byte[stored.Length];
-                try
+                if (!TryReadDeviceId(stored, StrictUtf8, 1, out var existing))
                 {
-                    stored.CopyTo(bytes);
-                    var value = StrictUtf8.GetString(bytes);
-                    if (!AuthContractValidation.TryValidateDeviceId(value, out _))
-                    {
-                        throw new InvalidDataException("Windows Credential Manager 中的设备标识无效。");
-                    }
+                    throw new InvalidDataException("Windows Credential Manager 中的设备标识无效。");
+                }
 
-                    return value;
-                }
-                finally
+                return existing;
+            }
+        }
+
+        if (legacyRustSecretStore.TryGet(LegacyRustCredentialName, out var legacy))
+        {
+            using (legacy)
+            {
+                if (!TryReadDeviceId(legacy, StrictUtf16LittleEndian, sizeof(char), out var migrated))
                 {
-                    CryptographicOperations.ZeroMemory(bytes);
+                    throw new InvalidDataException("Rust 桌面端保存的设备标识无效；为避免创建第二设备，C# 已停止自动迁移。");
                 }
+
+                StoreDeviceId(secretStore, migrated);
+                return migrated;
             }
         }
 
         var created = $"desktop-{Guid.NewGuid():N}";
-        var createdBytes = Encoding.ASCII.GetBytes(created);
+        StoreDeviceId(secretStore, created);
+        return created;
+    }
+
+    private static bool TryReadDeviceId(
+        SecretBuffer secret,
+        Encoding encoding,
+        int bytesPerCharacter,
+        out string deviceId)
+    {
+        deviceId = string.Empty;
+        if (secret.Length < AuthInputLimits.DeviceIdMinLength * bytesPerCharacter
+            || secret.Length > AuthInputLimits.DeviceIdMaxLength * bytesPerCharacter
+            || secret.Length % bytesPerCharacter != 0)
+        {
+            return false;
+        }
+
+        var bytes = new byte[secret.Length];
         try
         {
-            secretStore.Set(CredentialName, createdBytes);
-            return created;
+            secret.CopyTo(bytes);
+            deviceId = encoding.GetString(bytes);
+            return AuthContractValidation.TryValidateDeviceId(deviceId, out _);
+        }
+        catch (DecoderFallbackException)
+        {
+            deviceId = string.Empty;
+            return false;
         }
         finally
         {
-            CryptographicOperations.ZeroMemory(createdBytes);
+            CryptographicOperations.ZeroMemory(bytes);
+        }
+    }
+
+    private static void StoreDeviceId(ISecretStore secretStore, string deviceId)
+    {
+        var bytes = Encoding.ASCII.GetBytes(deviceId);
+        try
+        {
+            secretStore.Set(CredentialName, bytes);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(bytes);
         }
     }
 }

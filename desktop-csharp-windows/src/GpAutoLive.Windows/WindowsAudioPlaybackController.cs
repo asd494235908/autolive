@@ -1094,6 +1094,15 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
         }
         finally
         {
+            if (finalPcmBus is not null)
+            {
+                finalPcmBus.DiscardOverlayPending();
+            }
+            else
+            {
+                overlayBuffer.DiscardPending();
+            }
+
             await decoder.DisposeAsync().ConfigureAwait(false);
             lock (_gate)
             {

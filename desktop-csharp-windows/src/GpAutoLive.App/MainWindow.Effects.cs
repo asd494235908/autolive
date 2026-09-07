@@ -1,7 +1,10 @@
 using System.Windows;
+using System.Globalization;
 using System.Windows.Controls;
+using GpAutoLive.App.Features.Effects;
 using GpAutoLive.Contracts;
 using GpAutoLive.Core;
+using GpAutoLive.Core.Configuration;
 using GpAutoLive.Media;
 using GpAutoLive.Windows;
 
@@ -9,8 +12,6 @@ namespace GpAutoLive.App;
 
 public partial class MainWindow
 {
-    private bool _parameterPageExpanded;
-
     private async void RegenerateEffectParametersButton_Click(object sender, RoutedEventArgs e)
     {
         _state.RegenerateParameterSnapshots();
@@ -73,7 +74,11 @@ public partial class MainWindow
             .ConfigureAwait(true);
         var audioReconfigured = !string.IsNullOrWhiteSpace(source.AudioCodecName)
             && result.IsSuccess
-            && await ReconfigureVideoAudioAsync(source, identity).ConfigureAwait(true);
+            && await ReconfigureVideoAudioAsync(
+                    source,
+                    identity,
+                    _state.AudioProcessingRevision)
+                .ConfigureAwait(true);
         _finalEffectController.Update(CreateFinalEffectSnapshot());
         if (!result.IsSuccess || (!string.IsNullOrWhiteSpace(source.AudioCodecName) && !audioReconfigured))
         {
@@ -96,6 +101,7 @@ public partial class MainWindow
 
     private async Task ApplyAudioProcessingAsync()
     {
+        var audioProcessingRevision = _state.AudioProcessingRevision;
         var snapshot = _mediaPool.Snapshot;
         if (snapshot.SourceMediaPool.IsEmpty)
         {
@@ -112,7 +118,11 @@ public partial class MainWindow
         var source = snapshot.SourceMediaPool[snapshot.SourceMediaIndex];
         if (source.MediaKind is MediaKind.Video)
         {
-            await ReconfigureVideoAudioAsync(source, _mediaPool.CurrentIdentity).ConfigureAwait(true);
+            await ReconfigureVideoAudioAsync(
+                    source,
+                    _mediaPool.CurrentIdentity,
+                    audioProcessingRevision)
+                .ConfigureAwait(true);
             return;
         }
 
@@ -122,8 +132,20 @@ public partial class MainWindow
         {
             sourceStartMs = Math.Min(sourceStartMs, durationMs - 1);
         }
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            ReportStaleAudioProcessingRequest();
+            return;
+        }
+
         if (!await StopVideoAudioForTransitionAsync().ConfigureAwait(true))
         {
+            return;
+        }
+
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            ReportStaleAudioProcessingRequest();
             return;
         }
 
@@ -132,6 +154,16 @@ public partial class MainWindow
         {
             var stopped = _mediaPool.StopPlayback();
             ApplyMediaOperation(stopped, started.Error?.Message ?? "声音处理重启失败");
+            return;
+        }
+
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            if (await StopStaleAudioProcessingSessionAsync().ConfigureAwait(true))
+            {
+                ReportStaleAudioProcessingRequest();
+            }
+
             return;
         }
 
@@ -152,8 +184,28 @@ public partial class MainWindow
             }
         }
 
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            if (await StopStaleAudioProcessingSessionAsync().ConfigureAwait(true))
+            {
+                ReportStaleAudioProcessingRequest();
+            }
+
+            return;
+        }
+
         StartAudioCompletionWatcher(identity);
         await PrepareNextAudioCandidateAsync(identity).ConfigureAwait(true);
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            if (await StopVideoAudioForTransitionAsync().ConfigureAwait(true))
+            {
+                ReportStaleAudioProcessingRequest();
+            }
+
+            return;
+        }
+
         AudioDeviceStatusText.Text = _state.AudioProcessing
             ? "声音处理已应用 · FFmpeg 音频滤镜"
             : "声音处理已关闭 · 已恢复原始 PCM";
@@ -162,7 +214,8 @@ public partial class MainWindow
 
     private async Task<bool> ReconfigureVideoAudioAsync(
         SourceMediaDto source,
-        MediaPlaybackIdentity? identity)
+        MediaPlaybackIdentity? identity,
+        long audioProcessingRevision)
     {
         if (identity is null)
         {
@@ -178,9 +231,21 @@ public partial class MainWindow
             return false;
         }
 
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            ReportStaleAudioProcessingRequest();
+            return false;
+        }
+
         var wasPaused = _mediaPool.Snapshot.PlaybackState is PlaybackState.Paused;
         if (!await StopVideoAudioForTransitionAsync().ConfigureAwait(true))
         {
+            return false;
+        }
+
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            ReportStaleAudioProcessingRequest();
             return false;
         }
 
@@ -190,6 +255,16 @@ public partial class MainWindow
         {
             AudioDeviceStatusText.Text = "视频画面继续运行 · 新声音会话未启动";
             _state.SetStatus(started.Error?.Message ?? "视频声音处理重启失败；视频画面仍在播放");
+            return false;
+        }
+
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            if (await StopStaleAudioProcessingSessionAsync().ConfigureAwait(true))
+            {
+                ReportStaleAudioProcessingRequest();
+            }
+
             return false;
         }
 
@@ -205,11 +280,40 @@ public partial class MainWindow
             }
         }
 
+        if (!IsAudioProcessingRequestCurrent(audioProcessingRevision))
+        {
+            if (await StopStaleAudioProcessingSessionAsync().ConfigureAwait(true))
+            {
+                ReportStaleAudioProcessingRequest();
+            }
+
+            return false;
+        }
+
         StartAudioCompletionWatcher(identity);
         AudioDeviceStatusText.Text = _state.AudioProcessing
             ? "视频声音处理已应用 · 从当前时间点恢复"
             : "视频声音处理已关闭 · 从当前时间点恢复原始 PCM";
         _state.SetStatus(AudioDeviceStatusText.Text);
+        return true;
+    }
+
+    private bool IsAudioProcessingRequestCurrent(long revision) =>
+        !_isClosing && _state.AudioProcessingRevision == revision;
+
+    private void ReportStaleAudioProcessingRequest() =>
+        _state.SetStatus("声音处理开关已再次变化，已跳过过期声音重建");
+
+    private async Task<bool> StopStaleAudioProcessingSessionAsync()
+    {
+        await StopAudioCompletionWatcherAsync().ConfigureAwait(true);
+        var stopped = await _audioPlaybackController.StopAsync().ConfigureAwait(true);
+        if (!stopped.IsSuccess)
+        {
+            _state.SetStatus(stopped.Error?.Message ?? "过期声音会话停止失败");
+            return false;
+        }
+
         return true;
     }
 
@@ -274,12 +378,25 @@ public partial class MainWindow
             return;
         }
 
+        if (VideoPlaybackModeSelector.RequiresSessionRestart(
+                controllerSnapshot.ActiveVideoProcessingMode,
+                next.Mode))
+        {
+            await RestartVideoSessionForEffectModeAsync(
+                    snapshot.SourceMediaPool[snapshot.SourceMediaIndex],
+                    identity,
+                    next)
+                .ConfigureAwait(true);
+            return;
+        }
+
         var result = await _mpvController.UpdateEffectsAsync(
                 identity,
                 next,
                 _windowCancellation.Token,
                 waitForNextFrame: true)
             .ConfigureAwait(true);
+        UpdateMediaProjection();
         _state.SetStatus(result.IsSuccess
             ? (_state.VideoProcessing
                 ? next.Mode is MpvVideoProcessingMode.Gpu83
@@ -288,6 +405,159 @@ public partial class MainWindow
                 : "视频处理已关闭并提交给 mpv")
             : result.Error?.Message ?? "视频处理运行时更新失败");
         _finalEffectController.Update(CreateFinalEffectSnapshot());
+    }
+
+    private async Task RestartVideoSessionForEffectModeAsync(
+        SourceMediaDto source,
+        MediaPlaybackIdentity identity,
+        MpvVideoEffectSnapshot next)
+    {
+        var sourceStartMs = await ReadCurrentVideoPositionAsync(identity, source.DurationMs)
+            .ConfigureAwait(true);
+        if (sourceStartMs is null)
+        {
+            _state.SetStatus("无法读取当前视频位置，视频处理模式未切换；请重新播放后再试");
+            return;
+        }
+
+        if (!EnsureFinalEffectWindowVisible()
+            || _finalEffectWindow is null
+            || !_finalEffectWindow.TryGetVideoSurfaceHandle(out var hostWindowId))
+        {
+            _state.SetStatus("最终效果视频表面尚未创建，视频处理模式未切换");
+            return;
+        }
+
+        var runtime = await EnsureVerifiedMediaRuntimeAsync().ConfigureAwait(true);
+        if (runtime is null)
+        {
+            return;
+        }
+
+        var wasPaused = _mediaPool.Snapshot.PlaybackState is PlaybackState.Paused;
+        if (!await StopVideoAudioForTransitionAsync().ConfigureAwait(true))
+        {
+            return;
+        }
+
+        await StopVideoStateWatcherAsync().ConfigureAwait(true);
+        var stopped = await _mpvController.ShutdownAsync(_windowCancellation.Token)
+            .ConfigureAwait(true);
+        if (!stopped.IsSuccess)
+        {
+            _state.SetStatus(stopped.Error?.Message ?? "切换视频处理模式时停止旧 mpv 会话失败");
+            return;
+        }
+
+        var requestedMode = VideoPlaybackModeSelector.ToLaunchMode(next.Mode);
+        var startupModes = requestedMode switch
+        {
+            MpvLaunchMode.Gpu83 => new[] { MpvLaunchMode.Gpu83, MpvLaunchMode.Cpu4, MpvLaunchMode.Original },
+            MpvLaunchMode.Cpu4 => new[] { MpvLaunchMode.Cpu4, MpvLaunchMode.Original },
+            _ => new[] { MpvLaunchMode.Original },
+        };
+        WindowsMpvPlaybackControllerResult started = default!;
+        MpvVideoEffectSnapshot? startedEffects = null;
+        MpvLaunchMode startedMode = requestedMode;
+        MpvVideoParameterError? lastEffectError = null;
+        foreach (var startupMode in startupModes)
+        {
+            if (!TryCreateRuntimeVideoEffectSnapshot(
+                    source,
+                    _state.VideoProcessing,
+                    out var candidateEffects,
+                    out var effectError,
+                    modeOverride: startupMode)
+                || candidateEffects is null)
+            {
+                lastEffectError = effectError;
+                continue;
+            }
+
+            started = await _mpvController.StartAsync(
+                    runtime,
+                    source,
+                    identity,
+                    hostWindowId,
+                    startupMode,
+                    _windowCancellation.Token,
+                    candidateEffects,
+                    waitForFirstFrame: true,
+                    sourceStartMs: sourceStartMs.Value)
+                .ConfigureAwait(true);
+            if (started.IsSuccess)
+            {
+                startedEffects = candidateEffects;
+                startedMode = startupMode;
+                break;
+            }
+        }
+
+        if (!started.IsSuccess || startedEffects is null)
+        {
+            _state.SetStatus(lastEffectError?.Message ?? started.Error?.Message ?? "视频处理模式切换失败；请重新播放后再试");
+            return;
+        }
+
+        var audioStarted = false;
+        if (!string.IsNullOrWhiteSpace(source.AudioCodecName))
+        {
+            var audio = await StartAudioPlaybackAsync(source, identity, sourceStartMs.Value)
+                .ConfigureAwait(true);
+            audioStarted = audio.IsSuccess;
+            AudioDeviceStatusText.Text = audioStarted
+                ? "视频声音已从当前时间点重新连接"
+                : "视频画面已切换 · 声音输出不可用";
+        }
+
+        if (wasPaused)
+        {
+            var pausedVideo = await _mpvController.TogglePauseAsync(
+                    identity,
+                    _windowCancellation.Token)
+                .ConfigureAwait(true);
+            if (!pausedVideo.IsSuccess)
+            {
+                _state.SetStatus(pausedVideo.Error?.Message ?? "视频处理模式切换后暂停同步失败");
+                return;
+            }
+
+            if (audioStarted)
+            {
+                var pausedAudio = await _audioPlaybackController.PauseAsync().ConfigureAwait(true);
+                if (!pausedAudio.IsSuccess)
+                {
+                    _state.SetStatus(pausedAudio.Error?.Message ?? "视频处理模式切换后声音暂停同步失败");
+                    return;
+                }
+            }
+        }
+
+        if (_mediaPool.CurrentIdentity != identity)
+        {
+            _ = await _audioPlaybackController.StopAsync().ConfigureAwait(true);
+            _ = await _mpvController.ShutdownAsync(_windowCancellation.Token).ConfigureAwait(true);
+            _state.SetStatus("媒体源在视频处理模式切换期间发生变化，已拒绝过期会话");
+            return;
+        }
+
+        if (!wasPaused)
+        {
+            StartVideoStateWatcher(identity);
+        }
+
+        if (audioStarted && !wasPaused)
+        {
+            StartAudioCompletionWatcher(identity);
+        }
+
+        UpdateMediaProjection();
+        _finalEffectController.Update(CreateFinalEffectSnapshot());
+        _state.SetStatus(audioStarted || string.IsNullOrWhiteSpace(source.AudioCodecName)
+            ? startedMode == requestedMode
+                ? $"视频处理已切换到 {VideoPlaybackModeSelector.DescribeActive(startedEffects.Mode)}，已从当前位置恢复"
+                : $"视频处理已切换并回退到 {VideoPlaybackModeSelector.DescribeActive(startedEffects.Mode)}，已从当前位置恢复"
+            : $"视频处理已切换到 {VideoPlaybackModeSelector.DescribeActive(startedEffects.Mode)}，声音输出不可用");
     }
 
     private async Task ApplyAutomaticVideoEffectCycleAsync(MediaPlaybackIdentity identity)
@@ -376,56 +646,118 @@ public partial class MainWindow
         target.BringIntoView();
     }
 
-    private void ParameterScrollViewer_ScrollChanged(object sender, ScrollChangedEventArgs e)
+    private async void ApplyEffectCycleButton_Click(object sender, RoutedEventArgs e)
     {
-        var expanded = e.VerticalOffset > 8;
-        ParameterScrollHintText.Visibility = expanded
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-        if (_parameterPageExpanded == expanded)
+        if (!_login.CanEnterWorkbench || _isClosing)
         {
             return;
         }
 
-        _parameterPageExpanded = expanded;
-        ParameterTabButtons.Visibility = expanded
-            ? Visibility.Collapsed
-            : Visibility.Visible;
-        ParameterScrollHintText.HorizontalAlignment = expanded
-            ? HorizontalAlignment.Center
-            : HorizontalAlignment.Right;
-        ParameterScrollHintText.Margin = expanded
-            ? new Thickness(0)
-            : new Thickness(0, 0, 8, 0);
-        ParameterContentGrid.Margin = expanded
-            ? new Thickness(0)
-            : new Thickness(0, 8, 0, 0);
-        QuickParamsCard.Padding = expanded
-            ? new Thickness(8, 0, 8, 8)
-            : new Thickness(8);
-        ParameterTabRow.Height = expanded
-            ? new GridLength(12)
-            : new GridLength(42);
-        PreviewCard.Visibility = expanded ? Visibility.Collapsed : Visibility.Visible;
-        PreviewRow.Height = expanded
-            ? new GridLength(0)
-            : new GridLength(0.96, GridUnitType.Star);
-        PreviewGapRow.Height = expanded
-            ? new GridLength(0)
-            : new GridLength(10);
-        ParameterCategoryNavigation.Visibility = expanded
-            ? Visibility.Collapsed
-            : Visibility.Visible;
-        ParameterCategoryColumn.Width = expanded
-            ? new GridLength(0)
-            : new GridLength(76);
-        ParameterCategoryGapColumn.Width = expanded
-            ? new GridLength(0)
-            : new GridLength(16);
-        QuickParamsRow.Height = expanded
-            ? new GridLength(1, GridUnitType.Star)
-            : new GridLength(1.04, GridUnitType.Star);
+        var tag = (sender as FrameworkElement)?.Tag as string;
+        var video = string.Equals(tag, "video", StringComparison.Ordinal);
+        var minimumTextBox = video ? VideoCycleMinTextBox : AudioCycleMinTextBox;
+        var maximumTextBox = video ? VideoCycleMaxTextBox : AudioCycleMaxTextBox;
+        if (!TryParseCycleSeconds(minimumTextBox.Text, video ? "视频周期最小值" : "声音周期最小值", out var minimumMs, out var error)
+            || !TryParseCycleSeconds(maximumTextBox.Text, video ? "视频周期最大值" : "声音周期最大值", out var maximumMs, out error))
+        {
+            _state.SetStatus(error ?? "周期输入无效");
+            return;
+        }
+
+        var next = video
+            ? new EffectCycleSettings(minimumMs, maximumMs, _effectCycleSettings.AudioPeriodMinMs, _effectCycleSettings.AudioPeriodMaxMs)
+            : new EffectCycleSettings(_effectCycleSettings.VideoPeriodMinMs, _effectCycleSettings.VideoPeriodMaxMs, minimumMs, maximumMs);
+        if (!EffectCycleSettings.TryCreate(
+                next.VideoPeriodMinMs,
+                next.VideoPeriodMaxMs,
+                next.AudioPeriodMinMs,
+                next.AudioPeriodMaxMs,
+                out var validated,
+                out error)
+            || validated is null)
+        {
+            _state.SetStatus(error ?? "周期范围无效");
+            return;
+        }
+
+        _effectCycleSettings = validated;
+        UpdateEffectCycleProjection();
+        if (_preferences is not null)
+        {
+            var saveWarning = await _preferences
+                .SaveEffectCycleSettingsAsync(_effectCycleSettings, _windowCancellation.Token)
+                .ConfigureAwait(true);
+            if (saveWarning is not null)
+            {
+                _state.SetStatus(saveWarning);
+                return;
+            }
+        }
+
+        _state.SetStatus(video ? "视频处理周期已应用；下一周期按新范围生成" : "声音处理周期已应用；下一周期按新范围生成");
     }
+
+    private void UpdateEffectCycleProjection()
+    {
+        VideoCycleRangeText.Text = FormatCycleRange(
+            _effectCycleSettings.VideoPeriodMinMs,
+            _effectCycleSettings.VideoPeriodMaxMs);
+        AudioCycleRangeText.Text = FormatCycleRange(
+            _effectCycleSettings.AudioPeriodMinMs,
+            _effectCycleSettings.AudioPeriodMaxMs);
+        CycleSummaryText.Text = $"视频 {FormatCycleRange(_effectCycleSettings.VideoPeriodMinMs, _effectCycleSettings.VideoPeriodMaxMs)} · "
+            + $"声音 {FormatCycleRange(_effectCycleSettings.AudioPeriodMinMs, _effectCycleSettings.AudioPeriodMaxMs)} · "
+            + $"插话 {FormatCycleRange(_interludeConfig.IntervalMinMs, _interludeConfig.IntervalMaxMs)}";
+        if (!VideoCycleMinTextBox.IsKeyboardFocusWithin
+            && !VideoCycleMaxTextBox.IsKeyboardFocusWithin)
+        {
+            VideoCycleMinTextBox.Text = FormatCycleSeconds(_effectCycleSettings.VideoPeriodMinMs);
+            VideoCycleMaxTextBox.Text = FormatCycleSeconds(_effectCycleSettings.VideoPeriodMaxMs);
+        }
+
+        if (!AudioCycleMinTextBox.IsKeyboardFocusWithin
+            && !AudioCycleMaxTextBox.IsKeyboardFocusWithin)
+        {
+            AudioCycleMinTextBox.Text = FormatCycleSeconds(_effectCycleSettings.AudioPeriodMinMs);
+            AudioCycleMaxTextBox.Text = FormatCycleSeconds(_effectCycleSettings.AudioPeriodMaxMs);
+        }
+        ApplyVideoCycleButton.IsEnabled = _login.CanEnterWorkbench;
+        ApplyAudioCycleButton.IsEnabled = _login.CanEnterWorkbench;
+    }
+
+    private static bool TryParseCycleSeconds(
+        string text,
+        string label,
+        out ulong milliseconds,
+        out string? error)
+    {
+        milliseconds = 0;
+        error = null;
+        if (!double.TryParse(text, NumberStyles.Float, CultureInfo.CurrentCulture, out var seconds)
+            || double.IsNaN(seconds)
+            || double.IsInfinity(seconds))
+        {
+            error = $"{label}必须是数字。";
+            return false;
+        }
+
+        var value = seconds * 1_000d;
+        if (value < EffectCycleSettings.MinimumPeriodMs
+            || value > EffectCycleSettings.MaximumPeriodMs)
+        {
+            error = $"{label}必须在 1 到 60 秒之间。";
+            return false;
+        }
+
+        milliseconds = checked((ulong)Math.Round(value, MidpointRounding.AwayFromZero));
+        return true;
+    }
+
+    private static string FormatCycleSeconds(ulong milliseconds) =>
+        (milliseconds / 1_000d).ToString("0.###", CultureInfo.CurrentCulture);
+
+    private static string FormatCycleRange(ulong minimum, ulong maximum) =>
+        $"{FormatCycleSeconds(minimum)}–{FormatCycleSeconds(maximum)} 秒";
 
     private void ResetVideoEffectsButton_Click(object sender, RoutedEventArgs e)
     {

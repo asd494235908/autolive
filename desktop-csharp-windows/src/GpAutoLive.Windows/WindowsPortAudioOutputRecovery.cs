@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace GpAutoLive.Windows;
 
 /// <summary>PortAudio 输出设备恢复的固定预算，避免设备丢失时无限重试。</summary>
@@ -88,7 +90,36 @@ public sealed class WindowsPortAudioOutputRecovery
                 await Task.Delay(_policy.GetDelay(attempt - 1), cancellationToken).ConfigureAwait(false);
             }
 
-            var result = await restart(cancellationToken).ConfigureAwait(false);
+            WindowsPortAudioOutputResult result;
+            try
+            {
+                result = await restart(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return new(
+                    false,
+                    snapshot(),
+                    new WindowsPortAudioStreamError(
+                        WindowsPortAudioStreamFailureCode.Cancelled,
+                        "PortAudio 输出流恢复已取消。",
+                        Retryable: true));
+            }
+            catch (Exception exception) when (exception is AccessViolationException
+                or InvalidOperationException
+                or MarshalDirectiveException
+                or ObjectDisposedException
+                or SEHException)
+            {
+                result = new(
+                    false,
+                    snapshot(),
+                    new WindowsPortAudioStreamError(
+                        WindowsPortAudioStreamFailureCode.RestartFailed,
+                        "PortAudio 输出流恢复发生原生错误。",
+                        Retryable: true));
+            }
+
             if (result.IsSuccess)
             {
                 return result;

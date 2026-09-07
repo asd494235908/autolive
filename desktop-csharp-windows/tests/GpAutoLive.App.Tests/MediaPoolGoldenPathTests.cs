@@ -178,6 +178,30 @@ public sealed class MediaPoolGoldenPathTests
     }
 
     [TestMethod]
+    public async Task File_picker_import_appends_and_keeps_existing_source_file()
+    {
+        var mediaPool = new MediaPoolService();
+        var existing = CreateMedia("existing-source.mp4");
+        var added = CreateMedia("added-source.mp4");
+        Assert.IsTrue(mediaPool.ReplaceAll([existing]).IsSuccess);
+        using var importer = new MediaImportCoordinator(
+            mediaPool,
+            new FfprobeMediaProbe(
+                Path.Combine(CreateDirectory(), "ffprobe.exe"),
+                new SuccessfulFfprobeRunner()));
+
+        var result = await importer.ImportAsync(
+            MainWindow.CreateFileImportRequest([added.SourcePath]));
+
+        Assert.IsTrue(result.IsSuccess, result.Error?.Message);
+        CollectionAssert.AreEqual(
+            new[] { existing.SourcePath, added.SourcePath },
+            result.Snapshot.SourceMediaPool.Select(static item => item.SourcePath).ToArray());
+        Assert.IsTrue(File.Exists(existing.SourcePath), "追加导入不得删除原播放池的用户源文件。");
+        Assert.IsTrue(File.Exists(added.SourcePath), "追加导入不得删除新选择的用户源文件。");
+    }
+
+    [TestMethod]
     public void Import_waits_for_the_shared_playback_command_gate()
     {
         WpfTestApplicationHost.Run(() =>

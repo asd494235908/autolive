@@ -17,6 +17,7 @@ public enum WindowsPortAudioInputFailureCode
     StopFailed,
     CallbackFailed,
     HardwareUnavailable,
+    OutputBusUnavailable,
     Cancelled,
     Closed,
 }

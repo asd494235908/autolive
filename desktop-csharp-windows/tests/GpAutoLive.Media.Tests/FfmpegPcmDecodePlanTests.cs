@@ -127,6 +127,37 @@ public sealed class FfmpegPcmDecodePlanTests
     }
 
     [TestMethod]
+    public void Interlude_single_track_preset_is_consumed_by_the_decode_plan()
+    {
+        var ffmpeg = Environment.ProcessPath!;
+        var sourcePath = Path.Combine(Path.GetTempPath(), $"gpalive-{Guid.NewGuid():N}.mp3");
+        File.WriteAllBytes(sourcePath, new byte[] { 1 });
+        try
+        {
+            var source = CreateSource(MediaKind.Audio, "aac", sourcePath);
+            var effects = new AudioEffectParams { VoiceLibraryId = "p22" };
+            var ok = FfmpegPcmDecodePlanBuilder.TryCreate(
+                ffmpeg,
+                source,
+                48_000,
+                2,
+                out var plan,
+                out var error,
+                effects);
+
+            Assert.IsTrue(ok, error?.Message);
+            Assert.IsNotNull(plan);
+            var filterIndex = plan!.Arguments.IndexOf("-af");
+            Assert.IsTrue(filterIndex >= 0 && filterIndex + 1 < plan.Arguments.Length);
+            StringAssert.Contains(plan.Arguments[filterIndex + 1], "equalizer=f=");
+        }
+        finally
+        {
+            File.Delete(sourcePath);
+        }
+    }
+
+    [TestMethod]
     public void Audio_effects_with_an_unconsumed_formal_value_fail_closed()
     {
         var ffmpeg = Environment.ProcessPath!;

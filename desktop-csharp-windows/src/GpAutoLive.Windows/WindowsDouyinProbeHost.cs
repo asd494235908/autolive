@@ -66,12 +66,21 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
 {
     private const int MaxInvalidEvents = 16;
     private const int ReadBufferChars = 8 * 1024;
+    private static readonly TimeSpan ReplyResponseTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ReplyMinimumInterval = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan ReplyRateWindow = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan ReplyRiskCooldown = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan CommandResponseTimeout = TimeSpan.FromSeconds(10);
+    private const int ReplyMaximumPerMinute = 5;
     private static readonly TimeSpan CleanupTimeout = TimeSpan.FromSeconds(2);
     private static readonly UTF8Encoding Utf8 = new(false, false);
 
     private readonly object _gate = new();
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
+    private readonly SemaphoreSlim _replySendGate = new(1, 1);
+    private readonly SemaphoreSlim _replySignal = new(0);
     private readonly DouyinLiveManager _manager;
+    private readonly Func<ProcessStartInfo, ProcessStartInfo>? _processStartInfoFactory;
     private Process? _process;
     private WindowsJobObject? _job;
     private CancellationTokenSource? _runCancellation;
@@ -79,16 +88,35 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
     private WindowsDouyinProbeHostState _state = WindowsDouyinProbeHostState.Ready;
     private int? _exitCode;
     private string? _qrPath;
+    private string? _expectedRoomId;
+    private string? _expectedSessionId;
+    private ulong? _expectedGeneration;
+    private PendingReplyResponse? _pendingReplyResponse;
+    private DateTimeOffset? _lastReplyDispatchUtc;
+    private DateTimeOffset? _replyBlockedUntilUtc;
+    private readonly Queue<DateTimeOffset> _replyDispatchHistory = new();
     private string? _lastEvent;
     private int _invalidEventCount;
     private int _terminationReason;
     private bool _stopRequested;
     private bool _disposed;
+    private WindowsDouyinProbeProtocol _protocol;
+    private PendingCommandResponse? _pendingCommandResponse;
+    private PendingLiveOpenResponse? _pendingLiveOpenResponse;
+    private TaskCompletionSource<WindowsDouyinProbeEvent?>? _authConfirmation;
 
     /// <summary>创建使用指定核心状态所有者的宿主。</summary>
     public WindowsDouyinProbeHost(DouyinLiveManager manager)
+        : this(manager, null)
+    {
+    }
+
+    internal WindowsDouyinProbeHost(
+        DouyinLiveManager manager,
+        Func<ProcessStartInfo, ProcessStartInfo>? processStartInfoFactory)
     {
         _manager = manager ?? throw new ArgumentNullException(nameof(manager));
+        _processStartInfoFactory = processStartInfoFactory;
     }
 
     /// <summary>当前宿主和 M1 状态快照。</summary>
@@ -159,9 +187,15 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                     false);
             }
 
+            while (_replySignal.Wait(0))
+            {
+            }
+
             var process = new Process
             {
-                StartInfo = CreateStartInfo(plan, request.UpstreamRoot),
+                StartInfo = _processStartInfoFactory is null
+                    ? CreateStartInfo(plan, request.UpstreamRoot)
+                    : _processStartInfoFactory(CreateStartInfo(plan, request.UpstreamRoot)),
                 EnableRaisingEvents = false
             };
             try
@@ -200,16 +234,37 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 _job = job;
                 _runCancellation = runCancellation;
                 _monitorTask = null;
+                _protocol = request.Protocol;
                 _state = WindowsDouyinProbeHostState.Running;
                 _exitCode = null;
                 _qrPath = null;
+                _expectedRoomId = request.Config.RoomId;
+                _expectedSessionId = null;
+                _expectedGeneration = null;
+                _pendingReplyResponse = null;
+                _pendingCommandResponse = null;
+                _pendingLiveOpenResponse = null;
+                _authConfirmation = request.Protocol == WindowsDouyinProbeProtocol.CanonicalNdjson
+                    ? new TaskCompletionSource<WindowsDouyinProbeEvent?>(TaskCreationOptions.RunContinuationsAsynchronously)
+                    : null;
+                _lastReplyDispatchUtc = null;
+                _replyBlockedUntilUtc = null;
+                _replyDispatchHistory.Clear();
                 _lastEvent = "probe_started";
                 _invalidEventCount = 0;
                 _terminationReason = 0;
                 _stopRequested = false;
             }
 
-            var monitor = MonitorAsync(process, job, request.QrOutputPath, cancellationToken, runCancellation);
+            var monitor = MonitorAsync(
+                process,
+                job,
+                request.QrOutputPath,
+                request.Config.RoomId,
+                request.Protocol,
+                _manager.Snapshot.Generation,
+                cancellationToken,
+                runCancellation);
             lock (_gate)
             {
                 _monitorTask = monitor;
@@ -258,7 +313,6 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                     : WindowsDouyinProbeHostState.Stopping;
             }
 
-            CancelRun();
             Process? process;
             WindowsJobObject? job;
             Task? monitor;
@@ -269,6 +323,13 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 monitor = _monitorTask;
             }
 
+            if (process is not null && !HasExited(process))
+            {
+                await TryGracefulStopAsync(process).ConfigureAwait(false);
+            }
+
+            CancelRun();
+            CloseStandardInput(process);
             if (process is not null && !HasExited(process))
             {
                 KillProcessTree(process, job);
@@ -299,6 +360,13 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 _exitCode = exitCode;
                 _state = _disposed ? WindowsDouyinProbeHostState.Closed : WindowsDouyinProbeHostState.Stopped;
                 _qrPath = null;
+                _protocol = WindowsDouyinProbeProtocol.LegacyEvents;
+                _expectedRoomId = null;
+                _expectedSessionId = null;
+                _expectedGeneration = null;
+                _pendingCommandResponse = null;
+                _pendingLiveOpenResponse = null;
+                _authConfirmation = null;
             }
             _manager.Stop();
             PublishSnapshot();
@@ -348,6 +416,7 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 monitor = _monitorTask;
             }
 
+            CloseStandardInput(process);
             KillProcessTree(process, job);
             if (monitor is not null)
             {
@@ -372,12 +441,21 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 _monitorTask = null;
                 _state = WindowsDouyinProbeHostState.Closed;
                 _qrPath = null;
+                _protocol = WindowsDouyinProbeProtocol.LegacyEvents;
+                _expectedRoomId = null;
+                _expectedSessionId = null;
+                _expectedGeneration = null;
+                _pendingCommandResponse = null;
+                _pendingLiveOpenResponse = null;
+                _authConfirmation = null;
             }
         }
         finally
         {
             _lifecycle.Release();
             _lifecycle.Dispose();
+            _replySignal.Dispose();
+            _replySendGate.Dispose();
             GC.SuppressFinalize(this);
         }
     }
@@ -386,9 +464,13 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
         Process process,
         WindowsJobObject? job,
         string qrPath,
+        string webRid,
+        WindowsDouyinProbeProtocol protocol,
+        ulong generation,
         CancellationToken callerCancellation,
         CancellationTokenSource runCancellation)
     {
+        var processExitTask = process.WaitForExitAsync(runCancellation.Token);
         var stdoutTask = ReadStdoutAsync(process.StandardOutput.BaseStream, qrPath, runCancellation.Token);
         var stderrTask = DrainStreamAsync(
             process.StandardError.BaseStream,
@@ -403,12 +485,17 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 SetTerminationReasonIfUnset(4);
                 runCancellation.Cancel();
             });
+        using var replyCancellation = CancellationTokenSource.CreateLinkedTokenSource(runCancellation.Token);
+        var replyTask = DrainRepliesAsync(process, processExitTask, replyCancellation.Token);
+        var canonicalTask = protocol == WindowsDouyinProbeProtocol.CanonicalNdjson
+            ? RunCanonicalSessionAsync(process, webRid, generation, runCancellation.Token)
+            : Task.CompletedTask;
         var naturalExit = false;
         try
         {
             try
             {
-                await process.WaitForExitAsync(runCancellation.Token).ConfigureAwait(false);
+                await processExitTask.ConfigureAwait(false);
                 naturalExit = true;
             }
             catch (OperationCanceledException) when (runCancellation.IsCancellationRequested)
@@ -421,9 +508,13 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 await WaitForExitBoundedAsync(process).ConfigureAwait(false);
             }
 
+            replyCancellation.Cancel();
+            CancelPendingReplyResponse();
             try
             {
-                await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(CleanupTimeout).ConfigureAwait(false);
+                await Task.WhenAll(stdoutTask, stderrTask, replyTask, canonicalTask)
+                    .WaitAsync(CleanupTimeout)
+                    .ConfigureAwait(false);
             }
             catch (TimeoutException)
             {
@@ -484,6 +575,591 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
             // The lifecycle owner disposes Process/Job; monitor only drains and projects state.
         }
     }
+
+    private async Task TryGracefulStopAsync(Process process)
+    {
+        WindowsDouyinProbeProtocol protocol;
+        DouyinLiveState state;
+        string? sessionId;
+        ulong? generation;
+        lock (_gate)
+        {
+            protocol = _protocol;
+            sessionId = _expectedSessionId;
+            generation = _expectedGeneration;
+        }
+
+        if (protocol != WindowsDouyinProbeProtocol.CanonicalNdjson)
+        {
+            return;
+        }
+
+        state = _manager.Snapshot.State;
+        var cancelRequestId = CreateRequestId("cancel");
+        if (state == DouyinLiveState.WaitingQr
+            && WindowsDouyinSidecarProtocol.TrySerializeAuthCancel(
+                cancelRequestId,
+                out var cancelLine,
+                out _))
+        {
+            await SendGracefulCommandAsync(process, cancelRequestId, cancelLine).ConfigureAwait(false);
+        }
+        else
+        {
+            var closeRequestId = CreateRequestId("close");
+            if (state is (DouyinLiveState.RoomResolved or DouyinLiveState.Listening or DouyinLiveState.Paused)
+                && sessionId is not null
+                && generation is > 0
+                && WindowsDouyinSidecarProtocol.TrySerializeLiveClose(
+                    closeRequestId,
+                    sessionId,
+                    generation.Value,
+                    out var closeLine,
+                    out _))
+            {
+                await SendGracefulCommandAsync(process, closeRequestId, closeLine).ConfigureAwait(false);
+            }
+
+            var logoutRequestId = CreateRequestId("logout");
+            if (WindowsDouyinSidecarProtocol.TrySerializeAuthLogout(
+                    logoutRequestId,
+                    out var logoutLine,
+                    out _))
+            {
+                await SendGracefulCommandAsync(process, logoutRequestId, logoutLine).ConfigureAwait(false);
+            }
+        }
+
+        var shutdownRequestId = CreateRequestId("shutdown");
+        if (WindowsDouyinSidecarProtocol.TrySerializeShutdown(
+                shutdownRequestId,
+                out var shutdownLine,
+                out _))
+        {
+            await SendGracefulCommandAsync(process, shutdownRequestId, shutdownLine).ConfigureAwait(false);
+        }
+    }
+
+    private async Task SendGracefulCommandAsync(
+        Process process,
+        string requestId,
+        string line)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(750));
+        await SendCommandAsync(process, requestId, line, timeout.Token).ConfigureAwait(false);
+    }
+
+    private async Task DrainRepliesAsync(
+        Process process,
+        Task processExitTask,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var signalTask = _replySignal.WaitAsync(cancellationToken);
+                var completed = await Task.WhenAny(signalTask, processExitTask).ConfigureAwait(false);
+                if (completed == processExitTask)
+                {
+                    return;
+                }
+
+                await signalTask.ConfigureAwait(false);
+                while (TryGetCanonicalIdentity(out var sessionId, out var generation))
+                {
+                    if (!await WaitForReplyBudgetAsync(cancellationToken).ConfigureAwait(false))
+                    {
+                        break;
+                    }
+
+                    if (!TryGetCanonicalIdentity(out sessionId, out generation)
+                        || !_manager.TryDequeue(
+                            DateTimeOffset.UtcNow,
+                            out var task,
+                            expectedGeneration: generation)
+                        || task is null)
+                    {
+                        break;
+                    }
+
+                    var outcome = await SendReplyTaskAsync(
+                        process,
+                        sessionId,
+                        generation,
+                        task,
+                        cancellationToken).ConfigureAwait(false);
+                    _manager.RecordSendOutcome(outcome);
+                    PublishSnapshot();
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+    }
+
+    private async Task RunCanonicalSessionAsync(
+        Process process,
+        string webRid,
+        ulong generation,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var qrRequestId = CreateRequestId("qr");
+            if (!WindowsDouyinSidecarProtocol.TrySerializeAuthQrStart(
+                    qrRequestId,
+                    out var qrLine,
+                    out _))
+            {
+                FailCanonicalSession("sidecar 二维码登录请求无效");
+                return;
+            }
+
+            var qrResponse = await SendCommandAsync(
+                    process,
+                    qrRequestId,
+                    qrLine,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (qrResponse is null || !qrResponse.IsSuccess)
+            {
+                FailCanonicalSession("sidecar 二维码登录启动失败");
+                return;
+            }
+
+            var confirmed = await WaitForAuthConfirmationAsync(cancellationToken).ConfigureAwait(false);
+            if (confirmed is null)
+            {
+                return;
+            }
+
+            if (_manager.Snapshot.State != DouyinLiveState.LoggedIn)
+            {
+                FailCanonicalSession("sidecar 登录状态未确认");
+                return;
+            }
+
+            var openRequestId = CreateRequestId("open");
+            if (!WindowsDouyinSidecarProtocol.TrySerializeLiveOpen(
+                    openRequestId,
+                    webRid,
+                    generation,
+                    out var openLine,
+                    out _))
+            {
+                FailCanonicalSession("sidecar 直播间请求无效");
+                return;
+            }
+
+            var openResponse = await SendLiveOpenAsync(
+                    process,
+                    openRequestId,
+                    generation,
+                    openLine,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (openResponse is null || !openResponse.IsSuccess)
+            {
+                FailCanonicalSession("sidecar 直播间打开失败");
+                return;
+            }
+
+            if (openResponse.LiveStatus is "room_ended" or "failed")
+            {
+                _manager.MarkInconclusive("直播间当前不可监听");
+                CancelRun();
+                PublishSnapshot();
+                return;
+            }
+
+            var managerState = _manager.Snapshot.State;
+            if (managerState == DouyinLiveState.LoggedIn
+                && !_manager.MarkRoomResolved().IsSuccess)
+            {
+                FailCanonicalSession("sidecar 直播间状态未能接入");
+                return;
+            }
+
+            if (_manager.Snapshot.State is not (DouyinLiveState.RoomResolved or DouyinLiveState.Listening))
+            {
+                FailCanonicalSession("sidecar 直播间状态未能接入");
+                return;
+            }
+
+            PublishSnapshot();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (IOException)
+        {
+            FailCanonicalSession("sidecar 命令通道不可用");
+        }
+        catch (InvalidOperationException)
+        {
+            FailCanonicalSession("sidecar 命令通道不可用");
+        }
+    }
+
+    private async Task<WindowsDouyinCommandResponse?> SendCommandAsync(
+        Process process,
+        string requestId,
+        string line,
+        CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource<WindowsDouyinCommandResponse?>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_gate)
+        {
+            if (_pendingCommandResponse is not null || _pendingLiveOpenResponse is not null)
+            {
+                return null;
+            }
+
+            _pendingCommandResponse = new(requestId, completion);
+        }
+
+        try
+        {
+            using var ioCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            ioCancellation.CancelAfter(CommandResponseTimeout);
+            await process.StandardInput.WriteLineAsync(line.AsMemory(), ioCancellation.Token).ConfigureAwait(false);
+            await process.StandardInput.FlushAsync(ioCancellation.Token).ConfigureAwait(false);
+            return await completion.Task
+                .WaitAsync(CommandResponseTimeout, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+        catch (TimeoutException)
+        {
+            return null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                if (_pendingCommandResponse?.RequestId == requestId)
+                {
+                    _pendingCommandResponse = null;
+                }
+            }
+        }
+    }
+
+    private async Task<WindowsDouyinLiveOpenResponse?> SendLiveOpenAsync(
+        Process process,
+        string requestId,
+        ulong generation,
+        string line,
+        CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource<WindowsDouyinLiveOpenResponse?>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_gate)
+        {
+            if (_pendingCommandResponse is not null || _pendingLiveOpenResponse is not null)
+            {
+                return null;
+            }
+
+            _pendingLiveOpenResponse = new(requestId, generation, completion);
+        }
+
+        try
+        {
+            using var ioCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            ioCancellation.CancelAfter(CommandResponseTimeout);
+            await process.StandardInput.WriteLineAsync(line.AsMemory(), ioCancellation.Token).ConfigureAwait(false);
+            await process.StandardInput.FlushAsync(ioCancellation.Token).ConfigureAwait(false);
+            return await completion.Task
+                .WaitAsync(CommandResponseTimeout, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+        catch (TimeoutException)
+        {
+            return null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                if (_pendingLiveOpenResponse?.RequestId == requestId)
+                {
+                    _pendingLiveOpenResponse = null;
+                }
+            }
+        }
+    }
+
+    private async Task<WindowsDouyinProbeEvent?> WaitForAuthConfirmationAsync(
+        CancellationToken cancellationToken)
+    {
+        TaskCompletionSource<WindowsDouyinProbeEvent?>? completion;
+        lock (_gate)
+        {
+            completion = _authConfirmation;
+        }
+
+        if (completion is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+    }
+
+    private void FailCanonicalSession(string reason)
+    {
+        _manager.Fail(reason);
+        CancelRun();
+        PublishSnapshot();
+    }
+
+    private static string CreateRequestId(string prefix) => $"{prefix}-{Guid.NewGuid():N}";
+
+    private async Task<bool> WaitForReplyBudgetAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            TimeSpan delay;
+            lock (_gate)
+            {
+                var now = DateTimeOffset.UtcNow;
+                if ((_replyBlockedUntilUtc is { } blockedUntil && now < blockedUntil)
+                    || _manager.Snapshot.ReplySendingBlocked)
+                {
+                    return false;
+                }
+
+                while (_replyDispatchHistory.Count > 0
+                    && now - _replyDispatchHistory.Peek() >= ReplyRateWindow)
+                {
+                    _replyDispatchHistory.Dequeue();
+                }
+
+                var nextAllowed = now;
+                if (_lastReplyDispatchUtc is { } lastDispatch)
+                {
+                    nextAllowed = Max(nextAllowed, lastDispatch + ReplyMinimumInterval);
+                }
+
+                if (_replyDispatchHistory.Count >= ReplyMaximumPerMinute)
+                {
+                    nextAllowed = Max(nextAllowed, _replyDispatchHistory.Peek() + ReplyRateWindow);
+                }
+
+                delay = nextAllowed - now;
+            }
+
+            if (delay <= TimeSpan.Zero)
+            {
+                return true;
+            }
+
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<DouyinSendOutcome> SendReplyTaskAsync(
+        Process process,
+        string sessionId,
+        ulong generation,
+        DouyinReplyTask task,
+        CancellationToken cancellationToken)
+    {
+        var clientActionId = task.ClientActionId;
+        var request = new WindowsDouyinChatSendRequest(
+            sessionId,
+            generation,
+            clientActionId,
+            task.ReplyText);
+        if (!WindowsDouyinSidecarProtocol.TrySerializeChatSend(request, out var line, out _))
+        {
+            return DouyinSendOutcome.NotSent;
+        }
+
+        try
+        {
+            await _replySendGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return DouyinSendOutcome.NotSent;
+        }
+
+        var writeStarted = false;
+        try
+        {
+            if (HasExited(process)
+                || !TryGetCanonicalIdentity(out var currentSessionId, out var currentGeneration)
+                || !string.Equals(currentSessionId, sessionId, StringComparison.Ordinal)
+                || currentGeneration != generation
+                || task.Generation != generation)
+            {
+                return DouyinSendOutcome.NotSent;
+            }
+
+            var completion = new TaskCompletionSource<WindowsDouyinSidecarResponse?>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_gate)
+            {
+                if (_pendingReplyResponse is not null)
+                {
+                    return DouyinSendOutcome.OutcomeUnknown;
+                }
+
+                _pendingReplyResponse = new(clientActionId, completion);
+            }
+
+            try
+            {
+                using var ioCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                ioCancellation.CancelAfter(ReplyResponseTimeout);
+                writeStarted = true;
+                await process.StandardInput.WriteLineAsync(line.AsMemory(), ioCancellation.Token).ConfigureAwait(false);
+                await process.StandardInput.FlushAsync(ioCancellation.Token).ConfigureAwait(false);
+                MarkReplyDispatched();
+
+                var response = await completion.Task
+                    .WaitAsync(ReplyResponseTimeout, cancellationToken)
+                    .ConfigureAwait(false);
+                if (response is null
+                    || !string.Equals(response.RequestId, clientActionId, StringComparison.Ordinal)
+                    || (response.ClientActionId is not null
+                        && !string.Equals(response.ClientActionId, clientActionId, StringComparison.Ordinal)))
+                {
+                    return DouyinSendOutcome.OutcomeUnknown;
+                }
+
+                if (!response.IsSuccess
+                    && response.ErrorCode is "auth_expired" or "rate_limited" or "risk_controlled")
+                {
+                    BlockReplySending();
+                }
+
+                return response.Outcome;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return writeStarted ? DouyinSendOutcome.OutcomeUnknown : DouyinSendOutcome.NotSent;
+            }
+            catch (OperationCanceledException)
+            {
+                return writeStarted ? DouyinSendOutcome.OutcomeUnknown : DouyinSendOutcome.NotSent;
+            }
+            catch (TimeoutException)
+            {
+                return writeStarted ? DouyinSendOutcome.OutcomeUnknown : DouyinSendOutcome.NotSent;
+            }
+            catch (IOException)
+            {
+                return writeStarted ? DouyinSendOutcome.OutcomeUnknown : DouyinSendOutcome.NotSent;
+            }
+            catch (InvalidOperationException)
+            {
+                return writeStarted ? DouyinSendOutcome.OutcomeUnknown : DouyinSendOutcome.NotSent;
+            }
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                if (_pendingReplyResponse?.RequestId == clientActionId)
+                {
+                    _pendingReplyResponse = null;
+                }
+            }
+
+            try
+            {
+                _replySendGate.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+                // 仅在有界清理与未受控底层写入竞态同时发生时兜底。
+            }
+        }
+    }
+
+    private bool TryGetCanonicalIdentity(out string sessionId, out ulong generation)
+    {
+        lock (_gate)
+        {
+            sessionId = _expectedSessionId ?? string.Empty;
+            generation = _expectedGeneration ?? 0;
+        }
+
+        var managerSnapshot = _manager.Snapshot;
+        return sessionId.Length > 0
+            && generation > 0
+            && !managerSnapshot.ReplySendingBlocked
+            && managerSnapshot.State == DouyinLiveState.Listening;
+    }
+
+    private void BlockReplySending()
+    {
+        lock (_gate)
+        {
+            _replyBlockedUntilUtc = Max(
+                _replyBlockedUntilUtc ?? DateTimeOffset.MinValue,
+                DateTimeOffset.UtcNow + ReplyRiskCooldown);
+        }
+
+        _manager.BlockReplySending("sidecar 进入风控/限流状态");
+    }
+
+    private void MarkReplyDispatched()
+    {
+        lock (_gate)
+        {
+            var now = DateTimeOffset.UtcNow;
+            _lastReplyDispatchUtc = now;
+            _replyDispatchHistory.Enqueue(now);
+        }
+    }
+
+    private static DateTimeOffset Max(DateTimeOffset left, DateTimeOffset right) =>
+        left >= right ? left : right;
 
     private async Task ReadStdoutAsync(Stream stream, string qrPath, CancellationToken cancellationToken)
     {
@@ -557,9 +1233,105 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
             return false;
         }
 
-        if (WindowsDouyinProbeEventParser.TryParse(line, out var probeEvent, out _))
+        string? expectedRoomId;
+        string? expectedSessionId;
+        ulong? expectedGeneration;
+        lock (_gate)
         {
+            expectedRoomId = _expectedRoomId;
+            expectedSessionId = _expectedSessionId;
+            expectedGeneration = _expectedGeneration;
+        }
+
+        PendingCommandResponse? pendingCommand;
+        PendingLiveOpenResponse? pendingLiveOpen;
+        lock (_gate)
+        {
+            pendingCommand = _pendingCommandResponse;
+            pendingLiveOpen = _pendingLiveOpenResponse;
+        }
+
+        if (pendingLiveOpen is not null
+            && WindowsDouyinSidecarProtocol.TryParseLiveOpenResponse(
+                line,
+                pendingLiveOpen.RequestId,
+                out var liveOpenResponse,
+                out _))
+        {
+            if (CompletePendingLiveOpenResponse(pendingLiveOpen, liveOpenResponse!))
+            {
+                return true;
+            }
+
+            return true;
+        }
+
+        if (pendingCommand is not null
+            && WindowsDouyinSidecarProtocol.TryParseCommandResponse(
+                line,
+                pendingCommand.RequestId,
+                out var commandResponse,
+                out _))
+        {
+            if (pendingCommand.Completion.TrySetResult(commandResponse))
+            {
+                lock (_gate)
+                {
+                    if (ReferenceEquals(_pendingCommandResponse, pendingCommand))
+                    {
+                        _pendingCommandResponse = null;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        if (WindowsDouyinSidecarProtocol.TryParseResponse(line, out var response, out _))
+        {
+            if (CompletePendingReplyResponse(response!))
+            {
+                return true;
+            }
+
+            // 合法但迟到/未知请求的 response 不属于事件，也不能累计为无效事件。
+            return true;
+        }
+
+        if (WindowsDouyinProbeEventParser.TryParse(
+                line,
+                out var probeEvent,
+                out _,
+                expectedRoomId,
+                expectedSessionId,
+                expectedGeneration))
+        {
+            if (IsCanonicalUnboundEvent(probeEvent!))
+            {
+                SetTerminationReasonIfUnset(4);
+                CancelRun();
+                return false;
+            }
+
+            if (probeEvent!.SessionId is not null)
+            {
+                lock (_gate)
+                {
+                    _expectedSessionId ??= probeEvent.SessionId;
+                    _expectedGeneration ??= probeEvent.Generation;
+                }
+            }
+
             ApplyEvent(probeEvent!, qrPath);
+            if (probeEvent.Kind == WindowsDouyinProbeEventKind.AuthState
+                && probeEvent.State == "confirmed"
+                && _manager.Snapshot.State == DouyinLiveState.LoggedIn)
+            {
+                lock (_gate)
+                {
+                    _authConfirmation?.TrySetResult(probeEvent);
+                }
+            }
         }
         else if (Interlocked.Increment(ref _invalidEventCount) > MaxInvalidEvents)
         {
@@ -569,6 +1341,88 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
         }
 
         return true;
+    }
+
+    private bool CompletePendingReplyResponse(WindowsDouyinSidecarResponse response)
+    {
+        PendingReplyResponse? pending;
+        lock (_gate)
+        {
+            pending = _pendingReplyResponse;
+        }
+
+        return pending is not null
+            && string.Equals(pending.RequestId, response.RequestId, StringComparison.Ordinal)
+            && pending.Completion.TrySetResult(response);
+    }
+
+    private bool CompletePendingLiveOpenResponse(
+        PendingLiveOpenResponse pending,
+        WindowsDouyinLiveOpenResponse response)
+    {
+        if (!response.IsSuccess
+            || string.IsNullOrWhiteSpace(response.SessionId))
+        {
+            return pending.Completion.TrySetResult(response);
+        }
+
+        var shouldResolveRoom = response.LiveStatus is not ("room_ended" or "failed");
+        lock (_gate)
+        {
+            if (!ReferenceEquals(_pendingLiveOpenResponse, pending))
+            {
+                return false;
+            }
+
+            _expectedSessionId = response.SessionId;
+            _expectedGeneration = pending.Generation;
+        }
+
+        if (shouldResolveRoom
+            && !_manager.MarkRoomResolved().IsSuccess
+            && _manager.Snapshot.State != DouyinLiveState.RoomResolved)
+        {
+            return pending.Completion.TrySetResult(new(
+                response.RequestId,
+                false,
+                ErrorCode: "protocol_invalid",
+                IsRetryable: false,
+                Outcome: DouyinSendOutcome.NotSent));
+        }
+
+        PublishSnapshot();
+        return pending.Completion.TrySetResult(response);
+    }
+
+    private bool IsCanonicalUnboundEvent(WindowsDouyinProbeEvent probeEvent)
+    {
+        lock (_gate)
+        {
+            return _protocol == WindowsDouyinProbeProtocol.CanonicalNdjson
+                && probeEvent.Kind is (WindowsDouyinProbeEventKind.LiveState
+                    or WindowsDouyinProbeEventKind.ChatReceived)
+                && (_expectedSessionId is null || _expectedGeneration is null);
+        }
+    }
+
+    private void CancelPendingReplyResponse()
+    {
+        PendingReplyResponse? pending;
+        lock (_gate)
+        {
+            pending = _pendingReplyResponse;
+        }
+
+        pending?.Completion.TrySetResult(null);
+        lock (_gate)
+        {
+            _pendingReplyResponse = null;
+            _pendingCommandResponse?.Completion.TrySetResult(null);
+            _pendingLiveOpenResponse?.Completion.TrySetResult(null);
+            _pendingCommandResponse = null;
+            _pendingLiveOpenResponse = null;
+            _authConfirmation?.TrySetResult(null);
+        }
     }
 
     private static async Task DrainStreamAsync(
@@ -616,21 +1470,136 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
 
     private void ApplyEvent(WindowsDouyinProbeEvent probeEvent, string qrPath)
     {
+        var qrPathReady = probeEvent.QrPngBytes is { Length: > 0 }
+            && probeEvent.QrExpiresAtUtc is { } qrExpiresAtUtc
+            && TryWriteQrPng(qrPath, probeEvent.QrPngBytes, qrExpiresAtUtc);
         lock (_gate)
         {
             _lastEvent = probeEvent.Name;
             if (probeEvent.Kind == WindowsDouyinProbeEventKind.QrIssued
-                && File.Exists(qrPath)
-                && !HasReparsePoint(qrPath))
+                && (qrPathReady
+                    || (probeEvent.QrPngBytes is null
+                        && File.Exists(qrPath)
+                        && !HasReparsePoint(qrPath))))
             {
                 _qrPath = qrPath;
             }
         }
 
-        WindowsDouyinProbeEventBridge.Apply(_manager, probeEvent);
+        var bridgeResult = WindowsDouyinProbeEventBridge.Apply(_manager, probeEvent);
+        if (bridgeResult is { IsSuccess: false })
+        {
+            if (_manager.Snapshot.State != DouyinLiveState.Failed)
+            {
+                var failed = _manager.Fail("sidecar 事件未通过本地状态校验");
+                bridgeResult = new(false, failed.Snapshot, bridgeResult.Error);
+            }
+
+            lock (_gate)
+            {
+                _lastEvent = bridgeResult.Snapshot.LastEvent;
+            }
+        }
+
+        if (probeEvent.SessionId is not null || probeEvent.Kind == WindowsDouyinProbeEventKind.ChatReceived)
+        {
+            try
+            {
+                _replySignal.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+                // 宿主已开始释放；不再唤醒发送循环。
+            }
+        }
 
         PublishSnapshot();
     }
+
+    internal static bool TryWriteQrPng(string path, byte[] bytes, DateTimeOffset expiresAtUtc)
+    {
+        if (expiresAtUtc <= DateTimeOffset.UtcNow
+            || bytes.Length is 0 or > 256 * 1024
+            || !IsPng(bytes))
+        {
+            return false;
+        }
+
+        try
+        {
+            var fullPath = Path.GetFullPath(path);
+            if (File.Exists(fullPath) || Directory.Exists(fullPath))
+            {
+                return false;
+            }
+
+            var temporaryPath = $"{fullPath}.{Guid.NewGuid():N}.partial";
+            try
+            {
+                using (var stream = new FileStream(
+                    temporaryPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.Read,
+                    bufferSize: 4096,
+                    options: FileOptions.SequentialScan))
+                {
+                    stream.Write(bytes, 0, bytes.Length);
+                    stream.Flush(flushToDisk: true);
+                }
+
+                File.Move(temporaryPath, fullPath);
+                return File.Exists(fullPath) && !HasReparsePoint(fullPath);
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(temporaryPath))
+                    {
+                        File.Delete(temporaryPath);
+                    }
+                }
+                catch (IOException)
+                {
+                }
+                catch (UnauthorizedAccessException)
+                {
+                }
+            }
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+        catch (System.Security.SecurityException)
+        {
+            return false;
+        }
+        catch (NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsPng(byte[] bytes) =>
+        bytes.Length >= 8
+        && bytes[0] == 0x89
+        && bytes[1] == 0x50
+        && bytes[2] == 0x4E
+        && bytes[3] == 0x47
+        && bytes[4] == 0x0D
+        && bytes[5] == 0x0A
+        && bytes[6] == 0x1A
+        && bytes[7] == 0x0A;
 
     private async Task ReleaseExitedProcessAsync()
     {
@@ -697,6 +1666,7 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
 
     private void CancelRun()
     {
+        CancelPendingReplyResponse();
         try
         {
             _runCancellation?.Cancel();
@@ -747,8 +1717,10 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
             WindowStyle = ProcessWindowStyle.Hidden,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            RedirectStandardInput = true,
             StandardOutputEncoding = Utf8,
-            StandardErrorEncoding = Utf8
+            StandardErrorEncoding = Utf8,
+            StandardInputEncoding = Utf8
         };
 
         foreach (var argument in plan.Arguments)
@@ -758,6 +1730,33 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
 
         return startInfo;
     }
+
+    private static void CloseStandardInput(Process? process)
+    {
+        try
+        {
+            process?.StandardInput.Close();
+        }
+        catch (InvalidOperationException)
+        {
+        }
+        catch (IOException)
+        {
+        }
+    }
+
+    private sealed record PendingReplyResponse(
+        string RequestId,
+        TaskCompletionSource<WindowsDouyinSidecarResponse?> Completion);
+
+    private sealed record PendingCommandResponse(
+        string RequestId,
+        TaskCompletionSource<WindowsDouyinCommandResponse?> Completion);
+
+    private sealed record PendingLiveOpenResponse(
+        string RequestId,
+        ulong Generation,
+        TaskCompletionSource<WindowsDouyinLiveOpenResponse?> Completion);
 
     private static void DisposeProcess(Process? process, WindowsJobObject? job)
     {

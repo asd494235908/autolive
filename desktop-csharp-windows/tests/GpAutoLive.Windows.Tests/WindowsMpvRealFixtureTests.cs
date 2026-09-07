@@ -155,6 +155,14 @@ public sealed class WindowsMpvRealFixtureTests
             initialEffectSnapshot: initialEffectSnapshot,
             waitForFirstFrame: true);
         Assert.IsTrue(started.IsSuccess, started.Error?.Message);
+        Assert.AreEqual(
+            mode switch
+            {
+                MpvLaunchMode.Gpu83 => MpvVideoProcessingMode.Gpu83,
+                MpvLaunchMode.Cpu4 => MpvVideoProcessingMode.Cpu4,
+                _ => MpvVideoProcessingMode.Original,
+            },
+            started.Snapshot.ActiveVideoProcessingMode);
 
         var seek = await controller.SeekAsync(identity, 500);
         Assert.IsTrue(seek.IsSuccess, seek.Error?.Message);
@@ -189,7 +197,19 @@ public sealed class WindowsMpvRealFixtureTests
             var frameReadback = await controller.ReadPropertyAsync(identity, MpvIpcProperty.EstimatedFrameNumber);
             Assert.IsTrue(frameReadback.IsSuccess, frameReadback.IpcError?.Message ?? frameReadback.SessionError?.Message);
             Assert.IsTrue(MpvIpcValueReader.TryReadFiniteDouble(frameReadback.Frame!, out var frameNumber, out var frameError), frameError?.Message);
-            Assert.IsTrue(frameNumber is > 0, "换源成功返回时必须已经观察到新源首帧。");
+            var playbackTimeReadback = await controller.ReadPropertyAsync(identity, MpvIpcProperty.PlaybackTime);
+            Assert.IsTrue(
+                playbackTimeReadback.IsSuccess,
+                playbackTimeReadback.IpcError?.Message ?? playbackTimeReadback.SessionError?.Message);
+            Assert.IsTrue(
+                MpvIpcValueReader.TryReadFiniteDouble(
+                    playbackTimeReadback.Frame!,
+                    out var playbackTime,
+                    out var playbackTimeError),
+                playbackTimeError?.Message);
+            Assert.IsTrue(
+                frameNumber is > 0 || playbackTime is > 0,
+                "换源成功返回时必须已经观察到视频帧编号或播放时间前进。");
         }
         finally
         {
@@ -335,6 +355,96 @@ public sealed class WindowsMpvRealFixtureTests
 
         Assert.IsTrue(sawPositivePlaybackTime, "真实 mpv 未观察到首个有效播放时间。");
         Assert.IsTrue(sawEof, "真实 mpv 未观察到 EOF。");
+    }
+
+    [TestMethod]
+    public async Task Real_mpeg_ts_start_accepts_advancing_time_when_estimated_frame_number_stays_zero()
+    {
+        var installationDirectory = Environment.GetEnvironmentVariable("AUTOLIVE_TEST_MPV_INSTALL_ROOT");
+        var mediaPath = Environment.GetEnvironmentVariable("AUTOLIVE_TEST_MPV_TS_MEDIA");
+        if (string.IsNullOrWhiteSpace(installationDirectory)
+            || string.IsNullOrWhiteSpace(mediaPath))
+        {
+            // MPEG-TS/mpv regression fixture is opt-in; the regular suite remains hermetic.
+            return;
+        }
+
+        Assert.IsTrue(OperatingSystem.IsWindows(), "真实 MPEG-TS 夹具只支持 Windows。");
+        Assert.IsTrue(File.Exists(mediaPath), "显式 MPEG-TS 夹具媒体文件不存在。");
+        Assert.AreEqual(".ts", Path.GetExtension(mediaPath), ignoreCase: true);
+
+        var runtimeResult = await RuntimeMediaManifestBoundary.LoadAndVerifyAsync(
+            installationDirectory,
+            MediaRuntimeBoundary.DefaultRuntimeVersion);
+        Assert.IsTrue(runtimeResult.IsSuccess, runtimeResult.Error?.Message);
+        Assert.IsNotNull(runtimeResult.Runtime);
+
+        using var hostWindow = NativeHostWindow.Create();
+        var source = CreateFixtureSource(mediaPath);
+        var identity = new MediaPlaybackIdentity(1, 1, 0, 0);
+
+        await using (var observationController = new WindowsMpvPlaybackController())
+        {
+            var startedWithoutGate = await observationController.StartAsync(
+                runtimeResult.Runtime,
+                source,
+                identity,
+                checked((uint)hostWindow.Handle.ToInt64()),
+                MpvLaunchMode.Original,
+                waitForFirstFrame: false);
+            Assert.IsTrue(startedWithoutGate.IsSuccess, startedWithoutGate.Error?.Message);
+
+            double? previousPlaybackTime = null;
+            var observedTsProgress = false;
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            while (!timeout.IsCancellationRequested)
+            {
+                var frame = await observationController.ReadPropertyAsync(
+                    identity,
+                    MpvIpcProperty.EstimatedFrameNumber,
+                    timeout.Token);
+                var position = await observationController.ReadPropertyAsync(
+                    identity,
+                    MpvIpcProperty.PlaybackTime,
+                    timeout.Token);
+                if (frame.IsSuccess
+                    && position.IsSuccess
+                    && frame.Frame is not null
+                    && position.Frame is not null
+                    && MpvIpcValueReader.TryReadFiniteDouble(frame.Frame, out var frameNumber, out _)
+                    && MpvIpcValueReader.TryReadFiniteDouble(position.Frame, out var playbackTime, out _)
+                    && frameNumber is 0
+                    && playbackTime is double currentPlaybackTime)
+                {
+                    observedTsProgress = previousPlaybackTime is double previous
+                        && currentPlaybackTime > previous;
+                    previousPlaybackTime = currentPlaybackTime;
+                    if (observedTsProgress)
+                    {
+                        break;
+                    }
+                }
+
+                await Task.Delay(25, timeout.Token);
+            }
+
+            Assert.IsTrue(
+                observedTsProgress,
+                "夹具必须复现 estimated-frame-number 恒为 0、但 time-pos 持续增长的 MPEG-TS 行为。");
+        }
+
+        await using var gatedController = new WindowsMpvPlaybackController();
+        var startedWithGate = await gatedController.StartAsync(
+            runtimeResult.Runtime,
+            source,
+            identity,
+            checked((uint)hostWindow.Handle.ToInt64()),
+            MpvLaunchMode.Original,
+            waitForFirstFrame: true);
+
+        Assert.IsTrue(
+            startedWithGate.IsSuccess,
+            $"MPEG-TS 的 time-pos 已前进，应视为首帧进展：{startedWithGate.Error?.Message}");
     }
 
     [TestMethod]

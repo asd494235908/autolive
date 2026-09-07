@@ -12,6 +12,7 @@ public static class DouyinProbeRequestFactory
     private const string CondaVariable = "CONDA_EXE";
     private const string EnvironmentVariable = "AUTOLIVE_CONDA_ENV";
     private const string TimeoutVariable = "AUTOLIVE_DOUYIN_TIMEOUT_SEC";
+    private const string ProtocolVariable = "AUTOLIVE_DOUYIN_PROTOCOL";
 
     /// <summary>
     /// 读取 sidecar 运行配置。三个路径变量全部为空时返回未配置；只设置部分路径时返回脱敏错误。
@@ -71,6 +72,19 @@ public static class DouyinProbeRequestFactory
             timeout = TimeSpan.FromSeconds(int.Parse(timeoutText, System.Globalization.CultureInfo.InvariantCulture));
         }
 
+        var protocolText = readEnvironment(ProtocolVariable)?.Trim();
+        var protocol = protocolText?.ToLowerInvariant() switch
+        {
+            null or "" or "legacy" => WindowsDouyinProbeProtocol.LegacyEvents,
+            "canonical" => WindowsDouyinProbeProtocol.CanonicalNdjson,
+            _ => (WindowsDouyinProbeProtocol?)null
+        };
+        if (protocol is null)
+        {
+            error = "AUTOLIVE_DOUYIN_PROTOCOL 只允许 legacy 或 canonical。";
+            return false;
+        }
+
         var qrRoot = string.IsNullOrWhiteSpace(temporaryDirectory)
             ? Path.GetTempPath()
             : temporaryDirectory.Trim();
@@ -82,7 +96,8 @@ public static class DouyinProbeRequestFactory
             condaEnvironment,
             qrOutput,
             config,
-            timeout);
+            timeout,
+            protocol.Value);
         return true;
     }
 }

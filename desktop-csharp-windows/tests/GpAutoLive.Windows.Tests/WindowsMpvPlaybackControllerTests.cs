@@ -22,6 +22,7 @@ public sealed class WindowsMpvPlaybackControllerTests
         Assert.IsFalse(result.IsSuccess);
         Assert.AreEqual(WindowsMpvPlaybackControllerFailureCode.RuntimeUnavailable, result.Error?.Code);
         Assert.AreEqual(WindowsMpvPlaybackControllerState.Ready, result.Snapshot.State);
+        Assert.IsNull(result.Snapshot.ActiveVideoProcessingMode);
     }
 
     [TestMethod]

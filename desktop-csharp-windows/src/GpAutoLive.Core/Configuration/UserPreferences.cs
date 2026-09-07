@@ -38,6 +38,27 @@ public sealed record UserPreferences
     /// <summary>最近一次非敏感输出模式。</summary>
     public string LastOutputMode { get; init; } = "preview";
 
+    /// <summary>视频处理周期下限，单位毫秒。</summary>
+    public ulong VideoCyclePeriodMinMs { get; init; } = DefaultVideoCyclePeriodMinMs;
+
+    /// <summary>视频处理周期上限，单位毫秒。</summary>
+    public ulong VideoCyclePeriodMaxMs { get; init; } = DefaultVideoCyclePeriodMaxMs;
+
+    /// <summary>普通声音处理周期下限，单位毫秒。</summary>
+    public ulong AudioCyclePeriodMinMs { get; init; } = DefaultAudioCyclePeriodMinMs;
+
+    /// <summary>普通声音处理周期上限，单位毫秒。</summary>
+    public ulong AudioCyclePeriodMaxMs { get; init; } = DefaultAudioCyclePeriodMaxMs;
+
+    /// <summary>默认视频周期下限。</summary>
+    public const ulong DefaultVideoCyclePeriodMinMs = 5_000;
+    /// <summary>默认视频周期上限。</summary>
+    public const ulong DefaultVideoCyclePeriodMaxMs = 8_000;
+    /// <summary>默认声音周期下限。</summary>
+    public const ulong DefaultAudioCyclePeriodMinMs = 3_000;
+    /// <summary>默认声音周期上限。</summary>
+    public const ulong DefaultAudioCyclePeriodMaxMs = 5_000;
+
     /// <summary>默认偏好实例。</summary>
     public static UserPreferences Defaults { get; } = new();
 
@@ -79,6 +100,10 @@ public sealed record UserPreferences
         };
     }
 
+    /// <summary>更新视频和普通声音周期规则；周期结果快照不属于此配置。</summary>
+    public UserPreferences WithEffectCycleSettings(EffectCycleSettings settings) =>
+        (settings ?? throw new ArgumentNullException(nameof(settings))).ApplyTo(this);
+
     internal void Validate()
     {
         if (SchemaVersion != CurrentSchemaVersion)
@@ -112,6 +137,17 @@ public sealed record UserPreferences
         if (!AllowedOutputModes.Contains(LastOutputMode, StringComparer.OrdinalIgnoreCase))
         {
             throw new ConfigurationValidationException("输出模式值不受支持。");
+        }
+
+        if (!EffectCycleSettings.TryCreate(
+                VideoCyclePeriodMinMs,
+                VideoCyclePeriodMaxMs,
+                AudioCyclePeriodMinMs,
+                AudioCyclePeriodMaxMs,
+                out _,
+                out var cycleError))
+        {
+            throw new ConfigurationValidationException(cycleError ?? "效果周期配置无效。");
         }
     }
 

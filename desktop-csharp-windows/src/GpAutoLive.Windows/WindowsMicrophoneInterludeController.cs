@@ -46,7 +46,10 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly AudioPriorityCoordinator _audioPriority;
     private readonly MicrophoneInterludeGate _interludeGate;
+    private readonly AudioPcmRingBuffer _inputBuffer;
     private readonly WindowsPortAudioInputStream _input;
+    private readonly WindowsMicrophonePcmBridge _pcmBridge;
+    private readonly Func<FinalPcmBus?>? _finalPcmBusProvider;
     private readonly CancellationTokenSource _disposeCancellation = new();
     private WindowsMicrophoneInterludeState _state = WindowsMicrophoneInterludeState.Idle;
     private WindowsPortAudioInputError? _lastError;
@@ -61,11 +64,15 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
         int capacityFrames = 48_000,
         float startThresholdDb = -42,
         float stopThresholdDb = -48,
-        long hangoverMs = 250)
+        long hangoverMs = 250,
+        Func<FinalPcmBus?>? finalPcmBusProvider = null)
     {
         _audioPriority = audioPriority ?? throw new ArgumentNullException(nameof(audioPriority));
         _interludeGate = new(channels, startThresholdDb, stopThresholdDb, hangoverMs);
-        _input = new(new AudioPcmRingBuffer(capacityFrames, channels), _interludeGate);
+        _inputBuffer = new(capacityFrames, channels);
+        _input = new(_inputBuffer, _interludeGate);
+        _pcmBridge = new(channels);
+        _finalPcmBusProvider = finalPcmBusProvider;
     }
 
     public WindowsMicrophoneInterludeSnapshot Snapshot
@@ -124,6 +131,15 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
 
                 _state = WindowsMicrophoneInterludeState.Starting;
                 _lastError = null;
+            }
+
+            if (_finalPcmBusProvider is not null
+                && !TryGetUsableFinalPcmBus(out var busError))
+            {
+                return Failure(
+                    WindowsPortAudioInputFailureCode.OutputBusUnavailable,
+                    busError ?? "麦克风最终 PCM 输出总线不可用。",
+                    retryable: true);
             }
 
             var started = await _input
@@ -295,6 +311,33 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
                 var gate = _interludeGate.Snapshot;
                 var speaking = gate.State is
                     MicrophoneInterludeGateState.Speaking or MicrophoneInterludeGateState.Hangover;
+
+                if (_finalPcmBusProvider is not null
+                    && !_pcmBridge.TryDrain(
+                        _inputBuffer,
+                        _finalPcmBusProvider(),
+                        speaking,
+                        out var outputError))
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        return;
+                    }
+
+                    lock (_gate)
+                    {
+                        _lastError = outputError;
+                        _state = WindowsMicrophoneInterludeState.Failed;
+                        _sessionCancellation?.Cancel();
+                    }
+
+                    _audioPriority.SetMicrophoneSpeaking(false);
+                    Volatile.Write(ref _prioritySpeaking, false);
+                    await Task.Run(_input.Stop).ConfigureAwait(false);
+                    PublishSnapshot();
+                    return;
+                }
+
                 if (speaking == Volatile.Read(ref _prioritySpeaking))
                 {
                     continue;
@@ -362,4 +405,23 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
         error is null
             ? null
             : new(error.Code, error.Message, error.Retryable);
+
+    private bool TryGetUsableFinalPcmBus(out string? error)
+    {
+        var bus = _finalPcmBusProvider?.Invoke();
+        if (bus is null || bus.Snapshot.IsClosed)
+        {
+            error = "请先播放带声音媒体，麦克风没有可用的最终 PCM 输出总线。";
+            return false;
+        }
+
+        if (bus.Channels is not (1 or 2))
+        {
+            error = "当前音频输出只支持 1 或 2 声道麦克风插话。";
+            return false;
+        }
+
+        error = null;
+        return true;
+    }
 }

@@ -11,10 +11,13 @@ public sealed class AudioEffectCyclePlannerTests
     {
         var identity = new MediaPlaybackIdentity(1, 1, 0, 0);
         var planner = new AudioEffectCyclePlanner();
+        planner.Configure(4_000, 4_000);
 
         Assert.AreEqual(
             AudioEffectCycleAction.None,
             planner.GetAction(identity, 0, 20_000, enabled: true, hasPreparedCandidate: false, out _));
+        Assert.AreEqual(0UL, planner.CurrentCycleStartMs);
+        Assert.AreEqual(4_000UL, planner.CurrentCycleTargetMs);
         Assert.AreEqual(
             AudioEffectCycleAction.Prepare,
             planner.GetAction(identity, 3_000, 20_000, enabled: true, hasPreparedCandidate: false, out var target));
@@ -34,5 +37,22 @@ public sealed class AudioEffectCyclePlannerTests
         Assert.AreEqual(
             AudioEffectCycleAction.None,
             planner.GetAction(identity, 0, 4_000, enabled: true, hasPreparedCandidate: false, out _));
+    }
+
+    [TestMethod]
+    public void Uses_the_user_configured_audio_period_range()
+    {
+        var identity = new MediaPlaybackIdentity(1, 1, 0, 0);
+        var planner = new AudioEffectCyclePlanner();
+        planner.Configure(2_000, 2_000);
+
+        Assert.AreEqual(
+            AudioEffectCycleAction.None,
+            planner.GetAction(identity, 0, 20_000, enabled: true, hasPreparedCandidate: false, out _));
+        Assert.AreEqual(
+            AudioEffectCycleAction.Prepare,
+            planner.GetAction(identity, 1_000, 20_000, enabled: true, hasPreparedCandidate: false, out var target));
+        Assert.AreEqual(2_000UL, target);
+        Assert.AreEqual(2_000UL, planner.CurrentPeriodMs);
     }
 }

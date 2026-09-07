@@ -1,5 +1,14 @@
 # GpAutoLive C# Windows 桌面端实施计划
 
+> 当前边界修正（2026-09-06）：Rust/Tauri 与 C# 是隔离客户端。实施 C# 功能时只阅读 Rust 源码获取行为参考，不启动、探测、调用或联调 Rust；C# 只验收自己的进程、媒体输出、安装签名与回滚。本文较早的跨客户端锁和交叉启动记录保留为历史审计，不再作为 C# 当前完成条件。
+
+## 173. C# 媒体池搜索与底部导入按钮样式修复（2026-09-05）
+
+- `MainWindow.xaml` 的媒体池搜索框已从只读固定文案改为真实 TextBox，使用已有 `ShellState` 单一状态源的 `MediaSearchText` 和 `VisibleMediaItems` 显示投影；按文件名/媒体类型不区分大小写匹配，空白查询恢复完整池，零结果显示“没有匹配的媒体”，不改写 `MediaPoolService` 的真实播放池。
+- 过滤后 `ListBox.SelectedIndex` 不再直接作为媒体池索引；选择、上移、下移、移除、键盘删除、自动换源和播放切换统一按选中 `MediaListItemViewModel` 映射回完整池索引，保留原子编辑、当前源和播放状态边界。
+- 底部 `ImportButton` 继续复用顶栏同一个 `ImportButton_Click`/`RunImportAsync` 入口，仅明确 `32px` 高度、Stretch 布局、水平/垂直居中，并复用顶栏加号图形与 `Ctrl+O` 文案，删除原来由内容自然尺寸造成的又宽又矮表现。
+- 新增 ShellState 与 WPF 回归：搜索投影/空白恢复/源池不变、过滤选中项映射和按钮布局共 `2/2`，既有媒体池忙碌态回归 `1/1`；`dotnet format --verify-no-changes --no-restore` 与 Release x64 构建 `0` 警告/`0` 错误。CUA 未返回 C# 原生窗口，人工页面点击/像素级视觉验收仍待补做；未修改 Rust/Tauri、未新增依赖或播放器。
+
 > 当前同步长任务的最新状态以 [`CSharp-Windows当前状态.md`](./CSharp-Windows当前状态.md) 和 [`CSharp与Rust桌面端功能同步长任务实施方案`](../../docs/superpowers/plans/2026-09-04-CSharp与Rust桌面端功能同步长任务实施方案.md) 为准。本文件较早的 Phase C3/C4 段落保留历史实施快照；2026-09-04 后，视频处理关闭统一走 Original，开启时按完整 shader 哈希选择 GPU83/CPU4，首次播放与动态更新共用系统生成快照。
 
 > 实施进度（2026-09-03）：Phase C0/C1 已完成；Phase C2 已完成严格控制面合同、纯逻辑会话门禁、原子 INI/JSON 配置、Windows Credential Manager/DPAPI 边界、有界 `HttpClient` 传输层、冷启动 Refresh Token 恢复、单任务后台心跳和 WPF 登录/自动激活/Refresh/Logout 编排（默认未配置服务端时不发网络请求）；Phase C3 已接入纯逻辑媒体池、逐项有界导入/FFprobe 协调器、FFprobe 命令/输出边界、Windows `Process` 适配器、最小 Job Object 增强边界、手动导航、FileDrop 拖放、唯一最终效果窗口和“已验证资源→HWND→受管 mpv”播放控制器接线；Phase C4 已接入 mpv 单会话 JSON IPC、Windows 命名管道传输边界、外置媒体资源清单完整性校验、受限视频参数快照、活动源身份门禁、固定容量 PCM 环缓、三属性播放状态有界监视器、PortAudio 独立 DLL 设备枚举、预分配回调输出流和输入流边界、最终 PCM 双消费者总线及本地能量 VAD 门控边界，以及 Windows 受管 mpv 宿主和“进程→管道→会话”组合生命周期；Phase C5 已接入固定话术合同、单操作状态机、Windows SAPI STA/COM 适配边界、音频优先级/静音策略边界、RTMP 配置/参数合同、Windows FFmpeg 宿主生命周期和本机 H.264 编码器逐候选探测边界；当前纯音频 FFmpeg→环缓→PortAudio 播放/暂停/恢复/停止已接入 WPF，有限音轨支持有界排空，RTMP 画面及最终 PCM 声音会话已接入 WPF 开始/停止控制（真实 ZLMediaKit/RTMPS 网络和断线重试仍未验收）。v76 在 v75 基础上保留同一 WGC D3D11 设备上的 GPU→YUY2 转换器，并修正首次 GPU 回读时先 `MarkReady` 后 `SubmitFrame` 的状态顺序：GPU 完成固定 1280×720 缩放和 BT.601 limited-range 打包，三槽 staging + `DO_NOT_WAIT` 有界回读，并接入 `WindowsVirtualCameraGpuOutputSession` 的 generation/latest-wins 逻辑边界；Vortice 运行库按程序集白名单外置到 `runtime/gpu/`，避免主 EXE/安装根目录继续膨胀。v75 及更早版本保留为历史发布记录；本轮新增抖音 M1 WPF 本地配置/生命周期入口、非敏感配置版本化 JSON 原子存储、Windows Conda/上游文件/环境名/超时/PNG 输出校验的 sidecar 启动计划，以及 sidecar 脱敏事件解析、固定缓冲有界 stdout 读取、受管进程树生命周期和核心状态桥接，并补齐 Windows GDI/User GUI 资源计数与 Gen0/Gen1/Gen2 GC 计数快照；新增仅使用 BCL 的 AkVirtualCamera Named Pipe 固定帧传输客户端、固定 sidecar 启动计划、x64 PE32+ 架构校验、受管 sidecar 宿主、虚拟摄像头资源包固定路径/文件探测、D3D11 硬件前置探测、最终效果窗口 HWND 绑定代际契约和真实 WGC HWND frame-pool 会话边界。已有插话声音配置 JSON、22 个预设白名单、随机/周期选择器、固定缓冲 attack/release 过渡、AkVirtualCamera 固定规格/GPU 真实性/状态与 latest-wins 帧契约、固定 52 字节 sidecar 帧协议与会话管道名校验，以及抖音 M1 本地合同、扫码状态机、有界回复队列和脱敏状态投影继续保留。PortAudio 原生健康探测、回调健康快照和最多 3 次有界设备恢复、麦克风门控优先级和解码输出门控、插话文件目录快照与 PCM 混音、虚拟摄像头 WGC/D3D11/sidecar、抖音 sidecar 真实运行仍保持“代码已接入·待真实设备/发布门禁”；22 套预设真实 DSP、真实声卡听感、AEC/降噪/AGC/完整 VAD、真实设备拔插/睡眠唤醒、目标 GPU、控制面联调、SAPI 语音包实机、真实 RTMP/网络、AkVirtualCamera、抖音 QR/协议兼容、Rust/Tauri 复刻运行时和外部 sidecar 仍未全部验收。
@@ -268,8 +277,8 @@ Contracts 不反向依赖任何层
 
 ### 8.2 操作便利度
 
-- `Ctrl+O` 导入媒体，`Space` 播放/暂停，`Ctrl+Shift+S` 停止，`F11` 全屏最终效果，`Ctrl+,` 设置；文本输入聚焦时不抢快捷键。
-- 播放池支持拖放、键盘上移/下移、删除确认和原子整批替换；失败保留旧池。
+- `Ctrl+O` 添加媒体并追加到当前播放池，`Space` 播放/暂停，`Ctrl+Shift+S` 停止，`F11` 全屏最终效果，`Ctrl+,` 设置；文本输入聚焦时不抢快捷键。
+- 播放池支持文件选择/拖放追加、版本化 JSON 列表原子整批替换、键盘上移/下移和删除确认；上述操作只修改播放池引用，不删除用户本地源文件，失败保留旧池。
 - 右栏输出卡只展示当前状态与主操作，详细设置进入对话框/抽屉式面板。
 - 参数用分类导航、搜索和折叠；默认只显示常用项，所有正式参数仍可到达且状态不丢失。
 - 全部字段有可见标签、单位、范围和就地错误；图标按钮提供可访问名称和 Tooltip。
@@ -1108,10 +1117,10 @@ v8 启动冒烟在设置 `DOTNET_ROOT`/`DOTNET_ROOT_X64` 指向本地 .NET 10 �
 
 ## 77. 当前实施增量：全局媒体/输出资源所有权门禁与 v81 发布复验（2026-09-03）
 
-- 新增 `GpAutoLive.Windows/WindowsMediaOutputOwnership.cs`：使用固定 `Local\\GpAutoLive.MediaOutput.Owner.v1` 命名互斥实现全局媒体/输出资源租约；立即尝试、不等待、不启动或终止其他进程，重复获取和异常退出后的 abandoned mutex 均有确定结果，释放幂等且不触碰用户配置或媒体文件。
-- 获取资源锁前只读探测 Rust/Tauri 正式进程名 `autolive-desktop-core`；检测到参考客户端或无法可靠探测时 fail-closed。C# 自身进程内另有不区分线程的名称集合，避免 .NET Mutex 同线程可重入造成重复租约。
-- `GpAutoLive.App/App.xaml.cs` 在独立 AppUserModelID 配置后、C# 单实例互斥前取得资源租约；资源门禁失败显示可行动提示并退出，单实例创建失败或退出时按逆序释放租约。Rust/Tauri 目录保持只读，因此本轮未宣称两个客户端已完成双向锁协议；灰度期间仍要求单端运行。
-- 新增 4 项 Windows 所有权边界测试，覆盖首租约、重复获取、释放重试、参考进程探测、非法名称和探测异常；全量自动化测试为 **400 项通过**（Contracts 25、Core 75、Media 91、Windows 173、App 36）。
+- 新增 `GpAutoLive.Windows/WindowsMediaOutputOwnership.cs`：使用 C# 专属的 `Local\\GpAutoLive.CSharp.MediaOutput.Owner.v1` 命名互斥实现本端媒体/输出资源租约；立即尝试、不等待、不启动或探测 Rust/其他客户端，重复获取和异常退出后的 abandoned mutex 均有确定结果，释放幂等且不触碰用户配置或媒体文件。
+- C# 获取资源锁前不启动、不探测 Rust 或其他客户端；C# 自身进程内另有不区分线程的名称集合，避免 .NET Mutex 同线程可重入造成重复租约。
+- `GpAutoLive.App/App.xaml.cs` 在独立 AppUserModelID 配置后、C# 单实例互斥前取得资源租约；资源门禁失败显示可行动提示并退出，单实例创建失败或退出时按逆序释放租约。Rust/Tauri 目录保持只读，灰度期间不要求两个客户端互斥运行。
+- 新增 C# Windows 所有权边界测试，覆盖首租约、重复获取、释放重试、非法名称和内核异常；当前定向自动化已通过，Rust 不参与测试。
 - v81 正式候选：`artifacts/csharp-windows-controller-20260903-v81` 根目录 8 个运行文件、`1,434,352` bytes，`GpAutoLive.exe` `162,816` bytes；`runtime/winrt/` 2 个 DLL 合计 `27,848,816` bytes，`runtime/gpu/` 7 个 DLL 合计 `1,208,320` bytes，二者均带 manifest；独立 symbols 包 `artifacts/csharp-windows-symbols-20260903-v81` 7 个文件、`474,875` bytes；媒体运行时继续复用 13 个硬链接文件、逻辑大小 `352,365,694` bytes，三个运行库 manifest 的大小与 SHA-256 校验通过。
 - v81 发布包使用锁定 `.tools/dotnet` 启动关闭冒烟：`WaitForInputIdle=True`、窗口标题 `GpAutoLive`、`CloseMainWindow=True`、退出码 0，且无 `GpAutoLive/mpv/ffmpeg/ffprobe` 残留；4 秒空闲基线 6 个样本，私有工作集 `85,340,160～86,671,360` bytes、工作集 `142,761,984～147,570,688` bytes、CPU 峰值 `2.26%`，GDI `17`、User `40～42`。
 - 全局租约只证明 C# 端的 fail-closed 边界；Rust/Tauri 未修改，故其启动时不会主动读取该互斥，仍需发布前双客户端协议、升级/卸载、签名/许可证、真实 DirectShow、sidecar ACL、GPU→sidecar、WGC 可见帧、多 GPU、下游兼容、真实 ZLMediaKit/RTMPS 网络和 30 分钟长稳验收。
@@ -1245,7 +1254,7 @@ v8 启动冒烟在设置 `DOTNET_ROOT`/`DOTNET_ROOT_X64` 指向本地 .NET 10 �
 
 ## 94. 当前实施增量：C5 RTMP 有限重连协调器（2026-09-03）
 
-- 新增 `GpAutoLive.Windows/WindowsRtmpReconnectCoordinator` 与 `WindowsRtmpReconnectPolicy`：一次断开事件最多 3 次尝试，退避固定为 250ms、500ms、1s；所有等待、尝试、异常和取消均有界，状态收敛为 `Reconnecting → Publishing/Failed`，取消回到 `Idle`。
+- 新增 `GpAutoLive.Windows/WindowsRtmpReconnectCoordinator` 与 `WindowsRtmpReconnectPolicy`：一次断开事件默认最多 6 次尝试（初次启动后重试 5 次），退避固定为 1s、2s、4s、8s、15s；所有等待、尝试、异常和取消均有界，状态收敛为 `Reconnecting → Publishing/Failed`，取消回到 `Idle`。
 - 协调器只接收上层注入的脱敏尝试函数，不访问网络、不保存地址/路径/stream key、不读取 FFmpeg 原文；`null` 或异常结果均映射为固定 `StartFailed` 并继续受预算约束。由于本地 FFmpeg `Process.Exited` 不能证明远端握手/断开，当前不自动接线到宿主，避免画面和 `pipe:0` 音频会话被错误分开重启。
 - 新增 8 项 Windows 测试，覆盖成功、不可重试失败、三次耗尽、退避取消、尝试取消、并发拒绝、异常脱敏和空结果 fail-closed；Windows 测试总数为 189，C3–C5 离线矩阵已把该行纳入并增至 166 项。
 
@@ -1272,7 +1281,7 @@ v8 启动冒烟在设置 `DOTNET_ROOT`/`DOTNET_ROOT_X64` 指向本地 .NET 10 �
 
 - 审计确认 `WindowsRtmpReconnectCoordinator` 的注入尝试回调已经是当前最小安全接线边界；`WindowsRtmpOutputManager.Process.Exited` 只能证明本地 FFmpeg 退出，不能推断远端 RTMP/RTMPS 握手、鉴权或断开。
 - `WindowsRtmpAudioSession` 同时拥有 PCM 解码器、固定容量总线、混音源和唯一分流泵；只重启画面宿主会破坏画面/声音组合，因此本轮没有把协调器自动接入宿主，也没有新增网络探测、隐式后台重连或敏感地址保存。
-- 新增 [`C5 RTMP 宿主重连接线审计`](./C5-RTMP宿主重连接线审计.md)，规定未来生产接线必须由同一上层所有者完成远端断开确认、`RtmpSourceIdentity` 校验以及画面/声音成组停止和重建；协调器仍保持最多 3 次、250/500/1000ms 退避、可取消、并发拒绝和脱敏终态。
+- 新增 [`C5 RTMP 宿主重连接线审计`](./C5-RTMP宿主重连接线审计.md)，规定未来生产接线必须由同一上层所有者完成远端断开确认、`RtmpSourceIdentity` 校验以及画面/声音成组停止和重建；协调器默认保持最多 6 次、1/2/4/8/15s 退避、可取消、并发拒绝和脱敏终态。
 - 新增首次尝试前取消的契约测试；Windows RTMP 协调器测试为 **9/9** 通过，Windows 项目测试为 **190/190** 通过；`dotnet format --verify-no-changes --no-restore` 与 `git diff --check` 通过。真实 ZLMediaKit/RTMPS 断开信号和恢复门禁仍待验收。
 
 ## 99. 当前实施增量：C8 WPF 虚拟摄像头职责拆分（2026-09-03）
@@ -1344,7 +1353,7 @@ v8 启动冒烟在设置 `DOTNET_ROOT`/`DOTNET_ROOT_X64` 指向本地 .NET 10 �
 - 发现安装、回滚、卸载脚本在多个维护壳/命令行实例并发运行时可能同时读取旧 `current.json`，后写入者覆盖前一个安装事务的回滚链；新增 `tools/csharp-windows-install-transaction-lock.ps1`，三条写操作共同取得 `Local\\GpAutoLive.CSharp.Windows.InstallTransaction.v1` 命名互斥。
 - 事务锁立即尝试、占用时返回 `install_transaction_busy`，不创建 staging、不切换活动指针、不删除版本；异常退出由 Windows 自动释放，abandoned mutex 可安全接管。安装维护壳已将 helper 复制到固定 `tools/`，与命令行脚本保持同一边界。
 - 新增 `tools/test-c7-install-transaction-lock.ps1`，在外部持锁时验证安装、回滚、卸载均 fail-closed；锁竞争和安装 WhatIf 未创建测试安装目录。该修正不修改 `desktop/`，不删除源码，也不改变主程序媒体资源锁。
-- v89 包核验、`-RequireSigned` 预期拒绝、`-PlanOnly`、现有安装状态 read-only/WhatIf 均复验通过；当前 PID 19612 仍被保护，v89 真实冒烟保持 `blocked_preexisting_processes`，未强制关闭窗口。签名、UAC、裸机 Runtime/PowerShell 7、干净机安装、跨客户端双向锁协议和长稳仍待验收。详细记录见 [`C7 安装事务锁审查记录`](./C7-安装事务锁审查记录.md)。
+- v89 包核验、`-RequireSigned` 预期拒绝、`-PlanOnly`、现有安装状态 read-only/WhatIf 均复验通过；当前 PID 19612 仍被保护，v89 真实冒烟保持 `blocked_preexisting_processes`，未强制关闭窗口。签名、UAC、裸机 Runtime/PowerShell 7、干净机安装、C# 自身崩溃恢复和长稳仍待验收。Rust 仅作只读参考。详细记录见 [`C7 安装事务锁审查记录`](./C7-安装事务锁审查记录.md)。
 
 ## 110. 当前实施增量：v90 C6/C7 统一候选（2026-09-03）
 
@@ -1355,9 +1364,9 @@ v8 启动冒烟在设置 `DOTNET_ROOT`/`DOTNET_ROOT_X64` 指向本地 .NET 10 �
 
 ## 111. 当前实施增量：C7 媒体输出所有权与单实例竞态审查（2026-09-03）
 
-- 审查确认 C# 启动顺序为 Windows 运行时/AppUserModelID 配置 → `Local\\GpAutoLive.MediaOutput.Owner.v1` 媒体/输出租约 → C# 单实例互斥 → 主窗口；`MainWindow.OnClosed` 先回收媒体/输出会话，`App.OnExit` 再释放两个互斥，失败路径均释放已取得的资源。
+- 审查确认 C# 启动顺序为 Windows 运行时/AppUserModelID 配置 → `Local\\GpAutoLive.CSharp.MediaOutput.Owner.v1` 本端媒体/输出租约 → C# 单实例互斥 → 主窗口；`MainWindow.OnClosed` 先回收媒体/输出会话，`App.OnExit` 再释放两个 C# 锁，失败路径均释放已取得的资源。
 - 只读检查 `desktop/src-tauri/src/main.rs`：Rust/Tauri 仅注册自身 `tauri_plugin_single_instance`，没有消费 C# 媒体输出互斥名称，因此当前仍只能宣称 C# 端 fail-closed 和 Rust 进程只读探测，不能伪造双端双向锁协议。
-- `WindowsMediaOutputOwnershipLease.TryAcquire` 在立即获取媒体互斥后新增一次参考进程二次探测；二次探测发现参考进程或发生可识别探测失败时，租约不转移并显式释放已持有互斥，收窄首次探测与锁获取之间的竞态。新增两项回归测试验证该路径及释放后重试。
+- 旧审计中的参考进程二次探测路径已删除；`WindowsMediaOutputOwnershipLease.TryAcquire` 现在只获取 C# 自身专属媒体互斥，Rust 进程存在与否不改变 C# 启动结果。新增回归测试验证 C# 资源锁与 App 生命周期边界。
 - 所有权专项测试 **6/6**、Windows 项目测试 **192/192**、独立输出目录下全量方案测试 **437/437**；`dotnet format --verify-no-changes --no-restore` 与 `tools/verify-scope.ps1` 均通过。详细记录见 [`C7 媒体输出所有权与单实例审查记录`](./C7-媒体输出所有权与单实例审查记录.md)。
 - 二次探测不是跨客户端原子握手；参考端若在二次探测之后启动仍无法由只读 C# 代码证明不存在竞态。双端共同协议、真实设备/网络争用、签名安装、Windows 10/11 和长稳门禁继续保持未验收。
 
@@ -1366,7 +1375,7 @@ v8 启动冒烟在设置 `DOTNET_ROOT`/`DOTNET_ROOT_X64` 指向本地 .NET 10 �
 - 安装脚本读取已有 `current.json` 时新增 schema、活动版本格式、`relative_path` 和 `previous_version` 校验；损坏指针在发布包校验后、任何 staging/指针写入前 fail-closed。
 - 安装在版本目录已移动但活动指针写入失败或被取消时，清理本次新版本目录并保留旧 `current.json`；有效 `-WhatIf` 不创建安装根目录。
 - 新增 `tools/test-c7-install-boundaries.ps1`，覆盖损坏指针预演拒绝、WhatIf 只读和激活失败清理；新增 Installer 结果投影回归，要求 `healthy` 状态同时具备 schema、活动版本、已验证版本清单及回滚候选一致性。
-- Installer Release x64 构建 **0 警告/0 错误**、Installer 测试 **15/15**、PowerShell 全工具解析、边界测试、事务锁竞争测试和作用域检查均通过。方案级 `dotnet test --no-build` 为 **441/441**；方案级重新构建因开发窗口 PID 19612 锁定 App 输出 DLL 未完成，未强制关闭窗口。签名、UAC、裸机 Runtime、干净机安装、跨客户端双向锁协议和长稳仍保持 deferred。
+- Installer Release x64 构建 **0 警告/0 错误**、Installer 测试 **15/15**、PowerShell 全工具解析、边界测试、事务锁竞争测试和作用域检查均通过。方案级 `dotnet test --no-build` 为 **441/441**；方案级重新构建因开发窗口 PID 19612 锁定 App 输出 DLL 未完成，未强制关闭窗口。签名、UAC、裸机 Runtime、干净机安装、C# 自身崩溃恢复和长稳仍保持 deferred，Rust 不参与。
 
 ## 113. 当前实施增量：C4/C5 主线程生命周期复核（2026-09-03）
 
@@ -1760,3 +1769,37 @@ v8 启动冒烟在设置 `DOTNET_ROOT`/`DOTNET_ROOT_X64` 指向本地 .NET 10 �
 - `MediaPoolOwner.ResumePlayback` 与 Rust `PlaybackCore::resume` 对齐，只允许 `Ready/Paused → Playing`；`Stopped` 保留为停止终态，重新播放必须调用 `StartPlayback`，并且失败的恢复操作保持原快照不变。
 - `MainWindow` 只有在 Core 状态为 `Playing/Paused`、当前媒体身份一致且 mpv 运行态有效时才复用 `TogglePauseAsync`；`Ready/Stopped` 不再根据进程存活猜测恢复，而是沿用登录、运行包、FFprobe、首帧和单一 mpv 会话门禁进入启动路径。
 - 本轮不新增播放器、抽象或依赖，不修改 Rust；Core 状态测试 `16/16` 通过。App/WPF 人工导入、暂停/恢复/停止和 EOF 换源、真实声卡及长稳仍需独立验收。
+
+## 172. C# 最终效果窗口对齐 Rust 视频纯画布（2026-09-05）
+
+- 对照 Rust `desktop/ui/src/App.tsx` 的 `FinalEffectWindow`，删除 C# `FinalEffectWindow` 的底部 Footer、状态浮层、等待播放文字及弹窗内播放/停止/进度/身份/关闭控件；最终效果窗客户区只保留黑色画布和视频/纯音频表面。
+- C# 窗口标题改为 `GpAutoLive 最终效果`，默认客户区 `1280×720`、最小 `320×180`，保留原生标题栏、可调整大小、居中、单实例和主窗口播放控制。
+- 删除只服务于 Footer 的 `FinalEffectPlaybackCommand`、`CommandRequested` 和进度/身份投影，保留 `ReservedVideoSurface` 子 HWND 与 WGC 顶层 HWND 的双句柄边界；不修改 Rust/Tauri。
+- 新增/调整 WPF 回归测试覆盖纯画布无控件、Rust 对齐尺寸/标题及 F11 往返；自动化构建、真实 WGC 可见帧、人工页面和长稳按总计划单独验收。
+
+## 173. RTMP 重连发布门禁与媒体身份保护（2026-09-06）
+
+- `MainWindow.ReconnectRtmpCoreAsync` 在调用既有有限重连协调器时固定当前 `MediaPlaybackIdentity`，停止前后和启动前后均检查身份；媒体池切换期间不跨源重连，身份变化返回不可重试的启动失败。
+- 重连启动后增加最多 10 秒的有界就绪等待：只有 `WindowsRtmpOutputManager` 已通过正向 `-progress` 证据进入 `Publishing`，且启用声音时 `WindowsRtmpAudioSession` 仍运行且无错误，才向协调器报告成功；启动超时/进程失败继续按既有 `1/2/4/8/15s` 预算重试。
+- 新增 `MainWindowRtmpReadinessTests` 2/2；不新增播放器、队列或依赖，不把 `Process.Exited` 自动解释为远端断开，真实 ZLMediaKit/RTMPS 握手、断线恢复和长稳仍待服务器恢复后验收。
+
+## 174. 虚拟摄像头与媒体输出所有权生命周期复核（2026-09-06）
+
+- `WindowsVirtualCameraOutputCoordinator` 统一收集 writer、GPU、Named Pipe client 和 sidecar host 的清理结果；清理失败继续执行后续回收并返回 `CleanupFailed`，取消后使用不可取消令牌做一次有界补偿，清理未完成期间拒绝再次启动，重复 Stop 成功后解除熔断。
+- C# 启动先取得 C# 专属媒体输出 Mutex，再取得单实例文件句柄；退出先释放媒体输出 Mutex，再释放单实例文件句柄。新增独立线程内核 Mutex 争用、abandoned 接管和启动/退出顺序测试。
+- 虚拟摄像头受影响测试 38/38、C# 所有权测试和生命周期测试通过；未新增依赖，Rust 保持只读。真实 sidecar、WGC 可见帧、DirectShow、C# 输出资源和签名卸载继续待设备验收。
+
+## 175. 控制面密度、响应式与真实周期进度边界（2026-09-07）
+
+- 音频诊断区收口为紧凑的实际 PCM 双频谱：视频/主音频与插话仍分别读取 `FinalPcmBus` 的只读频谱快照，不消费输出环缓；在降低面板高度后用有界增益、峰值/衰减和主题渐变增强弱波动辨识度，无 PCM 时显示明确等待态，不用随机柱形或循环动画伪造信号。
+- 主窗口文字、状态徽标、输入框和参数卡按可用宽度响应式排列，允许必要的换行或省略；亮度等视频参数的名称和值优先保持同一行，窄窗口再有序降级，避免固定像素宽度造成文字截断、数值错位或纵向空间浪费。视觉增强限于 WPF 主题、渐变、边框和轻量状态动效，不新增媒体处理或高频后台任务。
+- “插话文件池（高级）”按信息层级重排：目录路径使用可伸展的完整输入行，目录操作、试播控制、周期范围、输出设备和说明分别成组；输入控件保留可读最小宽度并随右栏扩展，现有目录快照、预设、周期校验和 PortAudio 设备合同保持不变。
+- 视频变换、声音变换和插话自动变换分别显示独立周期进度。进度只能由各自现有周期所有者的真实已用时间/本轮目标时长投影，暂停时冻结、换源或重新生成时归零、禁用或无活动会话时显示未运行；不得用 UI 定时器独立推进、合并三条进度或把参数已生成冒充媒体已生效。
+- 本轮边界只涉及 WPF 信息密度、视觉呈现和既有状态的只读投影，不修改 `MediaEffectParams`/周期范围契约、GPU83/CPU4/Original 降级、声音 DSP、插话混音、媒体调度、队列、线程或输出所有权。
+
+## 176. 生产自动视频周期低感知范围修复（2026-09-07）
+
+- 调用链复核确认 `VideoEffectCyclePlanner` 只负责基于 mpv/最终 PCM 播放位置触发下一轮，实际参数由 `GeneratedVideoEffectSnapshot.Create` 唯一生成，并由 GPU83 完整快照或 CPU4 四字段回退链消费。
+- 旧 C# 生成器把亮度、对比度、饱和度、色相和锐化按接近明显对照档的整数范围写入每轮生产快照，导致 5～8 秒周期持续产生肉眼可见的明暗和偏色跳变；现已对齐正式自动低感知范围：亮度 `±0.1～0.35%`、对比度/饱和度相对 `100%` 偏移 `±0.1～0.3%`、色相 `±0.05～0.2°`、锐化 `0.1～0.4%`。
+- “明显可见”档只用于固定测试素材证明参数映射确实改变输出，不得进入生产自动周期，也不得作为跨素材、屏幕或观看距离的人眼阈值承诺。周期时钟、完整快照校验、GPU83→CPU4→Original 单向降级及其余高级视觉低感知参数保持不变。
+- 新增 256 个确定性种子的范围回归；失败先行测试在旧生成器上失败，修复后相关测试 `3/3`、`ShellStateTests` `18/18` 和范围内格式检查通过。未运行全量测试或完整构建，真实视频主观低感知、目标 GPU 矩阵与长稳由后续统一验收。

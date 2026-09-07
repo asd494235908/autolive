@@ -4,6 +4,47 @@ namespace GpAutoLive.Media.Tests;
 public sealed class AudioPcmMixerTests
 {
     [TestMethod]
+    public void Output_volume_percent_maps_to_linear_gain_decibels()
+    {
+        Assert.IsTrue(AudioPcmMixer.TryGetOutputVolumeGainDb(100, out var fullGainDb));
+        Assert.AreEqual(0, fullGainDb, 0.0001);
+
+        Assert.IsTrue(AudioPcmMixer.TryGetOutputVolumeGainDb(50, out var halfGainDb));
+        Assert.AreEqual(-6.0206, halfGainDb, 0.001);
+
+        Assert.IsTrue(AudioPcmMixer.TryGetOutputVolumeGainDb(0, out var mutedGainDb));
+        Assert.AreEqual(-120, mutedGainDb, 0.0001);
+    }
+
+    [TestMethod]
+    public void Output_volume_percent_rejects_non_finite_or_out_of_range_values()
+    {
+        Assert.IsFalse(AudioPcmMixer.TryGetOutputVolumeGainDb(double.NaN, out _));
+        Assert.IsFalse(AudioPcmMixer.TryGetOutputVolumeGainDb(-1, out _));
+        Assert.IsFalse(AudioPcmMixer.TryGetOutputVolumeGainDb(101, out _));
+        Assert.IsFalse(AudioPcmMixer.TryGetOutputVolumeGainDb(double.PositiveInfinity, out _));
+    }
+
+    [TestMethod]
+    public void Output_volume_gain_is_consumed_by_the_base_pcm_mix_policy()
+    {
+        Assert.IsTrue(AudioPcmMixer.TryGetOutputVolumeGainDb(50, out var gainDb));
+        var output = new float[1];
+
+        Assert.IsTrue(AudioPcmMixer.TryMix(
+            new[] { 1F },
+            ReadOnlySpan<float>.Empty,
+            output,
+            channels: 1,
+            new AudioPcmMixPolicy(BaseGainDb: gainDb),
+            out var frames,
+            out var error), error?.Message);
+
+        Assert.AreEqual(1, frames);
+        Assert.AreEqual(0.5F, output[0], 0.001F);
+    }
+
+    [TestMethod]
     public void Interlude_ducks_base_and_keeps_overlay()
     {
         var basePcm = new[] { 1F, -1F };
@@ -165,6 +206,29 @@ public sealed class AudioPcmMixerTests
         Assert.IsTrue(Math.Abs(output[1]) < 0.01F);
         Assert.IsTrue(output[2] > 0.49F && output[2] < 0.51F);
         Assert.IsTrue(Math.Abs(output[3]) < 0.01F);
+    }
+
+    [TestMethod]
+    public void Mixing_output_source_applies_overlay_volume_without_changing_base_duck()
+    {
+        var baseBuffer = new AudioPcmRingBuffer(capacityFrames: 4, channels: 1);
+        var overlayBuffer = new AudioPcmRingBuffer(capacityFrames: 4, channels: 1);
+        Assert.IsTrue(baseBuffer.TryWrite([1F], out _, out _));
+        Assert.IsTrue(overlayBuffer.TryWrite([1F], out _, out _));
+        var source = new AudioPcmMixingOutputSource(
+            baseBuffer,
+            overlayBuffer,
+            channels: 1,
+            maxFramesPerRead: 1,
+            policyProvider: static () => new AudioPcmMixPolicy(
+                BaseDuckingDb: -6,
+                OverlayGainDb: -12));
+        var output = new float[1];
+
+        Assert.IsTrue(source.TryRead(output, out var frames, out var error), error?.Message);
+
+        Assert.AreEqual(1, frames);
+        Assert.AreEqual(0.752F, output[0], 0.002F);
     }
 
     [TestMethod]

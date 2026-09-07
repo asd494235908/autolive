@@ -47,7 +47,7 @@ public static class WindowsVirtualCameraInstallationProbe
     private static readonly nint InvalidDeviceInfoSet = new(-1);
 
     /// <summary>
-    /// 探测固定双注册表视图、安装根组件和当前存在的目标 PnP 设备。
+    /// 探测固定双注册表视图、正式发布组件和当前存在的目标 PnP 设备。
     /// 显式根目录只用于开发/安装验证；为空时使用注册表所有者提供的根目录。
     /// </summary>
     public static WindowsVirtualCameraInstallationProbeResult Probe(string? installationRoot = null)
@@ -209,9 +209,13 @@ public static class WindowsVirtualCameraInstallationProbe
     {
         var expected = new[]
         {
+            Path.Combine(root, "release-ready.json"),
             Path.Combine(root, "x64", "AkVirtualCamera.dll"),
-            Path.Combine(root, "x86", "AkVirtualCamera.dll"),
+            Path.Combine(root, "x64", "AkVCamAssistant.exe"),
             Path.Combine(root, "x64", "AkVCamManager.exe"),
+            Path.Combine(root, "x86", "AkVirtualCamera.dll"),
+            Path.Combine(root, "bin", "akvirtualcamera-sidecar-x64.exe"),
+            Path.Combine(root, "bin", "vcam_capi.dll"),
         };
 
         foreach (var path in expected)

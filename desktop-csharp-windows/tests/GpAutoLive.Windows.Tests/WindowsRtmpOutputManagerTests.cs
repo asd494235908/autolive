@@ -53,6 +53,17 @@ public sealed class WindowsRtmpOutputManagerTests
     }
 
     [TestMethod]
+    public void Ffmpeg_progress_requires_positive_output_evidence()
+    {
+        Assert.IsFalse(WindowsRtmpOutputManager.IsProgressOutputAdvanced("progress=continue"));
+        Assert.IsFalse(WindowsRtmpOutputManager.IsProgressOutputAdvanced("out_time_ms=0"));
+        Assert.IsFalse(WindowsRtmpOutputManager.IsProgressOutputAdvanced("total_size=0"));
+        Assert.IsTrue(WindowsRtmpOutputManager.IsProgressOutputAdvanced("out_time_ms=123000"));
+        Assert.IsTrue(WindowsRtmpOutputManager.IsProgressOutputAdvanced("total_size=4096"));
+        Assert.IsFalse(WindowsRtmpOutputManager.IsProgressOutputAdvanced("out_time_ms=not-a-number"));
+    }
+
+    [TestMethod]
     public async Task Start_after_dispose_returns_closed_without_validating_plan()
     {
         await using var manager = new WindowsRtmpOutputManager();

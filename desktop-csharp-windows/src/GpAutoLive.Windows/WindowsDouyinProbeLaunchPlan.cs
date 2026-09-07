@@ -6,6 +6,15 @@ using GpAutoLive.Core.Processes;
 namespace GpAutoLive.Windows;
 
 /// <summary>抖音 M1 受管 Python 探针的启动输入；不包含 Cookie、Token 或登录态。</summary>
+public enum WindowsDouyinProbeProtocol
+{
+    /// <summary>兼容当前仓库的一次性 CLI 事件探针。</summary>
+    LegacyEvents,
+    /// <summary>Rust 冻结的 NDJSON v1 sidecar 命令/事件协议。</summary>
+    CanonicalNdjson
+}
+
+/// <summary>抖音 M1 受管 Python 探针的启动输入；不包含 Cookie、Token 或登录态。</summary>
 public sealed record WindowsDouyinProbeLaunchRequest(
     string UpstreamRoot,
     string ProbeScriptPath,
@@ -13,7 +22,8 @@ public sealed record WindowsDouyinProbeLaunchRequest(
     string CondaEnvironment,
     string QrOutputPath,
     DouyinLiveConfig Config,
-    TimeSpan Timeout);
+    TimeSpan Timeout,
+    WindowsDouyinProbeProtocol Protocol = WindowsDouyinProbeProtocol.LegacyEvents);
 
 /// <summary>为 Conda 探针构造的安全外部进程计划。</summary>
 public static class WindowsDouyinProbeLaunchPlanBuilder

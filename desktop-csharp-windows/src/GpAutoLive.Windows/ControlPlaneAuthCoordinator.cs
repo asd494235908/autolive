@@ -13,6 +13,7 @@ namespace GpAutoLive.Windows;
 public sealed class ControlPlaneAuthCoordinator : IDisposable
 {
     public const string RefreshTokenCredentialName = "control-plane-refresh-token";
+    public const string PendingLogoutCredentialName = "control-plane-pending-logout-token";
 
     private readonly ControlPlaneHttpClient _client;
     private readonly ISecretStore _secretStore;
@@ -21,6 +22,7 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
     private readonly SemaphoreSlim _serial = new(1, 1);
     private readonly IDisposable? _ownedClient;
     private readonly IControlPlaneClock _clock;
+    private readonly PendingLogoutTokenStore _pendingLogoutTokens;
     private AuthTokenSet? _tokens;
     private bool _disposed;
 
@@ -41,11 +43,75 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
 
         _ownedClient = ownedClient;
         _clock = clock ?? SystemControlPlaneClock.Instance;
+        _pendingLogoutTokens = new PendingLogoutTokenStore(_secretStore);
     }
 
     public AuthSessionSnapshot Snapshot => _session.Snapshot;
 
     public DeviceRegistrationDto DeviceRegistration => _deviceRegistration;
+
+    /// <summary>重试一条上次未获远端确认的退出撤销；失败时保留凭据供下次启动再试。</summary>
+    public async Task<string?> RetryPendingLogoutAsync(CancellationToken cancellationToken = default)
+    {
+        var entered = false;
+        try
+        {
+            await _serial.WaitAsync(cancellationToken).ConfigureAwait(false);
+            entered = true;
+            ThrowIfDisposed();
+            if (!_pendingLogoutTokens.TryGetFirst(out var credentialName, out var refreshToken))
+            {
+                return null;
+            }
+
+            var result = await _client.LogoutAsync(
+                new LogoutRequestDto(refreshToken),
+                cancellationToken).ConfigureAwait(false);
+            if (!result.IsSuccess || result.Value?.Success != true)
+            {
+                return "上次退出的远端会话仍未撤销；已保留安全凭据，稍后会再次重试。";
+            }
+
+            _pendingLogoutTokens.Remove(credentialName);
+            return null;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return "上次退出的远端会话撤销重试未完成；不会恢复该本地会话。";
+        }
+        finally
+        {
+            if (entered)
+            {
+                _serial.Release();
+            }
+        }
+    }
+
+    /// <summary>按本地时钟收回已到期授权，供心跳循环在每轮网络请求前执行。</summary>
+    public async Task<AuthTransition?> ExpireActivationIfNeededAsync(CancellationToken cancellationToken = default)
+    {
+        var entered = false;
+        try
+        {
+            await _serial.WaitAsync(cancellationToken).ConfigureAwait(false);
+            entered = true;
+            ThrowIfDisposed();
+            var transition = _session.ExpireActivationIfNeeded(CreateOperationKey(), _clock.UtcNow);
+            return transition;
+        }
+        finally
+        {
+            if (entered)
+            {
+                _serial.Release();
+            }
+        }
+    }
 
     public async Task<AuthTransition> LoginAsync(
         string username,
@@ -136,45 +202,7 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
             entered = true;
             ThrowIfDisposed();
             operationKey = CreateOperationKey();
-            var begin = _session.BeginRefresh(operationKey, _clock.UtcNow);
-            if (begin.Kind != AuthTransitionKind.Accepted)
-            {
-                return begin;
-            }
-
-            if (_tokens is null)
-            {
-                return FinalizeFailure(_session.FailRefresh(
-                    operationKey,
-                    ToContractError(null, "当前进程没有可用的刷新凭据"),
-                    _clock.UtcNow));
-            }
-
-            var result = await _client.RefreshAsync(
-                new RefreshTokenRequestDto(_tokens.RefreshToken),
-                cancellationToken).ConfigureAwait(false);
-            if (!result.IsSuccess || result.Value is null)
-            {
-                return FinalizeFailure(_session.FailRefresh(
-                    operationKey,
-                    ToContractError(result.Error, "刷新会话失败"),
-                    _clock.UtcNow));
-            }
-
-            if (!AuthTokenSet.TryCreate(result.Value.Tokens, _clock.UtcNow, out var tokens, out var tokenError))
-            {
-                return FinalizeFailure(_session.FailRefresh(operationKey, tokenError!, _clock.UtcNow));
-            }
-
-            var completed = _session.CompleteRefresh(operationKey, tokens!, _clock.UtcNow);
-            if (completed.Kind != AuthTransitionKind.Completed)
-            {
-                return FinalizeFailure(completed);
-            }
-
-            _tokens = tokens;
-            ApplyCredentialAction(completed.CredentialAction);
-            return await ActivateCoreAsync(cancellationToken).ConfigureAwait(false);
+            return await RefreshCoreAsync(operationKey, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -338,28 +366,11 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
             entered = true;
             ThrowIfDisposed();
             operationKey ??= CreateOperationKey();
-            var begin = _session.BeginHeartbeat(operationKey, request, _clock.UtcNow);
-            if (begin.Kind != AuthTransitionKind.Accepted)
-            {
-                return begin;
-            }
-
-            if (_tokens is null)
-            {
-                return _session.FailHeartbeat(
-                    operationKey,
-                    ToContractError(null, "当前进程没有可用的访问凭据"),
-                    _clock.UtcNow);
-            }
-
-            var result = await _client.HeartbeatAsync(
-                _tokens.AccessToken,
+            return await HeartbeatCoreAsync(
                 request,
                 operationKey,
+                retryAfterUnauthorized: true,
                 cancellationToken).ConfigureAwait(false);
-            return result.IsSuccess && result.Value is not null
-                ? _session.CompleteHeartbeat(operationKey, result.Value.DeviceStatus, _clock.UtcNow)
-                : _session.FailHeartbeat(operationKey, ToContractError(result.Error, "心跳失败"), _clock.UtcNow);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -367,6 +378,15 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
                 ? CreateRejected(AuthOperationKind.Heartbeat, "心跳已取消", 499, "CONTROL_PLANE_CANCELLED")
                 : _session.CancelPendingOperation()
                     ?? CreateRejected(AuthOperationKind.Heartbeat, "心跳已取消", 499, "CONTROL_PLANE_CANCELLED");
+        }
+        catch (Exception exception) when (IsCredentialStoreFailure(exception))
+        {
+            return HandleUnexpectedFailure(
+                AuthOperationKind.Heartbeat,
+                operationKey,
+                "心跳刷新未完成，安全凭据存储不可用。",
+                "AUTH_CREDENTIAL_STORAGE_UNAVAILABLE",
+                clearPersistedCredential: true);
         }
         catch (Exception)
         {
@@ -385,6 +405,8 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
     {
         var entered = false;
         string? operationKey = null;
+        string? refreshTokenToRevoke = null;
+        var remoteConfirmed = false;
         try
         {
             await _serial.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -397,19 +419,23 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
                 return begin;
             }
 
-            var remoteConfirmed = false;
-            if (_tokens is not null)
+            refreshTokenToRevoke = _tokens?.RefreshToken;
+            remoteConfirmed = refreshTokenToRevoke is null;
+            if (refreshTokenToRevoke is not null)
             {
                 var result = await _client.LogoutAsync(
-                    new LogoutRequestDto(_tokens.RefreshToken),
+                    new LogoutRequestDto(refreshTokenToRevoke),
                     cancellationToken).ConfigureAwait(false);
                 remoteConfirmed = result.IsSuccess && result.Value?.Success == true;
             }
 
             var completed = _session.CompleteLogout(operationKey, remoteConfirmed, _clock.UtcNow);
+            var warning = !remoteConfirmed && refreshTokenToRevoke is not null
+                ? QueuePendingLogout(refreshTokenToRevoke)
+                : null;
             _tokens = null;
             ApplyCredentialAction(completed.CredentialAction);
-            return completed;
+            return completed with { Warning = warning };
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -420,15 +446,23 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
         }
         catch (Exception)
         {
+            var warning = remoteConfirmed || refreshTokenToRevoke is null
+                ? null
+                : QueuePendingLogout(refreshTokenToRevoke);
             var localLogout = operationKey is null
                 ? null
                 : _session.CompleteLogout(operationKey, remoteConfirmed: false, now: _clock.UtcNow);
             _tokens = null;
             TryDeletePersistedRefreshToken();
-            var error = new ControlPlaneErrorDto(
-                "CONTROL_PLANE_CLIENT_FAILURE",
-                "远端退出未确认，本地会话已安全清理。",
-                500);
+            var error = remoteConfirmed
+                ? new ControlPlaneErrorDto(
+                    "AUTH_CREDENTIAL_STORAGE_UNAVAILABLE",
+                    "远端退出已确认，但本地凭据清理未完成；下次恢复会由服务端再次拒绝该会话。",
+                    500)
+                : new ControlPlaneErrorDto(
+                    "CONTROL_PLANE_CLIENT_FAILURE",
+                    "远端退出未确认，本地会话已安全清理。",
+                    500);
             return new AuthTransition(
                 AuthTransitionKind.Rejected,
                 AuthOperationKind.Logout,
@@ -436,7 +470,8 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
                 localLogout?.Snapshot ?? _session.Snapshot,
                 error)
             {
-                RemoteLogoutConfirmed = false
+                RemoteLogoutConfirmed = remoteConfirmed,
+                Warning = warning
             };
         }
         finally
@@ -492,6 +527,115 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
         return transition;
     }
 
+    private async Task<AuthTransition> RefreshCoreAsync(
+        string operationKey,
+        CancellationToken cancellationToken)
+    {
+        var begin = _session.BeginRefresh(operationKey, _clock.UtcNow);
+        if (begin.Kind != AuthTransitionKind.Accepted)
+        {
+            return begin;
+        }
+
+        if (_tokens is null)
+        {
+            return FinalizeFailure(_session.FailRefresh(
+                operationKey,
+                ToContractError(null, "当前进程没有可用的刷新凭据"),
+                _clock.UtcNow));
+        }
+
+        var result = await _client.RefreshAsync(
+            new RefreshTokenRequestDto(_tokens.RefreshToken),
+            cancellationToken).ConfigureAwait(false);
+        if (!result.IsSuccess || result.Value is null)
+        {
+            return FinalizeFailure(_session.FailRefresh(
+                operationKey,
+                ToContractError(result.Error, "刷新会话失败"),
+                _clock.UtcNow));
+        }
+
+        if (!AuthTokenSet.TryCreate(result.Value.Tokens, _clock.UtcNow, out var tokens, out var tokenError))
+        {
+            return FinalizeFailure(_session.FailRefresh(operationKey, tokenError!, _clock.UtcNow));
+        }
+
+        var completed = _session.CompleteRefresh(operationKey, tokens!, _clock.UtcNow);
+        if (completed.Kind != AuthTransitionKind.Completed)
+        {
+            return FinalizeFailure(completed);
+        }
+
+        _tokens = tokens;
+        ApplyCredentialAction(completed.CredentialAction);
+        return await ActivateCoreAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<AuthTransition> HeartbeatCoreAsync(
+        HeartbeatRequestDto request,
+        string operationKey,
+        bool retryAfterUnauthorized,
+        CancellationToken cancellationToken)
+    {
+        var begin = _session.BeginHeartbeat(operationKey, request, _clock.UtcNow);
+        if (begin.Kind != AuthTransitionKind.Accepted)
+        {
+            return begin;
+        }
+
+        if (_tokens is null)
+        {
+            return _session.FailHeartbeat(
+                operationKey,
+                ToContractError(null, "当前进程没有可用的访问凭据"),
+                _clock.UtcNow);
+        }
+
+        var result = await _client.HeartbeatAsync(
+            _tokens.AccessToken,
+            request,
+            operationKey,
+            cancellationToken).ConfigureAwait(false);
+        if (IsUnauthenticated(result.Error))
+        {
+            if (retryAfterUnauthorized)
+            {
+                _session.CancelPendingOperation();
+                var refresh = await RefreshCoreAsync(CreateOperationKey(), cancellationToken).ConfigureAwait(false);
+                if (!refresh.IsSuccess || !refresh.Snapshot.CanEnterWorkbench)
+                {
+                    return refresh;
+                }
+
+                return await HeartbeatCoreAsync(
+                    request,
+                    CreateOperationKey(),
+                    retryAfterUnauthorized: false,
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            return _session.FailHeartbeat(
+                operationKey,
+                ToContractError(result.Error, "心跳认证失败"),
+                _clock.UtcNow);
+        }
+
+        var transition = result.IsSuccess && result.Value is not null
+            ? _session.CompleteHeartbeat(operationKey, result.Value.DeviceStatus, _clock.UtcNow)
+            : _session.FailHeartbeat(operationKey, ToContractError(result.Error, "心跳失败"), _clock.UtcNow);
+        if (!transition.Snapshot.IsAuthenticated)
+        {
+            ClearLocalTokensAfterAuthorizationFailure();
+        }
+
+        return transition;
+    }
+
+    private static bool IsUnauthenticated(ControlPlaneHttpError? error) =>
+        error?.Status == 401
+        || string.Equals(error?.Code, AuthErrorCodes.Unauthenticated, StringComparison.Ordinal);
+
     private void ApplyCredentialAction(CredentialAction? action)
     {
         if (action is null)
@@ -540,7 +684,11 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
         bool clearPersistedCredential = false)
     {
         var cancelled = _session.CancelPendingOperation();
-        _tokens = null;
+        var snapshot = cancelled?.Snapshot ?? _session.Snapshot;
+        if (clearPersistedCredential || !snapshot.IsAuthenticated)
+        {
+            _tokens = null;
+        }
         if (clearPersistedCredential)
         {
             TryDeletePersistedRefreshToken();
@@ -551,7 +699,7 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
             AuthTransitionKind.Rejected,
             operation,
             operationKey ?? CreateOperationKey(),
-            cancelled?.Snapshot ?? _session.Snapshot,
+            snapshot,
             error);
     }
 
@@ -611,6 +759,20 @@ public sealed class ControlPlaneAuthCoordinator : IDisposable
         catch (Exception)
         {
             // 读取到的凭据已经 fail-closed；删除失败不把秘密带入错误正文或日志。
+        }
+    }
+
+    private string QueuePendingLogout(string refreshToken)
+    {
+        try
+        {
+            return _pendingLogoutTokens.Enqueue(refreshToken)
+                ? "远端退出未确认；本地会话已清理，并会在下次启动时重试撤销。"
+                : "远端退出未确认；本地会话已清理，但待撤销凭据队列已满。";
+        }
+        catch (Exception)
+        {
+            return "远端退出未确认；本地会话已清理，但待撤销凭据未能写入安全存储。";
         }
     }
 

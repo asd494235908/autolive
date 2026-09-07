@@ -283,6 +283,195 @@ public sealed class VideoPlaybackAudioFallbackTests
     }
 
     [TestMethod]
+    public void Video_audio_processing_toggle_rebuilds_audio_without_restarting_video()
+    {
+        var fixture = Environment.GetEnvironmentVariable("AUTOLIVE_TEST_MPV_MEDIA")
+            ?? @"E:\下载\csharp-golden-av.mp4";
+        var runtime = Environment.GetEnvironmentVariable("AUTOLIVE_MEDIA_RUNTIME_ROOT")
+            ?? FindRuntimeFromRepository();
+        fixture = Path.GetFullPath(fixture);
+        runtime = Path.GetFullPath(runtime);
+        var ffmpeg = Environment.GetEnvironmentVariable("AUTOLIVE_TEST_FFMPEG");
+        var portAudio = Environment.GetEnvironmentVariable("AUTOLIVE_TEST_PORTAUDIO_DLL");
+        if (!OperatingSystem.IsWindows()
+            || !File.Exists(fixture)
+            || !File.Exists(Path.Combine(runtime, "runtime", "media", "1.0.0", "manifest.json"))
+            || string.IsNullOrWhiteSpace(ffmpeg)
+            || !File.Exists(ffmpeg)
+            || string.IsNullOrWhiteSpace(portAudio)
+            || !File.Exists(portAudio))
+        {
+            Assert.Inconclusive("需要 Windows、真实媒体、已校验 C# 运行时、FFmpeg 和 PortAudio 夹具。");
+        }
+
+        var previousRuntime = Environment.GetEnvironmentVariable("AUTOLIVE_MEDIA_RUNTIME_ROOT");
+        Environment.SetEnvironmentVariable("AUTOLIVE_MEDIA_RUNTIME_ROOT", runtime);
+        try
+        {
+            WpfTestApplicationHost.Run(() =>
+            {
+                MainWindow? window = null;
+                try
+                {
+                    window = new MainWindow();
+                    window.Show();
+                    PumpDispatcherUntilLoaded();
+                    GetPrivateField<LoginViewModel>(window, "_login")
+                        .ApplyActivated("fixture-account");
+
+                    var mediaPool = GetPrivateField<MediaPoolService>(window, "_mediaPool");
+                    var state = GetPrivateField<ShellState>(window, "_state");
+                    var source = CreateSyntheticVideoSource(fixture) with { DurationMs = 10_000 };
+                    var committed = mediaPool.ReplaceAll([source]);
+                    Assert.IsTrue(committed.IsSuccess, committed.Error?.Message);
+                    state.ApplyMediaSnapshot(committed.Snapshot);
+                    InvokePrivate(window, "UpdateMediaProjection");
+
+                    var startTask = InvokePrivate(window, "TogglePlaybackCoreAsync") as Task
+                        ?? throw new InvalidOperationException("视频播放入口未返回异步任务。");
+                    PumpUntilCompleted(startTask);
+                    startTask.GetAwaiter().GetResult();
+
+                    var mpv = GetPrivateField<WindowsMpvPlaybackController>(window, "_mpvController");
+                    var audio = GetPrivateField<WindowsAudioPlaybackController>(window, "_audioPlaybackController");
+                    var initialIdentity = mpv.Snapshot.ActiveIdentity;
+                    var initialDecoderPid = audio.Snapshot.Decoder?.ProcessId;
+                    Assert.IsNotNull(initialIdentity, "视频会话没有建立活动身份。");
+                    Assert.IsNotNull(initialDecoderPid, "视频声音会话没有建立 FFmpeg 解码器。");
+                    Assert.IsTrue(
+                        PumpUntil(
+                            () => state.AudioEffectCycleProgress > 0,
+                            TimeSpan.FromSeconds(2)),
+                        "带音轨视频已经建立最终 PCM，但声音周期观察器没有推进变换进度。");
+
+                    state.AudioProcessing = false;
+                    if (!PumpUntil(
+                            () => audio.Snapshot.Decoder?.ProcessId is int processId
+                                && processId != initialDecoderPid
+                                && state.StatusMessage.Contains("原始 PCM", StringComparison.Ordinal),
+                            TimeSpan.FromSeconds(8)))
+                    {
+                        throw new InvalidOperationException(
+                            $"关闭声音处理后未重建声音会话：状态={state.StatusMessage}，"
+                            + $"解码器={audio.Snapshot.Decoder?.ProcessId}，音频状态={audio.Snapshot.State}。");
+                    }
+
+                    Assert.AreEqual(PlaybackState.Playing, mediaPool.Snapshot.PlaybackState);
+                    Assert.AreEqual(initialIdentity, mpv.Snapshot.ActiveIdentity);
+                    Assert.AreEqual(WindowsMpvPlaybackControllerState.Playing, mpv.Snapshot.State);
+                }
+                finally
+                {
+                    try
+                    {
+                        StopPlaybackForTest(window);
+                    }
+                    finally
+                    {
+                        window?.Close();
+                    }
+                }
+            });
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("AUTOLIVE_MEDIA_RUNTIME_ROOT", previousRuntime);
+        }
+    }
+
+    [TestMethod]
+    public void Pure_audio_processing_toggle_rebuilds_the_same_audio_output_path()
+    {
+        var fixture = Environment.GetEnvironmentVariable("AUTOLIVE_TEST_MPV_MEDIA")
+            ?? @"E:\下载\csharp-golden-av.mp4";
+        var runtime = Environment.GetEnvironmentVariable("AUTOLIVE_MEDIA_RUNTIME_ROOT")
+            ?? FindRuntimeFromRepository();
+        fixture = Path.GetFullPath(fixture);
+        runtime = Path.GetFullPath(runtime);
+        var ffmpeg = Environment.GetEnvironmentVariable("AUTOLIVE_TEST_FFMPEG");
+        var portAudio = Environment.GetEnvironmentVariable("AUTOLIVE_TEST_PORTAUDIO_DLL");
+        if (!OperatingSystem.IsWindows()
+            || !File.Exists(fixture)
+            || !File.Exists(Path.Combine(runtime, "runtime", "media", "1.0.0", "manifest.json"))
+            || string.IsNullOrWhiteSpace(ffmpeg)
+            || !File.Exists(ffmpeg)
+            || string.IsNullOrWhiteSpace(portAudio)
+            || !File.Exists(portAudio))
+        {
+            Assert.Inconclusive("需要 Windows、真实媒体、已校验 C# 运行时、FFmpeg 和 PortAudio 夹具。");
+        }
+
+        var audioFixture = Path.Combine(Path.GetTempPath(), $"gpautolive-audio-toggle-{Guid.NewGuid():N}.wav");
+        GenerateAudioFixture(ffmpeg!, audioFixture);
+        var previousRuntime = Environment.GetEnvironmentVariable("AUTOLIVE_MEDIA_RUNTIME_ROOT");
+        Environment.SetEnvironmentVariable("AUTOLIVE_MEDIA_RUNTIME_ROOT", runtime);
+        try
+        {
+            WpfTestApplicationHost.Run(() =>
+            {
+                MainWindow? window = null;
+                try
+                {
+                    window = new MainWindow();
+                    window.Show();
+                    PumpDispatcherUntilLoaded();
+                    GetPrivateField<LoginViewModel>(window, "_login")
+                        .ApplyActivated("fixture-account");
+
+                    var mediaPool = GetPrivateField<MediaPoolService>(window, "_mediaPool");
+                    var state = GetPrivateField<ShellState>(window, "_state");
+                    var source = CreateSyntheticAudioSource(audioFixture);
+                    var committed = mediaPool.ReplaceAll([source]);
+                    Assert.IsTrue(committed.IsSuccess, committed.Error?.Message);
+                    state.ApplyMediaSnapshot(committed.Snapshot);
+                    InvokePrivate(window, "UpdateMediaProjection");
+
+                    var startTask = InvokePrivate(window, "TogglePlaybackCoreAsync") as Task
+                        ?? throw new InvalidOperationException("纯音频播放入口未返回异步任务。");
+                    PumpUntilCompleted(startTask);
+                    startTask.GetAwaiter().GetResult();
+
+                    var audio = GetPrivateField<WindowsAudioPlaybackController>(window, "_audioPlaybackController");
+                    var initialDecoderPid = audio.Snapshot.Decoder?.ProcessId;
+                    Assert.IsNotNull(initialDecoderPid, "纯音频会话没有建立 FFmpeg 解码器。");
+
+                    state.AudioProcessing = false;
+                    if (!PumpUntil(
+                            () => audio.Snapshot.Decoder?.ProcessId is int processId
+                                && processId != initialDecoderPid
+                                && state.StatusMessage.Contains("原始 PCM", StringComparison.Ordinal),
+                            TimeSpan.FromSeconds(8)))
+                    {
+                        throw new InvalidOperationException(
+                            $"关闭声音处理后未重建纯音频会话：状态={state.StatusMessage}，"
+                            + $"解码器={audio.Snapshot.Decoder?.ProcessId}，音频状态={audio.Snapshot.State}。");
+                    }
+
+                    Assert.AreEqual(PlaybackState.Playing, mediaPool.Snapshot.PlaybackState);
+                    Assert.AreEqual(WindowsAudioPlaybackState.Playing, audio.Snapshot.State);
+                    Assert.IsTrue(audio.Snapshot.Output?.OutputFramesWritten > 0);
+                }
+                finally
+                {
+                    try
+                    {
+                        StopPlaybackForTest(window);
+                    }
+                    finally
+                    {
+                        window?.Close();
+                    }
+                }
+            });
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("AUTOLIVE_MEDIA_RUNTIME_ROOT", previousRuntime);
+            File.Delete(audioFixture);
+        }
+    }
+
+    [TestMethod]
     public void Main_window_imports_fixture_and_starts_video()
     {
         var fixture = Environment.GetEnvironmentVariable("AUTOLIVE_TEST_MPV_MEDIA")
@@ -309,6 +498,7 @@ public sealed class VideoPlaybackAudioFallbackTests
                 {
                     window = new MainWindow();
                     window.Show();
+                    PumpDispatcherUntilLoaded();
                     GetPrivateField<LoginViewModel>(window, "_login")
                         .ApplyActivated("fixture-account");
 
@@ -327,8 +517,11 @@ public sealed class VideoPlaybackAudioFallbackTests
                     if (mediaPool.Snapshot.SourceMediaPool.Length != 1
                         || mediaPool.Snapshot.PlaybackState is not PlaybackState.Ready)
                     {
+                        var actualShellState = GetPrivateField<ShellState>(window, "_state");
+                        var mediaStatus = GetPrivateField<TextBlock>(window, "MediaStatusText");
                         throw new InvalidOperationException(
-                            $"主窗口导入后播放池状态不正确：{mediaPool.Snapshot.SourceMediaPool.Length} 项，状态 {mediaPool.Snapshot.PlaybackState}。");
+                            $"主窗口导入后播放池状态不正确：{mediaPool.Snapshot.SourceMediaPool.Length} 项，状态 {mediaPool.Snapshot.PlaybackState}，"
+                            + $"主状态={actualShellState.StatusMessage}，运行时={mediaStatus.Text}。");
                     }
 
                     var mediaList = GetPrivateField<ListBox>(window, "MediaListBox");
@@ -427,6 +620,10 @@ public sealed class VideoPlaybackAudioFallbackTests
                             $"主窗口导入后播放池状态不正确：{mediaPool.Snapshot.SourceMediaPool.Length} 项，状态 {mediaPool.Snapshot.PlaybackState}。");
                     }
 
+                    var firstDurationMs = mediaPool.Snapshot.SourceMediaPool[0].DurationMs ?? 20_000;
+                    var eofTimeout = TimeSpan.FromMilliseconds(
+                        Math.Clamp((double)firstDurationMs + 10_000, 20_000, 120_000));
+
                     var startTask = InvokePrivate(window, "TogglePlaybackCoreAsync") as Task
                         ?? throw new InvalidOperationException("主窗口播放入口未返回异步任务。");
                     PumpUntilCompleted(startTask);
@@ -442,10 +639,11 @@ public sealed class VideoPlaybackAudioFallbackTests
                                     && poolSnapshot.PlaybackState is PlaybackState.Playing
                                     && state.StatusMessage.Contains("已自动切换到第 2 项", StringComparison.Ordinal);
                             },
-                            TimeSpan.FromSeconds(20)))
+                            eofTimeout))
                     {
                         throw new InvalidOperationException(
                             $"第一项 EOF 后未完成真实换源，当前索引 {mediaPool.Snapshot.SourceMediaIndex}，"
+                            + $"首项时长={firstDurationMs}ms，等待预算={eofTimeout.TotalSeconds:0.#}s，"
                             + $"池状态 {mediaPool.Snapshot.PlaybackState}，主窗口状态 {state.StatusMessage}，"
                             + $"mpv={mpv.Snapshot.State}/{mpv.Snapshot.Runtime.State}/{mpv.Snapshot.Runtime.IpcState}，"
                             + $"身份={mpv.Snapshot.ActiveIdentity}，声音={GetPrivateField<TextBlock>(window, "AudioDeviceStatusText").Text}。");
@@ -563,6 +761,15 @@ public sealed class VideoPlaybackAudioFallbackTests
         return true;
     }
 
+    private static void PumpDispatcherUntilLoaded()
+    {
+        var frame = new DispatcherFrame();
+        Dispatcher.CurrentDispatcher.BeginInvoke(
+            DispatcherPriority.ApplicationIdle,
+            new Action(() => frame.Continue = false));
+        Dispatcher.PushFrame(frame);
+    }
+
     private static string FindRuntimeFromRepository()
     {
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
@@ -601,4 +808,49 @@ public sealed class VideoPlaybackAudioFallbackTests
         "aac",
         null,
         "disabled");
+
+    private static SourceMediaDto CreateSyntheticAudioSource(string path) => new(
+        path,
+        path,
+        MediaKind.Audio,
+        MediaCompatibilityMode.Direct,
+        Path.GetFileName(path),
+        (ulong)new FileInfo(path).Length,
+        2_500,
+        null,
+        null,
+        null,
+        null,
+        null,
+        48_000,
+        1,
+        null,
+        "pcm_s16le",
+        null,
+        "disabled");
+
+    private static void GenerateAudioFixture(string ffmpeg, string path)
+    {
+        using var generator = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = ffmpeg,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            },
+        };
+        generator.StartInfo.ArgumentList.Add("-hide_banner");
+        generator.StartInfo.ArgumentList.Add("-loglevel");
+        generator.StartInfo.ArgumentList.Add("error");
+        generator.StartInfo.ArgumentList.Add("-f");
+        generator.StartInfo.ArgumentList.Add("lavfi");
+        generator.StartInfo.ArgumentList.Add("-i");
+        generator.StartInfo.ArgumentList.Add("sine=frequency=440:sample_rate=48000:duration=8");
+        generator.StartInfo.ArgumentList.Add("-y");
+        generator.StartInfo.ArgumentList.Add(path);
+        Assert.IsTrue(generator.Start());
+        generator.WaitForExit();
+        Assert.AreEqual(0, generator.ExitCode);
+    }
 }

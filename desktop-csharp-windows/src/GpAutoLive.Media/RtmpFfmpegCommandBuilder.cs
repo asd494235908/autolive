@@ -113,6 +113,10 @@ public static class RtmpFfmpegCommandBuilder
         arguments.Add("-hide_banner");
         arguments.Add("-loglevel");
         arguments.Add("error");
+        // 进度协议与错误共用受管 stderr，供宿主确认输出确实前进；
+        // 不把原始 stderr 或目标地址传播到状态层。
+        arguments.Add("-progress");
+        arguments.Add("pipe:2");
         // audio_enabled 时 stdin 是最终 PCM 输入，不能再关闭标准输入。
         if (!config.AudioEnabled)
         {

@@ -60,6 +60,27 @@ public sealed class RtmpFfmpegCommandBuilderTests
     }
 
     [TestMethod]
+    public void Rtmp_plan_enables_bounded_ffmpeg_progress_on_stderr()
+    {
+        using var fixture = MediaFixture.Create("sample.mp4");
+
+        var created = RtmpFfmpegCommandBuilder.TryCreate(
+            RtmpOutputConfig.Default with { TargetUrl = "rtmp://127.0.0.1/live/stream" },
+            fixture.Source,
+            @"C:\media\ffmpeg.exe",
+            preferredEncoder: "h264_amf",
+            sourceIdentity: null,
+            out var plan,
+            out var error);
+
+        Assert.IsTrue(created, error?.Message);
+        Assert.IsNotNull(plan);
+        var progressIndex = plan!.ProcessPlan.Arguments.IndexOf("-progress");
+        Assert.IsTrue(progressIndex >= 0);
+        Assert.AreEqual("pipe:2", plan.ProcessPlan.Arguments[progressIndex + 1]);
+    }
+
+    [TestMethod]
     public void Video_and_audio_plan_uses_direct_source_and_final_pcm_pipe()
     {
         using var fixture = MediaFixture.Create("sample.mp4");

@@ -7,107 +7,108 @@ public sealed class WindowsMediaOutputOwnershipTests
     public void First_lease_wins_second_is_rejected_and_release_allows_retry()
     {
         var mutexName = $"Local\\GpAutoLive.Tests.{Guid.NewGuid():N}";
-        var first = WindowsMediaOutputOwnershipLease.TryAcquire(
-            mutexName,
-            referenceClientProbe: static () => false);
+        var first = WindowsMediaOutputOwnershipLease.TryAcquire(mutexName);
 
         Assert.IsTrue(first.IsSuccess, first.Code.ToString());
         Assert.IsNotNull(first.Lease);
         using var firstLease = first.Lease!;
 
-        var second = WindowsMediaOutputOwnershipLease.TryAcquire(
-            mutexName,
-            referenceClientProbe: static () => false);
+        var second = WindowsMediaOutputOwnershipLease.TryAcquire(mutexName);
         Assert.AreEqual(WindowsMediaOutputOwnershipCode.AlreadyOwned, second.Code);
         Assert.IsNull(second.Lease);
 
         firstLease.Dispose();
-        var retry = WindowsMediaOutputOwnershipLease.TryAcquire(
-            mutexName,
-            referenceClientProbe: static () => false);
+        var retry = WindowsMediaOutputOwnershipLease.TryAcquire(mutexName);
         Assert.IsTrue(retry.IsSuccess, retry.Code.ToString());
         retry.Lease!.Dispose();
     }
 
     [TestMethod]
-    public void Reference_client_probe_blocks_before_mutex_creation()
-    {
-        var mutexName = $"Local\\GpAutoLive.Tests.{Guid.NewGuid():N}";
-        var result = WindowsMediaOutputOwnershipLease.TryAcquire(
-            mutexName,
-            referenceClientProbe: static () => true);
-
-        Assert.AreEqual(WindowsMediaOutputOwnershipCode.ReferenceClientRunning, result.Code);
-        Assert.IsNull(result.Lease);
-    }
-
-    [TestMethod]
     public void Invalid_mutex_name_fails_closed()
     {
-        var result = WindowsMediaOutputOwnershipLease.TryAcquire(
-            "GpAutoLive.Tests.Invalid",
-            referenceClientProbe: static () => false);
+        var result = WindowsMediaOutputOwnershipLease.TryAcquire("GpAutoLive.Tests.Invalid");
 
         Assert.AreEqual(WindowsMediaOutputOwnershipCode.InvalidMutexName, result.Code);
         Assert.IsNull(result.Lease);
     }
 
     [TestMethod]
-    public void Probe_failure_fails_closed()
+    public void Kernel_mutex_contention_is_rejected_and_release_allows_retry()
     {
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Inconclusive("命名 Mutex 门禁仅在 Windows 上验证。");
+        }
+
         var mutexName = $"Local\\GpAutoLive.Tests.{Guid.NewGuid():N}";
-        var result = WindowsMediaOutputOwnershipLease.TryAcquire(
-            mutexName,
-            referenceClientProbe: static () => throw new InvalidOperationException());
-
-        Assert.AreEqual(WindowsMediaOutputOwnershipCode.ReferenceClientProbeFailed, result.Code);
-        Assert.IsNull(result.Lease);
-    }
-
-    [TestMethod]
-    public void Reference_client_appearing_after_mutex_acquisition_is_rejected_and_mutex_is_released()
-    {
-        var mutexName = $"Local\\GpAutoLive.Tests.{Guid.NewGuid():N}";
-        var probeCount = 0;
-        var result = WindowsMediaOutputOwnershipLease.TryAcquire(
-            mutexName,
-            referenceClientProbe: () => Interlocked.Increment(ref probeCount) == 2);
-
-        Assert.AreEqual(WindowsMediaOutputOwnershipCode.ReferenceClientRunning, result.Code);
-        Assert.IsNull(result.Lease);
-        Assert.AreEqual(2, probeCount);
-
-        var retry = WindowsMediaOutputOwnershipLease.TryAcquire(
-            mutexName,
-            referenceClientProbe: static () => false);
-        Assert.IsTrue(retry.IsSuccess, retry.Code.ToString());
-        retry.Lease!.Dispose();
-    }
-
-    [TestMethod]
-    public void Probe_failure_after_mutex_acquisition_releases_mutex()
-    {
-        var mutexName = $"Local\\GpAutoLive.Tests.{Guid.NewGuid():N}";
-        var probeCount = 0;
-        var result = WindowsMediaOutputOwnershipLease.TryAcquire(
-            mutexName,
-            referenceClientProbe: () =>
+        using var ready = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        Exception? ownerFailure = null;
+        var ownerThread = new Thread(() =>
+        {
+            try
             {
-                if (Interlocked.Increment(ref probeCount) == 2)
-                {
-                    throw new InvalidOperationException();
-                }
+                using var mutex = new Mutex(initiallyOwned: false, mutexName);
+                Assert.IsTrue(mutex.WaitOne(TimeSpan.FromSeconds(5)));
+                ready.Set();
+                release.Wait(TimeSpan.FromSeconds(5));
+                mutex.ReleaseMutex();
+            }
+            catch (Exception exception)
+            {
+                ownerFailure = exception;
+                ready.Set();
+            }
+        });
 
-                return false;
-            });
+        ownerThread.Start();
+        try
+        {
+            Assert.IsTrue(ready.Wait(TimeSpan.FromSeconds(5)), "内核 Mutex 持有线程未就绪。");
+            Assert.IsNull(ownerFailure, ownerFailure?.ToString());
 
-        Assert.AreEqual(WindowsMediaOutputOwnershipCode.ReferenceClientProbeFailed, result.Code);
-        Assert.IsNull(result.Lease);
+            var blocked = WindowsMediaOutputOwnershipLease.TryAcquire(
+                mutexName);
+            Assert.AreEqual(WindowsMediaOutputOwnershipCode.AlreadyOwned, blocked.Code);
+            Assert.IsNull(blocked.Lease);
+        }
+        finally
+        {
+            release.Set();
+            Assert.IsTrue(ownerThread.Join(TimeSpan.FromSeconds(5)), "内核 Mutex 持有线程未退出。");
+        }
 
+        Assert.IsNull(ownerFailure, ownerFailure?.ToString());
         var retry = WindowsMediaOutputOwnershipLease.TryAcquire(
-            mutexName,
-            referenceClientProbe: static () => false);
+            mutexName);
         Assert.IsTrue(retry.IsSuccess, retry.Code.ToString());
         retry.Lease!.Dispose();
+    }
+
+    [TestMethod]
+    public void Abandoned_kernel_mutex_is_taken_over_and_released_cleanly()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Inconclusive("命名 Mutex 门禁仅在 Windows 上验证。");
+        }
+
+        var mutexName = $"Local\\GpAutoLive.Tests.{Guid.NewGuid():N}";
+        using var ready = new ManualResetEventSlim();
+        var ownerThread = new Thread(() =>
+        {
+            using var mutex = new Mutex(initiallyOwned: false, mutexName);
+            Assert.IsTrue(mutex.WaitOne(TimeSpan.FromSeconds(5)));
+            ready.Set();
+        });
+
+        ownerThread.Start();
+        Assert.IsTrue(ready.Wait(TimeSpan.FromSeconds(5)), "异常退出模拟线程未取得 Mutex。");
+        Assert.IsTrue(ownerThread.Join(TimeSpan.FromSeconds(5)), "异常退出模拟线程未退出。");
+
+        var result = WindowsMediaOutputOwnershipLease.TryAcquire(
+            mutexName);
+        Assert.IsTrue(result.IsSuccess, result.Code.ToString());
+        result.Lease!.Dispose();
     }
 }

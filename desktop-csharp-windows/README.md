@@ -6,6 +6,8 @@
 - 当前已完成 Phase C0/C1、Phase C2 纯逻辑控制面、有界 HTTP 传输层、冷启动 Refresh Token 恢复、单任务后台心跳和 WPF 登录/自动激活/Refresh/Logout 编排，以及 Phase C3/C4 的部分核心边界：媒体池原子状态机、WPF 原生文件选择/拖放与已验证 FFprobe 导入组合、逐项有界媒体导入协调器、FFprobe 有界命令/输出边界、固定容量 PCM 环缓、Windows `Process`/Job Object 适配器、mpv 固定 JSON IPC/会话/命名管道组合边界、受管 mpv 宿主生命周期、外置资源清单校验、唯一最终效果窗口和“已验证资源→HWND→受管 mpv”播放控制器接线；音频优先级、预分配 PCM 混音、FFmpeg PCM 解码和单一音频播放控制器边界已接入；C5 已接入固定话术合同、单操作状态机和 Windows SAPI STA/COM 适配边界。正式媒体资源/签名、真实控制面联调、mpv 首帧/EOF/HWND 实机链路、PortAudio/SAPI 真实语音输出仍未验收，不能视为完整可用产品。
 - 目标技术栈为 C# + WPF + .NET 10 LTS，目标平台仅为 Windows 10/11 x64。
 
+> 2026-09-06 起，C# 是后续版本唯一桌面认证事实源，Rust/Tauri 登录不再参与运行时同步。服务端多设备登录下 C# 与 Rust 保持各自独立设备 ID；仅在 C# 首次启动且自身尚无设备 ID 时，才从 Rust 固定旧凭据复制合法设备 ID，不迁移密码或任何 Token。C# 使用 `AUTOLIVE_CONTROL_PLANE_BASE_URI`/`AUTOLIVE_CONTROL_PLANE_ENV` 作为唯一控制面配置。账号登录成功后，设备待激活、数量上限、授权到期或激活响应异常只关闭工作台并保留账号会话；只有明确 401/`UNAUTHENTICATED` 才要求重新登录。真实迁移、TLS 和服务端状态矩阵仍待验收。
+
 ## 开发联调控制面
 
 开发联调允许显式使用固定测试地址 `http://101.96.208.132:9090`。启动 C# 客户端前设置：
@@ -29,7 +31,7 @@ dotnet run --project .\src\GpAutoLive.App\GpAutoLive.App.csproj --launch-profile
 .\tools\start-csharp-development.cmd
 ```
 
-该脚本会使用项目锁定的本地 .NET SDK、构建当前 C# x64 客户端，并注入 `AUTOLIVE_MEDIA_RUNTIME_ROOT`。直接双击 `src\GpAutoLive.App\bin\...\GpAutoLive.exe` 只适合检查界面壳；没有 `runtime\media\1.0.0\manifest.json` 时，导入和播放会按设计拒绝，不会启动未经校验的 FFmpeg、FFprobe 或 mpv。不要同时启动 Rust 客户端；C# 主控窗口和最终效果窗口属于同一进程。
+该脚本会使用项目锁定的本地 .NET SDK、构建当前 C# x64 客户端，并注入 `AUTOLIVE_MEDIA_RUNTIME_ROOT`。直接双击 `src\GpAutoLive.App\bin\...\GpAutoLive.exe` 只适合检查界面壳；没有 `runtime\media\1.0.0\manifest.json` 时，导入和播放会按设计拒绝，不会启动未经校验的 FFmpeg、FFprobe 或 mpv。Rust 客户端与 C# 客户端隔离，C# 不启动或探测 Rust；C# 主控窗口和最终效果窗口属于同一进程。
 
 `GpAutoLive - 本地离线壳` 启动档仅用于无网络 UI 验证，不会伪造登录或授权状态。
 

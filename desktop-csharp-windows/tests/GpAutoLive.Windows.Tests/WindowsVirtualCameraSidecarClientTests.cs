@@ -78,6 +78,42 @@ public sealed class WindowsVirtualCameraSidecarClientTests
     }
 
     [TestMethod]
+    public async Task Cancellation_during_write_closes_pipe_and_enters_retryable_failure_state()
+    {
+        var pipeName = CreatePipeName();
+        var suffix = pipeName[WindowsVirtualCameraSidecarProtocol.PipePrefix.Length..];
+        await using var server = new NamedPipeServerStream(
+            suffix,
+            PipeDirection.In,
+            1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous,
+            inBufferSize: 1,
+            outBufferSize: 1);
+        await using var client = new WindowsVirtualCameraSidecarClient(TimeSpan.FromSeconds(5));
+        using var connectTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var waitTask = server.WaitForConnectionAsync(connectTimeout.Token);
+
+        var connect = await client.ConnectAsync(pipeName, TimeSpan.FromSeconds(2), connectTimeout.Token);
+        Assert.IsTrue(connect.IsSuccess, connect.Error?.Message);
+        await waitTask;
+
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        var write = await client.WriteFrameAsync(CreateFrame(1, 1, 90_000), cancellation.Token);
+
+        Assert.IsFalse(write.IsSuccess);
+        Assert.AreEqual(WindowsVirtualCameraSidecarClientErrorCode.Cancelled, write.Error!.Code);
+        Assert.IsTrue(write.Error.Retryable);
+        Assert.AreEqual(WindowsVirtualCameraSidecarClientState.Failed, write.Snapshot.State);
+        Assert.AreEqual(WindowsVirtualCameraSidecarClientErrorCode.Cancelled, write.Snapshot.LastErrorCode);
+
+        using var followUpCancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        var followUp = await client.WriteFrameAsync(CreateFrame(1, 2, 180_000), followUpCancellation.Token);
+        Assert.IsFalse(followUp.IsSuccess);
+        Assert.AreEqual(WindowsVirtualCameraSidecarClientErrorCode.NotConnected, followUp.Error!.Code);
+    }
+
+    [TestMethod]
     public async Task Timestamp_overflow_is_rejected_without_connecting_or_allocating_frame_buffer()
     {
         await using var client = new WindowsVirtualCameraSidecarClient();

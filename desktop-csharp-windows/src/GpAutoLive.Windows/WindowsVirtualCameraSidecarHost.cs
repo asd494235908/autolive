@@ -420,7 +420,8 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
 
         try
         {
-            return string.Equals(executablePath, plan.ExecutablePath, StringComparison.Ordinal)
+            return WindowsAuthenticodeProbe.Probe(executablePath).IsValid
+                && string.Equals(executablePath, plan.ExecutablePath, StringComparison.Ordinal)
                 && string.Equals(
                     Path.GetDirectoryName(executablePath),
                     plan.WorkingDirectory,

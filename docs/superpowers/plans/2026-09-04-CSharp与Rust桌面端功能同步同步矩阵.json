@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-09-05",
+  "updated_at": "2026-09-06",
   "source_plan": "2026-09-04-CSharp与Rust桌面端功能同步长任务实施方案.md",
   "status_labels": {
     "正式需求·待实现/未接入": "只有需求、模型、默认值或校验，尚未进入真实输出。",
@@ -15,14 +15,14 @@
       "name": "登录、设备、激活、心跳",
       "priority": "P0",
       "rust": {
-        "status": "代码已接入·待验收",
+        "status": "非当前范围",
         "evidence": ["desktop/src-tauri/src/control_plane_auth.rs", "desktop/src-tauri/src/commands.rs"]
       },
       "csharp": {
         "status": "代码已接入·待验收",
-        "evidence": ["desktop-csharp-windows/src/GpAutoLive.App/", "desktop-csharp-windows/docs/CSharp-Windows当前状态.md"]
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Core/AuthSession.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/ControlPlaneAuthCoordinator.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsDeviceIdentity.cs", "desktop-csharp-windows/src/GpAutoLive.App/Features/Auth/LoginViewModel.cs", "desktop-csharp-windows/docs/CSharp-Windows当前状态.md"]
       },
-      "next_gate": "统一刷新、离线恢复、错误语义和服务端/设备授权矩阵"
+      "next_gate": "C# 为唯一事实源；自动化已覆盖一次性 Rust 设备 ID 迁移、退出撤销重试、严格到期与心跳门禁投影。仍需真实 Credential Manager、生产 TLS、管理员禁用/撤销、max_devices=1 迁移和跨到期时间实机验收"
     },
     {
       "id": "local-media-pool",
@@ -78,7 +78,7 @@
         "status": "代码已接入·待验收",
         "evidence": ["desktop-csharp-windows/src/GpAutoLive.Media/FinalPcmBus.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsAudioPlaybackController.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsRtmpAudioSession.cs"]
       },
-      "next_gate": "真实 N/N+1 预载/切换、可听 PTS、过载重建、设备拔插和故障恢复；首批 PCM 启动门槛与 RTMP 分支非阻塞已通过显式夹具"
+      "next_gate": "PortAudio 重开原生/对象异常分类与有界重试已通过定向测试；仍需真实 N/N+1 预载/切换、可听 PTS、过载重建、设备拔插和故障恢复"
     },
     {
       "id": "interlude-and-sapi",
@@ -90,9 +90,9 @@
       },
       "csharp": {
         "status": "代码已接入·待验收",
-        "evidence": ["desktop-csharp-windows/src/GpAutoLive.App/MainWindow.AudioInterlude.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsSystemSpeechAdapter.cs"]
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.App/MainWindow.AudioInterlude.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsSystemSpeechAdapter.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsSapiSpeechBridge.cs", "desktop-csharp-windows/src/GpAutoLive.Media/FinalPcmBus.cs"]
       },
-      "next_gate": "统一优先级、静音、抢占、取消、恢复和真实 SAPI 设备输出"
+      "next_gate": "自动插话调度、单轨预设 ID-only 消费、最终 PCM overlay 与 EOF/取消尾部清理代码边界已有定向测试；仍需真实 SAPI voice/声卡输出、RTMP-only 消费、优先级恢复、Rust 预设 DSP/多轨差异、自动调度听感和长稳"
     },
     {
       "id": "microphone-interlude",
@@ -104,9 +104,9 @@
       },
       "csharp": {
         "status": "代码已接入·待验收",
-        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Windows/WindowsMicrophoneInterludeController.cs"]
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Windows/WindowsMicrophoneInterludeController.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsMicrophonePcmBridge.cs", "desktop-csharp-windows/src/GpAutoLive.App/MainWindow.AudioInterlude.cs", "desktop-csharp-windows/docs/C5-麦克风插话实现记录.md"]
       },
-      "next_gate": "真实 AEC/降噪/AGC/VAD 声学门禁；VAD 只作说话活动门控"
+      "next_gate": "真实 SpeexDSP/等价 AEC、降噪、AGC、完整 VAD、声卡/回声参考/拔插恢复与长稳；当前只完成输入到最终 PCM overlay 的基础可听桥接，VAD 只作说话活动门控"
     },
     {
       "id": "rtmp-output",
@@ -118,9 +118,9 @@
       },
       "csharp": {
         "status": "代码已接入·待验收",
-        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Windows/WindowsRtmpOutputManager.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsRtmpAudioSession.cs", "desktop-csharp-windows/src/GpAutoLive.App/MainWindow.Rtmp.cs"]
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Windows/WindowsRtmpOutputManager.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsRtmpReconnectCoordinator.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsRtmpAudioSession.cs", "desktop-csharp-windows/src/GpAutoLive.Media/RtmpFfmpegCommandBuilder.cs", "desktop-csharp-windows/src/GpAutoLive.App/MainWindow.Rtmp.cs", "desktop-csharp-windows/tests/GpAutoLive.App.Tests/MainWindowRtmpReadinessTests.cs"]
       },
-      "next_gate": "ZLMediaKit/RTMPS 远端握手、三轨道、断线恢复、取消和 30 分钟长稳；本机进程终态、启动期 Pump/Producer 失败和停止超时资源保留已有显式测试"
+      "next_gate": "ZLMediaKit/RTMPS 远端握手、三轨道、无进展/断线成组恢复、取消和 30 分钟长稳；当前已补齐重连后的有界 Publishing/声音运行门禁、媒体身份保护、用户停止/媒体切换取消边界、失败会话配置快照以及失败资源可回收投影，但仍未完成真实远端验证"
     },
     {
       "id": "akvirtualcamera",
@@ -132,9 +132,9 @@
       },
       "csharp": {
         "status": "代码已接入·待验收",
-        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Core/VirtualCameraOutputManager.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsGraphicsCaptureCapabilityProbe.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsGraphicsCaptureWindowSession.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsGraphicsCaptureGpuYuy2Converter.cs"]
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Core/VirtualCameraOutputManager.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsGraphicsCaptureCapabilityProbe.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsGraphicsCaptureWindowSession.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsGraphicsCaptureGpuYuy2Converter.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsVirtualCameraSidecarClient.cs"]
       },
-      "next_gate": "实际 WPF FinalEffectWindow 可见帧、固定 YUY2 720p30 下游、sidecar、DirectShow、签名和卸载；原生 Win32 GPU83 WGC→D3D11→YUY2 已通过显式帧哈希夹具"
+      "next_gate": "实际 WPF FinalEffectWindow 可见帧、固定 YUY2 720p30 下游、真实 sidecar/DirectShow、签名和卸载；取消写入、组合清理失败熔断及原生 Win32 GPU83 WGC→D3D11→YUY2 夹具已有本地证据"
     },
     {
       "id": "douyin-m1",
@@ -146,9 +146,9 @@
       },
       "csharp": {
         "status": "代码已接入·待验收",
-        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Core/DouyinLiveManager.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsDouyinProbeHost.cs"]
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Core/DouyinLiveManager.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsDouyinProbeHost.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsDouyinProbeEventParser.cs", "desktop-csharp-windows/src/GpAutoLive.Windows/WindowsDouyinSidecarProtocol.cs", "desktop-csharp-windows/src/GpAutoLive.App/Features/Douyin/DouyinQrImageLoader.cs", "desktop-csharp-windows/src/GpAutoLive.App/MainWindow.Douyin.cs"]
       },
-      "next_gate": "真实 WebcastChatMessage 事件桥、扫码、单房间发送、自回显、风险停止和许可审计"
+        "next_gate": "正式 canonical sidecar、真实扫码、WebcastChatMessage/live.gap 事件桥、单房间平台发送、自回显、风险恢复、auth.logout 和许可审计；本地 fake sidecar 已验证 auth.qr.start→auth.state→live.open→live.state→live.gap→live.chat→chat.send→accepted→live.close→auth.logout→shutdown 生命周期"
     },
     {
       "id": "runtime-resources",
@@ -166,7 +166,7 @@
     },
     {
       "id": "shared-output-ownership",
-      "name": "单实例与媒体输出所有权",
+      "name": "C# 单实例与自身媒体输出所有权",
       "priority": "P0",
       "rust": {
         "status": "代码已接入·待验收",
@@ -174,9 +174,9 @@
       },
       "csharp": {
         "status": "代码已接入·待验收",
-        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Windows/WindowsMediaOutputOwnership.cs", "desktop-csharp-windows/docs/C7-媒体输出所有权与单实例审查记录.md"]
+        "evidence": ["desktop-csharp-windows/src/GpAutoLive.Windows/WindowsMediaOutputOwnership.cs", "desktop-csharp-windows/src/GpAutoLive.App/App.xaml.cs", "desktop-csharp-windows/tests/GpAutoLive.Windows.Tests/WindowsMediaOutputOwnershipTests.cs", "desktop-csharp-windows/tests/GpAutoLive.App.Tests/WindowsMediaOutputOwnershipLifecycleTests.cs", "desktop-csharp-windows/docs/C7-媒体输出所有权与单实例审查记录.md"]
       },
-      "next_gate": "跨进程争用、启动竞态、输出资源矩阵、崩溃恢复和无孤儿进程"
+      "next_gate": "C# 自身重复启动、崩溃恢复、安装中断回滚、不同权限级别和无孤儿进程；Rust 仅作只读代码参考，不启动、不探测、不参与资源争用"
     },
     {
       "id": "realtime-speech-morphing",

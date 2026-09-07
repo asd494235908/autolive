@@ -14,6 +14,22 @@
         </Setter>
     </Style>
 
+    <DataTemplate x:Key="DarkExpanderHeaderTemplate">
+        <TextBlock FontFamily="{StaticResource UiFontFamily}"
+                   FontSize="12"
+                   FontWeight="SemiBold"
+                   Foreground="{StaticResource TextBrush}"
+                   Text="{Binding}"
+                   TextTrimming="CharacterEllipsis" />
+    </DataTemplate>
+
+    <Style x:Key="DarkExpanderStyle" TargetType="Expander">
+        <Setter Property="FontFamily" Value="{StaticResource UiFontFamily}" />
+        <Setter Property="FontSize" Value="12" />
+        <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+        <Setter Property="HeaderTemplate" Value="{StaticResource DarkExpanderHeaderTemplate}" />
+    </Style>
+
     <Style x:Key="ButtonStyle" TargetType="Button">
         <Setter Property="Background" Value="{StaticResource SurfaceRaisedBrush}" />
         <Setter Property="Foreground" Value="{StaticResource TextBrush}" />

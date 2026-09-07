@@ -1,5 +1,7 @@
 using Microsoft.Win32;
+using System;
 using System.IO;
+using System.Globalization;
 using System.Windows;
 using GpAutoLive.Contracts;
 using GpAutoLive.Core;
@@ -46,8 +48,8 @@ public partial class MainWindow
         }
 
         _speechOperationId = result.OperationId;
-        FixedSpeechStatusText.Text = "正在朗读 · Windows SAPI（待验收）";
-        _state.SetStatus("固定话术已开始；真实语音设备仍待验收");
+        FixedSpeechStatusText.Text = "正在朗读 · SAPI → 最终 PCM（待验收）";
+        _state.SetStatus("固定话术已进入最终 PCM；SAPI/声卡仍待验收");
         UpdateFixedSpeechProjection();
         _ = ObserveFixedSpeechCompletionAsync(result.OperationId, result.Completion);
     }
@@ -142,9 +144,82 @@ public partial class MainWindow
     private WindowsSystemSpeechAdapter EnsureSpeechAdapter() =>
         _speechAdapter ??= new WindowsSystemSpeechAdapter(
             new WindowsSapiSpeechBridge(),
-            audioPriority: _audioPriority);
+            audioPriority: _audioPriority,
+            finalPcmBusProvider: () => _audioPlaybackController.ActiveFinalPcmBus);
 
     // 插话文件池界面编排保留在此 partial；共享状态仍由 MainWindow.xaml.cs 唯一持有。
+
+    private async void InterludeScheduleTimer_Tick(object? sender, EventArgs e)
+    {
+        if (_isClosing || _interludeScheduleStartInFlight)
+        {
+            return;
+        }
+
+        var mediaSnapshot = _mediaPool.Snapshot;
+        var pool = _interludePool.Snapshot;
+        var scheduleKey = BuildInterludeScheduleKey(mediaSnapshot);
+        var audioSnapshot = _audioPlaybackController.Snapshot;
+        var rtmpAudioActive = _rtmpAudioSession.Snapshot.IsRunning;
+        var audioHostReady = audioSnapshot.State is WindowsAudioPlaybackState.Playing
+            or WindowsAudioPlaybackState.Paused
+            || rtmpAudioActive;
+        var priority = _audioPriority.Snapshot;
+        var playbackPaused = mediaSnapshot.PlaybackState is not PlaybackState.Playing
+            || priority.FixedSpeechActive
+            || priority.MicrophoneSpeaking;
+        var scheduleEnabled = _interludeConfig.Enabled
+            && pool.Status is InterludePoolStatus.Ready
+            && pool.Files.Length > 0
+            && mediaSnapshot.PlaybackState is PlaybackState.Playing or PlaybackState.Paused;
+
+        if (!scheduleEnabled)
+        {
+            _interludeSchedulePlanner.Reset(scheduleKey, resetLastFileIndex: false);
+            _state.SetInterludeEffectCycleProgress(0);
+            return;
+        }
+
+        var decision = _interludeSchedulePlanner.Observe(
+            scheduleKey,
+            Environment.TickCount64,
+            pool.Files.Length,
+            _interludeConfig.IntervalMinMs,
+            _interludeConfig.IntervalMaxMs,
+            enabled: true,
+            playbackActive: _interludeObservationTask is not null || priority.InterludeActive,
+            playbackStarting: _interludeScheduleStartInFlight,
+            paused: playbackPaused,
+            canStartPlayback: audioHostReady);
+        _state.SetInterludeEffectCycleProgress(
+            decision.ShouldStart ? 100 : decision.ProgressPercent);
+        if (!decision.ShouldStart || decision.FileIndex is not int fileIndex)
+        {
+            return;
+        }
+
+        _interludeScheduleStartInFlight = true;
+        try
+        {
+            await RunPlaybackCommandAsync(
+                    () => StartInterludeFileAsync(fileIndex, fromScheduler: true),
+                    _windowCancellation.Token)
+                .ConfigureAwait(true);
+        }
+        catch (OperationCanceledException) when (_isClosing || _windowCancellation.IsCancellationRequested)
+        {
+            // 关闭时由窗口取消路径回收插话解码器。
+        }
+        finally
+        {
+            _interludeScheduleStartInFlight = false;
+        }
+    }
+
+    private static string? BuildInterludeScheduleKey(AppState snapshot) =>
+        snapshot.SourceMediaPool.IsEmpty
+            ? null
+            : $"{snapshot.PlaybackGeneration}:{snapshot.SourceRevision}:{snapshot.SourceMediaIndex}";
 
     private async void SelectInterludeDirectoryButton_Click(object sender, RoutedEventArgs e)
     {
@@ -250,7 +325,7 @@ public partial class MainWindow
     {
         try
         {
-            await RunPlaybackCommandAsync(StartInterludeFileAsync).ConfigureAwait(true);
+            await RunPlaybackCommandAsync(() => StartInterludeFileAsync()).ConfigureAwait(true);
         }
         catch (OperationCanceledException) when (_isClosing || _windowCancellation.IsCancellationRequested)
         {
@@ -263,7 +338,81 @@ public partial class MainWindow
         await RunPlaybackCommandAsync(StopInterludeFileAsync).ConfigureAwait(true);
     }
 
-    private async Task StartInterludeFileAsync()
+    private async void ApplyInterludeCycleButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_login.CanEnterWorkbench || _isClosing)
+        {
+            return;
+        }
+
+        if (!TryParseInterludeSeconds(InterludeCycleMinTextBox.Text, "插话间隔最小值", out var minimumMs, out var error)
+            || !TryParseInterludeSeconds(InterludeCycleMaxTextBox.Text, "插话间隔最大值", out var maximumMs, out error))
+        {
+            InterludeCycleValidationText.Text = error ?? "插话周期输入无效";
+            _state.SetStatus(InterludeCycleValidationText.Text);
+            return;
+        }
+
+        if (minimumMs > maximumMs)
+        {
+            InterludeCycleValidationText.Text = "插话间隔最小值不能大于最大值。";
+            _state.SetStatus(InterludeCycleValidationText.Text);
+            return;
+        }
+
+        var next = _interludeConfig with
+        {
+            IntervalMinMs = minimumMs,
+            IntervalMaxMs = maximumMs,
+        };
+        if (!InterludeAudioRules.TryValidate(next, out var validationError))
+        {
+            InterludeCycleValidationText.Text = validationError?.Message ?? "插话周期配置无效";
+            _state.SetStatus(InterludeCycleValidationText.Text);
+            return;
+        }
+
+        _interludeConfig = next;
+        _interludeSchedulePlanner.Reset(
+            BuildInterludeScheduleKey(_mediaPool.Snapshot),
+            resetLastFileIndex: false);
+        _state.SetInterludeEffectCycleProgress(0);
+        await PersistInterludeAudioConfigAsync().ConfigureAwait(true);
+        InterludeCycleValidationText.Text = string.Empty;
+        UpdateInterludeProjection();
+        UpdateEffectCycleProjection();
+        _state.SetStatus("插话触发间隔已应用；下一次插话按新范围等待");
+    }
+
+    private static bool TryParseInterludeSeconds(
+        string text,
+        string label,
+        out ulong milliseconds,
+        out string? error)
+    {
+        milliseconds = 0;
+        error = null;
+        if (!double.TryParse(text, NumberStyles.Float, CultureInfo.CurrentCulture, out var seconds)
+            || double.IsNaN(seconds)
+            || double.IsInfinity(seconds))
+        {
+            error = $"{label}必须是数字。";
+            return false;
+        }
+
+        var value = seconds * 1_000d;
+        if (value < InterludeAudioRules.MinIntervalMs
+            || value > InterludeAudioRules.MaxIntervalMs)
+        {
+            error = $"{label}必须在 0.5 到 60 秒之间。";
+            return false;
+        }
+
+        milliseconds = checked((ulong)Math.Round(value, MidpointRounding.AwayFromZero));
+        return true;
+    }
+
+    private async Task StartInterludeFileAsync(int? selectedIndex = null, bool fromScheduler = false)
     {
         if (_isClosing || !_login.CanEnterWorkbench)
         {
@@ -332,13 +481,44 @@ public partial class MainWindow
             return;
         }
 
-        var entry = pool.Files[0];
+        if (!audioSelection.TryCreateBoundedAudioEffectParams(
+                out var interludeAudioEffects,
+                out var projectionError)
+            || interludeAudioEffects is null)
+        {
+            _audioPriority.End(AudioPriorityLayer.InterludeFile);
+            _state.SetStatus(projectionError ?? "插话声音预设尚未接入当前消费链");
+            UpdateInterludeProjection();
+            return;
+        }
+
+        var entryIndex = selectedIndex ?? 0;
+        if (entryIndex < 0 || entryIndex >= pool.Files.Length)
+        {
+            _audioPriority.End(AudioPriorityLayer.InterludeFile);
+            _state.SetStatus("插话文件索引已失效，等待下一次调度");
+            UpdateInterludeProjection();
+            return;
+        }
+
+        var entry = pool.Files[entryIndex];
         var interludeSource = CreateInterludeSource(entry);
         if (_mediaPool.CurrentIdentity != sessionIdentity)
         {
             _audioPriority.End(AudioPriorityLayer.InterludeFile);
             _state.SetStatus("播放项已变化，已拒绝过期插话");
             UpdateInterludeProjection();
+            return;
+        }
+
+        var currentPool = _interludePool.Snapshot;
+        if (currentPool.Status is not InterludePoolStatus.Ready
+            || entryIndex >= currentPool.Files.Length
+            || !string.Equals(currentPool.Files[entryIndex].Path, entry.Path, StringComparison.OrdinalIgnoreCase))
+        {
+            _audioPriority.End(AudioPriorityLayer.InterludeFile);
+            _state.SetStatus("插话文件池已变化，已拒绝过期插话");
+            UpdateInterludeProjection(currentPool);
             return;
         }
 
@@ -350,7 +530,8 @@ public partial class MainWindow
                     ? _audioPlaybackController.Snapshot.Output?.Channels ?? FinalPcmBus.DefaultChannels
                     : FinalPcmBus.DefaultChannels,
                 out var plan,
-                out var planError)
+                out var planError,
+                audioEffects: interludeAudioEffects)
             || plan is null)
         {
             _audioPriority.End(AudioPriorityLayer.InterludeFile);
@@ -389,14 +570,24 @@ public partial class MainWindow
             return;
         }
 
-        _interludeObservationTask = completion;
+        var priorityCompletion = ObserveInterludePriorityCompletionAsync(
+            completion,
+            _audioPriority);
+        _interludeObservationTask = priorityCompletion;
+        if (!fromScheduler)
+        {
+            _interludeSchedulePlanner.MarkPlaybackStarted(
+                BuildInterludeScheduleKey(_mediaPool.Snapshot),
+                entryIndex);
+            _state.SetInterludeEffectCycleProgress(0);
+        }
         InterludePoolStatusText.Text = rtmpAudioActive && !localAudioActive
             ? $"正在播放插话 · {entry.FileName} · 与 RTMP PCM 分流共享混音"
             : $"正在播放插话 · {entry.FileName} · 与主音频共享 PortAudio 输出";
         var presetSummary = string.Join(", ", audioSelection.PresetIds);
-        _state.SetStatus($"插话已开始：{entry.FileName} · 预设 {presetSummary}（DSP 待验收）");
+        _state.SetStatus($"插话已开始：{entry.FileName} · 预设 {presetSummary}（C# 单轨参数已送入 FFmpeg，效果待验收）");
         UpdateInterludeProjection();
-        _ = ObserveInterludeCompletionAsync(completion, entry.FileName);
+        _ = ObserveInterludeCompletionAsync(priorityCompletion, entry.FileName);
     }
 
     private async Task StopInterludeFileAsync()
@@ -406,6 +597,9 @@ public partial class MainWindow
         if (localResult.IsSuccess && rtmpResult.IsSuccess)
         {
             _audioPriority.End(AudioPriorityLayer.InterludeFile);
+            _interludeSchedulePlanner.Reset(
+                BuildInterludeScheduleKey(_mediaPool.Snapshot),
+                resetLastFileIndex: false);
             InterludePoolStatusText.Text = "插话已停止；主音频继续播放";
             _state.SetStatus("插话已停止；主音频继续播放");
         }
@@ -457,10 +651,25 @@ public partial class MainWindow
         }
 
         _interludeObservationTask = null;
-        _audioPriority.End(AudioPriorityLayer.InterludeFile);
         InterludePoolStatusText.Text = $"插话已结束 · {fileName} · 主音频继续播放";
         _state.SetStatus("插话已结束；主音频继续播放");
         UpdateInterludeProjection();
+    }
+
+    internal static async Task ObserveInterludePriorityCompletionAsync(
+        Task completion,
+        AudioPriorityCoordinator priority)
+    {
+        ArgumentNullException.ThrowIfNull(completion);
+        ArgumentNullException.ThrowIfNull(priority);
+        try
+        {
+            await completion.ConfigureAwait(false);
+        }
+        finally
+        {
+            priority.End(AudioPriorityLayer.InterludeFile);
+        }
     }
 
     private void UpdateInterludeProjection(InterludePoolSnapshot? provided = null)
@@ -484,6 +693,20 @@ public partial class MainWindow
         var projectedDirectory = snapshot.Directory ?? persistedDirectory;
         InterludeDirectoryTextBox.Text = projectedDirectory ?? string.Empty;
         InterludeAudioConfigStatusText.Text = FormatInterludeAudioConfig(_interludeConfig);
+        if (!InterludeVolumeSlider.IsMouseCaptureWithin
+            && !InterludeVolumeSlider.IsKeyboardFocusWithin)
+        {
+            InterludeVolumeSlider.Value = InterludeVolumeDbToPercent(_interludeConfig.VolumeDb);
+        }
+        InterludeVolumeText.Text = $"{InterludeVolumeDbToPercent(_interludeConfig.VolumeDb):0}%";
+        if (!InterludeCycleMinTextBox.IsKeyboardFocusWithin
+            && !InterludeCycleMaxTextBox.IsKeyboardFocusWithin)
+        {
+            InterludeCycleMinTextBox.Text = FormatSeconds(_interludeConfig.IntervalMinMs);
+            InterludeCycleMaxTextBox.Text = FormatSeconds(_interludeConfig.IntervalMaxMs);
+        }
+        ApplyInterludeCycleButton.IsEnabled = authorized && !_importBusy;
+        InterludeVolumeSlider.IsEnabled = authorized && !_importBusy;
         SelectInterludeDirectoryButton.IsEnabled = authorized && !_importBusy;
         ClearInterludePoolButton.IsEnabled = authorized
             && !_importBusy
@@ -505,7 +728,7 @@ public partial class MainWindow
         {
             InterludePoolStatusText.Text = snapshot.Status switch
             {
-                InterludePoolStatus.Ready => $"已发现 {snapshot.Files.Length} 个候选文件 · 纯音频/RTMP 声音会话时可叠加首项插话",
+                InterludePoolStatus.Ready => $"已发现 {snapshot.Files.Length} 个候选文件 · 播放中按 {_interludeConfig.IntervalMinMs}–{_interludeConfig.IntervalMaxMs} ms 自动插话",
                 InterludePoolStatus.Empty => "目录中没有受支持的媒体文件 · 不启动解码或音频流",
                 InterludePoolStatus.Failed => snapshot.Error ?? "插话目录扫描失败；旧快照已保留",
                 InterludePoolStatus.Disabled when persistedDirectory is not null => "已保存插话目录；重新选择目录以刷新候选文件",
@@ -522,8 +745,11 @@ public partial class MainWindow
         var mix = config.AudioMixEnabled
             ? $"多轨 {config.AudioMixPickMin}–{config.AudioMixPickMax}"
             : "多轨关闭";
-        return $"预设：{mode} · {mix} · duck {config.DuckingDepthDb:0.#} dB · 淡入/淡出 {config.DuckingAttackMs}/{config.DuckingReleaseMs} ms（曲线待验收）";
+        return $"预设：{mode} · {mix} · 音量 {config.VolumeDb:+0.#;-0.#;0} dB · 插话间隔 {FormatSeconds(config.IntervalMinMs)}–{FormatSeconds(config.IntervalMaxMs)} 秒 · duck {config.DuckingDepthDb:0.#} dB · 淡入/淡出 {config.DuckingAttackMs}/{config.DuckingReleaseMs} ms（曲线待验收）";
     }
+
+    private static string FormatSeconds(ulong milliseconds) =>
+        (milliseconds / 1_000d).ToString("0.###", CultureInfo.CurrentCulture);
 
     private static SourceMediaDto CreateInterludeSource(InterludeFileEntry entry) =>
         new(
@@ -546,11 +772,11 @@ public partial class MainWindow
             null,
             "not-computed");
 
-    private async Task LoadInterludeAudioConfigAsync()
+    private async Task<string?> LoadInterludeAudioConfigAsync()
     {
         if (_interludeConfigStore is null || _isClosing)
         {
-            return;
+            return null;
         }
 
         try
@@ -558,6 +784,19 @@ public partial class MainWindow
             _interludeConfig = await _interludeConfigStore
                 .ReadAsync(_windowCancellation.Token)
                 .ConfigureAwait(true);
+            var restoreResult = await Task.Run(
+                    () => RestoreConfiguredInterludePool(
+                        _interludeConfig,
+                        _interludePool,
+                        _windowCancellation.Token),
+                    _windowCancellation.Token)
+                .ConfigureAwait(true);
+            if (restoreResult is { IsSuccess: false })
+            {
+                var message = $"插话候选恢复失败：{restoreResult.Error?.Message ?? "目录扫描失败"}；已保存目录保持不变";
+                _state.SetStatus(message);
+                return message;
+            }
         }
         catch (OperationCanceledException) when (_windowCancellation.IsCancellationRequested)
         {
@@ -576,7 +815,17 @@ public partial class MainWindow
         {
             _state.SetStatus("插话声音配置不可访问，使用内存默认值");
         }
+
+        return null;
     }
+
+    internal static InterludePoolResult? RestoreConfiguredInterludePool(
+        InterludeAudioConfig config,
+        InterludeFilePoolService pool,
+        CancellationToken cancellationToken) =>
+        config.Enabled && !string.IsNullOrWhiteSpace(config.Directory)
+            ? pool.ScanDirectory(config.Directory, cancellationToken)
+            : null;
 
     private async Task PersistInterludeAudioConfigAsync()
     {
@@ -781,7 +1030,9 @@ public partial class MainWindow
             return;
         }
 
-        _microphoneInterludeController ??= new WindowsMicrophoneInterludeController(_audioPriority);
+        _microphoneInterludeController ??= new WindowsMicrophoneInterludeController(
+            _audioPriority,
+            finalPcmBusProvider: () => _audioPlaybackController.ActiveFinalPcmBus);
         _microphoneInterludeController.SnapshotChanged -= MicrophoneInterludeController_SnapshotChanged;
         _microphoneInterludeController.SnapshotChanged += MicrophoneInterludeController_SnapshotChanged;
 
@@ -815,24 +1066,24 @@ public partial class MainWindow
         }
     }
 
-    private async Task StopMicrophoneAsync()
+    private async Task<bool> StopMicrophoneAsync()
     {
         if (_isClosing)
         {
-            return;
+            return true;
         }
 
         var controller = _microphoneInterludeController;
         if (controller is null)
         {
             UpdateMicrophoneProjection();
-            return;
+            return true;
         }
 
         var result = await controller.StopAsync().ConfigureAwait(true);
         if (_isClosing)
         {
-            return;
+            return true;
         }
 
         UpdateMicrophoneProjection(result.Snapshot);
@@ -840,11 +1091,12 @@ public partial class MainWindow
         {
             MicrophoneStatusText.Text = result.Error?.Message ?? "麦克风门控停止失败";
             _state.SetStatus("麦克风门控停止失败；已请求释放输入流");
-            return;
+            return false;
         }
 
         MicrophoneStatusText.Text = "麦克风门控已停止";
         _state.SetStatus("麦克风本地能量门控已停止");
+        return true;
     }
 
     private void MicrophoneInterludeController_SnapshotChanged(WindowsMicrophoneInterludeSnapshot snapshot)
@@ -889,18 +1141,22 @@ public partial class MainWindow
         var authorized = _login.CanEnterWorkbench;
         var listening = snapshot?.State == WindowsMicrophoneInterludeState.Listening
             && snapshot.Input.IsRunning;
+        var finalPcmBusAvailable = _audioPlaybackController.ActiveFinalPcmBus is { Snapshot.IsClosed: false };
         SetStatusPill(MicrophoneStatePillText, listening ? "已启用" : "待机", listening);
         var hasInputDevice = AudioInputDeviceComboBox.Items.Count > 0;
         AudioInputDeviceComboBox.IsEnabled = authorized && !listening && hasInputDevice;
         RefreshAudioDevicesButton.IsEnabled = authorized && !listening && !_importBusy;
         StartMicrophoneButton.IsEnabled = authorized
             && !listening
+            && finalPcmBusAvailable
             && AudioInputDeviceComboBox.SelectedValue is int;
         StopMicrophoneButton.IsEnabled = authorized && listening;
 
         if (snapshot is null)
         {
-            MicrophoneStatusText.Text = "未启用；仅本地能量门控，AEC/降噪/AGC 待验收";
+            MicrophoneStatusText.Text = finalPcmBusAvailable
+                ? "未启用；可输出到最终 PCM，总线 DSP 待验收"
+                : "未启用；请先播放带声音媒体，AEC/降噪/AGC 待验收";
             return;
         }
 
@@ -913,7 +1169,9 @@ public partial class MainWindow
             WindowsMicrophoneInterludeState.Failed =>
                 snapshot.Error ?? "麦克风门控启动失败",
             WindowsMicrophoneInterludeState.Closed => "麦克风门控已关闭",
-            _ => "未启用；仅本地能量门控，AEC/降噪/AGC 待验收",
+            _ => finalPcmBusAvailable
+                ? "未启用；可输出到最终 PCM，总线 DSP 待验收"
+                : "未启用；请先播放带声音媒体，AEC/降噪/AGC 待验收",
         };
     }
 }

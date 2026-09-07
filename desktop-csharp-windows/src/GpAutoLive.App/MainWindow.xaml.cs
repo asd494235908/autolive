@@ -20,6 +20,9 @@ namespace GpAutoLive.App;
 
 public partial class MainWindow : Window
 {
+    private const double ResponsiveDesignWidth = 1586;
+    private const double ResponsiveDesignHeight = 992;
+    private const double MaximumResponsiveShellScale = 1.25;
     private const string ControlPlaneBaseUriVariable = "AUTOLIVE_CONTROL_PLANE_BASE_URI";
     private const string ControlPlaneEnvironmentVariable = "AUTOLIVE_CONTROL_PLANE_ENV";
     private const string TestControlPlaneEnvironment = "test";
@@ -42,6 +45,7 @@ public partial class MainWindow : Window
     private readonly WindowsRtmpOutputManager _rtmpOutputManager = new();
     private readonly WindowsRtmpAudioSession _rtmpAudioSession;
     private readonly WindowsRtmpReconnectCoordinator _rtmpReconnectCoordinator = new();
+    private RtmpOutputConfig? _lastRtmpConfig;
     private readonly AudioPriorityCoordinator _audioPriority = new();
     private readonly VirtualCameraOutputManager _virtualCameraOutput = new();
     private readonly WindowsVirtualCameraSurfaceBinding _virtualCameraSurfaceBinding = new();
@@ -60,15 +64,21 @@ public partial class MainWindow : Window
     private readonly LatestWinsAsyncUpdateQueue _microphoneUiUpdates;
     private readonly LatestWinsAsyncUpdateQueue _douyinUiUpdates;
     private readonly DispatcherTimer _performanceTimer;
+    private readonly DispatcherTimer _spectrumTimer;
+    private readonly DispatcherTimer _interludeScheduleTimer;
+    private readonly InterludeSchedulePlanner _interludeSchedulePlanner = new();
     private readonly SemaphoreSlim _playbackCommandSerial = new(1, 1);
     private readonly CancellationTokenSource _windowCancellation = new();
     private InterludeAudioConfig _interludeConfig = InterludeAudioConfig.Default;
+    private EffectCycleSettings _effectCycleSettings = EffectCycleSettings.Default;
     private WindowsPortAudioDeviceEnumerator? _portAudioEnumerator;
     private WindowsMicrophoneInterludeController? _microphoneInterludeController;
     private WindowsSystemSpeechAdapter? _speechAdapter;
     private CancellationTokenSource? _audioCompletionCancellation;
+    private CancellationTokenSource? _rtmpReconnectCancellation;
     private Task? _audioCompletionTask;
     private Task? _interludeObservationTask;
+    private bool _interludeScheduleStartInFlight;
     private CancellationTokenSource? _videoStateCancellation;
     private Task? _videoStateTask;
     private string? _speechOperationId;
@@ -100,6 +110,14 @@ public partial class MainWindow : Window
         {
             Interval = TimeSpan.FromSeconds(1),
         };
+        _spectrumTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+        {
+            Interval = TimeSpan.FromMilliseconds(120),
+        };
+        _interludeScheduleTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+        {
+            Interval = TimeSpan.FromMilliseconds(250),
+        };
         _microphoneUiUpdates = new(
             callback => _ = Dispatcher.InvokeAsync(callback, DispatcherPriority.Background),
             HandleBackgroundUiUpdateError);
@@ -107,14 +125,19 @@ public partial class MainWindow : Window
             callback => _ = Dispatcher.InvokeAsync(callback, DispatcherPriority.Background),
             HandleBackgroundUiUpdateError);
         _performanceTimer.Tick += PerformanceTimer_Tick;
+        _spectrumTimer.Tick += SpectrumTimer_Tick;
+        _interludeScheduleTimer.Tick += InterludeScheduleTimer_Tick;
+        _interludeScheduleTimer.Start();
+        _spectrumTimer.Start();
+        InitializeAudioDiagnostics();
         DataContext = _state;
         _state.PropertyChanged += ShellState_PropertyChanged;
         LoginGate.DataContext = _login;
+        LoginGate.IsEnabled = _authCoordinator is null;
         _login.PropertyChanged += Login_PropertyChanged;
         _douyinProbeHost.SnapshotChanged += DouyinProbeHost_SnapshotChanged;
         _rtmpOutputManager.SnapshotChanged += RtmpOutputManager_SnapshotChanged;
         _finalEffectController.StateChanged += FinalEffectController_StateChanged;
-        _finalEffectController.CommandRequested += FinalEffectController_CommandRequested;
         _state.ApplyMediaSnapshot(_mediaPool.Snapshot);
         // Keep the media assembly cold on the login shell. Resource probing is deferred until
         // the authorized workbench is actually entered, matching the startup memory budget.
@@ -125,6 +148,7 @@ public partial class MainWindow : Window
         UpdateLoginProjection();
         UpdateFixedSpeechProjection();
         UpdateInterludeProjection();
+        UpdateEffectCycleProjection();
         UpdateVirtualCameraProjection();
         UpdateDouyinProjection();
         if (preferencesError is not null)
@@ -148,6 +172,7 @@ public partial class MainWindow : Window
             }
         }
 
+        CancelRtmpReconnect();
         _windowCancellation.Cancel();
         try
         {
@@ -174,16 +199,36 @@ public partial class MainWindow : Window
         _douyinUiUpdates.Dispose();
         _performanceTimer.Stop();
         _performanceTimer.Tick -= PerformanceTimer_Tick;
+        _spectrumTimer.Stop();
+        _spectrumTimer.Tick -= SpectrumTimer_Tick;
+        _interludeScheduleTimer.Stop();
+        _interludeScheduleTimer.Tick -= InterludeScheduleTimer_Tick;
         _mediaImporter?.Dispose();
         _mediaImporter = null;
         _login.PropertyChanged -= Login_PropertyChanged;
         _state.PropertyChanged -= ShellState_PropertyChanged;
         _finalEffectController.StateChanged -= FinalEffectController_StateChanged;
-        _finalEffectController.CommandRequested -= FinalEffectController_CommandRequested;
+        if (_virtualCameraOutputCoordinator is not null)
+        {
+            _virtualCameraOutputCoordinator.SnapshotChanged -= VirtualCameraOutputCoordinator_SnapshotChanged;
+        }
         _finalEffectWindow?.Close();
         _finalEffectWindow = null;
         _settingsWindow?.Close();
         _settingsWindow = null;
+        try
+        {
+            _microphoneInterludeController?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException)
+        {
+            // 关闭窗口时麦克风门控已请求取消；不阻止窗口退出。
+        }
+        if (_microphoneInterludeController is not null)
+        {
+            _microphoneInterludeController.SnapshotChanged -= MicrophoneInterludeController_SnapshotChanged;
+        }
+        _microphoneInterludeController = null;
         try
         {
             _mpvController.DisposeAsync().AsTask().GetAwaiter().GetResult();
@@ -220,19 +265,6 @@ public partial class MainWindow : Window
         {
             // 关闭窗口时 RTMP 进程已请求退出；不阻止 WPF 退出。
         }
-        try
-        {
-            _microphoneInterludeController?.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
-        catch (OperationCanceledException)
-        {
-            // 关闭窗口时麦克风门控已请求取消；不阻止窗口退出。
-        }
-        if (_microphoneInterludeController is not null)
-        {
-            _microphoneInterludeController.SnapshotChanged -= MicrophoneInterludeController_SnapshotChanged;
-        }
-        _microphoneInterludeController = null;
         try
         {
             _heartbeatScheduler?.DisposeAsync().AsTask().GetAwaiter().GetResult();
@@ -272,6 +304,20 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (e.PropertyName is nameof(ShellState.MediaSearchText)
+            or nameof(ShellState.MediaKindFilter)
+            or nameof(ShellState.VisibleMediaItems))
+        {
+            UpdateMediaProjection();
+            var snapshot = _mediaPool.Snapshot;
+            if (!snapshot.SourceMediaPool.IsEmpty)
+            {
+                SelectMediaPoolIndex(snapshot.SourceMediaIndex);
+            }
+
+            return;
+        }
+
         if (e.PropertyName == nameof(ShellState.VideoProcessing))
         {
             await RunPlaybackCommandAsync(
@@ -298,8 +344,22 @@ public partial class MainWindow : Window
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
-        _parameterPageExpanded = false;
         ParameterScrollViewer.ScrollToTop();
+
+        if (_authCoordinator is not null)
+        {
+            try
+            {
+                await RestoreControlPlaneSessionAsync().ConfigureAwait(true);
+            }
+            finally
+            {
+                if (!_isClosing)
+                {
+                    LoginGate.IsEnabled = true;
+                }
+            }
+        }
 
         if (_preferences is not null)
         {
@@ -307,11 +367,13 @@ public partial class MainWindow : Window
             {
                 var warning = await _preferences.LoadAsync(_windowCancellation.Token).ConfigureAwait(true);
                 _preferences.ApplyTo(this);
+                _effectCycleSettings = EffectCycleSettings.From(_preferences.Current);
                 if (warning is not null)
                 {
                     _state.SetStatus(warning);
                 }
                 ApplyRuntimePreferences();
+                UpdateEffectCycleProjection();
             }
             catch (OperationCanceledException)
             {
@@ -323,14 +385,16 @@ public partial class MainWindow : Window
             ApplyRuntimePreferences();
         }
 
-        await LoadInterludeAudioConfigAsync().ConfigureAwait(true);
+        var interludeRestoreError = await LoadInterludeAudioConfigAsync().ConfigureAwait(true);
+        UpdateInterludeProjection();
+        if (interludeRestoreError is not null)
+        {
+            InterludePoolStatusText.Text = interludeRestoreError;
+        }
+        UpdateEffectCycleProjection();
         await LoadDouyinConfigAsync().ConfigureAwait(true);
         _ = RefreshVirtualCameraProbesAsync();
 
-        if (!_isClosing && _authCoordinator is not null)
-        {
-            _ = RestoreControlPlaneSessionAsync();
-        }
     }
 
     private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -352,6 +416,34 @@ public partial class MainWindow : Window
                 // 拖动手势在窗口状态改变时可能被 WPF 取消；不应打断壳层。
             }
         }
+    }
+
+    private void Window_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        if (ResponsiveShellScaleTransform is null)
+        {
+            return;
+        }
+
+        var scale = CalculateResponsiveShellScale(e.NewSize);
+        ResponsiveShellScaleTransform.ScaleX = scale;
+        ResponsiveShellScaleTransform.ScaleY = scale;
+    }
+
+    internal static double CalculateResponsiveShellScale(Size size)
+    {
+        if (!double.IsFinite(size.Width)
+            || !double.IsFinite(size.Height)
+            || size.Width <= 0
+            || size.Height <= 0)
+        {
+            return 1;
+        }
+
+        var availableScale = Math.Min(
+            size.Width / ResponsiveDesignWidth,
+            size.Height / ResponsiveDesignHeight);
+        return Math.Clamp(availableScale, 1, MaximumResponsiveShellScale);
     }
 
     private void MinimizeButton_Click(object sender, RoutedEventArgs e) =>
@@ -457,6 +549,7 @@ public partial class MainWindow : Window
         if (e.PropertyName == nameof(LoginViewModel.Status)
             && _login.Status is LoginStatus.Activated or LoginStatus.Offline)
         {
+            _heartbeatScheduler?.Start();
             _ = SendHeartbeatNowSafelyAsync();
         }
         else if (e.PropertyName == nameof(LoginViewModel.Status)
@@ -468,28 +561,13 @@ public partial class MainWindow : Window
         }
     }
 
-    private void FinalEffectController_CommandRequested(object? sender, FinalEffectCommandRequestedEventArgs e)
-    {
-        if (e.Command is FinalEffectPlaybackCommand.TogglePlayPause)
-        {
-            _ = TogglePlaybackAsync();
-        }
-        else
-        {
-            _ = StopPlaybackAsync();
-        }
-    }
-
     private void FinalEffectController_StateChanged(object? sender, EventArgs e) => UpdateFinalEffectButtons();
 
     private async void FinalEffectWindow_Closed(object? sender, EventArgs e)
     {
         if (!_isClosing
             && _virtualCameraOutputCoordinator is not null
-            && _virtualCameraOutput.Snapshot.State is (VirtualCameraState.Starting
-                or VirtualCameraState.Ready
-                or VirtualCameraState.Streaming
-                or VirtualCameraState.Recovering))
+            && _virtualCameraOutputCoordinator.HasActiveResources)
         {
             await StopVirtualCameraCoreAsync().ConfigureAwait(true);
         }
@@ -545,6 +623,7 @@ public partial class MainWindow : Window
         SetImportButtonsEnabled(canEnterWorkbench && !_importBusy);
         UpdateFixedSpeechProjection();
         UpdateInterludeProjection();
+        UpdateEffectCycleProjection();
         UpdateMicrophoneProjection();
         UpdateRtmpProjection();
         UpdateVirtualCameraProjection();
@@ -562,12 +641,29 @@ public partial class MainWindow : Window
 
     private AudioPcmMixPolicy CreateBaseAudioMixPolicy()
     {
-        var priority = _audioPriority.Snapshot;
-        return new(
-            BaseDuckingDb: priority.MediaDucked ? _interludeConfig.DuckingDepthDb : 0,
-            MuteBase: priority.MediaMuted,
-            OverlayGainDb: priority.InterludeMuted ? -120 : _interludeConfig.VolumeDb);
+        return CreateAudioMixPolicy(
+            _audioPriority.Snapshot,
+            GetOutputVolumeGainDb(),
+            _interludeConfig.DuckingDepthDb,
+            _interludeConfig.VolumeDb);
     }
+
+    /// <summary>
+    /// 将优先级快照转换为最终 PCM 混音策略。
+    /// 固定话术和麦克风都写入同一 overlay 总线；它们只应静音/duck 基础轨，
+    /// 不能因为 <see cref="AudioPrioritySnapshot.InterludeMuted" /> 而把自身也静音。
+    /// </summary>
+    internal static AudioPcmMixPolicy CreateAudioMixPolicy(
+        AudioPrioritySnapshot priority,
+        double outputGainDb,
+        double duckingDepthDb,
+        double overlayGainDb) =>
+        new(
+            BaseGainDb: outputGainDb,
+            BaseDuckingDb: priority.MediaDucked ? duckingDepthDb : 0,
+            MuteBase: priority.MediaMuted,
+            OverlayGainDb: overlayGainDb,
+            MuteOverlay: false);
 
     private static ControlPlaneAuthCoordinator? TryCreateAuthCoordinator()
     {
@@ -662,7 +758,17 @@ public partial class MainWindow : Window
             return new ControlPlaneHeartbeatScheduler(
                 auth,
                 CreateHeartbeatStatus,
-                new HeartbeatOutboxStore(outboxPath));
+                new HeartbeatOutboxStore(outboxPath),
+                transitionObserver: transition =>
+                {
+                    _ = Dispatcher.InvokeAsync(() =>
+                    {
+                        if (!_isClosing)
+                        {
+                            _login.ApplyTransition(transition);
+                        }
+                    });
+                });
         }
         catch (ArgumentException)
         {
@@ -687,6 +793,9 @@ public partial class MainWindow : Window
 
         try
         {
+            var pendingLogoutWarning = await _authCoordinator
+                .RetryPendingLogoutAsync(_windowCancellation.Token)
+                .ConfigureAwait(true);
             var transition = await _authCoordinator.RestoreAsync(_windowCancellation.Token).ConfigureAwait(true);
             if (_isClosing || _windowCancellation.IsCancellationRequested)
             {
@@ -697,6 +806,12 @@ public partial class MainWindow : Window
             {
                 _login.ApplyTransition(transition);
                 _state.SetStatus(transition.Error?.Message ?? "已尝试恢复控制面会话");
+            }
+
+            if (pendingLogoutWarning is not null)
+            {
+                _login.ApplyWarning(pendingLogoutWarning);
+                _state.SetStatus(pendingLogoutWarning);
             }
 
             if (_login.CanEnterWorkbench)
@@ -711,6 +826,10 @@ public partial class MainWindow : Window
         catch (InvalidOperationException exception)
         {
             _login.ApplyError(exception.Message);
+        }
+        catch (Exception)
+        {
+            _login.ApplyError("控制面会话恢复失败，请重新登录。");
         }
     }
 
@@ -747,7 +866,7 @@ public partial class MainWindow : Window
             // 同上。
         }
 
-        var playbackState = _mediaPool.Snapshot.PlaybackState.ToString().ToLowerInvariant();
+        var playbackState = MapHeartbeatPlaybackState(_mediaPool.Snapshot.PlaybackState);
         return new HeartbeatStatusDto(
             diskFreeBytes,
             Environment.WorkingSet,
@@ -759,6 +878,14 @@ public partial class MainWindow : Window
             null,
             playbackState);
     }
+
+    internal static string MapHeartbeatPlaybackState(PlaybackState state) => state switch
+    {
+        PlaybackState.Ready or PlaybackState.Stopped => "idle",
+        PlaybackState.Playing => "playing",
+        PlaybackState.Paused => "paused",
+        _ => "error",
+    };
 
     private void UpdateFinalEffectButtons()
     {

@@ -140,6 +140,21 @@ public static class AudioPcmMixer
         return true;
     }
 
+    /// <summary>将用户界面的 0～100% 输出音量转换为 PCM 基础轨 dB 增益。</summary>
+    public static bool TryGetOutputVolumeGainDb(double percent, out double decibels)
+    {
+        if (!double.IsFinite(percent) || percent is < 0 or > 100)
+        {
+            decibels = 0;
+            return false;
+        }
+
+        decibels = percent <= 0
+            ? MinGainDb
+            : 20 * Math.Log10(percent / 100);
+        return double.IsFinite(decibels) && decibels is >= MinGainDb and <= 0;
+    }
+
     /// <summary>
     /// 对一段基础媒体 PCM 原地应用静音/duck/增益策略。调用方提供已分配的缓冲，
     /// 不创建临时数组；用于解码线程在写入最终总线前收敛共享音频优先级。

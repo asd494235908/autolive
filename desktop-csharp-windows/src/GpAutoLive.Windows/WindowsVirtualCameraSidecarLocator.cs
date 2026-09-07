@@ -31,8 +31,14 @@ public static class WindowsVirtualCameraSidecarLocator
     /// <summary>可选的本机资源包根目录环境变量，仅用于开发/安装验证。</summary>
     public const string InstallRootEnvironmentVariable = "AUTOLIVE_AKVIRTUALCAMERA_ROOT";
 
-    /// <summary>资源包内固定的 sidecar 相对路径。</summary>
+    /// <summary>正式资源 staging 使用的 sidecar 相对路径。</summary>
     public static readonly string RelativeExecutablePath = Path.Combine(
+        "akvirtualcamera",
+        "bin",
+        WindowsVirtualCameraSidecarLaunchPlanBuilder.SidecarFileName);
+
+    /// <summary>兼容 v1 旧资源包的 sidecar 相对路径。</summary>
+    public static readonly string LegacyRelativeExecutablePath = Path.Combine(
         "virtual-camera",
         "bin",
         WindowsVirtualCameraSidecarLaunchPlanBuilder.SidecarFileName);
@@ -53,16 +59,30 @@ public static class WindowsVirtualCameraSidecarLocator
         }
 
         var executablePath = Path.Combine(root, RelativeExecutablePath);
-        if (!File.Exists(executablePath))
+        if (File.Exists(executablePath))
         {
-            return new(WindowsVirtualCameraSidecarProbeCode.NotFound);
+            if (WindowsVirtualCameraSidecarLaunchPlanBuilder.TryResolveValidatedSidecar(
+                    executablePath,
+                    out var validatedPath))
+            {
+                return CreateAvailableResult(validatedPath);
+            }
+
+            return new(WindowsVirtualCameraSidecarProbeCode.InvalidSidecar);
         }
 
-        return WindowsVirtualCameraSidecarLaunchPlanBuilder.TryResolveValidatedSidecar(
+        executablePath = Path.Combine(root, LegacyRelativeExecutablePath);
+        if (File.Exists(executablePath)
+            && WindowsVirtualCameraSidecarLaunchPlanBuilder.TryResolveValidatedSidecar(
                 executablePath,
-                out var validatedPath)
-            ? CreateAvailableResult(validatedPath)
-            : new(WindowsVirtualCameraSidecarProbeCode.InvalidSidecar);
+                out var legacyValidatedPath))
+        {
+            return CreateAvailableResult(legacyValidatedPath);
+        }
+
+        return File.Exists(executablePath)
+            ? new(WindowsVirtualCameraSidecarProbeCode.InvalidSidecar)
+            : new(WindowsVirtualCameraSidecarProbeCode.NotFound);
     }
 
     /// <summary>按开发环境变量或应用目录探测 sidecar。</summary>

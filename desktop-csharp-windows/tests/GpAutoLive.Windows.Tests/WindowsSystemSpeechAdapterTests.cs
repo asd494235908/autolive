@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using GpAutoLive.Contracts;
+using GpAutoLive.Media;
 using GpAutoLive.Windows;
 
 namespace GpAutoLive.Windows.Tests;
@@ -6,6 +8,51 @@ namespace GpAutoLive.Windows.Tests;
 [TestClass]
 public sealed class WindowsSystemSpeechAdapterTests
 {
+    [TestMethod]
+    public async Task Speech_requires_an_active_final_pcm_bus_before_starting_sapi()
+    {
+        var bridge = new FakeBridge();
+        await using var adapter = new WindowsSystemSpeechAdapter(
+            bridge,
+            finalPcmBusProvider: static () => null);
+
+        var result = await adapter.SpeakAsync(
+            FixedSpeechCommandDto.Speak("speech-no-bus", "没有总线不得回退到默认设备"));
+
+        Assert.IsFalse(result.IsAccepted);
+        Assert.AreEqual(WindowsSpeechFailureCode.FinalPcmBusUnavailable, result.Error?.Code);
+        Assert.AreEqual(0, bridge.StartCount);
+        Assert.AreEqual(WindowsSpeechAdapterState.Idle, result.Snapshot.State);
+    }
+
+    [TestMethod]
+    public async Task Speech_pcm_is_published_to_the_final_bus_and_cancel_discards_pending_overlay()
+    {
+        using var bus = new FinalPcmBus(capacityFrames: 8, channels: 1);
+        var bridge = new FakeBridge();
+        await using var adapter = new WindowsSystemSpeechAdapter(
+            bridge,
+            finalPcmBusProvider: () => bus);
+
+        var speakTask = adapter.SpeakAsync(FixedSpeechCommandDto.Speak("speech-pcm", "进入最终 PCM"));
+        var operation = await bridge.WaitForOperationAsync(0);
+        operation.MarkStarted();
+        var accepted = await speakTask;
+
+        Assert.IsTrue(operation.PublishPcm16(16_384));
+        Assert.AreEqual(1, bus.OutputOverlayBuffer.Snapshot.AvailableFrames);
+        Assert.IsTrue(adapter.AudioPrioritySnapshot.MediaMuted);
+        Assert.IsTrue(adapter.AudioPrioritySnapshot.InterludeMuted);
+
+        var cancelled = await adapter.CancelAsync("speech-pcm");
+
+        Assert.AreEqual(WindowsSpeechAdapterState.Cancelled, cancelled.Snapshot.State);
+        Assert.AreEqual(0, bus.OutputOverlayBuffer.Snapshot.AvailableFrames);
+        Assert.AreEqual(0, bus.RtmpOverlayBuffer.Snapshot.AvailableFrames);
+        Assert.AreEqual(WindowsSpeechAdapterState.Cancelled,
+            (await accepted.Completion!.WaitAsync(TimeSpan.FromSeconds(1))).Snapshot.State);
+    }
+
     [TestMethod]
     public async Task Speak_marks_playing_after_bridge_start_and_snapshot_contains_no_text()
     {
@@ -209,10 +256,12 @@ public sealed class WindowsSystemSpeechAdapterTests
         public Task<IWindowsSpeechOperation> StartAsync(
             string text,
             string? voiceKey,
+            int pcmChannels,
+            Func<ReadOnlyMemory<byte>, bool>? pcmSink,
             CancellationToken cancellationToken = default)
         {
             StartCount++;
-            var operation = new FakeOperation(StartError);
+            var operation = new FakeOperation(StartError, pcmSink);
             Operations.Add(operation);
             OperationCreated.TrySetResult(operation);
             OperationCreated = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -236,7 +285,9 @@ public sealed class WindowsSystemSpeechAdapterTests
         }
     }
 
-    private sealed class FakeOperation(WindowsSpeechError? startError) : IWindowsSpeechOperation
+    private sealed class FakeOperation(
+        WindowsSpeechError? startError,
+        Func<ReadOnlyMemory<byte>, bool>? pcmSink) : IWindowsSpeechOperation
     {
         private readonly TaskCompletionSource<WindowsSpeechBridgeStartResult> _started =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -247,6 +298,19 @@ public sealed class WindowsSystemSpeechAdapterTests
         public Task<WindowsSpeechBridgeCompletion> Completion => _completion.Task;
         public int CancelCount { get; private set; }
         public int DisposeCount { get; private set; }
+
+        public bool PublishPcm16(params short[] samples)
+        {
+            var bytes = new byte[checked(samples.Length * sizeof(short))];
+            for (var index = 0; index < samples.Length; index++)
+            {
+                BinaryPrimitives.WriteInt16LittleEndian(
+                    bytes.AsSpan(index * sizeof(short), sizeof(short)),
+                    samples[index]);
+            }
+
+            return pcmSink?.Invoke(bytes) ?? false;
+        }
 
         public void MarkStarted(bool success = true, WindowsSpeechError? error = null) =>
             _started.TrySetResult(new(success, error ?? startError));
