@@ -228,8 +228,37 @@ func TestMigration23ForeignKeyContractCoversAllProductReferences(t *testing.T) {
 }
 
 func TestLatestVersionIncludesLoginSecurityMigrations(t *testing.T) {
-	if LatestVersion != 27 {
-		t.Fatalf("LatestVersion = %d, want 27", LatestVersion)
+	if LatestVersion != 28 {
+		t.Fatalf("LatestVersion = %d, want 28", LatestVersion)
+	}
+}
+
+func TestMigration28AddsScopedClientSyncFacts(t *testing.T) {
+	payload, err := fs.ReadFile(FS, "0028_douyin_desktop_user_asset_sync.up.sql")
+	if err != nil {
+		t.Fatalf("read migration 0028: %v", err)
+	}
+	sql := strings.Join(strings.Fields(string(payload)), " ")
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS client_sync_workspaces",
+		"PRIMARY KEY (product, user_id)",
+		"FOREIGN KEY (user_id, product) REFERENCES user_products(user_id, product)",
+		"current_revision BIGINT NOT NULL DEFAULT 0 CHECK (current_revision >= 0)",
+		"CREATE TABLE IF NOT EXISTS client_sync_items",
+		"PRIMARY KEY (product, user_id, kind, item_id)",
+		"revision BIGINT NOT NULL CHECK (revision > 0)",
+		"deleted BOOLEAN NOT NULL DEFAULT FALSE",
+		"octet_length(payload_jsonb::text) <= 262144",
+		"CREATE TABLE IF NOT EXISTS client_sync_mutations",
+		"PRIMARY KEY (product, user_id, device_id, mutation_id)",
+		"request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$')",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0028 is missing scoped sync fragment %q", fragment)
+		}
+	}
+	if strings.Contains(sql, "REFERENCES devices(id, product, user_id)") {
+		t.Fatal("migration 0028 must not keep device-history foreign keys that block existing device unbind transitions")
 	}
 }
 

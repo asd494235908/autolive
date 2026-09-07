@@ -50,7 +50,7 @@ Renderer 永远不直接持有 autoLive Token，也不放宽 Tauri CSP。远程�
 
 - 每个安装生成一次随机 `device_id`，格式为 `dydesk_<32位小写十六进制>`，保存在 app-data 的非秘密配置中；不采集 MAC、硬盘序列号或其他硬件指纹。
 - 登录成功后 sidecar 使用现有 `/api/v1/client/activate` 自动绑定设备。autoLive 当前授权是管理员预先绑定到软件账号的设备额度，不要求用户输入明文激活码。
-- 未分配授权、授权过期、设备数超限、用户/产品成员/设备被禁用时 fail-closed，并显示服务端稳定错误。
+- 未分配授权、激活码撤销或过期、设备数超限、用户/产品成员/设备被禁用时 fail-closed，并显示服务端稳定错误；Profile 与同步端点执行相同的激活码状态边界。
 - 同一账号可在授权 `max_devices` 范围内绑定多台电脑；授权边界由 autoLive PostgreSQL 和服务端检查执行。
 - 登录完成后读取 `/api/v1/client/profile`；只有 `product=douyin_desktop`、用户与设备均有效时进入产品。
 - 本期要求在线授权。云端不可达时允许停留在登录/错误页，不自行延长权益，也不删除本地数据。
@@ -71,6 +71,8 @@ Renderer 永远不直接持有 autoLive Token，也不放宽 Tauri CSP。远程�
 - `memory`：可复用场景、回复模式、标签、排除项、置信度、生命周期和 revision；只带脱敏来源引用，不复制本地反馈/评论完整链。
 
 知识同步以规范化文本和结构化分块为事实，不上传原文件二进制。目标设备按同步事实重建本地可读副本和 FTS/LanceDB 派生索引。
+
+语义标识固定为：模型配置 `global-model-config`，人设 `global-persona-v{version}`，策略 `global-policy-v{version}`，且版本号必须与 payload 一致。知识项必须保持来源→文档→分块/规则的引用完整；规则只能引用同一文档且 `enabled=true` 的分块，分块迁移文档或停用前必须先消除既有规则引用，删除按规则→分块→文档→来源执行。
 
 ### 5.2 不同步内容
 
@@ -102,12 +104,13 @@ Renderer 永远不直接持有 autoLive Token，也不放宽 Tauri CSP。远程�
   - 新建要求 `base_revision=0`；更新/删除要求等于服务端当前 revision。
   - 冲突返回 `409 SYNC_CONFLICT`，不部分伪装成功。
 
-所有同步请求必须是 `douyin_desktop` 桌面会话、已绑定有效设备，并从认证上下文取得 product/user/device；请求体不能替换作用域。
+所有同步请求必须是 `douyin_desktop` 桌面会话，且产品、产品成员、用户、设备和未过期激活绑定均有效，并从认证上下文取得 product/user/device；请求体不能替换作用域。
 
 ### 6.3 边界
 
 - kind 必须来自固定 allowlist；`item_id`、数量、层级深度、字符串长度和 payload 字节数均有上限。
 - 服务端拒绝秘密字段名、非 JSON 数值、未知字段和不符合 kind schema 的 payload。
+- 服务端拒绝不符合固定语义标识、缺失父项、引用禁用分块、分块更新破坏既有规则、跨文档规则引用或删除后仍留下活动子项的变更。
 - 同步读取只返回当前用户产品空间；管理员列表和其他产品不能旁路读取正文。
 - 不新增 WebSocket；启动、手动同步和 sidecar 有界周期同步足够满足本期目标。
 
@@ -136,8 +139,9 @@ Renderer 永远不直接持有 autoLive Token，也不放宽 Tauri CSP。远程�
 2. 读取当前本地同步项并计算规范化 SHA-256。
 3. 分页拉取 `after_revision` 之后的云端变化。
 4. 若本地当前哈希仍等于上次同步哈希，应用云变化；若两端都修改同一项，记录冲突并保留本地内容，不静默覆盖。
+   远端父项或被引用项墓碑遇到本地依赖时也形成显式冲突并阻止依赖上传；用户选择云端版本后按依赖逆序删除。
 5. 扫描本地尚未同步的变化，以保存的云 revision 为 `base_revision` 分批推送。
-6. 写入成功回执和 cursor；按需重建知识/记忆派生索引。
+6. 远端应用先写入 SQLite finalize journal；写入成功回执和 cursor 后按需重建知识/记忆派生索引，崩溃重启按依赖顺序重放。
 
 首次同步规则：云空间为空时上传本地资产；云空间非空时先拉取并合并不同 ID。单例 `model_config` 以云端为准，但本机 Keychain Key 保留；相同 ID 的双向修改进入冲突。
 

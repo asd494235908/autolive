@@ -1679,6 +1679,23 @@ func (s *ControlPlane) getClientProfile(ctx context.Context, userID, deviceID st
 		if user.Status != controlplane.UserStatusActive {
 			return controlplane.ClientProfile{}, controlplane.ErrUserDisabled
 		}
+		if product == controlplane.ProductDouyinDesktop {
+			productReader, ok := s.repository.(store.ProductRepository)
+			if !ok {
+				return controlplane.ClientProfile{}, store.ErrNormalizedProductRepositoryRequired
+			}
+			productSummary, err := productReader.GetProduct(ctx, product)
+			if err != nil {
+				return controlplane.ClientProfile{}, err
+			}
+			membership, err := productReader.GetUserProductMembership(ctx, user.ID, product)
+			if err != nil {
+				return controlplane.ClientProfile{}, err
+			}
+			if productSummary.Status != "active" || membership.Status != "active" {
+				return controlplane.ClientProfile{}, controlplane.ErrForbidden
+			}
+		}
 		var device controlplane.DeviceSummary
 		var deviceErr error
 		if product != "" {
@@ -1721,6 +1738,13 @@ func (s *ControlPlane) getClientProfile(ctx context.Context, userID, deviceID st
 				return controlplane.ClientProfile{}, err
 			}
 			profile.Device.ActivationExpiresAt = formatActivationExpiry(expiresAt)
+		} else if product == controlplane.ProductDouyinDesktop {
+			return controlplane.ClientProfile{}, controlplane.ErrDeviceBindingRequired
+		}
+		if product == controlplane.ProductDouyinDesktop {
+			if err := validateDesktopActivationExpiry(profile.Device.ActivationExpiresAt, s.repository.Now()); err != nil {
+				return controlplane.ClientProfile{}, err
+			}
 		}
 		return profile, nil
 	}
@@ -1731,6 +1755,22 @@ func (s *ControlPlane) getClientProfile(ctx context.Context, userID, deviceID st
 		}
 		if user.Status != controlplane.UserStatusActive {
 			return controlplane.ClientProfile{}, controlplane.ErrUserDisabled
+		}
+		if product == controlplane.ProductDouyinDesktop {
+			productSummary, ok := state.Products[string(product)]
+			if !ok || productSummary.Status != "active" {
+				return controlplane.ClientProfile{}, controlplane.ErrForbidden
+			}
+			membershipActive := false
+			for _, membership := range state.UserProducts {
+				if membership.UserID == user.ID && membership.Product == product && membership.Status == "active" {
+					membershipActive = true
+					break
+				}
+			}
+			if !membershipActive {
+				return controlplane.ClientProfile{}, controlplane.ErrForbidden
+			}
 		}
 		device, err := resolveOwnedDevice(state, userID, deviceID)
 		if err != nil {
@@ -1749,7 +1789,12 @@ func (s *ControlPlane) getClientProfile(ctx context.Context, userID, deviceID st
 			Device:      device,
 			Permissions: permissionsForRole(user.Role),
 		}
-		profile.Device.ActivationExpiresAt = activationExpiryForDevice(state, user.ID, device.ID)
+		profile.Device.ActivationExpiresAt = activationExpiryForDevice(state, user.ID, device.ID, product)
+		if product == controlplane.ProductDouyinDesktop {
+			if err := validateDesktopActivationExpiry(profile.Device.ActivationExpiresAt, s.repository.Now()); err != nil {
+				return controlplane.ClientProfile{}, err
+			}
+		}
 		return profile, nil
 	})
 	if err != nil {
@@ -1757,6 +1802,20 @@ func (s *ControlPlane) getClientProfile(ctx context.Context, userID, deviceID st
 	}
 	profile.Device = decorateDeviceSummary(profile.Device, s.repository.Now())
 	return profile, nil
+}
+
+func validateDesktopActivationExpiry(expiresAt *string, now time.Time) error {
+	if expiresAt == nil {
+		return controlplane.ErrDeviceBindingRequired
+	}
+	parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(*expiresAt))
+	if err != nil {
+		return controlplane.ErrDeviceBindingRequired
+	}
+	if !parsed.After(now) {
+		return controlplane.ErrAccountActivationExpired
+	}
+	return nil
 }
 
 func (s *ControlPlane) RecordHeartbeat(ctx context.Context, idempotencyKey, userID string, input controlplane.HeartbeatInput) (controlplane.HeartbeatResult, error) {
@@ -4476,15 +4535,25 @@ func decorateDeviceSummary(device controlplane.DeviceSummary, now time.Time) con
 	return device
 }
 
-func activationExpiryForDevice(state *store.State, userID, deviceID string) *string {
+func activationExpiryForDevice(state *store.State, userID, deviceID string, product controlplane.ProductCode) *string {
+	valid := func(record store.ActivationCodeRecord) bool {
+		code := record.ActivationCode
+		storedProduct := code.Product
+		if storedProduct == "" {
+			storedProduct = controlplane.ProductAutoLive
+		}
+		return code.UserID == userID &&
+			(product == "" || storedProduct == product) &&
+			(code.Status == controlplane.ActivationCodeStatusActive || code.Status == controlplane.ActivationCodeStatusUsed)
+	}
 	if codeID := state.ActivationDeviceBindings[deviceID]; codeID != "" {
 		record, ok := state.ActivationCodes[codeID]
-		if ok && record.ActivationCode.UserID == userID {
+		if ok && valid(record) {
 			return formatActivationExpiryString(record.ActivationCode.ExpiresAt)
 		}
 	}
 	for _, record := range state.ActivationCodes {
-		if record.UsedByUserID == userID && record.UsedByDeviceID == deviceID {
+		if valid(record) && record.UsedByUserID == userID && record.UsedByDeviceID == deviceID {
 			return formatActivationExpiryString(record.ActivationCode.ExpiresAt)
 		}
 	}

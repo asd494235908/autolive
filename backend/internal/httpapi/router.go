@@ -88,6 +88,11 @@ func NewRouterWithRepositoryAndSecretStoreAndSessionStoreAndOptionsAndHealthTele
 	registerAuthRoutes(mux, authenticator)
 	registerAdminRBACRoutes(mux, controlPlane, authenticator)
 	registerControlPlaneRoutes(mux, controlPlane, authenticator)
+	var clientSyncRepository store.ClientSyncRepository
+	if candidate, ok := repository.(store.ClientSyncRepository); ok {
+		clientSyncRepository = candidate
+	}
+	registerClientSyncRoutes(mux, controlPlane, authenticator, clientSyncRepository)
 	mux.Handle("/api/v1/health", healthHandler(serviceVersion))
 	mux.Handle("/api/v1/livez", healthHandler(serviceVersion))
 	mux.Handle("/api/v1/readyz", readinessHandler(serviceVersion, func(ctx context.Context) error {

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"regexp"
 	"testing"
 	"time"
@@ -24,7 +25,7 @@ func TestPostgresRepositoryGetActivationExpiryReadsBoundCodeExpiry(t *testing.T)
 
 	mock.ExpectBegin()
 	expectNormalizedPageCoverage(mock)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT ac.expires_at")).WithArgs("usr_1", "dev_1").
+	mock.ExpectQuery("(?s)"+regexp.QuoteMeta("SELECT ac.expires_at")+".*"+regexp.QuoteMeta("ac.status IN ('active', 'used')")).WithArgs("usr_1", "dev_1").
 		WillReturnRows(sqlmock.NewRows([]string{"expires_at"}).AddRow(expiresAt))
 	mock.ExpectCommit()
 
@@ -34,6 +35,31 @@ func TestPostgresRepositoryGetActivationExpiryReadsBoundCodeExpiry(t *testing.T)
 	}
 	if actual == nil || !actual.Equal(expiresAt) {
 		t.Fatalf("activation expiry = %v, want %v", actual, expiresAt)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestPostgresRepositoryGetActivationExpiryRejectsRevokedBinding(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer database.Close()
+	repository, err := NewPostgresRepositoryWithSecretStoreAndModelReadSource(database, time.Now, nil, ModelReadSourceNormalized)
+	if err != nil {
+		t.Fatalf("constructor error = %v", err)
+	}
+
+	mock.ExpectBegin()
+	expectNormalizedPageCoverage(mock)
+	mock.ExpectQuery("(?s)"+regexp.QuoteMeta("SELECT ac.expires_at")+".*"+regexp.QuoteMeta("ac.status IN ('active', 'used')")).WithArgs("usr_1", "dev_1").WillReturnError(sql.ErrNoRows)
+	mock.ExpectCommit()
+
+	actual, err := repository.GetActivationExpiry(context.Background(), "usr_1", "dev_1")
+	if err != nil || actual != nil {
+		t.Fatalf("GetActivationExpiry() = %v, %v; want nil, nil", actual, err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)

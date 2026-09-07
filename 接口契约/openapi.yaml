@@ -276,6 +276,100 @@ paths:
           $ref: '#/components/responses/RequestTimeout'
         '500':
           $ref: '#/components/responses/InternalServerError'
+  /api/v1/client/sync/items:
+    get:
+      tags: [Client]
+      summary: 按全局 revision 增量读取 douyin-desktop 用户资产
+      description: 作用域只来自已认证的 desktop 会话及其有效设备绑定；仅支持 product=douyin_desktop。
+      operationId: listClientSyncItems
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: after_revision
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 200
+      responses:
+        '200':
+          description: 按 revision 升序返回当前事实或删除墓碑
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientSyncPageResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      tags: [Client]
+      summary: 使用 CAS 与 mutation 幂等写入 douyin-desktop 用户资产
+      description: |
+        每项使用自带 mutation_id 保证幂等；请求体不得提交 user、product 或 device 作用域。
+        新建项 base_revision=0；更新或删除必须等于当前 revision。批内任一冲突时整批不提交。
+        model_config 的 item_id 固定为 global-model-config；persona_version / policy_version
+        分别使用 global-persona-v{version} / global-policy-v{version}，且版本必须与 payload 一致。
+        知识项必须按来源、文档、分块/规则的父子顺序写入；规则只能引用同一文档的活动分块。
+        删除父项前必须先按规则、分块、文档、来源的顺序删除活动子项。
+      operationId: writeClientSyncItems
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClientSyncWriteRequest'
+      responses:
+        '200':
+          description: 写入已提交，或按相同 mutation_id 返回原回执
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientSyncWriteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/client/model-leases:
     post:
       tags: [Model Leases]
@@ -2915,6 +3009,275 @@ components:
           type: array
           items:
             type: string
+    ClientSyncId:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+    ClientSyncKind:
+      type: string
+      enum: [persona_version, policy_version, model_config, knowledge_source, knowledge_document, knowledge_chunk, knowledge_rule, memory]
+    ClientSyncMutation:
+      type: object
+      additionalProperties: false
+      required: [mutation_id, kind, item_id, base_revision, deleted]
+      properties:
+        mutation_id:
+          $ref: '#/components/schemas/ClientSyncId'
+        kind:
+          $ref: '#/components/schemas/ClientSyncKind'
+        item_id:
+          $ref: '#/components/schemas/ClientSyncId'
+          description: 模型配置与人设/策略版本使用固定语义标识；知识项和记忆使用稳定业务标识。
+        base_revision:
+          type: integer
+          format: int64
+          minimum: 0
+        deleted:
+          type: boolean
+        payload:
+          $ref: '#/components/schemas/ClientSyncPayload'
+          description: 服务端按 kind 精确匹配 schema；单项序列化后最多 256 KiB，并递归拒绝秘密键。删除墓碑必须省略。
+      allOf:
+        - if:
+            properties:
+              deleted:
+                const: false
+          then:
+            required: [payload]
+        - if:
+            properties:
+              deleted:
+                const: true
+          then:
+            not:
+              required: [payload]
+    ClientSyncWriteRequest:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/ClientSyncMutation'
+    ClientSyncItem:
+      type: object
+      additionalProperties: false
+      required: [kind, item_id, revision, deleted, updated_by_device_id, updated_at]
+      properties:
+        kind:
+          $ref: '#/components/schemas/ClientSyncKind'
+        item_id:
+          $ref: '#/components/schemas/ClientSyncId'
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
+        deleted:
+          type: boolean
+        payload:
+          $ref: '#/components/schemas/ClientSyncPayload'
+        updated_by_device_id:
+          $ref: '#/components/schemas/ClientSyncId'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+      allOf:
+        - if:
+            properties:
+              deleted:
+                const: false
+          then:
+            required: [payload]
+        - if:
+            properties:
+              deleted:
+                const: true
+          then:
+            not:
+              required: [payload]
+    ClientSyncReceipt:
+      type: object
+      additionalProperties: false
+      required: [mutation_id, kind, item_id, revision, deleted]
+      properties:
+        mutation_id:
+          $ref: '#/components/schemas/ClientSyncId'
+        kind:
+          $ref: '#/components/schemas/ClientSyncKind'
+        item_id:
+          $ref: '#/components/schemas/ClientSyncId'
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
+        deleted:
+          type: boolean
+    ClientSyncPageResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, items, next_cursor, has_more, server_revision]
+      properties:
+        request_id:
+          type: string
+        items:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/ClientSyncItem'
+        next_cursor:
+          type: integer
+          format: int64
+          minimum: 0
+        has_more:
+          type: boolean
+        server_revision:
+          type: integer
+          format: int64
+          minimum: 0
+    ClientSyncWriteResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, items, server_revision]
+      properties:
+        request_id:
+          type: string
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/ClientSyncReceipt'
+        server_revision:
+          type: integer
+          format: int64
+          minimum: 0
+    ClientSyncPayload:
+      oneOf:
+        - $ref: '#/components/schemas/PersonaVersionSyncPayload'
+        - $ref: '#/components/schemas/PolicyVersionSyncPayload'
+        - $ref: '#/components/schemas/ModelConfigSyncPayload'
+        - $ref: '#/components/schemas/KnowledgeSourceSyncPayload'
+        - $ref: '#/components/schemas/KnowledgeDocumentSyncPayload'
+        - $ref: '#/components/schemas/KnowledgeChunkSyncPayload'
+        - $ref: '#/components/schemas/KnowledgeRuleSyncPayload'
+        - $ref: '#/components/schemas/MemorySyncPayload'
+    PersonaVersionSyncPayload:
+      type: object
+      additionalProperties: false
+      required: [version, content, created_at]
+      properties:
+        version: {type: integer, minimum: 1}
+        content: {type: object, maxProperties: 200}
+        created_at: {$ref: '#/components/schemas/Timestamp'}
+    PolicyVersionSyncPayload:
+      type: object
+      additionalProperties: false
+      required: [version, score_threshold, minimum_confidence, daily_send_quota, automation_level, auto_send_enabled, content, created_at]
+      properties:
+        version: {type: integer, minimum: 1}
+        score_threshold: {type: number, minimum: 0, maximum: 1}
+        minimum_confidence: {type: number, minimum: 0, maximum: 1}
+        daily_send_quota: {type: integer, minimum: 0}
+        automation_level: {type: string, enum: [disabled, dry_run, manual, limited, regular]}
+        auto_send_enabled: {type: boolean}
+        content: {type: object, maxProperties: 200}
+        created_at: {$ref: '#/components/schemas/Timestamp'}
+    ModelConfigSyncPayload:
+      type: object
+      additionalProperties: false
+      required: [retrieval_mode, chat_base_url, chat_model, embedding_base_url, embedding_model, embedding_dimensions, config_version, updated_at]
+      properties:
+        retrieval_mode: {type: string, enum: [economy, high_quality]}
+        chat_base_url:
+          type: string
+          maxLength: 4096
+          format: uri
+          description: 允许 HTTP 或 HTTPS；禁止 URL 用户信息、query 和 fragment。HTTP 仅适用于用户明确配置的本地或受信模型服务。
+        chat_model: {type: string, maxLength: 4096}
+        embedding_base_url:
+          type: string
+          maxLength: 4096
+          format: uri
+          description: 允许 HTTP 或 HTTPS；禁止 URL 用户信息、query 和 fragment。HTTP 仅适用于用户明确配置的本地或受信模型服务。
+        embedding_model: {type: string, maxLength: 4096}
+        embedding_dimensions: {type: [integer, 'null'], minimum: 1}
+        config_version: {type: integer, minimum: 1}
+        updated_at: {$ref: '#/components/schemas/Timestamp'}
+    KnowledgeSourceSyncPayload:
+      type: object
+      additionalProperties: false
+      required: [source_type, title, original_name, source_key, content_hash, status, created_at, updated_at]
+      properties:
+        source_type: {type: string, enum: [file, manual, web]}
+        title: {type: string, maxLength: 4096}
+        original_name: {type: string, maxLength: 4096}
+        source_key: {type: [string, 'null'], maxLength: 4096}
+        content_hash: {type: [string, 'null'], pattern: '^[a-f0-9]{64}$'}
+        status: {type: string, enum: [active, disabled, failed]}
+        created_at: {$ref: '#/components/schemas/Timestamp'}
+        updated_at: {$ref: '#/components/schemas/Timestamp'}
+    KnowledgeDocumentSyncPayload:
+      type: object
+      additionalProperties: false
+      required: [source_id, version, content_hash, parser_version, chunker_version, status, metadata, created_at]
+      properties:
+        source_id: {$ref: '#/components/schemas/ClientSyncId'}
+        version: {type: integer, minimum: 1}
+        content_hash: {$ref: '#/components/schemas/Sha256Hex'}
+        parser_version: {type: string, maxLength: 4096}
+        chunker_version: {type: string, maxLength: 4096}
+        status: {type: string, enum: [parsed, indexing, indexed, failed]}
+        metadata: {type: object, maxProperties: 200}
+        created_at: {$ref: '#/components/schemas/Timestamp'}
+    KnowledgeChunkSyncPayload:
+      type: object
+      additionalProperties: false
+      required: [document_id, ordinal, text, locator, chunker_version, enabled, created_at]
+      properties:
+        document_id: {$ref: '#/components/schemas/ClientSyncId'}
+        ordinal: {type: integer, minimum: 0}
+        text: {type: string, maxLength: 65536}
+        locator: {type: object, maxProperties: 200}
+        chunker_version: {type: string, maxLength: 4096}
+        enabled: {type: boolean}
+        created_at: {$ref: '#/components/schemas/Timestamp'}
+    KnowledgeRuleSyncPayload:
+      type: object
+      additionalProperties: false
+      required: [document_id, condition_kind, condition_text, reply_guidance, literal_terms, record_ids, rule_fingerprint, status, created_at, updated_at]
+      properties:
+        document_id: {$ref: '#/components/schemas/ClientSyncId'}
+        condition_kind: {type: string, enum: [literal_contains, semantic]}
+        condition_text: {type: string, maxLength: 4096}
+        reply_guidance: {type: string, maxLength: 4096}
+        literal_terms: {type: array, maxItems: 200, items: {type: string, maxLength: 4096}}
+        record_ids: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/ClientSyncId'}}
+        rule_fingerprint: {$ref: '#/components/schemas/Sha256Hex'}
+        status: {type: string, enum: [pending, active, rejected]}
+        created_at: {$ref: '#/components/schemas/Timestamp'}
+        updated_at: {$ref: '#/components/schemas/Timestamp'}
+    MemorySyncPayload:
+      type: object
+      additionalProperties: false
+      required: [reusable_situation, response_pattern, tags, exclusions, confidence, revision, expires_at, lifecycle_state, created_at, updated_at, cloud_source_ref]
+      properties:
+        reusable_situation: {type: string, maxLength: 500}
+        response_pattern: {type: string, maxLength: 500}
+        tags: {type: array, maxItems: 20, items: {type: string, maxLength: 128}}
+        exclusions: {type: array, maxItems: 20, items: {type: string, maxLength: 128}}
+        confidence: {type: number, minimum: 0, maximum: 1}
+        revision: {type: integer, minimum: 1}
+        expires_at:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        lifecycle_state: {type: string, enum: [enabled, disabled, deleted]}
+        created_at: {$ref: '#/components/schemas/Timestamp'}
+        updated_at: {$ref: '#/components/schemas/Timestamp'}
+        cloud_source_ref: {$ref: '#/components/schemas/ClientSyncId'}
     CreateModelPoolAccountRequest:
       type: object
       additionalProperties: false

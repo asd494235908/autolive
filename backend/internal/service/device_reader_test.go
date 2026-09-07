@@ -11,9 +11,11 @@ import (
 
 type normalizedDeviceReaderRepository struct {
 	*store.MemoryStore
-	user      controlplane.UserSummary
-	device    controlplane.DeviceSummary
-	expiresAt time.Time
+	user             controlplane.UserSummary
+	device           controlplane.DeviceSummary
+	expiresAt        time.Time
+	productStatus    string
+	membershipStatus string
 }
 
 type normalizedReadOnlyRepository struct{ *store.MemoryStore }
@@ -36,6 +38,30 @@ func (r *normalizedDeviceReaderRepository) GetOwnedDevice(context.Context, strin
 
 func (r *normalizedDeviceReaderRepository) GetActivationExpiry(context.Context, string, string) (*time.Time, error) {
 	return &r.expiresAt, nil
+}
+
+func (r *normalizedDeviceReaderRepository) ListProducts(context.Context) ([]controlplane.ProductSummary, error) {
+	return nil, nil
+}
+
+func (r *normalizedDeviceReaderRepository) GetProduct(_ context.Context, product controlplane.ProductCode) (controlplane.ProductSummary, error) {
+	status := r.productStatus
+	if status == "" {
+		status = "active"
+	}
+	return controlplane.ProductSummary{Code: product, Status: status}, nil
+}
+
+func (r *normalizedDeviceReaderRepository) GetUserProductMembership(_ context.Context, userID string, product controlplane.ProductCode) (controlplane.UserProductMembership, error) {
+	status := r.membershipStatus
+	if status == "" {
+		status = "active"
+	}
+	return controlplane.UserProductMembership{UserID: userID, Product: product, Status: status}, nil
+}
+
+func (r *normalizedDeviceReaderRepository) EnsureUserProductMembership(_ context.Context, userID string, product controlplane.ProductCode) (controlplane.UserProductMembership, error) {
+	return r.GetUserProductMembership(context.Background(), userID, product)
 }
 
 func TestGetClientProfileUsesNormalizedUserAndDeviceReaders(t *testing.T) {
@@ -70,6 +96,58 @@ func TestGetClientProfileForProductRejectsNormalizedDeviceProductMismatch(t *tes
 	_, err := NewControlPlaneWithRepository(repository).GetClientProfileForProduct(context.Background(), "usr_1", "dev_1", controlplane.ProductAutoLive)
 	if err != controlplane.ErrForbidden {
 		t.Fatalf("GetClientProfileForProduct() error = %v, want forbidden", err)
+	}
+}
+
+func TestGetClientProfileForDesktopRejectsExpiredActivation(t *testing.T) {
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	repository := &normalizedDeviceReaderRepository{
+		MemoryStore: store.NewMemoryStore(func() time.Time { return now }),
+		user:        controlplane.UserSummary{ID: "usr_1", Role: controlplane.RoleUser, Status: controlplane.UserStatusActive},
+		device:      controlplane.DeviceSummary{ID: "dev_1", UserID: "usr_1", Product: controlplane.ProductDouyinDesktop, Status: controlplane.DeviceStatusActive},
+		expiresAt:   now,
+	}
+
+	_, err := NewControlPlaneWithRepository(repository).GetClientProfileForProduct(context.Background(), "usr_1", "dev_1", controlplane.ProductDouyinDesktop)
+	if err != controlplane.ErrAccountActivationExpired {
+		t.Fatalf("GetClientProfileForProduct() error = %v, want activation expired", err)
+	}
+}
+
+func TestGetClientProfileForDesktopRejectsInactiveMembership(t *testing.T) {
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	repository := &normalizedDeviceReaderRepository{
+		MemoryStore:      store.NewMemoryStore(func() time.Time { return now }),
+		user:             controlplane.UserSummary{ID: "usr_1", Role: controlplane.RoleUser, Status: controlplane.UserStatusActive},
+		device:           controlplane.DeviceSummary{ID: "dev_1", UserID: "usr_1", Product: controlplane.ProductDouyinDesktop, Status: controlplane.DeviceStatusActive},
+		expiresAt:        now.Add(time.Hour),
+		membershipStatus: "disabled",
+	}
+
+	_, err := NewControlPlaneWithRepository(repository).GetClientProfileForProduct(context.Background(), "usr_1", "dev_1", controlplane.ProductDouyinDesktop)
+	if err != controlplane.ErrForbidden {
+		t.Fatalf("GetClientProfileForProduct() error = %v, want forbidden", err)
+	}
+}
+
+func TestGetClientProfileForDesktopRejectsRevokedMemoryActivation(t *testing.T) {
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	repository := store.NewMemoryStore(func() time.Time { return now })
+	if err := repository.Run(context.Background(), func(state *store.State) error {
+		state.Products[string(controlplane.ProductDouyinDesktop)] = controlplane.ProductSummary{Code: controlplane.ProductDouyinDesktop, Status: "active"}
+		state.UserProducts["usr_1:douyin_desktop"] = controlplane.UserProductMembership{UserID: "usr_1", Product: controlplane.ProductDouyinDesktop, Status: "active"}
+		state.Users["usr_1"] = controlplane.UserSummary{ID: "usr_1", Role: controlplane.RoleUser, Status: controlplane.UserStatusActive}
+		state.Devices["dev_1"] = controlplane.DeviceSummary{ID: "dev_1", UserID: "usr_1", Product: controlplane.ProductDouyinDesktop, Status: controlplane.DeviceStatusActive}
+		state.ActivationCodes["ac_1"] = store.ActivationCodeRecord{ActivationCode: controlplane.ActivationCode{ID: "ac_1", Product: controlplane.ProductDouyinDesktop, UserID: "usr_1", Status: controlplane.ActivationCodeStatusRevoked, ExpiresAt: now.Add(time.Hour).Format(time.RFC3339)}}
+		state.ActivationDeviceBindings["dev_1"] = "ac_1"
+		return nil
+	}); err != nil {
+		t.Fatalf("seed profile state: %v", err)
+	}
+
+	_, err := NewControlPlaneWithRepository(repository).GetClientProfileForProduct(context.Background(), "usr_1", "dev_1", controlplane.ProductDouyinDesktop)
+	if err != controlplane.ErrDeviceBindingRequired {
+		t.Fatalf("GetClientProfileForProduct() error = %v, want binding required", err)
 	}
 }
 

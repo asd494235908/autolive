@@ -73,4 +73,7 @@ var (
 	ErrModelLeaseStateConflict         = NewError(http.StatusConflict, "MODEL_LEASE_STATE_CONFLICT", "模型租约状态不允许当前操作")
 	ErrSecretStoreUnavailable          = NewError(http.StatusServiceUnavailable, "SECRET_STORE_UNAVAILABLE", "服务端密钥存储暂不可用")
 	ErrCommitOutcomeUnknown            = NewError(http.StatusServiceUnavailable, "COMMIT_OUTCOME_UNKNOWN", "服务端无法确认本次写入是否已提交")
+	ErrClientSyncSchemaInvalid         = NewError(http.StatusBadRequest, "SYNC_SCHEMA_INVALID", "同步项不符合允许的数据契约")
+	ErrClientSyncConflict              = NewError(http.StatusConflict, "SYNC_CONFLICT", "同步项已在其他设备更新")
+	ErrClientSyncMutationConflict      = NewError(http.StatusConflict, "SYNC_MUTATION_CONFLICT", "同步幂等标识对应的请求语义冲突")
 )

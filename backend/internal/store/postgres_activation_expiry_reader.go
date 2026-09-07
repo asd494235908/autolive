@@ -33,6 +33,7 @@ func (s *PostgresRepository) GetActivationExpiry(ctx context.Context, userID, de
 			JOIN activation_codes AS ac ON ac.id = binding.activation_code_id
 			WHERE binding.user_id = $1 AND binding.device_id = $2
 			  AND ac.bound_user_id = $1
+			  AND ac.status IN ('active', 'used')
 			ORDER BY binding.bound_at DESC, ac.id DESC
 			LIMIT 1
 		`, userID, deviceID).Scan(&expiresAt)
@@ -63,6 +64,7 @@ func (s *PostgresRepository) GetActivationExpiryForProduct(ctx context.Context, 
 			JOIN activation_codes AS ac ON ac.id = binding.activation_code_id
 			WHERE binding.user_id = $1 AND binding.device_id = $2 AND binding.product = $3
 			  AND ac.bound_user_id = $1 AND ac.product = $3
+			  AND ac.status IN ('active', 'used')
 			ORDER BY binding.bound_at DESC, ac.id DESC
 			LIMIT 1
 		`
