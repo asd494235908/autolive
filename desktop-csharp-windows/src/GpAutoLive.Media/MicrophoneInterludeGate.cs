@@ -135,7 +135,10 @@ public sealed class MicrophoneInterludeGate
                 return CreateSnapshot();
             }
 
-            if (levelDb >= _startThresholdDb)
+            var thresholdDb = _state is MicrophoneInterludeGateState.Armed
+                ? _startThresholdDb
+                : _stopThresholdDb;
+            if (levelDb >= thresholdDb)
             {
                 if (_state is not MicrophoneInterludeGateState.Speaking)
                 {
@@ -145,16 +148,16 @@ public sealed class MicrophoneInterludeGate
 
                 _lastSpeechTimestampMs = nowMs;
             }
-            else if (_state is MicrophoneInterludeGateState.Speaking)
+            else if (_state is MicrophoneInterludeGateState.Speaking or MicrophoneInterludeGateState.Hangover)
             {
-                _state = MicrophoneInterludeGateState.Hangover;
-                IncrementGeneration();
-            }
-            else if (_state is MicrophoneInterludeGateState.Hangover
-                && nowMs - _lastSpeechTimestampMs >= _hangoverMs)
-            {
-                _state = MicrophoneInterludeGateState.Armed;
-                IncrementGeneration();
+                var nextState = nowMs - _lastSpeechTimestampMs >= _hangoverMs
+                    ? MicrophoneInterludeGateState.Armed
+                    : MicrophoneInterludeGateState.Hangover;
+                if (_state != nextState)
+                {
+                    _state = nextState;
+                    IncrementGeneration();
+                }
             }
 
             return CreateSnapshot();

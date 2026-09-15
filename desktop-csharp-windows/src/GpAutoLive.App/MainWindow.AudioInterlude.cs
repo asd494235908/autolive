@@ -13,6 +13,9 @@ namespace GpAutoLive.App;
 
 public partial class MainWindow
 {
+    private readonly SemaphoreSlim _microphoneLifecycle = new(1, 1);
+    private bool _microphoneSnapshotSubscribed;
+
     // 固定话术界面编排保留在此 partial；共享状态仍由 MainWindow.xaml.cs 唯一持有。
 
     private async void SpeakFixedSpeechButton_Click(object sender, RoutedEventArgs e)
@@ -888,115 +891,50 @@ public partial class MainWindow
 
     // 麦克风本地门控界面编排保留在此 partial；共享状态仍由 MainWindow.xaml.cs 唯一持有。
 
-    private async void RefreshAudioDevicesButton_Click(object sender, RoutedEventArgs e) =>
-        await RefreshAudioDevicesAsync().ConfigureAwait(true);
-
-    /// <summary>
-    /// 懒加载并复用一次 PortAudio 设备枚举；播放启动时也调用此入口，
-    /// 避免用户必须先手动点击设备刷新才能播放带音轨媒体。
-    /// </summary>
-    private async Task RefreshAudioDevicesAsync()
+    private async void TestMicrophoneButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!_login.CanEnterWorkbench)
-        {
-            _state.SetStatus("请先完成登录与设备授权");
-            return;
-        }
-
-        RefreshAudioDevicesButton.IsEnabled = false;
-        AudioDeviceStatusText.Text = "正在枚举 PortAudio 输入/输出设备…";
         try
         {
-            var runtime = await EnsureVerifiedMediaRuntimeAsync().ConfigureAwait(true);
-            if (runtime is null)
-            {
-                AudioOutputDeviceComboBox.ItemsSource = null;
-                AudioInputDeviceComboBox.ItemsSource = null;
-                UpdateMicrophoneProjection();
-                AudioDeviceStatusText.Text = "媒体运行资源未校验，无法枚举 PortAudio";
-                return;
-            }
-
-            if (!runtime.TryGetResource("portaudio_x64.dll", out var resource) || resource is null)
-            {
-                AudioOutputDeviceComboBox.ItemsSource = null;
-                AudioInputDeviceComboBox.ItemsSource = null;
-                UpdateMicrophoneProjection();
-                AudioDeviceStatusText.Text = "PortAudio DLL 未安装；不会回退到系统 PATH";
-                _state.SetStatus("PortAudio 运行资源未安装");
-                return;
-            }
-
-            _portAudioEnumerator ??= new WindowsPortAudioDeviceEnumerator();
-            var result = await _portAudioEnumerator
-                .ProbeAsync(resource.AbsolutePath, _windowCancellation.Token)
-                .ConfigureAwait(true);
-            if (_isClosing || _windowCancellation.IsCancellationRequested)
-            {
-                return;
-            }
-
-            if (!result.IsSuccess)
-            {
-                AudioOutputDeviceComboBox.ItemsSource = null;
-                AudioOutputDeviceComboBox.IsEnabled = false;
-                AudioInputDeviceComboBox.ItemsSource = null;
-                AudioInputDeviceComboBox.IsEnabled = false;
-                UpdateMicrophoneProjection();
-                AudioDeviceStatusText.Text = result.Error?.Message ?? "PortAudio 设备枚举失败";
-                _state.SetStatus("PortAudio 设备枚举失败；未启动音频流");
-                return;
-            }
-
-            var outputDevices = result.Snapshot.Devices
-                .Where(static device => device.MaxOutputChannels > 0)
-                .ToArray();
-            AudioOutputDeviceComboBox.ItemsSource = outputDevices;
-            AudioOutputDeviceComboBox.IsEnabled = outputDevices.Length > 0;
-            if (result.Snapshot.DefaultOutputDevice is int defaultIndex
-                && outputDevices.Any(device => device.Index == defaultIndex))
-            {
-                AudioOutputDeviceComboBox.SelectedValue = defaultIndex;
-            }
-            else if (outputDevices.Length > 0)
-            {
-                // 某些驱动不会返回 PortAudio 默认设备索引；仍选择第一个
-                // 已验证的输出设备，避免“枚举成功但播放永远要求手选”。
-                AudioOutputDeviceComboBox.SelectedIndex = 0;
-            }
-
-            var inputDevices = result.Snapshot.Devices
-                .Where(static device => device.MaxInputChannels > 0)
-                .ToArray();
-            AudioInputDeviceComboBox.ItemsSource = inputDevices;
-            if (inputDevices.Length > 0 && AudioInputDeviceComboBox.SelectedIndex < 0)
-            {
-                AudioInputDeviceComboBox.SelectedIndex = 0;
-            }
-            UpdateMicrophoneProjection();
-
-            AudioDeviceStatusText.Text = outputDevices.Length == 0
-                ? $"PortAudio 已加载；输入设备 {inputDevices.Length} 个，未发现可用输出设备"
-                : $"PortAudio 已发现 {outputDevices.Length} 个输出设备、{inputDevices.Length} 个输入设备 · 尚未启动音频流";
-            _state.SetStatus("PortAudio 输入/输出设备枚举完成；尚未启动音频流");
+            await RunPlaybackCommandAsync(StartMicrophoneAsync).ConfigureAwait(true);
         }
-        catch (OperationCanceledException) when (_windowCancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (_isClosing || _windowCancellation.IsCancellationRequested)
         {
-            AudioDeviceStatusText.Text = "设备枚举已取消";
-        }
-        finally
-        {
-            RefreshAudioDevicesButton.IsEnabled = !_isClosing
-                && _login.CanEnterWorkbench
-                && _microphoneInterludeController?.Snapshot.Input.IsRunning != true;
+            // 关闭窗口时取消资源校验；不把取消显示成启动失败。
         }
     }
+
+    internal static bool CanStartMicrophone(
+        bool authorized,
+        bool listening,
+        bool finalPcmBusAvailable,
+        bool inputDeviceSelected,
+        bool commandBusy) =>
+        authorized
+        && !listening
+        && !commandBusy
+        && finalPcmBusAvailable
+        && inputDeviceSelected;
+
+    internal static bool CanStopMicrophone(
+        bool authorized,
+        bool listening,
+        bool commandBusy) =>
+        authorized && listening && !commandBusy;
+
+    private static string GetMicrophoneIdleStatus(
+        bool finalPcmBusAvailable,
+        bool inputDeviceAvailable) =>
+        !finalPcmBusAvailable
+            ? "未启用；停止时刷新并选择麦克风，再播放带声音媒体以建立 FinalPcmBus"
+            : !inputDeviceAvailable
+                ? "已建立 FinalPcmBus；请先停止播放，刷新并选择麦克风设备后再播放并启用门控"
+                : "未启用；可启用本地 RMS/VAD 门控并输出到 FinalPcmBus（不识别/上传）";
 
     private async void StartMicrophoneButton_Click(object sender, RoutedEventArgs e)
     {
         try
         {
-            await StartMicrophoneAsync().ConfigureAwait(true);
+            await RunPlaybackCommandAsync(StartMicrophoneAsync).ConfigureAwait(true);
         }
         catch (OperationCanceledException) when (_isClosing || _windowCancellation.IsCancellationRequested)
         {
@@ -1012,46 +950,77 @@ public partial class MainWindow
             return;
         }
 
-        if (AudioInputDeviceComboBox.SelectedValue is not int deviceIndex)
+        if (!await _microphoneLifecycle.WaitAsync(0).ConfigureAwait(true))
         {
-            MicrophoneStatusText.Text = "请先刷新并选择 PortAudio 麦克风输入设备";
-            _state.SetStatus("麦克风门控未启动，尚未选择输入设备");
             return;
         }
 
-        var runtime = await EnsureVerifiedMediaRuntimeAsync().ConfigureAwait(true);
-        if (runtime is null
-            || !runtime.TryGetResource("portaudio_x64.dll", out var resource)
-            || resource is null)
+        try
         {
+            var finalPcmBus = _audioPlaybackController.ActiveFinalPcmBus;
+            if (finalPcmBus is null || finalPcmBus.Snapshot.IsClosed)
+            {
+                MicrophoneStatusText.Text = GetMicrophoneIdleStatus(false, AudioInputDeviceComboBox.Items.Count > 0);
+                _state.SetStatus("请先播放带声音媒体，建立可用 FinalPcmBus 后再启用麦克风门控");
+                return;
+            }
+
+            if (finalPcmBus.Channels is not (1 or 2))
+            {
+                MicrophoneStatusText.Text = "当前音频输出不支持 1/2 声道麦克风插话";
+                _state.SetStatus("麦克风门控未启动；当前 FinalPcmBus 声道数不受支持");
+                return;
+            }
+
+            if (!_audioDeviceListCurrent || AudioInputDeviceComboBox.SelectedItem is not WindowsPortAudioDevice { MaxInputChannels: > 0 } inputDevice)
+            {
+                MicrophoneStatusText.Text = "请先刷新并选择 PortAudio 麦克风输入设备";
+                _state.SetStatus("麦克风门控未启动，尚未选择输入设备");
+                return;
+            }
+
+            var runtime = await EnsureVerifiedMediaRuntimeAsync().ConfigureAwait(true);
+            if (runtime is null
+                || !runtime.TryGetResource("portaudio_x64.dll", out var resource)
+                || resource is null)
+            {
+                UpdateMicrophoneProjection();
+                MicrophoneStatusText.Text = "PortAudio DLL 未校验；麦克风门控保持关闭";
+                _state.SetStatus("PortAudio 运行资源未安装，麦克风门控未启动");
+                return;
+            }
+
+            _microphoneInterludeController ??= new WindowsMicrophoneInterludeController(
+                _audioPriority,
+                finalPcmBusProvider: () => _audioPlaybackController.ActiveFinalPcmBus);
+            if (!_microphoneSnapshotSubscribed)
+            {
+                _microphoneInterludeController.SnapshotChanged += MicrophoneInterludeController_SnapshotChanged;
+                _microphoneSnapshotSubscribed = true;
+            }
+
+            var result = await _microphoneInterludeController
+                .StartAsync(
+                    resource.AbsolutePath,
+                    new WindowsPortAudioInputConfig(inputDevice.Index, Channels: 1),
+                    _windowCancellation.Token)
+                .ConfigureAwait(true);
+            UpdateMicrophoneProjection(result.Snapshot);
+            if (!result.IsSuccess)
+            {
+                MicrophoneStatusText.Text = result.Error?.Message ?? "麦克风门控启动失败";
+                _state.SetStatus("麦克风本地门控未启动");
+                return;
+            }
+
+            MicrophoneStatusText.Text = "麦克风门控已启用 · 仅本地处理，不识别/上传";
+            _state.SetStatus("麦克风本地 RMS/VAD 门控已启用；AEC/降噪/AGC仍待验收");
+        }
+        finally
+        {
+            _microphoneLifecycle.Release();
             UpdateMicrophoneProjection();
-            MicrophoneStatusText.Text = "PortAudio DLL 未校验；麦克风门控保持关闭";
-            _state.SetStatus("PortAudio 运行资源未安装，麦克风门控未启动");
-            return;
         }
-
-        _microphoneInterludeController ??= new WindowsMicrophoneInterludeController(
-            _audioPriority,
-            finalPcmBusProvider: () => _audioPlaybackController.ActiveFinalPcmBus);
-        _microphoneInterludeController.SnapshotChanged -= MicrophoneInterludeController_SnapshotChanged;
-        _microphoneInterludeController.SnapshotChanged += MicrophoneInterludeController_SnapshotChanged;
-
-        var result = await _microphoneInterludeController
-            .StartAsync(
-                resource.AbsolutePath,
-                new WindowsPortAudioInputConfig(deviceIndex, Channels: 1),
-                _windowCancellation.Token)
-            .ConfigureAwait(true);
-        UpdateMicrophoneProjection(result.Snapshot);
-        if (!result.IsSuccess)
-        {
-            MicrophoneStatusText.Text = result.Error?.Message ?? "麦克风门控启动失败";
-            _state.SetStatus("麦克风本地门控未启动");
-            return;
-        }
-
-        MicrophoneStatusText.Text = "麦克风门控已启用 · 仅本地处理，不识别/上传";
-        _state.SetStatus("麦克风本地能量门控已启用；AEC/降噪/AGC仍待验收");
     }
 
     private async void StopMicrophoneButton_Click(object sender, RoutedEventArgs e)
@@ -1073,30 +1042,39 @@ public partial class MainWindow
             return true;
         }
 
-        var controller = _microphoneInterludeController;
-        if (controller is null)
+        await _microphoneLifecycle.WaitAsync(_windowCancellation.Token).ConfigureAwait(true);
+        try
         {
+            var controller = _microphoneInterludeController;
+            if (controller is null)
+            {
+                UpdateMicrophoneProjection();
+                return true;
+            }
+
+            var result = await controller.StopAsync().ConfigureAwait(true);
+            if (_isClosing)
+            {
+                return true;
+            }
+
+            UpdateMicrophoneProjection(result.Snapshot);
+            if (!result.IsSuccess)
+            {
+                MicrophoneStatusText.Text = result.Error?.Message ?? "麦克风门控停止失败";
+                _state.SetStatus("麦克风门控停止失败；已请求释放输入流");
+                return false;
+            }
+
+            MicrophoneStatusText.Text = "麦克风门控已停止";
+            _state.SetStatus("麦克风本地 RMS/VAD 门控已停止");
+            return true;
+        }
+        finally
+        {
+            _microphoneLifecycle.Release();
             UpdateMicrophoneProjection();
-            return true;
         }
-
-        var result = await controller.StopAsync().ConfigureAwait(true);
-        if (_isClosing)
-        {
-            return true;
-        }
-
-        UpdateMicrophoneProjection(result.Snapshot);
-        if (!result.IsSuccess)
-        {
-            MicrophoneStatusText.Text = result.Error?.Message ?? "麦克风门控停止失败";
-            _state.SetStatus("麦克风门控停止失败；已请求释放输入流");
-            return false;
-        }
-
-        MicrophoneStatusText.Text = "麦克风门控已停止";
-        _state.SetStatus("麦克风本地能量门控已停止");
-        return true;
     }
 
     private void MicrophoneInterludeController_SnapshotChanged(WindowsMicrophoneInterludeSnapshot snapshot)
@@ -1141,22 +1119,31 @@ public partial class MainWindow
         var authorized = _login.CanEnterWorkbench;
         var listening = snapshot?.State == WindowsMicrophoneInterludeState.Listening
             && snapshot.Input.IsRunning;
-        var finalPcmBusAvailable = _audioPlaybackController.ActiveFinalPcmBus is { Snapshot.IsClosed: false };
+        var finalPcmBus = _audioPlaybackController.ActiveFinalPcmBus;
+        var finalPcmBusAvailable = finalPcmBus is { Snapshot.IsClosed: false }
+            && finalPcmBus.Channels is 1 or 2;
+        var commandBusy = _microphoneLifecycle.CurrentCount == 0;
         SetStatusPill(MicrophoneStatePillText, listening ? "已启用" : "待机", listening);
         var hasInputDevice = AudioInputDeviceComboBox.Items.Count > 0;
-        AudioInputDeviceComboBox.IsEnabled = authorized && !listening && hasInputDevice;
-        RefreshAudioDevicesButton.IsEnabled = authorized && !listening && !_importBusy;
-        StartMicrophoneButton.IsEnabled = authorized
-            && !listening
-            && finalPcmBusAvailable
-            && AudioInputDeviceComboBox.SelectedValue is int;
-        StopMicrophoneButton.IsEnabled = authorized && listening;
+        var inputDeviceSelected = _audioDeviceListCurrent && AudioInputDeviceComboBox.SelectedValue is int;
+        var canStart = CanStartMicrophone(
+            authorized,
+            listening,
+            finalPcmBusAvailable,
+            inputDeviceSelected,
+            commandBusy);
+        AudioInputDeviceComboBox.IsEnabled = authorized && !listening && !commandBusy && _audioDeviceListCurrent && hasInputDevice;
+        UpdateAudioDeviceProjection();
+        StartMicrophoneButton.IsEnabled = canStart;
+        StopMicrophoneButton.IsEnabled = CanStopMicrophone(authorized, listening, commandBusy);
+        TestMicrophoneButton.IsEnabled = canStart;
+        TestMicrophoneButton.ToolTip = canStart
+            ? "启用本地 RMS/VAD 门控并接入当前 FinalPcmBus"
+            : GetMicrophoneIdleStatus(finalPcmBusAvailable, hasInputDevice);
 
         if (snapshot is null)
         {
-            MicrophoneStatusText.Text = finalPcmBusAvailable
-                ? "未启用；可输出到最终 PCM，总线 DSP 待验收"
-                : "未启用；请先播放带声音媒体，AEC/降噪/AGC 待验收";
+            MicrophoneStatusText.Text = GetMicrophoneIdleStatus(finalPcmBusAvailable, hasInputDevice);
             return;
         }
 
@@ -1169,9 +1156,7 @@ public partial class MainWindow
             WindowsMicrophoneInterludeState.Failed =>
                 snapshot.Error ?? "麦克风门控启动失败",
             WindowsMicrophoneInterludeState.Closed => "麦克风门控已关闭",
-            _ => finalPcmBusAvailable
-                ? "未启用；可输出到最终 PCM，总线 DSP 待验收"
-                : "未启用；请先播放带声音媒体，AEC/降噪/AGC 待验收",
+            _ => GetMicrophoneIdleStatus(finalPcmBusAvailable, hasInputDevice),
         };
     }
 }

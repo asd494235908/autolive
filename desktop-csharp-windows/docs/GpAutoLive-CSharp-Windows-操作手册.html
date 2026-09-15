@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GpAutoLive C# Windows 桌面端操作手册</title>
+<style>
+  :root {
+    --bg: #0b0f15;
+    --surface: #101720;
+    --card: #141c28;
+    --border: #223040;
+    --text: #e6ebf2;
+    --muted: #8a97a8;
+    --accent: #3d9cff;
+    --accent-dim: #6ab7ff;
+    --warn: #e0a63c;
+    --ok: #3ecf8e;
+    --code-bg: #0d1420;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    line-height: 1.7;
+    font-size: 15px;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 40px 32px 80px; }
+  h1 {
+    font-size: 28px;
+    margin: 0 0 8px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 16px;
+  }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 28px; }
+  h2 {
+    font-size: 21px;
+    margin: 40px 0 12px;
+    padding-left: 10px;
+    border-left: 3px solid var(--accent);
+  }
+  h3 { font-size: 17px; margin: 26px 0 8px; color: var(--accent-dim); }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0; padding-left: 24px; }
+  li { margin: 5px 0; }
+  code {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-family: "Cascadia Code", Consolas, monospace;
+    font-size: 13px;
+    color: var(--accent-dim);
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-family: "Cascadia Code", Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  pre code { background: none; border: none; padding: 0; color: #c9d4e0; }
+  blockquote {
+    margin: 14px 0;
+    padding: 10px 16px;
+    border-left: 3px solid var(--warn);
+    background: rgba(224, 166, 60, 0.06);
+    color: #d8c9a8;
+    border-radius: 0 6px 6px 0;
+  }
+  blockquote p { margin: 4px 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--surface); color: var(--accent-dim); font-weight: 600; }
+  tr:nth-child(even) td { background: rgba(255,255,255,0.015); }
+  .status-ok { color: var(--ok); font-weight: 600; }
+  .status-wip { color: var(--warn); font-weight: 600; }
+  .status-todo { color: var(--muted); font-weight: 600; }
+  .toc {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 22px;
+    margin: 24px 0;
+  }
+  .toc a { color: var(--accent-dim); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .toc ol { columns: 2; column-gap: 40px; }
+  kbd {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-family: "Cascadia Code", Consolas, monospace;
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>GpAutoLive C# Windows 桌面端操作手册</h1>
+<p class="subtitle">适用范围：<code>desktop-csharp-windows/</code>（C# 14 + .NET 10 + WPF，仅 Windows 10/11 x64）。本文依据当前源码链路与文档整理，描述用户实际操作路径；功能「代码已接入」与「实机已验收」分开标注。</p>
+
+<div class="toc">
+  <ol>
+    <li><a href="#status">文档状态说明</a></li>
+    <li><a href="#req">系统要求</a></li>
+    <li><a href="#install">安装与启动</a></li>
+    <li><a href="#login">登录与设备授权</a></li>
+    <li><a href="#layout">主界面布局</a></li>
+    <li><a href="#media">媒体池操作</a></li>
+    <li><a href="#play">播放操作</a></li>
+    <li><a href="#effects">视频 / 声音处理</a></li>
+    <li><a href="#interlude">插话文件</a></li>
+    <li><a href="#mic">麦克风插话</a></li>
+    <li><a href="#speech">固定话术</a></li>
+    <li><a href="#rtmp">RTMP / RTMPS 推流</a></li>
+    <li><a href="#vcam">虚拟摄像头</a></li>
+    <li><a href="#douyin">抖音弹幕 M1</a></li>
+    <li><a href="#final">最终效果窗口</a></li>
+    <li><a href="#settings">设置</a></li>
+    <li><a href="#hotkeys">快捷键</a></li>
+    <li><a href="#priority">声音优先级</a></li>
+    <li><a href="#exit">关闭与退出</a></li>
+    <li><a href="#matrix">能力状态矩阵</a></li>
+    <li><a href="#faq">常见问题</a></li>
+  </ol>
+</div>
+
+<h2 id="status">1. 文档状态说明</h2>
+<p>本产品仍处于「实施中」，不是正式发布完成版。文中每项能力按以下口径区分：</p>
+<ul>
+  <li><span class="status-ok">已实现并生效</span>：真实媒体/设备/网络链路已验证。</li>
+  <li><span class="status-wip">代码已接入 · 待验收</span>：代码链路和自动化测试已通过，但真实设备、声卡、GPU、网络或安装门禁尚未完成。</li>
+  <li><span class="status-todo">正式需求 · 待实施/未接入</span>：仅有需求或占位，尚不可用。</li>
+</ul>
+<p>请以「已实现并生效」作为可用判断依据，其余状态不代表可投入生产使用。</p>
+
+<h2 id="req">2. 系统要求</h2>
+<table>
+  <tr><th>项目</th><th>要求</th></tr>
+  <tr><td>操作系统</td><td>Windows 10 2004+ / Windows 11，x64</td></tr>
+  <tr><td>.NET 运行时</td><td>.NET 10.0.11 Windows Desktop Runtime x64（安装器离线携带或在线安装）</td></tr>
+  <tr><td>媒体运行资源</td><td>mpv / FFmpeg / FFprobe / PortAudio / D3DCompiler 外置资源包（安装目录 <code>runtime/</code> 下）</td></tr>
+</table>
+
+<h2 id="install">3. 安装与启动</h2>
+<h3>3.1 安装包</h3>
+<ul>
+  <li>安装器为 NSIS 单文件 <code>GpAutoLive-Setup-*.exe</code>，安装到 <code>%ProgramFiles%\GpAutoLive\app</code>。</li>
+  <li>安装器会离线安装或修复 <code>.NET 10.0.11 Windows Desktop Runtime x64</code>，并创建开始菜单、桌面快捷方式和标准卸载登记。</li>
+  <li>卸载保留 <code>%LocalAppData%</code> 配置、Windows 凭据和用户媒体文件。</li>
+</ul>
+<blockquote><p>当前安装候选仅用于内部测试：未签名、法律待审。文件名带 <code>TEST-UNSIGNED-LEGAL-REVIEW</code> 者不得作为生产安装包。</p></blockquote>
+
+<h3>3.2 开发启动</h3>
+<p>源码开发环境使用仓库锁定 SDK 启动：</p>
+<pre><code>desktop-csharp-windows\tools\start-csharp-development.cmd</code></pre>
+<p>脚本每次先用仓库锁定的本地 SDK 以 <code>Platform=x64</code> 编译当前 App，再启动对应 <code>bin\x64\Release</code> 产物；构建失败会 fail-closed。</p>
+
+<h3>3.3 启动门禁顺序</h3>
+<p>程序启动按固定顺序建立门禁（<code>App.xaml.cs</code>）：</p>
+<ol>
+  <li>配置 WinRT 按需运行库解析器；</li>
+  <li>建立 Windows 应用身份（AppUserModelID）；</li>
+  <li>获取「媒体/输出资源所有权」互斥锁——同一用户已有实例占用时提示并退出；</li>
+  <li>建立「单实例」门禁——已有实例运行时新实例直接退出；</li>
+  <li>显示主窗口。</li>
+</ol>
+
+<h2 id="login">4. 登录与设备授权</h2>
+<h3>4.1 状态链路</h3>
+<p>登录门禁状态机为：</p>
+<pre><code>SignedOut → Authenticated → Activated</code></pre>
+<ul>
+  <li><code>SignedOut</code>：未登录，工作台和播放栏禁用。</li>
+  <li><code>Authenticated</code>：账号登录成功，等待服务端设备授权。</li>
+  <li><code>Activated</code>：设备授权通过，才开放工作台。</li>
+  <li><code>Offline</code>：只能从已授权会话进入，表示进入工作台后的断网续播；冷启动不能用离线状态绕过登录。</li>
+</ul>
+
+<h3>4.2 控制面配置</h3>
+<ul>
+  <li>未配置控制面时只做本地输入/状态投影，不发网络请求。</li>
+  <li>测试联调：设置 <code>AUTOLIVE_CONTROL_PLANE_ENV=test</code> 与 <code>AUTOLIVE_CONTROL_PLANE_BASE_URI=http://101.96.208.132:9090</code>。</li>
+  <li>本地开发：<code>AUTOLIVE_CONTROL_PLANE_ENV=development</code>，允许固定测试地址或 loopback HTTP。</li>
+  <li>正式环境：要求显式 HTTPS 地址；其他远程 HTTP 一律拒绝。</li>
+  <li>NSIS 安装版通过应用目录内 <code>GpAutoLive.control-plane-profile</code> 决定口味：<code>cloud-test-v1</code> 自动连接唯一测试地址并隔离测试凭据；<code>production-v1</code> 只接受显式 HTTPS；<code>offline</code> 强制禁网。安装器不写全局环境变量。</li>
+</ul>
+
+<h3>4.3 凭据存储</h3>
+<ul>
+  <li>Refresh Token、待撤销 Token、设备身份均存入 Windows Credential Manager（当前用户），不落盘、不进日志。</li>
+  <li>设备 ID 为随机 <code>desktop-&lt;GUID&gt;</code>，不采集硬件序列号。</li>
+  <li>登录成功且设备授权通过后，后台每 30 秒发送一次心跳；播放状态上报 <code>idle/playing/paused/error</code>。</li>
+</ul>
+
+<h2 id="layout">5. 主界面布局</h2>
+<p>主窗口为三栏工作台 + 顶栏 + 底栏：</p>
+<ul>
+  <li><strong>顶栏</strong>：设备授权状态、账户、授权到期、CPU/GPU/内存、设置按钮、最小化/最大化/关闭。</li>
+  <li><strong>操作带</strong>：主页/工作区、添加媒体、整理媒体、导入列表、保存配置、加载配置、开始推流、打开效果窗口、主菜单（退出登录）。</li>
+  <li><strong>左栏</strong>：媒体池（搜索、类型筛选、条目列表）与「播放设置（本地有序循环）」卡片。</li>
+  <li><strong>中栏上半区</strong>：音频诊断（最终 PCM 音谱、三条周期进度）。</li>
+  <li><strong>中栏下半区</strong>：参数 / 播放队列 / 快捷键 / 日志 Tab，以及视频处理、声音处理、场景与合成分类导航。</li>
+  <li><strong>右栏</strong>：RTMP 推流、虚拟摄像头、麦克风插话、固定话术、抖音弹幕五张输出/能力卡片。</li>
+  <li><strong>底栏</strong>：播放、暂停、停止、上一条、下一条、时间轴、当前媒体、独立的视频处理/声音处理开关、音量。</li>
+</ul>
+
+<h2 id="media">6. 媒体池操作</h2>
+<h3>6.1 支持格式</h3>
+<ul>
+  <li>视频：<code>.mp4/.mov/.mkv/.avi/.webm/.m4v/.ts/.m2ts/.flv/.wmv/.3gp</code></li>
+  <li>纯音频：<code>.mp3/.wav/.m4a/.aac/.ogg/.flac</code></li>
+</ul>
+<p>扩展名只用于选择过滤，最终以 FFprobe 的真实流、时长和可读性探测为准。</p>
+
+<h3>6.2 添加媒体</h3>
+<ul>
+  <li>点击「添加媒体」按钮或按 <kbd>Ctrl+O</kbd>：按所选顺序<strong>追加</strong>到当前播放池，不删除已有条目或本地源文件。</li>
+  <li>拖放文件到媒体池：保留系统顺序，按「追加」语义送入同一导入协调器。</li>
+</ul>
+
+<h3>6.3 导入链路（原子提交）</h3>
+<pre><code>选择文件 → 逐项 FFprobe 探测 → 文件大小读取 → 解析 SourceMediaDto
+        → 整批成功后才原子 Append/ReplaceAll/ReplaceAt
+        → 任一探测失败/重复路径/超限/取消 → 保留旧播放池并显示错误</code></pre>
+<ul>
+  <li>最多 100 项；探测按用户顺序串行执行；默认预算 5 秒、stdout 512 KiB、stderr 64 KiB。</li>
+</ul>
+
+<h3>6.4 编辑操作</h3>
+<ul>
+  <li><strong>上移/下移</strong>：调整选中项顺序。</li>
+  <li><strong>移除</strong>：删除选中项（需确认，不删除本地源文件）。</li>
+  <li><strong>清空</strong>：清空播放池（需确认）。</li>
+  <li><strong>搜索</strong>：按文件名或媒体类型过滤，空白恢复完整池。</li>
+  <li><strong>类型筛选</strong>：全部 / 视频 / 音频。</li>
+  <li>以上操作只修改进程内播放池引用，用户本地源文件不进入删除路径。</li>
+</ul>
+
+<h3>6.5 播放设置</h3>
+<p>播放触发方式：本地有序循环 / 手动播放当前项；播放完成后保持最后一帧 / 回到首项；可勾选循环播放。「应用到全部」批量设置尚未接入正式配置。</p>
+
+<h2 id="play">7. 播放操作</h2>
+<h3>7.1 播放链路</h3>
+<pre><code>点击播放 → mpv 单一受管进程 + JSON IPC（命名管道）
+        → 视频：GPU83(gpu-next/libplacebo) → CPU4 → Original 单向降级
+        → 声音：FFmpeg PCM 解码 → FinalPcmBus → PortAudio 输出 / RTMP 分流</code></pre>
+<ul>
+  <li>视频与声音周期独立，但共享源时间轴；PortAudio 启用时以实际可听 PTS 为主时钟校正 mpv 视频 PTS。</li>
+  <li>纯音频项不创建 mpv 视频会话。</li>
+  <li>播放池顺序循环：末项结束回到首项，单项池自循环。</li>
+  <li>视频处理模式切换（Original/CPU4/GPU83）会从当前 mpv 位置有界重启单一会话；GPU83 启动失败单向降级到 CPU4，再失败保持 Original。</li>
+</ul>
+
+<h3>7.2 播放控制</h3>
+<ul>
+  <li>底栏：播放、暂停、停止、上一条、下一条、时间轴（进度条 + 当前位置/时长）。</li>
+  <li>鼠标拖动时间轴、方向键、Home/End 可执行受身份保护的绝对 seek。</li>
+  <li>切换媒体源时短暂保留旧帧，加载失败不暴露播放器黑底。</li>
+</ul>
+
+<h2 id="effects">8. 视频 / 声音处理</h2>
+<ul>
+  <li>视频处理和声音处理是<strong>两个独立开关</strong>，分别控制视频效果和普通声音效果。</li>
+  <li>周期结果由系统自动/随机生成并<strong>只读展示</strong>，用户只编辑规则（周期范围、预设池等），不直接改本周期效果值。</li>
+  <li>状态栏显示当前真实会话模式：<code>GPU·GPU83</code> / <code>CPU·CPU4</code> / <code>未处理·Original</code> / <code>等待视频</code>。</li>
+  <li>视频周期低感知范围：亮度 <code>±0.1～0.35%</code>、对比度/饱和度相对 <code>100%</code> 偏移 <code>±0.1～0.3%</code>、色相 <code>±0.05～0.2°</code>、锐化 <code>0.1～0.4%</code>（界面以两位小数显示）。</li>
+  <li>CPU4 只允许亮度、对比度、饱和度和色相。</li>
+  <li>视频/声音/插话三条 <code>0–100</code> 周期进度在音频诊断卡底部显示。</li>
+</ul>
+
+<h2 id="interlude">9. 插话文件</h2>
+<ul>
+  <li>配置目录 + p01～p22 预设白名单（固定/随机选择、多轨 1～4、间隔、音量、duck 深度、attack/release）。</li>
+  <li>默认：固定预设 <code>p01</code>、随机候选 <code>p01</code>～<code>p20</code>、插话间隔 8～13 秒、预设周期 8～15 秒、duck 深度 -60 dB、attack/release 50/250 ms。</li>
+  <li>配置写入 <code>%LocalAppData%\GpAutoLive\profiles\interlude\default.json</code>（版本化 JSON + 原子写入）。</li>
+  <li>重启读取 <code>Enabled=true</code> 且目录非空的配置后，后台有界扫描恢复候选快照，但不自动播放。</li>
+  <li>p01～p22 目前是「ID-only 选择合同」的最小消费边界，22 套完整 DSP 字段映射尚未接入。</li>
+</ul>
+
+<h2 id="mic">10. 麦克风插话</h2>
+<ul>
+  <li>只在存在活动最终 PCM 总线时允许启用；媒体切换、媒体池编辑和停止播放前先停止麦克风。</li>
+  <li>本地能量门控（RMS/VAD）判断说话/挂起，说话帧进入最终 PCM overlay，静音期间丢弃积压。</li>
+  <li>当前未实现 AEC、降噪、AGC、完整 VAD——<span class="status-wip">代码已接入 · 待真实设备验收</span>。</li>
+</ul>
+
+<h2 id="speech">11. 固定话术</h2>
+<ul>
+  <li>使用 Windows SAPI 本地语音朗读（<code>SAPI.SpVoice</code>），不调用模型、不经过 Go。</li>
+  <li>SAPI 输出捕获为 48kHz/16-bit PCM 送入最终 PCM 总线；没有活动总线时拒绝启动，不回退默认设备。</li>
+  <li>单操作：新话术抢占旧话术，麦克风优先时拒绝新固定话术；启动确认预算 1500ms。</li>
+  <li>当前真实 SAPI voice、声卡、RTMP-only 输出仍未验收。</li>
+</ul>
+
+<h2 id="rtmp">12. RTMP / RTMPS 推流</h2>
+<h3>12.1 配置与链路</h3>
+<pre><code>输入 rtmp:// 或 rtmps:// 地址 → 配置校验 → 本机 H.264 编码器逐候选探测
+        (h264_nvenc → h264_amf → h264_qsv → h264_mf → libopenh264)
+        → 受管 FFmpeg 直接读取源媒体发布 H.264 + AAC FLV</code></pre>
+<ul>
+  <li>只接受 <code>rtmp://</code> / <code>rtmps://</code>，拒绝反斜杠、凭据、片段、非法主机/端口；至少选择画面或声音一项。</li>
+  <li>画面直接读取当前活动源，不捕获桌面/窗口；声音从最终 PCM 总线分流。</li>
+  <li>视频帧率固定 25/30/50/60 FPS。</li>
+  <li>编码器按 <code>h264_nvenc → h264_amf → h264_qsv → h264_mf → libopenh264</code> 单向降级。</li>
+</ul>
+
+<h3>12.2 重连与状态</h3>
+<ul>
+  <li>通过 <code>-progress pipe:2</code> 建立正向进度证据，出现正 <code>out_time</code>/<code>total_size</code> 才投影「推流中」。</li>
+  <li>默认初次启动后最多 5 次重试，退避 <code>1/2/4/8/15s</code>；只有所选轨道都达到已发布状态才报告成功。</li>
+  <li>切换媒体源会先停止活动推流，避免旧媒体身份继续发布。</li>
+</ul>
+
+<h2 id="vcam">13. 虚拟摄像头</h2>
+<ul>
+  <li>契约：<code>GpAutoLive Camera</code>、YUY2、1280×720、30fps、<code>zero_copy=false</code>。</li>
+  <li>链路：WGC 捕获本应用最终效果窗口 HWND → D3D11 GPU 缩放/色彩转换 → 一次有界 GPU→CPU 回读 → AkVirtualCamera sidecar → DirectShow。</li>
+  <li>只允许捕获本应用最终效果窗口，不扩展为桌面/第三方窗口采集。</li>
+  <li>黑帧使用 Y=16/U=128/V=128（limited-range），避免全零被下游渲染成绿色。</li>
+  <li>启动前执行 Authenticode 校验，未签名/无效 sidecar 拒绝启动。</li>
+</ul>
+<blockquote><p><strong>当前状态</strong>：合同与状态机已接入，真实 WGC/D3D11/AkVirtualCamera sidecar/DirectShow 注册/签名/许可门禁未完成，界面显示「待验收」，不创建系统设备、不启动未签名 sidecar。</p></blockquote>
+
+<h2 id="douyin">14. 抖音弹幕 M1</h2>
+<h3>14.1 配置</h3>
+<ul>
+  <li>直播间号（纯数字或 <code>https://live.douyin.com/&lt;digits&gt;</code>）。</li>
+  <li>回复池：1～100 条，每条最多 80 个 Unicode 字符 / 320 个 UTF-8 字节。</li>
+  <li>队列容量：10～5000，默认 500。</li>
+</ul>
+
+<h3>14.2 行为</h3>
+<ul>
+  <li>只读取 <code>WebcastChatMessage</code>，从本地回复池随机选句，经有界队列串行发送。</li>
+  <li>自回显、重连重放、重复消息 ID 入队前过滤；队列满丢最旧未发送项；任务 60 秒过期。</li>
+  <li>未知发送结果不自动重试；<code>accepted</code> 不冒充本人回显。</li>
+  <li>凭据只存内存，重启重新扫码；不调用模型、不经过 Go、不保持抖音登录。</li>
+  <li>「实时弹幕」窗口显示最近 500 条昵称/正文/时间，支持置顶、清空、回到最新、手动单条发送。</li>
+</ul>
+<blockquote><p><strong>当前状态</strong>：本地合同、队列与脱敏状态投影已接入；真实 QR 扫码、受管 Python sidecar、平台发送、自回显仍待验收。按钮是本地合同/状态演练入口，不是抖音可用连接。</p></blockquote>
+
+<h2 id="final">15. 最终效果窗口</h2>
+<ul>
+  <li>单实例窗口；视频使用独立 mpv 视频子 HWND，声音使用黑底，窗口内不重复放置播放控制。</li>
+  <li>首次显示按当前视频宽高比等比缩放到工作区内；拖拽边缘/角点时锁定视频宽高比；全屏期间不拦截系统尺寸。</li>
+  <li>默认尺寸 <code>1280×720</code>、最小 <code>320×180</code>。</li>
+</ul>
+
+<h2 id="settings">16. 设置（Ctrl+,）</h2>
+<ul>
+  <li><strong>性能采样</strong>：启用后每秒更新标题栏 CPU/GPU/内存。</li>
+  <li><strong>启动时展开快速参数卡</strong>。</li>
+  <li><strong>下次输出入口</strong>：本地预览 / RTMP·RTMPS / 虚拟摄像头（只记住选择，不自动启动）。</li>
+  <li>偏好只写入本机用户配置，不包含媒体文件、地址或凭据；<kbd>Enter</kbd> 保存、<kbd>Esc</kbd> 取消。</li>
+  <li>当前版本固定深色主题与简体中文。</li>
+</ul>
+
+<h2 id="hotkeys">17. 快捷键</h2>
+<table>
+  <tr><th>快捷键</th><th>作用</th></tr>
+  <tr><td><kbd>Ctrl+O</kbd></td><td>添加媒体（追加到播放池）</td></tr>
+  <tr><td><kbd>Space</kbd></td><td>播放 / 暂停</td></tr>
+  <tr><td><kbd>Ctrl+Shift+S</kbd></td><td>停止</td></tr>
+  <tr><td><kbd>F11</kbd></td><td>全屏最终效果窗口</td></tr>
+  <tr><td><kbd>Ctrl+,</kbd></td><td>打开设置</td></tr>
+</table>
+<p>文本输入聚焦时不抢快捷键。</p>
+
+<h2 id="priority">18. 声音优先级</h2>
+<p>固定优先级：<strong>麦克风插话 &gt; 固定话术 &gt; 插话文件 &gt; 普通声音 / 原媒体</strong>。</p>
+<p>麦克风开始说话时停止或数字静音低优先级声音；麦克风结束后不自动续播已被截断的插话文件或固定话术。</p>
+
+<h2 id="exit">19. 关闭与退出</h2>
+<ul>
+  <li>退出顺序固定：关闭新任务门禁 → 取消计划 → 停止输出 → 回收子进程树 → Join 读取任务 → 释放窗口/音频/管道句柄 → 退出。</li>
+  <li>退出后应无 <code>GpAutoLive/mpv/ffmpeg/ffprobe</code> 残留进程。</li>
+  <li>窗口关闭异步 Join；先释放麦克风输入和门控观察器，再释放 mpv、PortAudio、RTMP 输出总线。</li>
+</ul>
+
+<h2 id="matrix">20. 能力状态矩阵</h2>
+<table>
+  <tr><th>能力</th><th>当前状态</th></tr>
+  <tr><td>登录 / 设备授权 / Refresh / 心跳</td><td><span class="status-wip">代码已接入 · 待真实控制面联调</span></td></tr>
+  <tr><td>媒体池（导入/拖放/排序/搜索/筛选）</td><td><span class="status-wip">代码已接入 · 自动化通过 · 待人工页面复验</span></td></tr>
+  <tr><td>mpv 播放 / seek / EOF 换源 / 单向降级</td><td><span class="status-ok">真实夹具已验证本机</span> · 目标 GPU 矩阵待验收</td></tr>
+  <tr><td>视频 / 声音周期效果</td><td><span class="status-wip">代码已接入</span> · 真实主观观察与长稳待验收</td></tr>
+  <tr><td>插话文件</td><td><span class="status-wip">代码已接入</span> · 真实声卡听感待验收（22 套 DSP 未完整映射）</td></tr>
+  <tr><td>麦克风插话</td><td><span class="status-wip">代码已接入</span> · 待真实麦克风/声卡验收（无 AEC/降噪/AGC/完整 VAD）</td></tr>
+  <tr><td>固定话术（SAPI）</td><td><span class="status-wip">代码已接入</span> · 待真实语音包/声卡验收</td></tr>
+  <tr><td>RTMP / RTMPS 推流</td><td><span class="status-wip">代码已接入</span> · 远端握手/断线恢复/长稳待验收</td></tr>
+  <tr><td>虚拟摄像头</td><td><span class="status-wip">合同与状态机已接入</span> · WGC/D3D11/sidecar/签名/许可待验收</td></tr>
+  <tr><td>抖音弹幕 M1</td><td><span class="status-wip">本地合同/队列已接入</span> · 真实扫码/平台发送待验收</td></tr>
+  <tr><td>安装 / 升级 / 卸载</td><td><span class="status-wip">安装器已构建</span> · 未签名、法律待审、干净机安装待验收</td></tr>
+</table>
+
+<h2 id="faq">21. 常见问题</h2>
+<ol>
+  <li><strong>提示「媒体/输出资源已被占用」</strong>：同一用户已有另一个 C# 实例在运行，先关闭它再启动。</li>
+  <li><strong>提示「设备未授权」</strong>：账号已登录但设备尚未通过服务端授权，点击重试设备授权；<code>DEVICE_LIMIT_EXCEEDED</code> 表示设备额度已满。</li>
+  <li><strong>RTMP 地址被拒</strong>：地址必须为 <code>rtmp://</code> 或 <code>rtmps://</code>，不能含反斜杠、凭据或片段。</li>
+  <li><strong>虚拟摄像头/抖音显示「待验收」</strong>：属正常状态，对应真实设备/网络/签名门禁尚未完成，不表示功能故障。</li>
+  <li><strong>无法播放</strong>：确认媒体文件在支持扩展名白名单内，且 FFprobe 探测通过；纯音频项不会创建视频画面。</li>
+</ol>
+
+</div>
+</body>
+</html>

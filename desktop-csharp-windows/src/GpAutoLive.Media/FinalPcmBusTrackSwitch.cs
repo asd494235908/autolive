@@ -33,6 +33,7 @@ public sealed class FinalPcmBusTrackSwitch : IDisposable
             activeCandidateId,
             new AudioPcmRingBufferOutputSource(activeBus.RtmpBuffer),
             activeBus.Channels);
+        _rtmpSource.FollowReadPosition(_outputSource);
         _outputOverlaySource = new(
             activeCandidateId,
             new AudioPcmRingBufferOutputSource(activeBus.OutputOverlayBuffer),
@@ -41,11 +42,15 @@ public sealed class FinalPcmBusTrackSwitch : IDisposable
             activeCandidateId,
             new AudioPcmRingBufferOutputSource(activeBus.RtmpOverlayBuffer),
             activeBus.Channels);
+        _outputOverlaySource.FollowCandidate(_outputSource);
+        _rtmpOverlaySource.FollowCandidate(_rtmpSource);
     }
 
     public int Channels => _activeBus.Channels;
 
     public ulong ActiveCandidateId => _outputSource.ActiveCandidateId;
+
+    public ulong LocalCandidateFramesRead => _outputSource.CandidateFramesRead;
 
     public ulong? PreparedCandidateId
     {
@@ -77,7 +82,8 @@ public sealed class FinalPcmBusTrackSwitch : IDisposable
         {
             lock (_gate)
             {
-                return _activeBus;
+                return _preparedBus is not null && _outputSource.ActiveCandidateId == _preparedCandidateId
+                    ? _preparedBus : _activeBus;
             }
         }
     }
@@ -98,6 +104,27 @@ public sealed class FinalPcmBusTrackSwitch : IDisposable
             _rtmpConsumerAttached = attached;
             _activeBus.SetRtmpConsumerAttached(attached);
             _preparedBus?.SetRtmpConsumerAttached(attached);
+        }
+    }
+
+    /// <summary>接入现有本机未读尾部及 N+1 头部；晋升期间保持旧状态供调用方稍后重试。</summary>
+    public bool TryAttachRtmpFromPendingOutput(out ulong firstCandidateFrame, ulong? expectedCandidateId = null)
+    {
+        firstCandidateFrame = 0;
+        lock (_gate)
+        {
+            if (_disposed || _rtmpConsumerAttached || _outputSource.HasPendingCommit
+                || _outputSource.ActiveCandidateId != _rtmpSource.ActiveCandidateId
+                || expectedCandidateId is ulong expected && _outputSource.ActiveCandidateId != expected)
+            {
+                return false;
+            }
+
+            firstCandidateFrame = _activeBus.AttachRtmpFromPendingOutput();
+            _rtmpSource.SetInitialFramePosition(firstCandidateFrame);
+            _preparedBus?.AttachRtmpFromPendingOutput();
+            _rtmpConsumerAttached = true;
+            return true;
         }
     }
 
@@ -142,6 +169,10 @@ public sealed class FinalPcmBusTrackSwitch : IDisposable
             }
 
             nextBus.SetRtmpConsumerAttached(_rtmpConsumerAttached);
+            if (_rtmpConsumerAttached)
+            {
+                nextBus.RequireContinuousRtmpReads();
+            }
 
             if (_preparedBus is not null)
             {
@@ -219,9 +250,7 @@ public sealed class FinalPcmBusTrackSwitch : IDisposable
             }
 
             if (!_outputSource.TryCommitPrepared(candidateId, out error)
-                || !_rtmpSource.TryCommitPrepared(candidateId, out error)
-                || !_outputOverlaySource.TryCommitPrepared(candidateId, out error)
-                || !_rtmpOverlaySource.TryCommitPrepared(candidateId, out error))
+                || !_rtmpSource.TryCommitPrepared(candidateId, out error))
             {
                 return false;
             }
@@ -249,25 +278,13 @@ public sealed class FinalPcmBusTrackSwitch : IDisposable
                 return false;
             }
 
-            if (!_outputSource.TryCommitPreparedAtFrames(candidateId, framesFromNow, out error))
+            if (!AudioPcmTrackSwitchOutputSource.TryCommitTogether(
+                    _outputSource, _rtmpSource, candidateId, framesFromNow, _rtmpConsumerAttached, out error))
             {
                 return false;
             }
 
-            var commitRtmp = _rtmpConsumerAttached
-                ? _rtmpSource.TryCommitPreparedAtFrames(candidateId, framesFromNow, out error)
-                : _rtmpSource.TryCommitPrepared(candidateId, out error);
-            if (!commitRtmp)
-            {
-                return false;
-            }
-
-            if (!_outputOverlaySource.TryCommitPrepared(candidateId, out error))
-            {
-                return false;
-            }
-
-            return _rtmpOverlaySource.TryCommitPrepared(candidateId, out error);
+            return true;
         }
     }
 
@@ -333,8 +350,8 @@ public sealed class FinalPcmBusTrackSwitch : IDisposable
 
             // 插话分支没有独立的候选消费者；其边界跟随主轨提交，避免未启用插话时
             // 因为没有回调读取 overlay source 而永远阻塞候选回收。
-            _ = _outputOverlaySource.TryForcePromoteCommittedWithoutRead(candidateId, out _);
-            _ = _rtmpOverlaySource.TryForcePromoteCommittedWithoutRead(candidateId, out _);
+            _outputOverlaySource.SynchronizeCandidate();
+            _rtmpOverlaySource.SynchronizeCandidate();
 
             if (_rtmpSource.ActiveCandidateId != candidateId
                 || _rtmpOverlaySource.ActiveCandidateId != candidateId

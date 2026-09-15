@@ -6,6 +6,41 @@ namespace GpAutoLive.Media.Tests;
 public sealed class AudioPcmRingBufferTests
 {
     [TestMethod]
+    public void Wrapped_short_read_preserves_unfilled_destination_and_next_empty_read()
+    {
+        var ring = new AudioPcmRingBuffer(capacityFrames: 4, channels: 2);
+        Assert.IsTrue(ring.TryWrite([1, 10, 2, 20, 3, 30], out _, out _));
+        Assert.IsTrue(ring.TryRead(new float[4], out var consumed, out _));
+        Assert.AreEqual(2, consumed);
+        Assert.IsTrue(ring.TryWrite([4, 40, 5, 50, 6, 60], out var written, out _));
+        Assert.AreEqual(3, written);
+
+        var output = Enumerable.Repeat(-1F, 12).ToArray();
+        Assert.IsTrue(ring.TryReadRealtime(output, out var read, out _));
+        Assert.AreEqual(4, read);
+        CollectionAssert.AreEqual(new float[] { 3, 30, 4, 40, 5, 50, 6, 60, -1, -1, -1, -1 }, output);
+        Assert.IsTrue(ring.TryReadRealtime(output.AsSpan(8), out read, out _));
+        Assert.AreEqual(0, read);
+        Assert.AreEqual(-1F, output[8]);
+        Assert.AreEqual(0UL, ring.Snapshot.DroppedFrames);
+    }
+
+    [TestMethod]
+    public void Oversized_wrapped_write_counts_both_old_frames_and_discarded_input_prefix()
+    {
+        var ring = new AudioPcmRingBuffer(capacityFrames: 3, channels: 2);
+        Assert.IsTrue(ring.TryWrite([1, 10, 2, 20], out _, out _));
+        Assert.IsTrue(ring.TryRead(new float[2], out _, out _));
+        Assert.IsTrue(ring.TryWrite([3, 30, 4, 40, 5, 50, 6, 60, 7, 70], out var written, out _));
+        Assert.AreEqual(3, written);
+        Assert.AreEqual(3UL, ring.Snapshot.DroppedFrames);
+        var output = new float[6];
+        Assert.IsTrue(ring.TryRead(output, out var read, out _));
+        Assert.AreEqual(3, read);
+        CollectionAssert.AreEqual(new float[] { 5, 50, 6, 60, 7, 70 }, output);
+    }
+
+    [TestMethod]
     public void WriteAndReadPreserveInterleavedFrameOrderAcrossWrap()
     {
         var ring = new AudioPcmRingBuffer(capacityFrames: 3, channels: 2);

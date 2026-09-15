@@ -8,6 +8,19 @@ namespace GpAutoLive.Windows.Tests;
 public sealed class WindowsAudioPlaybackControllerTests
 {
     [TestMethod]
+    public void Initial_and_candidate_pcm_use_capacity_backpressure_instead_of_realtime_input_throttle()
+    {
+        var plan = new FfmpegPcmDecodePlan(Environment.ProcessPath!,
+            ["-re", "-i", "fixture.wav"], "fixture.wav", 48_000, 2, TimeSpan.FromSeconds(1));
+        var initial = WindowsAudioPlaybackController.RemoveRealtimeInputThrottle(plan, hasBackpressure: true);
+        var next = WindowsAudioPlaybackController.RemoveRealtimeInputThrottle(plan);
+        CollectionAssert.AreEqual(new[] { "-i", "fixture.wav" }, initial.Arguments.ToArray());
+        CollectionAssert.AreEqual(initial.Arguments.ToArray(), next.Arguments.ToArray());
+        Assert.AreSame(plan, WindowsAudioPlaybackController.RemoveRealtimeInputThrottle(plan, hasBackpressure: false));
+        Assert.AreSame(initial, WindowsAudioPlaybackController.RemoveRealtimeInputThrottle(initial));
+    }
+
+    [TestMethod]
     public async Task Null_plan_fails_closed_without_starting_output()
     {
         await using var controller = new WindowsAudioPlaybackController();
@@ -217,6 +230,9 @@ public sealed class WindowsAudioPlaybackControllerTests
             Assert.IsTrue(
                 started.Snapshot.Decoder?.DecodedFrames > 0,
                 "音频启动成功前必须已经产生首批 PCM 帧。");
+            Assert.IsTrue(
+                started.Snapshot.Output?.MediaFramesWritten > 0,
+                "音频启动成功前必须已有主源 PCM 进入设备回调，不能只等 FFmpeg 写入环缓。");
             Assert.IsTrue(
                 started.Snapshot.Output?.HardwareState is WindowsPortAudioHardwareState.Active
                     or WindowsPortAudioHardwareState.Unknown,

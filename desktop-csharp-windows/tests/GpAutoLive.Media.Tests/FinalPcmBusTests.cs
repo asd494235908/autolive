@@ -51,12 +51,13 @@ public sealed class FinalPcmBusTests
 
         Assert.IsTrue(bus.TryPublish(new float[] { 1, 2 }, out _, out _));
         Assert.IsTrue(bus.TryPublish(new float[] { 3, 4 }, out _, out _));
+        Assert.IsTrue(bus.TryPublish(new float[] { 5, 6 }, out _, out _));
 
         var snapshot = bus.Snapshot;
-        Assert.AreEqual((ulong)2, snapshot.OutputDroppedFrames);
+        Assert.AreEqual((ulong)4, snapshot.OutputDroppedFrames);
         Assert.AreEqual((ulong)2, snapshot.RtmpDroppedFrames);
         Assert.AreEqual(2, snapshot.OutputAvailableFrames);
-        Assert.AreEqual(2, snapshot.RtmpAvailableFrames);
+        Assert.AreEqual(4, snapshot.RtmpAvailableFrames);
     }
 
     [TestMethod]

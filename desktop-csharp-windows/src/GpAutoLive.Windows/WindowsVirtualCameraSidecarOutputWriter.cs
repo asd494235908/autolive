@@ -63,7 +63,7 @@ public sealed class WindowsVirtualCameraSidecarOutputWriter : IAsyncDisposable
     private readonly VirtualCameraOutputManager _output;
     private readonly WindowsVirtualCameraSidecarClient _client;
     private readonly TimeSpan _framePeriod;
-    private readonly byte[] _blackPayload;
+    private byte[] _blackPayload;
     private CancellationTokenSource? _cancellation;
     private Task? _worker;
     private TaskCompletionSource<bool>? _firstFrameReady;
@@ -99,20 +99,7 @@ public sealed class WindowsVirtualCameraSidecarOutputWriter : IAsyncDisposable
         }
 
         _framePeriod = framePeriod;
-        var config = output.Snapshot.Config;
-        if (!config.TryGetFrameBytes(out _, out var frameBytes))
-        {
-            throw new ArgumentException("虚拟摄像头输出配置无效", nameof(output));
-        }
-
-        _blackPayload = new byte[frameBytes];
-        for (var index = 0; index < _blackPayload.Length; index += 4)
-        {
-            _blackPayload[index] = 16;
-            _blackPayload[index + 1] = 128;
-            _blackPayload[index + 2] = 16;
-            _blackPayload[index + 3] = 128;
-        }
+        _blackPayload = [];
     }
 
     /// <summary>读取脱敏输出泵快照。</summary>
@@ -183,6 +170,10 @@ public sealed class WindowsVirtualCameraSidecarOutputWriter : IAsyncDisposable
                     "虚拟摄像头输出泵已经在运行");
             }
 
+            if (!VirtualCameraFrame.TryCreateBlack(config, 1, 1, 0, out var blackFrame, out _))
+                return FailureNoLock(WindowsVirtualCameraSidecarOutputWriterErrorCode.WriteFailed, "输出尺寸无效");
+            _blackPayload = blackFrame.Payload;
+            _latestFrame = null;
             cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _cancellation = cancellation;
             firstFrameReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -459,8 +450,8 @@ public sealed class WindowsVirtualCameraSidecarOutputWriter : IAsyncDisposable
             && latest.Generation == status.Generation;
         var sequence = NextSequence();
         frame = useLatest
-            ? new VirtualCameraFrame(status.Generation, sequence, latest!.Timestamp90Khz, latest.Payload)
-            : new VirtualCameraFrame(status.Generation, sequence, 0, _blackPayload);
+            ? new VirtualCameraFrame(status.Generation, sequence, latest!.Timestamp90Khz, latest.Payload, status.Config.Width, status.Config.Height)
+            : new VirtualCameraFrame(status.Generation, sequence, 0, _blackPayload, status.Config.Width, status.Config.Height);
 
         lock (_gate)
         {

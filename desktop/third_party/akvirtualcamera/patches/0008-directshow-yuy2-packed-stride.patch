@@ -1,0 +1,132 @@
+diff --git a/windows/PlatformUtils/src/utils.cpp b/windows/PlatformUtils/src/utils.cpp
+index 7dcfb6d..191293b 100644
+--- a/windows/PlatformUtils/src/utils.cpp
++++ b/windows/PlatformUtils/src/utils.cpp
+@@ -28,6 +28,7 @@
+ #include <wincodec.h>
+ 
+ #include "utils.h"
++#include "yuy2_sample.h"
+ #include "preferences.h"
+ #include "VCamUtils/src/fraction.h"
+ #include "VCamUtils/src/messageclient.h"
+@@ -582,7 +583,8 @@ AM_MEDIA_TYPE *AkVCam::mediaTypeFromFormat(const AkVCam::VideoFormat &format)
+     if (IsEqualGUID(subtype, GUID_NULL))
+         return nullptr;
+ 
+-    auto frameSize = format.dataSize();
++    auto frameSize = format.format() == PixelFormat_yuyv422
++        ? packedYuy2SampleBytes(format.width(), format.height()) : format.dataSize();
+ 
+     if (!frameSize)
+         return nullptr;
+@@ -609,7 +611,7 @@ AM_MEDIA_TYPE *AkVCam::mediaTypeFromFormat(const AkVCam::VideoFormat &format)
+     videoInfo->bmiHeader.biPlanes = 1;
+     videoInfo->bmiHeader.biBitCount = WORD(format.bpp());
+     videoInfo->bmiHeader.biCompression = compressionFromFormat(format.format());
+-    videoInfo->bmiHeader.biSizeImage = DWORD(format.dataSize());
++    videoInfo->bmiHeader.biSizeImage = DWORD(frameSize);
+ 
+     switch (videoInfo->bmiHeader.biCompression) {
+     case BI_RGB:
+diff --git a/windows/PlatformUtils/src/yuy2_sample.h b/windows/PlatformUtils/src/yuy2_sample.h
+new file mode 100644
+index 0000000..d618fdc
+--- /dev/null
++++ b/windows/PlatformUtils/src/yuy2_sample.h
+@@ -0,0 +1,28 @@
++// GpAutoLive modification, GPL-3.0-or-later.
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++
++namespace AkVCam {
++inline std::size_t packedYuy2SampleBytes(int width, int height) {
++    if (width <= 0 || height <= 0 || width % 2 != 0) return 0;
++    const auto rowBytes = static_cast<std::size_t>(width) * 2;
++    return static_cast<std::size_t>(height) > std::numeric_limits<std::size_t>::max() / rowBytes
++        ? 0 : rowBytes * height;
++}
++
++// VideoFrame uses SIMD-aligned rows. DirectShow YUY2 samples carry only pixels.
++inline bool copyPackedYuy2Sample(std::uint8_t *destination, std::size_t capacity,
++                                const std::uint8_t *source, std::size_t sourceStride,
++                                int width, int height) {
++    const auto rowBytes = static_cast<std::size_t>(width) * 2;
++    const auto bytes = packedYuy2SampleBytes(width, height);
++    if (!bytes || !destination || !source || sourceStride < rowBytes || capacity < bytes)
++        return false;
++    for (int row = 0; row < height; ++row)
++        std::memcpy(destination + row * rowBytes, source + row * sourceStride, rowBytes);
++    return true;
++}
++}
+diff --git a/windows/dshow/BaseFilter/src/pin.cpp b/windows/dshow/BaseFilter/src/pin.cpp
+index f830a85..f1705b2 100644
+--- a/windows/dshow/BaseFilter/src/pin.cpp
++++ b/windows/dshow/BaseFilter/src/pin.cpp
+@@ -38,6 +38,7 @@
+ #include "memallocator.h"
+ #include "PlatformUtils/src/preferences.h"
+ #include "PlatformUtils/src/utils.h"
++#include "PlatformUtils/src/yuy2_sample.h"
+ #include "VCamUtils/src/fraction.h"
+ #include "VCamUtils/src/videoadjusts.h"
+ #include "VCamUtils/src/videoconverter.h"
+@@ -888,7 +889,8 @@ HRESULT AkVCam::Pin::Connect(IPin *pReceivePin, const AM_MEDIA_TYPE *pmt)
+     if (allocatorRequirements.cBuffers < 1)
+         allocatorRequirements.cBuffers = 1;
+ 
+-    allocatorRequirements.cbBuffer = LONG(videoFormat.dataSize());
++    allocatorRequirements.cbBuffer = LONG(videoFormat.format() == PixelFormat_yuyv422
++        ? packedYuy2SampleBytes(videoFormat.width(), videoFormat.height()) : videoFormat.dataSize());
+ 
+     if (allocatorRequirements.cbAlign < 1)
+         allocatorRequirements.cbAlign = 1;
+@@ -1189,6 +1191,8 @@ void AkVCam::PinPrivate::sendFrame(void *userData)
+ 
+     BYTE *pData = nullptr;
+     LONG size = sample->GetSize();
++    auto format = formatFromMediaType(self->m_mediaType);
++    LONG dataLength = size;
+ 
+     if (size < 1 || FAILED(sample->GetPointer(&pData)) || !pData) {
+         AkLogError("Failed getting the sample data pointer");
+@@ -1200,7 +1204,17 @@ void AkVCam::PinPrivate::sendFrame(void *userData)
+     {
+         std::lock_guard<std::mutex> lock(self->m_mutex);
+ 
+-        if (self->m_frameReady && self->m_currentFrame.size() > 0) {
++        if (format.format() == PixelFormat_yuyv422) {
++            const bool ready = self->m_frameReady && self->m_currentFrame.size() > 0;
++            const auto fallback = ready ? VideoFrame{} : self->randomFrame();
++            const auto &frame = ready ? self->m_currentFrame : fallback;
++            if (!copyPackedYuy2Sample(pData, size, frame.constData(), frame.lineSize(0),
++                                      format.width(), format.height())) {
++                sample->Release();
++                return;
++            }
++            dataLength = LONG(packedYuy2SampleBytes(format.width(), format.height()));
++        } else if (self->m_frameReady && self->m_currentFrame.size() > 0) {
+             if (self->m_isRgb) {
+                 auto line = pData;
+                 auto lineSize = self->m_currentFrame.lineSize(0);
+@@ -1225,7 +1239,6 @@ void AkVCam::PinPrivate::sendFrame(void *userData)
+         }
+     }
+ 
+-    auto format = formatFromMediaType(self->m_mediaType);
+     auto fps = format.fps();
+     auto duration = REFERENCE_TIME(TIME_BASE / fps.value());
+ 
+@@ -1235,7 +1248,7 @@ void AkVCam::PinPrivate::sendFrame(void *userData)
+     sample->SetMediaType(self->m_mediaType);
+     sample->SetTime(&timeStart, &timeEnd);
+     sample->SetMediaTime(&timeStart, &timeEnd);
+-    sample->SetActualDataLength(size);
++    sample->SetActualDataLength(dataLength);
+     sample->SetDiscontinuity(self->m_firstFrame);
+     sample->SetSyncPoint(true);
+     sample->SetPreroll(false);

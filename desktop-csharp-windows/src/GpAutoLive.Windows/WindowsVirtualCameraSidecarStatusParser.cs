@@ -8,6 +8,10 @@ public static class WindowsVirtualCameraSidecarStatusParser
     /// <summary>允许 sidecar 报告的最大下游客户端数量。</summary>
     public const uint MaxClientCount = 1024;
 
+    /// <summary>首帧已被 C API 接受；不代表下游应用已显示。</summary>
+    public static bool IsOutputReady(ReadOnlySpan<byte> line) =>
+        line.SequenceEqual("GPAKVC_OUTPUT_READY"u8) || line.SequenceEqual("GPAKVC_OUTPUT_READY\r"u8);
+
     /// <summary>
     /// 只接受 ASCII 形式的 <c>GPAKVC_CLIENTS N</c>，拒绝符号、空格、溢出和附加字段。
     /// 输入不包含换行也可以；末尾的 CR 会被忽略。

@@ -7,6 +7,8 @@ param(
 
     [switch]$RequireSigned,
 
+    [switch]$RequireReleaseReadyLegal,
+
     [string]$OutputPath
 )
 
@@ -240,9 +242,93 @@ if ($mediaVersion -ne $mediaVersionDirectory.Name) {
 }
 $mediaReport = Verify-ListedManifest $mediaManifestRelativePath "bin$([char]92)" "runtime/media/$($mediaVersionDirectory.Name)"
 $legalRoot = Join-Path $mediaVersionDirectory.FullName 'legal'
-$missingLegal = (-not (Test-Path -LiteralPath $legalRoot -PathType Container)) -or (@(Get-ChildItem -LiteralPath $legalRoot -Recurse -File).Count -eq 0)
-if ($missingLegal) {
+$requiredLegalFiles = @(
+    'Copyright.txt',
+    'GPL-2.0.txt',
+    'LGPL-2.1.txt',
+    'mpv-runtime-manifest.json',
+    'SOURCE.md',
+    "portaudio$([char]92)LICENSE.txt",
+    "portaudio$([char]92)README.md"
+)
+$releaseLegalFiles = @(
+    'THIRD-PARTY-NOTICES.txt',
+    'ffmpeg-runtime-manifest.json'
+)
+$allowedLegalFiles = @($requiredLegalFiles + $releaseLegalFiles)
+if (-not (Test-Path -LiteralPath $legalRoot -PathType Container)) {
     throw 'Media runtime license materials are missing.'
+}
+$legalRootItem = Get-Item -LiteralPath $legalRoot
+if (($legalRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw 'Media runtime legal directory cannot be a reparse point.'
+}
+$actualLegalFiles = @(
+    Get-ChildItem -LiteralPath $legalRoot -Recurse -File | ForEach-Object {
+        if (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Media runtime legal file cannot be a reparse point: $($_.FullName)."
+        }
+        [IO.Path]::GetRelativePath($legalRoot, $_.FullName)
+    }
+)
+$unexpectedLegalDirectories = @(
+    Get-ChildItem -LiteralPath $legalRoot -Recurse -Directory | Where-Object {
+        (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        ([IO.Path]::GetRelativePath($legalRoot, $_.FullName) -ne 'portaudio')
+    }
+)
+if ($unexpectedLegalDirectories.Count -ne 0) {
+    throw 'Media runtime legal directory contains unexpected or nested directories.'
+}
+$missingLegalFiles = @($requiredLegalFiles | Where-Object { $_ -notin $actualLegalFiles })
+$unexpectedLegalFiles = @($actualLegalFiles | Where-Object { $_ -notin $allowedLegalFiles })
+if ($missingLegalFiles.Count -ne 0 -or $unexpectedLegalFiles.Count -ne 0) {
+    throw 'Media runtime license materials do not match the required release set.'
+}
+
+$mpvRuntimeManifest = Get-ManifestJson (Join-Path $legalRoot 'mpv-runtime-manifest.json') 'mpv runtime legal manifest'
+foreach ($property in @($mpvRuntimeManifest.files.PSObject.Properties)) {
+    $relative = $property.Name.Replace('/', [char]92)
+    if ($relative -eq 'mpv.exe') {
+        $licensedFile = Join-Path $mediaVersionDirectory.FullName 'bin\mpv.exe'
+    }
+    elseif ($relative.StartsWith("legal$([char]92)", [StringComparison]::OrdinalIgnoreCase)) {
+        $licensedFile = Join-Path $mediaVersionDirectory.FullName $relative
+    }
+    else {
+        throw "mpv legal manifest path is outside the allowed runtime area: $relative."
+    }
+    $expectedHash = [string]$property.Value.sha256
+    if ($expectedHash -notmatch '^[a-fA-F0-9]{64}$' -or -not (Test-Path -LiteralPath $licensedFile -PathType Leaf)) {
+        throw "mpv legal manifest entry is invalid: $relative."
+    }
+    $actualHash = (Get-FileHash -LiteralPath $licensedFile -Algorithm SHA256).Hash
+    if ($actualHash -ne $expectedHash) {
+        throw "mpv legal manifest hash mismatch: $relative."
+    }
+}
+if ($RequireReleaseReadyLegal) {
+    $missingReleaseLegalFiles = @($releaseLegalFiles | Where-Object { $_ -notin $actualLegalFiles })
+    if ($missingReleaseLegalFiles.Count -ne 0) {
+        throw 'Media runtime FFmpeg notices or legal manifest are missing.'
+    }
+    $audit = $mpvRuntimeManifest.audit
+    $legalReady = ($null -ne $audit) -and
+        ($audit.release_review_status -eq 'approved') -and
+        ($audit.corresponding_source_complete -eq $true) -and
+        ($audit.third_party_notices_reviewed -eq $true)
+    if (-not $legalReady) {
+        throw 'Media runtime legal review is not release-ready.'
+    }
+    $ffmpegRuntimeManifest = Get-ManifestJson (Join-Path $legalRoot 'ffmpeg-runtime-manifest.json') 'FFmpeg runtime legal manifest'
+    $ffmpegAudit = $ffmpegRuntimeManifest.audit
+    $ffmpegLegalReady = ($null -ne $ffmpegAudit) -and
+        ($ffmpegAudit.release_review_status -eq 'approved') -and
+        ($ffmpegAudit.corresponding_source_complete -eq $true) -and
+        ($ffmpegAudit.third_party_notices_reviewed -eq $true)
+    if (-not $ffmpegLegalReady) {
+        throw 'FFmpeg runtime legal review is not release-ready.'
+    }
 }
 
 $symbolsReport = $null

@@ -34,6 +34,9 @@ public sealed record FfmpegPcmDecodePlan(
 {
     /// <summary>音频仅从当前视频时间点恢复时使用；普通首播为 0。</summary>
     public ulong SourceStartMs { get; init; }
+
+    /// <summary>输出 PCM 帧对应的源时间倍率，来自已校验效果参数。</summary>
+    public double PlaybackRate { get; init; } = 1.0;
 }
 
 /// <summary>构造受限的普通声音/插话 PCM 解码计划，不启动进程。</summary>
@@ -190,6 +193,7 @@ public static class FfmpegPcmDecodePlanBuilder
             DefaultTimeout)
         {
             SourceStartMs = sourceStartMs,
+            PlaybackRate = audioEffects?.PlaybackSpeed ?? 1.0,
         };
         return true;
     }

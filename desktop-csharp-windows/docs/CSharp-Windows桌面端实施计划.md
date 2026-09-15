@@ -1,5 +1,15 @@
 # GpAutoLive C# Windows 桌面端实施计划
 
+> 2026-09-07 v100 发布增量：视频参数两位小数显示修复已进入 `csharp-windows-controller-20260907-v100` 与 `GpAutoLive-Setup-v100-TEST-UNSIGNED-LEGAL-REVIEW.exe`。完整本地测试、目录包清单及 publish 哈希一致性、包内 BAML 精度、GPU83 最终像素夹具、NSIS 元数据/哈希和目录包启动关闭冒烟均已核验；继续使用固定云测试地址，保持未签名、法律待审和仅内部测试边界。
+
+> 2026-09-07 视频周期参数可见性收口：自动周期继续使用既有低感知范围，UI 对亮度、对比度、饱和度、色相和锐度改为两位小数显示，避免安装包中的整数格式把每轮真实小幅变化显示成默认值。验收要求同时包含 WPF 绑定回归、目录包 DLL 与本轮 publish DLL 哈希一致、包内媒体运行资源核验，以及真实 GPU83 参数更新/回读证据；不得用轮次递增单独冒充效果已提交。v99 保留为历史候选，新修复只进入后续版本。
+
+> 2026-09-07 视频只读快照响应式收口：保持摘要四列、视频参数八列和既有 `Snapshot*Style`，只把卡内并排覆盖的标签/数值改为纵向两行，并给长源素材值增加字符省略与完整值 Tooltip；不新增断点、转换器、ViewModel 字段或第二处理模式事实源。1280×800 回归会检查真实布局坐标不相交，标准 1586×992 夹具继续用于首屏目视复核。
+
+> 2026-09-07 v99 发布增量：上述窄宽布局修复已进入 `csharp-windows-controller-20260907-v99` 与 `GpAutoLive-Setup-v99-TEST-UNSIGNED-LEGAL-REVIEW.exe`。本地 Release 发布、目录包清单核验、NSIS 产品元数据/哈希核验和目录包启动关闭冒烟通过；安装包继续使用 `CloudTest/cloud-test-v1` 固定测试云地址，保持未签名、法律待审、仅内部测试边界。
+
+> 2026-09-07 C7 NSIS 离线安装增量：C# WPF/SAPI 首次安装不再依赖 framework-dependent `GpAutoLive.Setup.exe` 或 PowerShell 7。新增原生 NSIS 3.12 入口，离线携带已固定 SHA-512 且微软 Authenticode 有效的 `.NET 10.0.11 Windows Desktop Runtime x64` 和完整发布目录；覆盖 x64/Windows 10 2004、当前用户锁与跨用户 EXE 占用拒绝、同卷 staging/rollback、安装登记失败回滚、卸载隔离、快捷方式、卸载登记与用户数据保留。v96 修复 staging 当前目录导致的首次激活失败；v98 增加固定包口味：`CloudTest` 自动连接唯一测试云地址并隔离 Credential Manager 凭据，`Production` 禁止测试 HTTP 且只接受显式 HTTPS，不写全局环境变量。发布包 verifier 同时收紧法律材料和实际分发字节哈希。v98-TEST 仍因法律审核、代码签名和管理员/干净机安装卸载门禁未完成而保持内部候选。
+
 > 当前边界修正（2026-09-06）：Rust/Tauri 与 C# 是隔离客户端。实施 C# 功能时只阅读 Rust 源码获取行为参考，不启动、探测、调用或联调 Rust；C# 只验收自己的进程、媒体输出、安装签名与回滚。本文较早的跨客户端锁和交叉启动记录保留为历史审计，不再作为 C# 当前完成条件。
 
 ## 173. C# 媒体池搜索与底部导入按钮样式修复（2026-09-05）

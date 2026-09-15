@@ -4,11 +4,14 @@ namespace GpAutoLive.App;
 
 public partial class MainWindow
 {
-    private void StartMediaThumbnailLoad() =>
+    private void StartMediaThumbnailLoad()
+    {
+        if (_isClosing) return;
         _mediaThumbnailCache.Start(
             _state.MediaItems,
             _verifiedMediaRuntime,
             Dispatcher,
             _windowCancellation.Token,
             UpdateMediaProjection);
+    }
 }

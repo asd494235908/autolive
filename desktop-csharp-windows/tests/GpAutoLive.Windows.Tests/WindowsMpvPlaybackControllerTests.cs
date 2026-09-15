@@ -102,6 +102,21 @@ public sealed class WindowsMpvPlaybackControllerTests
         Assert.AreEqual(WindowsMpvPlaybackControllerFailureCode.NotRunning, result.Error?.Code);
     }
 
+    [TestMethod]
+    public async Task Audio_clock_sync_uses_runtime_identity_and_cancellation_boundary()
+    {
+        await using var controller = new WindowsMpvPlaybackController();
+        var identity = new MediaPlaybackIdentity(1, 1, 0, 0);
+        var missingIdentity = await controller.SynchronizeAudioClockAsync(null, 1000, 1100, 1);
+        Assert.AreEqual(WindowsMpvPlaybackControllerFailureCode.InvalidInput, missingIdentity.Error?.Code);
+        var unavailable = await controller.SynchronizeAudioClockAsync(identity, 1000, 1100, 1);
+        Assert.AreEqual(WindowsMpvPlaybackControllerFailureCode.NotRunning, unavailable.Error?.Code);
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        var result = await controller.SynchronizeAudioClockAsync(identity, 1000, 1100, 1, cancelled.Token);
+        Assert.AreEqual(WindowsMpvPlaybackControllerFailureCode.Cancelled, result.Error?.Code);
+    }
+
     private static SourceMediaDto CreateSource(MediaKind kind) =>
         new("C:\\media\\sample.mp4", "C:\\media\\sample.mp4", kind, MediaCompatibilityMode.Direct, "sample.mp4", 1, 1_000, null, null, 1280, 720, 30, null, null, "h264", null, null, "not_calculated");
 }

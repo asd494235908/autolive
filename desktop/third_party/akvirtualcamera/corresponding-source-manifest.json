@@ -10,11 +10,11 @@
   "overlay": [
     {
       "path": "desktop/third_party/akvirtualcamera/sidecar/src/main.cpp",
-      "sha256": "35eeae7a6836cdd5ae5f546aceef48ef49df816f6d55b214089e9a478b34ca52"
+      "sha256": "71e82bff339ce9b57858cd67e421b300351ca880e7ab9768aac60288978371fc"
     },
     {
       "path": "desktop/third_party/akvirtualcamera/sidecar/CMakeLists.txt",
-      "sha256": "ac84c3d8a441dfb3746cda793521ab896da00cd5253fa3138a36c852a2197095"
+      "sha256": "ecbbdb884ff67637f4e1036f2b1200e9eb3f97e8f66165f77d7eced51d743d53"
     },
     {
       "path": "desktop/third_party/akvirtualcamera/cmake/enable-gpautolive-sidecar.cmake",
@@ -22,11 +22,11 @@
     },
     {
       "path": "desktop/third_party/akvirtualcamera/build-sidecar.ps1",
-      "sha256": "04a214d836d644c67eae12ddefa7bf316c6c37a02235c080aebc43f59ab759b1"
+      "sha256": "4dfe7267dbd6051116a62c96a0fd01a6f55bd34a75786780a69a165f1f4d85b4"
     },
     {
       "path": "desktop/third_party/akvirtualcamera/build-directshow.ps1",
-      "sha256": "120b4e9255b7246a064dd0d58ca547dc4291cddbe7ddd3723cacdc46cf71de2b"
+      "sha256": "9a6cec399827c1f0a5d47eb2a144e515b390313ac72a364baa92d1094ca8e853"
     },
     {
       "path": "desktop/third_party/akvirtualcamera/patches/0001-add-gpautolive-sidecar.cmake.patch",
@@ -35,6 +35,74 @@
     {
       "path": "desktop/third_party/akvirtualcamera/patches/0002-loopback-service-socket.patch",
       "sha256": "68504db97734230fc2fc07a090cf8e2a3682e656c9fdf1fa9c4e5235d487970e"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/sidecar/src/frame_format.h",
+      "sha256": "dd6b7fc4e4f23a29f8fcefac47fcfa696ec15e337d05086b82f8a4509d3c8dd9"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/sidecar/src/frame_format_test.cpp",
+      "sha256": "484cf63aa08cc6236a7e9aadd1ba69440d15a02fd0f69c8d1f3a337bf166f73e"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/sidecar/src/device_format.h",
+      "sha256": "a0973c0f3b453d3bfaa385596105c3f21d07089b5a8779acc956f217b0028972"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/sidecar/src/device_format_test.cpp",
+      "sha256": "af655ba7cb2e98510ff0a6fac1e658f7be4a21d58375ac0a826c6eb1908630c3"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/patches/0003-directshow-com-apartment.patch",
+      "sha256": "40b58e685e53e0d488b02bede5a2a5637f23c74bb1e25ed4a0de3d0980080b0d"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/test-directshow-registration.ps1",
+      "sha256": "49bb4a2e495d1d4ab80d247efd87f45ef00c3abde359f69218c304b5a85b7bd9"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/patches/0004-directshow-capture-pin-category.patch",
+      "sha256": "6dcd548e9903403eb87d98f7d6077694b43b4f6d70ef87e39ba324c735709cb6"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/test-directshow-pin-category.ps1",
+      "sha256": "11b1cd575b6699f47dd93b0c99666e4fa1031dbb7e987ea0249149e58ebe3ac5"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/test-ipc-frame-wakeup.ps1",
+      "sha256": "d5227f8665e425321b61feec46e2e50274ace2551ce3d78467b279878f0762a7"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/patches/0005-ipc-cancel-deadline-wakeup.patch",
+      "sha256": "f99d4c446d277a2df6886a877a134b380bae868bd770dfded134bf0783ab2885"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/patches/0006-directshow-yuy2-idle-black.patch",
+      "sha256": "e544ddc2501deae78cfb72acd7c87f33419629b78729579afa9381b4bb8391e6"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/test-ipc-socket-lifecycle.ps1",
+      "sha256": "2eef75547fbb776fcb04d2a825722e91fbf4382b90ac759d5f3f9fbd3028af61"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/sidecar/src/yuy2_black_frame_test.cpp",
+      "sha256": "66e37ef3f64e153f1e1b54198b56eeaede6c5e6e5d178ace36cbd621295679c6"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/patches/0007-service-listener-wakeup.patch",
+      "sha256": "e4282e5098fb4575d8560624aa256a98c40b611813a4079651368cf726f08cd7"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/test-ipc-service-wakeup.ps1",
+      "sha256": "807a40a509923ea913857bb2937733e8242c24a42d753d10790d182e4f5cbe07"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/patches/0008-directshow-yuy2-packed-stride.patch",
+      "sha256": "7532230efdd349e706007cd5361c31b33ca7e633e54af89d0452b0510196e5dc"
+    },
+    {
+      "path": "desktop/third_party/akvirtualcamera/sidecar/src/yuy2_sample_test.cpp",
+      "sha256": "fbd95d691dd7d1d24058573bfdd5cd3422421baeef041a5670bbd5afbc221375"
     }
   ],
   "license": "GPL-3.0-only",
@@ -42,7 +110,10 @@
     "network": "none",
     "compiler": "msvc",
     "sidecar_architecture": "x64",
-    "directshow_architectures": ["x86", "x64"]
+    "directshow_architectures": [
+      "x86",
+      "x64"
+    ]
   },
   "status": "source-and-overlay-declared; build-and-release-evidence-pending"
 }

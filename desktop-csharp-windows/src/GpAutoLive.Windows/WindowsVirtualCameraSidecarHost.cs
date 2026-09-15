@@ -34,7 +34,10 @@ public enum WindowsVirtualCameraSidecarHostErrorCode
     OutputLimitExceeded,
     OutputReadFailed,
     StopTimedOut,
-    Closed
+    Closed,
+    ConsumersMustClose,
+    OutputFormatRejected,
+    NativeOutputFailed
 }
 
 /// <summary>宿主错误；不包含路径、令牌、管道名或原始异常正文。</summary>
@@ -73,6 +76,8 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private Process? _process;
     private WindowsJobObject? _job;
+    private IDisposable? _componentLocks;
+    private TaskCompletionSource<WindowsVirtualCameraSidecarHostErrorCode?>? _outputReady;
     private CancellationTokenSource? _runCancellation;
     private Task? _monitorTask;
     private WindowsVirtualCameraSidecarHostState _state = WindowsVirtualCameraSidecarHostState.Ready;
@@ -113,7 +118,7 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
             return Failure(WindowsVirtualCameraSidecarHostErrorCode.Cancelled, "虚拟摄像头 sidecar 启动已取消。", true);
         }
 
-        if (!TryValidatePlan(plan))
+        if (plan is null || !TryValidatePlan(plan))
         {
             return Failure(WindowsVirtualCameraSidecarHostErrorCode.InvalidPlan, "虚拟摄像头 sidecar 启动计划无效。", false);
         }
@@ -127,6 +132,7 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
             return Failure(WindowsVirtualCameraSidecarHostErrorCode.Cancelled, "虚拟摄像头 sidecar 启动已取消。", true);
         }
 
+        IDisposable? developmentFiles = null;
         try
         {
             if (_disposed)
@@ -145,6 +151,13 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
             }
 
             await ReleaseExitedProcessAsync().ConfigureAwait(false);
+
+            // 启动点重新校验，成功后把只读组件句柄移交进程生命周期，覆盖延迟 DLL 加载。
+            developmentFiles = WindowsVirtualCameraDevelopmentTrust.LockAndValidate(plan.ExecutablePath);
+            if (!TryValidatePlan(plan) || (plan.Arguments.Length == 2 && developmentFiles is null))
+            {
+                return Failure(WindowsVirtualCameraSidecarHostErrorCode.InvalidPlan, "虚拟摄像头组件信任校验失败。", false);
+            }
 
             if (!WindowsJobObject.TryCreate(out var candidateJob) || candidateJob is null)
             {
@@ -206,10 +219,14 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
             }
 
             var runCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var outputReady = new TaskCompletionSource<WindowsVirtualCameraSidecarHostErrorCode?>(TaskCreationOptions.RunContinuationsAsynchronously);
             lock (_gate)
             {
                 _process = process;
                 _job = candidateJob;
+                _componentLocks = developmentFiles;
+                developmentFiles = null;
+                _outputReady = outputReady;
                 _runCancellation = runCancellation;
                 _monitorTask = null;
                 _state = WindowsVirtualCameraSidecarHostState.Running;
@@ -220,7 +237,7 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
                 _pipeName = plan.PipeName;
             }
 
-            var monitor = MonitorAsync(process, candidateJob, cancellationToken, runCancellation);
+            var monitor = MonitorAsync(process, candidateJob, cancellationToken, runCancellation, outputReady);
             lock (_gate)
             {
                 _monitorTask = monitor;
@@ -231,14 +248,45 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
             {
                 SetTerminationReasonIfUnset((int)TerminationReason.ProcessExited);
                 await monitor.ConfigureAwait(false);
-                return Failure(WindowsVirtualCameraSidecarHostErrorCode.ProcessExited, "虚拟摄像头 sidecar 启动后立即退出。", true);
+                var error = Snapshot.LastErrorCode ?? WindowsVirtualCameraSidecarHostErrorCode.ProcessExited;
+                return Failure(error, DescribeOutputFailure(error), true);
             }
 
             return Succeeded();
         }
         finally
         {
+            developmentFiles?.Dispose();
             _lifecycle.Release();
+        }
+    }
+
+    /// <summary>最多等待 5 秒确认原生 C API 接受首帧，管道连接或写入不能代替此确认。</summary>
+    public async Task<WindowsVirtualCameraSidecarHostResult> WaitForOutputReadyAsync(CancellationToken cancellationToken = default)
+    {
+        if (cancellationToken.IsCancellationRequested)
+            return Failure(WindowsVirtualCameraSidecarHostErrorCode.Cancelled, "虚拟摄像头首帧确认已取消。", true);
+        Task<WindowsVirtualCameraSidecarHostErrorCode?>? ready;
+        lock (_gate) { ready = _outputReady?.Task; }
+        if (ready is null)
+            return Failure(WindowsVirtualCameraSidecarHostErrorCode.InvalidPlan, "虚拟摄像头尚未启动原生输出会话。", false);
+        try
+        {
+            var error = await ready.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+            if (error is not null) return Failure(error.Value, DescribeOutputFailure(error.Value), true);
+            var snapshot = Snapshot;
+            return snapshot.State == WindowsVirtualCameraSidecarHostState.Running
+                ? Succeeded()
+                : Failure(snapshot.LastErrorCode ?? WindowsVirtualCameraSidecarHostErrorCode.ProcessExited,
+                    DescribeOutputFailure(snapshot.LastErrorCode ?? WindowsVirtualCameraSidecarHostErrorCode.ProcessExited), true);
+        }
+        catch (TimeoutException)
+        {
+            return Failure(WindowsVirtualCameraSidecarHostErrorCode.StartupTimedOut, "虚拟摄像头原生组件未在 5 秒内确认首帧输出。", true);
+        }
+        catch (OperationCanceledException)
+        {
+            return Failure(WindowsVirtualCameraSidecarHostErrorCode.Cancelled, "虚拟摄像头首帧确认已取消。", true);
         }
     }
 
@@ -314,6 +362,8 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
             {
                 _process = null;
                 _job = null;
+                _componentLocks?.Dispose();
+                _componentLocks = null;
                 _runCancellation?.Dispose();
                 _runCancellation = null;
                 _monitorTask = null;
@@ -384,6 +434,8 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
             {
                 _process = null;
                 _job = null;
+                _componentLocks?.Dispose();
+                _componentLocks = null;
                 _runCancellation?.Dispose();
                 _runCancellation = null;
                 _monitorTask = null;
@@ -404,8 +456,9 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
         if (plan is null
             || !OperatingSystem.IsWindows()
             || plan.Arguments.IsDefaultOrEmpty
-            || plan.Arguments.Length != 1
+            || plan.Arguments.Length is < 1 or > 2
             || !string.Equals(plan.Arguments[0], "--session-token-stdin", StringComparison.Ordinal)
+            || (plan.Arguments.Length == 2 && plan.Arguments[1] != "--development-format")
             || plan.Config is null
             || plan.SessionToken is null
             || plan.PipeName is null
@@ -420,7 +473,10 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
 
         try
         {
-            return WindowsAuthenticodeProbe.Probe(executablePath).IsValid
+            var developmentTrusted = plan.Arguments.Length == 2
+                && WindowsVirtualCameraDevelopmentTrust.TryGetRoot(executablePath, out var root)
+                && WindowsVirtualCameraDevelopmentTrust.ValidateManifest(root);
+            return (developmentTrusted || (plan.Arguments.Length == 1 && WindowsAuthenticodeProbe.Probe(executablePath).IsValid))
                 && string.Equals(executablePath, plan.ExecutablePath, StringComparison.Ordinal)
                 && string.Equals(
                     Path.GetDirectoryName(executablePath),
@@ -492,7 +548,8 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
         Process process,
         WindowsJobObject job,
         CancellationToken callerCancellation,
-        CancellationTokenSource runCancellation)
+        CancellationTokenSource runCancellation,
+        TaskCompletionSource<WindowsVirtualCameraSidecarHostErrorCode?> outputReady)
     {
         var outputLimit = 0;
         void SignalOutputLimit(int value)
@@ -510,7 +567,7 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
             CancelMonitor(runCancellation);
         }
 
-        var stdoutTask = DrainBoundedStdoutAsync(process.StandardOutput.BaseStream, MaxStandardOutputBytes, runCancellation.Token, () => SignalOutputLimit(1), SignalOutputReadFailure, PublishDownstreamClientCount);
+        var stdoutTask = DrainBoundedStdoutAsync(process.StandardOutput.BaseStream, MaxStandardOutputBytes, runCancellation.Token, () => SignalOutputLimit(1), SignalOutputReadFailure, PublishDownstreamClientCount, () => outputReady.TrySetResult(null));
         var stderrTask = DrainBoundedAsync(process.StandardError.BaseStream, MaxStandardErrorBytes, runCancellation.Token, () => SignalOutputLimit(2), SignalOutputReadFailure);
         var naturalExit = false;
         try
@@ -582,7 +639,7 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
                     break;
                 default:
                     state = WindowsVirtualCameraSidecarHostState.Exited;
-                    errorCode = WindowsVirtualCameraSidecarHostErrorCode.ProcessExited;
+                    errorCode = MapNativeExitCode(exitCode);
                     break;
             }
 
@@ -592,10 +649,12 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
                 _exitCode = exitCode;
                 _lastErrorCode = errorCode;
             }
+            outputReady.TrySetResult(errorCode ?? WindowsVirtualCameraSidecarHostErrorCode.Cancelled);
             PublishSnapshot();
         }
         finally
         {
+            outputReady.TrySetResult(WindowsVirtualCameraSidecarHostErrorCode.ProcessExited);
             // Process and Job Object handles remain owned by the lifecycle methods.
         }
     }
@@ -651,7 +710,8 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
         CancellationToken cancellationToken,
         Action onLimit,
         Action onFailure,
-        Action<uint> onClientCount)
+        Action<uint> onClientCount,
+        Action onOutputReady)
     {
         var buffer = ArrayPool<byte>.Shared.Rent(ReadBufferBytes);
         var line = ArrayPool<byte>.Shared.Rent(WindowsVirtualCameraSidecarLaunchPlanBuilder.MaxStatusLineBytes + 1);
@@ -681,6 +741,8 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
                     var value = buffer[index];
                     if (value == (byte)'\n')
                     {
+                        if (!lineTooLong && WindowsVirtualCameraSidecarStatusParser.IsOutputReady(line.AsSpan(0, lineLength)))
+                            onOutputReady();
                         if (!lineTooLong
                             && WindowsVirtualCameraSidecarStatusParser.TryParseClientCount(
                                 line.AsSpan(0, lineLength),
@@ -764,6 +826,8 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
             {
                 _process = null;
                 _job = null;
+                _componentLocks?.Dispose();
+                _componentLocks = null;
                 _runCancellation?.Dispose();
                 _runCancellation = null;
                 _monitorTask = null;
@@ -777,6 +841,7 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
         CancellationTokenSource? cancellation;
         lock (_gate)
         {
+            _outputReady?.TrySetResult(WindowsVirtualCameraSidecarHostErrorCode.Cancelled);
             cancellation = _runCancellation;
         }
 
@@ -799,6 +864,23 @@ public sealed class WindowsVirtualCameraSidecarHost : IAsyncDisposable
             // Stop/Dispose 与输出读取回调可能并发；已释放的 CTS 等价于已取消。
         }
     }
+
+    internal static WindowsVirtualCameraSidecarHostErrorCode MapNativeExitCode(int? exitCode) => exitCode switch
+    {
+        6 => WindowsVirtualCameraSidecarHostErrorCode.ConsumersMustClose,
+        7 => WindowsVirtualCameraSidecarHostErrorCode.OutputFormatRejected,
+        5 => WindowsVirtualCameraSidecarHostErrorCode.NativeOutputFailed,
+        _ => WindowsVirtualCameraSidecarHostErrorCode.ProcessExited,
+    };
+
+    internal static string DescribeOutputFailure(WindowsVirtualCameraSidecarHostErrorCode code) => code switch
+    {
+        WindowsVirtualCameraSidecarHostErrorCode.ConsumersMustClose => "请先关闭正在使用虚拟摄像头的应用，再按当前视频分辨率启动输出。",
+        WindowsVirtualCameraSidecarHostErrorCode.OutputFormatRejected => "虚拟摄像头设备格式配置失败，请检查安装注册、格式修改权限和源视频分辨率。",
+        WindowsVirtualCameraSidecarHostErrorCode.NativeOutputFailed => "虚拟摄像头原生组件无法创建输出流或提交画面。",
+        WindowsVirtualCameraSidecarHostErrorCode.Cancelled => "虚拟摄像头首帧确认已取消。",
+        _ => "虚拟摄像头原生输出会话已退出，尚未确认有效画面。",
+    };
 
     private WindowsVirtualCameraSidecarHostSnapshot CreateSnapshot() =>
         new(_state, SafeProcessId(_process), _exitCode, _lastErrorCode);

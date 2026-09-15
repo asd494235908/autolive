@@ -38,6 +38,7 @@ public sealed class MpvLaunchPlanTests
         Assert.IsNotNull(plan);
         Assert.AreEqual(fixture.MpvPath, plan.ExecutablePath);
         CollectionAssert.Contains(plan.Arguments, "--vo=gpu-next");
+        CollectionAssert.Contains(plan.Arguments, "--hr-seek-demuxer-offset=2");
         CollectionAssert.Contains(plan.Arguments, "--hwdec=auto-safe");
         CollectionAssert.Contains(plan.Arguments, "--wid=1234");
         CollectionAssert.Contains(plan.Arguments, "--start=1.250");

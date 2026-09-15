@@ -56,9 +56,11 @@ public sealed class FinalPcmBus : IDisposable
         Channels = channels;
         CapacityFrames = capacityFrames;
         OutputBuffer = new AudioPcmRingBuffer(capacityFrames, channels);
-        RtmpBuffer = new AudioPcmRingBuffer(capacityFrames, channels);
+        // 接入先复制本机未读尾部；额外一段同等有界容量承接网络消费者的短时滞后。
+        var rtmpCapacityFrames = Math.Min(480_000, checked(capacityFrames * 2));
+        RtmpBuffer = new AudioPcmRingBuffer(rtmpCapacityFrames, channels);
         OutputOverlayBuffer = new AudioPcmRingBuffer(capacityFrames, channels);
-        RtmpOverlayBuffer = new AudioPcmRingBuffer(capacityFrames, channels);
+        RtmpOverlayBuffer = new AudioPcmRingBuffer(rtmpCapacityFrames, channels);
         OutputSpectrum = new();
         OverlaySpectrum = new();
     }
@@ -123,6 +125,25 @@ public sealed class FinalPcmBus : IDisposable
             RtmpOverlayBuffer.DiscardPending();
             _rtmpConsumerAttached = attached;
         }
+    }
+
+    /// <summary>原子接入本机尚未输出的 PCM，返回该首帧在当前候选内的偏移。</summary>
+    public ulong AttachRtmpFromPendingOutput()
+    {
+        lock (_gate)
+        {
+            var copiedFrames = OutputBuffer.CopyPendingTo(RtmpBuffer);
+            OutputOverlayBuffer.CopyPendingTo(RtmpOverlayBuffer);
+            RequireContinuousRtmpReads();
+            _rtmpConsumerAttached = true;
+            return _publishedFrames - (ulong)copiedFrames;
+        }
+    }
+
+    internal void RequireContinuousRtmpReads()
+    {
+        RtmpBuffer.RequireContinuousReads();
+        RtmpOverlayBuffer.RequireContinuousReads();
     }
 
     /// <summary>同时向本机和 RTMP 两个消费者发布一段完整交错 PCM。</summary>

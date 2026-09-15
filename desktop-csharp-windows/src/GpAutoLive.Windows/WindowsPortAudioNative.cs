@@ -5,7 +5,7 @@ namespace GpAutoLive.Windows;
 /// <summary>
 /// PortAudio v19 的最小动态 ABI。只暴露枚举与输出流需要的函数，避免 P/Invoke 搜索 PATH。
 /// </summary>
-internal sealed class WindowsPortAudioNative : IDisposable
+internal sealed class WindowsPortAudioNative : IWindowsPortAudioStreamNative
 {
     internal const uint Float32SampleFormat = 0x00000001;
     internal const int Continue = 0;
@@ -148,7 +148,7 @@ internal sealed class WindowsPortAudioNative : IDisposable
 
     internal int Initialize() => _initialize();
 
-    internal int Terminate() => _terminate();
+    public int Terminate() => _terminate();
 
     internal int GetDeviceCount() => _getDeviceCount();
 
@@ -162,7 +162,7 @@ internal sealed class WindowsPortAudioNative : IDisposable
         return pointer == 0 ? default : Marshal.PtrToStructure<HostApiInfo>(pointer);
     }
 
-    internal int OpenOutputStream(
+    public int OpenOutputStream(
         out nint stream,
         ref StreamParameters outputParameters,
         double sampleRate,
@@ -189,7 +189,7 @@ internal sealed class WindowsPortAudioNative : IDisposable
         }
     }
 
-    internal int OpenInputStream(
+    public int OpenInputStream(
         out nint stream,
         ref StreamParameters inputParameters,
         double sampleRate,
@@ -216,17 +216,17 @@ internal sealed class WindowsPortAudioNative : IDisposable
         }
     }
 
-    internal int StartStream(nint stream) => _startStream(stream);
+    public int StartStream(nint stream) => _startStream(stream);
 
-    internal int StopStream(nint stream) => _stopStream(stream);
+    public int StopStream(nint stream) => _stopStream(stream);
 
-    internal int CloseStream(nint stream) => _closeStream(stream);
+    public int CloseStream(nint stream) => _closeStream(stream);
 
     /// <summary>
     /// 查询原生流健康状态。旧版或裁剪版 PortAudio 缺少可选导出时返回 false，
     /// 调用方应把状态标记为 Unknown，而不是把缺失探针当成设备故障。
     /// </summary>
-    internal bool TryQueryStreamState(nint stream, out int active, out int stopped)
+    public bool TryQueryStreamState(nint stream, out int active, out int stopped)
     {
         active = 0;
         stopped = 0;
@@ -272,7 +272,7 @@ internal sealed class WindowsPortAudioNative : IDisposable
         }
     }
 
-    internal bool TryInitialize(out int errorCode)
+    public bool TryInitialize(out int errorCode)
     {
         errorCode = Initialize();
         return errorCode == 0;
@@ -288,6 +288,9 @@ internal sealed class WindowsPortAudioNative : IDisposable
         _disposed = true;
         NativeLibrary.Free(_library);
     }
+
+    internal static IWindowsPortAudioStreamNative? LoadStream(string path) =>
+        TryLoad(path, out var native) ? native : null;
 
     internal static bool TryLoad(string path, out WindowsPortAudioNative? native)
     {

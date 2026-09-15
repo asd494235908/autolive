@@ -10,6 +10,7 @@ public enum WindowsDouyinProbeEventKind
     QrWaiting,
     QrIssued,
     AuthState,
+    AuthDiagnostic,
     LoginConfirmed,
     SelfIdentityReady,
     RoomResolved,
@@ -29,7 +30,7 @@ public enum WindowsDouyinProbeEventKind
     WebsocketClosed
 }
 
-/// <summary>已脱敏的单行探针事件；弹幕事件只携带固定元数据，不携带正文、Cookie、Token 或异常正文。</summary>
+/// <summary>单行探针事件；显示正文只留本地内存，不携带 Cookie、Token 或异常正文。</summary>
 public sealed record WindowsDouyinProbeEvent(
     WindowsDouyinProbeEventKind Kind,
     string Name,
@@ -40,7 +41,9 @@ public sealed record WindowsDouyinProbeEvent(
     byte[]? QrPngBytes = null,
     DateTimeOffset? QrExpiresAtUtc = null,
     string? GapReason = null,
-    ulong? GapDroppedCount = null);
+    ulong? GapDroppedCount = null,
+    DouyinChatDisplayMessage? ChatDisplay = null,
+    WindowsDouyinAuthDiagnostic? Diagnostic = null);
 
 /// <summary>解析 sidecar stdout 的 JSON 行，并只返回固定事件白名单。</summary>
 public static class WindowsDouyinProbeEventParser
@@ -91,6 +94,7 @@ public static class WindowsDouyinProbeEventParser
             }
 
             DouyinChatMessageMetadata? chatMetadata = null;
+            DouyinChatDisplayMessage? chatDisplay = null;
             string? sessionId = null;
             ulong? generation = null;
             string? state = null;
@@ -98,6 +102,13 @@ public static class WindowsDouyinProbeEventParser
             DateTimeOffset? qrExpiresAtUtc = null;
             string? gapReason = null;
             ulong? gapDroppedCount = null;
+            WindowsDouyinAuthDiagnostic? diagnostic = null;
+            if (kind == WindowsDouyinProbeEventKind.AuthDiagnostic
+                && !WindowsDouyinAuthDiagnostic.TryParse(document.RootElement, out diagnostic))
+            {
+                error = "登录诊断不符合固定字段白名单。";
+                return false;
+            }
             if (kind == WindowsDouyinProbeEventKind.ChatReceived
                 && !TryParseChatMetadata(
                     document.RootElement,
@@ -106,6 +117,7 @@ public static class WindowsDouyinProbeEventParser
                     expectedSessionId,
                     expectedGeneration,
                     out chatMetadata,
+                    out chatDisplay,
                     out sessionId,
                     out generation,
                     out error))
@@ -170,7 +182,9 @@ public static class WindowsDouyinProbeEventParser
                 qrPngBytes,
                 qrExpiresAtUtc,
                 gapReason,
-                gapDroppedCount);
+                gapDroppedCount,
+                chatDisplay,
+                diagnostic);
             return true;
         }
         catch (JsonException)
@@ -187,11 +201,13 @@ public static class WindowsDouyinProbeEventParser
         string? expectedSessionId,
         ulong? expectedGeneration,
         out DouyinChatMessageMetadata? metadata,
+        out DouyinChatDisplayMessage? display,
         out string? sessionId,
         out ulong? generation,
         out string? error)
     {
         metadata = null;
+        display = null;
         sessionId = null;
         generation = null;
         error = null;
@@ -203,6 +219,7 @@ public static class WindowsDouyinProbeEventParser
                 expectedSessionId,
                 expectedGeneration,
                 out metadata,
+                out display,
                 out sessionId,
                 out generation,
                 out error);
@@ -261,11 +278,13 @@ public static class WindowsDouyinProbeEventParser
         string? expectedSessionId,
         ulong? expectedGeneration,
         out DouyinChatMessageMetadata? metadata,
+        out DouyinChatDisplayMessage? display,
         out string? sessionId,
         out ulong? generation,
         out string? error)
     {
         metadata = null;
+        display = null;
         sessionId = null;
         generation = null;
         error = null;
@@ -353,7 +372,7 @@ public static class WindowsDouyinProbeEventParser
 
         try
         {
-            _ = DateTimeOffset.FromUnixTimeMilliseconds(receivedAtUnixMs);
+            display = new(messageId.Trim(), DateTimeOffset.FromUnixTimeMilliseconds(receivedAtUnixMs), nickname, content, isSelf);
         }
         catch (ArgumentOutOfRangeException)
         {
@@ -657,6 +676,7 @@ public static class WindowsDouyinProbeEventParser
             "qr_issued" => WindowsDouyinProbeEventKind.QrIssued,
             "auth.qr" => WindowsDouyinProbeEventKind.QrIssued,
             "auth.state" => WindowsDouyinProbeEventKind.AuthState,
+            "auth.diagnostic" => WindowsDouyinProbeEventKind.AuthDiagnostic,
             "login_confirmed" => WindowsDouyinProbeEventKind.LoginConfirmed,
             "self_identity_ready" => WindowsDouyinProbeEventKind.SelfIdentityReady,
             "room_resolved" => WindowsDouyinProbeEventKind.RoomResolved,
@@ -683,6 +703,7 @@ public static class WindowsDouyinProbeEventParser
             or "qr_issued"
             or "auth.qr"
             or "auth.state"
+            or "auth.diagnostic"
             or "login_confirmed"
             or "self_identity_ready"
             or "room_resolved"

@@ -32,7 +32,11 @@ public sealed class WindowsGraphicsCaptureGpuYuy2ConverterTests
     }
 
     [TestMethod]
-    public void ConstantBgraTexture_IsConvertedOnGpuToLimitedRangeYuy2()
+    [DataRow(1280U, 720U)]
+    [DataRow(1920U, 1080U)]
+    [DataRow(1080U, 1920U)]
+    [DataRow(640U, 481U)]
+    public void ConstantBgraTexture_IsConvertedOnGpuToLimitedRangeYuy2(uint outputWidth, uint outputHeight)
     {
         if (!OperatingSystem.IsWindows())
         {
@@ -47,7 +51,7 @@ public sealed class WindowsGraphicsCaptureGpuYuy2ConverterTests
         }
 
         using var context = deviceResult.Context;
-        using var converter = new WindowsGraphicsCaptureGpuYuy2Converter();
+        using var converter = new WindowsGraphicsCaptureGpuYuy2Converter(new VirtualCameraConfig { Width = outputWidth, Height = outputHeight });
         var sourceDescription = new Texture2DDescription(
             Format.B8G8R8A8_UNorm,
             1280,
@@ -105,7 +109,9 @@ public sealed class WindowsGraphicsCaptureGpuYuy2ConverterTests
         }
 
         Assert.IsNotNull(converted?.Frame, $"三槽 GPU 回读应在有界尝试内产出一帧，最后状态 {lastCode}");
-        Assert.AreEqual(1280 * 720 * 2, converted!.Frame!.Payload.Length);
+        Assert.AreEqual(checked((int)(outputWidth * outputHeight * 2)), converted!.Frame!.Payload.Length);
+        Assert.AreEqual(outputWidth, converted.Frame.Width);
+        Assert.AreEqual(outputHeight, converted.Frame.Height);
         Assert.AreEqual(7UL, converted.Frame.Generation);
         Assert.IsTrue(converted.ReadbackDuration >= TimeSpan.Zero);
         Assert.IsTrue(converted.Frame.Payload[0] is >= 70 and <= 95, "红色输入的 Y 应在 limited-range 红色范围");

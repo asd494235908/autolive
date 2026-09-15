@@ -64,7 +64,7 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
     private Func<FinalPcmBus?>? _sharedFinalPcmBusProvider;
     private bool _ownsBus;
     private bool _disposed;
-    private bool _disposeStarted;
+    private Task? _disposeTask;
     private bool _running;
     private ulong _producedFrames;
     private ulong _forwardedFrames;
@@ -99,6 +99,17 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
             lock (_gate)
             {
                 return _overlayTask ?? Task.CompletedTask;
+            }
+        }
+    }
+
+    public bool HasPendingCleanup
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _sessionCancellation is not null || _overlayTask is not null;
             }
         }
     }
@@ -169,6 +180,11 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
             }
 
             var outputChannels = sharedFinalPcmBus?.Channels ?? FinalPcmBus.DefaultChannels;
+            if (config.VideoEnabled && Math.Abs((audioEffects?.PlaybackSpeed ?? 1.0) - 1.0) > 0.001)
+            {
+                return Failure(WindowsRtmpAudioSessionFailureCode.InvalidArguments,
+                    "当前音画推流只支持保持源时长的声音处理。", false);
+            }
             if (!FfmpegPcmDecodePlanBuilder.TryCreate(
                     ffmpegPath,
                     source,
@@ -176,13 +192,24 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
                     outputChannels,
                     out var decodePlan,
                     out var decodeError,
-                    audioEffects)
+                    audioEffects,
+                    sourceIdentity?.SourcePositionMs ?? 0)
                 || decodePlan is null)
             {
                 return Failure(
                     WindowsRtmpAudioSessionFailureCode.InvalidArguments,
                     decodeError?.Message ?? "RTMP 声音解码计划无效。",
                     decodeError?.Retryable == true);
+            }
+
+            var loopPlan = decodePlan;
+            if (decodePlan.SourceStartMs > 0
+                && (!FfmpegPcmDecodePlanBuilder.TryCreate(ffmpegPath, source,
+                    decodePlan.SampleRateHz, outputChannels, out loopPlan, out decodeError, audioEffects)
+                    || loopPlan is null))
+            {
+                return Failure(WindowsRtmpAudioSessionFailureCode.InvalidArguments,
+                    decodeError?.Message ?? "RTMP 声音循环计划无效。", false);
             }
 
             if (sharedFinalPcmBus is not null
@@ -241,7 +268,8 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
                 sharedRtmpOverlayOutputSource ?? new AudioPcmRingBufferOutputSource(bus.RtmpOverlayBuffer),
                 outputChannels,
                 policyProvider: baseMixPolicyProvider,
-                envelopeOptions: mixEnvelopeOptions);
+                envelopeOptions: mixEnvelopeOptions,
+                overlayFollowsBase: true);
             var pump = new WindowsRtmpFinalPcmPump(
                 mixingOutputSource,
                 outputChannels);
@@ -266,7 +294,7 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
                 _baseMixPolicyProvider = null;
                 producerTask = _producerTask = decoder is null
                     ? Task.CompletedTask
-                    : ProduceAsync(decodePlan, bus, decoder, sessionCancellation, producerStartup);
+                    : ProduceAsync(decodePlan, loopPlan, bus, decoder, sessionCancellation, producerStartup);
                 pumpTask = _pumpTask = RunPumpAsync(pump, sessionCancellation, pumpStartup);
                 if (decoder is null)
                 {
@@ -348,7 +376,7 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
 
         try
         {
-            CancellationTokenSource? sessionCancellation;
+            CancellationToken sessionToken;
             FinalPcmBus? bus;
             lock (_gate)
             {
@@ -367,8 +395,8 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
                     return Failure(WindowsRtmpAudioSessionFailureCode.AlreadyRunning, "RTMP 插话解码已经在运行。", false);
                 }
 
-                sessionCancellation = _sessionCancellation;
-                bus = _sharedFinalPcmBusProvider?.Invoke() ?? _bus;
+                sessionToken = _sessionCancellation.Token;
+                bus = _sharedFinalPcmBusProvider is null ? _bus : _sharedFinalPcmBusProvider();
             }
 
             if (bus is null || plan is null || plan.Channels != bus.Channels)
@@ -377,7 +405,7 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
             }
 
             var overlayCancellation = CancellationTokenSource.CreateLinkedTokenSource(
-                sessionCancellation.Token,
+                sessionToken,
                 cancellationToken);
             var decoder = new WindowsFfmpegPcmDecoder();
             var staleSession = false;
@@ -464,38 +492,36 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         lock (_gate)
         {
-            if (_disposeStarted)
-            {
-                return;
-            }
-
-            _disposeStarted = true;
             _disposed = true;
+            if (_disposeTask is null || _disposeTask.IsFaulted)
+            {
+                _disposeTask = DisposeCoreAsync();
+            }
+            return new(_disposeTask);
         }
+    }
 
+    private async Task DisposeCoreAsync()
+    {
         var stopped = await StopAsync(CancellationToken.None).ConfigureAwait(false);
         if (!stopped.IsSuccess)
         {
             // 停止超时时保留生命周期信号和资源引用，允许调用方再次 Stop/Dispose
             // 完成底层宿主回收；不能把未 Join 的会话伪装成已释放。
-            lock (_gate)
-            {
-                _disposeStarted = false;
-            }
-
-            return;
+            throw new InvalidOperationException(stopped.Error?.Message ?? "RTMP 声音资源尚未退出，保留所有者供重试。");
         }
 
-        _lifecycle.Dispose();
+        // 生命周期信号不创建内核句柄；保留它使并发 Stop/Dispose 能观察相同终态。
         GC.SuppressFinalize(this);
     }
 
     private async Task ProduceAsync(
         FfmpegPcmDecodePlan plan,
+        FfmpegPcmDecodePlan loopPlan,
         FinalPcmBus bus,
         WindowsFfmpegPcmDecoder decoder,
         CancellationTokenSource sessionCancellation,
@@ -545,6 +571,7 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
 
                 startup.TrySetResult(null);
                 AddProducedFrames(result.Snapshot.DecodedFrames);
+                plan = loopPlan;
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -636,14 +663,19 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
     {
         try
         {
-            _ = await decoder.DecodeAsync(
+            var result = await decoder.DecodeAsync(
                     plan,
                     destination: null,
                     cancellation.Token,
                     finalPcmBus: bus,
                     baseMixPolicyProvider: null,
-                    finalPcmOverlay: true)
+                    finalPcmOverlay: true,
+                    finalPcmBusProvider: _sharedFinalPcmBusProvider)
                 .ConfigureAwait(false);
+            if (!result.IsSuccess && !cancellation.IsCancellationRequested)
+            {
+                throw new InvalidOperationException(result.Error?.Message ?? "RTMP 插话解码失败。");
+            }
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
@@ -651,6 +683,11 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
         finally
         {
             bus.DiscardOverlayPending();
+            var currentBus = _sharedFinalPcmBusProvider?.Invoke();
+            if (!ReferenceEquals(currentBus, bus))
+            {
+                currentBus?.DiscardOverlayPending();
+            }
             await decoder.DisposeAsync().ConfigureAwait(false);
             lock (_gate)
             {
@@ -690,8 +727,10 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
         if (sessionCancellation is null)
         {
             // 已进入停止临界区后必须完成宿主回收；调用方取消只影响进入临界区，不能留下 FFmpeg。
-            await _manager.StopAsync(CancellationToken.None).ConfigureAwait(false);
-            return Success();
+            var stoppedHost = await _manager.StopAsync(CancellationToken.None).ConfigureAwait(false);
+            return stoppedHost.IsSuccess ? Success()
+                : Failure(WindowsRtmpAudioSessionFailureCode.StopTimedOut,
+                    stoppedHost.Error?.Message ?? "RTMP 宿主尚未退出。", true);
         }
 
         sessionCancellation.Cancel();
@@ -765,6 +804,7 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
             _overlayTask = null;
             _baseMixPolicyProvider = null;
             _sharedFinalPcmBusProvider = null;
+            _lastError = null;
         }
 
         return Success();
@@ -780,6 +820,7 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
             cancellation = _overlayCancellation;
             decoder = _overlayDecoder;
             task = _overlayTask;
+            cancellation?.Cancel();
         }
 
         if (cancellation is null || task is null)
@@ -787,7 +828,6 @@ public sealed class WindowsRtmpAudioSession : IAsyncDisposable
             return Success();
         }
 
-        cancellation.Cancel();
         decoder?.Stop();
         try
         {

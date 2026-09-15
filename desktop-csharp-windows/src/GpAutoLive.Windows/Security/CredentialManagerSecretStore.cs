@@ -16,6 +16,7 @@ public sealed class CredentialManagerSecretStore : ISecretStore
     private const int MaxTargetNameLength = 256;
     private const int MaxSecretBytes = 64 * 1024;
     private const string DefaultTargetPrefix = "GpAutoLive.CSharp.Windows/";
+    private const string TestControlPlaneTargetPrefix = "GpAutoLive.CSharp.Windows.Test/";
     private const string LegacyRustDeviceIdTarget = "device-id.autolive.desktop";
     private readonly string _targetPrefix;
 
@@ -39,6 +40,9 @@ public sealed class CredentialManagerSecretStore : ISecretStore
         new ReadOnlyExactTargetStore(
             new CredentialManagerSecretStore(string.Empty),
             LegacyRustDeviceIdTarget);
+
+    public static CredentialManagerSecretStore CreateTestControlPlaneStore() =>
+        new(TestControlPlaneTargetPrefix);
 
     public void Set(string name, ReadOnlySpan<byte> secret)
     {

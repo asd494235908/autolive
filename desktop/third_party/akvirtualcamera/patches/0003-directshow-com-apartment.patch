@@ -1,0 +1,62 @@
+diff --git a/windows/dshow/VirtualCamera/src/plugininterface.cpp b/windows/dshow/VirtualCamera/src/plugininterface.cpp
+--- a/windows/dshow/VirtualCamera/src/plugininterface.cpp
++++ b/windows/dshow/VirtualCamera/src/plugininterface.cpp
+@@ -248,11 +248,12 @@ bool AkVCam::PluginInterfacePrivate::registerFilter(const std::string &deviceId,
+     regFilter.cPins2 = static_cast<ULONG>(pins.size());
+     regFilter.rgPins2 = pins.data();
+ 
+-    auto result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
++    const auto initializeResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
++    auto result = initializeResult;
+     bool ok = false;
+     LPWSTR wdescription = nullptr;
+ 
+-    if (FAILED(result)) {
++    if (FAILED(initializeResult) && initializeResult != RPC_E_CHANGED_MODE) {
+         AkLogError("Failed to initialize the COM library.");
+ 
+         goto registerFilter_failed;
+@@ -278,14 +279,18 @@ bool AkVCam::PluginInterfacePrivate::registerFilter(const std::string &deviceId,
+                                           nullptr,
+                                           &regFilter);
+     CoTaskMemFree(wdescription);
+-    ok = true;
++    ok = SUCCEEDED(result);
+ 
+ registerFilter_failed:
+ 
++    if (pMoniker)
++        pMoniker->Release();
++
+     if (filterMapper)
+         filterMapper->Release();
+ 
+-    CoUninitialize();
++    if (SUCCEEDED(initializeResult))
++        CoUninitialize();
+ 
+     AkLogInfo("Result: %s", stringFromResult(result).c_str());
+ 
+@@ -303,9 +308,10 @@ void AkVCam::PluginInterfacePrivate::unregisterFilter(const CLSID &clsid) const
+ {
+     AkLogFunction();
+     IFilterMapper2 *filterMapper = nullptr;
+-    auto result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
++    const auto initializeResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
++    auto result = initializeResult;
+ 
+-    if (FAILED(result))
++    if (FAILED(initializeResult) && initializeResult != RPC_E_CHANGED_MODE)
+         goto unregisterFilter_failed;
+ 
+     result = CoCreateInstance(CLSID_FilterMapper2,
+@@ -326,7 +332,8 @@ unregisterFilter_failed:
+     if (filterMapper)
+         filterMapper->Release();
+ 
+-    CoUninitialize();
++    if (SUCCEEDED(initializeResult))
++        CoUninitialize();
+     AkLogInfo("Result: %s", stringFromResult(result).c_str());
+ }
+ 

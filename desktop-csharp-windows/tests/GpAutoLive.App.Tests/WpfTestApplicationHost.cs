@@ -1,5 +1,7 @@
 using System.Windows;
+using System.Windows.Markup;
 using System.Windows.Threading;
+using System.Xml.Linq;
 
 namespace GpAutoLive.App.Tests;
 
@@ -33,7 +35,22 @@ internal static class WpfTestApplicationHost
                 throw new AssertFailedException("WPF 测试宿主 Dispatcher 已关闭。");
             }
 
-            var operation = dispatcher.InvokeAsync(action, DispatcherPriority.Send);
+            var operation = dispatcher.InvokeAsync(() =>
+            {
+                try { action(); }
+                finally
+                {
+                    foreach (var window in Application.Current.Windows.OfType<MainWindow>().ToArray())
+                    {
+                        if (window.ShutdownCompletion is { } shutdown)
+                        {
+                            DrainShutdown(shutdown);
+                            Assert.IsFalse(Application.Current.Windows.Cast<Window>().Contains(window),
+                                "测试窗口资源退出失败，窗口仍等待重试。");
+                        }
+                    }
+                }
+            }, DispatcherPriority.Send);
             if (!operation.Task.Wait(timeout))
             {
                 throw new AssertFailedException(
@@ -42,6 +59,22 @@ internal static class WpfTestApplicationHost
 
             operation.Task.GetAwaiter().GetResult();
         }
+    }
+
+    private static void DrainShutdown(Task shutdown)
+    {
+        if (shutdown.IsCompleted) return;
+        var dispatcher = Dispatcher.CurrentDispatcher;
+        var frame = new DispatcherFrame();
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(20) };
+        timer.Tick += (_, _) => frame.Continue = false;
+        _ = shutdown.ContinueWith(_ => dispatcher.BeginInvoke(new Action(() => frame.Continue = false)),
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        timer.Start();
+        Dispatcher.PushFrame(frame);
+        timer.Stop();
+        Assert.IsTrue(shutdown.IsCompleted, "测试窗口异步关闭未能完成。");
+        shutdown.GetAwaiter().GetResult();
     }
 
     private static void EnsureStarted()
@@ -74,7 +107,7 @@ internal static class WpfTestApplicationHost
 
         if (_startupException is not null)
         {
-            throw new AssertFailedException("WPF 测试宿主启动失败。", _startupException);
+            throw new AssertFailedException($"WPF 测试宿主启动失败：{_startupException}", _startupException);
         }
     }
 
@@ -85,9 +118,20 @@ internal static class WpfTestApplicationHost
             var dispatcher = Dispatcher.CurrentDispatcher;
             SynchronizationContext.SetSynchronizationContext(
                 new DispatcherSynchronizationContext(dispatcher));
-            var application = new App();
-            application.InitializeComponent();
-            application.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            // 复用同一份 App.xaml 资源，不实例化会获取生产锁的 App。
+            var source = XDocument.Load(System.IO.Path.Combine(AppContext.BaseDirectory, "Fixtures", "App.resources-source.xaml"));
+            XNamespace presentation = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+            var resources = source.Root!.Element(presentation + "Application.Resources")!.Elements().Single();
+            var application = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+            // 先发布主题字典，保证后续模板的 StaticResource 能在解析时找到颜色。
+            var merged = resources.Element(presentation + "ResourceDictionary.MergedDictionaries");
+            if (merged is not null)
+            {
+                foreach (var dictionary in merged.Elements())
+                    application.Resources.MergedDictionaries.Add((ResourceDictionary)XamlReader.Parse(dictionary.ToString()));
+                merged.Remove();
+            }
+            application.Resources.MergedDictionaries.Add((ResourceDictionary)XamlReader.Parse(resources.ToString()));
 
             lock (Gate)
             {
@@ -103,4 +147,5 @@ internal static class WpfTestApplicationHost
             Ready.Set();
         }
     }
+
 }

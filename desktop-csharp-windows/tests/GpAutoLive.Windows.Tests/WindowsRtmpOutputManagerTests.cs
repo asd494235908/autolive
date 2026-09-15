@@ -9,6 +9,46 @@ namespace GpAutoLive.Windows.Tests;
 public sealed class WindowsRtmpOutputManagerTests
 {
     [TestMethod]
+    public async Task Rapid_native_exit_is_joined_during_or_immediately_after_start()
+    {
+        using var fixture = MediaFixture.Create();
+        await using var manager = new WindowsRtmpOutputManager();
+        var exited = new TaskCompletionSource<WindowsRtmpSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+        manager.SnapshotChanged += snapshot =>
+        {
+            if (snapshot.State == RtmpOutputState.Failed && snapshot.ProcessId is null)
+                exited.TrySetResult(snapshot);
+        };
+        var started = await manager.StartAsync(
+            RtmpOutputConfig.Default with { TargetUrl = "rtmp://127.0.0.1/live/fixture" },
+            fixture.Source, Path.Combine(Environment.SystemDirectory, "where.exe"));
+        if (!started.IsSuccess)
+        {
+            Assert.AreEqual(WindowsRtmpFailureCode.ProcessExited, started.Error?.Code);
+            Assert.IsNull(started.Snapshot.ProcessId);
+            Assert.IsFalse(started.Snapshot.FinalPcmInputOpen);
+        }
+        var final = await exited.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.IsFalse(final.FinalPcmInputOpen);
+        Assert.IsNull(final.ProcessId);
+    }
+
+    [TestMethod]
+    public void Video_control_stdin_is_redirected_without_enabling_pcm()
+    {
+        using var fixture = MediaFixture.Create();
+        Assert.IsTrue(RtmpFfmpegCommandBuilder.TryCreate(
+            RtmpOutputConfig.Default with { TargetUrl = "rtmp://127.0.0.1/live/fixture", AudioEnabled = false },
+            fixture.Source, @"C:\media\ffmpeg.exe", null, null, out var plan, out var error), error?.Message);
+        Assert.IsNotNull(plan);
+        var method = typeof(WindowsRtmpOutputManager).GetMethod("CreateStartInfo",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+        var startInfo = (ProcessStartInfo)method.Invoke(null, [plan])!;
+        Assert.IsTrue(startInfo.RedirectStandardInput);
+        Assert.IsFalse(plan.RequiresFinalPcmInput);
+    }
+
+    [TestMethod]
     public async Task Stop_without_start_is_idempotent()
     {
         await using var manager = new WindowsRtmpOutputManager();

@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [ValidateSet('x64')]
     [string]$Architecture = 'x64',
@@ -70,6 +70,13 @@ $cmakeBuild = Join-Path $BuildRoot "cmake-$Architecture"
 $installRoot = Join-Path $BuildRoot "install-$Architecture"
 New-Item -ItemType Directory -Path $sourceStage,$cmakeBuild,$installRoot -Force | Out-Null
 
+# Re-extraction replaces tracked upstream files, but tar leaves patch-added
+# files behind. Refresh only the known 0006-generated header before replay.
+foreach ($headerPath in @('windows/dshow/BaseFilter/src/yuy2_black_frame.h', 'windows/PlatformUtils/src/yuy2_sample.h')) {
+    $generatedHeader = Join-Path $sourceStage ('akvirtualcamera-9cf77ae6379e5f635255f4b377478d388a46a3b2/' + $headerPath)
+    if (Test-Path -LiteralPath $generatedHeader -PathType Leaf) { Remove-Item -LiteralPath $generatedHeader }
+}
+
 & $tar.Source -xf $SourceArchive -C $sourceStage
 $sourceDir = Get-ChildItem -LiteralPath $sourceStage -Directory | Select-Object -First 1
 if (-not $sourceDir) {
@@ -81,6 +88,29 @@ if (-not $sourceDir) {
 # re-running with the same BuildRoot verifies an already applied patch.
 $patchFile = Join-Path $componentRoot 'patches/0002-loopback-service-socket.patch'
 $repositoryRoot = (Resolve-Path (Join-Path $componentRoot '..\..\..')).Path
+Apply-LoopbackPatch -SourceDirectory $sourceDir.FullName -PatchFile $patchFile `
+    -RepositoryRoot $repositoryRoot -GitPath $git.Source
+$patchFile = Join-Path $componentRoot 'patches/0003-directshow-com-apartment.patch'
+Apply-LoopbackPatch -SourceDirectory $sourceDir.FullName -PatchFile $patchFile `
+    -RepositoryRoot $repositoryRoot -GitPath $git.Source
+
+$patchFile = Join-Path $componentRoot 'patches/0004-directshow-capture-pin-category.patch'
+Apply-LoopbackPatch -SourceDirectory $sourceDir.FullName -PatchFile $patchFile `
+    -RepositoryRoot $repositoryRoot -GitPath $git.Source
+
+$patchFile = Join-Path $componentRoot 'patches/0005-ipc-cancel-deadline-wakeup.patch'
+Apply-LoopbackPatch -SourceDirectory $sourceDir.FullName -PatchFile $patchFile `
+    -RepositoryRoot $repositoryRoot -GitPath $git.Source
+
+$patchFile = Join-Path $componentRoot 'patches/0006-directshow-yuy2-idle-black.patch'
+Apply-LoopbackPatch -SourceDirectory $sourceDir.FullName -PatchFile $patchFile `
+    -RepositoryRoot $repositoryRoot -GitPath $git.Source
+
+$patchFile = Join-Path $componentRoot 'patches/0007-service-listener-wakeup.patch'
+Apply-LoopbackPatch -SourceDirectory $sourceDir.FullName -PatchFile $patchFile `
+    -RepositoryRoot $repositoryRoot -GitPath $git.Source
+
+$patchFile = Join-Path $componentRoot 'patches/0008-directshow-yuy2-packed-stride.patch'
 Apply-LoopbackPatch -SourceDirectory $sourceDir.FullName -PatchFile $patchFile `
     -RepositoryRoot $repositoryRoot -GitPath $git.Source
 

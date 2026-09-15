@@ -249,6 +249,18 @@ public sealed class WindowsVirtualCameraOutputCoordinator : IAsyncDisposable
                     cleanup);
             }
 
+            var nativeOutput = await _sidecarHost.WaitForOutputReadyAsync(cancellationToken).ConfigureAwait(false);
+            if (!nativeOutput.IsSuccess)
+            {
+                var cleanup = await CleanupAsync(writer, gpuAttempted, clientAttempted, hostAttempted, CancellationToken.None).ConfigureAwait(false);
+                return FailureAfterCleanup(
+                    nativeOutput.Error?.Code == WindowsVirtualCameraSidecarHostErrorCode.Cancelled
+                        ? WindowsVirtualCameraOutputCoordinatorCode.Cancelled
+                        : WindowsVirtualCameraOutputCoordinatorCode.SidecarStartFailed,
+                    nativeOutput.Error?.Message ?? "虚拟摄像头原生输出未确认首帧",
+                    cleanup);
+            }
+
             lock (_gate)
             {
                 _writer = writer;
@@ -469,7 +481,8 @@ public sealed class WindowsVirtualCameraOutputCoordinator : IAsyncDisposable
             else if (sidecar.State is WindowsVirtualCameraSidecarHostState.Exited
                 or WindowsVirtualCameraSidecarHostState.Failed)
             {
-                reason = $"sidecar 已进入 {sidecar.State} 状态";
+                reason = WindowsVirtualCameraSidecarHost.DescribeOutputFailure(
+                    sidecar.LastErrorCode ?? WindowsVirtualCameraSidecarHostErrorCode.ProcessExited);
             }
             else if (client.State == WindowsVirtualCameraSidecarClientState.Failed)
             {

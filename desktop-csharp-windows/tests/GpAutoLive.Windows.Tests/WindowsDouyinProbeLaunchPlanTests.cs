@@ -8,6 +8,19 @@ namespace GpAutoLive.Windows.Tests;
 public sealed class WindowsDouyinProbeLaunchPlanTests
 {
     [TestMethod]
+    public void Canonical_plan_passes_only_upstream_path_and_keeps_session_data_in_stdin()
+    {
+        using var fixture = ProbeFixture.Create();
+        var request = fixture.CreateRequest(new DouyinLiveConfig { RoomId = "12345", Replies = [] }) with
+        {
+            Protocol = WindowsDouyinProbeProtocol.CanonicalNdjson
+        };
+        Assert.IsTrue(WindowsDouyinProbeLaunchPlanBuilder.TryCreate(request, out var plan, out var error), error);
+        CollectionAssert.AreEqual(new[] { "run", "--no-capture-output", "-n", request.CondaEnvironment,
+            "python", fixture.ScriptPath, "--upstream-root", fixture.UpstreamRoot }, plan!.Arguments.ToArray());
+    }
+
+    [TestMethod]
     public void Plan_uses_argument_list_and_reuses_normalized_local_config()
     {
         using var fixture = ProbeFixture.Create();

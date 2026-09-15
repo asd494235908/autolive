@@ -98,16 +98,19 @@ public static class WindowsDouyinProbeLaunchPlanBuilder
         arguments.Add(scriptPath);
         arguments.Add("--upstream-root");
         arguments.Add(upstreamRoot);
-        arguments.Add("--room-id");
-        arguments.Add(config.RoomId);
-        arguments.Add("--timeout");
-        arguments.Add(((long)request.Timeout.TotalSeconds).ToString(CultureInfo.InvariantCulture));
-        arguments.Add("--qr-output");
-        arguments.Add(qrOutputPath);
-        foreach (var reply in config.Replies)
+        if (request.Protocol == WindowsDouyinProbeProtocol.LegacyEvents)
         {
-            arguments.Add("--reply");
-            arguments.Add(reply);
+            arguments.Add("--room-id");
+            arguments.Add(config.RoomId);
+            arguments.Add("--timeout");
+            arguments.Add(((long)request.Timeout.TotalSeconds).ToString(CultureInfo.InvariantCulture));
+            arguments.Add("--qr-output");
+            arguments.Add(qrOutputPath);
+            foreach (var reply in config.Replies)
+            {
+                arguments.Add("--reply");
+                arguments.Add(reply);
+            }
         }
 
         plan = new ExternalProcessPlan(

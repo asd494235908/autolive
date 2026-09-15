@@ -62,6 +62,11 @@ public sealed class AudioPcmMixingOutputSource : IAudioPcmOutputSource
     private readonly int _releaseFrames = 0;
     private float _baseGain = 1F;
     private float _overlayGain;
+    private readonly bool _overlayFollowsBase;
+    private ulong _baseFramesRead;
+
+    /// <summary>实际混入输出的主源帧数；插话独立输出不推进主源时钟。</summary>
+    public ulong BaseFramesRead => Volatile.Read(ref _baseFramesRead);
 
     public AudioPcmMixingOutputSource(
         AudioPcmRingBuffer baseBuffer,
@@ -87,7 +92,8 @@ public sealed class AudioPcmMixingOutputSource : IAudioPcmOutputSource
         int channels,
         int maxFramesPerRead = 4_096,
         Func<AudioPcmMixPolicy>? policyProvider = null,
-        AudioPcmMixEnvelopeOptions? envelopeOptions = null)
+        AudioPcmMixEnvelopeOptions? envelopeOptions = null,
+        bool overlayFollowsBase = false)
     {
         _baseSource = baseSource ?? throw new ArgumentNullException(nameof(baseSource));
         _overlaySource = overlaySource ?? throw new ArgumentNullException(nameof(overlaySource));
@@ -109,6 +115,7 @@ public sealed class AudioPcmMixingOutputSource : IAudioPcmOutputSource
         _channels = channels;
         _overlayScratch = new float[checked(maxFramesPerRead * channels)];
         _policyProvider = policyProvider;
+        _overlayFollowsBase = overlayFollowsBase;
         if (envelopeOptions is { } envelope)
         {
             if (envelope.SampleRateHz is < 1_000 or > 384_000)
@@ -143,34 +150,62 @@ public sealed class AudioPcmMixingOutputSource : IAudioPcmOutputSource
     {
         framesRead = 0;
         error = null;
-        if (destination.Length % _channels != 0)
+        if (destination.Length % _channels != 0 || destination.Length > _overlayScratch.Length)
         {
-            error = new(
-                PcmRingBufferFailureCode.InvalidFrameShape,
-                "PCM 混音输出目标必须完整对齐到交错声道帧。");
+            error = new(destination.Length % _channels != 0
+                ? PcmRingBufferFailureCode.InvalidFrameShape : PcmRingBufferFailureCode.MixFailed,
+                "PCM 混音目标必须对齐且不超过固定容量。");
             return false;
         }
-
-        if (destination.Length > _overlayScratch.Length)
+        while (framesRead < destination.Length / _channels)
         {
-            error = new(
-                PcmRingBufferFailureCode.MixFailed,
-                "PCM 混音输出目标超过预分配回调缓冲容量。");
-            return false;
+            if (!TryReadSegment(destination[(framesRead * _channels)..], realtime, out var segmentFrames, out error))
+            {
+                return false;
+            }
+            if (segmentFrames == 0)
+            {
+                return true;
+            }
+            framesRead += segmentFrames;
         }
+        return true;
+    }
 
-        var baseReadSucceeded = realtime
-            ? _baseSource.TryReadRealtime(destination, out var baseFrames, out var baseError)
-            : _baseSource.TryRead(destination, out baseFrames, out baseError);
+    private bool TryReadSegment(
+        Span<float> destination,
+        bool realtime,
+        out int framesRead,
+        out PcmRingBufferError? error)
+    {
+        framesRead = 0;
+        error = null;
+
+        int baseFrames;
+        PcmRingBufferError? baseError;
+        var trackSource = _baseSource as AudioPcmTrackSwitchOutputSource;
+        var baseReadSucceeded = trackSource is not null
+            ? trackSource.TryReadOneCandidate(destination, realtime, out baseFrames, out baseError)
+            : realtime
+                ? _baseSource.TryReadRealtime(destination, out baseFrames, out baseError)
+                : _baseSource.TryRead(destination, out baseFrames, out baseError);
         if (!baseReadSucceeded)
         {
             error = baseError;
             return false;
         }
 
+        // RTMP 的源时间只由基础媒体帧推进。临时欠载保留插话尾部，恢复后继续叠加；
+        // 本机输出保留独立 overlay 能力，不受这一发布约束影响。
+        if (_overlayFollowsBase && baseFrames == 0)
+        {
+            return true;
+        }
+        var overlayLength = _overlayFollowsBase || trackSource is not null && baseFrames > 0
+            ? baseFrames * _channels : destination.Length;
         var overlayReadSucceeded = realtime
-            ? _overlaySource.TryReadRealtime(_overlayScratch.AsSpan(0, destination.Length), out var overlayFrames, out var overlayError)
-            : _overlaySource.TryRead(_overlayScratch.AsSpan(0, destination.Length), out overlayFrames, out overlayError);
+            ? _overlaySource.TryReadRealtime(_overlayScratch.AsSpan(0, overlayLength), out var overlayFrames, out var overlayError)
+            : _overlaySource.TryRead(_overlayScratch.AsSpan(0, overlayLength), out overlayFrames, out overlayError);
         if (!overlayReadSucceeded)
         {
             error = overlayError;
@@ -210,6 +245,7 @@ public sealed class AudioPcmMixingOutputSource : IAudioPcmOutputSource
             outputFrames);
         _baseGain = baseEnd;
         _overlayGain = overlayEnd;
+        Interlocked.Add(ref _baseFramesRead, (ulong)baseFrames);
         framesRead = outputFrames;
         return true;
     }

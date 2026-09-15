@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
 using System.Security;
 using Microsoft.Win32;
 
@@ -41,13 +42,9 @@ public static class WindowsVirtualCameraInstallationProbe
     private const string ExpectedDeviceName = "GpAutoLive Camera";
     private const string AlternateDeviceName = "GpAutoLiveCamera";
     private const int MaxDeviceEntries = 4096;
-    private const uint DigcfPresent = 0x00000002;
-    private const uint SpdrpDevicedesc = 0x00000000;
-    private const uint SpdrpFriendlyname = 0x0000000C;
-    private static readonly nint InvalidDeviceInfoSet = new(-1);
 
     /// <summary>
-    /// 探测固定双注册表视图、正式发布组件和当前存在的目标 PnP 设备。
+    /// 探测固定双注册表视图、发布/开发组件和 DirectShow 视频输入设备类别。
     /// 显式根目录只用于开发/安装验证；为空时使用注册表所有者提供的根目录。
     /// </summary>
     public static WindowsVirtualCameraInstallationProbeResult Probe(string? installationRoot = null)
@@ -55,6 +52,13 @@ public static class WindowsVirtualCameraInstallationProbe
         if (!OperatingSystem.IsWindows())
         {
             return Result(WindowsVirtualCameraInstallationProbeCode.NotWindows, false, false, false, false);
+        }
+
+        if (installationRoot is null)
+        {
+            var packageRoot = Environment.GetEnvironmentVariable(WindowsVirtualCameraSidecarLocator.InstallRootEnvironmentVariable);
+            if (!string.IsNullOrWhiteSpace(packageRoot))
+                installationRoot = Path.Combine(packageRoot, "akvirtualcamera");
         }
 
         if (!TryNormalizeInstallRoot(installationRoot, out var explicitRoot, out var explicitRootInvalid))
@@ -87,7 +91,8 @@ public static class WindowsVirtualCameraInstallationProbe
         var hasX86Owner = x86Root is not null;
         var registryCode = !hasX64Owner || !hasX86Owner
             ? WindowsVirtualCameraInstallationProbeCode.RegistryOwnerMissing
-            : !string.Equals(x64Root, x86Root, StringComparison.OrdinalIgnoreCase)
+            : (!string.Equals(x64Root, x86Root, StringComparison.OrdinalIgnoreCase)
+                || (explicitRoot is not null && !string.Equals(explicitRoot, x64Root, StringComparison.OrdinalIgnoreCase)))
                 ? WindowsVirtualCameraInstallationProbeCode.RegistryOwnerMismatch
                 : (WindowsVirtualCameraInstallationProbeCode?)null;
 
@@ -160,7 +165,7 @@ public static class WindowsVirtualCameraInstallationProbe
             return true;
         }
 
-        if (value.Any(char.IsControl))
+        if (value.Any(char.IsControl) || !Path.IsPathFullyQualified(value))
         {
             invalid = true;
             return false;
@@ -207,6 +212,10 @@ public static class WindowsVirtualCameraInstallationProbe
 
     private static bool HasFixedComponents(string root)
     {
+        var development = WindowsVirtualCameraDevelopmentTrust.TryGetRoot(
+            Path.Combine(root, "bin", WindowsVirtualCameraSidecarLaunchPlanBuilder.SidecarFileName), out var developmentRoot)
+            && string.Equals(root, developmentRoot, StringComparison.OrdinalIgnoreCase)
+            && WindowsVirtualCameraDevelopmentTrust.ValidateManifest(root);
         var expected = new[]
         {
             Path.Combine(root, "release-ready.json"),
@@ -220,6 +229,7 @@ public static class WindowsVirtualCameraInstallationProbe
 
         foreach (var path in expected)
         {
+            if (development && Path.GetFileName(path) == "release-ready.json") continue;
             try
             {
                 if (!File.Exists(path)
@@ -244,130 +254,63 @@ public static class WindowsVirtualCameraInstallationProbe
     private static bool TryFindPresentDevice(out bool probeFailed)
     {
         probeFailed = false;
-        nint deviceInfoSet;
+        object? systemEnumerator = null;
+        IEnumMoniker? devices = null;
         try
         {
-            deviceInfoSet = SetupDiGetClassDevsW(IntPtr.Zero, null, IntPtr.Zero, DigcfPresent);
-        }
-        catch (DllNotFoundException)
-        {
-            probeFailed = true;
-            return false;
-        }
-        catch (EntryPointNotFoundException)
-        {
-            probeFailed = true;
-            return false;
-        }
-
-        if (deviceInfoSet == InvalidDeviceInfoSet)
-        {
-            probeFailed = true;
-            return false;
-        }
-
-        try
-        {
-            var data = new SpDevinfoData
+            var type = Type.GetTypeFromCLSID(new Guid("62BE5D10-60EB-11D0-BD3B-00A0C911CE86"), throwOnError: true);
+            systemEnumerator = Activator.CreateInstance(type!);
+            var category = new Guid("860BB310-5D01-11D0-BD3B-00A0C911CE86");
+            var result = ((ICreateDevEnum)systemEnumerator!).CreateClassEnumerator(ref category, out devices, 0);
+            if (result == 1) return false; // S_FALSE 表示空类别。
+            if (result != 0 || devices is null) { probeFailed = true; return false; }
+            var monikers = new IMoniker[1];
+            for (var index = 0; index < MaxDeviceEntries; index++)
             {
-                CbSize = Marshal.SizeOf<SpDevinfoData>(),
-            };
-            for (uint index = 0; index < MaxDeviceEntries; index++)
-            {
-                if (!SetupDiEnumDeviceInfo(deviceInfoSet, index, ref data))
+                var next = devices.Next(1, monikers, IntPtr.Zero);
+                if (next == 1) return false;
+                if (next != 0) { probeFailed = true; return false; }
+                object? storage = null;
+                try
                 {
-                    var error = Marshal.GetLastWin32Error();
-                    if (error == 259) // ERROR_NO_MORE_ITEMS
-                    {
-                        return false;
-                    }
-
-                    probeFailed = true;
-                    return false;
+                    var bagId = new Guid("55272A00-42CB-11CE-8135-00AA004BB851");
+                    monikers[0].BindToStorage(null!, null!, ref bagId, out storage);
+                    if (((IPropertyBag)storage).Read("FriendlyName", out var value, IntPtr.Zero) == 0
+                        && value is string name
+                        && (string.Equals(name, ExpectedDeviceName, StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(name, AlternateDeviceName, StringComparison.OrdinalIgnoreCase))) return true;
                 }
-
-                if (IsExpectedDevice(deviceInfoSet, ref data, SpdrpFriendlyname)
-                    || IsExpectedDevice(deviceInfoSet, ref data, SpdrpDevicedesc))
+                finally
                 {
-                    return true;
+                    if (storage is not null) Marshal.ReleaseComObject(storage);
+                    Marshal.ReleaseComObject(monikers[0]);
                 }
-
-                data.CbSize = Marshal.SizeOf<SpDevinfoData>();
             }
-
+            probeFailed = true;
+            return false;
+        }
+        catch (Exception ex) when (ex is COMException or InvalidCastException or TypeLoadException or UnauthorizedAccessException)
+        {
             probeFailed = true;
             return false;
         }
         finally
         {
-            try
-            {
-                SetupDiDestroyDeviceInfoList(deviceInfoSet);
-            }
-            catch (DllNotFoundException)
-            {
-            }
-            catch (EntryPointNotFoundException)
-            {
-            }
+            if (devices is not null) Marshal.ReleaseComObject(devices);
+            if (systemEnumerator is not null) Marshal.ReleaseComObject(systemEnumerator);
         }
     }
 
-    private static bool IsExpectedDevice(nint deviceInfoSet, ref SpDevinfoData data, uint property)
+    [ComImport, Guid("29840822-5B84-11D0-BD3B-00A0C911CE86"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface ICreateDevEnum
     {
-        var name = new System.Text.StringBuilder(512);
-        if (!SetupDiGetDeviceRegistryPropertyW(
-                deviceInfoSet,
-                ref data,
-                property,
-                out _,
-                name,
-                name.Capacity,
-                out _))
-        {
-            return false;
-        }
-
-        var value = name.ToString().Trim();
-        return string.Equals(value, ExpectedDeviceName, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(value, AlternateDeviceName, StringComparison.OrdinalIgnoreCase);
+        [PreserveSig] int CreateClassEnumerator(ref Guid category, out IEnumMoniker? enumerator, int flags);
     }
 
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern nint SetupDiGetClassDevsW(
-        nint classGuid,
-        string? enumerator,
-        nint hwndParent,
-        uint flags);
-
-    [DllImport("setupapi.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetupDiEnumDeviceInfo(
-        nint deviceInfoSet,
-        uint memberIndex,
-        ref SpDevinfoData deviceInfoData);
-
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetupDiGetDeviceRegistryPropertyW(
-        nint deviceInfoSet,
-        ref SpDevinfoData deviceInfoData,
-        uint property,
-        out uint propertyRegDataType,
-        System.Text.StringBuilder propertyBuffer,
-        int propertyBufferSize,
-        out int requiredSize);
-
-    [DllImport("setupapi.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetupDiDestroyDeviceInfoList(nint deviceInfoSet);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct SpDevinfoData
+    [ComImport, Guid("55272A00-42CB-11CE-8135-00AA004BB851"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPropertyBag
     {
-        public int CbSize;
-        public Guid ClassGuid;
-        public uint DevInst;
-        public nint Reserved;
+        [PreserveSig] int Read([MarshalAs(UnmanagedType.LPWStr)] string name, [MarshalAs(UnmanagedType.Struct)] out object value, IntPtr errorLog);
+        [PreserveSig] int Write([MarshalAs(UnmanagedType.LPWStr)] string name, [MarshalAs(UnmanagedType.Struct)] ref object value);
     }
 }

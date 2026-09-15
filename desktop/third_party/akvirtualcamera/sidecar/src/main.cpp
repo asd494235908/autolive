@@ -4,7 +4,7 @@
  * This file is distributed under GPL-3.0-or-later as an independent
  * component. It does not link the Rust desktop process to AkVirtualCamera.
  * The sidecar loads the upstream C API from the fixed application directory,
- * accepts only the fixed YUY2 1280x720 frame protocol, and serves one
+ * accepts bounded YUY2 v2 source-sized frames (v1 remains 1280x720), and serves one
  * current-user named pipe per authenticated session token. The token is
  * received once over inherited stdin so it never appears in argv/env.
  */
@@ -21,6 +21,8 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include "frame_format.h"
+#include "device_format.h"
 
 #ifndef PIPE_REJECT_REMOTE_CLIENTS
 #define PIPE_REJECT_REMOTE_CLIENTS 0x00000008
@@ -32,9 +34,6 @@ constexpr std::size_t kTokenHexLength = 32;
 constexpr std::size_t kTokenBytes = 16;
 constexpr std::size_t kFrameHeaderBytes = 52;
 constexpr std::size_t kFramePayloadBytes = 1280u * 720u * 2u;
-constexpr std::uint16_t kProtocolVersion = 1;
-constexpr std::uint32_t kWidth = 1280;
-constexpr std::uint32_t kHeight = 720;
 constexpr char kFrameMagic[] = "GPAKVC01";
 constexpr char kDeviceId[] = "GpAutoLiveCamera";
 constexpr char kDeviceDescription[] = "GpAutoLive Camera";
@@ -111,6 +110,9 @@ struct CameraSession {
     VcamHandle handle = nullptr;
     std::string deviceId;
     bool streaming = false;
+    bool development = false;
+    int failureCode = 5;
+    bool firstFrameSent = false;
 
     bool start() {
         if (!api.load())
@@ -130,9 +132,6 @@ struct CameraSession {
         bool directMode = false;
         if (api.directMode(handle, deviceId.c_str(), &directMode) != 0 || !directMode)
             return false;
-        if (api.streamStart(handle, deviceId.c_str()) != 0)
-            return false;
-        streaming = true;
         return true;
     }
 
@@ -143,19 +142,40 @@ struct CameraSession {
             api.close(handle);
     }
 
-    bool send(const std::vector<std::uint8_t> &payload) {
-        if (!streaming || payload.size() != kFramePayloadBytes)
+    bool send(const std::vector<std::uint8_t> &payload, std::uint32_t width, std::uint32_t height) {
+        if (!streaming) {
+            // Reconfiguration requires consumers to reopen their media type.
+            const bool matchingFormat = prepareDeviceFormat(width, height, false);
+            if (!matchingFormat && development && clientCount() != 0) {
+                failureCode = 6;
+                std::fprintf(stderr, "GPAKVC_CLOSE_CONSUMERS_BEFORE_FORMAT_CHANGE\n");
+                return false;
+            }
+            if (!matchingFormat && (!development || !prepareDeviceFormat(width, height, true))) {
+                failureCode = 7;
+                return false;
+            }
+            if (api.streamStart(handle, deviceId.c_str()) != 0) return false;
+            streaming = true;
+        }
+        if (payload.size() != static_cast<std::size_t>(width) * height * 2u)
             return false;
         const char *planes[] = {reinterpret_cast<const char *>(payload.data())};
-        std::size_t lineSizes[] = {kWidth * 2u};
-        return api.streamSend(handle,
+        std::size_t lineSizes[] = {width * 2u};
+        const bool sent = api.streamSend(handle,
                               deviceId.c_str(),
                               "YUY2",
-                              static_cast<int>(kWidth),
-                              static_cast<int>(kHeight),
+                              static_cast<int>(width),
+                              static_cast<int>(height),
                               planes,
                               lineSizes)
             == 0;
+        if (sent && !firstFrameSent) {
+            firstFrameSent = true;
+            std::printf("GPAKVC_OUTPUT_READY\n");
+            std::fflush(stdout);
+        }
+        return sent;
     }
 
     int clientCount() const {
@@ -348,22 +368,28 @@ HANDLE createPipe(const std::wstring &name, PSECURITY_DESCRIPTOR *descriptor) {
 
 bool consumeFrames(HANDLE pipe, CameraSession &session) {
     std::array<std::uint8_t, kFrameHeaderBytes> header{};
-    std::vector<std::uint8_t> payload(kFramePayloadBytes);
+    std::vector<std::uint8_t> payload;
+    std::uint32_t sessionWidth = 0, sessionHeight = 0;
     std::uint64_t currentGeneration = 0;
     std::uint64_t lastSequence = 0;
     auto lastStatusAt = std::chrono::steady_clock::now();
     while (readExact(pipe, header.data(), header.size())) {
         if (std::memcmp(header.data(), kFrameMagic, 8) != 0
-            || readU16(header.data() + 8) != kProtocolVersion
             || readU16(header.data() + 10) != kFrameHeaderBytes
-            || readU32(header.data() + 36) != kWidth
-            || readU32(header.data() + 40) != kHeight
-            || readU32(header.data() + 44) != kFramePayloadBytes
+            || !validFrameFormat(readU16(header.data() + 8), readU32(header.data() + 36),
+                                 readU32(header.data() + 40), readU32(header.data() + 44))
             || readU32(header.data() + 48) != 0
             || readU64(header.data() + 12) == 0
             || readU64(header.data() + 20) == 0
             || readI64(header.data() + 28) < 0)
             return false;
+
+        const auto width = readU32(header.data() + 36), height = readU32(header.data() + 40);
+        if (sessionWidth && (sessionWidth != width || sessionHeight != height))
+            return false;
+        sessionWidth = width;
+        sessionHeight = height;
+        payload.resize(readU32(header.data() + 44));
 
         const std::uint64_t generation = readU64(header.data() + 12);
         const std::uint64_t sequence = readU64(header.data() + 20);
@@ -373,7 +399,7 @@ bool consumeFrames(HANDLE pipe, CameraSession &session) {
             continue;
         if (generation != currentGeneration)
             lastSequence = 0;
-        if (!session.send(payload))
+        if (!session.send(payload, width, height))
             return false;
         currentGeneration = generation;
         lastSequence = sequence;
@@ -389,20 +415,22 @@ bool consumeFrames(HANDLE pipe, CameraSession &session) {
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
-    if (argc != 2 || wcscmp(argv[1], L"--session-token-stdin") != 0)
+    if ((argc != 2 && argc != 3) || wcscmp(argv[1], L"--session-token-stdin") != 0
+        || (argc == 3 && wcscmp(argv[2], L"--development-format") != 0))
         return 2;
     std::array<std::uint8_t, kTokenBytes> token{};
     if (!readSessionTokenFromStdin(token))
         return 2;
 
     CameraSession cameraSession;
+    cameraSession.development = argc == 3;
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     HANDLE pipe = createPipe(pipeName(token), &descriptor);
     if (pipe == INVALID_HANDLE_VALUE) {
         return 3;
     }
-    // Initialize the fixed device before accepting the producer connection so that
-    // a connected pipe means the DirectShow endpoint can receive YUY2 frames.
+    // Verify device ownership/modes before accepting the producer. Output is
+    // acknowledged only after its first frame has actually entered the C API.
     if (!cameraSession.start()) {
         CloseHandle(pipe);
         LocalFree(descriptor);
@@ -423,5 +451,5 @@ int wmain(int argc, wchar_t **argv) {
     DisconnectNamedPipe(pipe);
     CloseHandle(pipe);
     LocalFree(descriptor);
-    return consumed ? 0 : 5;
+    return consumed ? 0 : cameraSession.failureCode;
 }

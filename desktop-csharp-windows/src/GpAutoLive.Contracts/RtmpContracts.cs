@@ -175,7 +175,7 @@ public static class RtmpOutputRules
         if (targetUrl.Any(static character =>
                 char.IsControl(character) || char.IsWhiteSpace(character) || character == '\\'))
         {
-            error = Invalid(RtmpConfigFailureCode.TargetUrlInvalid, "RTMP 地址格式无效");
+            error = Invalid(RtmpConfigFailureCode.TargetUrlInvalid, "RTMP 地址必须使用 rtmp:// 或 rtmps://，且不能包含反斜杠");
             return false;
         }
 

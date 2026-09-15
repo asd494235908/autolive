@@ -23,11 +23,19 @@ public sealed class VirtualCameraContractTests
     }
 
     [TestMethod]
-    public void Fixed_configuration_rejects_resolution_or_zero_copy_changes()
+    public void Adaptive_configuration_accepts_source_dimensions_and_rejects_unsafe_formats()
     {
-        Assert.IsFalse(
-            (VirtualCameraConfig.Default with { Width = 1920 }).TryValidateFixedOutput(out var resolutionError));
-        StringAssert.Contains(resolutionError!.Message, "YUY2");
+        foreach (var (width, height) in new[] { (1920U, 1080U), (1080U, 1920U), (4096U, 2160U), (2160U, 4096U), (640U, 481U) })
+        {
+            var config = VirtualCameraConfig.Default with { Width = width, Height = height };
+            Assert.IsTrue(config.TryValidateFixedOutput(out var error), error?.Message);
+            Assert.IsTrue(VirtualCameraFrame.TryCreateBlack(config, 1, 1, 0, out var frame, out error));
+            Assert.AreEqual(checked((int)(width * height * 2)), frame!.Payload.Length);
+        }
+        foreach (var (width, height) in new[] { (0U, 720U), (641U, 480U), (4098U, 2U), (4096U, 2161U), (2U, 4097U) })
+        {
+            Assert.IsFalse((VirtualCameraConfig.Default with { Width = width, Height = height }).TryValidateFixedOutput(out _));
+        }
 
         Assert.IsFalse(
             (VirtualCameraConfig.Default with { ZeroCopy = true }).TryValidateFixedOutput(out var transportError));

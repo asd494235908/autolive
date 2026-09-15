@@ -55,7 +55,10 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
     private WindowsPortAudioInputError? _lastError;
     private CancellationTokenSource? _sessionCancellation;
     private Task? _monitorTask;
+    private Task<WindowsPortAudioInputResult>? _inputStopTask;
     private bool _disposed;
+    private bool _disposeCompleted;
+    private bool _stopRequested;
     private bool _prioritySpeaking;
 
     public WindowsMicrophoneInterludeController(
@@ -94,6 +97,14 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
         WindowsPortAudioInputConfig config,
         CancellationToken cancellationToken = default)
     {
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                return Failure(WindowsPortAudioInputFailureCode.Closed, "麦克风门控已关闭。", false);
+            }
+        }
+
         if (cancellationToken.IsCancellationRequested)
         {
             return Failure(
@@ -104,7 +115,10 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
 
         try
         {
-            await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (!await _lifecycle.WaitAsync(StopTimeout, cancellationToken).ConfigureAwait(false))
+            {
+                return Failure(WindowsPortAudioInputFailureCode.StartFailed, "麦克风上一操作尚未回收。", true);
+            }
         }
         catch (ObjectDisposedException)
         {
@@ -124,12 +138,14 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
                     return Failure(WindowsPortAudioInputFailureCode.Closed, "麦克风门控已关闭。", false);
                 }
 
-                if (_input.Snapshot.IsRunning || _state is WindowsMicrophoneInterludeState.Starting or WindowsMicrophoneInterludeState.Listening)
+                if (_monitorTask is not null || _inputStopTask is not null || _input.HasPendingCleanup
+                    || _state is WindowsMicrophoneInterludeState.Starting or WindowsMicrophoneInterludeState.Listening)
                 {
                     return Failure(WindowsPortAudioInputFailureCode.InvalidConfig, "麦克风门控已经启动。", false);
                 }
 
                 _state = WindowsMicrophoneInterludeState.Starting;
+                _stopRequested = false;
                 _lastError = null;
             }
 
@@ -157,11 +173,29 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
                 return new(false, Snapshot, ToError(started.Error));
             }
 
+            bool stopRequested;
+            lock (_gate)
+            {
+                stopRequested = _stopRequested || _disposed || cancellationToken.IsCancellationRequested;
+            }
+
+            if (stopRequested)
+            {
+                await _input.StopAsync().ConfigureAwait(false);
+                return Failure(WindowsPortAudioInputFailureCode.Cancelled, "麦克风门控启动已取消。", true);
+            }
+
             var sessionCancellation = CancellationTokenSource.CreateLinkedTokenSource(
                 cancellationToken,
                 _disposeCancellation.Token);
             lock (_gate)
             {
+                if (_stopRequested || _disposed)
+                {
+                    sessionCancellation.Dispose();
+                    return Failure(WindowsPortAudioInputFailureCode.Cancelled, "麦克风门控启动已取消。", true);
+                }
+
                 _sessionCancellation = sessionCancellation;
                 _prioritySpeaking = false;
                 _audioPriority.SetMicrophoneSpeaking(false);
@@ -178,77 +212,104 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
         }
     }
 
-    /// <summary>停止输入和门控观察；重复调用安全。</summary>
+    /// <summary>停止输入和观察；预算到期保留任务及取消源，后续停止可继续 Join。</summary>
     public async Task<WindowsMicrophoneInterludeResult> StopAsync()
     {
-        try
+        var deadline = Environment.TickCount64 + (long)StopTimeout.TotalMilliseconds;
+        lock (_gate)
         {
-            await _lifecycle.WaitAsync().ConfigureAwait(false);
+            if (_disposeCompleted)
+            {
+                return new(true, CreateSnapshotUnsafe());
+            }
+
+            _stopRequested = true;
+            _sessionCancellation?.Cancel();
+            _interludeGate.Disable();
+            _audioPriority.SetMicrophoneSpeaking(false);
+            _prioritySpeaking = false;
         }
-        catch (ObjectDisposedException)
+
+        if (!await _lifecycle.WaitAsync(StopTimeout).ConfigureAwait(false))
         {
-            return new(true, Snapshot);
+            return Failure(WindowsPortAudioInputFailureCode.StopFailed, "麦克风生命周期操作未能在停止预算内结束。", true);
         }
 
         try
         {
             Task? monitorTask;
-            WindowsPortAudioInputError? monitorStopError = null;
-            WindowsPortAudioInputError? existingError;
+            WindowsPortAudioInputError? monitorFailure = null;
+            Task<WindowsPortAudioInputResult> inputStopTask;
             lock (_gate)
             {
-                _state = _disposed
-                    ? WindowsMicrophoneInterludeState.Closed
-                    : WindowsMicrophoneInterludeState.Stopping;
-                _sessionCancellation?.Cancel();
+                _state = WindowsMicrophoneInterludeState.Stopping;
                 monitorTask = _monitorTask;
+                // 重试只等待同一条停止任务；完成但失败时才允许再尝试关闭。
+                if (_inputStopTask is null || _inputStopTask.IsCompleted)
+                {
+                    _inputStopTask = _input.StopAsync();
+                }
+
+                inputStopTask = _inputStopTask;
             }
 
-            if (monitorTask is not null)
+            try
             {
-                try
+                if (monitorTask is not null)
                 {
-                    await monitorTask.WaitAsync(StopTimeout).ConfigureAwait(false);
+                    try
+                    {
+                        await monitorTask.WaitAsync(RemainingStopBudget(deadline)).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                    catch (Exception) when (monitorTask.IsFaulted)
+                    {
+                        monitorFailure = new(WindowsPortAudioInputFailureCode.CallbackFailed,
+                            "麦克风观察任务异常结束，正在回收输入资源。", Retryable: true);
+                        lock (_gate)
+                        {
+                            _lastError = monitorFailure;
+                        }
+                    }
                 }
-                catch (OperationCanceledException)
+
+                var stopped = await inputStopTask.WaitAsync(RemainingStopBudget(deadline)).ConfigureAwait(false);
+                if (!stopped.IsSuccess || _input.HasPendingCleanup)
                 {
+                    return Failure(WindowsPortAudioInputFailureCode.StopFailed,
+                        stopped.Error?.Message ?? "麦克风输入原生资源尚未回收。", true);
                 }
-                catch (TimeoutException)
-                {
-                    monitorStopError = new(
-                        WindowsPortAudioInputFailureCode.StopFailed,
-                        "麦克风门控观察器未能在停止预算内结束。",
-                        Retryable: true);
-                }
+            }
+            catch (TimeoutException)
+            {
+                return Failure(WindowsPortAudioInputFailureCode.StopFailed,
+                    "麦克风停止预算已到，保留观察任务、取消源和输入 owner 等待回收。", true);
             }
 
             lock (_gate)
             {
-                existingError = _lastError;
-            }
-
-            var stopped = _input.Stop();
-            _interludeGate.Disable();
-            _audioPriority.SetMicrophoneSpeaking(false);
-            lock (_gate)
-            {
-                _prioritySpeaking = false;
                 _sessionCancellation?.Dispose();
                 _sessionCancellation = null;
                 _monitorTask = null;
-                _lastError = monitorStopError ?? stopped.Error ?? existingError;
+                _inputStopTask = null;
+                if (_lastError?.Code is WindowsPortAudioInputFailureCode.StopFailed)
+                {
+                    _lastError = null;
+                }
+
                 _state = _disposed
                     ? WindowsMicrophoneInterludeState.Closed
-                    : monitorStopError is null && stopped.IsSuccess && existingError is null
+                    : _lastError is null
                         ? WindowsMicrophoneInterludeState.Idle
                         : WindowsMicrophoneInterludeState.Failed;
             }
 
             PublishSnapshot();
-            var finalError = monitorStopError ?? stopped.Error ?? existingError;
-            return monitorStopError is null && stopped.IsSuccess && existingError is null
+            return monitorFailure is null
                 ? new(true, Snapshot)
-                : new(false, Snapshot, ToError(finalError));
+                : new(false, Snapshot, ToError(monitorFailure));
         }
         finally
         {
@@ -260,17 +321,42 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
     {
         lock (_gate)
         {
+            if (_disposeCompleted)
+            {
+                return;
+            }
+
             _disposed = true;
+            _disposeCancellation.Cancel();
         }
 
-        _disposeCancellation.Cancel();
-        await StopAsync().ConfigureAwait(false);
-        _input.Dispose();
-        _disposeCancellation.Dispose();
-        _lifecycle.Dispose();
+        var stopped = await StopAsync().ConfigureAwait(false);
+        if (_input.HasPendingCleanup
+            || (!stopped.IsSuccess && stopped.Error?.Code is not WindowsPortAudioInputFailureCode.CallbackFailed))
+        {
+            // 未 Join 的对象不能释放同步原语；再次 Dispose/Stop 可继续回收。
+            throw new TimeoutException("麦克风会话释放未确认；保留任务和输入 owner，可重试 DisposeAsync。");
+        }
+
+        lock (_gate)
+        {
+            if (!_disposeCompleted)
+            {
+                _disposeCompleted = true;
+                _disposeCancellation.Dispose();
+            }
+        }
+
+        // SemaphoreSlim 未使用 WaitHandle，仅含受管状态；不与已排队的启动/停止者竞争 Dispose。
         GC.SuppressFinalize(this);
+        if (!stopped.IsSuccess)
+        {
+            throw new InvalidOperationException("麦克风观察任务异常，输入资源已完成回收。");
+        }
     }
 
+    private static TimeSpan RemainingStopBudget(long deadline) =>
+        TimeSpan.FromMilliseconds(Math.Max(0, deadline - Environment.TickCount64));
     private async Task MonitorGateAsync(CancellationToken cancellationToken)
     {
         try
@@ -301,9 +387,7 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
 
                     _audioPriority.SetMicrophoneSpeaking(false);
                     Volatile.Write(ref _prioritySpeaking, false);
-                    // Stop on a worker because the synchronous native boundary is
-                    // bounded but must not block this async monitor's executor.
-                    await Task.Run(_input.Stop).ConfigureAwait(false);
+                    await _input.StopAsync().ConfigureAwait(false);
                     PublishSnapshot();
                     return;
                 }
@@ -333,7 +417,7 @@ public sealed class WindowsMicrophoneInterludeController : IAsyncDisposable
 
                     _audioPriority.SetMicrophoneSpeaking(false);
                     Volatile.Write(ref _prioritySpeaking, false);
-                    await Task.Run(_input.Stop).ConfigureAwait(false);
+                    await _input.StopAsync().ConfigureAwait(false);
                     PublishSnapshot();
                     return;
                 }

@@ -91,7 +91,10 @@ public static class WindowsVirtualCameraSidecarLaunchPlanBuilder
         plan = new WindowsVirtualCameraSidecarLaunchPlan(
             sidecarPath,
             workingDirectory,
-            ImmutableArray.Create("--session-token-stdin"),
+            WindowsVirtualCameraDevelopmentTrust.TryGetRoot(sidecarPath, out var developmentRoot)
+                && WindowsVirtualCameraDevelopmentTrust.ValidateManifest(developmentRoot)
+                ? ImmutableArray.Create("--session-token-stdin", "--development-format")
+                : ImmutableArray.Create("--session-token-stdin"),
             request.Config,
             request.StartupTimeout)
         {

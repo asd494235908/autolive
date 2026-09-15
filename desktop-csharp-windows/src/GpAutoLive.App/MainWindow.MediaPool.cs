@@ -240,13 +240,16 @@ public partial class MainWindow
     /// </summary>
     private async Task<bool> StopMediaForMutationAsync()
     {
+        if (!await PreserveVideoTransitionFrameAsync().ConfigureAwait(true)) return false;
         if (!await StopRtmpForMediaMutationAsync().ConfigureAwait(true))
         {
+            CancelVideoTransitionBeforeLoad();
             return false;
         }
 
         if (!await StopVirtualCameraForMediaMutationAsync().ConfigureAwait(true))
         {
+            CancelVideoTransitionBeforeLoad();
             return false;
         }
 
@@ -255,6 +258,7 @@ public partial class MainWindow
         await StopInterludeForPriorityAsync().ConfigureAwait(true);
         if (!await StopMicrophoneAsync().ConfigureAwait(true))
         {
+            CancelVideoTransitionBeforeLoad();
             return false;
         }
         var audioState = _audioPlaybackController.Snapshot.State;
@@ -267,6 +271,7 @@ public partial class MainWindow
             if (!stoppedAudio.IsSuccess)
             {
                 _state.SetStatus(stoppedAudio.Error?.Message ?? "媒体池编辑前停止纯音频失败");
+                CancelVideoTransitionBeforeLoad();
                 return false;
             }
 
@@ -309,6 +314,7 @@ public partial class MainWindow
 
     private void ApplyMediaSnapshot(AppState snapshot, string status)
     {
+        if (_isClosing) return;
         _state.ApplyMediaSnapshot(snapshot);
         SyncVirtualCameraOutputContext(snapshot);
         SelectMediaPoolIndex(snapshot.SourceMediaPool.IsEmpty ? -1 : snapshot.SourceMediaIndex);
@@ -317,6 +323,7 @@ public partial class MainWindow
         _state.SetStatus(status);
         _finalEffectController.Update(CreateFinalEffectSnapshot());
         SetImportButtonsEnabled(_login.CanEnterWorkbench && !_importBusy);
+        UpdateVirtualCameraProjection();
     }
 
     private Task ImportMediaAsync() => RunImportAsync(CreateOpenFileImportRequestAsync);

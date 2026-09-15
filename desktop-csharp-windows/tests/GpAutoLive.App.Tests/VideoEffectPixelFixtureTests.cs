@@ -243,6 +243,11 @@ public sealed class VideoEffectPixelFixtureTests
                 finally
                 {
                     window?.Close();
+                    if (window?.ShutdownCompletion is { } shutdown)
+                    {
+                        PumpUntilCompleted(shutdown, "关闭主窗口");
+                        shutdown.GetAwaiter().GetResult();
+                    }
                 }
             }
         }

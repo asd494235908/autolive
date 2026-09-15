@@ -9,9 +9,12 @@ namespace GpAutoLive.Windows.Tests;
 public sealed class WindowsVirtualCameraSidecarOutputWriterTests
 {
     [TestMethod]
-    public async Task Writer_sends_a_fixed_black_frame_when_output_policy_is_black()
+    [DataRow(1280U, 720U)]
+    [DataRow(1920U, 1080U)]
+    [DataRow(1080U, 1920U)]
+    public async Task Writer_sends_adaptive_black_frame_when_output_policy_is_black(uint width, uint height)
     {
-        var manager = ReadyManager();
+        var manager = ReadyManager(width, height);
         var pipeName = CreatePipeName();
         await using var server = CreateServer(pipeName);
         await using var client = new WindowsVirtualCameraSidecarClient();
@@ -26,7 +29,7 @@ public sealed class WindowsVirtualCameraSidecarOutputWriterTests
             manager,
             client,
             TimeSpan.FromTicks(TimeSpan.TicksPerSecond / VirtualCameraRules.Fps));
-        var encoded = new byte[WindowsVirtualCameraSidecarProtocol.EncodedFrameBytes];
+        var encoded = new byte[(WindowsVirtualCameraSidecarProtocol.FrameHeaderBytes + checked((int)(width * height * 2)))];
         var readFrame = server.ReadExactlyAsync(encoded, timeout.Token);
         var started = await writer.StartAsync(timeout.Token);
         Assert.IsTrue(started.IsSuccess, started.Error?.Message);
@@ -38,6 +41,8 @@ public sealed class WindowsVirtualCameraSidecarOutputWriterTests
         Assert.AreEqual((byte)128, decoded.Payload[1]);
         Assert.AreEqual((byte)16, decoded.Payload[2]);
         Assert.AreEqual((byte)128, decoded.Payload[3]);
+        Assert.AreEqual(width, decoded!.Width);
+        Assert.AreEqual(height, decoded.Height);
         Assert.AreEqual(1UL, writer.Snapshot.FramesWritten);
         Assert.AreEqual(1UL, writer.Snapshot.BlackFramesWritten);
         Assert.AreEqual(0UL, writer.Snapshot.LatestFramesWritten);
@@ -47,17 +52,19 @@ public sealed class WindowsVirtualCameraSidecarOutputWriterTests
     }
 
     [TestMethod]
-    public async Task Writer_forwards_latest_frame_without_copying_or_replacing_payload()
+    [DataRow(1280U, 720U)]
+    [DataRow(1920U, 1080U)]
+    public async Task Writer_forwards_latest_frame_without_copying_or_replacing_payload(uint width, uint height)
     {
-        var manager = ReadyManager();
+        var manager = ReadyManager(width, height);
         var generation = manager.Snapshot.Generation;
         manager.SetOutputContext(new(true, true, false, false, false, true));
-        var payload = new byte[WindowsVirtualCameraSidecarProtocol.MaxPayloadBytes];
+        var payload = new byte[checked((int)(width * height * 2))];
         payload[0] = 90;
         payload[1] = 100;
         payload[2] = 110;
         payload[3] = 120;
-        Assert.IsTrue(manager.SubmitFrame(new VirtualCameraFrame(generation, 77, 90_000, payload)).IsSuccess);
+        Assert.IsTrue(manager.SubmitFrame(new VirtualCameraFrame(generation, 77, 90_000, payload, width, height)).IsSuccess);
 
         var pipeName = CreatePipeName();
         await using var server = CreateServer(pipeName);
@@ -72,7 +79,7 @@ public sealed class WindowsVirtualCameraSidecarOutputWriterTests
             manager,
             client,
             TimeSpan.FromTicks(TimeSpan.TicksPerSecond / VirtualCameraRules.Fps));
-        var encoded = new byte[WindowsVirtualCameraSidecarProtocol.EncodedFrameBytes];
+        var encoded = new byte[(WindowsVirtualCameraSidecarProtocol.FrameHeaderBytes + checked((int)(width * height * 2)))];
         var readFrame = server.ReadExactlyAsync(encoded, timeout.Token);
         var started = await writer.StartAsync(timeout.Token);
         Assert.IsTrue(started.IsSuccess, started.Error?.Message);
@@ -84,6 +91,8 @@ public sealed class WindowsVirtualCameraSidecarOutputWriterTests
         Assert.AreEqual(10_000_000L, decoded.Timestamp100Ns);
         Assert.AreEqual((byte)90, decoded.Payload[0]);
         Assert.AreEqual((byte)100, decoded.Payload[1]);
+        Assert.AreEqual(width, decoded!.Width);
+        Assert.AreEqual(height, decoded.Height);
         Assert.AreEqual(1UL, writer.Snapshot.FramesWritten);
         Assert.AreEqual(0UL, writer.Snapshot.BlackFramesWritten);
         Assert.AreEqual(1UL, writer.Snapshot.LatestFramesWritten);
@@ -284,9 +293,10 @@ public sealed class WindowsVirtualCameraSidecarOutputWriterTests
             : throw new InvalidOperationException(error?.Message);
     }
 
-    private static VirtualCameraOutputManager ReadyManager()
+    private static VirtualCameraOutputManager ReadyManager(uint width = 1280, uint height = 720)
     {
         var manager = new VirtualCameraOutputManager();
+        Assert.IsTrue(manager.ConfigureOutput(new VirtualCameraConfig { Width = width, Height = height }).IsSuccess);
         Assert.IsTrue(manager.MarkInstalled().IsSuccess);
         Assert.IsTrue(manager.BeginStart().IsSuccess);
         Assert.IsTrue(manager.MarkReady(new GpuCaptureFacts(
@@ -301,8 +311,8 @@ public sealed class WindowsVirtualCameraSidecarOutputWriterTests
             true,
             VirtualCameraRules.Transport,
             false,
-            VirtualCameraRules.Width,
-            VirtualCameraRules.Height,
+            width,
+            height,
             VirtualCameraRules.Fps)).IsSuccess);
         return manager;
     }

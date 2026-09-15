@@ -11,6 +11,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/GpAutoLive.App/GpAutoLive.App.csproj" />
+    <Content Include="../../src/GpAutoLive.App/App.xaml" Link="Fixtures/App.resources-source.xaml" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />

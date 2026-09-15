@@ -64,6 +64,10 @@ public sealed class WindowsMpvPlaybackRuntime : IAsyncDisposable
     private WindowsMpvPlaybackRuntimeState _state = WindowsMpvPlaybackRuntimeState.Ready;
     private bool _disposed;
 
+    internal long LoadedGeneration => _gateway?.Client.LoadedGeneration ?? 0;
+    internal long RestartedGeneration => _gateway?.Client.RestartedGeneration ?? 0;
+    internal long PlaybackRestartSequence => _gateway?.Client.PlaybackRestartSequence ?? 0;
+
     public WindowsMpvPlaybackRuntimeSnapshot Snapshot
     {
         get
@@ -388,11 +392,6 @@ public sealed class WindowsMpvPlaybackRuntime : IAsyncDisposable
 
         try
         {
-            if (_disposed)
-            {
-                return Succeeded();
-            }
-
             return await StopCoreAsync().ConfigureAwait(false);
         }
         finally
@@ -414,13 +413,17 @@ public sealed class WindowsMpvPlaybackRuntime : IAsyncDisposable
 
         try
         {
-            if (_disposed)
+            if (_state is WindowsMpvPlaybackRuntimeState.Closed)
             {
                 return;
             }
 
             _disposed = true;
-            await StopCoreAsync().ConfigureAwait(false);
+            var stopped = await StopCoreAsync().ConfigureAwait(false);
+            if (!stopped.IsSuccess)
+            {
+                throw new TimeoutException("mpv 组合运行时尚未完成回收，可重试关闭。");
+            }
             await _host.DisposeAsync().ConfigureAwait(false);
             lock (_gate)
             {
@@ -482,7 +485,7 @@ public sealed class WindowsMpvPlaybackRuntime : IAsyncDisposable
             : Failure(
                 WindowsMpvPlaybackRuntimeFailureCode.StopFailed,
                 stopped.Error?.Message ?? "mpv 未能在停止预算内退出。",
-                retryable: false);
+                retryable: true);
     }
 
     private static bool TryValidateBinding(MpvLaunchPlan? plan, MpvPlaybackSession? session)

@@ -23,12 +23,6 @@ public partial class MainWindow : Window
     private const double ResponsiveDesignWidth = 1586;
     private const double ResponsiveDesignHeight = 992;
     private const double MaximumResponsiveShellScale = 1.25;
-    private const string ControlPlaneBaseUriVariable = "AUTOLIVE_CONTROL_PLANE_BASE_URI";
-    private const string ControlPlaneEnvironmentVariable = "AUTOLIVE_CONTROL_PLANE_ENV";
-    private const string TestControlPlaneEnvironment = "test";
-    private const string LocalDevelopmentControlPlaneEnvironment = "development";
-    private const string DevelopmentControlPlaneBaseUri = "http://101.96.208.132:9090";
-
     private readonly ShellState _state = new();
     private readonly MediaPoolService _mediaPool = new();
     private readonly InterludeFilePoolService _interludePool = new();
@@ -157,146 +151,6 @@ public partial class MainWindow : Window
         }
     }
 
-    protected override void OnClosed(EventArgs e)
-    {
-        _isClosing = true;
-        if (_preferences?.IsLoaded == true)
-        {
-            try
-            {
-                _ = _preferences.SaveAsync(this).GetAwaiter().GetResult();
-            }
-            catch (OperationCanceledException)
-            {
-                // 关闭过程不应因偏好保存取消而阻止窗口退出。
-            }
-        }
-
-        CancelRtmpReconnect();
-        _windowCancellation.Cancel();
-        try
-        {
-            _mediaThumbnailCache.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
-        catch (OperationCanceledException)
-        {
-            // 关闭时取消缩略图任务，不阻止 WPF 退出。
-        }
-        _douyinProbeHost.SnapshotChanged -= DouyinProbeHost_SnapshotChanged;
-        _rtmpOutputManager.SnapshotChanged -= RtmpOutputManager_SnapshotChanged;
-        try
-        {
-            _douyinProbeHost.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
-        catch (OperationCanceledException)
-        {
-            // 关闭时 sidecar 已请求取消；不阻止 WPF 退出。
-        }
-        _douyinLive.Stop();
-        _audioCompletionCancellation?.Cancel();
-        _videoStateCancellation?.Cancel();
-        _microphoneUiUpdates.Dispose();
-        _douyinUiUpdates.Dispose();
-        _performanceTimer.Stop();
-        _performanceTimer.Tick -= PerformanceTimer_Tick;
-        _spectrumTimer.Stop();
-        _spectrumTimer.Tick -= SpectrumTimer_Tick;
-        _interludeScheduleTimer.Stop();
-        _interludeScheduleTimer.Tick -= InterludeScheduleTimer_Tick;
-        _mediaImporter?.Dispose();
-        _mediaImporter = null;
-        _login.PropertyChanged -= Login_PropertyChanged;
-        _state.PropertyChanged -= ShellState_PropertyChanged;
-        _finalEffectController.StateChanged -= FinalEffectController_StateChanged;
-        if (_virtualCameraOutputCoordinator is not null)
-        {
-            _virtualCameraOutputCoordinator.SnapshotChanged -= VirtualCameraOutputCoordinator_SnapshotChanged;
-        }
-        _finalEffectWindow?.Close();
-        _finalEffectWindow = null;
-        _settingsWindow?.Close();
-        _settingsWindow = null;
-        try
-        {
-            _microphoneInterludeController?.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
-        catch (OperationCanceledException)
-        {
-            // 关闭窗口时麦克风门控已请求取消；不阻止窗口退出。
-        }
-        if (_microphoneInterludeController is not null)
-        {
-            _microphoneInterludeController.SnapshotChanged -= MicrophoneInterludeController_SnapshotChanged;
-        }
-        _microphoneInterludeController = null;
-        try
-        {
-            _mpvController.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
-        catch (InvalidOperationException)
-        {
-            // 关闭窗口时媒体宿主可能已经由取消路径回收；不阻止 WPF 退出。
-        }
-        catch (IOException)
-        {
-            // 关闭窗口时命名管道可能已断开；不阻止 WPF 退出。
-        }
-        try
-        {
-            _audioPlaybackController.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
-        catch (OperationCanceledException)
-        {
-            // 关闭窗口时音频解码已请求取消；不阻止 WPF 退出。
-        }
-        try
-        {
-            _rtmpAudioSession.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
-        catch (OperationCanceledException)
-        {
-            // 关闭时 RTMP PCM 解码与分流已请求取消；不阻止窗口退出。
-        }
-        try
-        {
-            _rtmpOutputManager.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
-        catch (OperationCanceledException)
-        {
-            // 关闭窗口时 RTMP 进程已请求退出；不阻止 WPF 退出。
-        }
-        try
-        {
-            _heartbeatScheduler?.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
-        catch (OperationCanceledException)
-        {
-            // 退出时心跳循环应在取消后 Join；取消异常不阻止窗口退出。
-        }
-        try
-        {
-            _speechAdapter?.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
-        catch (OperationCanceledException)
-        {
-            // 退出时 SAPI 操作已请求取消；不阻止窗口退出。
-        }
-        _portAudioEnumerator?.Dispose();
-        _portAudioEnumerator = null;
-        _authCoordinator?.Dispose();
-        try
-        {
-            _virtualCameraOutputCoordinator?.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
-        catch (OperationCanceledException)
-        {
-            // 关闭窗口时虚拟摄像头输出已请求取消；不阻止 WPF 退出。
-        }
-        _virtualCameraSurfaceBinding.Dispose();
-        _windowCancellation.Dispose();
-        base.OnClosed(e);
-    }
-
     private async void ShellState_PropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (_isClosing)
@@ -344,6 +198,27 @@ public partial class MainWindow : Window
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
+        if (_isClosing) return;
+        _loadedTask = LoadWindowAsync();
+        await _loadedTask.ConfigureAwait(true);
+    }
+
+    private async Task LoadWindowAsync()
+    {
+        try
+        {
+            await LoadWindowCoreAsync().ConfigureAwait(true);
+        }
+        catch (OperationCanceledException) when (_isClosing)
+        {
+            // Shutdown joins this owner before releasing the window token.
+        }
+    }
+
+    private async Task LoadWindowCoreAsync()
+    {
+        Width = Math.Min(Width, SystemParameters.WorkArea.Width);
+        Height = Math.Min(Height, SystemParameters.WorkArea.Height);
         ParameterScrollViewer.ScrollToTop();
 
         if (_authCoordinator is not null)
@@ -361,11 +236,13 @@ public partial class MainWindow : Window
             }
         }
 
+        if (_isClosing) return;
         if (_preferences is not null)
         {
             try
             {
                 var warning = await _preferences.LoadAsync(_windowCancellation.Token).ConfigureAwait(true);
+                if (_isClosing) return;
                 _preferences.ApplyTo(this);
                 _effectCycleSettings = EffectCycleSettings.From(_preferences.Current);
                 if (warning is not null)
@@ -385,7 +262,9 @@ public partial class MainWindow : Window
             ApplyRuntimePreferences();
         }
 
+        if (_isClosing) return;
         var interludeRestoreError = await LoadInterludeAudioConfigAsync().ConfigureAwait(true);
+        if (_isClosing) return;
         UpdateInterludeProjection();
         if (interludeRestoreError is not null)
         {
@@ -393,7 +272,8 @@ public partial class MainWindow : Window
         }
         UpdateEffectCycleProjection();
         await LoadDouyinConfigAsync().ConfigureAwait(true);
-        _ = RefreshVirtualCameraProbesAsync();
+        if (_isClosing) return;
+        await RefreshVirtualCameraProbesAsync().ConfigureAwait(true);
 
     }
 
@@ -428,6 +308,7 @@ public partial class MainWindow : Window
         var scale = CalculateResponsiveShellScale(e.NewSize);
         ResponsiveShellScaleTransform.ScaleX = scale;
         ResponsiveShellScaleTransform.ScaleY = scale;
+        UpdateResponsiveLayout(e.NewSize);
     }
 
     internal static double CalculateResponsiveShellScale(Size size)
@@ -563,15 +444,8 @@ public partial class MainWindow : Window
 
     private void FinalEffectController_StateChanged(object? sender, EventArgs e) => UpdateFinalEffectButtons();
 
-    private async void FinalEffectWindow_Closed(object? sender, EventArgs e)
+    private void FinalEffectWindow_Closed(object? sender, EventArgs e)
     {
-        if (!_isClosing
-            && _virtualCameraOutputCoordinator is not null
-            && _virtualCameraOutputCoordinator.HasActiveResources)
-        {
-            await StopVirtualCameraCoreAsync().ConfigureAwait(true);
-        }
-
         _virtualCameraSurfaceBinding.Unbind();
         if (_finalEffectWindow is not null)
         {
@@ -583,10 +457,13 @@ public partial class MainWindow : Window
         UpdateFinalEffectButtons();
         if (!_isClosing)
         {
-            await RunPlaybackCommandAsync(
-                    StopPlaybackAfterFinalEffectWindowClosedAsync,
-                    _windowCancellation.Token)
-                .ConfigureAwait(true);
+            _finalEffectCloseTask = RunPlaybackCommandAsync(async () =>
+            {
+                if (_virtualCameraOutputCoordinator?.HasActiveResources == true)
+                    await StopVirtualCameraCoreAsync().ConfigureAwait(true);
+                if (!_isClosing)
+                    await StopPlaybackAfterFinalEffectWindowClosedAsync().ConfigureAwait(true);
+            });
         }
     }
 
@@ -667,21 +544,9 @@ public partial class MainWindow : Window
 
     private static ControlPlaneAuthCoordinator? TryCreateAuthCoordinator()
     {
-        var controlPlaneEnvironment = Environment.GetEnvironmentVariable(ControlPlaneEnvironmentVariable)?.Trim();
-        var isTestEnvironment = string.Equals(
-            controlPlaneEnvironment,
-            TestControlPlaneEnvironment,
-            StringComparison.OrdinalIgnoreCase);
-        var isLocalDevelopmentEnvironment = string.Equals(
-            controlPlaneEnvironment,
-            LocalDevelopmentControlPlaneEnvironment,
-            StringComparison.OrdinalIgnoreCase);
-        var allowsDevelopmentHttp = isTestEnvironment || isLocalDevelopmentEnvironment;
-        var baseUriText = Environment.GetEnvironmentVariable(ControlPlaneBaseUriVariable);
-        if (allowsDevelopmentHttp && string.IsNullOrWhiteSpace(baseUriText))
-        {
-            baseUriText = DevelopmentControlPlaneBaseUri;
-        }
+        var startupConfiguration = ControlPlaneStartupConfiguration.Load();
+        var allowsDevelopmentHttp = startupConfiguration.AllowsDevelopmentHttp;
+        var baseUriText = startupConfiguration.BaseUriText;
 
         if (string.IsNullOrWhiteSpace(baseUriText)
             || !Uri.TryCreate(baseUriText.Trim(), UriKind.Absolute, out var baseUri))
@@ -691,7 +556,9 @@ public partial class MainWindow : Window
 
         try
         {
-            var secretStore = new CredentialManagerSecretStore();
+            var secretStore = startupConfiguration.UsesTestCredentialStore
+                ? CredentialManagerSecretStore.CreateTestControlPlaneStore()
+                : new CredentialManagerSecretStore();
             var deviceId = WindowsDeviceIdentity.GetOrCreate(secretStore);
             var version = typeof(MainWindow).Assembly.GetName().Version?.ToString() ?? "0.1.0";
             var registration = new DeviceRegistrationDto(
@@ -796,6 +663,7 @@ public partial class MainWindow : Window
             var pendingLogoutWarning = await _authCoordinator
                 .RetryPendingLogoutAsync(_windowCancellation.Token)
                 .ConfigureAwait(true);
+            if (_isClosing) return;
             var transition = await _authCoordinator.RestoreAsync(_windowCancellation.Token).ConfigureAwait(true);
             if (_isClosing || _windowCancellation.IsCancellationRequested)
             {
@@ -896,6 +764,7 @@ public partial class MainWindow : Window
 
     private bool EnsureFinalEffectWindowVisible()
     {
+        if (_isClosing) return false;
         if (_finalEffectWindow is null)
         {
             _finalEffectWindow = new FinalEffectWindow(_finalEffectController)

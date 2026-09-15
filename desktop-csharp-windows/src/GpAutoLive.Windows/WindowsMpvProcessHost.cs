@@ -222,11 +222,6 @@ public sealed class WindowsMpvProcessHost : IAsyncDisposable
 
         try
         {
-            if (_disposed)
-            {
-                return Succeeded();
-            }
-
             return await StopCoreAsync().ConfigureAwait(false);
         }
         finally
@@ -248,13 +243,17 @@ public sealed class WindowsMpvProcessHost : IAsyncDisposable
 
         try
         {
-            if (_disposed)
+            if (_disposed && _process is null)
             {
                 return;
             }
 
             _disposed = true;
-            await StopCoreAsync().ConfigureAwait(false);
+            var stopped = await StopCoreAsync().ConfigureAwait(false);
+            if (!stopped.IsSuccess)
+            {
+                throw new TimeoutException("mpv 进程尚未完成回收，可重试关闭。");
+            }
             lock (_gate)
             {
                 _state = WindowsMpvHostState.Closed;
@@ -292,6 +291,19 @@ public sealed class WindowsMpvProcessHost : IAsyncDisposable
             exited = await WaitForExitBoundedAsync(process).ConfigureAwait(false);
         }
 
+        if (!exited)
+        {
+            lock (_gate)
+            {
+                _state = WindowsMpvHostState.Faulted;
+            }
+            // 进程退出未获确认，保留 Process、Job 和事件订阅，下一次 Stop 可继续回收。
+            return Failure(
+                WindowsMpvHostFailureCode.StopTimedOut,
+                "mpv 未能在停止预算内退出。",
+                retryable: true);
+        }
+
         var exitCode = SafeExitCode(process);
         process.Exited -= Process_Exited;
         process.Dispose();
@@ -304,12 +316,7 @@ public sealed class WindowsMpvProcessHost : IAsyncDisposable
             _state = _disposed ? WindowsMpvHostState.Closed : WindowsMpvHostState.Stopped;
         }
 
-        return exited
-            ? Succeeded()
-            : Failure(
-                WindowsMpvHostFailureCode.StopTimedOut,
-                "mpv 未能在停止预算内退出。",
-                retryable: false);
+        return Succeeded();
     }
 
     private async Task<WindowsMpvHostResult> FailStartAsync(Process process)
@@ -322,7 +329,13 @@ public sealed class WindowsMpvProcessHost : IAsyncDisposable
         }
 
         KillProcessTree(process, job);
-        await WaitForExitBoundedAsync(process).ConfigureAwait(false);
+        if (!await WaitForExitBoundedAsync(process).ConfigureAwait(false))
+        {
+            return Failure(
+                WindowsMpvHostFailureCode.StopTimedOut,
+                "mpv 启动失败后的进程回收尚未完成。",
+                retryable: true);
+        }
         var exitCode = SafeExitCode(process);
         process.Exited -= Process_Exited;
         process.Dispose();
@@ -498,18 +511,11 @@ public sealed class WindowsMpvProcessHost : IAsyncDisposable
     {
         try
         {
-            await process.WaitForExitAsync()
-                .WaitAsync(CleanupTimeout)
-                .ConfigureAwait(false);
-            return true;
+            return await Task.Run(() => process.WaitForExit(CleanupTimeout)).ConfigureAwait(false);
         }
         catch (InvalidOperationException)
         {
             return true;
-        }
-        catch (TimeoutException)
-        {
-            return HasExited(process);
         }
     }
 
@@ -517,7 +523,8 @@ public sealed class WindowsMpvProcessHost : IAsyncDisposable
     {
         try
         {
-            return process.HasExited;
+            // 退出码可早于内核句柄触发，资源释放必须依据真实句柄信号。
+            return process.WaitForExit(0);
         }
         catch (InvalidOperationException)
         {
@@ -525,7 +532,8 @@ public sealed class WindowsMpvProcessHost : IAsyncDisposable
         }
         catch (System.ComponentModel.Win32Exception)
         {
-            return true;
+            // 查询失败不能证明进程已经退出。
+            return false;
         }
     }
 

@@ -7,6 +7,43 @@ namespace GpAutoLive.Windows.Tests;
 public sealed class WindowsVirtualCameraSidecarProtocolTests
 {
     [TestMethod]
+    [DataRow(1920U, 1080U)]
+    [DataRow(1080U, 1920U)]
+    [DataRow(4096U, 2160U)]
+    [DataRow(640U, 481U)]
+    public void V2_round_trip_preserves_adaptive_dimensions_and_v1_rejects_them(uint width, uint height)
+    {
+        var payload = new byte[checked((int)(width * height * 2))];
+        var encoded = new byte[WindowsVirtualCameraSidecarProtocol.FrameHeaderBytes + payload.Length];
+        var frame = new WindowsVirtualCameraSidecarProtocol.SidecarFrame(1, 1, 0, payload, width, height);
+        Assert.IsTrue(WindowsVirtualCameraSidecarProtocol.TryEncode(frame, encoded, out var written, out var error), error?.Message);
+        Assert.AreEqual(encoded.Length, written);
+        Assert.AreEqual((ushort)2, BinaryPrimitives.ReadUInt16LittleEndian(encoded.AsSpan(8)));
+        Assert.IsTrue(WindowsVirtualCameraSidecarProtocol.TryDecode(encoded, out var decoded, out var consumed, out error), error?.Message);
+        Assert.AreEqual(width, decoded!.Width);
+        Assert.AreEqual(height, decoded.Height);
+        Assert.AreEqual(written, consumed);
+        BinaryPrimitives.WriteUInt16LittleEndian(encoded.AsSpan(8), 1);
+        Assert.IsFalse(WindowsVirtualCameraSidecarProtocol.TryDecode(encoded, out _, out _, out _));
+    }
+
+    [TestMethod]
+    public void Decoder_rejects_oversized_or_odd_width_headers_before_payload_allocation()
+    {
+        foreach (var (width, height) in new[] { (641U, 480U), (4096U, 2161U), (2U, 4097U), (uint.MaxValue, uint.MaxValue) })
+        {
+            var encoded = ValidEncodedFrame();
+            BinaryPrimitives.WriteUInt32LittleEndian(encoded.AsSpan(36), width);
+            BinaryPrimitives.WriteUInt32LittleEndian(encoded.AsSpan(40), height);
+            Assert.IsFalse(WindowsVirtualCameraSidecarProtocol.TryDecode(encoded, out _, out _, out var error));
+            Assert.AreEqual("sidecar_frame_invalid", error!.Code);
+        }
+        var legacy = ValidEncodedFrame();
+        BinaryPrimitives.WriteUInt16LittleEndian(legacy.AsSpan(8), 1);
+        Assert.IsTrue(WindowsVirtualCameraSidecarProtocol.TryDecode(legacy, out _, out _, out _));
+    }
+
+    [TestMethod]
     public void Pipe_name_is_derived_from_fixed_nonzero_16_byte_token()
     {
         Assert.IsTrue(
@@ -33,8 +70,8 @@ public sealed class WindowsVirtualCameraSidecarProtocolTests
             3,
             7,
             1234,
-            Enumerable.Repeat((byte)16, WindowsVirtualCameraSidecarProtocol.MaxPayloadBytes).ToArray());
-        var encoded = new byte[WindowsVirtualCameraSidecarProtocol.EncodedFrameBytes + 4];
+            Enumerable.Repeat((byte)16, (1280 * 720 * 2)).ToArray());
+        var encoded = new byte[(WindowsVirtualCameraSidecarProtocol.FrameHeaderBytes + 1280 * 720 * 2) + 4];
 
         Assert.IsTrue(
             WindowsVirtualCameraSidecarProtocol.TryEncode(
@@ -55,7 +92,7 @@ public sealed class WindowsVirtualCameraSidecarProtocolTests
                 out var consumed,
                 out var decodeError),
             decodeError?.Message);
-        Assert.AreEqual(WindowsVirtualCameraSidecarProtocol.EncodedFrameBytes, consumed);
+        Assert.AreEqual((WindowsVirtualCameraSidecarProtocol.FrameHeaderBytes + 1280 * 720 * 2), consumed);
         Assert.AreEqual(frame.Generation, decoded!.Generation);
         Assert.AreEqual(frame.Sequence, decoded.Sequence);
         Assert.AreEqual(frame.Timestamp100Ns, decoded.Timestamp100Ns);
@@ -73,7 +110,7 @@ public sealed class WindowsVirtualCameraSidecarProtocolTests
         BinaryPrimitives.WriteUInt64LittleEndian(input.AsSpan(20), 1);
         BinaryPrimitives.WriteUInt32LittleEndian(input.AsSpan(36), WindowsVirtualCameraSidecarProtocol.OutputWidth);
         BinaryPrimitives.WriteUInt32LittleEndian(input.AsSpan(40), WindowsVirtualCameraSidecarProtocol.OutputHeight);
-        BinaryPrimitives.WriteUInt32LittleEndian(input.AsSpan(44), WindowsVirtualCameraSidecarProtocol.MaxPayloadBytes);
+        BinaryPrimitives.WriteUInt32LittleEndian(input.AsSpan(44), (1280 * 720 * 2));
 
         Assert.IsFalse(WindowsVirtualCameraSidecarProtocol.TryDecode(input, out _, out _, out var error));
         Assert.AreEqual("sidecar_frame_truncated", error!.Code);
@@ -96,7 +133,7 @@ public sealed class WindowsVirtualCameraSidecarProtocolTests
     [TestMethod]
     public void Encode_rejects_small_destination_without_writing()
     {
-        var destination = Enumerable.Repeat((byte)0xcd, WindowsVirtualCameraSidecarProtocol.EncodedFrameBytes - 1).ToArray();
+        var destination = Enumerable.Repeat((byte)0xcd, (WindowsVirtualCameraSidecarProtocol.FrameHeaderBytes + 1280 * 720 * 2) - 1).ToArray();
         var before = destination[0];
         Assert.IsFalse(
             WindowsVirtualCameraSidecarProtocol.TryEncode(
@@ -114,11 +151,11 @@ public sealed class WindowsVirtualCameraSidecarProtocolTests
             1,
             1,
             0,
-            new byte[WindowsVirtualCameraSidecarProtocol.MaxPayloadBytes]);
+            new byte[(1280 * 720 * 2)]);
 
     private static byte[] ValidEncodedFrame()
     {
-        var encoded = new byte[WindowsVirtualCameraSidecarProtocol.EncodedFrameBytes];
+        var encoded = new byte[(WindowsVirtualCameraSidecarProtocol.FrameHeaderBytes + 1280 * 720 * 2)];
         Assert.IsTrue(
             WindowsVirtualCameraSidecarProtocol.TryEncode(
                 ValidFrame(),
@@ -129,4 +166,3 @@ public sealed class WindowsVirtualCameraSidecarProtocolTests
         return encoded;
     }
 }
-

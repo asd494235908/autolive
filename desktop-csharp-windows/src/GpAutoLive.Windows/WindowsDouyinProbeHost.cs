@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Text;
 using GpAutoLive.Contracts;
@@ -50,7 +51,11 @@ public sealed record WindowsDouyinProbeHostSnapshot(
     DouyinLiveStatus Douyin,
     string? QrPath,
     string? LastEvent,
-    int InvalidEventCount);
+    int InvalidEventCount,
+    bool Authenticated = false,
+    WindowsDouyinLoginClearReason LoginClearReason = WindowsDouyinLoginClearReason.NotAuthenticatedThisRun,
+    string? DiagnosticLogPath = null,
+    WindowsDouyinDiagnosticLogState DiagnosticLogState = WindowsDouyinDiagnosticLogState.NotStarted);
 
 /// <summary>探针启动/停止结果。</summary>
 public sealed record WindowsDouyinProbeHostResult(
@@ -59,10 +64,10 @@ public sealed record WindowsDouyinProbeHostResult(
     WindowsDouyinProbeHostError? Error = null);
 
 /// <summary>
-/// Windows 专用抖音 Conda sidecar 宿主。stdout 只接受脱敏 JSON 事件，
+/// Windows 专用抖音 Conda sidecar 宿主。stdout 只接受校验后的 JSON 事件，正文仅供本地显示，
 /// 进程树优先由 Job Object 回收，停止、超时和输出越界均有界结束。
 /// </summary>
-public sealed class WindowsDouyinProbeHost : IAsyncDisposable
+public sealed partial class WindowsDouyinProbeHost : IAsyncDisposable
 {
     private const int MaxInvalidEvents = 16;
     private const int ReadBufferChars = 8 * 1024;
@@ -80,6 +85,10 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
     private readonly SemaphoreSlim _replySendGate = new(1, 1);
     private readonly SemaphoreSlim _replySignal = new(0);
     private readonly DouyinLiveManager _manager;
+    private readonly WindowsDouyinChatBuffer _chatMessages = new();
+    private readonly TimeProvider _timeProvider;
+    private readonly WindowsDouyinDiagnosticLog _diagnosticLog;
+    private ITimer? _startupTimer;
     private readonly Func<ProcessStartInfo, ProcessStartInfo>? _processStartInfoFactory;
     private Process? _process;
     private WindowsJobObject? _job;
@@ -113,10 +122,14 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
 
     internal WindowsDouyinProbeHost(
         DouyinLiveManager manager,
-        Func<ProcessStartInfo, ProcessStartInfo>? processStartInfoFactory)
+        Func<ProcessStartInfo, ProcessStartInfo>? processStartInfoFactory,
+        TimeProvider? timeProvider = null,
+        WindowsDouyinDiagnosticLog? diagnosticLog = null)
     {
         _manager = manager ?? throw new ArgumentNullException(nameof(manager));
         _processStartInfoFactory = processStartInfoFactory;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _diagnosticLog = diagnosticLog ?? new WindowsDouyinDiagnosticLog();
     }
 
     /// <summary>当前宿主和 M1 状态快照。</summary>
@@ -133,6 +146,25 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
 
     /// <summary>收到脱敏状态变化时触发；事件处理器异常不会影响宿主回收。</summary>
     public event EventHandler<WindowsDouyinProbeHostSnapshot>? SnapshotChanged;
+
+    /// <summary>获取本轮最近 500 条弹幕；正文仅供桌面内存显示。</summary>
+    public ImmutableArray<DouyinChatDisplayMessage> GetChatMessages()
+    {
+        lock (_gate)
+        {
+            return _chatMessages.Snapshot();
+        }
+    }
+
+    /// <summary>清空显示记录，保留业务队列与消息去重。</summary>
+    public void ClearChatMessages()
+    {
+        lock (_gate)
+        {
+            _chatMessages.Clear();
+        }
+        PublishSnapshot();
+    }
 
     /// <summary>启动已验证的 Conda 探针；不会把 stdout 原文返回给调用方。</summary>
     public async Task<WindowsDouyinProbeHostResult> StartAsync(
@@ -174,7 +206,24 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
 
             if (_process is not null && !HasExited(_process))
             {
-                return Failure(WindowsDouyinProbeHostFailureCode.AlreadyRunning, "抖音探针已经在运行。", false);
+                if (request.Protocol == WindowsDouyinProbeProtocol.CanonicalNdjson
+                    && _protocol == WindowsDouyinProbeProtocol.CanonicalNdjson
+                    && _authenticated && _state == WindowsDouyinProbeHostState.Running
+                    && _runCancellation is { IsCancellationRequested: false }
+                    && _manager.Snapshot.State == DouyinLiveState.Listening
+                    && DouyinLiveRules.TryNormalizeRoomId(request.Config.RoomId, out var requestedRoom)
+                    && DouyinLiveRules.TryNormalizeRoomId(_expectedRoomId, out var currentRoom)
+                    && requestedRoom == currentRoom)
+                {
+                    return Succeeded();
+                }
+                if (request.Protocol == WindowsDouyinProbeProtocol.CanonicalNdjson
+                    && _protocol == WindowsDouyinProbeProtocol.CanonicalNdjson
+                    && _authenticated && _state == WindowsDouyinProbeHostState.Ready)
+                {
+                    return await ReopenAuthenticatedRoomAsync(request, _process, cancellationToken).ConfigureAwait(false);
+                }
+                return Failure(WindowsDouyinProbeHostFailureCode.AlreadyRunning, "已有直播间连接，请先断开后再连接其他直播间。", false);
             }
 
             await ReleaseExitedProcessAsync().ConfigureAwait(false);
@@ -191,6 +240,8 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
             {
             }
 
+            _diagnosticLog.BeginRun();
+
             var process = new Process
             {
                 StartInfo = _processStartInfoFactory is null
@@ -203,6 +254,8 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 if (!process.Start())
                 {
                     _manager.Fail("探针进程无法启动");
+                    ClearAuthentication(WindowsDouyinLoginClearReason.ProcessExited);
+                    _diagnosticLog.RecordHost(Snapshot);
                     process.Dispose();
                     return Failure(WindowsDouyinProbeHostFailureCode.StartFailed, "抖音探针进程无法启动。", true);
                 }
@@ -210,6 +263,8 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
             catch (Exception exception) when (IsProcessStartFailure(exception))
             {
                 _manager.Fail("探针进程无法启动");
+                ClearAuthentication(WindowsDouyinLoginClearReason.ProcessExited);
+                _diagnosticLog.RecordHost(Snapshot);
                 process.Dispose();
                 return Failure(WindowsDouyinProbeHostFailureCode.StartFailed, "抖音探针进程无法启动。", true);
             }
@@ -227,12 +282,16 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
             }
 
             var runCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            runCancellation.CancelAfter(request.Timeout);
             lock (_gate)
             {
                 _process = process;
+                _chatMessages.Reset(_manager.Snapshot.Generation);
                 _job = job;
                 _runCancellation = runCancellation;
+                ArmStartupTimer(runCancellation, request.Timeout);
+                _authenticated = false;
+                _loginClearReason = WindowsDouyinLoginClearReason.NotAuthenticatedThisRun;
+                _retiredSession = null;
                 _monitorTask = null;
                 _protocol = request.Protocol;
                 _state = WindowsDouyinProbeHostState.Running;
@@ -307,6 +366,11 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
 
             lock (_gate)
             {
+                if (_process is null && !_authenticated
+                    && _loginClearReason == WindowsDouyinLoginClearReason.NotAuthenticatedThisRun)
+                {
+                    return Succeeded();
+                }
                 _stopRequested = true;
                 _state = _process is null
                     ? WindowsDouyinProbeHostState.Stopped
@@ -354,11 +418,16 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
             {
                 _process = null;
                 _job = null;
+                _startupTimer?.Dispose();
+                _startupTimer = null;
                 _runCancellation?.Dispose();
                 _runCancellation = null;
                 _monitorTask = null;
                 _exitCode = exitCode;
                 _state = _disposed ? WindowsDouyinProbeHostState.Closed : WindowsDouyinProbeHostState.Stopped;
+                _authenticated = false;
+                _loginClearReason = WindowsDouyinLoginClearReason.ExplicitStop;
+                _retiredSession = null;
                 _qrPath = null;
                 _protocol = WindowsDouyinProbeProtocol.LegacyEvents;
                 _expectedRoomId = null;
@@ -439,7 +508,13 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 _runCancellation?.Dispose();
                 _runCancellation = null;
                 _monitorTask = null;
+                _startupTimer?.Dispose();
+                _startupTimer = null;
                 _state = WindowsDouyinProbeHostState.Closed;
+                _authenticated = false;
+                _loginClearReason = WindowsDouyinLoginClearReason.ExplicitStop;
+                _retiredSession = null;
+                _chatMessages.Reset(0);
                 _qrPath = null;
                 _protocol = WindowsDouyinProbeProtocol.LegacyEvents;
                 _expectedRoomId = null;
@@ -534,6 +609,18 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
             var exitCode = SafeExitCode(process);
             var reason = Volatile.Read(ref _terminationReason);
             var stopRequested = IsStopRequested();
+            lock (_gate)
+            {
+                if (reason != 5 && (_authenticated || _loginClearReason is
+                    WindowsDouyinLoginClearReason.NotAuthenticatedThisRun or WindowsDouyinLoginClearReason.None))
+                {
+                    ClearAuthentication(stopRequested || reason == 2
+                        ? WindowsDouyinLoginClearReason.ExplicitStop
+                        : reason is 3 or 4 ? WindowsDouyinLoginClearReason.LocalCommunicationError
+                        : reason == 1 ? (_authenticated ? WindowsDouyinLoginClearReason.LocalCommunicationError : WindowsDouyinLoginClearReason.LoginFailed)
+                        : WindowsDouyinLoginClearReason.ProcessExited);
+                }
+            }
             if (stopRequested || reason == 2)
             {
                 _manager.Stop();
@@ -703,42 +790,47 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
         Process process,
         string webRid,
         ulong generation,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool reuseAuthentication = false)
     {
         try
         {
-            var qrRequestId = CreateRequestId("qr");
-            if (!WindowsDouyinSidecarProtocol.TrySerializeAuthQrStart(
-                    qrRequestId,
-                    out var qrLine,
-                    out _))
+            if (!reuseAuthentication)
             {
-                FailCanonicalSession("sidecar 二维码登录请求无效");
-                return;
-            }
+                var qrRequestId = CreateRequestId("qr");
+                if (!WindowsDouyinSidecarProtocol.TrySerializeAuthQrStart(
+                        qrRequestId,
+                        out var qrLine,
+                        out _))
+                {
+                    FailCanonicalSession("sidecar 二维码登录请求无效");
+                    return;
+                }
 
-            var qrResponse = await SendCommandAsync(
-                    process,
-                    qrRequestId,
-                    qrLine,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            if (qrResponse is null || !qrResponse.IsSuccess)
-            {
-                FailCanonicalSession("sidecar 二维码登录启动失败");
-                return;
-            }
+                var qrResponse = await SendCommandAsync(
+                        process,
+                        qrRequestId,
+                        qrLine,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (qrResponse is null || !qrResponse.IsSuccess)
+                {
+                    FailCanonicalSession("sidecar 二维码登录启动失败", qrResponse is null
+                        ? WindowsDouyinLoginClearReason.LocalCommunicationError : WindowsDouyinLoginClearReason.LoginFailed);
+                    return;
+                }
 
-            var confirmed = await WaitForAuthConfirmationAsync(cancellationToken).ConfigureAwait(false);
-            if (confirmed is null)
-            {
-                return;
-            }
+                var confirmed = await WaitForAuthConfirmationAsync(cancellationToken).ConfigureAwait(false);
+                if (confirmed is null)
+                {
+                    return;
+                }
 
-            if (_manager.Snapshot.State != DouyinLiveState.LoggedIn)
-            {
-                FailCanonicalSession("sidecar 登录状态未确认");
-                return;
+                if (_manager.Snapshot.State != DouyinLiveState.LoggedIn)
+                {
+                    FailCanonicalSession("sidecar 登录状态未确认");
+                    return;
+                }
             }
 
             var openRequestId = CreateRequestId("open");
@@ -762,24 +854,37 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 .ConfigureAwait(false);
             if (openResponse is null || !openResponse.IsSuccess)
             {
-                FailCanonicalSession("sidecar 直播间打开失败");
+                if (openResponse is { ErrorCode: "auth_expired" })
+                {
+                    FailCanonicalSession("抖音登录状态已失效，请重新扫码", WindowsDouyinLoginClearReason.AuthenticationExpired);
+                }
+                else if (openResponse is not null)
+                {
+                    CompleteRoomDisconnect("直播间打开失败，可重新连接");
+                }
+                else
+                {
+                    if (!HasConfirmedRoomConnection(process, generation))
+                    {
+                        FailCanonicalSession("本地通信未确认直播间状态，登录辅助进程已清理，请重新扫码");
+                    }
+                }
                 return;
             }
 
             if (openResponse.LiveStatus is "room_ended" or "failed")
             {
-                _manager.MarkInconclusive("直播间当前不可监听");
-                CancelRun();
-                PublishSnapshot();
+                CompleteRoomDisconnect("直播间当前不可监听，可重新连接");
                 return;
             }
 
-            var managerState = _manager.Snapshot.State;
-            if (managerState == DouyinLiveState.LoggedIn
-                && !_manager.MarkRoomResolved().IsSuccess)
+            lock (_gate)
             {
-                FailCanonicalSession("sidecar 直播间状态未能接入");
-                return;
+                // 响应后的 closed/auth_expired 可能先于此 continuation 到达，不能复活已结束的房间。
+                if (_expectedGeneration != generation || _state != WindowsDouyinProbeHostState.Running)
+                {
+                    return;
+                }
             }
 
             if (_manager.Snapshot.State is not (DouyinLiveState.RoomResolved or DouyinLiveState.Listening))
@@ -828,7 +933,7 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
             await process.StandardInput.WriteLineAsync(line.AsMemory(), ioCancellation.Token).ConfigureAwait(false);
             await process.StandardInput.FlushAsync(ioCancellation.Token).ConfigureAwait(false);
             return await completion.Task
-                .WaitAsync(CommandResponseTimeout, cancellationToken)
+                .WaitAsync(CommandResponseTimeout, _timeProvider, cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -889,7 +994,7 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
             await process.StandardInput.WriteLineAsync(line.AsMemory(), ioCancellation.Token).ConfigureAwait(false);
             await process.StandardInput.FlushAsync(ioCancellation.Token).ConfigureAwait(false);
             return await completion.Task
-                .WaitAsync(CommandResponseTimeout, cancellationToken)
+                .WaitAsync(CommandResponseTimeout, _timeProvider, cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -948,16 +1053,27 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
         }
     }
 
-    private void FailCanonicalSession(string reason)
+    private void FailCanonicalSession(string reason,
+        WindowsDouyinLoginClearReason clearReason = WindowsDouyinLoginClearReason.LocalCommunicationError)
     {
+        lock (_gate)
+        {
+            // 已经确认的平台认证失效不能被随后的取消或管道关闭改写成本地错误。
+            if (!_authenticated && _loginClearReason == WindowsDouyinLoginClearReason.AuthenticationExpired)
+            {
+                return;
+            }
+            ClearAuthentication(clearReason);
+        }
         _manager.Fail(reason);
+        SetTerminationReasonIfUnset(5);
         CancelRun();
         PublishSnapshot();
     }
 
     private static string CreateRequestId(string prefix) => $"{prefix}-{Guid.NewGuid():N}";
 
-    private async Task<bool> WaitForReplyBudgetAsync(CancellationToken cancellationToken)
+    private async Task<bool> WaitForReplyBudgetAsync(CancellationToken cancellationToken, bool waitForAvailability = true)
     {
         while (true)
         {
@@ -996,6 +1112,11 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 return true;
             }
 
+            if (!waitForAvailability)
+            {
+                return false;
+            }
+
             await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
         }
     }
@@ -1005,7 +1126,8 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
         string sessionId,
         ulong generation,
         DouyinReplyTask task,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool manual = false)
     {
         var clientActionId = task.ClientActionId;
         var request = new WindowsDouyinChatSendRequest(
@@ -1020,9 +1142,40 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
 
         try
         {
-            await _replySendGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            while (true)
+            {
+                if (!manual && !await WaitForReplyBudgetAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    return DouyinSendOutcome.NotSent;
+                }
+                if (manual)
+                {
+                    if (!await _replySendGate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+                    {
+                        return DouyinSendOutcome.NotSent;
+                    }
+                }
+                else
+                {
+                    await _replySendGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                // 同锁内原子核对预算；自动等待期间释放锁，让断开能及时关闭房间。
+                if (await WaitForReplyBudgetAsync(cancellationToken, waitForAvailability: false).ConfigureAwait(false))
+                {
+                    break;
+                }
+                _replySendGate.Release();
+                if (manual)
+                {
+                    return DouyinSendOutcome.NotSent;
+                }
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return DouyinSendOutcome.NotSent;
+        }
+        catch (ObjectDisposedException)
         {
             return DouyinSendOutcome.NotSent;
         }
@@ -1034,7 +1187,8 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 || !TryGetCanonicalIdentity(out var currentSessionId, out var currentGeneration)
                 || !string.Equals(currentSessionId, sessionId, StringComparison.Ordinal)
                 || currentGeneration != generation
-                || task.Generation != generation)
+                || task.Generation != generation
+                || DateTimeOffset.UtcNow - task.EnqueuedAtUtc > DouyinLiveRules.TaskMaxAge)
             {
                 return DouyinSendOutcome.NotSent;
             }
@@ -1071,8 +1225,11 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                     return DouyinSendOutcome.OutcomeUnknown;
                 }
 
-                if (!response.IsSuccess
-                    && response.ErrorCode is "auth_expired" or "rate_limited" or "risk_controlled")
+                if (!response.IsSuccess && response.ErrorCode == "auth_expired")
+                {
+                    FailCanonicalSession("抖音登录状态已失效，请重新扫码", WindowsDouyinLoginClearReason.AuthenticationExpired);
+                }
+                else if (!response.IsSuccess && response.ErrorCode is "rate_limited" or "risk_controlled")
                 {
                     BlockReplySending();
                 }
@@ -1100,6 +1257,10 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 return writeStarted ? DouyinSendOutcome.OutcomeUnknown : DouyinSendOutcome.NotSent;
             }
         }
+        catch (OperationCanceledException)
+        {
+            return writeStarted ? DouyinSendOutcome.OutcomeUnknown : DouyinSendOutcome.NotSent;
+        }
         finally
         {
             lock (_gate)
@@ -1123,14 +1284,16 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
 
     private bool TryGetCanonicalIdentity(out string sessionId, out ulong generation)
     {
+        bool running;
         lock (_gate)
         {
             sessionId = _expectedSessionId ?? string.Empty;
             generation = _expectedGeneration ?? 0;
+            running = _state == WindowsDouyinProbeHostState.Running && !_stopRequested;
         }
 
         var managerSnapshot = _manager.Snapshot;
-        return sessionId.Length > 0
+        return running && sessionId.Length > 0
             && generation > 0
             && !managerSnapshot.ReplySendingBlocked
             && managerSnapshot.State == DouyinLiveState.Listening;
@@ -1224,7 +1387,11 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
     private bool ProcessStdoutLine(string line, string qrPath, ref int totalBytes)
     {
         var lineBytes = Utf8.GetByteCount(line) + 1;
-        totalBytes = checked(totalBytes + lineBytes);
+        // 持续协议按行消费，不累计会话 stdout；一次性旧探针仍保留总量门禁。
+        if (_protocol != WindowsDouyinProbeProtocol.CanonicalNdjson)
+        {
+            totalBytes = checked(totalBytes + lineBytes);
+        }
         if (totalBytes > WindowsDouyinProbeLaunchPlanBuilder.MaxStandardOutputBytes
             || lineBytes > WindowsDouyinProbeEventParser.MaxLineBytes)
         {
@@ -1306,6 +1473,16 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
                 expectedSessionId,
                 expectedGeneration))
         {
+            if (probeEvent!.Kind == WindowsDouyinProbeEventKind.AuthDiagnostic)
+            {
+                _diagnosticLog.RecordDiagnostic(probeEvent.Diagnostic);
+                PublishSnapshot();
+                return true;
+            }
+            if (IsRetiredLiveEvent(probeEvent!))
+            {
+                return true;
+            }
             if (IsCanonicalUnboundEvent(probeEvent!))
             {
                 SetTerminationReasonIfUnset(4);
@@ -1329,9 +1506,21 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
             {
                 lock (_gate)
                 {
+                    _authenticated = _protocol == WindowsDouyinProbeProtocol.CanonicalNdjson;
                     _authConfirmation?.TrySetResult(probeEvent);
                 }
+                PublishSnapshot();
             }
+        }
+        else if (WindowsDouyinAuthDiagnostic.IsDiagnosticEvent(line))
+        {
+            _diagnosticLog.RecordDiagnostic(null);
+            PublishSnapshot();
+            return true;
+        }
+        else if (IsRetiredLiveEvent(line))
+        {
+            return true;
         }
         else if (Interlocked.Increment(ref _invalidEventCount) > MaxInvalidEvents)
         {
@@ -1470,6 +1659,22 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
 
     private void ApplyEvent(WindowsDouyinProbeEvent probeEvent, string qrPath)
     {
+        if ((IsStopRequested() || (_state == WindowsDouyinProbeHostState.Stopping
+                && probeEvent is not { Kind: WindowsDouyinProbeEventKind.LiveState, State: "auth_expired" }))
+            && probeEvent.Kind is WindowsDouyinProbeEventKind.LiveState or WindowsDouyinProbeEventKind.ChatReceived
+                or WindowsDouyinProbeEventKind.LiveGap)
+        {
+            if (!IsStopRequested() && probeEvent is { Kind: WindowsDouyinProbeEventKind.LiveState, State: "closed" })
+            {
+                lock (_gate)
+                {
+                    _roomCloseObserved = true;
+                    _lastEvent = "live_close_observed";
+                }
+                PublishSnapshot();
+            }
+            return;
+        }
         var qrPathReady = probeEvent.QrPngBytes is { Length: > 0 }
             && probeEvent.QrExpiresAtUtc is { } qrExpiresAtUtc
             && TryWriteQrPng(qrPath, probeEvent.QrPngBytes, qrExpiresAtUtc);
@@ -1487,6 +1692,26 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
         }
 
         var bridgeResult = WindowsDouyinProbeEventBridge.Apply(_manager, probeEvent);
+        if (bridgeResult is { IsSuccess: true })
+        {
+            lock (_gate)
+            {
+                if (probeEvent.ChatDisplay is { } message
+                    && probeEvent.SessionId is { } sessionId
+                    && probeEvent.Generation is { } generation)
+                {
+                    _chatMessages.Add(message, sessionId, generation);
+                }
+                if (_protocol == WindowsDouyinProbeProtocol.CanonicalNdjson
+                    && probeEvent.Kind == WindowsDouyinProbeEventKind.LiveState
+                    && probeEvent.State == "connected")
+                {
+                    // request.Timeout 只约束扫码与建立连接；已连接持续到断开/取消。
+                    _startupTimer?.Dispose();
+                    _startupTimer = null;
+                }
+            }
+        }
         if (bridgeResult is { IsSuccess: false })
         {
             if (_manager.Snapshot.State != DouyinLiveState.Failed)
@@ -1499,6 +1724,23 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
             {
                 _lastEvent = bridgeResult.Snapshot.LastEvent;
             }
+        }
+
+        if (probeEvent is { Kind: WindowsDouyinProbeEventKind.LiveState, State: "closed" or "room_ended" or "failed" }
+            && _authenticated)
+        {
+            CompleteRoomDisconnect(probeEvent.State == "room_ended"
+                ? "直播间已结束，可连接其他直播间"
+                : "直播间连接已断开，可重新连接");
+        }
+        else if (probeEvent is { Kind: WindowsDouyinProbeEventKind.LiveState, State: "auth_expired" })
+        {
+            FailCanonicalSession("抖音登录状态已失效，请重新扫码", WindowsDouyinLoginClearReason.AuthenticationExpired);
+        }
+        else if (probeEvent is { Kind: WindowsDouyinProbeEventKind.AuthState, State: "expired" or "cancelled" or "failed" })
+        {
+            FailCanonicalSession(probeEvent.State == "cancelled" ? "扫码登录已取消" : "扫码登录失败或二维码已过期，请重新扫码",
+                probeEvent.State == "cancelled" ? WindowsDouyinLoginClearReason.ExplicitStop : WindowsDouyinLoginClearReason.LoginFailed);
         }
 
         if (probeEvent.SessionId is not null || probeEvent.Kind == WindowsDouyinProbeEventKind.ChatReceived)
@@ -1648,7 +1890,10 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
     {
         lock (_gate)
         {
+            _startupTimer?.Dispose();
+            _startupTimer = null;
             _state = _disposed ? WindowsDouyinProbeHostState.Closed : state;
+            _authenticated = false;
             _exitCode = exitCode;
         }
     }
@@ -1667,6 +1912,11 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
     private void CancelRun()
     {
         CancelPendingReplyResponse();
+        lock (_gate)
+        {
+            _startupTimer?.Dispose();
+            _startupTimer = null;
+        }
         try
         {
             _runCancellation?.Cancel();
@@ -1680,6 +1930,9 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
     private void PublishSnapshot()
     {
         var snapshot = Snapshot;
+        _diagnosticLog.RecordHost(snapshot);
+        var log = _diagnosticLog.Snapshot;
+        snapshot = snapshot with { DiagnosticLogPath = log.Path, DiagnosticLogState = log.State };
         try
         {
             SnapshotChanged?.Invoke(this, snapshot);
@@ -1690,14 +1943,22 @@ public sealed class WindowsDouyinProbeHost : IAsyncDisposable
         }
     }
 
-    private WindowsDouyinProbeHostSnapshot CreateSnapshot() => new(
+    private WindowsDouyinProbeHostSnapshot CreateSnapshot()
+    {
+        var log = _diagnosticLog.Snapshot;
+        return new(
         _state,
         SafeProcessId(_process),
         _exitCode,
         _manager.Snapshot,
         _qrPath,
         _lastEvent,
-        _invalidEventCount);
+        _invalidEventCount,
+        _authenticated,
+        _authenticated ? WindowsDouyinLoginClearReason.None : _loginClearReason,
+        log.Path,
+        log.State);
+    }
 
     private WindowsDouyinProbeHostResult Succeeded() => new(true, Snapshot);
 

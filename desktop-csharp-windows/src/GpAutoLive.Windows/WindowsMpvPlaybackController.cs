@@ -58,7 +58,7 @@ public sealed record WindowsMpvPlaybackControllerResult(
 /// 把 Core 播放身份、Media 的 mpv 会话和 Windows 受管宿主组合成一个播放所有者。
 /// WPF 只传递已验证资源、当前源和 HWND，不负责拼接命令行或管理进程。
 /// </summary>
-public sealed class WindowsMpvPlaybackController : IAsyncDisposable
+public sealed partial class WindowsMpvPlaybackController : IAsyncDisposable
 {
     private static readonly TimeSpan NextFrameObservationTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan NextFrameObservationInterval = TimeSpan.FromMilliseconds(50);
@@ -510,7 +510,8 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
         return await RunSessionOperationAsync(
             expectedIdentity,
             (session) => session.Seek(expectedIdentity!, positionMs),
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken,
+            seekCompletionPositionMs: positionMs).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -595,9 +596,13 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
                 return Failure(WindowsMpvPlaybackControllerFailureCode.InvalidInput, sourceError?.Message ?? "mpv 活动源无效。", false);
             }
 
+            // Drain already-buffered events before marking the next load generation.
+            var barrier = await runtime!.DispatchAsync(MpvIpcCommand.GetProperty(MpvIpcProperty.MediaPath), currentIdentity, cancellationToken).ConfigureAwait(false);
+            if (!barrier.IsSuccess) return Failure(WindowsMpvPlaybackControllerFailureCode.DispatchFailed, "无法确认播放器换源边界。", true);
+            var previousLoadedGeneration = runtime.LoadedGeneration;
             var wasPlaying = session!.Snapshot.State is MpvSessionState.Playing;
             var previousEffects = session.Snapshot.EffectSnapshot;
-            var bound = session.BindSource(activeSource);
+            var bound = session.BindSource(activeSource, startPaused: !wasPlaying);
             var dispatched = await DispatchCommandsAsync(bound, identity, cancellationToken).ConfigureAwait(false);
             if (!dispatched.IsSuccess)
             {
@@ -626,33 +631,11 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
                     return dispatched;
                 }
             }
-            else
-            {
-                // loadfile may clear mpv's previous pause state. Re-assert the paused
-                // intent through the session state machine before observing the new source.
-                var paused = session.Start();
-                dispatched = await DispatchCommandsAsync(paused, identity, cancellationToken).ConfigureAwait(false);
-                if (!dispatched.IsSuccess)
-                {
-                    await runtime!.StopAsync().ConfigureAwait(false);
-                    ClearRuntime(WindowsMpvPlaybackControllerState.Faulted);
-                    return dispatched;
-                }
-
-                paused = session.Pause();
-                dispatched = await DispatchCommandsAsync(paused, identity, cancellationToken).ConfigureAwait(false);
-                if (!dispatched.IsSuccess)
-                {
-                    await runtime!.StopAsync().ConfigureAwait(false);
-                    ClearRuntime(WindowsMpvPlaybackControllerState.Faulted);
-                    return dispatched;
-                }
-            }
-
             var sourceReady = await WaitForSourceReadyAsync(
                     runtime!,
                     identity,
                     activeSource.MediaPath.CanonicalPath,
+                    previousLoadedGeneration,
                     wasPlaying,
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -679,17 +662,21 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
 
     /// <summary>
     /// loadfile 的 IPC 成功只代表命令被接收；换源返回前还要确认目标路径、非 EOF
-    /// 和播放意图已经出现在 mpv 运行时，播放中额外确认已观察到新源首帧。
+    /// 和播放意图；新 load 的重启事件、VO 及窗口截图共同验证首帧，暂停也必须经过门禁。
     /// </summary>
     private async Task<WindowsMpvPlaybackControllerResult> WaitForSourceReadyAsync(
         WindowsMpvPlaybackRuntime runtime,
         MediaPlaybackIdentity identity,
         string expectedPath,
+        long previousLoadedGeneration,
         bool shouldBePlaying,
         CancellationToken cancellationToken)
     {
+        using var observationTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        observationTimeout.CancelAfter(SourceReadyObservationTimeout);
+        cancellationToken = observationTimeout.Token;
         var deadline = DateTime.UtcNow + SourceReadyObservationTimeout;
-        double? previousPlaybackTime = null;
+
         while (DateTime.UtcNow < deadline)
         {
             var path = await runtime.DispatchAsync(
@@ -715,33 +702,16 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
                     && !eofReached
                     && isPaused == !shouldBePlaying)
                 {
-                    if (!shouldBePlaying)
+                    var configured = await runtime.DispatchAsync(MpvIpcCommand.GetProperty(MpvIpcProperty.VideoOutputConfigured), identity, cancellationToken).ConfigureAwait(false);
+                    var seeking = await runtime.DispatchAsync(MpvIpcCommand.GetProperty(MpvIpcProperty.Seeking), identity, cancellationToken).ConfigureAwait(false);
+                    if (runtime.LoadedGeneration > previousLoadedGeneration
+                        && runtime.RestartedGeneration == runtime.LoadedGeneration
+                        && MpvIpcValueReader.TryReadBoolean(configured.Frame!, out var isConfigured, out _) && isConfigured
+                        && MpvIpcValueReader.TryReadBoolean(seeking.Frame!, out var isSeeking, out _) && !isSeeking)
                     {
-                        return Success();
-                    }
-
-                    var frame = await runtime.DispatchAsync(
-                            MpvIpcCommand.GetProperty(MpvIpcProperty.EstimatedFrameNumber),
-                            identity,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    if (TryReadEstimatedFrameNumber(frame, out var frameNumber)
-                        && frameNumber is > 0)
-                    {
-                        return Success();
-                    }
-
-                    if (frameNumber is not > 0)
-                    {
-                        var playbackTime = await runtime.DispatchAsync(
-                                MpvIpcCommand.GetProperty(MpvIpcProperty.PlaybackTime),
-                                identity,
-                                cancellationToken)
-                            .ConfigureAwait(false);
-                        if (HasPlaybackTimeAdvanced(playbackTime, ref previousPlaybackTime))
-                        {
-                            return Success();
-                        }
+                        var capture = await CapturePresentationCoreAsync(runtime, identity, cancellationToken).ConfigureAwait(false);
+                        if (capture.IsSuccess) return Success();
+                        return Failure(capture.Error!.Code, capture.Error.Message, true);
                     }
                 }
             }
@@ -810,16 +780,19 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
 
             var runtime = _runtime;
             var stopped = await runtime.StopAsync(cancellationToken).ConfigureAwait(false);
-            await runtime.DisposeAsync().ConfigureAwait(false);
             if (!stopped.IsSuccess)
             {
-                ClearRuntime(WindowsMpvPlaybackControllerState.Faulted);
+                lock (_gate)
+                {
+                    _state = WindowsMpvPlaybackControllerState.Faulted;
+                }
                 return Failure(
                     WindowsMpvPlaybackControllerFailureCode.StopFailed,
                     stopped.Error?.Message ?? "mpv 播放会话停止失败。",
-                    retryable: false);
+                    retryable: true);
             }
 
+            await runtime.DisposeAsync().ConfigureAwait(false);
             ClearRuntime(_disposed ? WindowsMpvPlaybackControllerState.Closed : WindowsMpvPlaybackControllerState.Ready);
             return Success();
         }
@@ -840,14 +813,19 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
             _disposed = true;
         }
 
-        await ShutdownAsync().ConfigureAwait(false);
+        var stopped = await ShutdownAsync().ConfigureAwait(false);
+        if (!stopped.IsSuccess)
+        {
+            throw new TimeoutException("mpv 播放会话尚未完成回收，可重试关闭。");
+        }
         GC.SuppressFinalize(this);
     }
 
     private async Task<WindowsMpvPlaybackControllerResult> RunSessionOperationAsync(
         MediaPlaybackIdentity? expectedIdentity,
         Func<MpvPlaybackSession, MpvSessionOperationResult> operation,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ulong? seekCompletionPositionMs = null)
     {
         if (expectedIdentity is null)
         {
@@ -871,7 +849,11 @@ public sealed class WindowsMpvPlaybackController : IAsyncDisposable
             }
 
             var result = operation(session!);
-            var dispatched = await DispatchCommandsAsync(result, expectedIdentity, cancellationToken).ConfigureAwait(false);
+            var dispatched = result.IsSuccess && seekCompletionPositionMs is ulong seekPosition
+                ? await DispatchSeekAndWaitAsync(runtime!, result, expectedIdentity,
+                    session!.Snapshot.ActiveSource?.DurationMs is ulong duration && seekPosition >= duration,
+                    cancellationToken).ConfigureAwait(false)
+                : await DispatchCommandsAsync(result, expectedIdentity, cancellationToken).ConfigureAwait(false);
             if (!dispatched.IsSuccess)
             {
                 return dispatched;

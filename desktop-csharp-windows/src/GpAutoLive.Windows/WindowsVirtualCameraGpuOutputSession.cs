@@ -36,7 +36,7 @@ public sealed class WindowsVirtualCameraGpuOutputSession : IAsyncDisposable
     private readonly VirtualCameraOutputManager _output;
     private readonly WindowsVirtualCameraSurfaceBinding _binding;
     private readonly WindowsGraphicsCaptureWindowSession _capture;
-    private readonly WindowsGraphicsCaptureGpuYuy2Converter _converter;
+    private WindowsGraphicsCaptureGpuYuy2Converter? _converter;
     private readonly object _gate = new();
     private ulong _sequence;
     private TaskCompletionSource<bool>? _firstFrameReady;
@@ -50,7 +50,6 @@ public sealed class WindowsVirtualCameraGpuOutputSession : IAsyncDisposable
         _output = output ?? throw new ArgumentNullException(nameof(output));
         _binding = binding ?? throw new ArgumentNullException(nameof(binding));
         _capture = new WindowsGraphicsCaptureWindowSession();
-        _converter = new WindowsGraphicsCaptureGpuYuy2Converter(output.Snapshot.Config);
     }
 
     /// <summary>读取输出逻辑状态和 WGC 捕获状态。</summary>
@@ -87,6 +86,8 @@ public sealed class WindowsVirtualCameraGpuOutputSession : IAsyncDisposable
 
         _output.SetOutputContext(_output.OutputContext with { HasValidFrame = false });
 
+        _converter?.Dispose();
+        _converter = new WindowsGraphicsCaptureGpuYuy2Converter(begin.Snapshot.Config);
         var startupBudget = NormalizeFirstFrameTimeout(timeout);
         var startupStopwatch = Stopwatch.StartNew();
         var captureResult = await _capture.StartAsync(
@@ -178,6 +179,11 @@ public sealed class WindowsVirtualCameraGpuOutputSession : IAsyncDisposable
         var captureStopped = _capture.Snapshot.Code is
             WindowsGraphicsCaptureWindowSessionCode.Stopped
             or WindowsGraphicsCaptureWindowSessionCode.Closed;
+        if (captureStopped)
+        {
+            _converter?.Dispose();
+            _converter = null;
+        }
         return Result(
             captureStopped,
             captureStopped
@@ -201,7 +207,7 @@ public sealed class WindowsVirtualCameraGpuOutputSession : IAsyncDisposable
         }
 
         await _capture.DisposeAsync().ConfigureAwait(false);
-        _converter.Dispose();
+        _converter?.Dispose();
         _output.Stop();
         _output.SetOutputContext(_output.OutputContext with { HasValidFrame = false });
     }
@@ -219,7 +225,7 @@ public sealed class WindowsVirtualCameraGpuOutputSession : IAsyncDisposable
         }
 
         var status = _output.Snapshot;
-        var conversion = _converter.TryConvert(
+        var conversion = _converter!.TryConvert(
             frame,
             context,
             status.Generation,
@@ -232,7 +238,7 @@ public sealed class WindowsVirtualCameraGpuOutputSession : IAsyncDisposable
         _output.RecordReadback(conversion.ReadbackDuration);
         if (_output.Snapshot.State == VirtualCameraState.Starting)
         {
-            if (!WindowsD3D11HardwareContextFactory.TryBuildFacts(context.Device, out var facts)
+            if (!WindowsD3D11HardwareContextFactory.TryBuildFacts(context.Device, out var facts, status.Config)
                 || facts is null
                 || !_output.MarkReady(facts).IsSuccess)
             {

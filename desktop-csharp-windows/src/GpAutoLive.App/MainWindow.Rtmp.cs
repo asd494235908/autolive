@@ -158,6 +158,7 @@ public partial class MainWindow
         }
 
         var snapshot = _mediaPool.Snapshot;
+        var expectedSourceIdentity = _mediaPool.CurrentIdentity;
         if (snapshot.SourceMediaPool.IsEmpty)
         {
             _state.SetStatus("播放池为空，无法开始 RTMP 推流");
@@ -232,57 +233,103 @@ public partial class MainWindow
         }
 
         var identity = _mediaPool.CurrentIdentity;
+        if (identity != expectedSourceIdentity)
+        {
+            RtmpStatusText.Text = "媒体源已变化，未启动旧源推流";
+            return;
+        }
+
+        WindowsRtmpAudioSource? sharedAudio = null;
+        ulong sourcePositionMs = 0;
+        if (config.AudioEnabled && _audioPlaybackController.ActiveFinalPcmBus is not null)
+        {
+            var captureStarted = Stopwatch.GetTimestamp();
+            while (!_audioPlaybackController.TryAttachRtmpSource(source.SourcePath, out sharedAudio, out var captureError))
+            {
+                if (captureError?.Retryable != true
+                    || Stopwatch.GetElapsedTime(captureStarted) >= TimeSpan.FromSeconds(3)
+                    || _mediaPool.CurrentIdentity != identity)
+                {
+                    RtmpStatusText.Text = captureError?.Message ?? "无法捕获一致的推流声音起点";
+                    _state.SetStatus(RtmpStatusText.Text);
+                    return;
+                }
+                await Task.Delay(20, _windowCancellation.Token).ConfigureAwait(true);
+            }
+            sourcePositionMs = sharedAudio!.SourcePositionMs;
+        }
+        else if (source.MediaKind == MediaKind.Video
+            && snapshot.PlaybackState is PlaybackState.Playing or PlaybackState.Paused)
+        {
+            var currentPosition = await ReadCurrentVideoPositionAsync(identity, source.DurationMs).ConfigureAwait(true);
+            if (currentPosition is null || _mediaPool.CurrentIdentity != identity)
+            {
+                RtmpStatusText.Text = "无法读取当前视频位置，未启动推流";
+                return;
+            }
+            sourcePositionMs = currentPosition.Value;
+        }
         var sourceIdentity = new RtmpSourceIdentity(
             identity.PlaybackGeneration,
             identity.SourceRevision,
             identity.SourceMediaIndex,
             identity.LoopIndex,
-            0,
+            sourcePositionMs,
             source.DurationMs);
-        bool startSucceeded;
+        bool startSucceeded = false;
         string? startError;
         string? redactedTargetUrl;
-        if (config.AudioEnabled)
+        try
         {
-            var audioResult = await _rtmpAudioSession.StartAsync(
-                    config,
-                    source,
-                    ffmpeg.AbsolutePath,
-                    sourceIdentity,
-                    preferredEncoder,
-                    _windowCancellation.Token,
-                    CreateBaseAudioMixPolicy,
-                     new AudioPcmMixEnvelopeOptions(
-                         FfmpegPcmDecodePlanBuilder.DefaultSampleRateHz,
-                         _interludeConfig.DuckingAttackMs,
-                         _interludeConfig.DuckingReleaseMs),
-                      sharedFinalPcmBus: _audioPlaybackController.ActiveFinalPcmBus,
-                      sharedRtmpOutputSource: _audioPlaybackController.ActiveFinalPcmRtmpOutputSource,
-                      sharedRtmpOverlayOutputSource: _audioPlaybackController.ActiveFinalPcmRtmpOverlayOutputSource,
-                      sharedFinalPcmBusProvider: () => _audioPlaybackController.ActiveFinalPcmBus,
-                      audioEffects: _state.AudioProcessing
-                          ? CreateCurrentAudioEffectParameters()
-                          : null,
-                      videoEffects: rtmpVideoEffects)
-                .ConfigureAwait(true);
-            startSucceeded = audioResult.IsSuccess;
-            startError = audioResult.Error?.Message;
-            redactedTargetUrl = RtmpOutputRules.RedactTargetUrl(config.TargetUrl);
+            if (config.AudioEnabled)
+            {
+                var audioResult = await _rtmpAudioSession.StartAsync(
+                        config,
+                        source,
+                        ffmpeg.AbsolutePath,
+                        sourceIdentity,
+                        preferredEncoder,
+                        _windowCancellation.Token,
+                        CreateBaseAudioMixPolicy,
+                        new AudioPcmMixEnvelopeOptions(
+                            FfmpegPcmDecodePlanBuilder.DefaultSampleRateHz,
+                            _interludeConfig.DuckingAttackMs,
+                            _interludeConfig.DuckingReleaseMs),
+                        sharedFinalPcmBus: sharedAudio?.Bus,
+                        sharedRtmpOutputSource: sharedAudio?.OutputSource,
+                        sharedRtmpOverlayOutputSource: sharedAudio?.OverlaySource,
+                        sharedFinalPcmBusProvider: sharedAudio is null ? null : () => _audioPlaybackController.ActiveFinalPcmBus,
+                        audioEffects: _state.AudioProcessing
+                            ? CreateCurrentAudioEffectParameters()
+                            : null,
+                        videoEffects: rtmpVideoEffects)
+                    .ConfigureAwait(true);
+                startSucceeded = audioResult.IsSuccess;
+                startError = audioResult.Error?.Message;
+                redactedTargetUrl = RtmpOutputRules.RedactTargetUrl(config.TargetUrl);
+            }
+            else
+            {
+                var videoResult = await _rtmpOutputManager.StartAsync(
+                        config,
+                        source,
+                        ffmpeg.AbsolutePath,
+                        preferredEncoder: preferredEncoder,
+                        sourceIdentity: sourceIdentity,
+                        videoEffects: rtmpVideoEffects,
+                        cancellationToken: _windowCancellation.Token)
+                    .ConfigureAwait(true);
+                startSucceeded = videoResult.IsSuccess;
+                startError = videoResult.Error?.Message;
+                redactedTargetUrl = videoResult.Snapshot.TargetUrl;
+            }
         }
-        else
+        finally
         {
-            var videoResult = await _rtmpOutputManager.StartAsync(
-                    config,
-                    source,
-                    ffmpeg.AbsolutePath,
-                    preferredEncoder: preferredEncoder,
-                    sourceIdentity: sourceIdentity,
-                    videoEffects: rtmpVideoEffects,
-                    cancellationToken: _windowCancellation.Token)
-                .ConfigureAwait(true);
-            startSucceeded = videoResult.IsSuccess;
-            startError = videoResult.Error?.Message;
-            redactedTargetUrl = videoResult.Snapshot.TargetUrl;
+            if (!startSucceeded)
+            {
+                _audioPlaybackController.SetRtmpConsumerAttached(false);
+            }
         }
 
         if (!startSucceeded)
@@ -457,7 +504,7 @@ public partial class MainWindow
         }
         await StopInterludeForPriorityAsync().ConfigureAwait(true);
         bool stopSucceeded;
-        if (_rtmpAudioSession.Snapshot.IsRunning)
+        if (_rtmpAudioSession.Snapshot.IsRunning || _rtmpAudioSession.HasPendingCleanup)
         {
             var audioResult = await _rtmpAudioSession.StopAsync(_windowCancellation.Token).ConfigureAwait(true);
             if (audioResult.IsSuccess)
@@ -481,6 +528,7 @@ public partial class MainWindow
         if (stopSucceeded && clearLastConfig)
         {
             _lastRtmpConfig = null;
+            _pausedRtmpConfig = null;
         }
         _state.SetStatus(RtmpStatusText.Text);
         UpdateRtmpProjection();
@@ -656,6 +704,7 @@ public partial class MainWindow
 
     private async Task<bool> StopRtmpForMediaMutationAsync()
     {
+        _pausedRtmpConfig = null;
         CancelRtmpReconnect();
         var managerSnapshot = _rtmpOutputManager.Snapshot;
         var state = managerSnapshot.State;
@@ -663,6 +712,7 @@ public partial class MainWindow
         var managerNeedsCleanup = managerSnapshot.ProcessId is not null
             || managerSnapshot.FinalPcmInputOpen;
         if (!_rtmpAudioSession.Snapshot.IsRunning
+            && !_rtmpAudioSession.HasPendingCleanup
             && state is not (RtmpOutputState.Starting or RtmpOutputState.Publishing)
             && !reconnecting
             && !managerNeedsCleanup)
@@ -676,7 +726,7 @@ public partial class MainWindow
 
         bool stopSucceeded;
         string? stopError;
-        if (_rtmpAudioSession.Snapshot.IsRunning)
+        if (_rtmpAudioSession.Snapshot.IsRunning || _rtmpAudioSession.HasPendingCleanup)
         {
             var audioStopped = await _rtmpAudioSession.StopAsync(_windowCancellation.Token).ConfigureAwait(true);
             if (audioStopped.IsSuccess)

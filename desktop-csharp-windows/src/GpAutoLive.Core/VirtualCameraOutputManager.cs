@@ -24,7 +24,7 @@ public sealed record VirtualCameraOperationResult(
 public sealed class VirtualCameraOutputManager
 {
     private readonly object _gate = new();
-    private readonly VirtualCameraConfig _config;
+    private VirtualCameraConfig _config;
     private readonly Queue<ulong> _readbackSamplesUs = new(VirtualCameraRules.ReadbackSampleCapacity);
     private VirtualCameraState _state = VirtualCameraState.Unavailable;
     private ulong _generation = 1;
@@ -65,6 +65,23 @@ public sealed class VirtualCameraOutputManager
         return true;
     }
 
+    /// <summary>仅在输出停止时配置源分辨率；清除旧代际帧和 GPU 事实。</summary>
+    public VirtualCameraOperationResult ConfigureOutput(VirtualCameraConfig? config)
+    {
+        lock (_gate)
+        {
+            if (_state is not (VirtualCameraState.Unavailable or VirtualCameraState.Installed or VirtualCameraState.Failed))
+                return Failure(VirtualCameraError.InvalidTransition(_state, "configure_output"));
+            VirtualCameraError? error = null;
+            if (config is null || !config.TryValidateFixedOutput(out error))
+                return Failure(error ?? VirtualCameraError.InvalidConfiguration("配置不能为空"));
+            if (_config == config) return Success();
+            _config = config;
+            InvalidateGeneration();
+            _gpu = null;
+            return Success();
+        }
+    }
     /// <summary>获取当前脱敏状态快照。</summary>
     public VirtualCameraStatus Snapshot
     {
@@ -300,6 +317,9 @@ public sealed class VirtualCameraOutputManager
             {
                 return Failure(configError!);
             }
+
+            if (frame.Width != _config.Width || frame.Height != _config.Height)
+                return Failure(VirtualCameraError.InvalidConfiguration("帧尺寸与本次输出配置不一致"));
 
             if (frame.Payload.Length != expectedBytes)
             {

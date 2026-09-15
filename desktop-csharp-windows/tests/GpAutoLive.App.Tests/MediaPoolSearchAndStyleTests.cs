@@ -3,6 +3,8 @@ using System.Reflection;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Data;
 using System.Windows.Media;
 using Ellipse = System.Windows.Shapes.Ellipse;
 using System.Windows.Threading;
@@ -152,8 +154,9 @@ public sealed class MediaPoolSearchAndStyleTests
                 window = new MainWindow();
                 window.Show();
 
-                var expanders = FindVisualChildren<Expander>(window).ToArray();
-                Assert.AreEqual(4, expanders.Length);
+                var expanders = FindVisualChildren<Expander>(window)
+                    .Where(expander => expander.Header is string header && header.EndsWith("（高级）", StringComparison.Ordinal)).ToArray();
+                Assert.AreEqual(3, expanders.Length);
                 Assert.IsTrue(expanders.All(static expander => expander.HeaderTemplate is not null));
                 var expectedTextBrush = window.TryFindResource("TextBrush") as SolidColorBrush;
                 Assert.IsNotNull(expectedTextBrush);
@@ -251,6 +254,88 @@ public sealed class MediaPoolSearchAndStyleTests
         Assert.AreEqual(1d, MainWindow.CalculateResponsiveShellScale(new Size(1280, 800)), 0.001d);
         Assert.AreEqual(1d, MainWindow.CalculateResponsiveShellScale(new Size(1586, 992)), 0.001d);
         Assert.AreEqual(1.25d, MainWindow.CalculateResponsiveShellScale(new Size(2864, 1762)), 0.001d);
+    }
+
+    [TestMethod]
+    public void Video_snapshot_cards_stack_labels_above_values_at_minimum_width()
+    {
+        WpfTestApplicationHost.Run(() =>
+        {
+            MainWindow? window = null;
+            try
+            {
+                window = new MainWindow
+                {
+                    Width = 1280,
+                    Height = 800,
+                };
+                window.Show();
+                Dispatcher.CurrentDispatcher.Invoke(DispatcherPriority.Background, new Action(static () => { }));
+
+                var processingPath = GetPrivateField<TextBlock>(window, "VideoProcessingPathText");
+                Assert.IsInstanceOfType(processingPath.Parent, typeof(StackPanel));
+                AssertTextBlocksDoNotOverlap((StackPanel)processingPath.Parent);
+
+                var section = GetPrivateField<Border>(window, "VideoSnapshotSection");
+                var parameterCards = FindVisualChildren<UniformGrid>(section).Single();
+                Assert.AreEqual(8, parameterCards.Children.Count);
+                foreach (var card in parameterCards.Children.OfType<Border>())
+                {
+                    Assert.IsInstanceOfType(card.Child, typeof(StackPanel));
+                    Assert.IsTrue(card.Height >= 50d);
+                    Assert.IsTrue(card.ActualWidth > 0d);
+                    AssertTextBlocksDoNotOverlap((StackPanel)card.Child);
+                }
+
+                var sourceValue = FindVisualChildren<TextBlock>(section)
+                    .Single(text => BindingOperations.GetBinding(text, TextBlock.TextProperty)?.ElementName == "CurrentMediaText");
+                Assert.AreEqual(TextTrimming.CharacterEllipsis, sourceValue.TextTrimming);
+                Assert.IsNotNull(sourceValue.ToolTip);
+            }
+            finally
+            {
+                window?.Close();
+            }
+        });
+    }
+
+    [TestMethod]
+    public void Video_snapshot_displays_low_perception_values_without_rounding_them_to_defaults()
+    {
+        WpfTestApplicationHost.Run(() =>
+        {
+            MainWindow? window = null;
+            try
+            {
+                window = new MainWindow();
+                window.Show();
+                Dispatcher.CurrentDispatcher.Invoke(DispatcherPriority.Background, new Action(static () => { }));
+
+                var section = GetPrivateField<Border>(window, "VideoSnapshotSection");
+                string BoundText(string path) => FindVisualChildren<TextBlock>(section)
+                    .Single(text => BindingOperations.GetBinding(text, TextBlock.TextProperty)?.Path?.Path == path)
+                    .Text;
+
+                Assert.AreNotEqual("0%", BoundText("VideoParameterSnapshot.BrightnessPercent"));
+                Assert.AreNotEqual("100%", BoundText("VideoParameterSnapshot.ContrastPercent"));
+                Assert.AreNotEqual("100%", BoundText("VideoParameterSnapshot.SaturationPercent"));
+                Assert.AreNotEqual("0°", BoundText("VideoParameterSnapshot.HueRotationDegrees"));
+                Assert.AreNotEqual("0%", BoundText("VideoParameterSnapshot.SharpnessPercent"));
+            }
+            finally
+            {
+                window?.Close();
+            }
+        });
+    }
+
+    private static void AssertTextBlocksDoNotOverlap(StackPanel stack)
+    {
+        var texts = stack.Children.OfType<TextBlock>().ToArray();
+        Assert.AreEqual(2, texts.Length);
+        var labelBottom = texts[0].TranslatePoint(new Point(0, texts[0].ActualHeight), stack).Y;
+        var valueTop = texts[1].TranslatePoint(new Point(0, 0), stack).Y;
+        Assert.IsTrue(labelBottom <= valueTop, $"标签底部 {labelBottom:0.##} 超过数值顶部 {valueTop:0.##}。");
     }
 
     [TestMethod]

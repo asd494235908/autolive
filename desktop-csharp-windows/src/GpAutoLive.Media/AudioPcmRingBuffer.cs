@@ -7,6 +7,7 @@ public enum PcmRingBufferFailureCode
     ConsumerBusy,
     Closed,
     MixFailed,
+    Discontinuity,
 }
 
 /// <summary>不包含音频正文的环缓错误。</summary>
@@ -36,6 +37,7 @@ public sealed class AudioPcmRingBuffer
     private int _writeFrame;
     private int _availableFrames;
     private ulong _droppedFrames;
+    private ulong? _readDropBaseline;
     private bool _closed;
 
     public AudioPcmRingBuffer(int capacityFrames, int channels)
@@ -63,6 +65,39 @@ public sealed class AudioPcmRingBuffer
             {
                 return CreateSnapshot();
             }
+        }
+    }
+
+    // 仅供最终总线按 Output -> RTMP 的固定方向接入；复制不会消费本地输出或分配新缓冲。
+    internal int CopyPendingTo(AudioPcmRingBuffer destination)
+    {
+        if (ReferenceEquals(this, destination)
+            || destination._channels != _channels
+            || destination._capacityFrames < _capacityFrames)
+        {
+            throw new ArgumentException("PCM 接入目标必须是同声道且容量充足的独立环缓。", nameof(destination));
+        }
+
+        lock (_gate)
+        lock (destination._gate)
+        {
+            var firstFrames = Math.Min(_availableFrames, _capacityFrames - _readFrame);
+            _samples.AsSpan(_readFrame * _channels, firstFrames * _channels)
+                .CopyTo(destination._samples);
+            _samples.AsSpan(0, (_availableFrames - firstFrames) * _channels)
+                .CopyTo(destination._samples.AsSpan(firstFrames * _channels));
+            destination._readFrame = 0;
+            destination._availableFrames = _availableFrames;
+            destination._writeFrame = _availableFrames % destination._capacityFrames;
+            return _availableFrames;
+        }
+    }
+
+    internal void RequireContinuousReads()
+    {
+        lock (_gate)
+        {
+            _readDropBaseline = _droppedFrames;
         }
     }
 
@@ -251,14 +286,13 @@ public sealed class AudioPcmRingBuffer
         }
 
         AddDroppedFrames(sourceStartFrame + overwritten);
-        for (var frame = 0; frame < framesToWrite; frame++)
-        {
-            var sourceOffset = checked((sourceStartFrame + frame) * _channels);
-            var destinationOffset = _writeFrame * _channels;
-            interleavedSamples.Slice(sourceOffset, _channels)
-                .CopyTo(_samples.AsSpan(destinationOffset, _channels));
-            _writeFrame = (_writeFrame + 1) % _capacityFrames;
-        }
+        var source = interleavedSamples.Slice(sourceStartFrame * _channels, framesToWrite * _channels);
+        var firstFrames = Math.Min(framesToWrite, _capacityFrames - _writeFrame);
+        source[..(firstFrames * _channels)]
+            .CopyTo(_samples.AsSpan(_writeFrame * _channels, firstFrames * _channels));
+        source[(firstFrames * _channels)..]
+            .CopyTo(_samples.AsSpan(0, (framesToWrite - firstFrames) * _channels));
+        _writeFrame = (_writeFrame + framesToWrite) % _capacityFrames;
 
         _availableFrames += framesToWrite;
         framesWritten = framesToWrite;
@@ -273,15 +307,18 @@ public sealed class AudioPcmRingBuffer
         framesRead = 0;
         error = null;
         var requestedFrames = destination.Length / _channels;
-        var framesToRead = Math.Min(requestedFrames, _availableFrames);
-        for (var frame = 0; frame < framesToRead; frame++)
+        if (_readDropBaseline is ulong baseline && _droppedFrames != baseline)
         {
-            var sourceOffset = _readFrame * _channels;
-            var destinationOffset = frame * _channels;
-            _samples.AsSpan(sourceOffset, _channels)
-                .CopyTo(destination.Slice(destinationOffset, _channels));
-            _readFrame = (_readFrame + 1) % _capacityFrames;
+            error = new(PcmRingBufferFailureCode.Discontinuity, "RTMP PCM 环缓已丢帧，必须重新对齐后发布。");
+            return false;
         }
+        var framesToRead = Math.Min(requestedFrames, _availableFrames);
+        var firstFrames = Math.Min(framesToRead, _capacityFrames - _readFrame);
+        _samples.AsSpan(_readFrame * _channels, firstFrames * _channels)
+            .CopyTo(destination[..(firstFrames * _channels)]);
+        _samples.AsSpan(0, (framesToRead - firstFrames) * _channels)
+            .CopyTo(destination.Slice(firstFrames * _channels, (framesToRead - firstFrames) * _channels));
+        _readFrame = (_readFrame + framesToRead) % _capacityFrames;
 
         _availableFrames -= framesToRead;
         framesRead = framesToRead;

@@ -30,6 +30,10 @@ public sealed class AudioPcmTrackSwitchOutputSource : IAudioPcmOutputSource
     private ulong _preparedCandidateId;
     private bool _commitRequested;
     private ulong _framesRead;
+    private ulong _totalFramesRead;
+    private ulong _candidateStartTotalFrames;
+    private AudioPcmTrackSwitchOutputSource? _readLeader;
+    private AudioPcmTrackSwitchOutputSource? _candidateLeader;
     private ulong? _commitAtFramesRead;
 
     public AudioPcmTrackSwitchOutputSource(
@@ -70,6 +74,71 @@ public sealed class AudioPcmTrackSwitchOutputSource : IAudioPcmOutputSource
 
     /// <inheritdoc />
     public int Channels => _channels;
+
+    internal bool HasPendingCommit { get { lock (_gate) { return _commitRequested; } } }
+
+    internal ulong CandidateFramesRead { get { lock (_gate) { return _framesRead; } } }
+
+    internal void FollowReadPosition(AudioPcmTrackSwitchOutputSource leader) => _readLeader = leader;
+
+    internal void FollowCandidate(AudioPcmTrackSwitchOutputSource leader) => _candidateLeader = leader;
+
+    internal void SynchronizeCandidate()
+    {
+        lock (_gate)
+        {
+            if (_candidateLeader is not null && _preparedSource is not null
+                && _candidateLeader.ActiveCandidateId == _preparedCandidateId)
+            {
+                _activeSource = _preparedSource;
+                _activeCandidateId = _preparedCandidateId;
+                _preparedSource = null;
+                _preparedCandidateId = 0;
+                _framesRead = 0;
+                _candidateStartTotalFrames = _totalFramesRead;
+                _commitRequested = false;
+                _commitAtFramesRead = null;
+            }
+        }
+    }
+
+    internal void SetInitialFramePosition(ulong framesRead)
+    {
+        lock (_gate)
+        {
+            _framesRead = framesRead;
+            if (_readLeader is not null)
+            {
+                lock (_readLeader._gate)
+                {
+                    _candidateStartTotalFrames = _readLeader._candidateStartTotalFrames;
+                }
+            }
+            _totalFramesRead = _candidateStartTotalFrames + framesRead;
+        }
+    }
+
+    internal static bool TryCommitTogether(
+        AudioPcmTrackSwitchOutputSource local,
+        AudioPcmTrackSwitchOutputSource remote,
+        ulong candidateId,
+        ulong framesFromNow,
+        bool remoteAttached,
+        out AudioPcmTrackSwitchError? error)
+    {
+        // 与远端读取 leader 的锁序一致，防止本机已经跨边界而远端尚未取得边界。
+        lock (remote._gate)
+        lock (local._gate)
+        {
+            if (!local.TryCommitPreparedAtFrames(candidateId, framesFromNow, out error, out var boundary))
+            {
+                return false;
+            }
+            return remoteAttached
+                ? remote.TryCommitPreparedAtPosition(candidateId, boundary, out error)
+                : remote.TryCommitPrepared(candidateId, out error);
+        }
+    }
 
     /// <inheritdoc />
     public bool IsClosed
@@ -178,6 +247,28 @@ public sealed class AudioPcmTrackSwitchOutputSource : IAudioPcmOutputSource
         ulong candidateId,
         ulong framesFromNow,
         out AudioPcmTrackSwitchError? error)
+        => TryCommitPreparedAtFrames(candidateId, framesFromNow, out error, out _);
+
+    internal bool TryCommitPreparedAtFrames(
+        ulong candidateId,
+        ulong framesFromNow,
+        out AudioPcmTrackSwitchError? error,
+        out ulong commitPosition)
+    {
+        lock (_gate)
+        {
+            commitPosition = ulong.MaxValue - _framesRead < framesFromNow ? ulong.MaxValue : _framesRead + framesFromNow;
+            return TryCommitPreparedAtPosition(
+                candidateId,
+                commitPosition,
+                out error);
+        }
+    }
+
+    internal bool TryCommitPreparedAtPosition(
+        ulong candidateId,
+        ulong candidateFramePosition,
+        out AudioPcmTrackSwitchError? error)
     {
         error = null;
         if (candidateId == 0)
@@ -207,9 +298,7 @@ public sealed class AudioPcmTrackSwitchOutputSource : IAudioPcmOutputSource
             }
 
             _commitRequested = true;
-            _commitAtFramesRead = ulong.MaxValue - _framesRead < framesFromNow
-                ? ulong.MaxValue
-                : _framesRead + framesFromNow;
+            _commitAtFramesRead = candidateFramePosition;
             return true;
         }
     }
@@ -247,6 +336,8 @@ public sealed class AudioPcmTrackSwitchOutputSource : IAudioPcmOutputSource
             }
 
             _activeSource = _preparedSource;
+            _framesRead = 0;
+            _candidateStartTotalFrames = _totalFramesRead;
             _activeCandidateId = _preparedCandidateId;
             _preparedSource = null;
             _preparedCandidateId = 0;
@@ -281,6 +372,8 @@ public sealed class AudioPcmTrackSwitchOutputSource : IAudioPcmOutputSource
             }
 
             _activeSource = _preparedSource;
+            _framesRead = 0;
+            _candidateStartTotalFrames = _totalFramesRead;
             _activeCandidateId = _preparedCandidateId;
             _preparedSource = null;
             _preparedCandidateId = 0;
@@ -335,11 +428,16 @@ public sealed class AudioPcmTrackSwitchOutputSource : IAudioPcmOutputSource
         out PcmRingBufferError? error) =>
         TryReadCore(destination, realtime: true, out framesRead, out error);
 
+    internal bool TryReadOneCandidate(Span<float> destination, bool realtime,
+        out int framesRead, out PcmRingBufferError? error) =>
+        TryReadCore(destination, realtime, out framesRead, out error, oneCandidate: true);
+
     private bool TryReadCore(
         Span<float> destination,
         bool realtime,
         out int framesRead,
-        out PcmRingBufferError? error)
+        out PcmRingBufferError? error,
+        bool oneCandidate = false)
     {
         framesRead = 0;
         error = null;
@@ -351,63 +449,125 @@ public sealed class AudioPcmTrackSwitchOutputSource : IAudioPcmOutputSource
             return false;
         }
 
-        while (framesRead < destination.Length / _channels)
+        if (realtime)
         {
-            IAudioPcmOutputSource source;
-            lock (_gate)
+            if (!Monitor.TryEnter(_gate))
             {
-                if (_commitRequested
-                    && _commitAtFramesRead is ulong commitAtFramesRead
-                    && _framesRead >= commitAtFramesRead
-                    && _preparedSource is not null)
-                {
-                    _activeSource = _preparedSource;
-                    _activeCandidateId = _preparedCandidateId;
-                    _preparedSource = null;
-                    _preparedCandidateId = 0;
-                    _commitRequested = false;
-                    _commitAtFramesRead = null;
-                }
-
-                source = _activeSource;
-            }
-
-            var target = destination.Slice(framesRead * _channels);
-            var readSucceeded = realtime
-                ? source.TryReadRealtime(target, out var sourceFrames, out error)
-                : source.TryRead(target, out sourceFrames, out error);
-            if (!readSucceeded)
-            {
+                error = new(PcmRingBufferFailureCode.ConsumerBusy, "PCM 音轨切换临界区繁忙。");
                 return false;
-            }
-
-            if (sourceFrames < 0 || sourceFrames > target.Length / _channels)
-            {
-                error = new(
-                    PcmRingBufferFailureCode.InvalidFrameShape,
-                    "PCM 音轨输出源返回了超过目标容量的帧数。");
-                return false;
-            }
-
-            framesRead += sourceFrames;
-            lock (_gate)
-            {
-                _framesRead = ulong.MaxValue - (ulong)sourceFrames < _framesRead
-                    ? ulong.MaxValue
-                    : _framesRead + (ulong)sourceFrames;
-            }
-            if (framesRead == destination.Length / _channels || !source.IsClosed)
-            {
-                return true;
-            }
-
-            if (!TryPromotePrepared(source))
-            {
-                return true;
             }
         }
+        else
+        {
+            Monitor.Enter(_gate);
+        }
+        try
+        {
+            SynchronizeCandidate();
+            while (framesRead < destination.Length / _channels)
+            {
+                IAudioPcmOutputSource source;
+                lock (_gate)
+                {
+                    if (_commitRequested
+                        && _commitAtFramesRead is ulong commitAtFramesRead
+                        && _framesRead >= commitAtFramesRead
+                        && _preparedSource is not null)
+                    {
+                        if (oneCandidate && framesRead > 0)
+                        {
+                            return true;
+                        }
+                        _activeSource = _preparedSource;
+                        _framesRead = 0;
+                        _candidateStartTotalFrames = _totalFramesRead;
+                        _activeCandidateId = _preparedCandidateId;
+                        _preparedSource = null;
+                        _preparedCandidateId = 0;
+                        _commitRequested = false;
+                        _commitAtFramesRead = null;
+                    }
 
-        return true;
+                    source = _activeSource;
+                }
+
+                var target = destination.Slice(framesRead * _channels);
+                if (_commitRequested && _commitAtFramesRead is ulong boundary)
+                {
+                    target = target[..((int)Math.Min((ulong)(target.Length / _channels), boundary - _framesRead) * _channels)];
+                }
+                if (_readLeader is not null)
+                {
+                    lock (_readLeader._gate)
+                    {
+                        var available = _readLeader._totalFramesRead > _totalFramesRead
+                            ? _readLeader._totalFramesRead - _totalFramesRead
+                            : 0;
+                        target = target[..((int)Math.Min((ulong)(target.Length / _channels), available) * _channels)];
+                    }
+                    if (target.IsEmpty)
+                    {
+                        return true;
+                    }
+                }
+                var readSucceeded = realtime
+                    ? source.TryReadRealtime(target, out var sourceFrames, out error)
+                    : source.TryRead(target, out sourceFrames, out error);
+                if (!readSucceeded)
+                {
+                    return false;
+                }
+
+                if (sourceFrames < 0 || sourceFrames > target.Length / _channels)
+                {
+                    error = new(
+                        PcmRingBufferFailureCode.InvalidFrameShape,
+                        "PCM 音轨输出源返回了超过目标容量的帧数。");
+                    return false;
+                }
+
+                framesRead += sourceFrames;
+                lock (_gate)
+                {
+                    _framesRead = ulong.MaxValue - (ulong)sourceFrames < _framesRead
+                        ? ulong.MaxValue
+                        : _framesRead + (ulong)sourceFrames;
+                    _totalFramesRead = ulong.MaxValue - (ulong)sourceFrames < _totalFramesRead
+                        ? ulong.MaxValue
+                        : _totalFramesRead + (ulong)sourceFrames;
+                }
+                if (framesRead == destination.Length / _channels)
+                {
+                    return true;
+                }
+
+                if (_commitRequested && _commitAtFramesRead is ulong reached && _framesRead >= reached)
+                {
+                    continue;
+                }
+
+                if (!source.IsClosed)
+                {
+                    return true;
+                }
+
+                if (oneCandidate && framesRead > 0)
+                {
+                    return true;
+                }
+
+                if (!TryPromotePrepared(source))
+                {
+                    return true;
+                }
+            }
+
+            return true;
+        }
+        finally
+        {
+            Monitor.Exit(_gate);
+        }
     }
 
     private bool TryPromotePrepared(IAudioPcmOutputSource drainedSource)
@@ -415,6 +575,7 @@ public sealed class AudioPcmTrackSwitchOutputSource : IAudioPcmOutputSource
         lock (_gate)
         {
             if (!ReferenceEquals(_activeSource, drainedSource)
+                || _candidateLeader is not null
                 || !_commitRequested
                 || _preparedSource is null)
             {
@@ -422,6 +583,8 @@ public sealed class AudioPcmTrackSwitchOutputSource : IAudioPcmOutputSource
             }
 
             _activeSource = _preparedSource;
+            _framesRead = 0;
+            _candidateStartTotalFrames = _totalFramesRead;
             _activeCandidateId = _preparedCandidateId;
             _preparedSource = null;
             _preparedCandidateId = 0;

@@ -1,0 +1,21 @@
+# Conda gpautolive-douyin runtime; Windows Python 3.11.
+# Direct versions match desktop/tools/douyin_probe_requirements.txt.
+beautifulsoup4==4.15.0
+certifi==2026.7.22
+cffi==2.1.1
+colorama==0.4.6
+cryptography==50.0.1
+curl_cffi==0.16.2
+ecdsa==0.19.2
+loguru==0.7.3
+packaging==26.3
+pillow==12.3.0
+protobuf==7.36.0
+pycparser==3.0
+python-dotenv==1.2.3
+qrcode==8.2
+six==1.17.0
+soupsieve==2.9.2
+typing_extensions==4.16.0
+websocket-client==1.9.1
+win32_setctime==1.2.0

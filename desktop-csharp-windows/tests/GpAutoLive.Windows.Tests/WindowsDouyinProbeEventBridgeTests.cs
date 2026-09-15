@@ -8,6 +8,23 @@ namespace GpAutoLive.Windows.Tests;
 public sealed class WindowsDouyinProbeEventBridgeTests
 {
     [TestMethod]
+    public void Natural_close_ends_listening_but_close_after_stop_keeps_idle()
+    {
+        var manager = new DouyinLiveManager();
+        Assert.IsTrue(manager.TryStart(new DouyinLiveConfig { RoomId = "12345", Replies = [] }).IsSuccess);
+        Assert.IsTrue(manager.MarkLoggedIn().IsSuccess);
+        Assert.IsTrue(manager.MarkRoomResolved().IsSuccess);
+        Assert.IsTrue(manager.BeginListening().IsSuccess);
+        var closed = new WindowsDouyinProbeEvent(WindowsDouyinProbeEventKind.LiveState, "live.state",
+            SessionId: "ls-1", Generation: 1, State: "closed");
+        Assert.IsTrue(WindowsDouyinProbeEventBridge.Apply(manager, closed)?.IsSuccess);
+        Assert.AreEqual(DouyinLiveState.Inconclusive, manager.Snapshot.State);
+        Assert.IsTrue(manager.Stop().IsSuccess);
+        Assert.IsNull(WindowsDouyinProbeEventBridge.Apply(manager, closed));
+        Assert.AreEqual(DouyinLiveState.Idle, manager.Snapshot.State);
+    }
+
+    [TestMethod]
     public void Redacted_probe_events_follow_the_m1_lifecycle()
     {
         var manager = new DouyinLiveManager();

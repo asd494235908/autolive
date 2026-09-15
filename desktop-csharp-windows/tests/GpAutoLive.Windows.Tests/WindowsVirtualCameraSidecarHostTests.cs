@@ -9,6 +9,86 @@ namespace GpAutoLive.Windows.Tests;
 public sealed class WindowsVirtualCameraSidecarHostTests
 {
     [TestMethod]
+    public async Task Missing_native_ack_returns_bounded_startup_timeout()
+    {
+        await using var host = new WindowsVirtualCameraSidecarHost();
+        var completion = new TaskCompletionSource<WindowsVirtualCameraSidecarHostErrorCode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        typeof(WindowsVirtualCameraSidecarHost).GetField("_outputReady", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(host, completion);
+        var result = await host.WaitForOutputReadyAsync();
+        Assert.IsFalse(result.IsSuccess);
+        Assert.AreEqual(WindowsVirtualCameraSidecarHostErrorCode.StartupTimedOut, result.Error!.Code);
+    }
+
+    [TestMethod]
+    public async Task Native_ack_only_succeeds_for_running_session()
+    {
+        await using var host = new WindowsVirtualCameraSidecarHost();
+        var completion = new TaskCompletionSource<WindowsVirtualCameraSidecarHostErrorCode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        typeof(WindowsVirtualCameraSidecarHost).GetField("_outputReady", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(host, completion);
+        completion.SetResult(null);
+        Assert.IsFalse((await host.WaitForOutputReadyAsync()).IsSuccess);
+        typeof(WindowsVirtualCameraSidecarHost).GetField("_state", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(host, WindowsVirtualCameraSidecarHostState.Running);
+        Assert.IsTrue((await host.WaitForOutputReadyAsync()).IsSuccess);
+    }
+
+    [TestMethod]
+    public async Task Output_confirmation_waits_for_native_ack_and_propagates_fixed_failure()
+    {
+        await using var host = new WindowsVirtualCameraSidecarHost();
+        var completion = new TaskCompletionSource<WindowsVirtualCameraSidecarHostErrorCode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        typeof(WindowsVirtualCameraSidecarHost).GetField("_outputReady", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(host, completion);
+        var waiting = host.WaitForOutputReadyAsync();
+        Assert.IsFalse(waiting.IsCompleted);
+        completion.SetResult(WindowsVirtualCameraSidecarHostErrorCode.ConsumersMustClose);
+        var result = await waiting;
+        Assert.IsFalse(result.IsSuccess);
+        Assert.AreEqual(WindowsVirtualCameraSidecarHostErrorCode.ConsumersMustClose, result.Error!.Code);
+        StringAssert.Contains(result.Error.Message, "关闭");
+    }
+
+    [TestMethod]
+    public async Task Output_confirmation_is_cancelled_while_native_ack_is_pending()
+    {
+        await using var host = new WindowsVirtualCameraSidecarHost();
+        var completion = new TaskCompletionSource<WindowsVirtualCameraSidecarHostErrorCode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        typeof(WindowsVirtualCameraSidecarHost).GetField("_outputReady", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(host, completion);
+        using var cancellation = new CancellationTokenSource();
+        var waiting = host.WaitForOutputReadyAsync(cancellation.Token);
+        cancellation.Cancel();
+        var result = await waiting;
+        Assert.AreEqual(WindowsVirtualCameraSidecarHostErrorCode.Cancelled, result.Error!.Code);
+    }
+
+    [TestMethod]
+    public void Native_exit_codes_map_to_fixed_actionable_errors()
+    {
+        Assert.AreEqual(WindowsVirtualCameraSidecarHostErrorCode.ConsumersMustClose, WindowsVirtualCameraSidecarHost.MapNativeExitCode(6));
+        Assert.AreEqual(WindowsVirtualCameraSidecarHostErrorCode.OutputFormatRejected, WindowsVirtualCameraSidecarHost.MapNativeExitCode(7));
+        Assert.AreEqual(WindowsVirtualCameraSidecarHostErrorCode.NativeOutputFailed, WindowsVirtualCameraSidecarHost.MapNativeExitCode(5));
+        Assert.AreEqual(WindowsVirtualCameraSidecarHostErrorCode.ProcessExited, WindowsVirtualCameraSidecarHost.MapNativeExitCode(999));
+    }
+
+    [TestMethod]
+    public async Task Output_confirmation_without_active_session_never_claims_ready()
+    {
+        await using var host = new WindowsVirtualCameraSidecarHost();
+        Assert.IsFalse((await host.WaitForOutputReadyAsync()).IsSuccess);
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        var result = await host.WaitForOutputReadyAsync(cancelled.Token);
+        Assert.AreEqual(WindowsVirtualCameraSidecarHostErrorCode.Cancelled, result.Error!.Code);
+    }
+
+    [TestMethod]
+    public async Task Null_plan_is_rejected_before_component_locking()
+    {
+        await using var host = new WindowsVirtualCameraSidecarHost();
+        var result = await host.StartAsync(null);
+        Assert.IsFalse(result.IsSuccess);
+        Assert.AreEqual(WindowsVirtualCameraSidecarHostErrorCode.InvalidPlan, result.Error!.Code);
+    }
+
+    [TestMethod]
     public async Task Forged_plan_without_memory_token_is_rejected()
     {
         await using var host = new WindowsVirtualCameraSidecarHost();

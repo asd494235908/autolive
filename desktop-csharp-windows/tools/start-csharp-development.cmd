@@ -6,6 +6,12 @@ set "AUTOLIVE_CONTROL_PLANE_BASE_URI=http://101.96.208.132:9090"
 set "APP_EXE=%~dp0..\src\GpAutoLive.App\bin\x64\Release\net10.0-windows10.0.19041.0\win-x64\GpAutoLive.exe"
 set "DOTNET_EXE=%~dp0..\.tools\dotnet\dotnet.exe"
 
+if not defined AUTOLIVE_DOUYIN_ROOT set "AUTOLIVE_DOUYIN_ROOT=%~dp0..\.tools\douyin-upstream"
+if not defined AUTOLIVE_DOUYIN_PROBE set "AUTOLIVE_DOUYIN_PROBE=%~dp0..\sidecars\douyin\sidecar.py"
+if not defined AUTOLIVE_DOUYIN_PROTOCOL set "AUTOLIVE_DOUYIN_PROTOCOL=canonical"
+if not defined AUTOLIVE_CONDA_ENV set "AUTOLIVE_CONDA_ENV=gpautolive-douyin"
+if not defined CONDA_EXE for /f "delims=" %%I in ('where conda.exe 2^>nul') do if not defined CONDA_EXE set "CONDA_EXE=%%I"
+
 if not "%~1"=="" goto :runtime_argument
 set "MEDIA_RUNTIME_ROOT=%~dp0..\artifacts\csharp-gpu83-real-v2"
 if exist "%MEDIA_RUNTIME_ROOT%\runtime\media\1.0.0\manifest.json" goto :runtime_ready

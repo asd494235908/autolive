@@ -5,6 +5,45 @@ namespace GpAutoLive.Windows.Tests;
 [TestClass]
 public sealed class WindowsDouyinProbeEventParserTests
 {
+    [TestMethod]
+    public void Authentication_diagnostic_accepts_only_bounded_safe_fields()
+    {
+        Assert.IsTrue(WindowsDouyinProbeEventParser.TryParse(
+            """{"v":1,"type":"event","event":"auth.diagnostic","payload":{"stage":"qr_fetch","code":"http_error","exception_type":"http","http_status":403,"platform_code":7}}""",
+            out _, out _));
+    }
+
+    [TestMethod]
+    [DataRow("\"url\":\"https://example.com/token\"")]
+    [DataRow("\"http_status\":600")]
+    [DataRow("\"platform_code\":2147483648")]
+    [DataRow("\"exception_type\":\"arbitrary_secret\"")]
+    [DataRow("\"stage\":\"qr_poll\"")]
+    [DataRow("\"http_status\":\"403\"")]
+    [DataRow("\"platform_code\":null")]
+    [DataRow("\"platform_code\":true")]
+    public void Authentication_diagnostic_rejects_extra_duplicate_and_unbounded_fields(string extra)
+    {
+        Assert.IsFalse(WindowsDouyinProbeEventParser.TryParse(
+            "{\"v\":1,\"type\":\"event\",\"event\":\"auth.diagnostic\",\"payload\":{\"stage\":\"qr_fetch\",\"code\":\"http_error\"," + extra + "}}",
+            out _, out _));
+    }
+
+    [TestMethod]
+    public void Authentication_diagnostic_rejects_root_fields_duplicates_and_invalid_envelope()
+    {
+        const string payload = "\"payload\":{\"stage\":\"qr_poll\",\"code\":\"scanned\"}";
+        foreach (var envelope in new[]
+        {
+            "\"v\":2,\"type\":\"event\",\"event\":\"auth.diagnostic\",",
+            "\"v\":1,\"v\":1,\"type\":\"event\",\"event\":\"auth.diagnostic\",",
+            "\"v\":1,\"type\":\"response\",\"event\":\"auth.diagnostic\",",
+            "\"v\":1,\"type\":\"event\",\"event\":\"auth.diagnostic\",\"token\":\"secret\","
+        })
+        {
+            Assert.IsFalse(WindowsDouyinProbeEventParser.TryParse("{" + envelope + payload + "}", out _, out _));
+        }
+    }
     private static readonly byte[] OnePixelPng =
     [
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
@@ -121,7 +160,7 @@ public sealed class WindowsDouyinProbeEventParserTests
     }
 
     [TestMethod]
-    public void Rust_ndjson_live_chat_event_is_projected_to_redacted_metadata()
+    public void Rust_ndjson_live_chat_keeps_local_display_and_redacted_reply_metadata()
     {
         Assert.IsTrue(
             WindowsDouyinProbeEventParser.TryParse(
@@ -137,6 +176,9 @@ public sealed class WindowsDouyinProbeEventParserTests
         Assert.AreEqual("author-1", parsed.ChatMetadata.SenderId);
         Assert.AreEqual(5, parsed.ChatMetadata.TextLength);
         Assert.AreEqual("12345", parsed.ChatMetadata.RoomId);
+        Assert.AreEqual("观众", parsed.ChatDisplay!.Nickname);
+        Assert.AreEqual("hello", parsed.ChatDisplay.Text);
+        Assert.AreEqual(DateTimeOffset.UnixEpoch, parsed.ChatDisplay.ReceivedAtUtc);
         Assert.AreEqual("ls-1", parsed.SessionId);
         Assert.AreEqual(1UL, parsed.Generation);
     }

@@ -30,7 +30,19 @@ public partial class MainWindow
         return RunPlaybackCommandAsync(() => NavigateMediaCoreAsync(next));
     }
 
-    private async Task NavigateMediaCoreAsync(bool next)
+    private Task NavigateMediaCoreAsync(bool next)
+    {
+        var snapshot = _mediaPool.Snapshot;
+        if (!_login.CanEnterWorkbench || snapshot.SourceMediaPool.Length <= 1)
+            return NavigateMediaItemCoreAsync(next);
+        var index = (snapshot.SourceMediaIndex + (next ? 1 : snapshot.SourceMediaPool.Length - 1))
+            % snapshot.SourceMediaPool.Length;
+        return ChangeVideoSourceWithVirtualCameraAsync(
+            snapshot.SourceMediaPool[index],
+            () => ChangeMediaSourceWithRtmpAsync(() => NavigateMediaItemCoreAsync(next)));
+    }
+
+    private async Task NavigateMediaItemCoreAsync(bool next)
     {
         if (!_login.CanEnterWorkbench)
         {
@@ -46,15 +58,18 @@ public partial class MainWindow
             return;
         }
 
-        if (!await StopRtmpForMediaMutationAsync().ConfigureAwait(true))
+        if (snapshot.SourceMediaPool.Length == 1)
         {
+            _state.SetStatus("播放池只有当前一项，继续保持当前画面");
             return;
         }
+        if (!await PreserveVideoTransitionFrameAsync().ConfigureAwait(true)) return;
 
         await StopVideoStateWatcherAsync().ConfigureAwait(true);
         await StopInterludeForPriorityAsync().ConfigureAwait(true);
         if (!await StopMicrophoneAsync().ConfigureAwait(true))
         {
+            CancelVideoTransitionBeforeLoad();
             return;
         }
 
@@ -70,6 +85,7 @@ public partial class MainWindow
             if (!stoppedAudio.IsSuccess)
             {
                 _state.SetStatus(stoppedAudio.Error?.Message ?? "纯音频切换前停止失败");
+                CancelVideoTransitionBeforeLoad();
                 return;
             }
 
@@ -82,6 +98,7 @@ public partial class MainWindow
         if (!result.IsSuccess)
         {
             ApplyMediaOperation(result, result.Error?.Message ?? "切换媒体项失败");
+            CancelVideoTransitionBeforeLoad();
             return;
         }
 
@@ -91,13 +108,12 @@ public partial class MainWindow
         {
             var target = result.Snapshot.SourceMediaPool[result.Snapshot.SourceMediaIndex];
             if (target.MediaKind is MediaKind.Video
-                && snapshot.PlaybackState is PlaybackState.Playing
+                && snapshot.PlaybackState is (PlaybackState.Playing or PlaybackState.Paused)
                 && previousIdentity.SourceRevision == result.Snapshot.SourceRevision)
             {
-                var switched = await _mpvController.SwitchSourceAsync(
+                var switched = await SwitchVideoSourcePausedAsync(
                     target,
-                    _mediaPool.CurrentIdentity,
-                    _windowCancellation.Token).ConfigureAwait(true);
+                    _mediaPool.CurrentIdentity).ConfigureAwait(true);
                 if (!switched.IsSuccess)
                 {
                     await _mpvController.ShutdownAsync(_windowCancellation.Token).ConfigureAwait(true);
@@ -122,7 +138,7 @@ public partial class MainWindow
         }
 
         var nextSource = result.Snapshot.SourceMediaPool[result.Snapshot.SourceMediaIndex];
-        if (audioSessionWasActive && wasPlaying)
+        if (wasPlaying)
         {
             // 当前版本不跨媒体项复用解码会话；切到纯音频或带音轨视频时都重新建立
             // 真实设备链路，避免播放池状态先行而没有对应输出会话。
@@ -171,6 +187,7 @@ public partial class MainWindow
             && result.IsSuccess
             && result.Snapshot.PlaybackState is PlaybackState.Playing)
         {
+            if (!await ResumeSwitchedVideoAsync(_mediaPool.CurrentIdentity).ConfigureAwait(true)) return;
             StartVideoStateWatcher(_mediaPool.CurrentIdentity);
         }
 
@@ -180,6 +197,8 @@ public partial class MainWindow
         if (result.IsSuccess)
         {
             SelectMediaPoolIndex(result.Snapshot.SourceMediaIndex);
+            if (switchedVideoSession || nextSource.MediaKind is MediaKind.Audio)
+                ReleaseVideoTransitionFrame();
         }
     }
 
@@ -198,6 +217,11 @@ public partial class MainWindow
 
         if (e.Key == Key.Space && Keyboard.Modifiers == ModifierKeys.None)
         {
+            if (Keyboard.FocusedElement is ButtonBase)
+            {
+                return;
+            }
+
             if (!_login.CanEnterWorkbench)
             {
                 _state.SetStatus("请先完成登录与设备授权");
@@ -274,7 +298,7 @@ public partial class MainWindow
 
     private Task TogglePlaybackAsync() => RunPlaybackCommandAsync(TogglePlaybackCoreAsync);
 
-    private async Task TogglePlaybackCoreAsync()
+    private async Task TransitionPlaybackCoreAsync()
     {
         var snapshot = _mediaPool.Snapshot;
         if (snapshot.SourceMediaPool.IsEmpty)
@@ -386,6 +410,7 @@ public partial class MainWindow
         var audioUnavailable = false;
         var audioRecovered = false;
         var audioSessionStarted = false;
+        var audioAlignmentFailed = false;
         WindowsMpvPlaybackControllerResult controllerResult;
         var launchMode = MpvLaunchMode.Original;
         var startedMode = MpvLaunchMode.Original;
@@ -443,6 +468,7 @@ public partial class MainWindow
                             {
                                 audioRecovered = true;
                                 audioSessionStarted = true;
+                                audioAlignmentFailed = !await AlignStartedVideoAudioAsync(identity).ConfigureAwait(true);
                                 AudioDeviceStatusText.Text = "视频声音已恢复 · 从当前时间点重新连接";
                             }
                             else
@@ -464,6 +490,7 @@ public partial class MainWindow
         {
             if (controllerSnapshot.ActiveIdentity is not null)
             {
+                if (!await PreserveVideoTransitionFrameAsync().ConfigureAwait(true)) return;
                 _ = await _mpvController.ShutdownAsync(_windowCancellation.Token).ConfigureAwait(true);
             }
 
@@ -530,6 +557,13 @@ public partial class MainWindow
             return;
         }
 
+        if (!reusedController && !await ConfirmRestartedVideoFrameAsync(identity).ConfigureAwait(true))
+        {
+            await _mpvController.ShutdownAsync(_windowCancellation.Token).ConfigureAwait(true);
+            ApplyMediaOperation(_mediaPool.StopPlayback(), _state.StatusMessage);
+            return;
+        }
+
         if (!reusedController && !string.IsNullOrWhiteSpace(source.AudioCodecName))
         {
             var startedAudio = await StartAudioPlaybackAsync(source, identity).ConfigureAwait(true);
@@ -543,6 +577,7 @@ public partial class MainWindow
             else
             {
                 audioSessionStarted = true;
+                audioAlignmentFailed = !await AlignStartedVideoAudioAsync(identity).ConfigureAwait(true);
                 AudioDeviceStatusText.Text = "视频声音已连接 · FFmpeg PCM / PortAudio";
             }
         }
@@ -589,6 +624,9 @@ public partial class MainWindow
                     : "视频播放已开始"
                 : "视频播放已暂停"
             : result.Error?.Message ?? "播放状态提交失败");
+        if (result.IsSuccess && audioAlignmentFailed)
+            _state.SetStatus("视频已开始 · 初始音画对齐未完成，正在按声音主时钟重新校正");
+        if (result.IsSuccess) ReleaseVideoTransitionFrame();
     }
 
     private static string DescribeVideoMode(MpvLaunchMode mode) => mode switch
@@ -683,6 +721,7 @@ public partial class MainWindow
         }
 
         ApplyMediaOperation(result, result.IsSuccess ? "播放已停止" : result.Error?.Message ?? "停止操作失败");
+        ReleaseVideoTransitionFrame();
     }
 
     private async Task<WindowsAudioPlaybackResult> StartAudioPlaybackAsync(
@@ -776,12 +815,12 @@ public partial class MainWindow
             return (null, new WindowsAudioPlaybackError("portaudio_missing", "PortAudio 运行资源未安装。"));
         }
 
-        if (AudioOutputDeviceComboBox.SelectedValue is not int)
+        if (!_audioDevicesEnumerated)
         {
-            await RefreshAudioDevicesAsync().ConfigureAwait(true);
+            await RefreshAudioDevicesCoreAsync().ConfigureAwait(true);
         }
 
-        if (AudioOutputDeviceComboBox.SelectedValue is not int deviceIndex)
+        if (!_audioDeviceListCurrent || AudioOutputDeviceComboBox.SelectedItem is not WindowsPortAudioDevice { MaxOutputChannels: > 0 } outputDevice)
         {
             AudioDeviceStatusText.Text = "请先刷新并选择 PortAudio 输出设备";
             return (null, new WindowsAudioPlaybackError(
@@ -814,7 +853,7 @@ public partial class MainWindow
                 "播放池在音频预载期间已变化。"));
         }
 
-        return (new AudioPlaybackPreparation(plan, portAudio.AbsolutePath, deviceIndex), null);
+        return (new AudioPlaybackPreparation(plan, portAudio.AbsolutePath, outputDevice.Index), null);
     }
 
     private async Task PrepareNextAudioCandidateAsync(MediaPlaybackIdentity identity)
@@ -887,6 +926,7 @@ public partial class MainWindow
 
     private void StartAudioCompletionWatcher(MediaPlaybackIdentity identity)
     {
+        if (_isClosing) return;
         try
         {
             _audioCompletionCancellation?.Cancel();
@@ -904,8 +944,6 @@ public partial class MainWindow
     {
         var cancellation = _audioCompletionCancellation;
         var task = _audioCompletionTask;
-        _audioCompletionCancellation = null;
-        _audioCompletionTask = null;
         if (cancellation is null)
         {
             return;
@@ -929,20 +967,21 @@ public partial class MainWindow
             {
                 // 取消只用于唤醒观察者；会话本身由音频控制器负责 Join。
             }
-            catch (TimeoutException)
-            {
-                // 不让 UI 停止命令等待观察者；控制器退出仍有独立预算。
-            }
         }
         else
         {
             cancellation.Dispose();
         }
-
+        if (ReferenceEquals(_audioCompletionCancellation, cancellation))
+        {
+            _audioCompletionCancellation = null;
+            _audioCompletionTask = null;
+        }
     }
 
     private void StartVideoStateWatcher(MediaPlaybackIdentity identity)
     {
+        if (_isClosing) return;
         try
         {
             _videoStateCancellation?.Cancel();
@@ -961,8 +1000,6 @@ public partial class MainWindow
     {
         var cancellation = _videoStateCancellation;
         var task = _videoStateTask;
-        _videoStateCancellation = null;
-        _videoStateTask = null;
         if (cancellation is null)
         {
             return;
@@ -987,14 +1024,15 @@ public partial class MainWindow
             {
                 // 取消只用于唤醒观察者；mpv 会话由调用方负责有界回收。
             }
-            catch (TimeoutException)
-            {
-                // 不让 UI 停止命令等待观察者；mpv 宿主有独立清理预算。
-            }
         }
         else
         {
             cancellation.Dispose();
+        }
+        if (ReferenceEquals(_videoStateCancellation, cancellation))
+        {
+            _videoStateCancellation = null;
+            _videoStateTask = null;
         }
     }
 
@@ -1023,6 +1061,10 @@ public partial class MainWindow
                 }
 
                 var playbackTimeMs = result.Snapshot.PlaybackTimeMs;
+                await RunPlaybackCommandAsync(
+                        () => SynchronizeVideoAudioAsync(result.Snapshot),
+                        ownerCancellation.Token)
+                    .ConfigureAwait(true);
                 if (_audioPlaybackIdentity == identity)
                 {
                     var audioSnapshot = _audioPlaybackController.Snapshot;
@@ -1112,13 +1154,36 @@ public partial class MainWindow
                 : stopped.Error?.Message ?? "视频状态监视失败，停止视频会话失败");
     }
 
-    private async Task CompleteVideoPlaybackItemAsync(MediaPlaybackIdentity identity)
+    private Task CompleteVideoPlaybackItemAsync(MediaPlaybackIdentity identity)
+    {
+        if (_isClosing || _mediaPool.Snapshot.PlaybackState != PlaybackState.Playing
+            || _mediaPool.CurrentIdentity != identity || _mpvController.Snapshot.ActiveIdentity != identity)
+            return Task.CompletedTask;
+        var snapshot = _mediaPool.Snapshot;
+        if (snapshot.SourceMediaPool.IsEmpty) return Task.CompletedTask;
+        var target = snapshot.SourceMediaPool[(snapshot.SourceMediaIndex + 1) % snapshot.SourceMediaPool.Length];
+        return ChangeVideoSourceWithVirtualCameraAsync(target,
+            () => ChangeMediaSourceWithRtmpAsync(() => CompleteVideoPlaybackItemCoreAsync(identity)));
+    }
+
+    private async Task CompleteVideoPlaybackItemCoreAsync(MediaPlaybackIdentity identity)
     {
         if (_isClosing
             || _mediaPool.Snapshot.PlaybackState != PlaybackState.Playing
             || _mediaPool.CurrentIdentity != identity
             || _mpvController.Snapshot.ActiveIdentity != identity)
         {
+            return;
+        }
+
+        if (!await PreserveVideoTransitionFrameAsync().ConfigureAwait(true))
+        {
+            var stopped = await _mpvController.StopPlaybackAsync(identity, _windowCancellation.Token)
+                .ConfigureAwait(true);
+            var audioStopped = await StopVideoAudioForTransitionAsync().ConfigureAwait(true);
+            ApplyMediaOperation(_mediaPool.StopPlayback(), !stopped.IsSuccess
+                ? stopped.Error?.Message ?? "无法保留末帧，播放器停止失败"
+                : !audioStopped ? "无法保留末帧，声音停止失败" : "无法保留末帧，自动切换已停止，请重试播放");
             return;
         }
 
@@ -1143,10 +1208,9 @@ public partial class MainWindow
         var target = completed.Snapshot.SourceMediaPool[completed.Snapshot.SourceMediaIndex];
         if (target.MediaKind is MediaKind.Video)
         {
-            var switched = await _mpvController.SwitchSourceAsync(
+            var switched = await SwitchVideoSourcePausedAsync(
                     target,
-                    _mediaPool.CurrentIdentity,
-                    _windowCancellation.Token)
+                    _mediaPool.CurrentIdentity)
                 .ConfigureAwait(true);
             if (!switched.IsSuccess)
             {
@@ -1173,9 +1237,11 @@ public partial class MainWindow
                 StartAudioCompletionWatcher(_mediaPool.CurrentIdentity);
             }
 
+            if (!await ResumeSwitchedVideoAsync(_mediaPool.CurrentIdentity).ConfigureAwait(true)) return;
             StartVideoStateWatcher(_mediaPool.CurrentIdentity);
             ApplyMediaOperation(completed, $"已自动切换到第 {completed.Snapshot.SourceMediaIndex + 1} 项");
             SelectMediaPoolIndex(completed.Snapshot.SourceMediaIndex);
+            ReleaseVideoTransitionFrame();
             return;
         }
 
@@ -1497,12 +1563,13 @@ public partial class MainWindow
     }
 
     private Task RunPlaybackCommandAsync(Func<Task> command) =>
-        RunPlaybackCommandAsync(command, _windowCancellation.Token);
+        _isClosing ? Task.CompletedTask : RunPlaybackCommandAsync(command, _windowCancellation.Token);
 
     private async Task RunPlaybackCommandAsync(
         Func<Task> command,
         CancellationToken cancellationToken)
     {
+        if (_isClosing) return;
         try
         {
             await _playbackCommandSerial.WaitAsync(cancellationToken).ConfigureAwait(true);
@@ -1514,16 +1581,28 @@ public partial class MainWindow
 
         try
         {
+            if (_isClosing) return;
+            UpdateAudioDeviceProjection();
             await command().ConfigureAwait(true);
+        }
+        catch (OperationCanceledException) when (_isClosing || cancellationToken.IsCancellationRequested)
+        {
+            // The owner joins the command before disposing window resources.
+        }
+        catch (TimeoutException)
+        {
+            if (!_isClosing) _state.SetStatus("旧媒体操作尚未退出，请稍后重试；资源所有权已保留。");
         }
         finally
         {
             _playbackCommandSerial.Release();
+            UpdateMicrophoneProjection();
         }
     }
 
     private void UpdateMediaProjection()
     {
+        if (_isClosing) return;
         var hasMedia = _state.HasMedia;
         var snapshot = _mediaPool.Snapshot;
         var currentSource = snapshot.SourceMediaPool.IsEmpty
@@ -1681,16 +1760,57 @@ public partial class MainWindow
             0,
             (decimal)durationMs);
         var identity = _mediaPool.CurrentIdentity;
+        var restartRtmp = _lastRtmpConfig ?? _pausedRtmpConfig;
+        if (!await StopRtmpForMediaMutationAsync().ConfigureAwait(true)) return;
+        await StopAudioCompletionWatcherAsync().ConfigureAwait(true);
+        await StopVideoStateWatcherAsync().ConfigureAwait(true);
+        var stoppedAudio = await _audioPlaybackController.StopAsync().ConfigureAwait(true);
+        if (!stoppedAudio.IsSuccess)
+        {
+            _state.SetStatus(stoppedAudio.Error?.Message ?? "跳转前声音资源未能停止");
+            StartVideoStateWatcher(identity);
+            return;
+        }
         var result = await _mpvController
             .SeekAsync(identity, positionMs, _windowCancellation.Token)
             .ConfigureAwait(true);
         if (!result.IsSuccess)
         {
             _state.SetStatus(result.Error?.Message ?? "视频跳转失败");
+            StartVideoStateWatcher(identity);
             return;
         }
 
+        if (!string.IsNullOrWhiteSpace(source.AudioCodecName)
+            && snapshot.PlaybackState is PlaybackState.Playing)
+        {
+            var startedAudio = await StartAudioPlaybackAsync(source, identity, positionMs).ConfigureAwait(true);
+            if (!startedAudio.IsSuccess)
+            {
+                _state.SetStatus(startedAudio.Error?.Message ?? "跳转后声音恢复失败");
+                StartVideoStateWatcher(identity);
+                return;
+            }
+            // Device initialization and PCM warmup happen after the first video seek.
+            // Re-align once to the now-audible source position instead of retaining that startup gap.
+            positionMs = _audioPlaybackController.Snapshot.AudibleClock?.PlaybackTimeMs ?? positionMs;
+            var alignedVideo = await _mpvController.SeekAsync(identity, positionMs, _windowCancellation.Token)
+                .ConfigureAwait(true);
+            if (!alignedVideo.IsSuccess)
+            {
+                _state.SetStatus(alignedVideo.Error?.Message ?? "跳转后音画重新对齐失败，请重试");
+                StartVideoStateWatcher(identity);
+                return;
+            }
+            StartAudioCompletionWatcher(identity);
+            await PrepareNextAudioCandidateAsync(identity).ConfigureAwait(true);
+        }
+        StartVideoStateWatcher(identity);
         ProjectVideoPlaybackPosition(identity, positionMs);
         _state.SetStatus($"已跳转到 {PlaybackTimeFormatter.Format(positionMs)}");
+        if (restartRtmp is not null && snapshot.PlaybackState is PlaybackState.Playing)
+            await StartRtmpCoreAsync(restartRtmp).ConfigureAwait(true);
+        else if (snapshot.PlaybackState is PlaybackState.Paused)
+            _pausedRtmpConfig = restartRtmp;
     }
 }

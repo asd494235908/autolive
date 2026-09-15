@@ -1,13 +1,14 @@
 namespace GpAutoLive.Windows;
 
-/// <summary>基于 PortAudio 已送出帧数和 DAC 延迟计算的可听音频时钟快照。</summary>
+/// <summary>基于 PortAudio 已送出的主源帧和 DAC 延迟计算的可听音频时钟快照。</summary>
 public sealed record WindowsAudibleAudioClockSnapshot(
     ulong OutputFramesWritten,
     ulong AudibleFrames,
     int SampleRateHz,
     ulong OutputLatencyMicroseconds,
     bool HasTimeInfo,
-    ulong? PlaybackTimeMs);
+    ulong? PlaybackTimeMs,
+    double PlaybackRate = 1.0);
 
 /// <summary>
 /// 单一音频会话的可听位置计算器。它不拥有设备、不读文件，只在源切换边界重设输出帧锚点。
@@ -48,8 +49,8 @@ public sealed class WindowsAudibleAudioClock
         }
 
         var latencyFrames = FramesFromMicroseconds(output.OutputLatencyMicroseconds, sampleRate);
-        var audibleFrames = output.OutputFramesWritten > latencyFrames
-            ? output.OutputFramesWritten - latencyFrames
+        var audibleFrames = output.MediaFramesWritten > latencyFrames
+            ? output.MediaFramesWritten - latencyFrames
             : 0;
         var playbackTimeMs = output.HasTimeInfo
             ? ToMilliseconds(
@@ -67,7 +68,8 @@ public sealed class WindowsAudibleAudioClock
             sampleRate,
             output.OutputLatencyMicroseconds,
             output.HasTimeInfo,
-            playbackTimeMs);
+            playbackTimeMs,
+            _playbackRate);
     }
 
     private static ulong FramesFromMicroseconds(ulong microseconds, int sampleRate)

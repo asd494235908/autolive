@@ -4,6 +4,37 @@ namespace GpAutoLive.Media.Tests;
 public sealed class MicrophoneInterludeGateTests
 {
     [TestMethod]
+    public void Between_threshold_speech_stays_open_and_recovers_from_hangover()
+    {
+        var gate = new MicrophoneInterludeGate(startThresholdDb: -42, stopThresholdDb: -48, hangoverMs: 250);
+        var quietSpeech = new[] { MathF.Pow(10, -45f / 20), MathF.Pow(10, -45f / 20) };
+        gate.Arm();
+
+        Assert.AreEqual(MicrophoneInterludeGateState.Armed, gate.Process(quietSpeech, 1_000).State);
+        gate.Process(new[] { 0.02f, 0.02f }, 1_010);
+        Assert.AreEqual(MicrophoneInterludeGateState.Speaking, gate.Process(quietSpeech, 1_310).State);
+        Assert.AreEqual(MicrophoneInterludeGateState.Hangover, gate.Process(new float[2], 1_320).State);
+        Assert.AreEqual(MicrophoneInterludeGateState.Speaking, gate.Process(quietSpeech, 1_330).State);
+        Assert.AreEqual(MicrophoneInterludeGateState.Hangover, gate.Process(new float[2], 1_579).State);
+        Assert.AreEqual(MicrophoneInterludeGateState.Armed, gate.Process(new float[2], 1_580).State);
+    }
+
+    [TestMethod]
+    public void First_quiet_observation_after_expiry_does_not_add_an_extra_hangover_block()
+    {
+        var gate = new MicrophoneInterludeGate(hangoverMs: 250);
+        gate.Arm();
+        gate.Process(new[] { 0.02f }, 1_000);
+
+        Assert.AreEqual(MicrophoneInterludeGateState.Armed, gate.Process(new float[1], 1_250).State);
+
+        var immediate = new MicrophoneInterludeGate(hangoverMs: 0);
+        immediate.Arm();
+        immediate.Process(new[] { 0.02f }, 1_000);
+        Assert.AreEqual(MicrophoneInterludeGateState.Armed, immediate.Process(new float[1], 1_000).State);
+    }
+
+    [TestMethod]
     public void Disabled_gate_does_not_enter_speaking()
     {
         var gate = new MicrophoneInterludeGate();

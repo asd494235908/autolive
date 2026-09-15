@@ -108,12 +108,12 @@
       {
         "role": "modifications",
         "path": "desktop/third_party/akvirtualcamera/MODIFICATIONS.md",
-        "sha256": "33f7adb6eb12e15ce2a55cc9f99ff5b79bf473e17202fb870c46194995cc065a"
+        "sha256": "650e7a23e7e568d2e59b38f4386e4055e9a1805b1d5b6357e0a51e71be904d69"
       },
       {
         "role": "corresponding-source",
         "path": "desktop/third_party/akvirtualcamera/corresponding-source-manifest.json",
-        "sha256": "d6cde855f39584e6b0b7ecc4ce85f2812a345f7eb8802b4a202a5367764814f9"
+        "sha256": "34c414fb411c0f58e34960e4a5de60d13c12728d714e1326ea149c88f3fecf88"
       },
       {
         "role": "cyclonedx-sbom",

@@ -1,0 +1,93 @@
+diff --git a/windows/dshow/BaseFilter/src/pin.cpp b/windows/dshow/BaseFilter/src/pin.cpp
+--- a/windows/dshow/BaseFilter/src/pin.cpp
++++ b/windows/dshow/BaseFilter/src/pin.cpp
+@@ -417,6 +417,7 @@ HRESULT AkVCam::Pin::QueryInterface(const IID &riid, void **ppv)
+         const IID *iid;
+         void *ptr;
+     } comInterfaceEntryMediaSample[] = {
++        COM_INTERFACE(IKsPropertySet)
+         COM_INTERFACE(IPin)
+         COM_INTERFACE(IAMStreamConfig)
+         COM_INTERFACE(IAMLatency)
+@@ -457,6 +458,44 @@ ULONG AkVCam::Pin::Release()
+     return ref;
+ }
+ 
++// IKsPropertySet: capture category is read-only.
++HRESULT AkVCam::Pin::Get(REFGUID set, DWORD id, LPVOID, DWORD,
++                         LPVOID data, DWORD size, DWORD *returned)
++{
++    if (set != AMPROPSETID_Pin)
++        return E_PROP_SET_UNSUPPORTED;
++    if (id != AMPROPERTY_PIN_CATEGORY)
++        return E_PROP_ID_UNSUPPORTED;
++    if (!data && !returned)
++        return E_POINTER;
++    if (returned)
++        *returned = sizeof(GUID);
++    if (!data)
++        return S_OK;
++    if (size < sizeof(GUID))
++        return HRESULT_FROM_WIN32(ERROR_MORE_DATA);
++    memcpy(data, &PIN_CATEGORY_CAPTURE, sizeof(GUID));
++    return S_OK;
++}
++
++HRESULT AkVCam::Pin::QuerySupported(REFGUID set, DWORD id, DWORD *support)
++{
++    if (!support)
++        return E_POINTER;
++    *support = 0;
++    if (set != AMPROPSETID_Pin)
++        return E_PROP_SET_UNSUPPORTED;
++    if (id != AMPROPERTY_PIN_CATEGORY)
++        return E_PROP_ID_UNSUPPORTED;
++    *support = KSPROPERTY_SUPPORT_GET;
++    return S_OK;
++}
++
++HRESULT AkVCam::Pin::Set(REFGUID, DWORD, LPVOID, DWORD, LPVOID, DWORD)
++{
++    return E_NOTIMPL;
++}
++
+ HRESULT AkVCam::Pin::GetLatency(REFERENCE_TIME *prtLatency)
+ {
+     AkLogFunction();
+diff --git a/windows/dshow/BaseFilter/src/pin.h b/windows/dshow/BaseFilter/src/pin.h
+--- a/windows/dshow/BaseFilter/src/pin.h
++++ b/windows/dshow/BaseFilter/src/pin.h
+@@ -23,6 +23,8 @@
+ #include <string>
+ #include <vector>
+ #include <strmif.h>
++#include <ks.h>
++#include <ksproxy.h>
+ 
+ #include "VCamUtils/src/videoformat.h"
+ #include "VCamUtils/src/videoframetypes.h"
+@@ -38,6 +40,7 @@ namespace AkVCam
+     class Pin:
+             public virtual IPin,
+             public virtual IAMStreamConfig,
++            public virtual IKsPropertySet,
+             public virtual IAMPushSource
+     {
+         public:
+@@ -65,6 +68,16 @@ namespace AkVCam
+             ULONG STDMETHODCALLTYPE AddRef() override;
+             ULONG STDMETHODCALLTYPE Release() override;
+ 
++            // IKsPropertySet
++            HRESULT STDMETHODCALLTYPE Get(REFGUID set, DWORD id, LPVOID instance,
++                                           DWORD instanceSize, LPVOID data,
++                                           DWORD size, DWORD *returned) override;
++            HRESULT STDMETHODCALLTYPE QuerySupported(REFGUID set, DWORD id,
++                                                      DWORD *support) override;
++            HRESULT STDMETHODCALLTYPE Set(REFGUID set, DWORD id, LPVOID instance,
++                                           DWORD instanceSize, LPVOID data,
++                                           DWORD size) override;
++
+             // IAMLatency
+ 
+             HRESULT WINAPI GetLatency(REFERENCE_TIME *prtLatency) override;

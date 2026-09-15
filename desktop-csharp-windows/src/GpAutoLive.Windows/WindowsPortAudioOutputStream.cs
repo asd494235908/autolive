@@ -60,6 +60,9 @@ public sealed record WindowsPortAudioOutputSnapshot(
     public uint LastCallbackStatusFlags { get; init; }
     public ulong XrunCount { get; init; }
     public ulong OutputFramesWritten { get; init; }
+    public ulong? BaseFramesWritten { get; init; }
+    public ulong MediaFramesWritten => BaseFramesWritten
+        ?? (OutputFramesWritten > UnderrunFrames ? OutputFramesWritten - UnderrunFrames : 0);
     public bool HasTimeInfo { get; init; }
     public ulong OutputLatencyMicroseconds { get; init; }
 }
@@ -90,12 +93,19 @@ public sealed class WindowsPortAudioOutputStream : IDisposable
     private const uint OutputOverflowedStatusFlag = 0x08;
     private const uint OutputXrunStatusFlags = OutputUnderflowedStatusFlag | OutputOverflowedStatusFlag;
     private readonly object _gate = new();
-    private readonly SemaphoreSlim _serial = new(1, 1);
+    private readonly WindowsPortAudioOperationOwner<WindowsPortAudioOutputResult> _operations;
+    private readonly Func<string, IWindowsPortAudioStreamNative?> _nativeLoader;
     private readonly IAudioPcmOutputSource _source;
     private readonly WindowsPortAudioNative.StreamCallback _callback;
     private float[] _callbackBuffer = [];
-    private WindowsPortAudioNative? _native;
+    private IWindowsPortAudioStreamNative? _native;
     private nint _stream;
+    private bool _initialized;
+    private bool _running;
+    private bool _stopping;
+    private GCHandle _callbackOwner;
+    private WindowsPortAudioHardwareState _hardwareState;
+    private long _lastHealthQueryAt;
     private WindowsPortAudioOutputConfig? _config;
     private bool _paused;
     private bool _disposed;
@@ -120,9 +130,31 @@ public sealed class WindowsPortAudioOutputStream : IDisposable
 
     /// <summary>创建使用自定义固定 PCM 输出源的 PortAudio 流。</summary>
     public WindowsPortAudioOutputStream(IAudioPcmOutputSource source)
+        : this(source, WindowsPortAudioNative.LoadStream, TimeSpan.FromSeconds(2))
+    {
+    }
+
+    internal WindowsPortAudioOutputStream(
+        IAudioPcmOutputSource source,
+        Func<string, IWindowsPortAudioStreamNative?> nativeLoader,
+        TimeSpan operationBudget)
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _callback = OnAudioCallback;
+        _nativeLoader = nativeLoader;
+        _operations = new(() => StopCore(), operationBudget);
+    }
+
+    internal bool HasPendingCleanup
+    {
+        get
+        {
+            var busy = _operations.IsBusy;
+            lock (_gate)
+            {
+                return busy || _native is not null;
+            }
+        }
     }
 
     /// <summary>读取脱敏流状态。</summary>
@@ -130,6 +162,7 @@ public sealed class WindowsPortAudioOutputStream : IDisposable
     {
         get
         {
+            RefreshHealthIfDue();
             lock (_gate)
             {
                 return CreateSnapshot();
@@ -137,251 +170,167 @@ public sealed class WindowsPortAudioOutputStream : IDisposable
         }
     }
 
-    /// <summary>在后台线程加载 DLL、打开并启动一个输出流。</summary>
-    public async Task<WindowsPortAudioOutputResult> StartAsync(
+    /// <summary>在后台线程加载 DLL、打开并启动一个输出流；超时后保留原生 owner。</summary>
+    public Task<WindowsPortAudioOutputResult> StartAsync(
         string? dllPath,
         WindowsPortAudioOutputConfig config,
-        CancellationToken cancellationToken = default)
-    {
-        if (cancellationToken.IsCancellationRequested)
-        {
-            return Failure(WindowsPortAudioStreamFailureCode.Cancelled, "PortAudio 输出流启动已取消。", retryable: true);
-        }
-
-        try
-        {
-            await _serial.WaitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            return Failure(WindowsPortAudioStreamFailureCode.Cancelled, "PortAudio 输出流启动已取消。", retryable: true);
-        }
-
-        try
+        CancellationToken cancellationToken = default) =>
+        RunOperationAsync(() =>
         {
             lock (_gate)
             {
                 if (_disposed)
                 {
-                    return Failure(WindowsPortAudioStreamFailureCode.Closed, "PortAudio 输出流已关闭。", retryable: false);
+                    return Failure(WindowsPortAudioStreamFailureCode.Closed, "PortAudio 输出流已关闭。", false);
                 }
 
-                if (_stream != 0)
+                if (_native is not null)
                 {
-                    return Failure(WindowsPortAudioStreamFailureCode.InvalidConfig, "PortAudio 输出流已经启动。", retryable: false);
+                    return Failure(WindowsPortAudioStreamFailureCode.InvalidConfig, "PortAudio 输出流已启动或尚未回收。", false);
                 }
             }
 
-            var result = await Task.Run(() => StartCore(dllPath, config), CancellationToken.None)
-                .ConfigureAwait(false);
-            if (cancellationToken.IsCancellationRequested && result.IsSuccess)
+            return StartCore(dllPath, config);
+        }, WindowsPortAudioStreamFailureCode.StartFailed, cancellationToken);
+
+    /// <summary>暂停回调消费但保留流和 PCM；原生调用仍受统一预算约束。</summary>
+    public WindowsPortAudioOutputResult Pause() => PauseAsync().GetAwaiter().GetResult();
+
+    public Task<WindowsPortAudioOutputResult> PauseAsync() => RunOperationAsync(() =>
+    {
+        IWindowsPortAudioStreamNative? native;
+        nint stream;
+        lock (_gate)
+        {
+            if (_disposed)
             {
-                StopCore();
-                return Failure(WindowsPortAudioStreamFailureCode.Cancelled, "PortAudio 输出流启动已取消。", retryable: true);
+                return Failure(WindowsPortAudioStreamFailureCode.Closed, "PortAudio 输出流已关闭。", false);
             }
 
-            return result;
-        }
-        finally
-        {
-            _serial.Release();
-        }
-    }
+            native = _native;
+            stream = _stream;
+            if (native is null || stream == 0 || _stopping)
+            {
+                return Failure(WindowsPortAudioStreamFailureCode.InvalidConfig, "PortAudio 输出流尚未启动或正在停止。", false);
+            }
 
-    /// <summary>暂停回调消费但保留原生流和当前 PCM 环缓；重复暂停安全。</summary>
-    public WindowsPortAudioOutputResult Pause()
-    {
-        if (!_serial.Wait(TimeSpan.FromSeconds(2)))
+            if (_paused)
+            {
+                return Success();
+            }
+        }
+
+        if (native.StopStream(stream) != 0)
         {
-            return Failure(WindowsPortAudioStreamFailureCode.PauseFailed, "PortAudio 输出流暂停超时。", retryable: true);
+            return Failure(WindowsPortAudioStreamFailureCode.PauseFailed, "PortAudio 输出流暂停失败。", true);
+        }
+
+        lock (_gate)
+        {
+            _paused = true;
+            _running = false;
+            _hardwareState = WindowsPortAudioHardwareState.Stopped;
+        }
+
+        return Success();
+    }, WindowsPortAudioStreamFailureCode.PauseFailed);
+
+    /// <summary>恢复暂停流；超时不会并行关闭仍执行中的原生调用。</summary>
+    public WindowsPortAudioOutputResult Resume() => ResumeAsync().GetAwaiter().GetResult();
+
+    public Task<WindowsPortAudioOutputResult> ResumeAsync() => RunOperationAsync(() =>
+    {
+        IWindowsPortAudioStreamNative? native;
+        nint stream;
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                return Failure(WindowsPortAudioStreamFailureCode.Closed, "PortAudio 输出流已关闭。", false);
+            }
+
+            native = _native;
+            stream = _stream;
+            if (native is null || stream == 0 || _stopping)
+            {
+                return Failure(WindowsPortAudioStreamFailureCode.InvalidConfig, "PortAudio 输出流尚未启动或正在停止。", false);
+            }
+
+            if (!_paused)
+            {
+                return Success();
+            }
+        }
+
+        if (native.StartStream(stream) != 0)
+        {
+            return Failure(WindowsPortAudioStreamFailureCode.ResumeFailed, "PortAudio 输出流恢复失败。", true);
+        }
+
+        lock (_gate)
+        {
+            _paused = false;
+            _running = true;
+            _hardwareState = WindowsPortAudioHardwareState.Active;
+        }
+
+        return Success();
+    }, WindowsPortAudioStreamFailureCode.ResumeFailed);
+
+    public WindowsPortAudioOutputResult Stop() => StopAsync().GetAwaiter().GetResult();
+
+    public async Task<WindowsPortAudioOutputResult> StopAsync()
+    {
+        lock (_gate)
+        {
+            _stopping = true;
         }
 
         try
         {
-            WindowsPortAudioNative? native;
-            nint stream;
-            lock (_gate)
-            {
-                if (_disposed)
-                {
-                    return Failure(WindowsPortAudioStreamFailureCode.Closed, "PortAudio 输出流已关闭。", retryable: false);
-                }
-
-                native = _native;
-                stream = _stream;
-                if (native is null || stream == 0)
-                {
-                    return Failure(WindowsPortAudioStreamFailureCode.InvalidConfig, "PortAudio 输出流尚未启动。", retryable: false);
-                }
-
-                if (_paused)
-                {
-                    return Success();
-                }
-            }
-
-            var errorCode = native.StopStream(stream);
-            if (errorCode != 0)
-            {
-                return Failure(WindowsPortAudioStreamFailureCode.PauseFailed, "PortAudio 输出流暂停失败。", retryable: true);
-            }
-
-            lock (_gate)
-            {
-                _paused = true;
-            }
-
-            return Success();
+            return await _operations.StopAsync().ConfigureAwait(false);
         }
-        catch (Exception exception) when (exception is AccessViolationException or InvalidOperationException or SEHException)
+        catch (TimeoutException)
         {
-            return Failure(WindowsPortAudioStreamFailureCode.PauseFailed, "PortAudio 输出流暂停失败。", retryable: true);
-        }
-        finally
-        {
-            _serial.Release();
+            return Failure(WindowsPortAudioStreamFailureCode.StopFailed, "PortAudio 输出停止超时，原生资源仍由原任务持有。", true);
         }
     }
 
-    /// <summary>恢复已暂停的原生流；重复恢复安全。</summary>
-    public WindowsPortAudioOutputResult Resume()
-    {
-        if (!_serial.Wait(TimeSpan.FromSeconds(2)))
-        {
-            return Failure(WindowsPortAudioStreamFailureCode.ResumeFailed, "PortAudio 输出流恢复超时。", retryable: true);
-        }
-
-        try
-        {
-            WindowsPortAudioNative? native;
-            nint stream;
-            lock (_gate)
-            {
-                if (_disposed)
-                {
-                    return Failure(WindowsPortAudioStreamFailureCode.Closed, "PortAudio 输出流已关闭。", retryable: false);
-                }
-
-                native = _native;
-                stream = _stream;
-                if (native is null || stream == 0)
-                {
-                    return Failure(WindowsPortAudioStreamFailureCode.InvalidConfig, "PortAudio 输出流尚未启动。", retryable: false);
-                }
-
-                if (!_paused)
-                {
-                    return Success();
-                }
-            }
-
-            var errorCode = native.StartStream(stream);
-            if (errorCode != 0)
-            {
-                return Failure(WindowsPortAudioStreamFailureCode.ResumeFailed, "PortAudio 输出流恢复失败。", retryable: true);
-            }
-
-            lock (_gate)
-            {
-                _paused = false;
-            }
-
-            return Success();
-        }
-        catch (Exception exception) when (exception is AccessViolationException or InvalidOperationException or SEHException)
-        {
-            return Failure(WindowsPortAudioStreamFailureCode.ResumeFailed, "PortAudio 输出流恢复失败。", retryable: true);
-        }
-        finally
-        {
-            _serial.Release();
-        }
-    }
-
-    /// <summary>有界停止并释放当前原生流；重复调用安全。</summary>
-    public WindowsPortAudioOutputResult Stop()
-    {
-        if (!_serial.Wait(TimeSpan.FromSeconds(2)))
-        {
-            return Failure(WindowsPortAudioStreamFailureCode.StopFailed, "PortAudio 输出流停止超时。", retryable: true);
-        }
-
-        try
-        {
-            return StopCore();
-        }
-        finally
-        {
-            _serial.Release();
-        }
-    }
-
-    /// <summary>
-    /// 在保留 PCM 环缓的前提下重新打开同一输出配置。只允许一个恢复操作，
-    /// 由调用方提供取消令牌和重试上限；失败时保持关闭并由上层 fail-closed。
-    /// </summary>
-    public async Task<WindowsPortAudioOutputResult> RestartAsync(
+    /// <summary>确认旧流关闭后才重开；不能吞掉 Close/Terminate 失败。</summary>
+    public Task<WindowsPortAudioOutputResult> RestartAsync(
         string? dllPath,
         WindowsPortAudioOutputConfig config,
-        CancellationToken cancellationToken = default)
-    {
-        if (cancellationToken.IsCancellationRequested)
-        {
-            return Failure(WindowsPortAudioStreamFailureCode.Cancelled, "PortAudio 输出流恢复已取消。", retryable: true);
-        }
-
-        try
-        {
-            await _serial.WaitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            return Failure(WindowsPortAudioStreamFailureCode.Cancelled, "PortAudio 输出流恢复已取消。", retryable: true);
-        }
-
-        try
+        CancellationToken cancellationToken = default) =>
+        RunOperationAsync(() =>
         {
             lock (_gate)
             {
                 if (_disposed)
                 {
-                    return Failure(WindowsPortAudioStreamFailureCode.Closed, "PortAudio 输出流已关闭。", retryable: false);
+                    return Failure(WindowsPortAudioStreamFailureCode.Closed, "PortAudio 输出流已关闭。", false);
                 }
 
-                if (_stream == 0 && !_restartEligible)
+                if ((_stream == 0 && !_restartEligible) || (_stopping && _native is not null))
                 {
-                    return Failure(WindowsPortAudioStreamFailureCode.InvalidConfig, "PortAudio 输出流尚未启动。", retryable: false);
+                    return Failure(WindowsPortAudioStreamFailureCode.InvalidConfig, "PortAudio 输出流尚未启动或旧资源尚未回收。", false);
                 }
 
                 _restartEligible = true;
             }
 
-            // 设备丢失时原生流可能已经处于 stopped 状态，Pa_StopStream
-            // 会返回 paStreamIsStopped；关闭句柄仍然必须继续，不能因此阻断重开。
-            _ = StopCore(ignoreStopError: true, preserveRestartEligibility: true);
-
-            var result = await Task.Run(() => StartCore(dllPath, config), CancellationToken.None)
-                .ConfigureAwait(false);
-            if (cancellationToken.IsCancellationRequested && result.IsSuccess)
+            var stopped = StopCore(ignoreStopError: true, preserveRestartEligibility: true);
+            if (!stopped.IsSuccess)
             {
-                StopCore();
-                return Failure(WindowsPortAudioStreamFailureCode.Cancelled, "PortAudio 输出流恢复已取消。", retryable: true);
+                return stopped;
             }
 
-            return result;
-        }
-        catch (Exception exception) when (exception is AccessViolationException
-            or InvalidOperationException
-            or MarshalDirectiveException
-            or SEHException)
-        {
-            return Failure(WindowsPortAudioStreamFailureCode.RestartFailed, "PortAudio 输出流恢复发生原生错误。", retryable: true);
-        }
-        finally
-        {
-            _serial.Release();
-        }
-    }
+            if (_operations.StopRequested)
+            {
+                return Failure(WindowsPortAudioStreamFailureCode.Cancelled, "PortAudio 输出恢复已取消。", true);
+            }
+
+            return StartCore(dllPath, config);
+        }, WindowsPortAudioStreamFailureCode.RestartFailed, cancellationToken);
 
     public void Dispose()
     {
@@ -390,67 +339,89 @@ public sealed class WindowsPortAudioOutputStream : IDisposable
             _disposed = true;
         }
 
-        if (_serial.Wait(TimeSpan.FromSeconds(2)))
+        var stopped = Stop();
+        if (!stopped.IsSuccess || HasPendingCleanup)
         {
-            try
+            if (_operations.TimedOut)
             {
-                StopCore();
+                throw new TimeoutException("PortAudio 输出流尚未回收；原 owner 仍持有资源，可重试 Dispose。");
             }
-            finally
-            {
-                _serial.Release();
-            }
-        }
 
+            throw new InvalidOperationException("PortAudio 输出流释放未确认；保留原 owner 等待重试。");
+        }
         GC.SuppressFinalize(this);
     }
 
+    private async Task<WindowsPortAudioOutputResult> RunOperationAsync(
+        Func<WindowsPortAudioOutputResult> operation,
+        WindowsPortAudioStreamFailureCode failureCode,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await _operations.RunAsync(operation, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return Failure(WindowsPortAudioStreamFailureCode.Cancelled, "PortAudio 输出操作已取消，等待原生资源回收。", true);
+        }
+        catch (TimeoutException)
+        {
+            return Failure(failureCode, "PortAudio 输出操作超时，原生资源仍由原任务持有。", true);
+        }
+        catch (Exception exception) when (exception is AccessViolationException or InvalidOperationException
+            or MarshalDirectiveException or SEHException)
+        {
+            return Failure(failureCode, "PortAudio 输出原生操作失败或尚未回收，请停止后重试。", true);
+        }
+    }
     private WindowsPortAudioOutputResult StartCore(
         string? dllPath,
         WindowsPortAudioOutputConfig config)
     {
         if (!OperatingSystem.IsWindows())
         {
-            return Failure(WindowsPortAudioStreamFailureCode.NotWindows, "PortAudio 输出流只支持 Windows。", retryable: false);
+            return Failure(WindowsPortAudioStreamFailureCode.NotWindows, "PortAudio 输出流只支持 Windows。", false);
         }
 
         if (!WindowsPortAudioDeviceEnumerator.TryValidatePath(dllPath, out var pathError))
         {
-            return Failure(
-                WindowsPortAudioStreamFailureCode.InvalidPath,
-                pathError?.Message ?? "PortAudio 资源路径无效。",
-                retryable: false);
+            return Failure(WindowsPortAudioStreamFailureCode.InvalidPath, pathError?.Message ?? "PortAudio 资源路径无效。", false);
         }
 
         if (!TryValidateConfig(config, out var configError))
         {
-            return Failure(WindowsPortAudioStreamFailureCode.InvalidConfig, configError!, retryable: false);
+            return Failure(WindowsPortAudioStreamFailureCode.InvalidConfig, configError!, false);
         }
 
         if (!File.Exists(dllPath))
         {
-            return Failure(WindowsPortAudioStreamFailureCode.ResourceMissing, "PortAudio 运行资源不存在。", retryable: true);
+            return Failure(WindowsPortAudioStreamFailureCode.ResourceMissing, "PortAudio 运行资源不存在。", true);
         }
 
-        if (!WindowsPortAudioNative.TryLoad(dllPath!, out var native) || native is null)
+        var native = _nativeLoader(dllPath!);
+        if (native is null)
         {
-            return Failure(WindowsPortAudioStreamFailureCode.NativeLoadFailed, "PortAudio 运行资源无法加载。", retryable: true);
+            return Failure(WindowsPortAudioStreamFailureCode.NativeLoadFailed, "PortAudio 运行资源无法加载。", true);
         }
 
-        var initialized = false;
         var keepOpen = false;
-        nint stream = 0;
+        lock (_gate)
+        {
+            _native = native;
+            _stopping = false;
+            _callbackOwner = GCHandle.Alloc(this);
+        }
+
         try
         {
             if (!native.TryInitialize(out _))
             {
-                return Failure(WindowsPortAudioStreamFailureCode.InitializeFailed, "PortAudio 初始化失败。", retryable: true);
+                return Failure(WindowsPortAudioStreamFailureCode.InitializeFailed, "PortAudio 初始化失败。", true);
             }
 
-            initialized = true;
-
-            var callbackSamples = checked(config.FramesPerBuffer * config.Channels);
-            var outputParameters = new WindowsPortAudioNative.StreamParameters
+            _initialized = true;
+            var parameters = new WindowsPortAudioNative.StreamParameters
             {
                 Device = config.DeviceIndex,
                 ChannelCount = config.Channels,
@@ -460,103 +431,64 @@ public sealed class WindowsPortAudioOutputStream : IDisposable
             };
             lock (_gate)
             {
-                if (_disposed)
+                if (_disposed || _operations.StopRequested)
                 {
-                    return Failure(WindowsPortAudioStreamFailureCode.Closed, "PortAudio 输出流已关闭。", retryable: false);
+                    return Failure(WindowsPortAudioStreamFailureCode.Cancelled, "PortAudio 输出流启动已取消。", true);
                 }
 
-                _callbackBuffer = new float[callbackSamples];
                 _config = config;
+                _paused = false;
+                _callbackBuffer = new float[checked(config.Channels * config.FramesPerBuffer)];
             }
 
-            var openError = native.OpenOutputStream(
-                out stream,
-                ref outputParameters,
-                config.SampleRate,
-                (uint)config.FramesPerBuffer,
-                _callback);
+            var openError = native.OpenOutputStream(out var stream, ref parameters,
+                config.SampleRate, (uint)config.FramesPerBuffer, _callback);
+            lock (_gate)
+            {
+                _stream = stream;
+            }
+
             if (openError != 0 || stream == 0)
             {
-                return Failure(WindowsPortAudioStreamFailureCode.OpenFailed, "PortAudio 输出设备无法打开。", retryable: true);
+                return Failure(WindowsPortAudioStreamFailureCode.OpenFailed, "PortAudio 输出设备无法打开。", true);
             }
 
+            if (_operations.StopRequested)
+            {
+                return Failure(WindowsPortAudioStreamFailureCode.Cancelled, "PortAudio 输出流启动已取消。", true);
+            }
+
+            if (native.StartStream(stream) != 0)
+            {
+                return Failure(WindowsPortAudioStreamFailureCode.StartFailed, "PortAudio 输出流无法启动。", true);
+            }
+
+            RefreshHealthCore();
             lock (_gate)
             {
-                _native = native;
-                _stream = stream;
-                _paused = false;
-            }
-
-            var startError = native.StartStream(stream);
-            if (startError != 0)
-            {
-                return Failure(WindowsPortAudioStreamFailureCode.StartFailed, "PortAudio 输出流无法启动。", retryable: true);
-            }
-
-            lock (_gate)
-            {
-                if (_disposed)
+                if (_disposed || _operations.StopRequested)
                 {
-                    return Failure(WindowsPortAudioStreamFailureCode.Closed, "PortAudio 输出流已关闭。", retryable: false);
+                    return Failure(WindowsPortAudioStreamFailureCode.Cancelled, "PortAudio 输出流启动已取消。", true);
                 }
-            }
 
-            lock (_gate)
-            {
                 _lastError = null;
+                _running = true;
             }
 
             keepOpen = true;
             return Success();
         }
         catch (Exception exception) when (exception is AccessViolationException
-            or InvalidOperationException
-            or MarshalDirectiveException
-            or SEHException)
+            or ArgumentException or InvalidOperationException or MarshalDirectiveException
+            or OverflowException or SEHException)
         {
-            return Failure(WindowsPortAudioStreamFailureCode.CallbackFailed, "PortAudio 输出流发生原生错误。", retryable: true);
+            return Failure(WindowsPortAudioStreamFailureCode.CallbackFailed, "PortAudio 输出流发生原生错误。", true);
         }
         finally
         {
             if (!keepOpen)
             {
-                if (stream != 0)
-                {
-                    try
-                    {
-                        native.CloseStream(stream);
-                    }
-                    catch (Exception exception) when (exception is AccessViolationException or InvalidOperationException or SEHException)
-                    {
-                        // 资源释放失败不能覆盖原始启动结果；进程退出时 Job Object 仍会兜底。
-                    }
-                }
-
-                lock (_gate)
-                {
-                    _native = null;
-                    _stream = 0;
-                    _config = null;
-                    _paused = false;
-                    _callbackBuffer = [];
-                }
-            }
-
-            if (initialized && !keepOpen)
-            {
-                try
-                {
-                    native.Terminate();
-                }
-                catch (Exception exception) when (exception is AccessViolationException or InvalidOperationException or SEHException)
-                {
-                    // 同上：不把原生清理异常回显给 UI。
-                }
-            }
-
-            if (!keepOpen)
-            {
-                native.Dispose();
+                StopCore(preserveRestartEligibility: _restartEligible);
             }
         }
     }
@@ -565,56 +497,83 @@ public sealed class WindowsPortAudioOutputStream : IDisposable
         bool ignoreStopError = false,
         bool preserveRestartEligibility = false)
     {
-        WindowsPortAudioNative? native;
+        IWindowsPortAudioStreamNative? native;
         nint stream;
         lock (_gate)
         {
+            _stopping = true;
+            _running = false;
             native = _native;
             stream = _stream;
-            _native = null;
-            _stream = 0;
-            _config = null;
-            _paused = false;
-            _callbackBuffer = [];
             if (!preserveRestartEligibility)
             {
                 _restartEligible = false;
             }
         }
 
-        if (native is null || stream == 0)
+        if (native is null)
         {
             return Success();
         }
 
-        var errorCode = 0;
         try
         {
-            errorCode = native.StopStream(stream);
-            var closeCode = native.CloseStream(stream);
-            errorCode = errorCode != 0 ? errorCode : closeCode;
+            var stopError = 0;
+            if (stream != 0)
+            {
+                stopError = native.StopStream(stream);
+                if (native.CloseStream(stream) != 0)
+                {
+                    return Failure(WindowsPortAudioStreamFailureCode.StopFailed, "PortAudio 输出流关闭未确认，保留资源等待重试。", true);
+                }
+
+                lock (_gate)
+                {
+                    _stream = 0;
+                    _config = null;
+                    _paused = false;
+                    _callbackBuffer = [];
+                    _hardwareState = WindowsPortAudioHardwareState.NotCreated;
+                    if (_callbackOwner.IsAllocated)
+                    {
+                        _callbackOwner.Free();
+                    }
+                }
+            }
+
+            if (_initialized)
+            {
+                if (native.Terminate() != 0)
+                {
+                    return Failure(WindowsPortAudioStreamFailureCode.StopFailed, "PortAudio 输出终止未确认，保留运行库等待重试。", true);
+                }
+
+                _initialized = false;
+            }
+
+            native.Dispose();
+            lock (_gate)
+            {
+                _native = null;
+                _config = null;
+                _paused = false;
+                _callbackBuffer = [];
+                _hardwareState = WindowsPortAudioHardwareState.NotCreated;
+                if (_callbackOwner.IsAllocated)
+                {
+                    _callbackOwner.Free();
+                }
+            }
+
+            return stopError is 0 or -9983 || ignoreStopError
+                ? Success()
+                : Failure(WindowsPortAudioStreamFailureCode.StopFailed, "PortAudio 输出流已关闭，但停止阶段返回错误。", true);
         }
         catch (Exception exception) when (exception is AccessViolationException or InvalidOperationException or SEHException)
         {
-            errorCode = -1;
+            return Failure(WindowsPortAudioStreamFailureCode.StopFailed, "PortAudio 输出原生释放失败，保留资源等待重试。", true);
         }
-        finally
-        {
-            try
-            {
-                native.Terminate();
-            }
-            finally
-            {
-                native.Dispose();
-            }
-        }
-
-        return errorCode == 0 || ignoreStopError
-            ? Success()
-            : Failure(WindowsPortAudioStreamFailureCode.StopFailed, "PortAudio 输出流停止失败。", retryable: true);
     }
-
     private int OnAudioCallback(
         nint inputBuffer,
         nint outputBuffer,
@@ -623,6 +582,11 @@ public sealed class WindowsPortAudioOutputStream : IDisposable
         uint statusFlags,
         nint userData)
     {
+        if (Volatile.Read(ref _stopping) || _operations.StopRequested)
+        {
+            return WindowsPortAudioNative.Abort;
+        }
+
         AddCounter(ref _callbackCount, 1);
         Volatile.Write(ref _lastCallbackStatusFlags, statusFlags);
         if (statusFlags != 0)
@@ -735,7 +699,13 @@ public sealed class WindowsPortAudioOutputStream : IDisposable
         return true;
     }
 
-    private WindowsPortAudioOutputResult Success() => new(true, CreateSnapshot());
+    private WindowsPortAudioOutputResult Success()
+    {
+        lock (_gate)
+        {
+            return new(true, CreateSnapshot());
+        }
+    }
 
     private WindowsPortAudioOutputResult Failure(
         WindowsPortAudioStreamFailureCode code,
@@ -754,7 +724,7 @@ public sealed class WindowsPortAudioOutputStream : IDisposable
     {
         var config = _config;
         return new(
-            IsRunning: _stream != 0 && !_paused,
+            IsRunning: _running && !_paused && !_stopping && !_operations.StopRequested,
             DeviceIndex: config?.DeviceIndex,
             Channels: config?.Channels ?? 0,
             SampleRate: config?.SampleRate ?? 0,
@@ -764,16 +734,53 @@ public sealed class WindowsPortAudioOutputStream : IDisposable
             ErrorCode: _lastError?.Code.ToString(),
             Error: _lastError?.Message)
         {
-            IsPaused = _stream != 0 && _paused,
-            HardwareState = QueryHardwareState(),
+            IsPaused = _stream != 0 && _paused && !_stopping && !_operations.StopRequested,
+            HardwareState = (_stopping || _operations.StopRequested) && _stream != 0
+                ? WindowsPortAudioHardwareState.QueryError
+                : _hardwareState,
             CallbackCount = Volatile.Read(ref _callbackCount),
             CallbackStatusFlagsCount = Volatile.Read(ref _callbackStatusFlagsCount),
             LastCallbackStatusFlags = Volatile.Read(ref _lastCallbackStatusFlags),
             XrunCount = Volatile.Read(ref _xrunCount),
             OutputFramesWritten = Volatile.Read(ref _outputFramesWritten),
+            BaseFramesWritten = (_source as AudioPcmMixingOutputSource)?.BaseFramesRead,
             HasTimeInfo = Volatile.Read(ref _hasCallbackTimeInfo) != 0,
             OutputLatencyMicroseconds = Volatile.Read(ref _lastOutputLatencyMicroseconds),
         };
+    }
+
+    private void RefreshHealthIfDue()
+    {
+        if (_operations.CheckHealthTimeout())
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_native is null || _stream == 0 || _disposed || _stopping || _paused
+                || Environment.TickCount64 - _lastHealthQueryAt < 250)
+            {
+                return;
+            }
+        }
+
+        _operations.TryRefresh(RefreshHealthCore);
+    }
+
+    private WindowsPortAudioOutputResult RefreshHealthCore()
+    {
+        var state = QueryHardwareState();
+        lock (_gate)
+        {
+            _lastHealthQueryAt = Environment.TickCount64;
+            if (!_stopping && !_operations.StopRequested)
+            {
+                _hardwareState = state;
+            }
+
+            return Success();
+        }
     }
 
     private WindowsPortAudioHardwareState QueryHardwareState()

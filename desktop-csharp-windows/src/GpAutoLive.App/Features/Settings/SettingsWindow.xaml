@@ -5,13 +5,13 @@
         Icon="/GpAutoLive;component/Assets/app-icon.ico"
         Width="560"
         Height="480"
-        MinWidth="560"
-        MinHeight="480"
-        MaxWidth="560"
-        MaxHeight="480"
+        MinWidth="360"
+        MinHeight="320"
+        MaxWidth="{Binding Source={x:Static SystemParameters.WorkArea}, Path=Width}"
+        MaxHeight="{Binding Source={x:Static SystemParameters.WorkArea}, Path=Height}"
         Background="{StaticResource WindowBrush}"
         Foreground="{StaticResource TextBrush}"
-        ResizeMode="NoResize"
+        ResizeMode="CanResize"
         ShowInTaskbar="False"
         UseLayoutRounding="True"
         SnapsToDevicePixels="True"
@@ -94,12 +94,18 @@
         </ScrollViewer>
 
         <Grid Grid.Row="4">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
             <TextBlock x:Name="StatusText"
+                       Margin="0,0,12,0"
                        VerticalAlignment="Center"
                        Foreground="{StaticResource MutedTextBrush}"
                        FontSize="11"
+                       TextWrapping="Wrap"
                        Text="Enter 保存 · Esc 取消" />
-            <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+            <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" Orientation="Horizontal">
                 <Button Width="76"
                         Margin="0,0,8,0"
                         AutomationProperties.Name="取消设置"

@@ -102,7 +102,7 @@ public static class DouyinLiveRules
     public static readonly TimeSpan TaskMaxAge = TimeSpan.FromSeconds(60);
     /// <summary>消息 ID 最大字节数。</summary>
     public const int MaxMessageIdBytes = 256;
-    /// <summary>sidecar 允许报告的弹幕正文长度上限；只传长度，不传正文。</summary>
+    /// <summary>sidecar 允许报告的弹幕正文长度上限；正文仅供本地内存显示。</summary>
     public const int MaxChatTextLength = 16 * 1024;
     /// <summary>消息去重集合容量。</summary>
     public const int SeenMessageCapacity = 4_096;
@@ -123,25 +123,22 @@ public static class DouyinLiveRules
 
         if (!TryNormalizeRoomId(config.RoomId, out var roomId))
         {
-            error = Invalid(DouyinLiveConfigFailureCode.RoomIdInvalid, "直播间号只接受 1～20 位数字或标准 live.douyin.com URL。");
+            error = Invalid(DouyinLiveConfigFailureCode.RoomIdInvalid, "请输入 1～20 位房间号、live.douyin.com 直播链接或 www.douyin.com/follow/live/ 直播链接。");
             return false;
         }
 
-        if (config.Replies.IsDefaultOrEmpty
-            || config.Replies.Length is < MinReplyCount or > MaxReplyCount)
+        var replies = config.Replies.IsDefault ? ImmutableArray<string>.Empty : config.Replies;
+        if ((config.Enabled && replies.Length < MinReplyCount)
+            || replies.Length > MaxReplyCount)
         {
             error = Invalid(DouyinLiveConfigFailureCode.ReplyCountOutOfRange, "回复候选必须为 1～100 条。");
             return false;
         }
 
-        var uniqueReplies = new List<string>(config.Replies.Length);
-        foreach (var reply in config.Replies)
+        var uniqueReplies = new List<string>(replies.Length);
+        foreach (var reply in replies)
         {
-            var text = reply?.Trim();
-            if (string.IsNullOrEmpty(text)
-                || text.EnumerateRunes().Count() > MaxReplyCharacters
-                || Encoding.UTF8.GetByteCount(text) > MaxReplyBytes
-                || text.Any(char.IsControl))
+            if (!TryNormalizeReply(reply, out var text))
             {
                 error = Invalid(DouyinLiveConfigFailureCode.ReplyInvalid, "每条回复必须是 1～80 个可打印 Unicode 字符且不超过 320 UTF-8 字节。");
                 return false;
@@ -167,15 +164,40 @@ public static class DouyinLiveRules
         return true;
     }
 
+    /// <summary>规范化单条本地发送正文；手动和自动回复共用同一字符、字节与控制符边界。</summary>
+    public static bool TryNormalizeReply(string? value, out string text)
+    {
+        text = value?.Trim() ?? string.Empty;
+        return text.Length > 0
+            && text.EnumerateRunes().Count() <= MaxReplyCharacters
+            && Encoding.UTF8.GetByteCount(text) <= MaxReplyBytes
+            && !text.Any(char.IsControl);
+    }
+
     /// <summary>规范化数字直播间号或标准 HTTPS URL。</summary>
     public static bool TryNormalizeRoomId(string? value, out string roomId)
     {
         roomId = string.Empty;
         var input = value?.Trim() ?? string.Empty;
-        const string prefix = "https://live.douyin.com/";
-        if (input.StartsWith(prefix, StringComparison.Ordinal))
+        if (Uri.TryCreate(input, UriKind.Absolute, out var uri))
         {
-            input = input[prefix.Length..];
+            if (uri.Scheme != Uri.UriSchemeHttps || !uri.IsDefaultPort || uri.UserInfo.Length != 0)
+            {
+                return false;
+            }
+            if (uri.Host == "live.douyin.com")
+            {
+                input = uri.AbsolutePath[1..];
+            }
+            else if (uri.Host == "www.douyin.com"
+                && uri.AbsolutePath.StartsWith("/follow/live/", StringComparison.Ordinal))
+            {
+                input = uri.AbsolutePath["/follow/live/".Length..];
+            }
+            else
+            {
+                return false;
+            }
         }
 
         if (input.Length is < 1 or > 20 || !input.All(static character => character is >= '0' and <= '9'))

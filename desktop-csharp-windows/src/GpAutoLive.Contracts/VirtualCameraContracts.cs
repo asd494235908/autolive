@@ -11,7 +11,7 @@ public enum VirtualCameraPixelFormat
     Yuy2
 }
 
-/// <summary>虚拟摄像头固定输出配置；不包含设备安装或系统权限操作。</summary>
+/// <summary>虚拟摄像头输出配置；不包含设备安装或系统权限操作。</summary>
 public sealed record VirtualCameraConfig
 {
     /// <summary>下游应用看到的固定设备名称。</summary>
@@ -43,9 +43,9 @@ public sealed record VirtualCameraConfig
     {
         error = null;
         frameBytes = 0;
-        if (Width == 0 || Height == 0)
+        if (Width == 0 || Height == 0 || (Width & 1) != 0 || Width > VirtualCameraRules.MaxDimension || Height > VirtualCameraRules.MaxDimension)
         {
-            error = VirtualCameraError.InvalidConfiguration("输出尺寸不能为空");
+            error = VirtualCameraError.InvalidConfiguration("YUY2 输出宽度必须为正偶数，高度必须为正数，边长不得超过 4096");
             return false;
         }
 
@@ -68,19 +68,17 @@ public sealed record VirtualCameraConfig
         }
     }
 
-    /// <summary>校验首版固定 YUY2 1280×720@30fps 合同。</summary>
+    /// <summary>校验动态有界尺寸、YUY2 30fps 输出合同。</summary>
     public bool TryValidateFixedOutput([NotNullWhen(false)] out VirtualCameraError? error)
     {
         error = null;
         if (!string.Equals(DeviceName, VirtualCameraRules.DeviceName, StringComparison.Ordinal)
             || PixelFormat != VirtualCameraPixelFormat.Yuy2
-            || Width != VirtualCameraRules.Width
-            || Height != VirtualCameraRules.Height
             || Fps != VirtualCameraRules.Fps
             || ZeroCopy)
         {
             error = VirtualCameraError.InvalidConfiguration(
-                "首版虚拟摄像头只允许 YUY2 1280×720@30fps 且 zero_copy=false");
+                "虚拟摄像头只允许 YUY2 @30fps 且 zero_copy=false");
             return false;
         }
 
@@ -96,9 +94,9 @@ public static class VirtualCameraRules
 {
     /// <summary>固定设备名称。</summary>
     public const string DeviceName = "GpAutoLive Camera";
-    /// <summary>固定输出宽度。</summary>
+    /// <summary>未配置时的默认输出宽度。</summary>
     public const uint Width = 1280;
-    /// <summary>固定输出高度。</summary>
+    /// <summary>未配置时的默认输出高度。</summary>
     public const uint Height = 720;
     /// <summary>固定输出帧率。</summary>
     public const uint Fps = 30;
@@ -107,7 +105,9 @@ public static class VirtualCameraRules
     /// <summary>固定 AkVirtualCamera 传输标识。</summary>
     public const string Transport = "akvcam_mmap_cpu";
     /// <summary>单帧最大字节数。</summary>
-    public const ulong MaxFrameBytes = 64UL * 1024 * 1024;
+    public const ulong MaxFrameBytes = 4096UL * 2160 * 2;
+    /// <summary>单边尺寸上限，支持横竖屏 DCI 4K。</summary>
+    public const uint MaxDimension = 4096;
     /// <summary>回读指标有界样本容量。</summary>
     public const int ReadbackSampleCapacity = 512;
 }
@@ -150,7 +150,7 @@ public sealed record GpuCaptureFacts(
     uint Height,
     uint Fps)
 {
-    /// <summary>验证事实是否满足固定虚拟摄像头输出合同。</summary>
+    /// <summary>验证事实是否满足本次虚拟摄像头输出合同。</summary>
     public bool TryValidateFor(VirtualCameraConfig config, [NotNullWhen(false)] out VirtualCameraError? error)
     {
         error = null;
@@ -184,7 +184,7 @@ public sealed record GpuCaptureFacts(
         }
         else if (Width != config.Width || Height != config.Height || Fps != config.Fps)
         {
-            error = VirtualCameraError.GpuGateFailed("实际输出规格与固定 720p30 合同不一致");
+            error = VirtualCameraError.GpuGateFailed("实际输出规格与本次配置不一致");
         }
 
         return error is null;
@@ -214,7 +214,9 @@ public sealed record VirtualCameraFrame(
     ulong Generation,
     ulong Sequence,
     ulong Timestamp90Khz,
-    byte[] Payload)
+    byte[] Payload,
+    uint Width = VirtualCameraRules.Width,
+    uint Height = VirtualCameraRules.Height)
 {
     /// <summary>创建 YUY2 limited-range 黑帧，避免全零造成绿色偏色。</summary>
     public static bool TryCreateBlack(
@@ -241,7 +243,7 @@ public sealed record VirtualCameraFrame(
             payload[index + 3] = 128;
         }
 
-        frame = new VirtualCameraFrame(generation, sequence, timestamp90Khz, payload);
+        frame = new VirtualCameraFrame(generation, sequence, timestamp90Khz, payload, config.Width, config.Height);
         return true;
     }
 }

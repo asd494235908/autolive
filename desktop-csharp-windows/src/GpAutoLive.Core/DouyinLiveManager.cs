@@ -16,7 +16,9 @@ public enum DouyinEnqueueDecision
     /// <summary>过滤重连重放消息。</summary>
     IgnoredReplay,
     /// <summary>过滤已观察过的消息 ID。</summary>
-    IgnoredDuplicate
+    IgnoredDuplicate,
+    /// <summary>正常接收；自动回复已关闭或暂停。</summary>
+    ObservedOnly
 }
 
 /// <summary>抖音弹幕入队结果；正文只保留在本地进程内存。</summary>
@@ -86,11 +88,15 @@ public sealed class DouyinLiveManager
         }
     }
 
-    /// <summary>启动一轮等待扫码会话；会话重启时不恢复上次凭据。</summary>
-    public DouyinLiveOperationResult TryStart(DouyinLiveConfig? config)
+    /// <summary>开始房间会话；宿主确认同一 sidecar 仍已认证时可复用本次运行内登录。</summary>
+    public DouyinLiveOperationResult TryStart(DouyinLiveConfig? config, bool reuseAuthenticatedSession = false)
     {
         lock (_gate)
         {
+            if (reuseAuthenticatedSession && _state != DouyinLiveState.LoggedIn)
+            {
+                return Failure(InvalidTransition("reuse_login"));
+            }
             if (!DouyinLiveRules.TryNormalize(config, out var normalized, out var validationError))
             {
                 return Failure(
@@ -99,7 +105,7 @@ public sealed class DouyinLiveManager
                         validationError?.Message ?? "抖音配置无效"));
             }
 
-            if (IsRunning())
+            if (IsRunning() && !(reuseAuthenticatedSession && _state == DouyinLiveState.LoggedIn))
             {
                 return Failure(new DouyinLiveOperationError(
                     "douyin_invalid_transition",
@@ -115,12 +121,12 @@ public sealed class DouyinLiveManager
             _chatReceived = false;
             _replyAttempted = false;
             _selfEchoFiltered = false;
-            _replySendingBlocked = false;
+            _replySendingBlocked = reuseAuthenticatedSession && _replySendingBlocked;
             _lastGapReason = null;
             _error = null;
             InvalidateGeneration();
-            _state = DouyinLiveState.WaitingQr;
-            RecordEvent("probe_started");
+            _state = reuseAuthenticatedSession ? DouyinLiveState.LoggedIn : DouyinLiveState.WaitingQr;
+            RecordEvent(reuseAuthenticatedSession ? "live_opening" : "probe_started");
             return Success();
         }
     }
@@ -198,6 +204,30 @@ public sealed class DouyinLiveManager
 
             _state = DouyinLiveState.Listening;
             RecordEvent("resumed");
+            return Success();
+        }
+    }
+
+    /// <summary>仅关闭房间并失效旧回复任务，保留已认证状态和本次登录的风控阻断。</summary>
+    public DouyinLiveOperationResult DisconnectRoom(string? reason = null)
+    {
+        lock (_gate)
+        {
+            if (_state == DouyinLiveState.LoggedIn && _lastEvent == "live_disconnected")
+            {
+                return Success();
+            }
+            if (_state is DouyinLiveState.Idle or DouyinLiveState.WaitingQr or DouyinLiveState.Stopping)
+            {
+                return Failure(InvalidTransition("live_disconnected"));
+            }
+            InvalidateGeneration();
+            _queue.Clear();
+            ClearSeenMessages();
+            _roomResolved = false;
+            _state = DouyinLiveState.LoggedIn;
+            _error = reason is null ? null : NormalizeReason(reason, "直播间已断开");
+            RecordEvent("live_disconnected");
             return Success();
         }
     }
@@ -347,24 +377,17 @@ public sealed class DouyinLiveManager
     }
 
     /// <summary>
-    /// 接收最小化弹幕 DTO。只接受监听状态和唯一消息 ID；本账号回显、重放和重复 ID 不入队。
+    /// 接收最小化弹幕 DTO；暂停只暂停回复，本账号回显、重放和重复 ID 不入队。
     /// </summary>
     public DouyinEnqueueResult ObserveChatMessage(DouyinChatMessage? message, DateTimeOffset now)
     {
         lock (_gate)
         {
-            if (_state != DouyinLiveState.Listening)
+            if (_state is not (DouyinLiveState.Listening or DouyinLiveState.Paused))
             {
                 return EnqueueFailure(new DouyinLiveOperationError(
                     "douyin_invalid_transition",
                     "当前未处于抖音公屏监听状态"));
-            }
-
-            if (!_config.Enabled)
-            {
-                return EnqueueFailure(new DouyinLiveOperationError(
-                    "douyin_auto_reply_disabled",
-                    "抖音自动回应未启用"));
             }
 
             if (message is null || !DouyinLiveRules.IsValidMessageId(message.MessageId))
@@ -379,24 +402,17 @@ public sealed class DouyinLiveManager
     }
 
     /// <summary>
-    /// 接收 sidecar 的脱敏弹幕元数据。正文不进入 C#，但仍校验单房间、发送者和正文长度边界。
+    /// 接收 sidecar 的脱敏弹幕元数据；显示正文由宿主管理，回复队列只处理元数据。
     /// </summary>
     public DouyinEnqueueResult ObserveChatMetadata(DouyinChatMessageMetadata? metadata, DateTimeOffset now)
     {
         lock (_gate)
         {
-            if (_state != DouyinLiveState.Listening)
+            if (_state is not (DouyinLiveState.Listening or DouyinLiveState.Paused))
             {
                 return EnqueueFailure(new DouyinLiveOperationError(
                     "douyin_invalid_transition",
                     "当前未处于抖音公屏监听状态"));
-            }
-
-            if (!_config.Enabled)
-            {
-                return EnqueueFailure(new DouyinLiveOperationError(
-                    "douyin_auto_reply_disabled",
-                    "抖音自动回应未启用"));
             }
 
             if (!IsValidChatMetadata(metadata))
@@ -417,6 +433,7 @@ public sealed class DouyinLiveManager
         DateTimeOffset now)
     {
         var messageId = messageIdValue.Trim();
+        _chatReceived = true;
         if (isSelf)
         {
             _selfEchoFiltered = true;
@@ -443,6 +460,12 @@ public sealed class DouyinLiveManager
         if (_seenMessageOrder.Count > DouyinLiveRules.SeenMessageCapacity)
         {
             _seenMessageIds.Remove(_seenMessageOrder.Dequeue());
+        }
+
+        if (!_config.Enabled || _state == DouyinLiveState.Paused)
+        {
+            RecordEvent("chat_received");
+            return new(true, DouyinEnqueueDecision.ObservedOnly, CreateStatus());
         }
 
         var replyIndex = SelectReplyIndex();

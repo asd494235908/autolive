@@ -7,6 +7,51 @@ namespace GpAutoLive.Core.Tests;
 public sealed class DouyinLiveManagerTests
 {
     [TestMethod]
+    public void Room_disconnect_reuses_login_but_invalidates_queue_and_keeps_risk_block()
+    {
+        var manager = ListeningManager();
+        var previous = manager.Snapshot.Generation;
+        Assert.IsTrue(manager.ObserveChatMessage(Message("old-room"), DateTimeOffset.UtcNow).IsAccepted);
+        Assert.IsTrue(manager.BlockReplySending("风险状态").IsSuccess);
+        Assert.IsTrue(manager.DisconnectRoom().IsSuccess);
+        var disconnected = manager.Snapshot.Generation;
+        Assert.IsTrue(manager.DisconnectRoom().IsSuccess);
+        Assert.AreEqual(disconnected, manager.Snapshot.Generation);
+        Assert.AreEqual(DouyinLiveState.LoggedIn, manager.Snapshot.State);
+        Assert.AreEqual(0, manager.Snapshot.QueueCount);
+        Assert.AreNotEqual(previous, manager.Snapshot.Generation);
+        Assert.IsTrue(manager.TryStart(Config() with { RoomId = "23456" }, reuseAuthenticatedSession: true).IsSuccess);
+        Assert.AreEqual(DouyinLiveState.LoggedIn, manager.Snapshot.State);
+        Assert.IsTrue(manager.Snapshot.ReplySendingBlocked);
+        Assert.IsTrue(manager.MarkRoomResolved().IsSuccess);
+        Assert.IsTrue(manager.BeginListening().IsSuccess);
+        Assert.IsFalse(manager.TryDequeue(DateTimeOffset.UtcNow, out _));
+        Assert.IsFalse(new DouyinLiveManager().TryStart(Config(), reuseAuthenticatedSession: true).IsSuccess);
+    }
+
+    [TestMethod]
+    public void Watching_with_empty_replies_and_paused_replying_keeps_receiving_without_queueing()
+    {
+        var manager = ListeningManager(Config() with { Enabled = false, Replies = [] });
+        var observed = manager.ObserveChatMessage(Message("watch"), DateTimeOffset.UtcNow);
+        Assert.IsTrue(observed.IsAccepted);
+        Assert.IsTrue(observed.Snapshot.ChatReceived);
+        Assert.AreEqual(0, observed.Snapshot.QueueCount);
+        Assert.IsTrue(manager.Pause().IsSuccess);
+        Assert.IsTrue(manager.ObserveChatMessage(Message("paused"), DateTimeOffset.UtcNow).IsAccepted);
+        Assert.IsFalse(manager.TryDequeue(DateTimeOffset.UtcNow, out _));
+
+        var replying = ListeningManager();
+        Assert.IsTrue(replying.Pause().IsSuccess);
+        Assert.IsTrue(replying.ObserveChatMetadata(new("12345", "paused-meta", "sender", 1, false, false),
+            DateTimeOffset.UtcNow).IsAccepted);
+        Assert.AreEqual(0, replying.Snapshot.QueueCount);
+        Assert.IsTrue(replying.Resume().IsSuccess);
+        Assert.AreEqual(DouyinEnqueueDecision.IgnoredDuplicate,
+            replying.ObserveChatMessage(Message("paused-meta"), DateTimeOffset.UtcNow).Decision);
+    }
+
+    [TestMethod]
     public void Lifecycle_requires_qr_login_room_resolution_and_listening()
     {
         var manager = new DouyinLiveManager(new Random(1));

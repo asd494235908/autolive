@@ -7,6 +7,25 @@ namespace GpAutoLive.Media.Tests;
 public sealed class RtmpFfmpegCommandBuilderTests
 {
     [TestMethod]
+    [DataRow(true, false)]
+    [DataRow(false, true)]
+    [DataRow(true, true)]
+    public void Graceful_stop_plan_keeps_video_control_and_ends_av_on_pcm_eof(bool video, bool audio)
+    {
+        using var fixture = MediaFixture.Create("sample.mp4");
+        Assert.IsTrue(RtmpFfmpegCommandBuilder.TryCreate(
+            RtmpOutputConfig.Default with { TargetUrl = "rtmp://127.0.0.1/live/stream", VideoEnabled = video, AudioEnabled = audio },
+            fixture.Source, @"C:\media\ffmpeg.exe", null, null, out var plan, out var error), error?.Message);
+        Assert.IsNotNull(plan);
+        Assert.IsFalse(plan.ProcessPlan.Arguments.Contains("-nostdin"));
+        Assert.AreEqual(video && audio, plan.ProcessPlan.Arguments.Contains("-shortest"));
+        var bufferIndex = plan.ProcessPlan.Arguments.IndexOf("-shortest_buf_duration");
+        Assert.AreEqual(video && audio, bufferIndex >= 0);
+        if (bufferIndex >= 0) Assert.AreEqual("0.1", plan.ProcessPlan.Arguments[bufferIndex + 1]);
+        Assert.AreEqual(audio, plan.RequiresFinalPcmInput);
+    }
+
+    [TestMethod]
     public void Cpu4_video_effects_are_translated_to_a_restricted_ffmpeg_filter()
     {
         using var fixture = MediaFixture.Create("sample.mp4");
@@ -78,6 +97,27 @@ public sealed class RtmpFfmpegCommandBuilderTests
         var progressIndex = plan!.ProcessPlan.Arguments.IndexOf("-progress");
         Assert.IsTrue(progressIndex >= 0);
         Assert.AreEqual("pipe:2", plan.ProcessPlan.Arguments[progressIndex + 1]);
+    }
+
+    [TestMethod]
+    public void Media_foundation_encoder_builds_without_string_quality_argument()
+    {
+        using var fixture = MediaFixture.Create("sample.mp4");
+
+        var created = RtmpFfmpegCommandBuilder.TryCreate(
+            RtmpOutputConfig.Default with { TargetUrl = "rtmp://127.0.0.1/live/stream" },
+            fixture.Source,
+            @"C:\media\ffmpeg.exe",
+            preferredEncoder: "h264_mf",
+            sourceIdentity: null,
+            out var plan,
+            out var error);
+
+        Assert.IsTrue(created, error?.Message);
+        Assert.IsNotNull(plan);
+        Assert.IsTrue(plan!.ProcessPlan.Arguments.Contains("h264_mf"));
+        Assert.IsFalse(plan.ProcessPlan.Arguments.Contains("-quality"));
+        Assert.IsFalse(plan.ProcessPlan.Arguments.Contains("speed"));
     }
 
     [TestMethod]

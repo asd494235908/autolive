@@ -54,6 +54,7 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
     private Process? _process;
     private WindowsJobObject? _job;
     private CancellationTokenSource? _activeCancellation;
+    private bool _stopRequested;
     private bool _disposed;
     private ulong _decodedFrames;
     private ulong _droppedFrames;
@@ -79,7 +80,8 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
         FinalPcmBus? finalPcmBus = null,
         Func<AudioPcmMixPolicy>? baseMixPolicyProvider = null,
         bool finalPcmOverlay = false,
-        Func<int, CancellationToken, ValueTask>? beforePublishWaiter = null)
+        Func<int, CancellationToken, ValueTask>? beforePublishWaiter = null,
+        Func<FinalPcmBus?>? finalPcmBusProvider = null)
     {
         if (cancellationToken.IsCancellationRequested)
         {
@@ -107,6 +109,12 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
             return Failure(WindowsFfmpegPcmDecoderFailureCode.Cancelled, "PCM 解码已取消。", retryable: true);
         }
 
+        Process? process = null;
+        WindowsJobObject? job = null;
+        CancellationTokenSource? runCancellation = null;
+        Task<bool>? stdoutTask = null;
+        Task<bool>? stderrTask = null;
+        var processStarted = false;
         try
         {
             if (_disposed)
@@ -139,18 +147,34 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
                 _lastError = null;
             }
 
-            using var process = new Process
+            runCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            runCancellation.CancelAfter(validatedPlan.Timeout);
+            lock (_gate)
+            {
+                if (_disposed)
+                {
+                    return Failure(WindowsFfmpegPcmDecoderFailureCode.Closed, "PCM 解码器已关闭。", retryable: false);
+                }
+                _stopRequested = false;
+                _activeCancellation = runCancellation;
+            }
+
+            process = new Process
             {
                 StartInfo = CreateStartInfo(validatedPlan),
                 EnableRaisingEvents = false,
             };
-            WindowsJobObject? job = null;
             try
             {
+                if (runCancellation.IsCancellationRequested)
+                {
+                    return Failure(WindowsFfmpegPcmDecoderFailureCode.Cancelled, "PCM 解码已取消。", retryable: true);
+                }
                 if (!process.Start())
                 {
                     return Failure(WindowsFfmpegPcmDecoderFailureCode.StartFailed, "FFmpeg PCM 解码进程无法启动。", retryable: true);
                 }
+                processStarted = true;
 
                 if (WindowsJobObject.TryCreate(out var candidateJob)
                     && candidateJob is not null
@@ -168,16 +192,25 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
                 return Failure(WindowsFfmpegPcmDecoderFailureCode.StartFailed, "FFmpeg PCM 解码进程无法启动。", retryable: true);
             }
 
-            using var runCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            runCancellation.CancelAfter(validatedPlan.Timeout);
             lock (_gate)
             {
                 _process = process;
                 _job = job;
-                _activeCancellation = runCancellation;
             }
 
-            var stdoutTask = ReadPcmAsync(
+            var readerFailed = 0;
+            async Task<bool> ObserveReaderAsync(Task<bool> reader)
+            {
+                var succeeded = await JoinTaskAsync(reader).ConfigureAwait(false);
+                if (!succeeded && !runCancellation.IsCancellationRequested)
+                {
+                    Interlocked.Exchange(ref readerFailed, 1);
+                    runCancellation.Cancel();
+                }
+                return succeeded;
+            }
+
+            stdoutTask = ObserveReaderAsync(ReadPcmAsync(
                 process.StandardOutput.BaseStream,
                 validatedDestination,
                 finalPcmBus,
@@ -186,22 +219,14 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
                 pauseWaiter,
                 baseMixPolicyProvider,
                 finalPcmOverlay,
-                beforePublishWaiter);
-            var stderrTask = DrainStderrAsync(process.StandardError.BaseStream, runCancellation.Token);
-            var processExited = false;
-            var mustTerminate = false;
+                beforePublishWaiter,
+                finalPcmBusProvider));
+            stderrTask = ObserveReaderAsync(DrainStderrAsync(process.StandardError.BaseStream, runCancellation.Token));
             try
             {
                 await process.WaitForExitAsync(runCancellation.Token).ConfigureAwait(false);
-                processExited = true;
-                runCancellation.CancelAfter(Timeout.InfiniteTimeSpan);
             }
             catch (OperationCanceledException) when (runCancellation.IsCancellationRequested)
-            {
-                mustTerminate = true;
-            }
-
-            if (mustTerminate || !processExited)
             {
                 KillProcessTree(process, job);
                 await WaitForExitBoundedAsync(process).ConfigureAwait(false);
@@ -210,12 +235,17 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
             var stdoutResult = await JoinTaskAsync(stdoutTask).ConfigureAwait(false);
             var stderrOk = await JoinTaskAsync(stderrTask).ConfigureAwait(false);
             var exitCode = SafeExitCode(process);
-            if (cancellationToken.IsCancellationRequested)
+            bool stopRequested;
+            lock (_gate)
+            {
+                stopRequested = _stopRequested;
+            }
+            if (cancellationToken.IsCancellationRequested || stopRequested)
             {
                 return Failure(WindowsFfmpegPcmDecoderFailureCode.Cancelled, "PCM 解码已取消。", retryable: true);
             }
 
-            if (runCancellation.IsCancellationRequested && !processExited)
+            if (runCancellation.IsCancellationRequested && Volatile.Read(ref readerFailed) == 0)
             {
                 return Failure(WindowsFfmpegPcmDecoderFailureCode.TimedOut, "PCM 解码超过时间预算。", retryable: true);
             }
@@ -225,8 +255,11 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
                 return Failure(WindowsFfmpegPcmDecoderFailureCode.OutputReadFailed, "PCM 解码输出读取失败。", retryable: true);
             }
 
+            var finalDestination = finalPcmOverlay && finalPcmBusProvider is not null
+                ? finalPcmBusProvider() : finalPcmBus;
             if ((validatedDestination?.Snapshot.IsClosed ?? false)
-                || (finalPcmBus?.Snapshot.IsClosed ?? false))
+                || (finalDestination?.Snapshot.IsClosed ?? false)
+                || finalPcmOverlay && finalDestination is null)
             {
                 return Failure(WindowsFfmpegPcmDecoderFailureCode.DestinationClosed, "PCM 解码目标已关闭。", retryable: false);
             }
@@ -237,22 +270,37 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
         }
         finally
         {
-            Process? process;
-            WindowsJobObject? job;
+            // Decode 保持进程和读取器的所有权直到真正结束。Dispose 的预算超时只通知调用方，
+            // 不能释放仍被读取器使用的 CTS、流或 ArrayPool 缓冲。
+            runCancellation?.Cancel();
+            if (processStarted && process is not null)
+            {
+                KillProcessTree(process, job);
+                await process.WaitForExitAsync().ConfigureAwait(false);
+                // HasExited/WaitForExitAsync 可在退出码可读但句柄尚未触发时返回。
+                // 真正等待操作系统完成退出，才能释放资源或让调用方删除输入文件。
+                if (!process.WaitForExit(0))
+                {
+                    await Task.Run(process.WaitForExit).ConfigureAwait(false);
+                }
+            }
+            if (stdoutTask is not null)
+            {
+                await JoinTaskAsync(stdoutTask).ConfigureAwait(false);
+            }
+            if (stderrTask is not null)
+            {
+                await JoinTaskAsync(stderrTask).ConfigureAwait(false);
+            }
             lock (_gate)
             {
-                process = _process;
-                job = _job;
                 _process = null;
                 _job = null;
                 _activeCancellation = null;
             }
 
-            if (process is not null)
-            {
-                process.Dispose();
-            }
-
+            runCancellation?.Dispose();
+            process?.Dispose();
             job?.Dispose();
             _lifecycle.Release();
         }
@@ -265,6 +313,7 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
         WindowsJobObject? job;
         lock (_gate)
         {
+            _stopRequested = true;
             _activeCancellation?.Cancel();
             process = _process;
             job = _job;
@@ -284,17 +333,12 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
         }
 
         Stop();
-        try
+        if (!await _lifecycle.WaitAsync(CleanupTimeout).ConfigureAwait(false))
         {
-            await _lifecycle.WaitAsync(CleanupTimeout).ConfigureAwait(false);
-            _lifecycle.Release();
+            throw new TimeoutException("PCM 解码器尚未完成回收，可重试关闭。");
         }
-        catch (TimeoutException)
-        {
-            // DecodeAsync 的所有进程/句柄仍由其 finally 有界回收；不阻塞应用退出。
-        }
-
-        _lifecycle.Dispose();
+        _lifecycle.Release();
+        // 未访问 AvailableWaitHandle，无原生句柄；保留受管门直到 GC，允许排队调用/重复关闭安全结束。
         GC.SuppressFinalize(this);
     }
 
@@ -307,7 +351,8 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
         Func<CancellationToken, ValueTask>? pauseWaiter,
         Func<AudioPcmMixPolicy>? baseMixPolicyProvider,
         bool finalPcmOverlay,
-        Func<int, CancellationToken, ValueTask>? beforePublishWaiter)
+        Func<int, CancellationToken, ValueTask>? beforePublishWaiter,
+        Func<FinalPcmBus?>? finalPcmBusProvider)
     {
         var byteBuffer = ArrayPool<byte>.Shared.Rent(ReadBufferBytes + 3);
         var sampleBuffer = ArrayPool<float>.Shared.Rent(4_096 * plan.Channels);
@@ -343,7 +388,8 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
                                 baseMixPolicyProvider,
                                 finalPcmOverlay,
                                 beforePublishWaiter,
-                                cancellationToken)
+                                cancellationToken,
+                                finalPcmBusProvider)
                             .ConfigureAwait(false))
                         {
                             return false;
@@ -374,7 +420,8 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
                                 baseMixPolicyProvider,
                                 finalPcmOverlay,
                                 beforePublishWaiter,
-                                cancellationToken)
+                                cancellationToken,
+                                finalPcmBusProvider)
                             .ConfigureAwait(false))
                         {
                             return false;
@@ -415,7 +462,8 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
         Func<AudioPcmMixPolicy>? baseMixPolicyProvider,
         bool finalPcmOverlay,
         Func<int, CancellationToken, ValueTask>? beforePublishWaiter,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<FinalPcmBus?>? finalPcmBusProvider)
     {
         var completeSamples = sampleCount - sampleCount % channels;
         if (completeSamples == 0)
@@ -426,6 +474,22 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
         if (beforePublishWaiter is not null)
         {
             await beforePublishWaiter(completeSamples / channels, cancellationToken).ConfigureAwait(false);
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (finalPcmOverlay && finalPcmBusProvider is not null)
+        {
+            // 每个分片在发布时选择本机当前候选；不能把整段文件插话绑定到已退休的总线。
+            finalPcmBus = finalPcmBusProvider();
+            if (finalPcmBus is null || finalPcmBus.Channels != channels)
+            {
+                lock (_gate)
+                {
+                    _lastError = new(WindowsFfmpegPcmDecoderFailureCode.DestinationClosed,
+                        "插话当前 PCM 总线不可用或声道不一致。");
+                }
+                return false;
+            }
         }
 
         if (!finalPcmOverlay && baseMixPolicyProvider is not null
@@ -460,6 +524,21 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
                     samples.AsSpan(0, completeSamples),
                     out framesPublished,
                     out busError);
+            if (!publishSucceeded && finalPcmOverlay
+                && busError?.Code is FinalPcmBusFailureCode.Closed
+                && finalPcmBusProvider is not null)
+            {
+                // 取当前总线后可能恰逢晋升。Closed 保证还未写入，可对新候选重试一次。
+                var replacement = finalPcmBusProvider();
+                if (replacement is not null && !ReferenceEquals(replacement, finalPcmBus)
+                    && replacement.Channels == channels)
+                {
+                    finalPcmBus = replacement;
+                    busDroppedBefore = finalPcmBus.Snapshot.OutputDroppedFrames;
+                    publishSucceeded = finalPcmBus.TryPublishOverlay(
+                        samples.AsSpan(0, completeSamples), out framesPublished, out busError);
+                }
+            }
             if (!publishSucceeded)
             {
                 lock (_gate)
@@ -635,14 +714,15 @@ public sealed class WindowsFfmpegPcmDecoder : IAsyncDisposable
     {
         try
         {
-            return await task.WaitAsync(CleanupTimeout).ConfigureAwait(false);
-        }
-        catch (TimeoutException)
-        {
-            return false;
+            return await task.ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
+            return false;
+        }
+        catch (Exception)
+        {
+            // 用户提供的暂停/混音等待器失败属于本次读取失败，不泄漏异常原文。
             return false;
         }
     }

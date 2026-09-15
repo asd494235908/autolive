@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using GpAutoLive.Contracts;
 
 namespace GpAutoLive.Windows;
 
@@ -6,18 +7,18 @@ namespace GpAutoLive.Windows;
 public static class WindowsVirtualCameraSidecarProtocol
 {
     /// <summary>协议版本。</summary>
-    public const ushort ProtocolVersion = 1;
+    public const ushort ProtocolVersion = 2;
     /// <summary>固定帧 magic。</summary>
     public static ReadOnlySpan<byte> FrameMagic => "GPAKVC01"u8;
     /// <summary>固定帧头长度。</summary>
     public const int FrameHeaderBytes = 52;
-    /// <summary>固定 YUY2 输出宽度。</summary>
+    /// <summary>v1 默认 YUY2 输出宽度。</summary>
     public const uint OutputWidth = 1280;
-    /// <summary>固定 YUY2 输出高度。</summary>
+    /// <summary>v1 默认 YUY2 输出高度。</summary>
     public const uint OutputHeight = 720;
-    /// <summary>固定 payload 字节数。</summary>
-    public const int MaxPayloadBytes = checked((int)(OutputWidth * OutputHeight * 2));
-    /// <summary>单帧完整传输字节数。</summary>
+    /// <summary>有界最大 payload 字节数。</summary>
+    public const int MaxPayloadBytes = checked((int)VirtualCameraRules.MaxFrameBytes);
+    /// <summary>单帧最大传输字节数。</summary>
     public const int EncodedFrameBytes = FrameHeaderBytes + MaxPayloadBytes;
     /// <summary>受控 Named Pipe 名称前缀。</summary>
     public const string PipePrefix = @"\\.\pipe\GpAutoLive-AkVirtualCamera-";
@@ -30,7 +31,9 @@ public static class WindowsVirtualCameraSidecarProtocol
         ulong Generation,
         ulong Sequence,
         long Timestamp100Ns,
-        byte[] Payload);
+        byte[] Payload,
+        uint Width = OutputWidth,
+        uint Height = OutputHeight);
 
     /// <summary>将 16 字节随机会话令牌映射为固定管道名。</summary>
     public static bool TryCreatePipeName(
@@ -93,7 +96,7 @@ public static class WindowsVirtualCameraSidecarProtocol
             return false;
         }
 
-        if (destination.Length < EncodedFrameBytes)
+        if (destination.Length < FrameHeaderBytes + frame!.Payload.Length)
         {
             error = new("sidecar_frame_buffer_too_small", "sidecar 帧目标缓冲区空间不足");
             return false;
@@ -106,12 +109,12 @@ public static class WindowsVirtualCameraSidecarProtocol
         BinaryPrimitives.WriteUInt64LittleEndian(destination[12..], value.Generation);
         BinaryPrimitives.WriteUInt64LittleEndian(destination[20..], value.Sequence);
         BinaryPrimitives.WriteInt64LittleEndian(destination[28..], value.Timestamp100Ns);
-        BinaryPrimitives.WriteUInt32LittleEndian(destination[36..], OutputWidth);
-        BinaryPrimitives.WriteUInt32LittleEndian(destination[40..], OutputHeight);
-        BinaryPrimitives.WriteUInt32LittleEndian(destination[44..], MaxPayloadBytes);
+        BinaryPrimitives.WriteUInt32LittleEndian(destination[36..], value.Width);
+        BinaryPrimitives.WriteUInt32LittleEndian(destination[40..], value.Height);
+        BinaryPrimitives.WriteUInt32LittleEndian(destination[44..], (uint)value.Payload.Length);
         BinaryPrimitives.WriteUInt32LittleEndian(destination[48..], 0);
         value.Payload.AsSpan().CopyTo(destination[FrameHeaderBytes..]);
-        written = EncodedFrameBytes;
+        written = FrameHeaderBytes + value.Payload.Length;
         return true;
     }
 
@@ -137,7 +140,8 @@ public static class WindowsVirtualCameraSidecarProtocol
             return false;
         }
 
-        if (BinaryPrimitives.ReadUInt16LittleEndian(input[8..]) != ProtocolVersion)
+        var version = BinaryPrimitives.ReadUInt16LittleEndian(input[8..]);
+        if (version is not (1 or ProtocolVersion))
         {
             error = InvalidFrame("协议版本不支持");
             return false;
@@ -162,13 +166,17 @@ public static class WindowsVirtualCameraSidecarProtocol
             return false;
         }
 
-        if (width != OutputWidth || height != OutputHeight || payloadLength != MaxPayloadBytes)
+        var config = new VirtualCameraConfig { Width = width, Height = height };
+        if (!config.TryGetFrameBytes(out _, out var expectedBytes)
+            || payloadLength != expectedBytes
+            || (version == 1 && (width != OutputWidth || height != OutputHeight)))
         {
-            error = InvalidFrame("输出规格或 payload 长度不是固定 1280×720 YUY2");
+            error = InvalidFrame("输出尺寸或 YUY2 payload 长度无效");
             return false;
         }
 
-        if (input.Length < EncodedFrameBytes)
+        var encodedBytes = FrameHeaderBytes + expectedBytes;
+        if (input.Length < encodedBytes)
         {
             error = new("sidecar_frame_truncated", "sidecar 帧数据不完整");
             return false;
@@ -178,7 +186,7 @@ public static class WindowsVirtualCameraSidecarProtocol
             generation,
             sequence,
             timestamp,
-            input[FrameHeaderBytes..EncodedFrameBytes].ToArray());
+            input[FrameHeaderBytes..encodedBytes].ToArray(), width, height);
         error = ValidateFrame(candidate);
         if (error is not null)
         {
@@ -186,7 +194,7 @@ public static class WindowsVirtualCameraSidecarProtocol
         }
 
         frame = candidate;
-        consumed = EncodedFrameBytes;
+        consumed = encodedBytes;
         return true;
     }
 
@@ -207,9 +215,10 @@ public static class WindowsVirtualCameraSidecarProtocol
             return InvalidFrame("时间戳不能为负数");
         }
 
-        if (frame.Payload is null || frame.Payload.Length != MaxPayloadBytes)
+        var config = new VirtualCameraConfig { Width = frame.Width, Height = frame.Height };
+        if (!config.TryGetFrameBytes(out _, out var frameBytes) || frame.Payload is null || frame.Payload.Length != frameBytes)
         {
-            return InvalidFrame("YUY2 payload 必须固定为 1280×720×2");
+            return InvalidFrame("YUY2 payload 必须匹配合法输出尺寸");
         }
 
         return null;

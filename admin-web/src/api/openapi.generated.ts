@@ -143,6 +143,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/client/sync/items": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 按全局 revision 增量读取 douyin-desktop 用户资产
+         * @description 作用域只来自已认证的 desktop 会话及其有效设备绑定；仅支持 product=douyin_desktop。
+         */
+        get: operations["listClientSyncItems"];
+        put?: never;
+        /**
+         * 使用 CAS 与 mutation 幂等写入 douyin-desktop 用户资产
+         * @description 每项使用自带 mutation_id 保证幂等；请求体不得提交 user、product 或 device 作用域。
+         *     新建项 base_revision=0；更新或删除必须等于当前 revision。批内任一冲突时整批不提交。
+         *     model_config 的 item_id 固定为 global-model-config；persona_version / policy_version
+         *     分别使用 global-persona-v{version} / global-policy-v{version}，且版本必须与 payload 一致。
+         *     知识项必须按来源、文档、分块/规则的父子顺序写入；规则只能引用同一文档的活动分块。
+         *     删除父项前必须先按规则、分块、文档、来源的顺序删除活动子项。
+         */
+        post: operations["writeClientSyncItems"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/client/model-leases": {
         parameters: {
             query?: never;
@@ -1032,6 +1061,152 @@ export interface components {
             device: components["schemas"]["DeviceSummary"];
             permissions: string[];
         };
+        ClientSyncId: string;
+        /** @enum {string} */
+        ClientSyncKind: "persona_version" | "policy_version" | "model_config" | "knowledge_source" | "knowledge_document" | "knowledge_chunk" | "knowledge_rule" | "memory";
+        ClientSyncMutation: {
+            mutation_id: components["schemas"]["ClientSyncId"];
+            kind: components["schemas"]["ClientSyncKind"];
+            /** @description 模型配置与人设/策略版本使用固定语义标识；知识项和记忆使用稳定业务标识。 */
+            item_id: components["schemas"]["ClientSyncId"];
+            /** Format: int64 */
+            base_revision: number;
+            deleted: boolean;
+            /** @description 服务端按 kind 精确匹配 schema；单项序列化后最多 256 KiB，并递归拒绝秘密键。删除墓碑必须省略。 */
+            payload?: components["schemas"]["ClientSyncPayload"];
+        } & (unknown & unknown);
+        ClientSyncWriteRequest: {
+            items: components["schemas"]["ClientSyncMutation"][];
+        };
+        ClientSyncItem: {
+            kind: components["schemas"]["ClientSyncKind"];
+            item_id: components["schemas"]["ClientSyncId"];
+            /** Format: int64 */
+            revision: number;
+            deleted: boolean;
+            payload?: components["schemas"]["ClientSyncPayload"];
+            updated_by_device_id: components["schemas"]["ClientSyncId"];
+            updated_at: components["schemas"]["Timestamp"];
+        } & (unknown & unknown);
+        ClientSyncReceipt: {
+            mutation_id: components["schemas"]["ClientSyncId"];
+            kind: components["schemas"]["ClientSyncKind"];
+            item_id: components["schemas"]["ClientSyncId"];
+            /** Format: int64 */
+            revision: number;
+            deleted: boolean;
+        };
+        ClientSyncPageResponse: {
+            request_id: string;
+            items: components["schemas"]["ClientSyncItem"][];
+            /** Format: int64 */
+            next_cursor: number;
+            has_more: boolean;
+            /** Format: int64 */
+            server_revision: number;
+        };
+        ClientSyncWriteResponse: {
+            request_id: string;
+            items: components["schemas"]["ClientSyncReceipt"][];
+            /** Format: int64 */
+            server_revision: number;
+        };
+        ClientSyncPayload: components["schemas"]["PersonaVersionSyncPayload"] | components["schemas"]["PolicyVersionSyncPayload"] | components["schemas"]["ModelConfigSyncPayload"] | components["schemas"]["KnowledgeSourceSyncPayload"] | components["schemas"]["KnowledgeDocumentSyncPayload"] | components["schemas"]["KnowledgeChunkSyncPayload"] | components["schemas"]["KnowledgeRuleSyncPayload"] | components["schemas"]["MemorySyncPayload"];
+        PersonaVersionSyncPayload: {
+            version: number;
+            content: Record<string, never>;
+            created_at: components["schemas"]["Timestamp"];
+        };
+        PolicyVersionSyncPayload: {
+            version: number;
+            score_threshold: number;
+            minimum_confidence: number;
+            daily_send_quota: number;
+            /** @enum {string} */
+            automation_level: "disabled" | "dry_run" | "manual" | "limited" | "regular";
+            auto_send_enabled: boolean;
+            content: Record<string, never>;
+            created_at: components["schemas"]["Timestamp"];
+        };
+        ModelConfigSyncPayload: {
+            /** @enum {string} */
+            retrieval_mode: "economy" | "high_quality";
+            /**
+             * Format: uri
+             * @description 允许 HTTP 或 HTTPS；禁止 URL 用户信息、query 和 fragment。HTTP 仅适用于用户明确配置的本地或受信模型服务。
+             */
+            chat_base_url: string;
+            chat_model: string;
+            /**
+             * Format: uri
+             * @description 允许 HTTP 或 HTTPS；禁止 URL 用户信息、query 和 fragment。HTTP 仅适用于用户明确配置的本地或受信模型服务。
+             */
+            embedding_base_url: string;
+            embedding_model: string;
+            embedding_dimensions: number | null;
+            config_version: number;
+            updated_at: components["schemas"]["Timestamp"];
+        };
+        KnowledgeSourceSyncPayload: {
+            /** @enum {string} */
+            source_type: "file" | "manual" | "web";
+            title: string;
+            original_name: string;
+            source_key: string | null;
+            content_hash: string | null;
+            /** @enum {string} */
+            status: "active" | "disabled" | "failed";
+            created_at: components["schemas"]["Timestamp"];
+            updated_at: components["schemas"]["Timestamp"];
+        };
+        KnowledgeDocumentSyncPayload: {
+            source_id: components["schemas"]["ClientSyncId"];
+            version: number;
+            content_hash: components["schemas"]["Sha256Hex"];
+            parser_version: string;
+            chunker_version: string;
+            /** @enum {string} */
+            status: "parsed" | "indexing" | "indexed" | "failed";
+            metadata: Record<string, never>;
+            created_at: components["schemas"]["Timestamp"];
+        };
+        KnowledgeChunkSyncPayload: {
+            document_id: components["schemas"]["ClientSyncId"];
+            ordinal: number;
+            text: string;
+            locator: Record<string, never>;
+            chunker_version: string;
+            enabled: boolean;
+            created_at: components["schemas"]["Timestamp"];
+        };
+        KnowledgeRuleSyncPayload: {
+            document_id: components["schemas"]["ClientSyncId"];
+            /** @enum {string} */
+            condition_kind: "literal_contains" | "semantic";
+            condition_text: string;
+            reply_guidance: string;
+            literal_terms: string[];
+            record_ids: components["schemas"]["ClientSyncId"][];
+            rule_fingerprint: components["schemas"]["Sha256Hex"];
+            /** @enum {string} */
+            status: "pending" | "active" | "rejected";
+            created_at: components["schemas"]["Timestamp"];
+            updated_at: components["schemas"]["Timestamp"];
+        };
+        MemorySyncPayload: {
+            reusable_situation: string;
+            response_pattern: string;
+            tags: string[];
+            exclusions: string[];
+            confidence: number;
+            revision: number;
+            expires_at: components["schemas"]["Timestamp"] | null;
+            /** @enum {string} */
+            lifecycle_state: "enabled" | "disabled" | "deleted";
+            created_at: components["schemas"]["Timestamp"];
+            updated_at: components["schemas"]["Timestamp"];
+            cloud_source_ref: components["schemas"]["ClientSyncId"];
+        };
         CreateModelPoolAccountRequest: {
             provider: string;
             model: string;
@@ -1738,6 +1913,70 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             408: components["responses"]["RequestTimeout"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    listClientSyncItems: {
+        parameters: {
+            query?: {
+                after_revision?: number;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 按 revision 升序返回当前事实或删除墓碑 */
+            200: {
+                headers: {
+                    "X-Request-Id": components["headers"]["X-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientSyncPageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            408: components["responses"]["RequestTimeout"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    writeClientSyncItems: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ClientSyncWriteRequest"];
+            };
+        };
+        responses: {
+            /** @description 写入已提交，或按相同 mutation_id 返回原回执 */
+            200: {
+                headers: {
+                    "X-Request-Id": components["headers"]["X-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientSyncWriteResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            408: components["responses"]["RequestTimeout"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     createModelLease: {

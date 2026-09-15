@@ -50,7 +50,10 @@ public sealed class MpvNamedPipeClientTests
             Assert.IsNotNull(requestLine);
             using var request = JsonDocument.Parse(requestLine!);
             Assert.AreEqual(42UL, request.RootElement.GetProperty("request_id").GetUInt64());
-            await writer.WriteLineAsync("{\"event\":\"property-change\",\"id\":1,\"name\":\"time-pos\",\"data\":1.0}");
+            await writer.WriteLineAsync("{\"event\":\"file-loaded\"}");
+            await writer.WriteLineAsync("{\"event\":\"playback-restart\"}");
+            await writer.WriteLineAsync("{\"event\":\"playback-restart\"}");
+            await writer.WriteLineAsync("{\"event\":\"file-loaded\"}");
             await writer.WriteLineAsync("{\"error\":\"success\",\"request_id\":42,\"data\":2.5}");
         });
 
@@ -64,6 +67,9 @@ public sealed class MpvNamedPipeClientTests
 
         Assert.IsTrue(result.IsSuccess);
         Assert.AreEqual(2.5, result.Frame?.Data?.GetDouble());
+        Assert.AreEqual(2L, client.LoadedGeneration);
+        Assert.AreEqual(1L, client.RestartedGeneration);
+        Assert.AreEqual(2L, client.PlaybackRestartSequence);
         await serverTask;
     }
 

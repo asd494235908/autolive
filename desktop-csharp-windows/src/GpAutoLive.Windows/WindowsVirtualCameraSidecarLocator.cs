@@ -14,13 +14,15 @@ public enum WindowsVirtualCameraSidecarProbeCode
 public sealed record WindowsVirtualCameraSidecarProbeResult(
     WindowsVirtualCameraSidecarProbeCode Code,
     string? ExecutablePath = null,
-    WindowsAuthenticodeProbeCode? SignatureCode = null)
+    WindowsAuthenticodeProbeCode? SignatureCode = null,
+    bool IsDevelopmentTrusted = false)
 {
     /// <summary>sidecar 是否已通过文件、目录和 x64 PE 校验。</summary>
     public bool IsAvailable => Code == WindowsVirtualCameraSidecarProbeCode.Available;
 
     /// <summary>sidecar 是否同时通过 Authenticode 签名门禁。</summary>
-    public bool IsTrusted => IsAvailable && SignatureCode == WindowsAuthenticodeProbeCode.Valid;
+    public bool IsTrusted => IsAvailable && (SignatureCode == WindowsAuthenticodeProbeCode.Valid || IsDevelopmentTrusted);
+    public string DiagnosticCode => IsDevelopmentTrusted ? "development_hash_verified" : IsTrusted ? "signature_verified" : "signature_required";
 }
 
 /// <summary>
@@ -90,7 +92,11 @@ public static class WindowsVirtualCameraSidecarLocator
         Func<string, string?>? readEnvironment = null)
     {
         readEnvironment ??= Environment.GetEnvironmentVariable;
-        return Probe(readEnvironment(InstallRootEnvironmentVariable));
+        var result = Probe(readEnvironment(InstallRootEnvironmentVariable));
+        return result.IsAvailable && result.ExecutablePath is not null
+            && WindowsVirtualCameraDevelopmentTrust.TryGetRoot(result.ExecutablePath, out var root, readEnvironment)
+            && WindowsVirtualCameraDevelopmentTrust.ValidateManifest(root)
+            ? result with { IsDevelopmentTrusted = true } : result;
     }
 
     private static bool TryResolveInstallRoot(string? value, out string root)

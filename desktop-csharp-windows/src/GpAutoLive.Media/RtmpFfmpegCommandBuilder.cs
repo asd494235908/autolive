@@ -117,11 +117,7 @@ public static class RtmpFfmpegCommandBuilder
         // 不把原始 stderr 或目标地址传播到状态层。
         arguments.Add("-progress");
         arguments.Add("pipe:2");
-        // audio_enabled 时 stdin 是最终 PCM 输入，不能再关闭标准输入。
-        if (!config.AudioEnabled)
-        {
-            arguments.Add("-nostdin");
-        }
+        // 纯视频保留 stdin 的 q 退出控制；启用声音时 stdin 由最终 PCM 独占。
 
         var inputIndex = 0;
         if (config.VideoEnabled)
@@ -142,8 +138,8 @@ public static class RtmpFfmpegCommandBuilder
 
         if (config.AudioEnabled)
         {
-            // The process host does not expose stdin yet; the flag documents the
-            // final-PCM boundary and prevents accidentally reading source audio twice.
+            // stdin is owned by the RTMP process host and receives the final PCM;
+            // this prevents the output plan from accidentally reading source audio twice.
             arguments.Add("-f");
             arguments.Add("f32le");
             arguments.Add("-ar");
@@ -198,6 +194,14 @@ public static class RtmpFfmpegCommandBuilder
             arguments.Add("2");
         }
 
+        if (config.VideoEnabled && config.AudioEnabled)
+        {
+            arguments.Add("-shortest");
+            // MF 编码延迟与默认 10 秒 shortest 缓冲会阻塞小分片 PCM；
+            // 固定同步缓冲边界让连续输入、短暂空隙和 EOF 均保持可退出。
+            arguments.Add("-shortest_buf_duration");
+            arguments.Add("0.1");
+        }
         arguments.Add("-f");
         arguments.Add("flv");
         arguments.Add("-flvflags");
@@ -303,10 +307,6 @@ public static class RtmpFfmpegCommandBuilder
             case "h264_qsv":
                 arguments.Add("-preset");
                 arguments.Add("veryfast");
-                break;
-            case "h264_mf":
-                arguments.Add("-quality");
-                arguments.Add("speed");
                 break;
             case "libopenh264":
                 arguments.Add("-threads");

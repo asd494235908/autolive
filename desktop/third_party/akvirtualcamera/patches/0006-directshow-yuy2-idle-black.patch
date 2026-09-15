@@ -1,0 +1,51 @@
+diff --git a/windows/dshow/BaseFilter/src/pin.cpp b/windows/dshow/BaseFilter/src/pin.cpp
+index 4d88cc9..f830a85 100644
+--- a/windows/dshow/BaseFilter/src/pin.cpp
++++ b/windows/dshow/BaseFilter/src/pin.cpp
+@@ -32,6 +32,7 @@
+ #include <uuids.h>
+ 
+ #include "pin.h"
++#include "yuy2_black_frame.h"
+ #include "basefilter.h"
+ #include "enummediatypes.h"
+ #include "memallocator.h"
+@@ -328,6 +329,9 @@ void AkVCam::Pin::frameReady(const VideoFrame &frame, bool isActive)
+                    frame.constData(),
+                    frame.size());
+             this->d->m_frameReady = true;
++        } else if (!isActive && format.format() == PixelFormat_yuyv422) {
++            // Product direct-mode output becomes black when its producer stops.
++            this->d->m_frameReady = false;
+         } else if (!isActive && this->d->m_testFrame) {
+             this->d->m_currentFrame =
+                     this->d->applyAdjusts(this->d->m_testFrame);
+@@ -1331,6 +1335,10 @@ AkVCam::VideoFrame AkVCam::PinPrivate::randomFrame()
+     auto format = formatFromMediaType(this->m_mediaType);
+ 
+     VideoFrame frame(format);
++    if (this->m_directMode && format.format() == PixelFormat_yuyv422) {
++        fillYuy2BlackFrame(frame.data(), frame.size());
++        return frame;
++    }
+     static std::uniform_int_distribution<int> distribution(0, 255);
+     static std::default_random_engine engine;
+     std::generate(frame.data(),
+diff --git a/windows/dshow/BaseFilter/src/yuy2_black_frame.h b/windows/dshow/BaseFilter/src/yuy2_black_frame.h
+new file mode 100644
+index 0000000..791a136
+--- /dev/null
++++ b/windows/dshow/BaseFilter/src/yuy2_black_frame.h
+@@ -0,0 +1,12 @@
++// GpAutoLive modification, GPL-3.0-or-later.
++#pragma once
++#include <cstddef>
++#include <cstdint>
++
++namespace AkVCam {
++// YUY2 limited-range black: Y0=16, U=128, Y1=16, V=128.
++inline void fillYuy2BlackFrame(std::uint8_t *data, std::size_t bytes) {
++    for (std::size_t index = 0; index < bytes; ++index)
++        data[index] = index % 2 == 0 ? 16 : 128;
++}
++}

@@ -62,13 +62,14 @@ public sealed record WindowsRtmpResult(
 
 /// <summary>
 /// Windows 专用 RTMP 长生命周期宿主。它只消费已校验的 FFmpeg 参数计划，
-/// 通过 Job Object 优先、Process.Kill 兜底回收进程树；声音输入由最终 PCM 总线写入。
+/// 先正常结束输出，再通过 Job Object/Process.Kill 兜底；声音输入由最终 PCM 总线写入。
 /// </summary>
 public sealed class WindowsRtmpOutputManager : IAsyncDisposable
 {
     private const int MaxProgressLineCharacters = 8 * 1024;
     private const int MaxPcmFloatsPerWrite = 48_000 * 2;
     private static readonly TimeSpan CleanupTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan GracefulStopTimeout = TimeSpan.FromMilliseconds(1_500);
     private readonly object _gate = new();
     private readonly SemaphoreSlim _serial = new(1, 1);
     private readonly SemaphoreSlim _audioSerial = new(1, 1);
@@ -208,7 +209,7 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
             {
                 if (!process.Start())
                 {
-                    return await FailStartAsync(process).ConfigureAwait(false);
+                    return await FailStartAsync().ConfigureAwait(false);
                 }
 
                 WindowsJobObject? candidateJob = null;
@@ -236,6 +237,14 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
                 if (HasExited(process))
                 {
                     Process_Exited(process, EventArgs.Empty);
+                    // Start 持有 _serial，Exited 回调只能标记失败；由当前所有者 Join。
+                    var stopped = await StopCoreAsync().ConfigureAwait(false);
+                    lock (_gate)
+                    {
+                        if (stopped.IsSuccess) _state = RtmpOutputState.Failed;
+                        _errorCode = "rtmp_process_exited";
+                        _error = "RTMP 进程启动后立即退出。";
+                    }
                     return Failure(
                         WindowsRtmpFailureCode.ProcessExited,
                         "RTMP 进程启动后立即退出。",
@@ -252,12 +261,20 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
             }
             catch (Exception exception) when (IsStartFailure(exception))
             {
-                return await FailStartAsync(process).ConfigureAwait(false);
+                return await FailStartAsync().ConfigureAwait(false);
             }
         }
         finally
         {
             _serial.Release();
+            // 退出可能发生在最后一次 HasExited 检查与释放串行锁之间。
+            // 回调当时不能抢占 Start；释放后补偿一次，仍由同一串行清理路径收尾。
+            Process? startedProcess;
+            lock (_gate) { startedProcess = _process; }
+            if (startedProcess is not null && HasExited(startedProcess))
+            {
+                Process_Exited(startedProcess, EventArgs.Empty);
+            }
         }
     }
 
@@ -301,6 +318,14 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
         {
             await _audioSerial.WaitAsync(cancellationToken).ConfigureAwait(false);
             enteredAudioSerial = true;
+            lock (_gate)
+            {
+                if (_disposed || _state is not (RtmpOutputState.Starting or RtmpOutputState.Publishing)
+                    || !ReferenceEquals(input, _standardInput))
+                {
+                    return Failure(WindowsRtmpFailureCode.NotRunning, "RTMP 推流当前未运行。", retryable: true);
+                }
+            }
             var byteCount = checked(interleavedPcm.Length * sizeof(float));
             var buffer = ArrayPool<byte>.Shared.Rent(byteCount);
             try
@@ -384,12 +409,13 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
 
             _disposed = true;
             var stopped = await StopCoreAsync().ConfigureAwait(false);
-            if (stopped.IsSuccess)
+            if (!stopped.IsSuccess)
             {
-                lock (_gate)
-                {
-                    _state = RtmpOutputState.Idle;
-                }
+                throw new InvalidOperationException(stopped.Error?.Message ?? "RTMP 进程尚未退出，保留所有者供重试。");
+            }
+            lock (_gate)
+            {
+                _state = RtmpOutputState.Idle;
             }
         }
         finally
@@ -409,7 +435,7 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
             UseShellExecute = false,
             CreateNoWindow = true,
             WindowStyle = ProcessWindowStyle.Hidden,
-            RedirectStandardInput = plan.RequiresFinalPcmInput,
+            RedirectStandardInput = true,
             RedirectStandardOutput = false,
             RedirectStandardError = true,
         };
@@ -424,12 +450,12 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
 
     private async Task<WindowsRtmpResult> StopCoreAsync()
     {
+        var watch = Stopwatch.StartNew();
         Process? process;
         WindowsJobObject? job;
         Stream? input;
         Task? stderrTask;
         CancellationTokenSource? stderrCancellation;
-        var hasProcess = true;
         lock (_gate)
         {
             process = _process;
@@ -437,151 +463,112 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
             input = _standardInput;
             stderrTask = _stderrTask;
             stderrCancellation = _stderrCancellation;
-            if (process is null)
-            {
-                _state = RtmpOutputState.Idle;
-                hasProcess = false;
-            }
-            else
-            {
-                _state = RtmpOutputState.Stopping;
-            }
+            _state = process is null ? RtmpOutputState.Idle : RtmpOutputState.Stopping;
         }
 
-        if (!hasProcess)
+        if (process is null)
         {
             PublishSnapshot();
             return Success();
         }
 
-        var activeProcess = process!;
-
-        stderrCancellation?.Cancel();
-        var exited = HasExited(activeProcess);
-        if (!exited)
+        // 全部阶段共用期限；正常退出期间 stderr 保持读取，避免 finalize 被管道背压阻塞。
+        if (!HasExited(process))
         {
-            KillProcessTree(activeProcess, job);
-            exited = await WaitForExitBoundedAsync(activeProcess).ConfigureAwait(false);
+            var entered = await _audioSerial.WaitAsync(Remaining(watch, GracefulStopTimeout)).ConfigureAwait(false);
+            if (entered)
+            {
+                try
+                {
+                    if (input is not null)
+                    {
+                        input.Dispose(); // 最终 PCM EOF；绝不往 PCM 写入控制字符。
+                    }
+                    else
+                    {
+                        using var quitCancellation = new CancellationTokenSource(Remaining(watch, GracefulStopTimeout));
+                        await process.StandardInput.BaseStream.WriteAsync(
+                            new byte[] { (byte)'q', (byte)'\n' }, quitCancellation.Token).ConfigureAwait(false);
+                    }
+                }
+                catch (Exception exception) when (exception is IOException or ObjectDisposedException or OperationCanceledException or InvalidOperationException)
+                {
+                    // 正常结束请求失败仍须执行强杀与 Join，不把请求提交视为完成。
+                }
+                finally { _audioSerial.Release(); }
+                await WaitForExitBoundedAsync(process, watch, GracefulStopTimeout).ConfigureAwait(false);
+            }
         }
 
-        if (!exited)
+        if (!HasExited(process))
         {
-            // 未确认进程退出前不能丢弃 PID、Job 或 stdin；保留 Stopping 状态，
-            // 允许后续 StopAsync 重试，避免无 Job 兜底时留下孤儿 FFmpeg。
-            return Failure(
-                WindowsRtmpFailureCode.StopTimedOut,
-                "RTMP 进程未能在停止预算内退出。",
-                retryable: true);
+            KillProcessTree(process, job);
+            await WaitForExitBoundedAsync(process, watch, CleanupTimeout).ConfigureAwait(false);
+        }
+        if (!HasExited(process))
+        {
+            return Failure(WindowsRtmpFailureCode.StopTimedOut, "RTMP 进程未能在停止预算内退出。", retryable: true);
         }
 
-        var audioSerialAcquired = false;
-        if (input is not null)
+        // 取锁超时绝不能关闭仍被写入的 stdin；Kill/进程 Join 后再等待写入者结束。
+        if (!await _audioSerial.WaitAsync(Remaining(watch, CleanupTimeout)).ConfigureAwait(false))
         {
-            audioSerialAcquired = await _audioSerial.WaitAsync(CleanupTimeout).ConfigureAwait(false);
+            return Failure(WindowsRtmpFailureCode.StopTimedOut, "RTMP PCM 写入未能在停止预算内结束。", retryable: true);
         }
-
-        if (input is not null && !audioSerialAcquired)
-        {
-            // 不能关闭仍可能被写入的 stdin；保留资源给下一次 StopAsync 重试，避免
-            // 画面进程、最终 PCM 泵和音频写入者出现半回收状态。
-            return Failure(
-                WindowsRtmpFailureCode.StopTimedOut,
-                "RTMP PCM 写入未能在停止预算内结束。",
-                retryable: true);
-        }
-
         try
         {
             input?.Dispose();
-            lock (_gate)
-            {
-                if (ReferenceEquals(_process, process))
-                {
-                    _standardInput = null;
-                    _stderrTask = null;
-                    _stderrCancellation = null;
-                }
-            }
         }
-        catch (IOException)
-        {
-        }
-        finally
-        {
-            if (audioSerialAcquired)
-            {
-                _audioSerial.Release();
-            }
-        }
+        catch (IOException) { }
+        finally { _audioSerial.Release(); }
 
+        stderrCancellation?.Cancel();
         if (stderrTask is not null)
         {
-            try
+            try { await stderrTask.WaitAsync(Remaining(watch, CleanupTimeout)).ConfigureAwait(false); }
+            catch (TimeoutException)
             {
-                await stderrTask.WaitAsync(CleanupTimeout).ConfigureAwait(false);
+                return Failure(WindowsRtmpFailureCode.StopTimedOut, "RTMP 进程输出读取任务尚未退出。", retryable: true);
             }
-            catch (Exception)
-            {
-                // 读取任务只保存有界状态，不把 stderr 原文传播到 UI。
-            }
+            catch (Exception) { /* 已 Join 的读取错误不暴露 stderr 原文。 */ }
         }
 
-        stderrCancellation?.Dispose();
-        var exitCode = SafeExitCode(activeProcess);
-        activeProcess.Exited -= Process_Exited;
-        activeProcess.Dispose();
+        var exitCode = SafeExitCode(process);
+        process.Exited -= Process_Exited;
+        process.Dispose();
         job?.Dispose();
+        stderrCancellation?.Dispose();
         lock (_gate)
         {
+            _standardInput = null;
+            _stderrTask = null;
+            _stderrCancellation = null;
             _process = null;
             _job = null;
             _exitCode = exitCode;
             _state = RtmpOutputState.Idle;
         }
         PublishSnapshot();
-
-        return exited
-            ? Success()
-            : Failure(WindowsRtmpFailureCode.StopTimedOut, "RTMP 进程未能在停止预算内退出。", retryable: false);
+        return Success();
     }
 
-    private async Task<WindowsRtmpResult> FailStartAsync(Process process)
+    private static TimeSpan Remaining(Stopwatch watch, TimeSpan budget)
     {
-        WindowsJobObject? job;
+        var elapsed = watch.Elapsed;
+        return elapsed < budget ? budget - elapsed : TimeSpan.Zero;
+    }
+    private async Task<WindowsRtmpResult> FailStartAsync()
+    {
+        // Start/Stop 共享同一个串行所有者和清理路径，包括已初始化的 stdin/读取任务。
+        await StopCoreAsync().ConfigureAwait(false);
         lock (_gate)
         {
-            job = _job;
-            _state = RtmpOutputState.Failed;
-        }
-
-        KillProcessTree(process, job);
-        var exited = await WaitForExitBoundedAsync(process).ConfigureAwait(false);
-        if (!exited)
-        {
-            lock (_gate)
-            {
-                _errorCode = "rtmp_process_start_failed";
-                _error = "RTMP 推流进程无法启动。";
-            }
-
-            return Failure(WindowsRtmpFailureCode.StartFailed, "RTMP 推流进程无法启动。", retryable: true);
-        }
-        var exitCode = SafeExitCode(process);
-        process.Exited -= Process_Exited;
-        process.Dispose();
-        job?.Dispose();
-        lock (_gate)
-        {
-            _process = null;
-            _job = null;
-            _exitCode = exitCode;
+            if (_process is null) _state = RtmpOutputState.Failed;
             _errorCode = "rtmp_process_start_failed";
             _error = "RTMP 推流进程无法启动。";
         }
-
         return Failure(WindowsRtmpFailureCode.StartFailed, "RTMP 推流进程无法启动。", retryable: true);
     }
-
     private async Task DrainStderrAsync(StreamReader reader, CancellationToken cancellationToken)
     {
         var buffer = new char[4_096];
@@ -724,12 +711,13 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
 
         if (release)
         {
-            // 自然退出是失败终态：关闭 PCM stdin、取消 stderr 读取并清除 PID，
-            // 让上层不会继续向已退出的画面/声音组合写入。
-            if (ReleaseExitedProcess(preserveFailure: true))
+            // 与 Start/Stop 共用唯一清理所有者；忙时由串行操作收尾，不能并发 Dispose。
+            if (_serial.Wait(0))
             {
-                PublishSnapshot();
+                try { ReleaseExitedProcess(preserveFailure: true); }
+                finally { _serial.Release(); }
             }
+            PublishSnapshot();
         }
     }
 
@@ -753,6 +741,7 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
 
     private bool ReleaseExitedProcess(bool preserveFailure = false)
     {
+        var watch = Stopwatch.StartNew();
         Process? process;
         WindowsJobObject? job;
         Stream? input;
@@ -773,7 +762,7 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
 
         // Exited 事件可能与最后一段 PCM 写入并发；只有取得写入串行锁后才可
         // 关闭 stdin 和释放进程资源。
-        var audioSerialEntered = input is null || _audioSerial.Wait(CleanupTimeout);
+        var audioSerialEntered = _audioSerial.Wait(Remaining(watch, CleanupTimeout));
         if (!audioSerialEntered)
         {
             return false;
@@ -781,6 +770,11 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
 
         try
         {
+            stderrCancellation?.Cancel();
+            if (!WaitForTaskBounded(stderrTask, Remaining(watch, CleanupTimeout)))
+            {
+                return false;
+            }
             lock (_gate)
             {
                 if (!ReferenceEquals(_process, process))
@@ -796,8 +790,6 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
                 _state = preserveFailure ? RtmpOutputState.Failed : RtmpOutputState.Idle;
             }
 
-            stderrCancellation?.Cancel();
-            WaitForTaskBounded(stderrTask);
             stderrCancellation?.Dispose();
             try
             {
@@ -813,45 +805,42 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
         }
         finally
         {
-            if (audioSerialEntered && input is not null)
+            if (audioSerialEntered)
             {
                 _audioSerial.Release();
             }
         }
     }
 
-    private static void WaitForTaskBounded(Task? task)
+    private static bool WaitForTaskBounded(Task? task, TimeSpan timeout)
     {
         if (task is null)
         {
-            return;
+            return true;
         }
 
         try
         {
-            task.Wait(CleanupTimeout);
+            return task.Wait(timeout);
         }
         catch (AggregateException)
         {
             // 读取任务内部只记录脱敏状态；清理阶段无需向上传播其异常。
+            return true;
         }
     }
 
-    private static async Task<bool> WaitForExitBoundedAsync(Process process)
+    private static async Task<bool> WaitForExitBoundedAsync(Process process, Stopwatch watch, TimeSpan budget)
     {
-        try
+        // .NET 可先观察到 ExitCode，内核句柄却尚未终止；不以 HasExited/退出事件代替 Join。
+        while (!HasExited(process))
         {
-            await process.WaitForExitAsync().WaitAsync(CleanupTimeout).ConfigureAwait(false);
-            return true;
+            var remaining = Remaining(watch, budget);
+            if (remaining <= TimeSpan.Zero) return false;
+            await Task.Delay(remaining < TimeSpan.FromMilliseconds(10)
+                ? remaining : TimeSpan.FromMilliseconds(10)).ConfigureAwait(false);
         }
-        catch (InvalidOperationException)
-        {
-            return true;
-        }
-        catch (TimeoutException)
-        {
-            return HasExited(process);
-        }
+        return true;
     }
 
     private static void KillProcessTree(Process process, WindowsJobObject? job)
@@ -863,7 +852,7 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
 
         try
         {
-            if (!process.HasExited)
+            if (!HasExited(process))
             {
                 process.Kill(entireProcessTree: true);
             }
@@ -883,7 +872,7 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
     {
         try
         {
-            return process.HasExited;
+            return process.WaitForExit(0);
         }
         catch (InvalidOperationException)
         {
@@ -891,7 +880,7 @@ public sealed class WindowsRtmpOutputManager : IAsyncDisposable
         }
         catch (System.ComponentModel.Win32Exception)
         {
-            return true;
+            return false;
         }
     }
 

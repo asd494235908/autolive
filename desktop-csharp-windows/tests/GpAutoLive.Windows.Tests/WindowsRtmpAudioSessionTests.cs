@@ -8,6 +8,34 @@ namespace GpAutoLive.Windows.Tests;
 public sealed class WindowsRtmpAudioSessionTests
 {
     [TestMethod]
+    [DataRow(2_000L, 1.0)]
+    [DataRow(0L, 1.2)]
+    public async Task Independent_audio_validates_the_video_start_and_rate_before_creating_a_host(long positionMs, double rate)
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            await using var manager = new WindowsRtmpOutputManager();
+            await using var session = new WindowsRtmpAudioSession(manager);
+            var source = new SourceMediaDto(path, "media://test", MediaKind.Video,
+                MediaCompatibilityMode.Direct, "test.mp4", 1, 1_000, null, null,
+                1_280, 720, 30, 48_000, 2, "h264", "aac", null, "disabled");
+            var result = await session.StartAsync(
+                RtmpOutputConfig.Default with { TargetUrl = "rtmp://127.0.0.1/live/test" },
+                source, Environment.ProcessPath,
+                new RtmpSourceIdentity(1, 1, 0, 0, (ulong)positionMs, 1_000),
+                audioEffects: new AudioEffectParams { PlaybackSpeed = rate });
+            Assert.IsFalse(result.IsSuccess);
+            Assert.AreEqual(WindowsRtmpAudioSessionFailureCode.InvalidArguments, result.Error?.Code);
+            Assert.AreEqual(RtmpOutputState.Idle, manager.Snapshot.State);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [TestMethod]
     public void Pump_failure_is_projected_but_stop_cancellation_is_not_a_failure()
     {
         var failure = new WindowsRtmpPcmPumpResult(

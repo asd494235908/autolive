@@ -6,6 +6,16 @@ namespace GpAutoLive.Windows.Tests;
 public sealed class WindowsVirtualCameraSidecarStatusParserTests
 {
     [TestMethod]
+    public void Output_ready_requires_exact_fixed_status_line()
+    {
+        Assert.IsTrue(WindowsVirtualCameraSidecarStatusParser.IsOutputReady("GPAKVC_OUTPUT_READY"u8));
+        Assert.IsTrue(WindowsVirtualCameraSidecarStatusParser.IsOutputReady("GPAKVC_OUTPUT_READY\r"u8));
+        Assert.IsFalse(WindowsVirtualCameraSidecarStatusParser.IsOutputReady("GPAKVC_OUTPUT_READY extra"u8));
+        Assert.IsFalse(WindowsVirtualCameraSidecarStatusParser.IsOutputReady("GPAKVC_OUTPUT_READY\n"u8));
+        Assert.IsFalse(WindowsVirtualCameraSidecarStatusParser.IsOutputReady("GPAKVC_CLIENTS 1"u8));
+    }
+
+    [TestMethod]
     public void Parses_bounded_client_count()
     {
         Assert.IsTrue(WindowsVirtualCameraSidecarStatusParser.TryParseClientCount("GPAKVC_CLIENTS 12"u8, out var count));

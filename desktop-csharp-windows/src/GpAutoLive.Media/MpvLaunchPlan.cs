@@ -171,6 +171,8 @@ public sealed class MpvLaunchPlan
         arguments.Add("--input-vo-keyboard=no");
         arguments.Add("--terminal=no");
         arguments.Add("--keep-open=yes");
+        // TS 解复用可能落到目标后的关键帧；提前读取后由 mpv 精确解码至目标。
+        arguments.Add("--hr-seek-demuxer-offset=2");
         arguments.Add("--vo=gpu-next");
         arguments.Add("--audio=no");
         arguments.Add(mode switch

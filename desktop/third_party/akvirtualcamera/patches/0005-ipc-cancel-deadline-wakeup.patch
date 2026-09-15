@@ -1,0 +1,662 @@
+diff --git a/VCamUtils/src/messageclient.cpp b/VCamUtils/src/messageclient.cpp
+--- a/VCamUtils/src/messageclient.cpp
++++ b/VCamUtils/src/messageclient.cpp
+@@ -31,6 +31,12 @@
+ 
+ namespace AkVCam
+ {
++    struct SocketCloser
++    {
++        SocketType socket;
++        ~SocketCloser() { Sockets::closeSocket(socket); }
++    };
++
+     class MessageClientPrivate
+     {
+         public:
+@@ -42,7 +48,8 @@ namespace AkVCam
+             static std::string getLastError();
+             bool connection(uint16_t port,
+                             MessageClient::InMessageHandler readData,
+-                            MessageClient::OutMessageHandler writeData);
++                            MessageClient::OutMessageHandler writeData,
++                            std::shared_ptr<std::atomic_bool> cancelled = {});
+     };
+ }
+ 
+@@ -74,13 +81,15 @@ bool AkVCam::MessageClient::isUp(uint16_t port)
+     AkLogDebug("Port: %d", port);
+     auto clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+ 
+-    if (clientSocket < 0) {
++    if (clientSocket == SocketType(-1)) {
+         AkLogCritical("Failed creating the socket: %s",
+                       std::system_error(errno, std::system_category()).what());
+ 
+         return false;
+     }
+ 
++    SocketCloser owner {clientSocket};
++
+     // Set the port
+     sockaddr_in serverAddress;
+     serverAddress.sin_family = AF_INET;
+@@ -88,16 +97,16 @@ bool AkVCam::MessageClient::isUp(uint16_t port)
+     serverAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+ 
+     // Connect to the server
+-    if (connect(clientSocket,
+-                reinterpret_cast<sockaddr *>(&serverAddress),
+-                sizeof(sockaddr_in)) != 0) {
++    if (!Sockets::connect(clientSocket,
++                           reinterpret_cast<sockaddr *>(&serverAddress),
++                           sizeof(sockaddr_in),
++                           std::chrono::steady_clock::now() + std::chrono::seconds(5), nullptr)) {
+         AkLogCritical("Failed connecting to the socket: %s",
+                       MessageClientPrivate::getLastError().c_str());
+ 
+         return false;
+     }
+ 
+-    Sockets::closeSocket(clientSocket);
+ 
+     return true;
+ }
+@@ -128,34 +137,39 @@ bool AkVCam::MessageClient::send(const Message &inMessage) const
+ }
+ 
+ std::future<bool> AkVCam::MessageClient::send(InMessageHandler inData,
+-                                              OutMessageHandler outData)
++                                              OutMessageHandler outData,
++                                              std::shared_ptr<std::atomic_bool> cancelled)
+ {
+-    return std::async(&MessageClientPrivate::connection,
++    return std::async(std::launch::async, &MessageClientPrivate::connection,
+                       this->d,
+                       this->d->m_port,
+                       inData,
+-                      outData);
++                      outData,
++                      std::move(cancelled));
+ }
+ 
+-std::future<bool> AkVCam::MessageClient::send(InMessageHandler inData)
++std::future<bool> AkVCam::MessageClient::send(InMessageHandler inData,
++                                              std::shared_ptr<std::atomic_bool> cancelled)
+ {
+     return this->send(inData,
+                       [] (const Message &message) -> bool {
+                           UNUSED(message);
+ 
+                           return true;
+-                      });
++                      }, std::move(cancelled));
+ }
+ 
+ std::future<bool> AkVCam::MessageClient::send(const Message &inMessage,
+-                                              OutMessageHandler outData)
++                                              OutMessageHandler outData,
++                                              std::shared_ptr<std::atomic_bool> cancelled)
+ {
+     return this->send([inMessage] (Message &message) -> bool {
+                           message = inMessage;
+ 
+                           return true;
+                       },
+-                      outData);
++                      outData,
++                      std::move(cancelled));
+ }
+ 
+ AkVCam::MessageClientPrivate::MessageClientPrivate(MessageClient *self):
+@@ -204,31 +218,20 @@ std::string AkVCam::MessageClientPrivate::getLastError()
+ 
+ bool AkVCam::MessageClientPrivate::connection(uint16_t port,
+                                               MessageClient::InMessageHandler readData,
+-                                              MessageClient::OutMessageHandler writeData)
++                                              MessageClient::OutMessageHandler writeData,
++                                              std::shared_ptr<std::atomic_bool> cancelled)
+ {
+     AkLogFunction();
+     AkLogDebug("Port: %d", port);
+     auto clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+ 
+-    if (clientSocket < 0) {
++    if (clientSocket == SocketType(-1)) {
+         AkLogError("Failed to create the socket");
+ 
+         return false;
+     }
+ 
+-    // Configure the socket operations timeout
+-
+-#ifdef _WIN32
+-    DWORD timeout = 5000; // 5 seconds
+-    setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+-    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+-#else
+-    struct timeval timeout;
+-    timeout.tv_sec = 5;  // 5 seconds
+-    timeout.tv_usec = 0;
+-    setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+-    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+-#endif
++    SocketCloser owner {clientSocket};
+ 
+     // Set the port
+     sockaddr_in serverAddress;
+@@ -237,12 +240,12 @@ bool AkVCam::MessageClientPrivate::connection(uint16_t port,
+     serverAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+ 
+     // Connect to the server
+-    if (connect(clientSocket,
+-                reinterpret_cast<sockaddr *>(&serverAddress),
+-                sizeof(sockaddr_in)) != 0) {
++    if (!Sockets::connect(clientSocket,
++                           reinterpret_cast<sockaddr *>(&serverAddress),
++                           sizeof(sockaddr_in),
++                           std::chrono::steady_clock::now() + std::chrono::seconds(5), cancelled.get())) {
+         AkLogError("Failed to connect with the server");
+-        Sockets::closeSocket(clientSocket);
+-
++    
+         return false;
+     }
+ 
+@@ -256,10 +259,15 @@ bool AkVCam::MessageClientPrivate::connection(uint16_t port,
+ 
+     // Send the response
+     for (;;) {
++        if (cancelled && cancelled->load())
++            break;
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+         bool more = true;
+ 
+         Message inMessage;
+-        more &= readData(inMessage);
++        more = readData(inMessage);
++        if (!more || (cancelled && cancelled->load()))
++            break;
+ 
+         this->m_logsMutex.lock();
+         AkLogDebug("Send message:");
+@@ -269,19 +277,19 @@ bool AkVCam::MessageClientPrivate::connection(uint16_t port,
+         AkLogDebug("    Data size: %zu", inMessage.data().size());
+         this->m_logsMutex.unlock();
+ 
+-        if (!Sockets::send(clientSocket, inMessage.id())) {
++        if (!Sockets::send(clientSocket, inMessage.id(), deadline, cancelled.get())) {
+             ok = false;
+ 
+             break;
+         }
+ 
+-        if (!Sockets::send(clientSocket, inMessage.queryId())) {
++        if (!Sockets::send(clientSocket, inMessage.queryId(), deadline, cancelled.get())) {
+             ok = false;
+ 
+             break;
+         }
+ 
+-        if (!Sockets::send(clientSocket, inMessage.data())) {
++        if (!Sockets::send(clientSocket, inMessage.data(), deadline, cancelled.get())) {
+             ok = false;
+ 
+             break;
+@@ -289,7 +297,7 @@ bool AkVCam::MessageClientPrivate::connection(uint16_t port,
+ 
+         int messageId = 0;
+ 
+-        if (!Sockets::recv(clientSocket, messageId)) {
++        if (!Sockets::recv(clientSocket, messageId, deadline, cancelled.get())) {
+             ok = false;
+ 
+             break;
+@@ -297,7 +305,7 @@ bool AkVCam::MessageClientPrivate::connection(uint16_t port,
+ 
+         uint64_t queryId = 0;
+ 
+-        if (!Sockets::recv(clientSocket, queryId)) {
++        if (!Sockets::recv(clientSocket, queryId, deadline, cancelled.get())) {
+             ok = false;
+ 
+             break;
+@@ -305,7 +313,7 @@ bool AkVCam::MessageClientPrivate::connection(uint16_t port,
+ 
+         std::vector<char> outData;
+ 
+-        if (!Sockets::recv(clientSocket, outData)) {
++        if (!Sockets::recv(clientSocket, outData, deadline, cancelled.get())) {
+             ok = false;
+ 
+             break;
+@@ -329,7 +337,6 @@ bool AkVCam::MessageClientPrivate::connection(uint16_t port,
+     AkLogDebug("Connection closed: %" PRId64, connectionId);
+     this->m_logsMutex.unlock();
+ 
+-    Sockets::closeSocket(clientSocket);
+ 
+-    return ok;
++    return ok && (!cancelled || !cancelled->load());
+ }
+diff --git a/VCamUtils/src/messageclient.h b/VCamUtils/src/messageclient.h
+--- a/VCamUtils/src/messageclient.h
++++ b/VCamUtils/src/messageclient.h
+@@ -21,6 +21,8 @@
+ #define AKVCAMUTILS_MESSAGECLIENT_H
+ 
+ #include <cstdint>
++#include <atomic>
++#include <memory>
+ #include <functional>
+ #include <future>
+ #include <vector>
+@@ -47,10 +49,13 @@ namespace AkVCam
+             bool send(const Message &inMessage, Message &outMessage) const;
+             bool send(const Message &inMessage) const;
+             std::future<bool> send(InMessageHandler inData,
+-                                   OutMessageHandler outData);
+-            std::future<bool> send(InMessageHandler inData);
++                                   OutMessageHandler outData,
++                                   std::shared_ptr<std::atomic_bool> cancelled = {});
++            std::future<bool> send(InMessageHandler inData,
++                                   std::shared_ptr<std::atomic_bool> cancelled = {});
+             std::future<bool> send(const Message &inMessage,
+-                                   OutMessageHandler outData);
++                                   OutMessageHandler outData,
++                                   std::shared_ptr<std::atomic_bool> cancelled = {});
+ 
+         private:
+             MessageClientPrivate *d;
+diff --git a/VCamUtils/src/sockets.cpp b/VCamUtils/src/sockets.cpp
+--- a/VCamUtils/src/sockets.cpp
++++ b/VCamUtils/src/sockets.cpp
+@@ -18,6 +18,75 @@
+  */
+ 
+ #include "sockets.h"
++#include <algorithm>
++#include <climits>
++#ifndef _WIN32
++#include <fcntl.h>
++#include <errno.h>
++#endif
++
++namespace {
++bool wouldBlock()
++{
++#ifdef _WIN32
++    auto error = WSAGetLastError();
++    return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
++#else
++    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS || errno == EINTR;
++#endif
++}
++
++bool waitReady(SocketType socket, bool writing, AkVCam::Sockets::Deadline deadline,
++               const std::atomic_bool *cancelled)
++{
++    while (!cancelled || !cancelled->load()) {
++        auto remaining = deadline - std::chrono::steady_clock::now();
++        if (remaining <= std::chrono::steady_clock::duration::zero())
++            return false;
++        auto micros = std::min<int64_t>(50000,
++            std::chrono::duration_cast<std::chrono::microseconds>(remaining).count());
++        timeval timeout {0, static_cast<long>(micros)};
++        fd_set ready, errors;
++        FD_ZERO(&ready); FD_SET(socket, &ready);
++        FD_ZERO(&errors); FD_SET(socket, &errors);
++        auto result = select(int(socket + 1), writing? nullptr: &ready,
++                             writing? &ready: nullptr, &errors, &timeout);
++        if (result < 0 || FD_ISSET(socket, &errors))
++            return false;
++        if (result > 0)
++            return !cancelled || !cancelled->load();
++    }
++    return false;
++}
++}
++
++bool AkVCam::Sockets::connect(SocketType socket, const sockaddr *address, int addressSize,
++                              Deadline deadline, const std::atomic_bool *cancelled)
++{
++#ifdef _WIN32
++    u_long nonblocking = 1;
++    if (ioctlsocket(socket, FIONBIO, &nonblocking) != 0)
++        return false;
++#else
++    auto flags = fcntl(socket, F_GETFL, 0);
++    if (flags < 0 || fcntl(socket, F_SETFL, flags | O_NONBLOCK) != 0)
++        return false;
++#endif
++    if (cancelled && cancelled->load())
++        return false;
++    if (::connect(socket, address, addressSize) == 0)
++        return true;
++    if (!wouldBlock() || !waitReady(socket, true, deadline, cancelled))
++        return false;
++    int error = 0;
++#ifdef _WIN32
++    int size = sizeof(error);
++#else
++    socklen_t size = sizeof(error);
++#endif
++    return getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&error), &size) == 0
++           && error == 0;
++}
+ 
+ #ifdef _WIN32
+ static bool akvcamSocketsInitialized = false;
+@@ -50,81 +119,64 @@ void AkVCam::Sockets::uninit()
+ #endif
+ }
+ 
+-bool AkVCam::Sockets::send(SocketType socket, const void *data, size_t dataSize)
++bool AkVCam::Sockets::send(SocketType socket, const void *data, size_t dataSize,
++                           Deadline deadline, const std::atomic_bool *cancelled)
+ {
+     size_t dataSent = 0;
+-
+     while (dataSent < dataSize) {
+-        auto sent = ::send(socket,
+-                           reinterpret_cast<const char *>(data) + dataSent,
+-#ifdef _WIN32
+-                           static_cast<int>(dataSize - dataSent),
+-#else
+-                           dataSize - dataSent,
+-#endif
+-                           0);
+-
++        if ((cancelled || deadline != (Deadline::max)())
++            && !waitReady(socket, true, deadline, cancelled))
++            return false;
++        auto sent = ::send(socket, reinterpret_cast<const char *>(data) + dataSent,
++                           int(std::min<size_t>(INT_MAX, dataSize - dataSent)), 0);
++        if (sent < 0 && (cancelled || deadline != (Deadline::max)()) && wouldBlock())
++            continue;
+         if (sent < 1)
+             return false;
+-
+-        dataSent += sent;
++        dataSent += size_t(sent);
+     }
+-
+     return true;
+ }
+ 
+-bool AkVCam::Sockets::send(SocketType socket, const std::vector<char> &data)
++bool AkVCam::Sockets::send(SocketType socket, const std::vector<char> &data,
++                           Deadline deadline, const std::atomic_bool *cancelled)
+ {
+-    bool ok = true;
+-    size_t dataSize = data.size();
+-    ok &= Sockets::send(socket,
+-                        reinterpret_cast<char *>(&dataSize),
+-                        sizeof(size_t));
+-
+-    if (ok && dataSize > 0)
+-        ok &= Sockets::send(socket, data.data(), dataSize);
+-
+-    return ok;
++    auto dataSize = data.size();
++    return Sockets::send(socket, &dataSize, sizeof(dataSize), deadline, cancelled)
++           && Sockets::send(socket, data.data(), dataSize, deadline, cancelled);
+ }
+ 
+-bool AkVCam::Sockets::recv(SocketType socket, void *data, size_t dataSize)
++bool AkVCam::Sockets::recv(SocketType socket, void *data, size_t dataSize,
++                           Deadline deadline, const std::atomic_bool *cancelled)
+ {
+     size_t dataReceived = 0;
+-
+     while (dataReceived < dataSize) {
+-        auto received = ::recv(socket,
+-                               reinterpret_cast<char *>(data) + dataReceived,
+-#ifdef _WIN32
+-                               static_cast<int>(dataSize - dataReceived),
+-#else
+-                               dataSize - dataReceived,
+-#endif
+-                               0);
+-
++        if ((cancelled || deadline != (Deadline::max)())
++            && !waitReady(socket, false, deadline, cancelled))
++            return false;
++        auto received = ::recv(socket, reinterpret_cast<char *>(data) + dataReceived,
++                               int(std::min<size_t>(INT_MAX, dataSize - dataReceived)), 0);
++        if (received < 0 && (cancelled || deadline != (Deadline::max)()) && wouldBlock())
++            continue;
+         if (received < 1)
+             return false;
+-
+-        dataReceived += received;
++        dataReceived += size_t(received);
+     }
+-
+     return true;
+ }
+ 
+-bool AkVCam::Sockets::recv(SocketType socket, std::vector<char> &data)
++bool AkVCam::Sockets::recv(SocketType socket, std::vector<char> &data,
++                           Deadline deadline, const std::atomic_bool *cancelled)
+ {
+-    bool ok = true;
+     size_t dataSize = 0;
+-    ok &= Sockets::recv(socket,
+-                        reinterpret_cast<char *>(&dataSize),
+-                        sizeof(size_t));
++    if (!Sockets::recv(socket, &dataSize, sizeof(dataSize), deadline, cancelled))
++        return false;
++    // Larger than the maximum 4096x2160 BGRA frame plus protocol metadata.
++    if (dataSize > 64 * 1024 * 1024)
++        return false;
+     data.resize(dataSize);
+-
+-    if (ok && dataSize > 0)
+-        ok &= Sockets::recv(socket, data.data(), dataSize);
+-
+-    return ok;
++    return Sockets::recv(socket, data.data(), dataSize, deadline, cancelled);
+ }
+-
+ void AkVCam::Sockets::closeSocket(SocketType socket)
+ {
+ #ifdef _WIN32
+diff --git a/VCamUtils/src/sockets.h b/VCamUtils/src/sockets.h
+--- a/VCamUtils/src/sockets.h
++++ b/VCamUtils/src/sockets.h
+@@ -21,6 +21,8 @@
+ #define AKVCAMUTILS_SOCKETS_H
+ 
+ #include <vector>
++#include <atomic>
++#include <chrono>
+ 
+ #ifdef _WIN32
+ #include <winsock2.h>
+@@ -41,22 +43,31 @@ namespace AkVCam
+     {
+         bool init();
+         void uninit();
+-        bool send(SocketType socket, const void *data, size_t dataSize);
+-        bool send(SocketType socket, const std::vector<char> &data);
++        using Deadline = std::chrono::steady_clock::time_point;
++        bool connect(SocketType socket, const sockaddr *address, int addressSize,
++                     Deadline deadline, const std::atomic_bool *cancelled);
++        bool send(SocketType socket, const void *data, size_t dataSize,
++                  Deadline deadline = (Deadline::max)(), const std::atomic_bool *cancelled = nullptr);
++        bool send(SocketType socket, const std::vector<char> &data,
++                  Deadline deadline = (Deadline::max)(), const std::atomic_bool *cancelled = nullptr);
+ 
+         template <typename T>
+-        inline bool send(SocketType socket, T value)
++        inline bool send(SocketType socket, T value,
++                         Deadline deadline = (Deadline::max)(), const std::atomic_bool *cancelled = nullptr)
+         {
+-            return Sockets::send(socket, &value, sizeof(T));
++            return Sockets::send(socket, &value, sizeof(T), deadline, cancelled);
+         }
+ 
+-        bool recv(SocketType socket, void *data, size_t dataSize);
+-        bool recv(SocketType socket, std::vector<char> &data);
++        bool recv(SocketType socket, void *data, size_t dataSize,
++                  Deadline deadline = (Deadline::max)(), const std::atomic_bool *cancelled = nullptr);
++        bool recv(SocketType socket, std::vector<char> &data,
++                  Deadline deadline = (Deadline::max)(), const std::atomic_bool *cancelled = nullptr);
+ 
+         template <typename T>
+-        inline bool recv(SocketType socket, T &value)
++        inline bool recv(SocketType socket, T &value,
++                         Deadline deadline = (Deadline::max)(), const std::atomic_bool *cancelled = nullptr)
+         {
+-            return Sockets::recv(socket, &value, sizeof(T));
++            return Sockets::recv(socket, &value, sizeof(T), deadline, cancelled);
+         }
+ 
+         void closeSocket(SocketType socket);
+diff --git a/windows/VCamIPC/src/ipcbridge.cpp b/windows/VCamIPC/src/ipcbridge.cpp
+--- a/windows/VCamIPC/src/ipcbridge.cpp
++++ b/windows/VCamIPC/src/ipcbridge.cpp
+@@ -71,6 +71,7 @@ namespace AkVCam
+     {
+         IpcBridge::StreamType type;
+         std::future<bool> messageFuture;
++        std::shared_ptr<std::atomic_bool> cancelled {std::make_shared<std::atomic_bool>(false)};
+         VideoFrame frame;
+         std::condition_variable_any frameAvailable;
+         std::mutex frameMutex;
+@@ -200,7 +201,13 @@ AkVCam::IpcBridge::~IpcBridge()
+     AkLogFunction();
+     AkLogDebug("Stopping the devices:");
+ 
+-    for (auto &device: this->devices())
++    std::vector<std::string> activeDevices;
++    {
++        std::lock_guard<std::mutex> lock(this->d->m_broadcastsMutex);
++        for (const auto &entry: this->d->m_broadcasts)
++            activeDevices.push_back(entry.first);
++    }
++    for (const auto &device: activeDevices)
+         this->deviceStop(device);
+ 
+     delete this->d;
+@@ -519,13 +526,13 @@ bool AkVCam::IpcBridge::deviceStart(StreamType type,
+             this->d->m_messageClient.send(MsgListen(deviceId, currentPid()).toMessage(),
+                                           std::bind(&IpcBridgePrivate::frameReady,
+                                                     this->d,
+-                                                    std::placeholders::_1));
++                                                    std::placeholders::_1), slot.cancelled);
+         AkLogDebug("Started input stream for device: %s", deviceId.c_str());
+     } else {
+         slot.messageFuture =
+             this->d->m_messageClient.send([this, deviceId] (Message &message) -> bool {
+             return this->d->frameRequired(deviceId, message);
+-        });
++        }, slot.cancelled);
+         AkLogDebug("Started output stream for device: %s", deviceId.c_str());
+     }
+ 
+@@ -559,28 +566,32 @@ void AkVCam::IpcBridge::deviceStop(const std::string &deviceId)
+         }
+ 
+         auto &slot = this->d->m_broadcasts[deviceId];
+-        slot.sharedMemory.close();
+-        slot.run = false;
+-        messageFuture = std::move(slot.messageFuture); // Move the future
++        if (!slot.messageFuture.valid())
++            return; // A concurrent stop already owns the join.
++        {
++            std::lock_guard<std::mutex> frameLock(slot.frameMutex);
++            slot.run = false;
++            slot.cancelled->store(true);
++            slot.frameAvailable.notify_all();
++        }
++        messageFuture = std::move(slot.messageFuture);
+         AkLogDebug("Set run = false for device: %s", deviceId.c_str());
+     } // m_broadcastsMutex is released here
+ 
+-    // Wait for the connection loop to end
+-    if (messageFuture.valid()) {
+-        AkLogDebug("Waiting for messageFuture for device: %s", deviceId.c_str());
+-        auto status = messageFuture.wait_for(std::chrono::seconds(5));
+-
+-        if (status == std::future_status::timeout)
+-            AkLogWarning("Timeout waiting for messageFuture in deviceStop for deviceId: %s", deviceId.c_str());
+-        else
+-            AkLogDebug("messageFuture completed for device: %s", deviceId.c_str());
+-    } else {
+-        AkLogWarning("Invalid messageFuture for device: %s", deviceId.c_str());
++    if (messageFuture.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
++        AkLogWarning("Device connection exceeded cancellation deadline: %s", deviceId.c_str());
++    // Cancellation wakes socket polling and frame waits; consume the future
++    // before releasing any state a callback can still access.
++    try {
++        messageFuture.get();
++    } catch (const std::exception &error) {
++        AkLogError("Device connection failed during stop: %s", error.what());
+     }
+ 
+     // Remove the device after the future is complete
+     {
+         std::lock_guard<std::mutex> lock(this->d->m_broadcastsMutex);
++        this->d->m_broadcasts.at(deviceId).sharedMemory.close();
+         this->d->m_broadcasts.erase(deviceId);
+         AkLogDebug("Device %s removed from broadcasts", deviceId.c_str());
+     }
+@@ -610,7 +621,7 @@ bool AkVCam::IpcBridge::write(const std::string &deviceId,
+ 
+     auto &slot = this->d->m_broadcasts[deviceId];
+ 
+-    if (slot.type != StreamType_Input) {
++    if (slot.type != StreamType_Input || !slot.run) {
+         this->d->m_broadcastsMutex.unlock();
+ 
+         return false;
+@@ -896,34 +907,24 @@ bool AkVCam::IpcBridgePrivate::frameRequired(const std::string &deviceId,
+                                              Message &message)
+ {
+     AkLogFunction();
+-
+-    this->m_broadcastsMutex.lock();
+-
+-    if (this->m_broadcasts.count(deviceId) < 1) {
+-        this->m_broadcastsMutex.unlock();
+-
++    std::unique_lock<std::mutex> broadcastsLock(this->m_broadcastsMutex);
++    auto found = this->m_broadcasts.find(deviceId);
++    if (found == this->m_broadcasts.end())
+         return false;
+-    }
+-
+-    auto &slot = this->m_broadcasts[deviceId];
+-
+-    std::unique_lock<std::mutex> lock(slot.frameMutex);
+-
+-    if (!slot.available)
+-        slot.frameAvailable.wait_for(lock,
+-                                     std::chrono::seconds(1));
+-
+-    auto &frame = slot.frame;
+-    auto run = slot.run;
++    auto &slot = found->second;
++    std::unique_lock<std::mutex> frameLock(slot.frameMutex);
++    // deviceStop joins this callback before erasing the slot.
++    broadcastsLock.unlock();
++    slot.frameAvailable.wait_for(frameLock, std::chrono::seconds(1), [&slot] {
++        return slot.available || !slot.run;
++    });
++    auto frame = slot.frame;
++    const auto run = slot.run;
+     slot.available = false;
+-    lock.unlock();
+-
++    frameLock.unlock();
+     message = MsgBroadcast(deviceId, currentPid(), frame).toMessage();
+-    this->m_broadcastsMutex.unlock();
+-
+     return run;
+ }
+-
+ bool AkVCam::IpcBridgePrivate::frameReady(const Message &message)
+ {
+     AkLogFunction();

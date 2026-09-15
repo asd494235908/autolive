@@ -4,6 +4,22 @@ namespace GpAutoLive.Media.Tests;
 public sealed class AudioPcmMixerTests
 {
     [TestMethod]
+    public void Overlay_only_output_does_not_increment_base_source_frames()
+    {
+        var basePcm = new AudioPcmRingBuffer(256, 1);
+        var overlay = new AudioPcmRingBuffer(256, 1);
+        var mixed = new AudioPcmMixingOutputSource(basePcm, overlay, 1);
+        Assert.IsTrue(overlay.TryWrite(new[] { 0.5F, 0.5F }, out _, out _));
+        Assert.IsTrue(mixed.TryRead(new float[2], out var frames, out _));
+        Assert.AreEqual(2, frames);
+        Assert.AreEqual<ulong>(0, mixed.BaseFramesRead);
+        Assert.IsTrue(basePcm.TryWrite(new[] { 0.5F, 0.5F }, out _, out _));
+        Assert.IsTrue(mixed.TryRead(new float[2], out frames, out _));
+        Assert.AreEqual(2, frames);
+        Assert.AreEqual<ulong>(2, mixed.BaseFramesRead);
+    }
+
+    [TestMethod]
     public void Output_volume_percent_maps_to_linear_gain_decibels()
     {
         Assert.IsTrue(AudioPcmMixer.TryGetOutputVolumeGainDb(100, out var fullGainDb));

@@ -55,6 +55,21 @@ public sealed class RtmpContractTests
     }
 
     [TestMethod]
+    public void Rejects_backslash_with_actionable_message()
+    {
+        var config = RtmpOutputConfig.Default with
+        {
+            TargetUrl = @"rtmp://127.0.0.1/live\stream"
+        };
+
+        Assert.IsFalse(RtmpOutputRules.TryValidate(config, out var error));
+        Assert.AreEqual(RtmpConfigFailureCode.TargetUrlInvalid, error?.Code);
+        Assert.AreEqual(
+            "RTMP 地址必须使用 rtmp:// 或 rtmps://，且不能包含反斜杠",
+            error?.Message);
+    }
+
+    [TestMethod]
     public void Serializes_with_snake_case_and_redacts_only_status_value()
     {
         var config = RtmpOutputConfig.Default with

@@ -333,9 +333,11 @@ public sealed class WindowsVirtualCameraSidecarClient : IAsyncDisposable
     {
         sidecarFrame = null;
         error = null;
-        if (frame is null || frame.Payload is null || frame.Payload.Length != WindowsVirtualCameraSidecarProtocol.MaxPayloadBytes)
+        if (frame is null || frame.Payload is null
+            || !(new VirtualCameraConfig { Width = frame.Width, Height = frame.Height }).TryGetFrameBytes(out _, out var frameBytes)
+            || frame.Payload.Length != frameBytes)
         {
-            error = new(WindowsVirtualCameraSidecarClientErrorCode.InvalidFrame, "虚拟摄像头帧 payload 必须固定为 1280×720 YUY2", false);
+            error = new(WindowsVirtualCameraSidecarClientErrorCode.InvalidFrame, "虚拟摄像头帧 payload 必须匹配合法 YUY2 输出尺寸", false);
             return false;
         }
 
@@ -351,7 +353,7 @@ public sealed class WindowsVirtualCameraSidecarClient : IAsyncDisposable
             return false;
         }
 
-        sidecarFrame = new(frame.Generation, frame.Sequence, timestamp100Ns, frame.Payload);
+        sidecarFrame = new(frame.Generation, frame.Sequence, timestamp100Ns, frame.Payload, frame.Width, frame.Height);
         return true;
     }
 

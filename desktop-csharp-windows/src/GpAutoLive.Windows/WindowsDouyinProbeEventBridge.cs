@@ -3,7 +3,7 @@ using GpAutoLive.Core;
 
 namespace GpAutoLive.Windows;
 
-/// <summary>把脱敏 sidecar 事件映射到 M1 核心状态所有者；正文不离开 sidecar 内存。</summary>
+/// <summary>把 sidecar 元数据映射到核心状态所有者；正文仅由本地显示缓存使用。</summary>
 public static class WindowsDouyinProbeEventBridge
 {
     /// <summary>应用一个固定事件；无需改变核心状态的事件返回 null。</summary>
@@ -99,6 +99,8 @@ public static class WindowsDouyinProbeEventBridge
             "auth_expired" => manager.Fail("抖音登录状态已失效"),
             "risk_controlled" => manager.BlockReplySending("抖音 sidecar 进入风控状态"),
             "failed" => manager.Fail("抖音 sidecar 报告直播状态失败"),
+            "closed" when manager.Snapshot.State is DouyinLiveState.Listening or DouyinLiveState.Paused
+                or DouyinLiveState.RoomResolved => manager.MarkInconclusive("直播间连接已断开，请重新连接"),
             "connecting" or "reconnecting" or "closed" => null,
             _ => manager.Fail("sidecar live.state 状态无效")
         };

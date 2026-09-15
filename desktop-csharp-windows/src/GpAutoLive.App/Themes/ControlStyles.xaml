@@ -297,6 +297,7 @@
     </Style>
 
     <Style TargetType="ComboBox">
+        <Setter Property="ToolTip" Value="{Binding Text, RelativeSource={RelativeSource Self}}" />
         <Setter Property="Background" Value="{StaticResource ControlBrush}" />
         <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
         <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
@@ -316,7 +317,7 @@
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}"
                                 CornerRadius="4">
-                            <Grid>
+                            <Grid ClipToBounds="True"><Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="30" /></Grid.ColumnDefinitions>
                                 <ContentPresenter Margin="{TemplateBinding Padding}"
                                                   VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
                                                   HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
@@ -326,7 +327,7 @@
                                                   TextElement.FontFamily="{TemplateBinding FontFamily}"
                                                   TextElement.FontSize="{TemplateBinding FontSize}"
                                                   TextElement.Foreground="{TemplateBinding Foreground}" />
-                                <ToggleButton x:Name="DropDownButton"
+                                <ToggleButton Grid.Column="1" x:Name="DropDownButton"
                                               Width="30"
                                               HorizontalAlignment="Right"
                                               IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}}"

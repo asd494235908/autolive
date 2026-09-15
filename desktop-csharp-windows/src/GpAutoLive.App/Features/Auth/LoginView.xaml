@@ -7,10 +7,14 @@
     <UserControl.Resources>
         <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
     </UserControl.Resources>
-    <Grid>
-        <Border Width="430"
+    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Disabled"
+                  HorizontalContentAlignment="Stretch"
+                  VerticalContentAlignment="Center">
+        <Border MaxWidth="430"
+                Margin="16"
                 Padding="28"
-                HorizontalAlignment="Center"
+                HorizontalAlignment="Stretch"
                 VerticalAlignment="Center"
                 Background="{StaticResource SurfaceBrush}"
                 BorderBrush="{StaticResource BorderBrush}"
@@ -93,11 +97,11 @@
                             VerticalContentAlignment="Center"
                             Style="{StaticResource AccentButtonStyle}"
                             AutomationProperties.Name="登录" />
-                    <StackPanel Grid.Row="2" Orientation="Horizontal">
+                    <WrapPanel Grid.Row="2" Orientation="Horizontal">
                         <Button Width="Auto"
                                 Height="30"
                                 MinHeight="30"
-                                Margin="0,0,8,0"
+                                Margin="0,0,8,6"
                                 IsEnabled="{Binding CanRefresh}"
                                 TabIndex="4"
                                 Content="重试设备授权"
@@ -108,6 +112,7 @@
                                 AutomationProperties.Name="重试设备授权" />
                         <Button Height="30"
                                 MinHeight="30"
+                                Margin="0,0,0,6"
                                 IsEnabled="{Binding CanUseOffline}"
                                 TabIndex="5"
                                 Content="离线续播（需已授权）"
@@ -116,7 +121,7 @@
                                 VerticalContentAlignment="Center"
                                 Style="{StaticResource ButtonStyle}"
                                 AutomationProperties.Name="进入离线续播模式" />
-                    </StackPanel>
+                    </WrapPanel>
                     <TextBlock Grid.Row="3"
                                Margin="0,8,0,0"
                                Foreground="#697186"
@@ -139,5 +144,5 @@
                 </Grid>
             </Grid>
         </Border>
-    </Grid>
+    </ScrollViewer>
 </UserControl>

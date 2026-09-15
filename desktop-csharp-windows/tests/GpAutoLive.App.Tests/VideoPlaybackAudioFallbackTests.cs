@@ -14,7 +14,7 @@ namespace GpAutoLive.App.Tests;
 
 [TestClass]
 [DoNotParallelize]
-public sealed class VideoPlaybackAudioFallbackTests
+public sealed partial class VideoPlaybackAudioFallbackTests
 {
     [TestMethod]
     public void Unauthorized_import_reports_login_gate_without_invoking_request_or_runtime()
@@ -222,13 +222,24 @@ public sealed class VideoPlaybackAudioFallbackTests
                     state.ApplyMediaSnapshot(committed.Snapshot);
                     InvokePrivate(window, "UpdateMediaProjection");
                     var outputDevice = GetPrivateField<ComboBox>(window, "AudioOutputDeviceComboBox");
-                    outputDevice.SelectedValue = int.MaxValue;
+                    // 模拟成功枚举后设备失效；保留有效选择形状，让真实 PortAudio 打开返回失败。
+                    var disconnectedDevice = new WindowsPortAudioDevice(int.MaxValue, "Disconnected fixture",
+                        "WASAPI", MaxInputChannels: 0, MaxOutputChannels: 2, DefaultSampleRate: 48_000);
+                    outputDevice.ItemsSource = new[] { disconnectedDevice };
+                    outputDevice.SelectedItem = disconnectedDevice;
+                    typeof(MainWindow).GetField("_audioDevicesEnumerated", BindingFlags.Instance | BindingFlags.NonPublic)!
+                        .SetValue(window, true);
+                    typeof(MainWindow).GetField("_audioDeviceListCurrent", BindingFlags.Instance | BindingFlags.NonPublic)!
+                        .SetValue(window, true);
 
                     var startTask = InvokePrivate(window, "TogglePlaybackCoreAsync") as Task
                         ?? throw new InvalidOperationException("视频播放入口未返回异步任务。");
                     PumpUntilCompleted(startTask);
                     startTask.GetAwaiter().GetResult();
 
+                    var audio = GetPrivateField<WindowsAudioPlaybackController>(window, "_audioPlaybackController");
+                    Assert.AreEqual(nameof(WindowsPortAudioStreamFailureCode.OpenFailed), audio.Snapshot.ErrorCode,
+                        "夹具必须进入真实 PortAudio 设备打开失败路径，不能被首次默认枚举或 UI 选择校验替代。");
                     if (mediaPool.Snapshot.PlaybackState is not PlaybackState.Playing)
                     {
                         throw new InvalidOperationException(

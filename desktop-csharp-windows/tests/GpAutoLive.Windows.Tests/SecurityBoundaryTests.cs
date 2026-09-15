@@ -39,6 +39,44 @@ public sealed class SecurityBoundaryTests
     }
 
     [TestMethod]
+    public void Test_control_plane_credentials_are_isolated_from_default_credentials()
+    {
+        var name = $"test-{Guid.NewGuid():N}";
+        var defaultSecret = "default-secret"u8.ToArray();
+        var testSecret = "test-secret"u8.ToArray();
+        var defaultStore = new CredentialManagerSecretStore();
+        var testStore = CredentialManagerSecretStore.CreateTestControlPlaneStore();
+
+        try
+        {
+            defaultStore.Set(name, defaultSecret);
+            testStore.Set(name, testSecret);
+
+            Assert.IsTrue(defaultStore.TryGet(name, out var loadedDefault));
+            Assert.IsTrue(testStore.TryGet(name, out var loadedTest));
+            using (loadedDefault)
+            using (loadedTest)
+            {
+                var defaultCopy = new byte[loadedDefault.Length];
+                var testCopy = new byte[loadedTest.Length];
+                loadedDefault.CopyTo(defaultCopy);
+                loadedTest.CopyTo(testCopy);
+                CollectionAssert.AreEqual(defaultSecret, defaultCopy);
+                CollectionAssert.AreEqual(testSecret, testCopy);
+                CryptographicOperations.ZeroMemory(defaultCopy);
+                CryptographicOperations.ZeroMemory(testCopy);
+            }
+        }
+        finally
+        {
+            defaultStore.Delete(name);
+            testStore.Delete(name);
+            CryptographicOperations.ZeroMemory(defaultSecret);
+            CryptographicOperations.ZeroMemory(testSecret);
+        }
+    }
+
+    [TestMethod]
     public void Dpapi_round_trip_and_secret_buffer_are_clearable()
     {
         var plaintext = "local-user-secret"u8.ToArray();

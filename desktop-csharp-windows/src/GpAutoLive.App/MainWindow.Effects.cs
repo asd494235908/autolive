@@ -295,7 +295,7 @@ public partial class MainWindow
             ? "视频声音处理已应用 · 从当前时间点恢复"
             : "视频声音处理已关闭 · 从当前时间点恢复原始 PCM";
         _state.SetStatus(AudioDeviceStatusText.Text);
-        return true;
+        return wasPaused || await AlignStartedVideoAudioAsync(identity).ConfigureAwait(true);
     }
 
     private bool IsAudioProcessingRequestCurrent(long revision) =>
@@ -558,6 +558,8 @@ public partial class MainWindow
                 ? $"视频处理已切换到 {VideoPlaybackModeSelector.DescribeActive(startedEffects.Mode)}，已从当前位置恢复"
                 : $"视频处理已切换并回退到 {VideoPlaybackModeSelector.DescribeActive(startedEffects.Mode)}，已从当前位置恢复"
             : $"视频处理已切换到 {VideoPlaybackModeSelector.DescribeActive(startedEffects.Mode)}，声音输出不可用");
+        if (audioStarted && !wasPaused)
+            await AlignStartedVideoAudioAsync(identity).ConfigureAwait(true);
     }
 
     private async Task ApplyAutomaticVideoEffectCycleAsync(MediaPlaybackIdentity identity)

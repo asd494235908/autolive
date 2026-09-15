@@ -10,6 +10,42 @@ public partial class MainWindow
 {
     private MediaPlaybackIdentity? _virtualCameraOutputIdentity;
 
+    internal static bool TryCreateVirtualCameraSourceConfig(
+        SourceMediaDto? source,
+        out VirtualCameraConfig? config,
+        out string? error)
+    {
+        config = null;
+        error = "虚拟摄像头需要有效的源视频分辨率";
+        if (source?.MediaKind != MediaKind.Video
+            || source.Width is not uint width || width == 0
+            || source.Height is not uint height || height == 0
+            || width == uint.MaxValue)
+            return false;
+
+        var candidate = VirtualCameraConfig.Default with
+        {
+            Width = width + width % 2,
+            Height = height,
+        };
+        if (!candidate.TryValidateFixedOutput(out var validation))
+        {
+            error = validation?.Message;
+            return false;
+        }
+        config = candidate;
+        error = null;
+        return true;
+    }
+
+    private SourceMediaDto? CurrentVirtualCameraSource()
+    {
+        var snapshot = _mediaPool.Snapshot;
+        return snapshot.SourceMediaIndex >= 0 && snapshot.SourceMediaIndex < snapshot.SourceMediaPool.Length
+            ? snapshot.SourceMediaPool[snapshot.SourceMediaIndex]
+            : null;
+    }
+
     private void SyncVirtualCameraOutputContext(AppState snapshot)
     {
         var source = snapshot.SourceMediaPool.IsEmpty
@@ -57,6 +93,34 @@ public partial class MainWindow
         return true;
     }
 
+    // 手动切项和自然 EOF 共用；播放命令串行锁已由调用方持有。
+    private async Task ChangeVideoSourceWithVirtualCameraAsync(SourceMediaDto? target, Func<Task> changeSource)
+    {
+        if (TryCreateVirtualCameraSourceConfig(target, out var targetConfig, out _)
+            && targetConfig == _virtualCameraOutput.Snapshot.Config)
+        {
+            // 同规格切项/循环沿用既有设备会话，避免无意义地要求下游重开。
+            await changeSource().ConfigureAwait(true);
+            return;
+        }
+        var resumeOutput = _virtualCameraOutput.Snapshot.State is
+            VirtualCameraState.Ready or VirtualCameraState.Streaming;
+        if (!await StopVirtualCameraForMediaMutationAsync().ConfigureAwait(true)) return;
+        try
+        {
+            await changeSource().ConfigureAwait(true);
+        }
+        finally
+        {
+            if (resumeOutput && !_isClosing && !_windowCancellation.IsCancellationRequested
+                && HasReadyVideoPlayback())
+            {
+                // 新源首帧已确认后才开始新 generation；失败只影响摄像头，不回滚本地播放。
+                await StartVirtualCameraCoreAsync().ConfigureAwait(true);
+            }
+        }
+    }
+
     private void UpdateVirtualCameraProjection()
     {
         if (!IsInitialized)
@@ -82,6 +146,15 @@ public partial class MainWindow
             or VirtualCameraState.Ready
             or VirtualCameraState.Streaming
             or VirtualCameraState.Recovering;
+        var hasSourceConfig = TryCreateVirtualCameraSourceConfig(
+            CurrentVirtualCameraSource(), out var sourceConfig, out var sourceError);
+        var displayConfig = outputRunning ? status.Config : sourceConfig;
+        VirtualCameraResolutionText.Text = displayConfig is null
+            ? "跟随源视频 · 等待视频"
+            : $"{displayConfig.Width}×{displayConfig.Height} · {displayConfig.Fps}fps";
+        VirtualCameraResolutionText.ToolTip = displayConfig is null
+            ? sourceError
+            : "分辨率跟随源视频；YUY2 宽度按偶数对齐。尺寸变化后下游应用可能需要重新打开摄像头。";
         var canStop = outputRunning || (_virtualCameraOutputCoordinator?.HasActiveResources ?? false);
         var cameraPill = status.State switch
         {
@@ -100,6 +173,7 @@ public partial class MainWindow
             && _virtualCameraD3D11Probe?.IsReady == true
             && _virtualCameraWgcProbe?.IsReady == true
             && _virtualCameraSurfaceBinding.Snapshot.IsBound
+            && hasSourceConfig
             && HasReadyVideoPlayback();
         StartVirtualCameraButton.IsEnabled = canStart;
         StopVirtualCameraButton.IsEnabled = _login.CanEnterWorkbench
@@ -114,10 +188,10 @@ public partial class MainWindow
         {
             return installation.Code switch
             {
-                WindowsVirtualCameraInstallationProbeCode.RegistryOwnerMissing => "未发现正式 x86/x64 安装所有者；请先安装签名组件",
+                WindowsVirtualCameraInstallationProbeCode.RegistryOwnerMissing => "未发现 x86/x64 安装登记；请先安装虚拟摄像头组件",
                 WindowsVirtualCameraInstallationProbeCode.RegistryOwnerMismatch => "x86/x64 安装路径不一致；输出门禁已拒绝",
                 WindowsVirtualCameraInstallationProbeCode.ComponentMissing => "安装组件不完整；输出门禁已拒绝",
-                WindowsVirtualCameraInstallationProbeCode.DeviceMissing => "未发现 GpAutoLive Camera PnP 设备；输出门禁已拒绝",
+                WindowsVirtualCameraInstallationProbeCode.DeviceMissing => "未发现 GpAutoLive Camera DirectShow 设备；输出门禁已拒绝",
                 WindowsVirtualCameraInstallationProbeCode.ProbeFailed => "Windows 设备安装探测失败；输出门禁已拒绝",
                 _ => "虚拟摄像头安装门禁未通过"
             };
@@ -145,7 +219,9 @@ public partial class MainWindow
 
     private string FormatVirtualCameraInstalledStatus() =>
         _virtualCameraSidecarProbe.IsTrusted
-            ? "组件已安装 · 输出尚未启动（GPU→YUY2 已接入；sidecar/DirectShow 待验收）"
+            ? _virtualCameraSidecarProbe.IsDevelopmentTrusted
+                ? "本地测试组件已校验（允许未签名）· 输出尚未启动"
+                : "签名组件已安装 · 输出尚未启动"
             : $"组件已安装 · {FormatSidecarSignatureStatus()}";
 
     private string FormatSidecarSignatureStatus() => _virtualCameraSidecarProbe.SignatureCode switch
@@ -185,7 +261,7 @@ public partial class MainWindow
     }
 
     private async void RefreshVirtualCameraButton_Click(object sender, RoutedEventArgs e) =>
-        await RefreshVirtualCameraProbesAsync().ConfigureAwait(true);
+        await RunPlaybackCommandAsync(RefreshVirtualCameraProbesAsync).ConfigureAwait(true);
 
     private async void StartVirtualCameraButton_Click(object sender, RoutedEventArgs e) =>
         await RunPlaybackCommandAsync(StartVirtualCameraCoreAsync).ConfigureAwait(true);
@@ -213,9 +289,9 @@ public partial class MainWindow
             || !_virtualCameraSidecarProbe.IsTrusted)
         {
             VirtualCameraActionStatusText.Text = _virtualCameraSidecarProbe.IsAvailable
-                ? "sidecar 未通过 Authenticode 签名门禁；未启动输出"
+                ? "sidecar 未通过组件信任校验；未启动输出"
                 : "未发现完整安装或有效 sidecar；未启动输出";
-            _state.SetStatus("虚拟摄像头安装/sidecar 签名门禁未通过");
+            _state.SetStatus("虚拟摄像头安装/组件信任校验未通过");
             return;
         }
 
@@ -243,6 +319,19 @@ public partial class MainWindow
             UpdateVirtualCameraProjection();
             return;
         }
+
+        if (!TryCreateVirtualCameraSourceConfig(CurrentVirtualCameraSource(), out var sourceConfig, out var sourceError))
+        {
+            VirtualCameraActionStatusText.Text = sourceError ?? "源视频分辨率不支持虚拟摄像头输出";
+            return;
+        }
+        var configured = _virtualCameraOutput.ConfigureOutput(sourceConfig);
+        if (!configured.IsSuccess)
+        {
+            VirtualCameraActionStatusText.Text = configured.Error?.Message ?? "虚拟摄像头尺寸配置失败";
+            return;
+        }
+        status = configured.Snapshot;
 
         _virtualCameraOutputCommandBusy = true;
         UpdateVirtualCameraProjection();
@@ -278,7 +367,7 @@ public partial class MainWindow
                     cancellationToken: _windowCancellation.Token)
                 .ConfigureAwait(true);
             VirtualCameraActionStatusText.Text = result.IsSuccess
-                ? "虚拟摄像头输出已启动；等待 sidecar 下游客户端"
+                ? $"虚拟摄像头 {status.Config.Width}×{status.Config.Height} 已启动；等待下游，尺寸变化后请重新打开摄像头"
                 : result.ErrorMessage ?? "虚拟摄像头输出启动失败";
             _state.SetStatus(VirtualCameraActionStatusText.Text);
         }
@@ -373,6 +462,7 @@ public partial class MainWindow
                     _windowCancellation.Token)
                 .ConfigureAwait(true);
 
+            if (_isClosing) return;
             if (_virtualCameraInstallationProbe.IsAvailable
                 && _virtualCameraOutput.Snapshot.State is VirtualCameraState.Unavailable or VirtualCameraState.Failed)
             {
@@ -388,7 +478,7 @@ public partial class MainWindow
 
             if (!_virtualCameraSidecarProbe.IsTrusted)
             {
-                VirtualCameraActionStatusText.Text = "sidecar 已发现但未通过 Authenticode 签名门禁；未启动任何进程";
+                VirtualCameraActionStatusText.Text = "sidecar 已发现但未通过组件信任校验；未启动任何进程";
                 return;
             }
 

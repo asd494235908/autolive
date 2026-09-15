@@ -42,7 +42,7 @@ public sealed record WindowsAudioPlaybackResult(
 /// 组合为一个可取消的本机播放会话。解码结束后关闭音频总线并停止输出，不保留完整音频文件；
 /// 循环由有界的重新解码实现。
 /// </summary>
-public sealed class WindowsAudioPlaybackController : IAsyncDisposable
+public sealed partial class WindowsAudioPlaybackController : IAsyncDisposable
 {
     private static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan DrainTimeout = TimeSpan.FromSeconds(5);
@@ -79,6 +79,7 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
     private WindowsAudioPlaybackState _state = WindowsAudioPlaybackState.Idle;
     private WindowsAudioPlaybackError? _lastError;
     private bool _disposed;
+    private Task? _disposeTask;
 
     private sealed class PreparedAudioCandidate
     {
@@ -278,7 +279,7 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
                     return Failure("closed", "本机音频播放控制器已关闭。", retryable: false);
                 }
 
-                if (_sessionTask is not null)
+                if (_sessionTask is not null || _output is not null)
                 {
                     return Reject("already_running", "本机音频播放已经在运行。", retryable: false);
                 }
@@ -289,7 +290,8 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
 
             if (plan is null
                 || outputConfig.Channels != plan.Channels
-                || Math.Abs(outputConfig.SampleRate - plan.SampleRateHz) > 0.001)
+                || Math.Abs(outputConfig.SampleRate - plan.SampleRateHz) > 0.001
+                || !double.IsFinite(plan.PlaybackRate) || plan.PlaybackRate is < 0.5 or > 2.0)
             {
                 return Failure("invalid_plan", "本机音频播放计划、采样率或声道配置无效。", retryable: false);
             }
@@ -306,6 +308,7 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             var sessionFinalPcmBus = !loop
                 ? finalPcmBus ?? new FinalPcmBus(_capacityFrames, plan.Channels)
                 : finalPcmBus;
+            plan = RemoveRealtimeInputThrottle(plan, hasBackpressure: sessionFinalPcmBus is not null);
             var finalPcmBusTrackSwitch = !loop && sessionFinalPcmBus is not null
                 ? new FinalPcmBusTrackSwitch(activeCandidateId: 1, sessionFinalPcmBus)
                 : null;
@@ -338,7 +341,17 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             var outputResult = await output.StartAsync(portAudioDllPath, outputConfig, cancellationToken).ConfigureAwait(false);
             if (!outputResult.IsSuccess)
             {
-                output.Dispose();
+                if (output.HasPendingCleanup)
+                {
+                    lock (_gate)
+                    {
+                        _output = output;
+                    }
+                }
+                else
+                {
+                    output.Dispose();
+                }
                 await decoder.DisposeAsync().ConfigureAwait(false);
                 if (ownsFinalPcmBus)
                 {
@@ -359,9 +372,12 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
                 _output = output;
                 _audibleAudioClock = new WindowsAudibleAudioClock();
                 _audibleAudioClock.Anchor(
-                    outputResult.Snapshot.OutputFramesWritten,
-                    sourcePositionMs: plan.SourceStartMs);
+                    outputResult.Snapshot.MediaFramesWritten,
+                    sourcePositionMs: plan.SourceStartMs,
+                    playbackRate: plan.PlaybackRate);
                 _decoder = decoder;
+                _activePlan = plan;
+                _activePlanCandidateId = 1;
                 _finalPcmBus = sessionFinalPcmBus;
                 _finalPcmBusTrackSwitch = finalPcmBusTrackSwitch;
                 _pauseGate = pauseGate;
@@ -388,16 +404,13 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
 
             var ready = await WaitForInitialPcmAsync(
                     decoder,
+                    output,
+                    outputResult.Snapshot.MediaFramesWritten,
                     sessionTask,
                     sessionCancellation,
                     cancellationToken)
                 .ConfigureAwait(false);
-            if (!ready.IsSuccess)
-            {
-                return ready;
-            }
-
-            return Success();
+            return ready;
         }
         finally
         {
@@ -456,9 +469,15 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
                     return Reject("candidate_already_prepared", "已经存在一个待提交的下一音频候选。", retryable: false);
                 }
 
-                if (plan is null || plan.Channels != _finalPcmBusTrackSwitch.Channels)
+                if (plan is null || plan.Channels != _finalPcmBusTrackSwitch.Channels
+                    || !double.IsFinite(plan.PlaybackRate) || plan.PlaybackRate is < 0.5 or > 2.0)
                 {
                     return Reject("candidate_invalid_plan", "下一音频候选计划或声道数无效。", retryable: false);
+                }
+
+                if (_finalPcmBusTrackSwitch.RtmpConsumerAttached && Math.Abs(plan.PlaybackRate - 1.0) > 0.001)
+                {
+                    return Reject("rtmp_speed_unsupported", "活动推流不接受改变源时长的声音候选。", retryable: false);
                 }
 
                 if (_candidateSequence == ulong.MaxValue)
@@ -725,6 +744,7 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             WindowsAudioPlaybackState state;
             WindowsAudioPauseGate? pauseGate;
             CancellationTokenSource? sessionCancellation;
+            CancellationToken sessionToken;
             AudioPcmRingBuffer? overlayBuffer;
             FinalPcmBus? finalPcmBus;
             lock (_gate)
@@ -732,8 +752,9 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
                 state = _state;
                 pauseGate = _pauseGate;
                 sessionCancellation = _sessionCancellation;
+                sessionToken = sessionCancellation?.Token ?? default;
                 overlayBuffer = _overlayBuffer;
-                finalPcmBus = _finalPcmBus;
+                finalPcmBus = _finalPcmBusTrackSwitch?.ActiveBus ?? _finalPcmBus;
                 if (_mixingOutputSource is null)
                 {
                     return Reject("interlude_mix_not_enabled", "当前音频会话未启用插话混音。", retryable: false);
@@ -760,7 +781,7 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             }
 
             var overlayCancellation = CancellationTokenSource.CreateLinkedTokenSource(
-                sessionCancellation.Token,
+                sessionToken,
                 cancellationToken);
             var decoder = new WindowsFfmpegPcmDecoder();
             var staleSession = false;
@@ -861,7 +882,7 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             }
 
             pauseGate.Pause();
-            var outputResult = output.Pause();
+            var outputResult = await output.PauseAsync().ConfigureAwait(false);
             if (!outputResult.IsSuccess)
             {
                 return FailAndAbortSession(
@@ -924,7 +945,7 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
                 return Failure("invalid_session", "本机音频播放会话资源不可用。", retryable: false);
             }
 
-            var outputResult = output.Resume();
+            var outputResult = await output.ResumeAsync().ConfigureAwait(false);
             if (!outputResult.IsSuccess)
             {
                 return FailAndAbortSession(
@@ -956,7 +977,10 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
     {
         try
         {
-            await _lifecycle.WaitAsync().ConfigureAwait(false);
+            if (!await _lifecycle.WaitAsync(StopTimeout).ConfigureAwait(false))
+            {
+                return Failure("stop_timeout", "本机音频生命周期仍在执行，保留资源供重试。", retryable: true);
+            }
         }
         catch (ObjectDisposedException)
         {
@@ -971,7 +995,7 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             WindowsAudioPauseGate? pauseGate;
             lock (_gate)
             {
-                if (_disposed && _sessionTask is null)
+                if (_disposed && _sessionTask is null && _output is null)
                 {
                     _state = WindowsAudioPlaybackState.Closed;
                     return Success();
@@ -989,6 +1013,10 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             decoder?.Stop();
             if (session is null)
             {
+                if (await StopOwnedOutputAsync(output).ConfigureAwait(false) is string outputError)
+                {
+                    return Failure("output_stop_pending", outputError, retryable: true);
+                }
                 lock (_gate)
                 {
                     _state = _disposed ? WindowsAudioPlaybackState.Closed : WindowsAudioPlaybackState.Idle;
@@ -1006,7 +1034,10 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
                 return Failure("stop_timeout", "本机音频播放未能在停止预算内结束。", retryable: true);
             }
 
-            output?.Stop();
+            if (await StopOwnedOutputAsync(output).ConfigureAwait(false) is string stopError)
+            {
+                return Failure("output_stop_pending", stopError, retryable: true);
+            }
             return Success();
         }
         finally
@@ -1015,16 +1046,56 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         lock (_gate)
         {
             _disposed = true;
+            if (_disposeTask is null || _disposeTask.IsFaulted)
+            {
+                _disposeTask = DisposeCoreAsync();
+            }
+            return new(_disposeTask);
         }
+    }
 
-        await StopAsync().ConfigureAwait(false);
-        _lifecycle.Dispose();
+    private async Task DisposeCoreAsync()
+    {
+        var stopped = await StopAsync().ConfigureAwait(false);
+        if (!stopped.IsSuccess)
+        {
+            throw new InvalidOperationException(stopped.Error?.Message ?? "本机声音资源尚未退出。");
+        }
         GC.SuppressFinalize(this);
+    }
+
+    private async Task<string?> StopOwnedOutputAsync(WindowsPortAudioOutputStream? output)
+    {
+        if (output is null)
+        {
+            return null;
+        }
+        var stopped = await output.StopAsync().ConfigureAwait(false);
+        if (!stopped.IsSuccess || output.HasPendingCleanup)
+        {
+            return stopped.Error?.Message ?? "PortAudio 原生资源仍在退出，保留所有者供重试。";
+        }
+        try
+        {
+            output.Dispose();
+        }
+        catch (Exception exception) when (exception is TimeoutException or InvalidOperationException)
+        {
+            return "PortAudio 原生资源仍在退出，保留所有者供重试。";
+        }
+        lock (_gate)
+        {
+            if (ReferenceEquals(_output, output))
+            {
+                _output = null;
+            }
+        }
+        return null;
     }
 
     private async Task<WindowsAudioPlaybackResult> StopInterludeCoreAsync()
@@ -1037,6 +1108,7 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             cancellation = _overlayCancellation;
             decoder = _overlayDecoder;
             task = _overlayTask;
+            cancellation?.Cancel();
         }
 
         if (cancellation is null || task is null)
@@ -1044,7 +1116,6 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             return Success();
         }
 
-        cancellation.Cancel();
         decoder?.Stop();
         try
         {
@@ -1067,9 +1138,10 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
     {
         try
         {
+            WindowsFfmpegPcmDecoderResult result;
             if (finalPcmBus is null)
             {
-                _ = await decoder.DecodeAsync(
+                result = await decoder.DecodeAsync(
                         plan,
                         overlayBuffer,
                         cancellation.Token,
@@ -1078,15 +1150,20 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             }
             else
             {
-                _ = await decoder.DecodeAsync(
+                result = await decoder.DecodeAsync(
                         plan,
                         destination: null,
                         cancellation.Token,
                         pauseGate.WaitIfPausedAsync,
                         finalPcmBus,
                         baseMixPolicyProvider: null,
-                        finalPcmOverlay: true)
+                        finalPcmOverlay: true,
+                        finalPcmBusProvider: () => ActiveFinalPcmBus)
                     .ConfigureAwait(false);
+            }
+            if (!result.IsSuccess && !cancellation.IsCancellationRequested)
+            {
+                throw new InvalidOperationException(result.Error?.Message ?? "本机插话解码失败。");
             }
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
@@ -1097,6 +1174,11 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             if (finalPcmBus is not null)
             {
                 finalPcmBus.DiscardOverlayPending();
+                var currentBus = ActiveFinalPcmBus;
+                if (!ReferenceEquals(currentBus, finalPcmBus))
+                {
+                    currentBus?.DiscardOverlayPending();
+                }
             }
             else
             {
@@ -1274,27 +1356,39 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
         lock (_gate)
         {
             var clock = _audibleAudioClock?.Project(_output?.Snapshot);
-            if (clock?.PlaybackTimeMs is not ulong currentPositionMs
-                || targetPositionMs <= currentPositionMs
-                || clock.SampleRateHz <= 0)
-            {
-                return 0;
-            }
-
-            var deltaMs = targetPositionMs - currentPositionMs;
-            var playbackFrames = deltaMs * (double)clock.SampleRateHz / 1_000d;
-            var latencyFrames = (double)clock.OutputLatencyMicroseconds
-                * clock.SampleRateHz
-                / 1_000_000d;
-            var frames = Math.Ceiling(playbackFrames) + Math.Ceiling(latencyFrames);
-            return !double.IsFinite(frames) || frames >= ulong.MaxValue
-                ? ulong.MaxValue
-                : (ulong)frames;
+            return CalculateFramesUntilPosition(clock, targetPositionMs);
         }
     }
 
-    private static FfmpegPcmDecodePlan RemoveRealtimeInputThrottle(FfmpegPcmDecodePlan plan)
+    internal static ulong CalculateFramesUntilPosition(
+        WindowsAudibleAudioClockSnapshot? clock, ulong targetPositionMs)
     {
+        if (clock?.PlaybackTimeMs is not ulong currentPositionMs
+            || targetPositionMs <= currentPositionMs
+            || clock.SampleRateHz <= 0)
+        {
+            return 0;
+        }
+
+        var deltaMs = targetPositionMs - currentPositionMs;
+        var playbackFrames = deltaMs * (double)clock.SampleRateHz / 1_000d / clock.PlaybackRate;
+        var latencyFrames = (double)clock.OutputLatencyMicroseconds
+            * clock.SampleRateHz
+            / 1_000_000d;
+        var frames = Math.Max(0, Math.Ceiling(playbackFrames) - Math.Ceiling(latencyFrames));
+        return !double.IsFinite(frames) || frames >= ulong.MaxValue
+            ? ulong.MaxValue
+            : (ulong)frames;
+    }
+
+    internal static FfmpegPcmDecodePlan RemoveRealtimeInputThrottle(
+        FfmpegPcmDecodePlan plan, bool hasBackpressure = true)
+    {
+        // 最终 PCM 总线按剩余容量等待；旧的独立环缓循环仍保留输入限速。
+        if (!hasBackpressure)
+        {
+            return plan;
+        }
         var realtimeIndex = plan.Arguments.IndexOf("-re");
         return realtimeIndex < 0
             ? plan
@@ -1420,15 +1514,15 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
                             {
                                 _preparedCandidate = null;
                                 _decoder = scheduledCandidate.Decoder;
+                                _activePlan = scheduledCandidate.Plan;
+                                _activePlanCandidateId = scheduledCandidate.CandidateId;
                                 _finalPcmBus = trackSwitch!.ActiveBus;
                                 _buffer = trackSwitch.ActiveBus.OutputBuffer;
                                 _candidateCompletion = scheduledCandidate.Completion;
                             }
                         }
 
-                        _audibleAudioClock?.Anchor(
-                            output.Snapshot.OutputFramesWritten,
-                            scheduledCandidate.Plan.SourceStartMs);
+                        AnchorPromotedAudioClock(output, trackSwitch!, scheduledCandidate.Plan);
                         scheduledCandidate.Activated.TrySetResult(true);
                         promotedBeforeDecodeCompletion = true;
                         break;
@@ -1544,9 +1638,7 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
                 retiredBus?.Close();
                 lock (_gate)
                 {
-                    _audibleAudioClock?.Anchor(
-                        output.Snapshot.OutputFramesWritten,
-                        sourcePositionMs: prepared.Plan.SourceStartMs);
+                    AnchorPromotedAudioClock(output, trackSwitch, prepared.Plan);
                 }
                 await currentDecoder.DisposeAsync().ConfigureAwait(false);
                 if (activeCandidate is not null)
@@ -1563,6 +1655,8 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
                     {
                         _preparedCandidate = null;
                         _decoder = prepared.Decoder;
+                        _activePlan = prepared.Plan;
+                        _activePlanCandidateId = prepared.CandidateId;
                         _finalPcmBus = trackSwitch.ActiveBus;
                         _buffer = trackSwitch.ActiveBus.OutputBuffer;
                         _candidateCompletion = prepared.Completion;
@@ -1620,7 +1714,12 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             {
                 trackSwitch.Dispose();
             }
-            output.Stop();
+            var outputStopError = await StopOwnedOutputAsync(output).ConfigureAwait(false);
+            var outputStopped = outputStopError is null;
+            if (!outputStopped)
+            {
+                SetFailure("output_stop_pending", outputStopError!, retryable: true);
+            }
             await currentDecoder.DisposeAsync().ConfigureAwait(false);
             if (activeCandidate is not null)
             {
@@ -1631,13 +1730,14 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
                 _sessionCancellation = null;
                 _sessionTask = null;
                 _decoder = null;
+                _activePlan = null;
                 _finalPcmBus = null;
                 _finalPcmBusTrackSwitch = null;
                 _pauseGate = null;
                 _overlayBuffer = null;
                 _mixingOutputSource = null;
                 _baseMixPolicyProvider = null;
-                _output = null;
+                _output = outputStopped ? null : output;
                 _audibleAudioClock = null;
                 _buffer = null;
                 _preparedCandidate = null;
@@ -1657,23 +1757,33 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
     }
 
     /// <summary>
-    /// 启动结果必须证明解码器已经把首批 PCM 写入目标；仅创建 PortAudio 和 FFmpeg 进程不算播放成功。
+    /// 启动结果必须证明 PortAudio 已消费首批主源 PCM；仅解码到环缓不算输出就绪。
     /// 这样主窗口不会在音频链实际失败或没有声音轨道时误显示“声音处理已应用”。
     /// </summary>
     private async Task<WindowsAudioPlaybackResult> WaitForInitialPcmAsync(
         WindowsFfmpegPcmDecoder decoder,
+        WindowsPortAudioOutputStream output,
+        ulong initialMediaFrames,
         Task sessionTask,
         CancellationTokenSource sessionCancellation,
         CancellationToken cancellationToken)
     {
         var deadline = DateTime.UtcNow + InitialPcmReadyTimeout;
+        var decoderSnapshot = decoder.Snapshot;
+        var outputSnapshot = output.Snapshot;
         try
         {
-            while (decoder.Snapshot.DecodedFrames == 0
+            while (outputSnapshot.MediaFramesWritten <= initialMediaFrames
                 && !sessionTask.IsCompleted
                 && DateTime.UtcNow < deadline)
             {
                 await Task.Delay(CandidatePollInterval, cancellationToken).ConfigureAwait(false);
+                var decoded = decoder.Snapshot;
+                if (decoded.DecodedFrames > 0)
+                {
+                    decoderSnapshot = decoded;
+                }
+                outputSnapshot = output.Snapshot;
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1684,17 +1794,17 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             return Failure("cancelled", "本机音频播放启动已取消。", retryable: true);
         }
 
-        var decoderSnapshot = decoder.Snapshot;
-        if (decoderSnapshot.DecodedFrames > 0)
+        if (outputSnapshot.MediaFramesWritten > initialMediaFrames)
         {
             // 循环播放可能在这里立刻开始下一轮解码并重置解码器的本轮计数；
             // 启动结果保留已经观测到的首帧快照，避免成功结果再次显示为 0 帧。
-            return new(true, Snapshot with { Decoder = decoderSnapshot });
+            // 不要求 DAC timeInfo；短音频可能已结束，但累计主源帧仍证明实际交给了输出。
+            return new(true, Snapshot with { Decoder = decoderSnapshot, Output = outputSnapshot });
         }
 
         if (!sessionTask.IsCompleted)
         {
-            SetFailure("audio_start_timeout", "本机音频在启动预算内没有产生 PCM 音频帧。", retryable: true);
+            SetFailure("audio_start_timeout", "本机音频在启动预算内没有向输出设备送出主源 PCM 帧。", retryable: true);
             sessionCancellation.Cancel();
             decoder.Stop();
         }
@@ -1872,10 +1982,10 @@ public sealed class WindowsAudioPlaybackController : IAsyncDisposable
             _state = WindowsAudioPlaybackState.Failed;
             cancellation = _sessionCancellation;
             decoder = _decoder;
+            cancellation?.Cancel();
         }
 
         pauseGate.Close();
-        cancellation?.Cancel();
         decoder?.Stop();
         return new(false, Snapshot, error);
     }

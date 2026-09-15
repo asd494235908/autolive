@@ -6,6 +6,15 @@ namespace GpAutoLive.App.Tests;
 public sealed class DouyinConfigDraftTests
 {
     [TestMethod]
+    public void WatchOnlyAllowsEmptyRepliesButAutomaticReplyStillRequiresCandidates()
+    {
+        Assert.IsTrue(DouyinConfigDraft.TryCreate(false, "12345", "", "500", out var watch, out _));
+        Assert.IsNotNull(watch);
+        Assert.IsTrue(watch.Replies.IsEmpty);
+        Assert.IsFalse(DouyinConfigDraft.TryCreate(true, "12345", "", "500", out _, out _));
+    }
+
+    [TestMethod]
     public void ValidDraftSplitsLinesAndPreservesEnabledFlag()
     {
         var ok = DouyinConfigDraft.TryCreate(
@@ -68,6 +77,6 @@ public sealed class DouyinConfigDraftTests
 
         Assert.IsFalse(ok);
         Assert.IsNull(config);
-        StringAssert.Contains(error, "直播间号");
+        StringAssert.Contains(error, "房间号");
     }
 }

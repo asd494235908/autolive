@@ -1,0 +1,55 @@
+diff --git a/VCamUtils/src/messageserver.cpp b/VCamUtils/src/messageserver.cpp
+--- a/VCamUtils/src/messageserver.cpp
++++ b/VCamUtils/src/messageserver.cpp
+@@ -254,13 +254,17 @@ void AkVCam::MessageServerPrivate::connection(SocketType clientSocket,
+ 
+         Message outMessage;
+ 
+-        this->m_handlersMutex.lock();
+-        auto hnd = this->m_handlers.find(messageId);
+-
+-        if (hnd != this->m_handlers.end())
+-            ok &= hnd->second(clientId, {messageId, queryId, inData}, outMessage);
+-
+-        this->m_handlersMutex.unlock();
++        MessageServer::MessageHandler handler;
++        {
++            std::lock_guard<std::mutex> lock(this->m_handlersMutex);
++            auto hnd = this->m_handlers.find(messageId);
++            if (hnd != this->m_handlers.end())
++                handler = hnd->second;
++        }
++        // A listen handler waits for broadcast; never hold the registry lock
++        // across the handler or another connection cannot supply that frame.
++        if (handler)
++            ok &= handler(clientId, {messageId, queryId, inData}, outMessage);
+ 
+         if (!ok)
+             break;
+diff --git a/Service/src/service.cpp b/Service/src/service.cpp
+--- a/Service/src/service.cpp
++++ b/Service/src/service.cpp
+@@ -142,6 +142,9 @@ void AkVCam::ServicePrivate::removeClientById(void *userData,
+     for (auto &slot: self->m_broadcasts) {
+         if (slot.second.broadcaster.clientId == clientId) {
+             slot.second.broadcaster = {0, 0};
++            slot.second.frame = {};
++            slot.second.frameReady = true;
++            self->m_frameAvailable.notify_all();
+ 
+             if (slot.second.listeners.empty())
+                 removeDevice = slot.first;
+@@ -271,7 +274,12 @@ bool AkVCam::ServicePrivate::listen(uint64_t clientId,
+         this->m_broadcasts[msgListen.device()] = {};
+ 
+     auto &slot = this->m_broadcasts[msgListen.device()];
+-    slot.listeners.push_back({clientId, msgListen.pid()});
++    auto listener = std::find_if(slot.listeners.begin(), slot.listeners.end(),
++                                 [clientId] (const Peer &peer) {
++        return peer.clientId == clientId;
++    });
++    if (listener == slot.listeners.end())
++        slot.listeners.push_back({clientId, msgListen.pid()});
+ 
+     if (!slot.frameReady)
+         this->m_frameAvailable.wait_for(this->m_peerMutex,

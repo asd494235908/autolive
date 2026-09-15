@@ -7,6 +7,23 @@ namespace GpAutoLive.Core.Tests;
 public sealed class VirtualCameraOutputManagerTests
 {
     [TestMethod]
+    public void Configure_output_invalidates_generation_and_rejects_running_changes()
+    {
+        var manager = new VirtualCameraOutputManager();
+        var original = manager.Snapshot;
+        var config = VirtualCameraConfig.Default with { Width = 1920, Height = 1080 };
+        Assert.IsTrue(manager.ConfigureOutput(config).IsSuccess);
+        Assert.AreEqual(config, manager.Snapshot.Config);
+        Assert.IsTrue(manager.Snapshot.Generation > original.Generation);
+        Assert.IsTrue(manager.MarkInstalled().IsSuccess);
+        Assert.IsTrue(manager.BeginStart().IsSuccess);
+        Assert.IsFalse(manager.ConfigureOutput(VirtualCameraConfig.Default).IsSuccess);
+        Assert.AreEqual(config, manager.Snapshot.Config);
+        Assert.IsTrue(manager.Stop().IsSuccess);
+        Assert.IsTrue(manager.ConfigureOutput(VirtualCameraConfig.Default).IsSuccess);
+    }
+
+    [TestMethod]
     public void Lifecycle_requires_install_start_and_gpu_gate_before_ready()
     {
         var manager = new VirtualCameraOutputManager();

@@ -7,6 +7,32 @@ namespace GpAutoLive.Contracts.Tests;
 public sealed class DouyinLiveContractTests
 {
     [TestMethod]
+    public void Watching_accepts_empty_reply_pool_but_enabled_replying_does_not()
+    {
+        var config = new DouyinLiveConfig { RoomId = "12345", Replies = [] };
+        Assert.IsTrue(DouyinLiveRules.TryNormalize(config, out var normalized, out _));
+        Assert.IsTrue(normalized!.Replies.IsEmpty);
+        Assert.IsFalse(DouyinLiveRules.TryNormalize(config with { Enabled = true }, out _, out _));
+    }
+
+    [TestMethod]
+    public void Follow_live_url_extracts_room_and_rejects_untrusted_authority()
+    {
+        Assert.IsTrue(DouyinLiveRules.TryNormalizeRoomId(
+            "https://www.douyin.com/follow/live/362781620214?anchor_id=3298190917109965", out var id));
+        Assert.AreEqual("362781620214", id);
+        foreach (var url in new[] {
+            "https://www.douyin.com.evil.test/follow/live/123",
+            "https://user@www.douyin.com/follow/live/123",
+            "https://www.douyin.com:8443/follow/live/123",
+            "http://www.douyin.com/follow/live/123",
+            "https://www.douyin.com/follow/live/123/extra" })
+        {
+            Assert.IsFalse(DouyinLiveRules.TryNormalizeRoomId(url, out _));
+        }
+    }
+
+    [TestMethod]
     public void Config_normalizes_standard_room_url_and_trimmed_replies()
     {
         var config = new DouyinLiveConfig

@@ -10,6 +10,20 @@ namespace GpAutoLive.Media.Tests;
 public sealed class MpvBoundaryTests
 {
     [TestMethod]
+    public void Paused_source_binds_without_an_intermediate_resume()
+    {
+        var session = new MpvPlaybackSession();
+        var source = CreateVideoSource(new MediaPlaybackIdentity(1, 1, 0, 0));
+        var bound = session.BindSource(source, startPaused: true);
+        Assert.IsTrue(bound.IsSuccess);
+        Assert.AreEqual(MpvSessionState.Paused, session.Snapshot.State);
+        var command = MpvIpcCommand.LoadFileReplace(source, 0, startPaused: true);
+        Assert.IsTrue(command.TrySerialize(1, out var line, out _));
+        using var document = JsonDocument.Parse(line!);
+        Assert.AreEqual("yes", document.RootElement.GetProperty("command")[4].GetProperty("pause").GetString());
+    }
+
+    [TestMethod]
     public void ShaderOptionsAreCanonicalAndRejectUnsafeValues()
     {
         var created = MpvShaderOptionsSnapshot.TryCreate(

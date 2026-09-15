@@ -16,6 +16,7 @@ public enum MpvIpcCommandKind
     RemoveCpu4FilterChain,
     InstallCpu4FilterChain,
     UpdateCpu4Filter,
+    CapturePresentation,
     GetProperty,
     Quit,
 }
@@ -122,8 +123,8 @@ public abstract record MpvIpcCommand
     {
     }
 
-    public static MpvIpcCommand LoadFileReplace(MpvActiveSource source, ulong sourceStartMs) =>
-        new LoadFileReplaceCommand(source, sourceStartMs);
+    public static MpvIpcCommand LoadFileReplace(MpvActiveSource source, ulong sourceStartMs, bool startPaused = false) =>
+        new LoadFileReplaceCommand(source, sourceStartMs, startPaused);
 
     public static MpvIpcCommand SetPause(bool paused) => new SetPauseCommand(paused);
 
@@ -145,6 +146,10 @@ public abstract record MpvIpcCommand
         new UpdateCpu4FilterCommand(parameter, mappedValue);
 
     public static MpvIpcCommand GetProperty(MpvIpcProperty property) => new GetPropertyCommand(property);
+
+    public static string PresentationCapturePath(Guid id) => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Temp", "GpAutoLive", "transition-frames", id.ToString("N"), id.ToString("N") + ".png");
+
+    public static MpvIpcCommand CapturePresentation(Guid id) => new CapturePresentationCommand(id);
 
     public static MpvIpcCommand Quit() => new QuitCommand();
 
@@ -219,7 +224,7 @@ public abstract record MpvIpcCommand
 
     private sealed record LoadFileReplaceCommand(
         MpvActiveSource Source,
-        ulong SourceStartMs) : MpvIpcCommand
+        ulong SourceStartMs, bool StartPaused) : MpvIpcCommand
     {
         public override MpvIpcCommandKind Kind => MpvIpcCommandKind.LoadFileReplace;
 
@@ -252,14 +257,34 @@ public abstract record MpvIpcCommand
             }
 
             var seconds = $"{SourceStartMs / 1_000}.{SourceStartMs % 1_000:000}";
+            var options = new Dictionary<string, object?>(StringComparer.Ordinal) { ["start"] = seconds, ["speed"] = "1" };
+            if (StartPaused) options["pause"] = "yes";
             arguments =
             [
                 "loadfile",
                 validatedPath.CanonicalPath,
                 "replace",
                 -1,
-                new Dictionary<string, object?>(StringComparer.Ordinal) { ["start"] = seconds },
+                options,
             ];
+            return true;
+        }
+    }
+
+    private sealed record CapturePresentationCommand(Guid Id) : MpvIpcCommand
+    {
+        public override MpvIpcCommandKind Kind => MpvIpcCommandKind.CapturePresentation;
+        public override string Operation => "capture presentation";
+        protected override bool TryBuildArguments(out ImmutableArray<object?> arguments, out MpvIpcError? error)
+        {
+            arguments = [];
+            error = null;
+            if (Id == Guid.Empty)
+            {
+                error = InvalidCommand(Kind, "保帧标识无效。", false);
+                return false;
+            }
+            arguments = ["screenshot-to-file", PresentationCapturePath(Id), "window"];
             return true;
         }
     }

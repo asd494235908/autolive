@@ -53,11 +53,11 @@ public sealed class WindowsVirtualCameraSidecarClientTests
         Assert.IsTrue(connect.IsSuccess, connect.Error?.Message);
         await waitTask;
 
-        var payload = new byte[WindowsVirtualCameraSidecarProtocol.MaxPayloadBytes];
+        var payload = new byte[(1280 * 720 * 2)];
         payload[0] = 16;
         payload[1] = 128;
         var frame = new VirtualCameraFrame(4, 9, 90_000, payload);
-        var encoded = new byte[WindowsVirtualCameraSidecarProtocol.EncodedFrameBytes];
+        var encoded = new byte[(WindowsVirtualCameraSidecarProtocol.FrameHeaderBytes + 1280 * 720 * 2)];
         var readTask = server.ReadExactlyAsync(encoded, timeout.Token);
         var write = await client.WriteFrameAsync(frame, timeout.Token);
         Assert.IsTrue(write.IsSuccess, write.Error?.Message);
@@ -70,7 +70,7 @@ public sealed class WindowsVirtualCameraSidecarClientTests
         Assert.AreEqual(10_000_000L, decoded.Timestamp100Ns);
         CollectionAssert.AreEqual(frame.Payload, decoded.Payload);
         Assert.AreEqual((ulong)1, client.Snapshot.FramesWritten);
-        Assert.AreEqual(WindowsVirtualCameraSidecarProtocol.MaxPayloadBytes, client.Snapshot.LastPayloadBytes);
+        Assert.AreEqual((1280 * 720 * 2), client.Snapshot.LastPayloadBytes);
 
         var stop = await client.StopAsync(timeout.Token);
         Assert.IsTrue(stop.IsSuccess, stop.Error?.Message);
@@ -150,7 +150,7 @@ public sealed class WindowsVirtualCameraSidecarClientTests
             generation,
             sequence,
             timestamp90Khz,
-            new byte[WindowsVirtualCameraSidecarProtocol.MaxPayloadBytes]);
+            new byte[(1280 * 720 * 2)]);
 
     private static string CreatePipeName()
     {

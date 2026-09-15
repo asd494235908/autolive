@@ -94,10 +94,12 @@ public static class WindowsD3D11HardwareContextFactory
     }
 
     /// <summary>从实际 D3D11 设备读取 adapter LUID、厂商和 feature level，拒绝猜测值。</summary>
-    public static bool TryBuildFacts(ID3D11Device device, out GpuCaptureFacts? facts)
+    public static bool TryBuildFacts(ID3D11Device device, out GpuCaptureFacts? facts, VirtualCameraConfig? config = null)
     {
         ArgumentNullException.ThrowIfNull(device);
         facts = null;
+        config ??= VirtualCameraConfig.Default;
+        if (!config.TryValidateFixedOutput(out _)) return false;
         try
         {
             using var dxgiDevice = device.QueryInterface<IDXGIDevice>();
@@ -115,9 +117,9 @@ public static class WindowsD3D11HardwareContextFactory
                 true,
                 VirtualCameraRules.Transport,
                 false,
-                VirtualCameraRules.Width,
-                VirtualCameraRules.Height,
-                VirtualCameraRules.Fps);
+                config.Width,
+                config.Height,
+                config.Fps);
             return true;
         }
         catch (SharpGen.Runtime.SharpGenException)

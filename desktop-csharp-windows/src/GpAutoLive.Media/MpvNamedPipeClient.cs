@@ -73,6 +73,13 @@ public sealed record MpvIpcPipeOptions
 /// </summary>
 public sealed class MpvNamedPipeClient : IAsyncDisposable
 {
+    private long _loadedGeneration;
+    private long _restartedGeneration;
+    private long _playbackRestartSequence;
+    public long LoadedGeneration => Interlocked.Read(ref _loadedGeneration);
+    public long RestartedGeneration => Interlocked.Read(ref _restartedGeneration);
+    public long PlaybackRestartSequence => Interlocked.Read(ref _playbackRestartSequence);
+
     private const int DisposeWaitMilliseconds = 2_000;
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
@@ -315,6 +322,12 @@ public sealed class MpvNamedPipeClient : IAsyncDisposable
 
                 if (parsed.Frame?.Kind is MpvIpcFrameKind.Event)
                 {
+                    if (parsed.Frame.EventName == "file-loaded") Interlocked.Increment(ref _loadedGeneration);
+                    if (parsed.Frame.EventName == "playback-restart")
+                    {
+                        Interlocked.Exchange(ref _restartedGeneration, LoadedGeneration);
+                        Interlocked.Increment(ref _playbackRestartSequence);
+                    }
                     continue;
                 }
 

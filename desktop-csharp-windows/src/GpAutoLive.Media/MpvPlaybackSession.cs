@@ -150,7 +150,7 @@ public sealed record MpvSessionOperationResult(
 /// 单一 mpv 视频会话的纯逻辑所有者。此类不打开管道、不启动进程，
 /// 只生成固定 IPC 命令并拒绝旧源的迟到响应。
 /// </summary>
-public sealed class MpvPlaybackSession
+public sealed partial class MpvPlaybackSession
 {
     private readonly object _gate = new();
     private MpvSessionSnapshot _snapshot = MpvSessionSnapshot.Initial;
@@ -170,7 +170,7 @@ public sealed class MpvPlaybackSession
     /// <summary>
     /// 绑定或替换唯一活动视频源。替换源会重置到 Ready，并让旧身份失效。
     /// </summary>
-    public MpvSessionOperationResult BindSource(MpvActiveSource? source, ulong sourceStartMs = 0)
+    public MpvSessionOperationResult BindSource(MpvActiveSource? source, ulong sourceStartMs = 0, bool startPaused = false)
     {
         lock (_gate)
         {
@@ -216,10 +216,10 @@ public sealed class MpvPlaybackSession
                 return MpvSessionOperationResult.Success(_snapshot, changed: false);
             }
 
-            var command = MpvIpcCommand.LoadFileReplace(source, sourceStartMs);
+            var command = MpvIpcCommand.LoadFileReplace(source, sourceStartMs, startPaused);
             _snapshot = _snapshot with
             {
-                State = MpvSessionState.Ready,
+                State = startPaused ? MpvSessionState.Paused : MpvSessionState.Ready,
                 ActiveSource = source,
                 EffectSnapshot = MpvVideoEffectSnapshot.Default,
                 EffectRevision = _snapshot.EffectRevision + 1,

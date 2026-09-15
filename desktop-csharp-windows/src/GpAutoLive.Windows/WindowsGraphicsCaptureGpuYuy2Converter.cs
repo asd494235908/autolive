@@ -35,13 +35,13 @@ public sealed record WindowsGraphicsCaptureGpuYuy2ConversionResult(
 
 /// <summary>
 /// 在 WGC 所属的同一硬件 D3D11 设备上完成缩放、BT.601 limited-range 色彩转换和一次有界回读。
-/// 输出纹理为 640×720 的 RGBA，每个像素打包两个 YUY2 像素；回读使用三个 staging 槽并丢弃过期帧。
+/// 输出纹理为配置宽度一半、配置高度的 RGBA，每个像素打包两个 YUY2 像素；回读使用三个 staging 槽并丢弃过期帧。
 /// </summary>
 public sealed class WindowsGraphicsCaptureGpuYuy2Converter : IDisposable
 {
-    private const int OutputWidth = 1280;
-    private const int OutputHeight = 720;
-    private const int PackedWidth = OutputWidth / 2;
+    private int OutputWidth => checked((int)_config.Width);
+    private int OutputHeight => checked((int)_config.Height);
+    private int PackedWidth => OutputWidth / 2;
     private const int StagingCount = 3;
     private static readonly Guid Texture2DIid =
         new("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
@@ -280,8 +280,8 @@ public sealed class WindowsGraphicsCaptureGpuYuy2Converter : IDisposable
 
             var packedDescription = new Texture2DDescription(
                 Format.R8G8B8A8_UNorm,
-                PackedWidth,
-                OutputHeight,
+                checked((uint)PackedWidth),
+                checked((uint)OutputHeight),
                 1,
                 1,
                 BindFlags.RenderTarget,
@@ -302,8 +302,8 @@ public sealed class WindowsGraphicsCaptureGpuYuy2Converter : IDisposable
 
             var stagingDescription = new Texture2DDescription(
                 Format.R8G8B8A8_UNorm,
-                PackedWidth,
-                OutputHeight,
+                checked((uint)PackedWidth),
+                checked((uint)OutputHeight),
                 1,
                 1,
                 BindFlags.None,
@@ -381,7 +381,7 @@ public sealed class WindowsGraphicsCaptureGpuYuy2Converter : IDisposable
 
             try
             {
-                var payload = new byte[VirtualCameraRules.Width * VirtualCameraRules.Height * 2];
+                var payload = new byte[checked(OutputWidth * OutputHeight * 2)];
                 var rowBytes = PackedWidth * 4;
                 for (var row = 0; row < OutputHeight; row++)
                 {
@@ -400,7 +400,7 @@ public sealed class WindowsGraphicsCaptureGpuYuy2Converter : IDisposable
                     latest = new(
                         true,
                         WindowsGraphicsCaptureGpuYuy2ConversionCode.Converted,
-                        new VirtualCameraFrame(slot.Generation, slot.Sequence, slot.Timestamp90Khz, payload),
+                        new VirtualCameraFrame(slot.Generation, slot.Sequence, slot.Timestamp90Khz, payload, _config.Width, _config.Height),
                         stopwatch.Elapsed);
                 }
             }
@@ -556,9 +556,8 @@ public sealed class WindowsGraphicsCaptureGpuYuy2Converter : IDisposable
         }
         struct VSOut { float4 position : SV_Position; float2 uv : TEXCOORD0; };
         float4 PSMain(VSOut input) : SV_Target {
-            uint sourceWidth, sourceHeight;
-            sourceTexture.GetDimensions(sourceWidth, sourceHeight);
-            float2 sourcePixel = float2(1.0 / sourceWidth, 1.0 / sourceHeight);
+            // A packed pixel covers two output pixels, including scaled source frames.
+            float2 sourcePixel = float2(ddx(input.uv.x) * 0.5, 0.0);
             float3 yuv0 = ToLimitedYuv(sourceTexture.Sample(
                 pointSampler,
                 input.uv - float2(sourcePixel.x * 0.5, 0.0)));

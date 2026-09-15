@@ -1,0 +1,97 @@
+<Window x:Class="GpAutoLive.App.Features.Douyin.DouyinChatWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="实时弹幕" Icon="/GpAutoLive;component/Assets/app-icon.ico"
+        Width="440" Height="560" MinWidth="340" MinHeight="320"
+        Background="{StaticResource WindowBrush}" Foreground="{StaticResource TextBrush}"
+        ShowInTaskbar="False" WindowStartupLocation="CenterOwner"
+        UseLayoutRounding="True" SnapsToDevicePixels="True">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <Grid Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock x:Name="ConnectionStatusText" VerticalAlignment="Center"
+                       Text="未连接" TextWrapping="Wrap" Margin="0,0,12,0" />
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <CheckBox Content="置顶" VerticalAlignment="Center" Margin="0,0,12,0"
+                          AutomationProperties.Name="弹幕窗口置顶"
+                          IsChecked="{Binding Topmost, RelativeSource={RelativeSource AncestorType=Window}, Mode=TwoWay}" />
+                <Button x:Name="ClearButton" Content="清空" MinWidth="56" Height="32"
+                        Style="{StaticResource ButtonStyle}" Click="ClearButton_Click"
+                        ToolTip="只清空显示记录，不停止监听或影响回复队列" />
+            </StackPanel>
+        </Grid>
+        <Grid Grid.Row="1">
+            <ListBox x:Name="MessagesList" Background="{StaticResource SurfaceBrush}"
+                     Foreground="{StaticResource TextBrush}" BorderBrush="{StaticResource BorderBrush}"
+                     AutomationProperties.Name="实时弹幕列表"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                     ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.CanContentScroll="True"
+                     VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                     VirtualizingPanel.ScrollUnit="Pixel" ScrollViewer.ScrollChanged="MessagesList_ScrollChanged">
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <StackPanel Margin="8,6">
+                            <DockPanel Margin="0,0,0,4">
+                                <TextBlock DockPanel.Dock="Left" Margin="0,0,10,0" FontSize="12"
+                                           Foreground="{StaticResource MutedTextBrush}"
+                                           Text="{Binding ReceivedAtUtc.LocalDateTime, StringFormat=HH:mm:ss}" />
+                                <TextBlock FontSize="13" FontWeight="SemiBold" TextTrimming="CharacterEllipsis">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Text" Value="{Binding Nickname}" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsSelf}" Value="True">
+                                                    <Setter Property="Text" Value="我" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                            </DockPanel>
+                            <TextBlock Text="{Binding Text}" FontSize="14" TextWrapping="Wrap" />
+                        </StackPanel>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+            <TextBlock x:Name="EmptyText" Text="暂无弹幕；连接直播间后在这里实时显示"
+                       Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                       TextAlignment="Center" VerticalAlignment="Center" Margin="24"
+                       IsHitTestVisible="False" />
+        </Grid>
+        <DockPanel Grid.Row="2" Margin="0,12,0,0">
+            <Button DockPanel.Dock="Right" x:Name="LatestButton" Content="回到最新" Height="32"
+                    Style="{StaticResource ButtonStyle}" Click="LatestButton_Click" />
+            <TextBlock x:Name="MessageCountText" Text="最近 0 / 500 条" VerticalAlignment="Center"
+                       Foreground="{StaticResource MutedTextBrush}" />
+        </DockPanel>
+        <StackPanel Grid.Row="3" Margin="0,12,0,0">
+            <TextBlock Text="手动发送弹幕" Margin="0,0,0,6" />
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBox x:Name="ManualChatTextBox" Height="32"
+                         AutomationProperties.Name="手动弹幕内容"
+                         ToolTip="最多 80 个字符；仅点击发送按钮才会发送"
+                         TextChanged="ManualChatTextBox_TextChanged" />
+                <Button x:Name="SendChatButton" Grid.Column="1" Content="发送" Height="32" MinWidth="64"
+                        Margin="8,0,0,0" IsEnabled="False" IsDefault="False"
+                        AutomationProperties.Name="手动发送一条弹幕"
+                        Style="{StaticResource AccentButtonStyle}" Click="SendChatButton_Click" />
+            </Grid>
+            <TextBlock x:Name="ManualSendStatusText" Text="连接直播间后可手动发送"
+                       Foreground="{StaticResource MutedTextBrush}" FontSize="11"
+                       TextWrapping="Wrap" Margin="0,6,0,0" MaxHeight="44" />
+        </StackPanel>
+    </Grid>
+</Window>

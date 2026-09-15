@@ -30,6 +30,13 @@ public partial class FinalEffectWindow : Window
 
     public IntPtr VideoSurfaceHandle => VideoSurface.SurfaceHandle;
 
+    internal bool HasHeldVideoFrame => VideoSurface.HasHeldFrame;
+
+    internal bool TryHoldVideoFrame(byte[] pngBytes, out string? error) =>
+        VideoSurface.TryHoldFrame(pngBytes, out error);
+
+    internal void ReleaseHeldVideoFrame() => VideoSurface.ReleaseHeldFrame();
+
     public bool IsFullscreen { get; private set; }
 
     internal double VideoAspectRatio => _videoAspectRatio;
@@ -112,6 +119,8 @@ public partial class FinalEffectWindow : Window
 
     private void ApplySnapshot(FinalEffectSnapshot snapshot)
     {
+        if (snapshot.SurfaceKind is not FinalEffectSurfaceKind.VideoHwndReserved)
+            VideoSurface.ReleaseHeldFrame();
         VideoSurface.Visibility = snapshot.SurfaceKind is FinalEffectSurfaceKind.VideoHwndReserved
             ? Visibility.Visible
             : Visibility.Collapsed;
@@ -154,6 +163,7 @@ public partial class FinalEffectWindow : Window
 
     private void Window_Closed(object? sender, EventArgs e)
     {
+        VideoSurface.ReleaseHeldFrame();
         _windowSource?.RemoveHook(WindowMessageHook);
         _windowSource = null;
         _controller.StateChanged -= Controller_StateChanged;
@@ -169,6 +179,13 @@ public partial class FinalEffectWindow : Window
             || _isApplyingVideoWindowSize
             || (!force && _lastSizedVideoDimensions == (width, height)))
         {
+            return;
+        }
+
+        if (!force && VideoSurface.HasHeldFrame)
+        {
+            // 换源沿用当前输出表面尺寸，避免保帧期间 resize 中断 WGC 或暴露未绘制区域。
+            _lastSizedVideoDimensions = (width, height);
             return;
         }
 
